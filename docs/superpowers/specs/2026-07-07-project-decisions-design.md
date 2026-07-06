@@ -56,19 +56,26 @@ facade crate 应 re-export 底层 crate 的常用 API，并通过 feature 控制
 
 - core 路由类型
 - view adapter trait 与 fake/test renderer 支持
-- ECS integration plugin 与 host/slot component
+- ECS integration plugin 与 host/slot component 的 re-export 路径
 
 建议 opt-in facade features 包含：
 
+- ECS integration
 - BSN adapter
 - platform adapter helpers
-- examples 或仅开发期使用的工具
+- 仅开发期使用的工具
 
 理由：
 
 - 用户可以从一个简单入口开始使用。
 - 内部 crate 边界依然明确且可测试。
 - 可选集成可以继续 feature-gate，避免不稳定或平台特定依赖进入所有构建。
+
+后续审查收敛说明：
+
+- “默认 facade surface” 表示 facade 可以提供稳定的 re-export 路径，不表示 default feature 必须启用所有集成。
+- 当前规划基线是 default feature 不拉入 Bevy；ECS、BSN 和 platform helper 通过显式 feature opt-in。
+- examples 使用 workspace examples 或 dev-only package，不作为 facade feature 表达。
 
 ### 3. 规划范围
 
@@ -383,6 +390,12 @@ RouteLocation
 - Diagnostics 能识别 router、host、slot、frame identity、generation、route id 和 error source。
 
 ### Phase 3: View Adapter Interface And BSN Adapter
+
+执行级拆分说明：
+
+- 本文保留 Phase 3 的聚合决策口径。
+- 后续执行流程已将 Phase 3 拆为 Phase 3A view contract/fake renderer、Phase 3B ECS integration、Phase 3C immediate BSN adapter、Phase 3D minimal nested routes example。
+- 实施时以 `docs/superpowers/plans/2026-07-07-phase-0-3-execution-flow.md` 的 gate 拆分为准。
 
 目的：
 

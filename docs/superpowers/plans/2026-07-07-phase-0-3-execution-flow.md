@@ -19,7 +19,10 @@ Execution must be split into phase-specific plans:
 - Phase 0 plan: contract freeze and workspace/core baseline.
 - Phase 1 plan: route tree, matcher, branch model.
 - Phase 2 plan: frame state, transaction, error boundary.
-- Phase 3 plan: view adapter, ECS integration, immediate BSN adapter, minimal example.
+- Phase 3A plan: view contract and fake/test renderer.
+- Phase 3B plan: ECS integration, host/slot/frame root, cleanup and finalization.
+- Phase 3C plan: immediate BSN adapter.
+- Phase 3D plan: minimal nested routes example.
 
 This document is the process and task-flow plan. It does not authorize code implementation by itself.
 
@@ -49,10 +52,12 @@ Implementation workers must read these files before writing a phase plan or code
 - Do not execute Phase 3 before Phase 2 is complete and verified.
 - Keep core independent from Bevy, BSN, platform APIs, and app-specific concepts.
 - Use TDD for behavior contracts: failing test, minimal implementation, passing test, commit.
-- Commit at phase checkpoints and at meaningful sub-phase boundaries.
-- If a phase reveals a design contradiction, pause implementation and update the planning docs before continuing.
+- Commit at phase gates and meaningful sub-phase gates. A checkpoint may be used for local progress notes, but it cannot replace a commit at a phase or sub-phase gate.
+- If a phase reveals a design contradiction, pause implementation and update the planning docs before continuing. Execution may resume only after the revised plan passes the same review flow that found the contradiction.
 - Adapter work may only use public APIs; it must not construct or forge frame identity, generation, or commit tokens.
 - Verification claims require fresh command output.
+- Required verification command failures block phase completion. A command that cannot run because of environment limits marks the gate as unverified or blocked unless the user explicitly accepts the risk in writing.
+- Every detailed phase plan must pass review before implementation starts. A self-review scan is not enough to authorize implementation.
 
 ---
 
@@ -104,14 +109,104 @@ If implementation discovers a better layout, update the active phase plan first 
 
 ---
 
-## 6. Task Flow
+## 6. Gate Evidence Model
+
+Every detailed plan and execution gate must produce auditable evidence.
+
+### 6.1 Plan Acceptance Gate
+
+Before implementation starts for any phase or sub-phase:
+
+- the detailed plan exists;
+- the plan has passed placeholder, trailing whitespace, and `git diff --check` checks;
+- the plan has been reviewed against the roadmap and review log;
+- any requested split or refinement has been applied;
+- the user has confirmed the execution mode or continuation path.
+
+### 6.2 TDD Evidence Ledger
+
+Each implementation task must record:
+
+- task id and files changed;
+- RED command and exit code;
+- RED output summary proving the test failed for the expected reason;
+- GREEN command and exit code;
+- GREEN output summary proving the target behavior passed;
+- commit SHA or explicit reason the task is still before a commit boundary;
+- any skipped command and whether that makes the gate blocked.
+
+Tests added after implementation do not count as TDD evidence unless the RED failure was observed and recorded before the implementation change.
+
+### 6.3 Phase Gate Evidence
+
+Each phase or sub-phase gate must record:
+
+- final commit SHA;
+- verification commands and exit codes;
+- review gate checklist result;
+- unresolved risks;
+- user-accepted exceptions, if any;
+- next phase or sub-phase authorized by the lead.
+
+`git log -1 --oneline` and `git status --short` are not enough by themselves. They only support the evidence record; they do not replace it.
+
+### 6.4 Failed Or Unavailable Verification
+
+Required command outcomes:
+
+- pass: the gate may proceed if all checklist items also pass;
+- fail: the gate is blocked;
+- unavailable because target crate does not exist yet: the active plan must identify the task that creates it and the later step that runs the command;
+- unavailable because of environment or network limits: the gate is unverified or blocked unless the user explicitly accepts the risk.
+
+---
+
+## 7. Task Flow
+
+### Task 0: Create Implementation Readiness Brief
+
+**Files:**
+- Create: `docs/superpowers/plans/2026-07-07-implementation-readiness-brief.md`
+- Read: all source documents listed in Section 2
+
+- [ ] **Step 1: Create the readiness brief**
+
+The brief must contain these implementation-start inputs:
+
+- Public API draft scope for Phase 0.
+- State machine diagram scope for Phase 0-2.
+- Error taxonomy finalization target.
+- Adapter responsibility table scope.
+- Test harness outline.
+- Minimal examples outline.
+- Open decisions that Phase 0 must freeze.
+
+- [ ] **Step 2: Run document checks**
+
+Run:
+
+```powershell
+$terms = @('T'+'BD','TO'+'DO','FIX'+'ME','待'+'定','未'+'定','稍'+'后','implement'+' later','fill'+' in')
+$pattern = $terms -join '|'
+rg -n $pattern 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-implementation-readiness-brief.md'
+rg -n "[ \t]+$" 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-implementation-readiness-brief.md'
+git diff --check
+```
+
+Expected: no placeholder matches, no trailing whitespace, and `git diff --check` exits successfully.
+
+- [ ] **Step 3: Readiness review gate**
+
+The readiness brief must be reviewed before Task 1 begins.
+
+Expected: the reviewer confirms the brief does not open new implementation scope and only prepares Phase 0 planning inputs.
 
 ### Task 1: Create Phase 0 Detailed Plan
 
 **Files:**
 - Create: `docs/superpowers/plans/2026-07-07-phase-0-contract-freeze-implementation-plan.md`
-- Read: `docs/superpowers/specs/2026-07-07-project-architecture-roadmap-plan.md`
-- Read: `docs/superpowers/specs/2026-07-07-project-architecture-roadmap-review-log.md`
+- Read: all source documents listed in Section 2
+- Read: `docs/superpowers/plans/2026-07-07-implementation-readiness-brief.md`
 
 - [ ] **Step 1: Re-read the planning baseline**
 
@@ -146,11 +241,24 @@ Run:
 $terms = @('T'+'BD','TO'+'DO','FIX'+'ME','待'+'定','未'+'定','稍'+'后','implement'+' later','fill'+' in')
 $pattern = $terms -join '|'
 rg -n $pattern 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-phase-0-contract-freeze-implementation-plan.md'
+rg -n "[ \t]+$" 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-phase-0-contract-freeze-implementation-plan.md'
+git diff --check
 ```
 
-Expected: no matches.
+Expected: no placeholder matches, no trailing whitespace, and `git diff --check` exits successfully.
 
-- [ ] **Step 4: Ask for execution mode**
+- [ ] **Step 4: Phase 0 plan acceptance gate**
+
+Review the Phase 0 plan against:
+
+- the roadmap Phase 0 scope;
+- the readiness brief;
+- the review log must-fix decisions;
+- the evidence model in Section 6.
+
+Expected: Phase 0 implementation does not begin until this plan acceptance gate passes.
+
+- [ ] **Step 5: Ask for execution mode**
 
 Offer:
 
@@ -160,7 +268,7 @@ Phase 0 plan is ready. Execution options:
 2. Inline Execution: execute in this session with checkpoints.
 ```
 
-Expected: user chooses an execution mode before implementation starts.
+Expected: user chooses an execution mode after the Phase 0 plan is accepted and before implementation starts.
 
 ### Task 2: Execute Phase 0
 
@@ -182,7 +290,7 @@ Expected: no unrelated changes, or unrelated changes are explicitly noted and ig
 
 Use `superpowers:subagent-driven-development` or `superpowers:executing-plans`.
 
-Expected: each task follows failing test, implementation, passing test, commit or checkpoint.
+Expected: each task records RED evidence, implementation summary, GREEN evidence, and commit boundary status in the TDD evidence ledger.
 
 - [ ] **Step 3: Run Phase 0 verification**
 
@@ -194,7 +302,7 @@ cargo test -p bevy_ui_router_core
 cargo check -p bevy_ui_router --no-default-features
 ```
 
-Expected: all commands pass, or every skipped/failed command is explained with evidence.
+Expected: all required commands pass. Failed commands block Phase 0 completion. Environment-limited commands mark the gate unverified or blocked unless the user explicitly accepts the risk in writing.
 
 - [ ] **Step 4: Phase 0 review gate**
 
@@ -205,14 +313,14 @@ Confirm:
 - diagnostics can express router, host, slot, frame, generation;
 - no BSN or app-specific concepts entered core.
 
-Expected: Phase 0 can be marked complete only after this gate passes.
+Expected: Phase 0 can be marked complete only after this gate passes and Phase 0 gate evidence is recorded.
 
 ### Task 3: Create Phase 1 Detailed Plan
 
 **Files:**
 - Create: `docs/superpowers/plans/2026-07-07-phase-1-route-tree-branch-model-implementation-plan.md`
-- Read: Phase 0 implementation result
-- Read: `docs/superpowers/specs/2026-07-07-project-architecture-roadmap-plan.md`
+- Read: all source documents listed in Section 2
+- Read: Phase 0 implementation result and Phase 0 gate evidence
 
 - [ ] **Step 1: Confirm Phase 0 completion evidence**
 
@@ -224,6 +332,8 @@ git status --short
 ```
 
 Expected: Phase 0 commit exists and worktree is clean.
+
+Also confirm Phase 0 gate evidence records final verification commands, exit codes, review checklist, unresolved risks, and authorized continuation to Phase 1.
 
 - [ ] **Step 2: Write the Phase 1 plan**
 
@@ -247,9 +357,17 @@ Run:
 $terms = @('T'+'BD','TO'+'DO','FIX'+'ME','待'+'定','未'+'定','稍'+'后','implement'+' later','fill'+' in')
 $pattern = $terms -join '|'
 rg -n $pattern 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-phase-1-route-tree-branch-model-implementation-plan.md'
+rg -n "[ \t]+$" 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-phase-1-route-tree-branch-model-implementation-plan.md'
+git diff --check
 ```
 
-Expected: no matches.
+Expected: no placeholder matches, no trailing whitespace, and `git diff --check` exits successfully.
+
+- [ ] **Step 4: Phase 1 plan acceptance gate**
+
+Review the Phase 1 plan against Phase 0 gate evidence, roadmap Phase 1 scope, and Section 6 evidence requirements.
+
+Expected: Phase 1 implementation does not begin until this plan acceptance gate passes.
 
 ### Task 4: Execute Phase 1
 
@@ -259,7 +377,7 @@ Expected: no matches.
 
 - [ ] **Step 1: Execute Phase 1 task-by-task**
 
-Expected: route declaration and matcher behavior are built through contract tests first.
+Expected: route declaration and matcher behavior are built through contract tests first, with RED and GREEN evidence recorded.
 
 - [ ] **Step 2: Run Phase 1 verification**
 
@@ -272,6 +390,8 @@ cargo check -p bevy_ui_router --no-default-features
 ```
 
 Expected: matcher, branch diff, and fingerprint tests pass.
+
+Failed required commands block Phase 1 completion. Environment-limited commands mark the gate unverified or blocked unless the user explicitly accepts the risk in writing.
 
 - [ ] **Step 3: Phase 1 review gate**
 
@@ -288,8 +408,8 @@ Expected: Phase 2 planning starts only after this gate passes.
 
 **Files:**
 - Create: `docs/superpowers/plans/2026-07-07-phase-2-frame-error-transaction-implementation-plan.md`
-- Read: Phase 1 implementation result
-- Read: `docs/superpowers/specs/2026-07-07-project-architecture-roadmap-plan.md`
+- Read: all source documents listed in Section 2
+- Read: Phase 1 implementation result and Phase 1 gate evidence
 
 - [ ] **Step 1: Confirm Phase 1 completion evidence**
 
@@ -301,6 +421,8 @@ git status --short
 ```
 
 Expected: Phase 1 commit exists and worktree is clean.
+
+Also confirm Phase 1 gate evidence records matcher, branch diff, fingerprint, stable ordering verification, unresolved risks, and authorized continuation to Phase 2.
 
 - [ ] **Step 2: Write the Phase 2 plan**
 
@@ -326,9 +448,17 @@ Run:
 $terms = @('T'+'BD','TO'+'DO','FIX'+'ME','待'+'定','未'+'定','稍'+'后','implement'+' later','fill'+' in')
 $pattern = $terms -join '|'
 rg -n $pattern 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-phase-2-frame-error-transaction-implementation-plan.md'
+rg -n "[ \t]+$" 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-phase-2-frame-error-transaction-implementation-plan.md'
+git diff --check
 ```
 
-Expected: no matches.
+Expected: no placeholder matches, no trailing whitespace, and `git diff --check` exits successfully.
+
+- [ ] **Step 4: Phase 2 plan acceptance gate**
+
+Review the Phase 2 plan against Phase 1 gate evidence, roadmap Phase 2 scope, and Section 6 evidence requirements.
+
+Expected: Phase 2 implementation does not begin until this plan acceptance gate passes.
 
 ### Task 6: Execute Phase 2
 
@@ -338,7 +468,7 @@ Expected: no matches.
 
 - [ ] **Step 1: Execute Phase 2 task-by-task**
 
-Expected: frame and transaction behavior are built through failing tests before implementation.
+Expected: frame and transaction behavior are built through failing tests before implementation, with RED and GREEN evidence recorded.
 
 - [ ] **Step 2: Run Phase 2 verification**
 
@@ -352,6 +482,8 @@ cargo check -p bevy_ui_router --no-default-features
 
 Expected: lifecycle, transaction, stale rejection, and error boundary tests pass.
 
+Failed required commands block Phase 2 completion. Environment-limited commands mark the gate unverified or blocked unless the user explicitly accepts the risk in writing.
+
 - [ ] **Step 3: Phase 2 review gate**
 
 Confirm:
@@ -361,14 +493,14 @@ Confirm:
 - failed transaction cleanup only touches its own partial output;
 - adapter cannot construct or forge frame id/generation.
 
-Expected: Phase 3 planning starts only after this gate passes.
+Expected: Phase 3A planning starts only after this gate passes and Phase 2 gate evidence is recorded.
 
-### Task 7: Create Phase 3 Detailed Plan
+### Task 7A: Create Phase 3A View Contract Plan
 
 **Files:**
-- Create: `docs/superpowers/plans/2026-07-07-phase-3-view-ecs-bsn-implementation-plan.md`
-- Read: Phase 2 implementation result
-- Read: `docs/superpowers/specs/2026-07-07-project-architecture-roadmap-plan.md`
+- Create: `docs/superpowers/plans/2026-07-07-phase-3a-view-contract-implementation-plan.md`
+- Read: all source documents listed in Section 2
+- Read: Phase 2 implementation result and Phase 2 gate evidence
 
 - [ ] **Step 1: Confirm Phase 2 completion evidence**
 
@@ -381,62 +513,326 @@ git status --short
 
 Expected: Phase 2 commit exists and worktree is clean.
 
-- [ ] **Step 2: Write the Phase 3 plan**
+Also confirm Phase 2 gate evidence records frame lifecycle, transaction, stale gate, error boundary verification, unresolved risks, and authorized continuation to Phase 3A.
 
-Create a detailed plan split into:
+- [ ] **Step 2: Write the Phase 3A plan**
+
+Create a detailed plan for:
 
 - Phase 3A: view contract and fake/test renderer;
-- Phase 3B: ECS host, slot, frame root marker, schedule sets, cleanup and finalization;
-- Phase 3C: immediate BSN adapter;
-- Phase 3D: minimal nested routes example.
+- renderer-agnostic view descriptor/result contracts;
+- fake renderer build/apply success and failure paths;
+- failure cleanup reporting;
+- active commit ordering tests.
 
-- [ ] **Step 3: Phase 3 plan self-review**
+- [ ] **Step 3: Phase 3A plan self-review**
 
 Run:
 
 ```powershell
 $terms = @('T'+'BD','TO'+'DO','FIX'+'ME','待'+'定','未'+'定','稍'+'后','implement'+' later','fill'+' in')
 $pattern = $terms -join '|'
-rg -n $pattern 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-phase-3-view-ecs-bsn-implementation-plan.md'
+rg -n $pattern 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-phase-3a-view-contract-implementation-plan.md'
+rg -n "[ \t]+$" 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-phase-3a-view-contract-implementation-plan.md'
+git diff --check
 ```
 
-Expected: no matches.
+Expected: no placeholder matches, no trailing whitespace, and `git diff --check` exits successfully.
 
-### Task 8: Execute Phase 3
+- [ ] **Step 4: Phase 3A plan acceptance gate**
+
+Review the Phase 3A plan against Phase 2 gate evidence, roadmap Phase 3A scope, and Section 6 evidence requirements.
+
+Expected: Phase 3A implementation does not begin until this plan acceptance gate passes.
+
+### Task 8A: Execute Phase 3A
 
 **Files:**
-- Follow: `docs/superpowers/plans/2026-07-07-phase-3-view-ecs-bsn-implementation-plan.md`
-- Modify: files listed by the Phase 3 plan
+- Follow: `docs/superpowers/plans/2026-07-07-phase-3a-view-contract-implementation-plan.md`
+- Modify: files listed by the Phase 3A plan
 
 - [ ] **Step 1: Execute Phase 3A**
 
-Expected: fake renderer proves build/apply success, failure cleanup, and active commit ordering.
+Expected: fake renderer proves build/apply success, failure cleanup, and active commit ordering, with RED and GREEN evidence recorded.
 
-- [ ] **Step 2: Execute Phase 3B**
-
-Expected: ECS ownership cleanup cannot touch app-owned host; focus/pickability/visibility finalization is testable.
-
-- [ ] **Step 3: Execute Phase 3C**
-
-Expected: immediate BSN adapter maps BSN failures into Router errors and uses public APIs only.
-
-- [ ] **Step 4: Execute Phase 3D**
-
-Expected: minimal nested routes example asserts active branch, frame markers, generation, and diagnostics.
-
-- [ ] **Step 5: Run Phase 3 verification**
+- [ ] **Step 2: Run Phase 3A verification**
 
 Minimum baseline:
 
 ```powershell
 cargo fmt --all --check
-cargo test -p bevy_ui_router_core
 cargo test -p bevy_ui_router_view
-cargo test -p bevy_ui_router_ecs --features ecs
-cargo check -p bevy_ui_router --features bsn
+cargo test -p bevy_ui_router_core
 ```
 
-Expected: all commands pass, or any environment-limited command is documented with exact failure output and reason.
+Expected: all required commands pass. Failed commands block Phase 3A completion.
+
+- [ ] **Step 3: Phase 3A review gate**
+
+Confirm:
+
+- fake renderer tests cover success and failure paths;
+- adapter-facing contracts do not expose forgeable identity;
+- active commit ordering is tested.
+
+Expected: Phase 3B planning starts only after this gate passes and Phase 3A gate evidence is recorded.
+
+### Task 7B: Create Phase 3B ECS Integration Plan
+
+**Files:**
+- Create: `docs/superpowers/plans/2026-07-07-phase-3b-ecs-integration-implementation-plan.md`
+- Read: all source documents listed in Section 2
+- Read: Phase 3A implementation result and Phase 3A gate evidence
+
+- [ ] **Step 1: Confirm Phase 3A completion evidence**
+
+Run:
+
+```powershell
+git log -1 --oneline
+git status --short
+```
+
+Expected: Phase 3A commit exists and worktree is clean.
+
+Also confirm Phase 3A gate evidence authorizes continuation to Phase 3B.
+
+- [ ] **Step 2: Write the Phase 3B plan**
+
+Create a detailed plan for:
+
+- ECS plugin setup;
+- `RouteHost`;
+- `RouteSlot`;
+- frame root marker;
+- schedule sets;
+- controlled cleanup API;
+- visibility, pickability, and focus finalization;
+- ownership tests proving app-owned host is not touched.
+
+- [ ] **Step 3: Phase 3B plan self-review**
+
+Run:
+
+```powershell
+$terms = @('T'+'BD','TO'+'DO','FIX'+'ME','待'+'定','未'+'定','稍'+'后','implement'+' later','fill'+' in')
+$pattern = $terms -join '|'
+rg -n $pattern 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-phase-3b-ecs-integration-implementation-plan.md'
+rg -n "[ \t]+$" 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-phase-3b-ecs-integration-implementation-plan.md'
+git diff --check
+```
+
+Expected: no placeholder matches, no trailing whitespace, and `git diff --check` exits successfully.
+
+- [ ] **Step 4: Phase 3B plan acceptance gate**
+
+Review the Phase 3B plan against Phase 3A gate evidence, roadmap Phase 3B scope, and Section 6 evidence requirements.
+
+Expected: Phase 3B implementation does not begin until this plan acceptance gate passes.
+
+### Task 8B: Execute Phase 3B
+
+**Files:**
+- Follow: `docs/superpowers/plans/2026-07-07-phase-3b-ecs-integration-implementation-plan.md`
+- Modify: files listed by the Phase 3B plan
+
+- [ ] **Step 1: Execute Phase 3B task-by-task**
+
+Expected: ECS ownership, cleanup, and finalization behavior are built through tests first, with RED and GREEN evidence recorded.
+
+- [ ] **Step 2: Run Phase 3B verification**
+
+Minimum baseline:
+
+```powershell
+cargo fmt --all --check
+cargo test -p bevy_ui_router_ecs --features ecs
+```
+
+If Phase 0 or Phase 3B freezes a different feature name, run the equivalent ECS integration test command recorded in the Phase 3B plan.
+
+Expected: all required commands pass. Failed commands block Phase 3B completion.
+
+- [ ] **Step 3: Phase 3B review gate**
+
+Confirm:
+
+- router-owned cleanup does not touch app-owned host;
+- frame root markers include router, host, slot, frame, generation, and route identity;
+- focus, pickability, and visibility finalization has tests.
+
+Expected: Phase 3C planning starts only after this gate passes and Phase 3B gate evidence is recorded.
+
+### Task 7C: Create Phase 3C Immediate BSN Adapter Plan
+
+**Files:**
+- Create: `docs/superpowers/plans/2026-07-07-phase-3c-bsn-adapter-implementation-plan.md`
+- Read: all source documents listed in Section 2
+- Read: Phase 3B implementation result and Phase 3B gate evidence
+
+- [ ] **Step 1: Confirm Phase 3B completion evidence**
+
+Run:
+
+```powershell
+git log -1 --oneline
+git status --short
+```
+
+Expected: Phase 3B commit exists and worktree is clean.
+
+Also confirm Phase 3B gate evidence authorizes continuation to Phase 3C.
+
+- [ ] **Step 2: Write the Phase 3C plan**
+
+Create a detailed plan for:
+
+- immediate code-driven BSN adapter;
+- BSN resolve/apply error mapping;
+- partial output reporting;
+- controlled cleanup API use;
+- proof that adapter only uses public Router/ECS APIs.
+
+- [ ] **Step 3: Phase 3C plan self-review**
+
+Run:
+
+```powershell
+$terms = @('T'+'BD','TO'+'DO','FIX'+'ME','待'+'定','未'+'定','稍'+'后','implement'+' later','fill'+' in')
+$pattern = $terms -join '|'
+rg -n $pattern 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-phase-3c-bsn-adapter-implementation-plan.md'
+rg -n "[ \t]+$" 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-phase-3c-bsn-adapter-implementation-plan.md'
+git diff --check
+```
+
+Expected: no placeholder matches, no trailing whitespace, and `git diff --check` exits successfully.
+
+- [ ] **Step 4: Phase 3C plan acceptance gate**
+
+Review the Phase 3C plan against Phase 3B gate evidence, roadmap Phase 3C scope, and Section 6 evidence requirements.
+
+Expected: Phase 3C implementation does not begin until this plan acceptance gate passes.
+
+### Task 8C: Execute Phase 3C
+
+**Files:**
+- Follow: `docs/superpowers/plans/2026-07-07-phase-3c-bsn-adapter-implementation-plan.md`
+- Modify: files listed by the Phase 3C plan
+
+- [ ] **Step 1: Execute Phase 3C task-by-task**
+
+Expected: immediate BSN adapter behavior is built through tests or integration checks first, with RED and GREEN evidence recorded. If RED/GREEN evidence is not feasible because of BSN API or environment limits, record the exact reason and mark the item unverified or blocked under Section 6.4 unless the user explicitly accepts the risk in writing.
+
+- [ ] **Step 2: Run Phase 3C verification**
+
+Minimum baseline:
+
+```powershell
+cargo fmt --all --check
+cargo check -p bevy_ui_router --features bsn
+cargo test -p bevy_ui_router_bsn --features bsn
+```
+
+If Phase 0 or Phase 3C freezes different feature names or package names, run the equivalent BSN adapter check and test commands recorded in the Phase 3C plan.
+
+Expected: all required commands pass. Failed commands block Phase 3C completion. If BSN cannot be tested because of missing upstream/custom API availability, the gate is unverified or blocked unless the user explicitly accepts the risk in writing.
+
+- [ ] **Step 3: Phase 3C review gate**
+
+Confirm:
+
+- BSN failures map to Router errors;
+- adapter does not own matching, history, lifecycle, cleanup authority, or platform policy;
+- adapter only uses public APIs.
+
+Expected: Phase 3D planning starts only after this gate passes and Phase 3C gate evidence is recorded.
+
+### Task 7D: Create Phase 3D Minimal Example Plan
+
+**Files:**
+- Create: `docs/superpowers/plans/2026-07-07-phase-3d-minimal-example-implementation-plan.md`
+- Read: all source documents listed in Section 2
+- Read: Phase 3C implementation result and Phase 3C gate evidence
+
+- [ ] **Step 1: Confirm Phase 3C completion evidence**
+
+Run:
+
+```powershell
+git log -1 --oneline
+git status --short
+```
+
+Expected: Phase 3C commit exists and worktree is clean.
+
+Also confirm Phase 3C gate evidence authorizes continuation to Phase 3D.
+
+- [ ] **Step 2: Write the Phase 3D plan**
+
+Create a detailed plan for:
+
+- neutral minimal nested routes example;
+- fake renderer path assertion;
+- BSN adapter path assertion;
+- active branch assertion;
+- frame marker assertion;
+- generation assertion;
+- diagnostics assertion.
+
+- [ ] **Step 3: Phase 3D plan self-review**
+
+Run:
+
+```powershell
+$terms = @('T'+'BD','TO'+'DO','FIX'+'ME','待'+'定','未'+'定','稍'+'后','implement'+' later','fill'+' in')
+$pattern = $terms -join '|'
+rg -n $pattern 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-phase-3d-minimal-example-implementation-plan.md'
+rg -n "[ \t]+$" 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-phase-3d-minimal-example-implementation-plan.md'
+git diff --check
+```
+
+Expected: no placeholder matches, no trailing whitespace, and `git diff --check` exits successfully.
+
+- [ ] **Step 4: Phase 3D plan acceptance gate**
+
+Review the Phase 3D plan against Phase 3C gate evidence, roadmap Phase 3D scope, and Section 6 evidence requirements.
+
+Expected: Phase 3D implementation does not begin until this plan acceptance gate passes.
+
+### Task 8D: Execute Phase 3D
+
+**Files:**
+- Follow: `docs/superpowers/plans/2026-07-07-phase-3d-minimal-example-implementation-plan.md`
+- Modify: files listed by the Phase 3D plan
+
+- [ ] **Step 1: Execute Phase 3D task-by-task**
+
+Expected: minimal nested routes example behavior is built with assertions for active branch, frame markers, generation, and diagnostics.
+
+- [ ] **Step 2: Run Phase 3D verification**
+
+Minimum baseline:
+
+```powershell
+cargo fmt --all --check
+cargo test --example minimal_nested_routes --features bsn
+cargo run --example minimal_nested_routes --features bsn
+```
+
+If the example is implemented as an integration test instead of a runnable example, run the equivalent command recorded in the Phase 3D plan.
+
+Expected: all required commands pass. Failed commands block Phase 3D completion.
+
+- [ ] **Step 3: Phase 3D review gate**
+
+Confirm:
+
+- example uses neutral route/page names;
+- example does not introduce app-specific assumptions;
+- fake renderer and BSN adapter paths are covered or explicitly separated with evidence;
+- diagnostics and frame marker assertions are present.
+
+Expected: Phase 0-3 completion review starts only after this gate passes and Phase 3D gate evidence is recorded.
 
 ### Task 9: Phase 0-3 Completion Review
 
@@ -455,6 +851,8 @@ git status --short
 ```
 
 Expected: all Phase 0-3 commits are visible and worktree is clean.
+
+Also review every Phase 0, Phase 1, Phase 2, Phase 3A, Phase 3B, Phase 3C, and Phase 3D gate evidence artifact. Each artifact must include final commit SHA, verification commands and exit codes, review checklist result, unresolved risks, and authorization for the next phase or sub-phase.
 
 - [ ] **Step 2: Produce completion summary**
 
@@ -479,7 +877,7 @@ Expected: no Phase 4 implementation begins without a new detailed plan.
 
 ---
 
-## 7. Subagent Strategy
+## 8. Subagent Strategy
 
 Use subagents only after a phase plan defines disjoint ownership.
 
@@ -488,13 +886,18 @@ Recommended split:
 - Phase 0: one worker for workspace/facade, one worker for core ids/location/history, one worker for diagnostics/tests.
 - Phase 1: one worker for route tree builder, one worker for matcher, one worker for branch diff/fingerprint tests.
 - Phase 2: one worker for frame/generation, one worker for transaction/stale gates, one worker for error boundary/fake harness.
-- Phase 3: one worker each for 3A, 3B, 3C, and 3D.
+- Phase 3: one worker each for 3A, 3B, 3C, and 3D after each sub-phase plan is accepted.
 
 Each worker must return:
 
 - files changed;
 - tests added;
-- commands run;
+- RED command, exit code, and output summary;
+- GREEN command, exit code, and output summary;
+- full verification commands, exit codes, and output summaries;
+- commit SHA for the accepted task or explicit note that the task has not reached a commit boundary;
+- failed commands, if any, clearly marked as blocking;
+- skipped commands and whether they make the gate unverified or blocked;
 - risks or deviations;
 - whether the worker touched only its assigned files.
 
@@ -502,7 +905,7 @@ The lead agent must review diffs and run phase verification before accepting wor
 
 ---
 
-## 8. Commit Strategy
+## 9. Commit Strategy
 
 Use small commits:
 
@@ -510,6 +913,13 @@ Use small commits:
 - one or more commits for each phase implementation, grouped by stable behavior;
 - one commit for docs updates after each phase gate;
 - no mixed commits that combine unrelated phase work.
+
+Checkpoint rules:
+
+- A checkpoint is a local progress marker or lead-agent review point.
+- A checkpoint may not replace a commit at a phase gate or sub-phase gate.
+- A checkpoint may not be used to claim a phase is complete.
+- If work pauses at a checkpoint, the final response must say which verification remains unfinished.
 
 Suggested commit messages:
 
@@ -524,7 +934,7 @@ docs: record phase 0 completion
 
 ---
 
-## 9. Verification Discipline
+## 10. Verification Discipline
 
 Before any completion claim, run the relevant verification commands and read the output.
 
@@ -541,3 +951,5 @@ git diff --check
 Expected: no placeholder matches, no trailing whitespace, and `git diff --check` exits successfully.
 
 Minimum Rust checks are phase-specific and listed above. If a command cannot run because the workspace or crate does not exist yet, the active phase plan must say which task creates it and which later step runs the command.
+
+Required verification failures block completion. Explanations are useful for diagnosis, but they do not convert a failed command into a passed gate. Environment-limited verification must be reported as unverified or blocked unless the user explicitly accepts the risk in writing.
