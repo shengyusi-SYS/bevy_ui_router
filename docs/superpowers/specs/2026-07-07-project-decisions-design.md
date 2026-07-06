@@ -1,32 +1,32 @@
-# Bevy UI Router Project Decisions Design
+# Bevy UI Router 项目决策设计记录
 
-**Date:** 2026-07-07  
-**Status:** Confirmed planning decisions  
-**Scope:** Project-level architecture and MVP planning decisions made before implementation.
-
----
-
-## Purpose
-
-This document records the confirmed project decisions for the generic Bevy UI Router. It is not an implementation plan and does not authorize code changes by itself.
-
-The goal is to keep the first implementation focused while preserving the architecture required by the existing design documents:
-
-- Router core remains generic, testable, and independent from Bevy, BSN, platform APIs, application services, themes, copy, permissions, and host application assumptions.
-- Bevy ECS integration owns entity, schedule, host, slot, visibility, pickability, focus, and ownership concerns.
-- BSN is the first concrete view adapter, not router core.
-- Platform behavior enters through router-neutral intent and location abstractions.
-- App-specific conventions stay outside core through extensions or integration profiles.
+**日期:** 2026-07-07
+**状态:** 已确认的准备阶段规划决策
+**范围:** 实现前确认的项目级架构、MVP 范围和阶段规划决策。
 
 ---
 
-## Confirmed Decisions
+## 目的
 
-### 1. Workspace Shape
+本文记录通用 Bevy UI Router 在准备阶段已经确认的项目决策。它不是实现计划，也不代表已经进入代码实现阶段。
 
-Use a multi-crate Cargo workspace.
+本文的目标是在第一轮实现中保持范围聚焦，同时保留既有设计文档要求的架构边界：
 
-Confirmed shape:
+- Router core 保持通用、可测试，并独立于 Bevy、BSN、平台 API、应用服务、主题、文案、权限和宿主应用假设。
+- Bevy ECS integration 负责 entity、schedule、host、slot、visibility、pickability、focus 和 ownership 相关问题。
+- BSN 是第一个具体 view adapter，而不是 Router core。
+- 平台行为通过 router-neutral intent 和 location abstraction 进入 Router。
+- 应用特定约定通过 extension 或 integration profile 留在 core 之外。
+
+---
+
+## 已确认决策
+
+### 1. Workspace 形态
+
+采用 multi-crate Cargo workspace。
+
+已确认的 crate 形态：
 
 - `bevy_ui_router_core`
 - `bevy_ui_router_view`
@@ -34,210 +34,210 @@ Confirmed shape:
 - `bevy_ui_router_bsn`
 - `bevy_ui_router_platform`
 - `bevy_ui_router`
-- examples and test support crates or packages as needed
+- examples 与 test support crate 或 package，按需要添加
 
-Rationale:
+理由：
 
-- Crate boundaries enforce the most important architectural rule: core must not depend on Bevy, BSN, platform APIs, or application-specific concepts.
-- Independent crates make contract tests easier to target.
-- Future renderers, platform adapters, and integration profiles can evolve without rewriting core.
+- crate 边界可以强制执行最重要的架构规则：core 不能依赖 Bevy、BSN、平台 API 或应用特定概念。
+- 独立 crate 更便于针对具体层编写合同测试。
+- 未来 renderer、platform adapter 和 integration profile 可以演进，而不需要重写 core。
 
-Trade-off:
+取舍：
 
-- The workspace has more initial setup than a single crate, and feature coordination must be maintained carefully.
+- 相比单 crate，workspace 初始搭建成本更高，并且需要维护 feature 组合。
 
-### 2. Public Entry Point
+### 2. 对外入口
 
-Keep `bevy_ui_router` as a facade crate.
+保留 `bevy_ui_router` 作为 facade crate。
 
-The facade crate should re-export commonly used APIs from the lower-level crates and use features to control optional integrations.
+facade crate 应 re-export 底层 crate 的常用 API，并通过 feature 控制可选集成。
 
-Recommended default facade surface:
+建议默认 facade surface 包含：
 
-- core routing types
-- view adapter traits and fake/test renderer support
-- ECS integration plugin and host/slot components
+- core 路由类型
+- view adapter trait 与 fake/test renderer 支持
+- ECS integration plugin 与 host/slot component
 
-Recommended opt-in facade features:
+建议 opt-in facade features 包含：
 
 - BSN adapter
 - platform adapter helpers
-- examples or dev-only utilities
+- examples 或仅开发期使用的工具
 
-Rationale:
+理由：
 
-- Users get a simple entry point.
-- Internal crate boundaries remain explicit and testable.
-- Optional integrations can remain feature-gated and avoid pulling unstable or platform-specific dependencies into every build.
+- 用户可以从一个简单入口开始使用。
+- 内部 crate 边界依然明确且可测试。
+- 可选集成可以继续 feature-gate，避免不稳定或平台特定依赖进入所有构建。
 
-### 3. Planning Scope
+### 3. 规划范围
 
-Plan the complete Phase 0-6 roadmap, but make only Phase 0-3 executable in the first detailed implementation plan.
+完整规划 Phase 0-6 路线图，但第一份详细实现计划只把 Phase 0-3 写到可执行粒度。
 
-Phase 0-3 should cover:
+Phase 0-3 覆盖：
 
-- contract freeze
-- route tree and branch model
-- frame state and error boundary
-- view adapter interface and immediate BSN adapter
+- 合同冻结
+- route tree 与 branch model
+- frame state 与 error boundary
+- view adapter interface 与 immediate BSN adapter
 
-Phase 4-6 should remain roadmap-level until the earlier contracts are stable:
+Phase 4-6 在早期合同稳定前保持 roadmap 级别：
 
-- loader, guard, and revalidation
-- cache, modal, and transition runtime
-- asset-driven BSN and dev tools
+- loader、guard 和 revalidation
+- cache、modal 和 transition runtime
+- asset-driven BSN 与 dev tools
 
-Rationale:
+理由：
 
-- The project needs a complete architectural direction, but non-MVP systems should not be implemented or over-specified before the core lifecycle is proven.
+- 项目需要完整的架构方向，但非 MVP 系统不应在 core lifecycle 被证明前就进入实现或过度细化。
 
-### 4. MVP API Style
+### 4. MVP API 风格
 
-Use a builder-first public API for route tree declaration.
+MVP public API 采用 builder-first 的 route tree 声明方式。
 
-MVP should provide a clear hand-written API such as a `RouteTree` or route builder. The underlying data structures should remain directly testable, but users should not need to construct every internal field manually.
+MVP 应提供清晰的手写 API，例如 `RouteTree` 或 route builder。底层数据结构仍需可直接测试，但用户不应被迫手动构造每一个内部字段。
 
-Rationale:
+理由：
 
-- Builder APIs are explicit, testable, and easier to stabilize than macros.
-- The API remains usable before derive macros, codegen, or route DSLs exist.
-- It avoids locking the project into syntax-level decisions too early.
+- Builder API 明确、可测试，比宏更容易稳定。
+- 在 derive macro、codegen 或 route DSL 出现前，API 已经可用。
+- 避免过早把项目锁定在语法层决策上。
 
-Non-MVP:
+MVP 非目标：
 
-- route declaration macros
+- route 声明宏
 - derive-based typed route generation
 - file-system route generation
 
-### 5. Typed Routes And Typed Search
+### 5. Typed Routes 与 Typed Search
 
-Do not include typed route or typed search APIs in the MVP executable scope.
+MVP 可执行范围不包含 typed route 或 typed search public API。
 
-MVP should use:
+MVP 使用：
 
 - raw `RouteLocation`
 - string path segments
-- raw or string-based params and search
-- stable params/search fingerprints for branch comparison
-- extension points for future typed codecs
+- raw 或 string-based params/search
+- 用于 branch comparison 的稳定 params/search fingerprint
+- 面向未来 typed codec 的 extension 点
 
-Typed route/search support moves to Phase 4 or later.
+Typed route/search 支持移动到 Phase 4 或之后。
 
-Rationale:
+理由：
 
-- The first implementation should stabilize matcher, history, reconciliation, frame identity, generation, and diagnostics before introducing schema and generic codec design.
-- Future typed APIs should layer on top of the raw boundary rather than replacing it.
+- 第一轮实现应先稳定 matcher、history、reconciliation、frame identity、generation 和 diagnostics，再引入 schema 与 generic codec 设计。
+- 未来 typed API 应叠加在 raw boundary 之上，而不是替换 raw boundary。
 
-### 6. View Adapter Strategy
+### 6. View Adapter 策略
 
-Use a dual-track view adapter strategy in Phase 0-3.
+Phase 0-3 采用双轨 view adapter 策略。
 
-Track A: fake/test renderer
+轨道 A：fake/test renderer
 
-- Used for contract tests.
-- Must prove lifecycle, branch reconciliation, failure cleanup, diagnostics, and ownership rules without depending on BSN.
+- 用于合同测试。
+- 必须在不依赖 BSN 的情况下证明 lifecycle、branch reconciliation、failure cleanup、diagnostics 和 ownership 规则。
 
-Track B: immediate BSN adapter
+轨道 B：immediate BSN adapter
 
-- Implemented in `bevy_ui_router_bsn`.
-- Feature-gated or independently isolated from core.
-- Targets immediate code-driven BSN scene apply.
-- Validates the real Bevy/BSN integration path without allowing BSN API instability to shape core semantics.
+- 在 `bevy_ui_router_bsn` 中实现。
+- 通过 feature-gate 或独立 crate 与 core 隔离。
+- 目标是支持 immediate code-driven BSN scene apply。
+- 验证真实 Bevy/BSN 集成路径，同时不允许 BSN API 不稳定性塑造 core 语义。
 
-Rationale:
+理由：
 
-- The fake/test renderer gives stable router contract coverage.
-- The BSN adapter exposes real integration risk early.
-- A failure in BSN integration must not require changing core routing semantics.
+- fake/test renderer 提供稳定的 Router 合同覆盖。
+- BSN adapter 提前暴露真实集成风险。
+- BSN 集成失败不应要求改变 core routing semantics。
 
-### 7. Bevy Dependency Strategy
+### 7. Bevy 依赖策略
 
-Keep `bevy_ui_router_core` free of Bevy dependencies.
+`bevy_ui_router_core` 不依赖 Bevy。
 
-Temporarily pin Bevy-dependent crates to the current custom Bevy 0.19 git branch used by the repository:
+暂时让依赖 Bevy 的 crate pin 到当前仓库使用的自定义 Bevy 0.19 git 分支：
 
 - `bevy_ui_router_ecs`
 - `bevy_ui_router_bsn`
-- examples that require Bevy
+- 需要 Bevy 的 examples
 
-The roadmap must explicitly include migration to upstream Bevy 0.19+ or the official BSN API when available.
+路线图必须明确记录：后续迁移到 upstream Bevy 0.19+ 或官方 BSN API。
 
-Rationale:
+理由：
 
-- The project can target the current BSN environment while preventing experimental Bevy dependencies from leaking into core.
-- It keeps a clear path to future reproducible builds and public release constraints.
+- 项目可以贴近当前 BSN 目标环境，同时防止实验性 Bevy 依赖泄漏到 core。
+- 为未来可复现构建和公开发布约束保留清晰路径。
 
-Risk:
+风险：
 
-- CI, external development, and publishability may be affected while Bevy-dependent crates use a custom git dependency.
+- 在 Bevy-dependent crates 使用自定义 git dependency 期间，CI、外部复现和发布能力可能受影响。
 
-### 8. Validation Strategy
+### 8. 验证策略
 
-Use dual-track validation.
+采用双轨验证。
 
-Every Phase 0-3 milestone must include focused contract tests. Phase 3 must additionally provide a neutral minimal nested routes example that exercises both:
+Phase 0-3 的每个 milestone 都必须有聚焦的合同测试。Phase 3 还必须提供一个中性的 minimal nested routes example，覆盖：
 
-- fake/test renderer path
-- immediate BSN adapter path
+- fake/test renderer 路径
+- immediate BSN adapter 路径
 
-Required test emphasis:
+重点测试：
 
-- matcher behavior
-- branch reconciliation and common-prefix retention
-- frame identity and generation
+- matcher 行为
+- branch reconciliation 与 common-prefix retention
+- frame identity 与 generation
 - route-owned subtree cleanup
-- failure cleanup that never touches app-owned host entities
-- error attribution and nearest boundary behavior
+- failure cleanup 不触碰 app-owned host entities
+- error attribution 与 nearest boundary behavior
 - diagnostics snapshots
-- stable ordering that does not rely on undefined Bevy query iteration order
+- 稳定排序，不依赖 Bevy 没有保证的 query iteration order
 
-Rationale:
+理由：
 
-- Tests protect the framework contracts.
-- Examples prove the public API and integration shape are usable.
+- 测试保护框架合同。
+- 示例证明 public API 与集成形态可用。
 
 ---
 
-## Architecture Boundary Summary
+## 架构边界摘要
 
 ### `bevy_ui_router_core`
 
-Owns router semantics only:
+只拥有 Router 语义：
 
 - `RouteLocation`
-- `RouteTree` and builder API
+- `RouteTree` 与 builder API
 - matcher
 - `MatchedBranch`
 - memory history
 - branch diff
-- frame identity and generation
+- frame identity 与 generation
 - frame lifecycle model
 - error taxonomy
 - diagnostics snapshot types
-- extension points for future typed route/search and app profiles
+- 面向未来 typed route/search 与 app profile 的 extension 点
 
-Must not depend on:
+不能依赖：
 
 - Bevy ECS types
 - BSN
 - platform APIs
 - concrete UI widgets
-- app-specific services, permissions, themes, copy, or shell models
+- app-specific services、permissions、themes、copy 或 shell models
 
 ### `bevy_ui_router_view`
 
-Owns renderer-agnostic view contracts:
+拥有 renderer-agnostic view contract：
 
 - view factory contract
-- render plan or view descriptor contract
-- apply result and failure cleanup contract
-- fake/test renderer for contract tests
+- render plan 或 view descriptor contract
+- apply result 与 failure cleanup contract
+- 用于合同测试的 fake/test renderer
 
-It may reference router identities from core but must not own history, matching, or lifecycle authority.
+它可以引用 core 中的 router identity，但不能拥有 history、matching 或 lifecycle authority。
 
 ### `bevy_ui_router_ecs`
 
-Owns Bevy integration:
+拥有 Bevy integration：
 
 - plugin setup
 - schedule sets
@@ -246,45 +246,45 @@ Owns Bevy integration:
 - route-owned frame root markers
 - entity ownership and cleanup
 - hierarchy mutation
-- visibility, pickability, and focus finalization
-- diagnostics publication as Bevy resources or events
+- visibility、pickability 和 focus finalization
+- 以 Bevy resource 或 event 发布 diagnostics
 
-It must not allow adapters to bypass core lifecycle or forge frame identity/generation.
+它不能允许 adapter 绕过 core lifecycle，也不能允许 adapter 伪造 frame identity/generation。
 
 ### `bevy_ui_router_bsn`
 
-Owns BSN rendering integration:
+拥有 BSN rendering integration：
 
 - code-driven BSN route views
 - immediate BSN scene apply
 - scene resolve/apply error mapping
-- cleanup of partially created router-owned output
+- 清理部分创建的 router-owned output
 
-It must not own:
+它不能拥有：
 
 - route matching
 - history
 - branch reconciliation
 - frame lifecycle authority
-- guard, loader, action, revalidation, back, or platform policy
+- guard、loader、action、revalidation、back 或 platform policy
 
 ### `bevy_ui_router_platform`
 
-Owns router-neutral platform boundary types:
+拥有 router-neutral platform boundary types：
 
 - `BackIntent`
 - `BackPolicy`
 - `BackCapabilitySnapshot`
 - location source abstractions
-- router instance targeting for future multi-window or multi-surface integration
+- 面向未来 multi-window 或 multi-surface integration 的 router instance targeting
 
-MVP should keep this crate minimal and avoid concrete platform packages.
+MVP 应保持该 crate 精简，避免接入具体平台 package。
 
 ---
 
-## Data Flow
+## 数据流
 
-The intended lifecycle is:
+预期 lifecycle：
 
 ```text
 RouteLocation
@@ -299,48 +299,48 @@ RouteLocation
   -> diagnostics snapshot
 ```
 
-Rules:
+规则：
 
-- Requested location, matched branch, and active rendered branch remain separate.
-- Pending or partially applied scenes are not active UI.
-- A frame becomes active only after view apply and ECS finalization succeed.
-- Stale async or deferred results must be rejected before producing visible state changes.
-- Failure cleanup is limited to router-owned local state and subtree.
-- App-owned hosts are never destroyed, replaced, or rebuilt by the router.
+- requested location、matched branch 和 active rendered branch 必须分离。
+- pending 或 partial applied scene 不是 active UI。
+- frame 只有在 view apply 与 ECS finalization 成功后才能 active。
+- stale async 或 deferred result 在产生可见状态变化前必须被拒绝。
+- failure cleanup 只限于 router-owned local state 和 subtree。
+- Router 不能销毁、替换或重建 app-owned host。
 
 ---
 
-## Phase Roadmap
+## 阶段路线图
 
 ### Phase 0: Contract Freeze
 
-Purpose:
+目的：
 
-- Convert the highest-risk lifecycle rules into executable contracts before adding renderer complexity.
+- 在加入 renderer 复杂度前，将最高风险的 lifecycle 规则转化为可执行合同。
 
-Executable scope:
+可执行范围：
 
-- workspace and facade structure
+- workspace 与 facade 结构
 - core crate isolation
 - raw `RouteLocation`
-- memory history behavior for `push`, `replace`, and `back`
-- initial frame identity and generation model
-- route-owned versus app-owned boundary tests
+- `push`、`replace`、`back` 的 memory history behavior
+- initial frame identity 与 generation model
+- route-owned 与 app-owned boundary tests
 - diagnostics snapshot shape
 
-Exit criteria:
+退出标准：
 
-- Core compiles without Bevy.
-- Contract tests cover navigation history, frame identity, generation, ownership boundary, and diagnostics basics.
-- No public API requires BSN or app-specific concepts.
+- core 可以在不依赖 Bevy 的情况下编译。
+- 合同测试覆盖 navigation history、frame identity、generation、ownership boundary 和 diagnostics 基础行为。
+- public API 不要求 BSN 或 app-specific concepts。
 
 ### Phase 1: Route Tree And Branch Model
 
-Purpose:
+目的：
 
-- Establish route declaration and matching.
+- 建立 route declaration 与 matching。
 
-Executable scope:
+可执行范围：
 
 - route builder API
 - route ids
@@ -350,80 +350,80 @@ Executable scope:
 - index routes
 - nested routes
 - pathless layouts
-- named slot identity in the model
+- model 中的 named slot identity
 - `MatchedBranch`
 - common-prefix branch diff
 
-Exit criteria:
+退出标准：
 
-- Matcher tests cover static, param, catch-all, index, pathless, not-found, and conflict behavior.
-- Branch diff tests prove common-prefix retention and changed suffix replacement.
-- Matching order is deterministic and does not depend on insertion or query iteration ambiguity unless explicitly defined.
+- Matcher 测试覆盖 static、param、catch-all、index、pathless、not-found 和 conflict behavior。
+- Branch diff 测试证明 common-prefix retention 与 changed suffix replacement。
+- Matching order 是确定的；除非规则明确说明，否则不依赖 insertion ambiguity 或 query iteration ambiguity。
 
 ### Phase 2: Frame State And Error Boundary
 
-Purpose:
+目的：
 
-- Separate location, matched branch, and active rendered branch, then make failure behavior explicit.
+- 分离 location、matched branch 和 active rendered branch，并明确失败行为。
 
-Executable scope:
+可执行范围：
 
 - route frame records
-- minimal statuses for MVP
+- MVP minimal statuses
 - error taxonomy
 - nearest error boundary resolution
 - frame generation increment rules
-- diagnostics for frame state and error attribution
+- frame state 与 error attribution diagnostics
 
-Exit criteria:
+退出标准：
 
-- Failed build/apply paths enter explicit error state.
-- Error boundary behavior replaces only the intended router-owned frame region.
-- App-owned host cleanup is forbidden by tests.
-- Diagnostics identify router, host, slot, frame identity, generation, route id, and error source.
+- Failed build/apply paths 进入明确 error state。
+- Error boundary behavior 只替换目标 router-owned frame region。
+- 测试禁止 app-owned host cleanup。
+- Diagnostics 能识别 router、host、slot、frame identity、generation、route id 和 error source。
 
 ### Phase 3: View Adapter Interface And BSN Adapter
 
-Purpose:
+目的：
 
-- Prove renderer-agnostic application and the first real renderer integration.
+- 证明 renderer-agnostic application 与第一个真实 renderer 集成。
 
-Executable scope:
+可执行范围：
 
 - `bevy_ui_router_view` renderer contract
 - fake/test renderer
-- ECS route host and slot integration
+- ECS route host 与 slot integration
 - frame root markers
 - hierarchy apply and cleanup
-- visibility, pickability, and focus finalization hooks
-- immediate code-driven BSN adapter behind isolated dependency boundary
+- visibility、pickability 和 focus finalization hooks
+- 依赖边界隔离下的 immediate code-driven BSN adapter
 - minimal nested routes example
 
-Exit criteria:
+退出标准：
 
-- Fake renderer tests prove apply success, apply failure cleanup, and active commit ordering.
-- BSN adapter demonstrates immediate scene apply in a neutral example.
-- Frame is not marked active before renderer apply and ECS finalization complete.
-- BSN failures map into route view/apply errors.
+- Fake renderer tests 证明 apply success、apply failure cleanup 和 active commit ordering。
+- BSN adapter 在中性 example 中展示 immediate scene apply。
+- renderer apply 与 ECS finalization 完成前，frame 不能标记为 active。
+- BSN failures 映射为 route view/apply errors。
 
 ### Phase 4: Loader, Guard, And Revalidate
 
-Roadmap scope:
+路线图范围：
 
 - typed params/search exploration
-- sync guard first, pending guard reserved
+- sync guard first，并为 pending guard 预留
 - route-scoped task contract
-- async result identity and stale checks
+- async result identity 与 stale checks
 - loader/action/revalidation dependency model
 - redirect loop detection
 
-Entry condition:
+进入条件：
 
-- Phase 0-3 contracts are stable enough that async results can target clear frame identities and generations.
+- Phase 0-3 合同已经足够稳定，async result 可以指向清晰的 frame identity 与 generation。
 
 ### Phase 5: Cache, Modal, And Transition
 
-Roadmap scope:
+路线图范围：
 
 - route-local serializable state
 - retained entity cache contract
@@ -431,64 +431,64 @@ Roadmap scope:
 - pause/resume lifecycle
 - transition policy
 - back policy composition
-- hidden subtree input isolation and focus release
+- hidden subtree input isolation 与 focus release
 
-Entry condition:
+进入条件：
 
-- Ownership, cleanup, focus, visibility, and pickability finalization are already covered by tests.
+- ownership、cleanup、focus、visibility 和 pickability finalization 已有测试覆盖。
 
 ### Phase 6: Asset-Driven BSN And DevTools
 
-Roadmap scope:
+路线图范围：
 
 - `.bsn` asset route views
 - queued/asset scene lifecycle
-- hot reload by rebuilding view frames while preserving allowed route state
+- hot reload 通过重建 view frame 并保留允许保留的 route state 实现
 - diagnostics overlay
 - navigation trace replay
 
-Entry condition:
+进入条件：
 
-- Immediate BSN adapter is stable and queued scene pending/apply/active boundaries are explicitly modeled.
-
----
-
-## Known Risks
-
-- The custom Bevy 0.19 git dependency may make CI and external reproduction fragile until migration to upstream Bevy or official BSN API is possible.
-- BSN API instability can affect `bevy_ui_router_bsn`, but must not reshape `bevy_ui_router_core`.
-- Builder API design can become too broad if it tries to cover typed routes, macros, profiles, and file routing before the raw route model is stable.
-- Examples can accidentally introduce app-specific assumptions; examples must use neutral page names and generic UI.
-- Retained entity cache, transition, and async loader semantics are important, but implementing them before lifecycle and ownership contracts are stable would increase risk.
+- Immediate BSN adapter 稳定，并且 queued scene pending/apply/active boundary 已经显式建模。
 
 ---
 
-## Non-Goals For MVP
+## 已知风险
+
+- 自定义 Bevy 0.19 git dependency 可能让 CI 和外部复现变脆弱，直到可以迁移到 upstream Bevy 或官方 BSN API。
+- BSN API 不稳定可能影响 `bevy_ui_router_bsn`，但不能重塑 `bevy_ui_router_core`。
+- 如果 Builder API 在 raw route model 稳定前试图覆盖 typed routes、macros、profiles 和 file routing，会变得过宽。
+- Examples 可能无意中引入 app-specific assumptions；示例必须使用中性页面名和通用 UI。
+- Retained entity cache、transition 和 async loader semantics 都很重要，但在 lifecycle 与 ownership contracts 稳定前实现它们会增加风险。
+
+---
+
+## MVP 非目标
 
 - typed route/search public API
-- derive macros or route DSL macros
+- derive macros 或 route DSL macros
 - async loader/action/revalidation implementation
 - pending async guard implementation
 - retained entity cache implementation
 - transition animation runtime
 - file-based BSN route scenes
 - hot reload
-- platform-specific back or deep-link packages
+- platform-specific back 或 deep-link packages
 - app-specific integration profiles
-- business-specific metadata, permissions, services, copy, themes, or shell policies
+- business-specific metadata、permissions、services、copy、themes 或 shell policies
 
 ---
 
-## Review Notes
+## 审阅说明
 
-This document records decisions already confirmed during planning. It intentionally leaves detailed task steps to a later implementation plan.
+本文记录准备阶段已经确认的决策。详细任务步骤会留到后续 implementation plan。
 
-Before moving to implementation planning, review whether the confirmed decisions still match the intended project direction:
+进入实现计划前，应确认这些决策仍符合项目方向：
 
-- multi-crate workspace with facade crate
-- Phase 0-6 roadmap with Phase 0-3 executable detail
+- multi-crate workspace 搭配 facade crate
+- Phase 0-6 路线图，并将 Phase 0-3 写到可执行粒度
 - builder-first MVP API
-- raw route/search in MVP
-- fake renderer plus BSN adapter dual track
-- Bevy dependency isolated to ECS/BSN crates
-- dual-track validation through tests and neutral examples
+- MVP 使用 raw route/search
+- fake renderer 与 BSN adapter 双轨推进
+- Bevy 依赖隔离在 ECS/BSN crates
+- 通过测试和中性示例进行双轨验证
