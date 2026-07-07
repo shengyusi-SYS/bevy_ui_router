@@ -30,6 +30,6 @@ pub mod prelude {
     pub use crate::meta::{ErrorBoundaryKey, RouteExplicitKey, RouteMeta};
     pub use crate::ownership::{CleanupScope, OwnedRegion};
     pub use crate::pattern::{RoutePathSegment, RoutePattern, RoutePatternKind};
-    pub use crate::route_tree::{RouteTree, RouteTreeBuilder};
+    pub use crate::route_tree::{RouteNodeOptions, RouteTree, RouteTreeBuilder};
     pub use crate::slot::RouteSlotKey;
 }

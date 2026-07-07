@@ -8,13 +8,77 @@ use std::{collections::BTreeMap, fmt};
 
 use crate::error::RouteError;
 use crate::ids::RouteId;
+use crate::meta::{ErrorBoundaryKey, RouteExplicitKey, RouteMeta};
 use crate::pattern::RoutePattern;
+use crate::slot::RouteSlotKey;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteNodeOptions {
+    slot: RouteSlotKey,
+    explicit_key: Option<RouteExplicitKey>,
+    error_boundary: Option<ErrorBoundaryKey>,
+    meta: RouteMeta,
+}
+
+impl RouteNodeOptions {
+    pub fn new() -> Self {
+        Self {
+            slot: RouteSlotKey::default(),
+            explicit_key: None,
+            error_boundary: None,
+            meta: RouteMeta::new(),
+        }
+    }
+
+    pub fn with_slot(mut self, slot: RouteSlotKey) -> Self {
+        self.slot = slot;
+        self
+    }
+
+    pub fn with_explicit_key(mut self, key: RouteExplicitKey) -> Self {
+        self.explicit_key = Some(key);
+        self
+    }
+
+    pub fn with_error_boundary(mut self, key: ErrorBoundaryKey) -> Self {
+        self.error_boundary = Some(key);
+        self
+    }
+
+    pub fn with_meta(mut self, meta: RouteMeta) -> Self {
+        self.meta = meta;
+        self
+    }
+
+    pub const fn slot(&self) -> &RouteSlotKey {
+        &self.slot
+    }
+
+    pub const fn explicit_key(&self) -> Option<&RouteExplicitKey> {
+        self.explicit_key.as_ref()
+    }
+
+    pub const fn error_boundary(&self) -> Option<&ErrorBoundaryKey> {
+        self.error_boundary.as_ref()
+    }
+
+    pub const fn meta(&self) -> &RouteMeta {
+        &self.meta
+    }
+}
+
+impl Default for RouteNodeOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Clone)]
 pub struct RouteNode {
     id: RouteId,
     parent: Option<RouteId>,
     pattern: RoutePattern,
+    options: RouteNodeOptions,
     declaration_index: usize,
     children: Vec<RouteId>,
 }
@@ -41,6 +105,10 @@ impl RouteNode {
 
     pub const fn pattern(&self) -> &RoutePattern {
         &self.pattern
+    }
+
+    pub const fn options(&self) -> &RouteNodeOptions {
+        &self.options
     }
 
     #[allow(dead_code)]
@@ -118,7 +186,7 @@ impl RouteTreeBuilder {
         }
 
         let id = self.allocate_id();
-        let node = self.node(id, None, pattern);
+        let node = self.node(id, None, pattern, RouteNodeOptions::new());
         self.root = Some(id);
         self.nodes.insert(id, node);
         Ok(self)
@@ -128,13 +196,31 @@ impl RouteTreeBuilder {
         self.root
     }
 
+    pub fn route_with_options(
+        &mut self,
+        parent: RouteId,
+        pattern: RoutePattern,
+        options: RouteNodeOptions,
+    ) -> Result<RouteId, RouteError> {
+        self.route_inner(parent, pattern, options)
+    }
+
     pub fn route(&mut self, parent: RouteId, pattern: RoutePattern) -> Result<RouteId, RouteError> {
+        self.route_inner(parent, pattern, RouteNodeOptions::new())
+    }
+
+    fn route_inner(
+        &mut self,
+        parent: RouteId,
+        pattern: RoutePattern,
+        options: RouteNodeOptions,
+    ) -> Result<RouteId, RouteError> {
         if !self.nodes.contains_key(&parent) {
             return Err(invalid_tree("route parent does not exist"));
         }
 
         let id = self.allocate_id();
-        let node = self.node(id, Some(parent), pattern);
+        let node = self.node(id, Some(parent), pattern, options);
         self.nodes.insert(id, node);
         self.nodes.get_mut(&parent).unwrap().children.push(id);
         Ok(id)
@@ -156,13 +242,20 @@ impl RouteTreeBuilder {
         id
     }
 
-    fn node(&mut self, id: RouteId, parent: Option<RouteId>, pattern: RoutePattern) -> RouteNode {
+    fn node(
+        &mut self,
+        id: RouteId,
+        parent: Option<RouteId>,
+        pattern: RoutePattern,
+        options: RouteNodeOptions,
+    ) -> RouteNode {
         let declaration_index = self.next_declaration_index;
         self.next_declaration_index += 1;
         RouteNode {
             id,
             parent,
             pattern,
+            options,
             declaration_index,
             children: Vec::new(),
         }
@@ -178,7 +271,9 @@ mod tests {
     use super::*;
     use crate::error::{RouteErrorKind, RouteErrorSourceCategory};
     use crate::ids::RouteId;
+    use crate::meta::{ErrorBoundaryKey, RouteExplicitKey, RouteMeta};
     use crate::pattern::RoutePattern;
+    use crate::slot::RouteSlotKey;
 
     #[test]
     fn builder_allocates_stable_route_ids_in_declaration_order() {
@@ -266,5 +361,55 @@ mod tests {
             assert!(!output.contains("declaration_index"));
             assert!(!output.contains("next_declaration_index"));
         }
+    }
+
+    #[test]
+    fn route_options_attach_slot_key_boundary_and_meta_to_nodes() {
+        let mut builder = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let options = RouteNodeOptions::new()
+            .with_slot(RouteSlotKey::named("details").unwrap())
+            .with_explicit_key(RouteExplicitKey::new("detail-v1").unwrap())
+            .with_error_boundary(ErrorBoundaryKey::named("detail-boundary").unwrap())
+            .with_meta(RouteMeta::new().with_diagnostic_label("detail").unwrap());
+
+        let detail = builder
+            .route_with_options(root, RoutePattern::path("details/:id").unwrap(), options)
+            .unwrap();
+        let tree = builder.build().unwrap();
+        let node = tree.node(detail).unwrap();
+
+        assert_eq!(node.options().slot().as_str(), "details");
+        assert_eq!(
+            node.options().explicit_key().map(RouteExplicitKey::as_str),
+            Some("detail-v1")
+        );
+        assert_eq!(
+            node.options()
+                .error_boundary()
+                .map(ErrorBoundaryKey::as_str),
+            Some("detail-boundary")
+        );
+        assert_eq!(node.options().meta().diagnostic_label(), Some("detail"));
+    }
+
+    #[test]
+    fn route_without_options_uses_default_slot_and_empty_meta() {
+        let mut builder = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let child = builder
+            .route(root, RoutePattern::path("settings").unwrap())
+            .unwrap();
+        let tree = builder.build().unwrap();
+        let node = tree.node(child).unwrap();
+
+        assert!(node.options().slot().is_default());
+        assert!(node.options().explicit_key().is_none());
+        assert!(node.options().error_boundary().is_none());
+        assert!(node.options().meta().diagnostic_label().is_none());
     }
 }
