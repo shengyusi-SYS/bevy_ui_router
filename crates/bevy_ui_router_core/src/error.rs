@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteErrorKind {
     InvalidRoutePattern,
+    InvalidRouteDeclaration,
     InvalidRouteTree,
     NotFound,
     MatchConflict,
@@ -47,6 +48,14 @@ impl RouteError {
     pub fn invalid_route_pattern(redacted_message: impl Into<String>) -> Self {
         Self::new(
             RouteErrorKind::InvalidRoutePattern,
+            RouteErrorSourceCategory::RouterCore,
+            redacted_message,
+        )
+    }
+
+    pub(crate) fn invalid_route_declaration(redacted_message: impl Into<String>) -> Self {
+        Self::new(
+            RouteErrorKind::InvalidRouteDeclaration,
             RouteErrorSourceCategory::RouterCore,
             redacted_message,
         )
