@@ -8,11 +8,11 @@
 
 **Tech Stack:** Rust 2024, workspace crates, zero runtime dependencies for `bevy_ui_router_core`, existing Cargo test and dependency-boundary checks.
 
-**Current Repository Status:** Blocked future plan. As of commit `f3b3663 docs: plan phase 1a route matcher`, Phase 1A is planned but not implemented in the current repository. Do not execute Phase 1B tasks until Phase 1A implementation files and verification evidence exist.
+**Current Repository Status:** Phase 1A is implemented, reviewed, and verified as of `8fc476a docs: record phase 1a matcher verification`. Phase 1B remains pending until this refreshed plan passes review and the user explicitly authorizes implementation.
 
 ## Global Constraints
 
-- Phase 1B can execute only after Phase 1A implementation is complete, reviewed, committed, and verified.
+- Phase 1B can execute only after Phase 1A implementation is complete, reviewed, committed, and verified; current evidence is recorded in `docs/superpowers/plans/2026-07-07-phase-1a-route-model-matcher-contract-plan.md`.
 - If Phase 1A implemented names or semantics differ from `docs/superpowers/plans/2026-07-07-phase-1a-route-model-matcher-contract-plan.md`, stop and revise this plan before implementation.
 - Router core remains renderer-agnostic and must not depend on Bevy ECS, BSN, platform APIs, application services, themes, permissions, data services, or application shell models.
 - Phase 1B must not implement transaction runtime, async resolve/apply, frame lifecycle mutation, retained subtree behavior, focus behavior, ECS host/slot behavior, or BSN view application.
@@ -27,10 +27,13 @@
 - Diagnostic labels, route metadata, and error-boundary declaration candidates must not participate in segment reuse keys.
 - Branch diff must fail closed when old and new branches come from different route-tree provenance.
 - Matching and diff ordering must be deterministic and must not depend on Bevy query iteration order, filesystem order, hash iteration order, or accidental child insertion order beyond explicit route declaration order encoded by core.
+- Route tree public `Debug`, `Eq`, and `PartialEq` behavior must not expose or make observable internal matcher inputs such as `children`, `declaration_index`, or provenance.
 - The core manifest must keep dependency sections empty.
 - Public API additions must be exported through `bevy_ui_router_core::prelude` only when they are stable Phase 1B contract surface.
+- `lib.rs` and `prelude` snippets in tasks are additive examples unless a step explicitly says to remove or replace an existing export. Preserve existing Phase 0 / Phase 1A prelude exports while adding Phase 1B entries.
 - Coverage and boundary-verification steps are not RED steps unless explicitly labeled RED. They may pass immediately when earlier tasks already implemented the behavior.
 - Every filtered `cargo test` command in this plan is invalid evidence if it exits 0 with `running 0 tests`.
+- Any test intended to be run with a `module::tests::test_name` filter must be inserted inside that module's existing `#[cfg(test)] mod tests` block, or the command in the plan must be updated to match the actual test path before it can be used as evidence.
 
 ---
 
@@ -38,7 +41,7 @@
 
 Before executing this plan, verify:
 
-- Phase 1A implementation commit exists.
+- Phase 1A implementation and review-fix commits exist, ending with `8fc476a docs: record phase 1a matcher verification` or a later commit that preserves the same evidence.
 - The worktree is clean.
 - `crates/bevy_ui_router_core/src/pattern.rs` exists.
 - `crates/bevy_ui_router_core/src/branch.rs` exists.
@@ -59,6 +62,8 @@ Test-Path crates\bevy_ui_router_core\src\matcher.rs
 Expected: `git status --short` prints nothing, and every `Test-Path` command prints `True`.
 
 If any precondition fails, do not execute Phase 1B. Return to Phase 1A implementation or revise this plan.
+
+As of this plan refresh, the expected Phase 1A source files exist and the repository has Phase 1A verification evidence. Task 0 remains mandatory at execution time because the working tree and source state can change after planning.
 
 ---
 
@@ -119,7 +124,7 @@ Phase 1B intentionally does not include:
 
 ## 4. Public Contract
 
-Phase 1B should leave these stable shapes available through `bevy_ui_router_core::prelude` unless a review explicitly narrows the surface:
+Phase 1B should leave these stable shapes available as public module APIs unless noted otherwise. Keep the default prelude smaller than the full module surface: prelude exports are for route declaration authoring and high-level branch diff use, not for every internal handoff/debug wrapper.
 
 ```rust
 pub struct RouteSlotKey;
@@ -254,6 +259,21 @@ impl BranchPlanningDiagnostic {
 
 Public constructors for fingerprints remain core-internal. External code may read fingerprint strings for diagnostics and tests, but cannot construct a fake matched branch fingerprint through the public API. `RouteBranchProvenance` remains core-internal and is externally observable only through `BranchDiff::provenance_changed()`.
 
+### 4.1 Prelude Surface Policy
+
+Phase 1B prelude additions are limited to:
+
+```rust
+pub mod prelude {
+    pub use crate::branch_diff::BranchDiff;
+    pub use crate::meta::{ErrorBoundaryKey, RouteExplicitKey, RouteMeta};
+    pub use crate::route_tree::RouteNodeOptions;
+    pub use crate::slot::RouteSlotKey;
+}
+```
+
+Do not add `RouteParamsFingerprint`, `RouteSearchFingerprint`, `RouteSegmentReuseKey`, `RouteBranchFingerprint`, `BranchDiffRoute`, `BranchPlanningDiagnostic`, or `RouteBranchProvenance` to the prelude in Phase 1B. They remain public module APIs where explicitly public, or core-internal where marked `pub(crate)`. This keeps branch-planning handoff/debug data from becoming the default app-facing lifecycle surface.
+
 ---
 
 ## 5. Semantics
@@ -300,7 +320,9 @@ Phase 1B freezes this raw search policy:
 
 - `RouteBranchProvenance` is a core-internal source identity allocated by the `RouteTree` / `RouteMatcher` source that produced a `MatchedBranch`.
 - It is not a structural fingerprint. Two independently built route trees must have different provenance even when they have identical routes, ids, slots, keys, params, metadata, and resulting fingerprint strings, unless a future reviewed route-tree update path explicitly preserves provenance.
+- Phase 1B allocates provenance in `RouteTreeBuilder::build()` using a core-internal monotonic source id. `RouteTree::clone()` and `RouteMatcher::clone()` preserve the same source identity; independent `build()` calls must produce different source identities.
 - `RouteBranchProvenance` type, constructors, string/debug access, and matched-branch accessor remain core-internal. It is not exported through `prelude`.
+- `RouteBranchProvenance` is not a `RouteFrameId`, not a `RouteGeneration`, not a stale-result token, and not adapter-forgeable runtime authority.
 - Two branches with different provenance must not share a common prefix, even if their route ids and reuse keys have the same raw values.
 - This avoids treating tree-local `RouteId` values as globally stable identities.
 
@@ -354,8 +376,10 @@ Phase 1B freezes this raw search policy:
 | Search change | `branch_diff::tests::search_change_fails_closed_by_raw_search_policy` | `cargo test -p bevy_ui_router_core branch_diff::tests::search_change_fails_closed_by_raw_search_policy -- --nocapture` | Search changes fully replace by default |
 | Fragment-only change | `branch_diff::tests::fragment_only_change_does_not_change_search_or_branch_diff` | `cargo test -p bevy_ui_router_core branch_diff::tests::fragment_only_change_does_not_change_search_or_branch_diff -- --nocapture` | Fragment changes do not change search fingerprint, branch fingerprint, or diff suffixes |
 | Nearest error-boundary metadata | `matcher::tests::nearest_error_boundary_uses_matched_ancestor_chain_only` | `cargo test -p bevy_ui_router_core matcher::tests::nearest_error_boundary_uses_matched_ancestor_chain_only -- --nocapture` | Nearest matched ancestor boundary is returned; off-branch routes return none |
-| Constructor authority boundaries | core doctests | `cargo test -p bevy_ui_router_core --doc` | Nonzero doctest evidence; external construction of fingerprints, matched routes, and matched branches fails to compile; provenance is not exposed through public API |
-| Public read-only contract exports | `facade_prelude_exposes_branch_planning_contracts` | `cargo test -p bevy_ui_router --no-default-features facade_prelude_exposes_branch_planning_contracts -- --nocapture` | Positive external naming/import coverage for stable read-only contract types |
+| Branch-planning diagnostics | `diagnostics::tests::branch_planning_event_has_no_active_identity` | `cargo test -p bevy_ui_router_core diagnostics::tests::branch_planning_event_has_no_active_identity -- --nocapture` | Structured payload is present, `identity().is_none()`, redacted message is fixed, and no frame/generation text leaks |
+| Non-prelude module exports | `public_api::non_prelude_branch_planning_support_types_are_public_module_api` | `cargo test -p bevy_ui_router_core --test public_api non_prelude_branch_planning_support_types_are_public_module_api -- --nocapture` | External integration test names fingerprint wrappers, `BranchDiffRoute`, and `diagnostics::BranchPlanningDiagnostic` through module paths without relying on prelude |
+| Constructor and comparable-trait authority boundaries | core doctests | `cargo test -p bevy_ui_router_core --doc` | Nonzero doctest evidence; external construction of fingerprints, matched routes, and matched branches fails to compile; provenance is not exposed through public API; route-tree internals do not gain public `PartialEq` comparability |
+| Default prelude/facade contract exports | `facade_prelude_exposes_branch_planning_contracts` | `cargo test -p bevy_ui_router --no-default-features facade_prelude_exposes_branch_planning_contracts -- --nocapture` | Positive external naming/import coverage for app-facing default prelude types; non-prelude branch planning support types are covered by public module-path integration tests |
 | Core dependency boundary | `dependency_boundary` integration tests | `cargo test -p bevy_ui_router_core --test dependency_boundary -- --nocapture` | Core manifest remains dependency-free |
 
 Every command in this table is invalid evidence if it exits 0 with `running 0 tests`.
@@ -398,7 +422,7 @@ Expected: status prints nothing and every `Test-Path` prints `True`.
 Run:
 
 ```powershell
-git log --oneline -5
+git log --oneline -12
 rg -n "pub struct RoutePattern|pub struct RouteTree|pub struct MatchedBranch|pub struct RouteMatcher" crates\bevy_ui_router_core\src
 cargo test -p bevy_ui_router_core pattern::tests -- --nocapture
 cargo test -p bevy_ui_router_core route_tree::tests -- --nocapture
@@ -406,7 +430,7 @@ cargo test -p bevy_ui_router_core matcher::tests -- --nocapture
 cargo test -p bevy_ui_router_core branch::tests -- --nocapture
 ```
 
-Expected: Phase 1A implementation evidence is present in source files, not only in planning docs. Each filtered test command reports nonzero tests and passes. If Phase 1A has not been implemented and verified, or any command exits 0 with `running 0 tests`, stop and report that Phase 1B is blocked.
+Expected: Phase 1A implementation evidence is present in source files, not only in planning docs. The log includes Phase 1A implementation, review-fix, and verification commits such as `dcd2837`, `b6d5c96`, and `8fc476a` or later equivalent commits. Each filtered test command reports nonzero tests and passes. If Phase 1A has not been implemented and verified, or any command exits 0 with `running 0 tests`, stop and report that Phase 1B is blocked.
 
 - [ ] **Step 3: Commit**
 
@@ -695,7 +719,7 @@ git commit -m "feat(core): add route declaration planning keys"
 
 - [ ] **Step 1: Add RED route option tests**
 
-Add tests to `crates/bevy_ui_router_core/src/route_tree.rs`:
+Add tests inside the existing `#[cfg(test)] mod tests` block in `crates/bevy_ui_router_core/src/route_tree.rs`:
 
 ```rust
 use crate::meta::{ErrorBoundaryKey, RouteExplicitKey, RouteMeta};
@@ -831,6 +855,12 @@ impl RouteNode {
     }
 }
 ```
+
+Preserve the Phase 1A route-tree debug/equality boundary:
+
+- Do not reintroduce derived `Eq` or `PartialEq` on `RouteNode`, `RouteTree`, `RouteTreeBuilder`, or `RouteMatcher`.
+- Keep manual `Debug` implementations for route tree types.
+- If `RouteNode` debug output includes options, it must still omit `children`, `declaration_index`, and any future provenance internals.
 
 Extend builder:
 
@@ -1135,26 +1165,31 @@ impl RouteBranchFingerprint {
 pub(crate) struct RouteBranchProvenance(String);
 
 impl RouteBranchProvenance {
-    pub(crate) fn new(raw: String) -> Self {
-        Self(raw)
+    pub(crate) fn next_tree_source() -> Self {
+        static NEXT_TREE_SOURCE: AtomicU64 = AtomicU64::new(1);
+        let raw = NEXT_TREE_SOURCE.fetch_add(1, Ordering::Relaxed);
+        Self(format!("tree:{raw}"))
     }
 }
 ```
 
+Add the required imports to `fingerprint.rs`:
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+```
+
 Keep provenance type, debug/string access, and constructors `pub(crate)` so external crates cannot name, inspect, or forge core source identity. Public fingerprint constructors also remain `pub(crate)` so external crates cannot forge core-produced fingerprints.
 
-- [ ] **Step 3: Export fingerprint read types**
+- [ ] **Step 3: Expose fingerprint modules without prelude exports**
 
 Modify `crates/bevy_ui_router_core/src/lib.rs`:
 
 ```rust
-pub mod prelude {
-    pub use crate::fingerprint::{
-        RouteBranchFingerprint, RouteParamsFingerprint, RouteSearchFingerprint,
-        RouteSegmentReuseKey,
-    };
-}
+pub mod fingerprint;
 ```
+
+Do not export fingerprint wrappers through `bevy_ui_router_core::prelude` in Phase 1B. They are public read-only module APIs for diagnostics/tests, not default app-facing lifecycle surface.
 
 - [ ] **Step 4: Run tests**
 
@@ -1172,6 +1207,7 @@ git commit -m "feat(core): add raw branch fingerprints"
 ### Task 4: Matched Branch Planning Metadata
 
 **Files:**
+- Modify: `crates/bevy_ui_router_core/src/route_tree.rs`
 - Modify: `crates/bevy_ui_router_core/src/branch.rs`
 - Modify: `crates/bevy_ui_router_core/src/matcher.rs`
 
@@ -1181,7 +1217,34 @@ git commit -m "feat(core): add raw branch fingerprints"
 
 - [ ] **Step 1: Add RED matched branch planning tests**
 
-Add tests to `crates/bevy_ui_router_core/src/matcher.rs`:
+Add this test inside the existing `#[cfg(test)] mod tests` block in `crates/bevy_ui_router_core/src/route_tree.rs`:
+
+```rust
+#[test]
+fn route_tree_provenance_is_internal_stable_for_clones_and_distinct_for_builds() {
+    let tree = RouteTree::builder()
+        .root(RoutePattern::path("/").unwrap())
+        .unwrap()
+        .build()
+        .unwrap();
+    let cloned = tree.clone();
+    let other = RouteTree::builder()
+        .root(RoutePattern::path("/").unwrap())
+        .unwrap()
+        .build()
+        .unwrap();
+
+    assert!(tree.provenance() == cloned.provenance());
+    assert!(tree.provenance() != other.provenance());
+
+    for output in [format!("{:?}", tree), format!("{:?}", cloned), format!("{:?}", other)] {
+        assert!(!output.contains("provenance"));
+        assert!(!output.contains("RouteBranchProvenance"));
+    }
+}
+```
+
+Add tests inside the existing `#[cfg(test)] mod tests` block in `crates/bevy_ui_router_core/src/matcher.rs`:
 
 ```rust
 use crate::branch::MatchedBranch;
@@ -1296,6 +1359,8 @@ Run: `cargo test -p bevy_ui_router_core matcher::tests::matched_branch_fingerpri
 
 Run: `cargo test -p bevy_ui_router_core matcher::tests::metadata_and_error_boundaries_do_not_change_reuse_or_branch_fingerprints -- --nocapture`
 
+Run: `cargo test -p bevy_ui_router_core route_tree::tests::route_tree_provenance_is_internal_stable_for_clones_and_distinct_for_builds -- --nocapture`
+
 Expected: compile failure or test failure because matched branch planning fields are not implemented. If any command exits 0 with `running 0 tests`, the RED step is invalid.
 
 - [ ] **Step 2: Extend matched route and branch data**
@@ -1327,6 +1392,7 @@ Add accessors listed in Section 4. Keep constructors `pub(crate)` and update tes
 Extend `MatchedBranch`:
 
 ```rust
+#[derive(Clone)]
 pub struct MatchedBranch {
     routes: Vec<MatchedRoute>,
     provenance: RouteBranchProvenance,
@@ -1337,13 +1403,27 @@ pub struct MatchedBranch {
 
 Add a `pub(crate)` `provenance` accessor for internal diff comparison, plus public `search_fingerprint`, `branch_fingerprint`, and `nearest_error_boundary_for` accessors.
 
-- [ ] **Step 3: Populate metadata from matcher**
+Do not derive `Debug`, `Eq`, or `PartialEq` for `MatchedBranch` after adding provenance. If `Debug` is needed, hand-write it and omit `provenance`. `BranchDiff::compare` is the public branch comparison contract; `MatchedBranch` equality must not become lifecycle or provenance authority.
+
+- [ ] **Step 3: Add route-tree provenance storage**
+
+Modify `crates/bevy_ui_router_core/src/route_tree.rs`:
+
+- Add `provenance: RouteBranchProvenance` to `RouteTree`.
+- Set it in `RouteTreeBuilder::build()` with `RouteBranchProvenance::next_tree_source()`.
+- Add `pub(crate) fn provenance(&self) -> &RouteBranchProvenance`.
+- Preserve `RouteTree::clone()` semantics so clones keep the same provenance.
+- Keep manual `Debug` output free of `provenance`, `RouteBranchProvenance`, `children`, and `declaration_index`.
+
+Do not store provenance in `RouteMatcher` separately. `RouteMatcher` reads it from its owned `RouteTree`.
+
+- [ ] **Step 4: Populate metadata from matcher**
 
 Modify `crates/bevy_ui_router_core/src/matcher.rs` so each `MatchedRoute` copies planning data from the matched `RouteNodeOptions`.
 
 When building a `MatchedBranch`:
 
-1. Compute one `RouteBranchProvenance` from the core-internal matcher source identity. This is an opaque source identity, not a structural fingerprint of the route tree.
+1. Copy one `RouteBranchProvenance` from `self.tree.provenance().clone()`. This is an opaque source identity, not a structural fingerprint of the route tree.
 2. Compute `RouteSearchFingerprint::from_location(location)` once.
 3. Compute each `RouteParamsFingerprint::from_route_params(route_id, params)`.
 4. Compute each `RouteSegmentReuseKey` from route id, slot key, explicit key, and params fingerprint only.
@@ -1352,7 +1432,7 @@ When building a `MatchedBranch`:
 
 Use typed length-prefixed fields for every dynamic component. Separator-only strings are not valid because route params, explicit keys, and search strings may contain separator-like characters.
 
-- [ ] **Step 4: Run focused tests**
+- [ ] **Step 5: Run focused tests**
 
 Run: `cargo test -p bevy_ui_router_core matcher::tests -- --nocapture`
 
@@ -1366,10 +1446,10 @@ Run: `cargo test -p bevy_ui_router_core fingerprint::tests -- --nocapture`
 
 Expected: fingerprint tests pass.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add crates/bevy_ui_router_core/src/branch.rs crates/bevy_ui_router_core/src/matcher.rs
+git add crates/bevy_ui_router_core/src/route_tree.rs crates/bevy_ui_router_core/src/branch.rs crates/bevy_ui_router_core/src/matcher.rs
 git commit -m "feat(core): enrich matched branch planning data"
 ```
 
@@ -1710,7 +1790,7 @@ fn reusable_segment(old: &MatchedRoute, new: &MatchedRoute) -> bool {
 }
 ```
 
-- [ ] **Step 4: Export branch diff types**
+- [ ] **Step 4: Export branch diff module and default prelude type**
 
 Modify `crates/bevy_ui_router_core/src/lib.rs`:
 
@@ -1718,9 +1798,11 @@ Modify `crates/bevy_ui_router_core/src/lib.rs`:
 pub mod branch_diff;
 
 pub mod prelude {
-    pub use crate::branch_diff::{BranchDiff, BranchDiffRoute};
+    pub use crate::branch_diff::BranchDiff;
 }
 ```
+
+Keep `BranchDiffRoute` available through `bevy_ui_router_core::branch_diff::BranchDiffRoute`, not through the prelude.
 
 - [ ] **Step 5: Run branch diff tests**
 
@@ -1747,7 +1829,7 @@ git commit -m "feat(core): add branch diff contract"
 
 - [ ] **Step 1: Add search-change fixture**
 
-Add this test to `crates/bevy_ui_router_core/src/branch_diff.rs`:
+Add this test inside the existing `#[cfg(test)] mod tests` block in `crates/bevy_ui_router_core/src/branch_diff.rs`:
 
 ```rust
 #[test]
@@ -1780,7 +1862,7 @@ Expected: test passes if Task 5 already implemented search tracking and search-c
 
 - [ ] **Step 2: Add fragment-only branch fixture**
 
-Add this test to `crates/bevy_ui_router_core/src/branch_diff.rs`:
+Add this test inside the existing `#[cfg(test)] mod tests` block in `crates/bevy_ui_router_core/src/branch_diff.rs`:
 
 ```rust
 #[test]
@@ -1818,7 +1900,7 @@ Expected: test passes if fragment exclusion is propagated through matched-branch
 
 - [ ] **Step 3: Add nearest error-boundary fixture**
 
-Add this test to `crates/bevy_ui_router_core/src/matcher.rs`:
+Add this test inside the existing `#[cfg(test)] mod tests` block in `crates/bevy_ui_router_core/src/matcher.rs`:
 
 ```rust
 use crate::ids::RouteId;
@@ -1923,7 +2005,9 @@ git commit -m "test(core): cover branch planning boundaries"
 - Modify: `crates/bevy_ui_router_core/src/diagnostics.rs`
 - Modify: `crates/bevy_ui_router_core/src/fingerprint.rs`
 - Modify: `crates/bevy_ui_router_core/src/branch.rs`
-- Modify: `crates/bevy_ui_router_core/src/lib.rs`
+- Modify: `crates/bevy_ui_router_core/src/branch_diff.rs`
+- Modify: `crates/bevy_ui_router_core/src/route_tree.rs`
+- Create: `crates/bevy_ui_router_core/tests/public_api.rs`
 - Modify: `crates/bevy_ui_router/tests/facade_features.rs`
 
 **Interfaces:**
@@ -1932,7 +2016,7 @@ git commit -m "test(core): cover branch planning boundaries"
 
 - [ ] **Step 1: Add RED diagnostics tests**
 
-Add this test to `crates/bevy_ui_router_core/src/diagnostics.rs`:
+Add this test inside the existing `#[cfg(test)] mod tests` block in `crates/bevy_ui_router_core/src/diagnostics.rs`:
 
 ```rust
 #[test]
@@ -2051,23 +2135,45 @@ impl DiagnosticEvent {
 
 Existing diagnostic constructors must set `branch_planning: None`. Phase 1B must not add a free-form public constructor that lets callers smuggle frame, generation, host, cleanup, resolve/apply, or adapter semantics into a `BranchPlanned` diagnostic.
 
-- [ ] **Step 3: Export diagnostic payload and add public boundary doctests**
+- [ ] **Step 3: Add external module-path positive boundary test**
 
-Modify `crates/bevy_ui_router_core/src/lib.rs`:
+Create `crates/bevy_ui_router_core/tests/public_api.rs`:
 
 ```rust
-pub mod prelude {
-    pub use crate::diagnostics::BranchPlanningDiagnostic;
+#[test]
+fn non_prelude_branch_planning_support_types_are_public_module_api() {
+    use bevy_ui_router_core::branch_diff::BranchDiffRoute;
+    use bevy_ui_router_core::diagnostics::BranchPlanningDiagnostic;
+    use bevy_ui_router_core::fingerprint::{
+        RouteBranchFingerprint, RouteParamsFingerprint, RouteSearchFingerprint,
+        RouteSegmentReuseKey,
+    };
+
+    let diagnostic = BranchPlanningDiagnostic::new(0, 0, 0, false, false, false);
+    assert_eq!(diagnostic.common_prefix_len(), 0);
+
+    fn assert_public<T>() {}
+    assert_public::<BranchDiffRoute>();
+    assert_public::<RouteBranchFingerprint>();
+    assert_public::<RouteParamsFingerprint>();
+    assert_public::<RouteSearchFingerprint>();
+    assert_public::<RouteSegmentReuseKey>();
 }
 ```
 
-Do not add or restate `DiagnosticIdentity`, `DiagnosticSnapshot`, `DiagnosticEvent`, or `DiagnosticEventKind` as Phase 1B export work. Preserve their existing exports and derives from earlier phases.
+Run: `cargo test -p bevy_ui_router_core --test public_api non_prelude_branch_planning_support_types_are_public_module_api -- --nocapture`
+
+Expected: the test passes and reports one nonzero integration test. If it fails because a type is not public through its module path, fix the module export rather than adding the type to prelude.
+
+- [ ] **Step 4: Add public boundary doctests**
+
+Do not modify `crates/bevy_ui_router_core/src/lib.rs` for `BranchPlanningDiagnostic` unless implementation-time inspection proves `pub mod diagnostics;` is absent. Current Phase 1A exposes the diagnostics module, so `BranchPlanningDiagnostic` is named through `bevy_ui_router_core::diagnostics::BranchPlanningDiagnostic`, not through the prelude. Do not add or restate `DiagnosticIdentity`, `DiagnosticSnapshot`, `DiagnosticEvent`, or `DiagnosticEventKind` as Phase 1B export work. Preserve their existing exports and derives from earlier phases.
 
 Add these doctests to `crates/bevy_ui_router_core/src/fingerprint.rs`:
 
 ```rust
 //! ```compile_fail
-//! use bevy_ui_router_core::prelude::{
+//! use bevy_ui_router_core::fingerprint::{
 //!     RouteBranchFingerprint, RouteSearchFingerprint, RouteSegmentReuseKey,
 //! };
 //!
@@ -2077,10 +2183,8 @@ Add these doctests to `crates/bevy_ui_router_core/src/fingerprint.rs`:
 //! ```
 //!
 //! ```compile_fail
-//! use bevy_ui_router_core::prelude::{
-//!     RouteExplicitKey, RouteId, RouteParamsFingerprint, RouteSegmentReuseKey,
-//!     RouteSlotKey,
-//! };
+//! use bevy_ui_router_core::fingerprint::{RouteParamsFingerprint, RouteSegmentReuseKey};
+//! use bevy_ui_router_core::prelude::{RouteExplicitKey, RouteId, RouteSlotKey};
 //!
 //! fn forge(
 //!     route: RouteId,
@@ -2105,18 +2209,68 @@ Add these doctests to `crates/bevy_ui_router_core/src/fingerprint.rs`:
 //! ```
 //! 
 //! ```compile_fail
-//! use bevy_ui_router_core::prelude::{RouteLocation, RouteSearchFingerprint};
+//! use bevy_ui_router_core::fingerprint::RouteSearchFingerprint;
+//! use bevy_ui_router_core::prelude::RouteLocation;
 //!
 //! let location = RouteLocation::new("/items");
 //! let _ = RouteSearchFingerprint::from_location(&location);
 //! ```
 //!
 //! ```compile_fail
-//! use bevy_ui_router_core::prelude::{RouteId, RouteParams, RouteParamsFingerprint};
+//! use bevy_ui_router_core::fingerprint::RouteParamsFingerprint;
+//! use bevy_ui_router_core::prelude::{RouteId, RouteParams};
 //!
 //! fn forge(route: RouteId, params: &RouteParams) {
 //!     let _ = RouteParamsFingerprint::from_route_params(route, params);
 //! }
+//! ```
+```
+
+Add this doctest to `crates/bevy_ui_router_core/src/branch_diff.rs`:
+
+```rust
+//! ```compile_fail
+//! use bevy_ui_router_core::prelude::BranchDiffRoute;
+//!
+//! let _ = core::mem::size_of::<BranchDiffRoute>();
+//! ```
+```
+
+Add this doctest to `crates/bevy_ui_router_core/src/diagnostics.rs`:
+
+```rust
+//! ```compile_fail
+//! use bevy_ui_router_core::prelude::BranchPlanningDiagnostic;
+//!
+//! let _ = BranchPlanningDiagnostic::new(0, 0, 0, false, false, false);
+//! ```
+```
+
+Add these doctests to `crates/bevy_ui_router_core/src/route_tree.rs`:
+
+```rust
+//! ```compile_fail
+//! use bevy_ui_router_core::route_tree::RouteNode;
+//!
+//! fn requires_partial_eq<T: PartialEq>() {}
+//!
+//! requires_partial_eq::<RouteNode>();
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_core::route_tree::RouteTree;
+//!
+//! fn requires_partial_eq<T: PartialEq>() {}
+//!
+//! requires_partial_eq::<RouteTree>();
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_core::route_tree::RouteTreeBuilder;
+//!
+//! fn requires_partial_eq<T: PartialEq>() {}
+//!
+//! requires_partial_eq::<RouteTreeBuilder>();
 //! ```
 ```
 
@@ -2130,9 +2284,10 @@ Add this doctest to `crates/bevy_ui_router_core/src/branch.rs`:
 //! ```
 //!
 //! ```compile_fail
+//! use bevy_ui_router_core::fingerprint::{RouteParamsFingerprint, RouteSegmentReuseKey};
 //! use bevy_ui_router_core::prelude::{
 //!     ErrorBoundaryKey, MatchedRoute, RouteExplicitKey, RouteId, RouteMeta,
-//!     RouteParams, RouteParamsFingerprint, RouteSegmentReuseKey, RouteSlotKey,
+//!     RouteParams, RouteSlotKey,
 //! };
 //!
 //! fn forge(
@@ -2165,7 +2320,7 @@ Run: `cargo test -p bevy_ui_router_core --doc`
 
 Expected: doctests pass, with nonzero doctest evidence and the compile-fail constructor boundary checks exercised.
 
-- [ ] **Step 4: Add facade boundary test**
+- [ ] **Step 5: Add facade boundary test**
 
 Add to `crates/bevy_ui_router/tests/facade_features.rs`:
 
@@ -2173,11 +2328,8 @@ Add to `crates/bevy_ui_router/tests/facade_features.rs`:
 #[test]
 fn facade_prelude_exposes_branch_planning_contracts() {
     use bevy_ui_router::prelude::{
-        BranchDiff, BranchDiffRoute, BranchPlanningDiagnostic, ErrorBoundaryKey,
-        MatchedBranch, MatchedRoute, RouteBranchFingerprint, RouteExplicitKey,
-        RouteId, RouteLocation, RouteMeta, RouteNodeOptions, RouteParams,
-        RouteParamsFingerprint, RouteSearchFingerprint, RouteSegmentReuseKey,
-        RouteSlotKey,
+        BranchDiff, ErrorBoundaryKey, MatchedBranch, MatchedRoute, RouteExplicitKey,
+        RouteId, RouteLocation, RouteMeta, RouteNodeOptions, RouteParams, RouteSlotKey,
     };
 
     let _slot = RouteSlotKey::default();
@@ -2186,20 +2338,14 @@ fn facade_prelude_exposes_branch_planning_contracts() {
     let _location = RouteLocation::new("/items");
     let _meta = RouteMeta::new();
     let _options = RouteNodeOptions::new();
-    let _diagnostic = BranchPlanningDiagnostic::new(0, 0, 0, false, false, false);
 
     fn assert_types<T>() {}
     assert_types::<BranchDiff>();
-    assert_types::<BranchDiffRoute>();
     assert_types::<MatchedBranch>();
     assert_types::<MatchedRoute>();
-    assert_types::<RouteBranchFingerprint>();
     assert_types::<RouteId>();
     assert_types::<RouteLocation>();
     assert_types::<RouteParams>();
-    assert_types::<RouteParamsFingerprint>();
-    assert_types::<RouteSearchFingerprint>();
-    assert_types::<RouteSegmentReuseKey>();
 }
 ```
 
@@ -2207,20 +2353,28 @@ Run: `cargo test -p bevy_ui_router --no-default-features facade_prelude_exposes_
 
 Expected: the test may pass immediately if facade re-export is already correct. If it fails because stable core contracts are missing, fix `crates/bevy_ui_router_core/src/lib.rs` or the facade prelude.
 
-- [ ] **Step 5: Run diagnostics and facade checks**
+- [ ] **Step 6: Run diagnostics and public boundary checks**
 
 Run: `cargo test -p bevy_ui_router_core diagnostics::tests -- --nocapture`
 
 Expected: diagnostics tests pass.
 
+Run: `cargo test -p bevy_ui_router_core --test public_api -- --nocapture`
+
+Expected: public API module-path tests pass.
+
+Run: `cargo test -p bevy_ui_router_core --doc`
+
+Expected: doctests pass and compile-fail boundary checks are exercised.
+
 Run: `cargo test -p bevy_ui_router --no-default-features`
 
 Expected: facade tests pass without default features.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add crates/bevy_ui_router_core/src/diagnostics.rs crates/bevy_ui_router_core/src/fingerprint.rs crates/bevy_ui_router_core/src/branch.rs crates/bevy_ui_router_core/src/lib.rs crates/bevy_ui_router/tests/facade_features.rs
+git add crates/bevy_ui_router_core/src/diagnostics.rs crates/bevy_ui_router_core/src/fingerprint.rs crates/bevy_ui_router_core/src/branch.rs crates/bevy_ui_router_core/src/branch_diff.rs crates/bevy_ui_router_core/src/route_tree.rs crates/bevy_ui_router_core/tests/public_api.rs crates/bevy_ui_router/tests/facade_features.rs
 git commit -m "test: expose branch planning contracts"
 ```
 
@@ -2251,13 +2405,19 @@ Run: `cargo test -p bevy_ui_router_core --doc`
 
 Expected: exit code 0.
 
-- [ ] **Step 4: Run dependency boundary tests**
+- [ ] **Step 4: Run public module-path tests**
+
+Run: `cargo test -p bevy_ui_router_core --test public_api`
+
+Expected: exit code 0.
+
+- [ ] **Step 5: Run dependency boundary tests**
 
 Run: `cargo test -p bevy_ui_router_core --test dependency_boundary`
 
 Expected: exit code 0.
 
-- [ ] **Step 5: Run facade checks**
+- [ ] **Step 6: Run facade checks**
 
 Run: `cargo test -p bevy_ui_router --no-default-features`
 
@@ -2271,7 +2431,7 @@ Run: `cargo check -p bevy_ui_router --no-default-features --features bsn`
 
 Expected: exit code 0.
 
-- [ ] **Step 6: Confirm Phase 2 handoff conditions**
+- [ ] **Step 7: Confirm Phase 2 handoff conditions**
 
 Run:
 
@@ -2282,7 +2442,7 @@ git status --short
 
 Expected: branch planning contracts exist and worktree has only intentional Phase 1B files modified or staged.
 
-- [ ] **Step 7: Commit verification notes**
+- [ ] **Step 8: Commit verification notes**
 
 ```bash
 git add docs/superpowers/plans/2026-07-07-phase-1b-branch-planning-contract-plan.md
@@ -2306,8 +2466,8 @@ The lead agent must evaluate findings before accepting them. If multiple finding
 
 ## 9. Acceptance Criteria
 
-- The final reviewed plan clearly states that Phase 1B depends on completed Phase 1A implementation.
-- The final reviewed plan clearly states that the current repository is blocked from executing Phase 1B until Phase 1A implementation exists.
+- The final reviewed plan clearly states that Phase 1B depends on completed Phase 1A implementation and must re-check that gate at execution time.
+- The final reviewed plan clearly states that the current repository has Phase 1A implementation and verification evidence, and that Phase 1B execution is blocked only if the execution-time gate fails or the refreshed plan has not passed review.
 - The plan covers branch diff, raw params/search fingerprint, named slot placement, route metadata, and error-boundary declaration candidates.
 - The plan has no frame id allocation, generation allocation, active branch commit, transaction runtime, async resolve/apply, ECS mutation, retained subtree, focus, or BSN adapter tasks.
 - `MatchedBranch`, `BranchDiff`, and fingerprints remain data-only planning inputs.
@@ -2322,7 +2482,9 @@ The lead agent must evaluate findings before accepting them. If multiple finding
 - Matched-branch tests directly prove leaf fingerprints use only local params, metadata/boundary changes do not alter reuse keys or branch fingerprints, and independent identical trees can have equal fingerprints while still failing closed by provenance.
 - Error-boundary tests prove nearest boundary metadata lookup for the matched ancestor chain and include off-branch / unknown-route negative coverage; rendering fallback UI and history mutation remain out of scope and are not introduced by Phase 1B APIs.
 - Public fingerprint, matched-route, and matched-branch constructors remain core-internal and have compile-fail boundary coverage; provenance is not exposed through any public API.
-- Public read-only contract types and their support types have positive prelude/facade import coverage, so compile-fail constructor tests cannot pass merely because required types are missing from public exports.
+- `RouteNode`, `RouteTree`, and `RouteTreeBuilder` do not gain public `PartialEq` comparability as a side effect of adding provenance or route planning options, and this has compile-fail boundary coverage.
+- Default app-facing contract types have positive prelude/facade import coverage, while non-prelude branch planning support types have positive integration-test module-path coverage, so compile-fail constructor tests cannot pass merely because required public module types are missing.
+- `BranchDiffRoute`, branch fingerprint wrappers, and `BranchPlanningDiagnostic` remain out of the default prelude unless a future reviewed API decision expands that surface.
 - Branch-planning diagnostics use a structured payload and fixed redacted message, with no active frame identity and no free-form path for frame/generation/host/cleanup semantics.
 - Phase 1B adds only local route declaration validation errors if missing; it preserves existing Phase 0 / Phase 1A error variants and does not add or reinterpret resolve/apply, stale-result, adapter, transaction, finalization, or cleanup errors.
 - The plan distinguishes RED evidence from coverage and boundary-verification steps.
