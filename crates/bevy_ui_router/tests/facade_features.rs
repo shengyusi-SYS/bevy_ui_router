@@ -275,12 +275,12 @@ fn facade_prelude_exposes_branch_planning_contracts() {
 
 #[test]
 fn facade_prelude_exposes_phase_2_observation_contracts() {
-    use bevy_ui_router::core::frame::{FrameReconciliationPlan, RouteFrameBranch};
     use bevy_ui_router::prelude::{
         FrameApplyOutcome, FrameApplyRequest, FrameApplyToken, FrameCleanupPlan,
-        NavigationTransactionSnapshot, NavigationTransactionState, RouteFrameIdentity,
-        RouteFrameRecord, RouteFrameScope, RouteFrameStatus, StaleApplyReason, StaleApplyResult,
-        TransactionCommitError, TransactionCommitErrorKind, TransactionFailure,
+        FrameReconciliationPlan, NavigationTransactionSnapshot, NavigationTransactionState,
+        RouteFrameBranch, RouteFrameIdentity, RouteFrameRecord, RouteFrameScope, RouteFrameStatus,
+        StaleApplyReason, StaleApplyResult, TransactionCommitError, TransactionCommitErrorKind,
+        TransactionFailure,
     };
 
     fn assert_public<T>() {}

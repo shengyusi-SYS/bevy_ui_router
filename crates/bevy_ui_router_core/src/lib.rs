@@ -27,7 +27,8 @@ pub mod prelude {
     };
     pub use crate::error::{RouteError, RouteErrorKind, RouteErrorSourceCategory};
     pub use crate::frame::{
-        FrameCleanupPlan, RouteFrameIdentity, RouteFrameRecord, RouteFrameScope, RouteFrameStatus,
+        FrameCleanupPlan, FrameReconciliationPlan, RouteFrameBranch, RouteFrameIdentity,
+        RouteFrameRecord, RouteFrameScope, RouteFrameStatus,
     };
     pub use crate::history::{HistoryError, MemoryHistory};
     pub use crate::ids::{
