@@ -233,3 +233,19 @@ package = "bsn"
         ]
     );
 }
+
+#[test]
+fn facade_prelude_exposes_core_matcher_contracts() {
+    use bevy_ui_router::prelude::{
+        MatchedBranch, RouteMatcher, RoutePattern, RoutePatternKind, RouteTree,
+    };
+
+    let pattern = RoutePattern::path("/").unwrap();
+    assert_eq!(pattern.kind(), RoutePatternKind::Path);
+
+    let tree = RouteTree::builder().root(pattern).unwrap().build().unwrap();
+    let _matcher = RouteMatcher::new(tree);
+
+    fn assert_types<T>() {}
+    assert_types::<MatchedBranch>();
+}
