@@ -87,6 +87,19 @@ fn core_manifest_still_has_no_dependency_entries_after_matcher() {
 }
 
 #[test]
+fn branch_planning_manifest_stays_dependency_free() {
+    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest = fs::read_to_string(manifest_path).expect("core manifest should be readable");
+    let dependency_entries = dependency_entries(&manifest);
+
+    assert!(
+        dependency_entries.is_empty(),
+        "Phase 1B branch planning must not add dependency-like entries:\n{}",
+        dependency_entries.join("\n")
+    );
+}
+
+#[test]
 fn dependency_subtables_are_treated_as_violations() {
     let manifest = r#"
 [dependencies]
