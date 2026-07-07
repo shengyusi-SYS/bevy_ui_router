@@ -6,6 +6,7 @@ pub mod branch_diff;
 pub mod diagnostics;
 pub mod error;
 pub mod fingerprint;
+pub mod frame;
 pub mod history;
 pub mod ids;
 pub mod location;
@@ -24,6 +25,9 @@ pub mod prelude {
         DiagnosticEvent, DiagnosticEventKind, DiagnosticIdentity, DiagnosticSnapshot,
     };
     pub use crate::error::{RouteError, RouteErrorKind, RouteErrorSourceCategory};
+    pub use crate::frame::{
+        FrameCleanupPlan, RouteFrameIdentity, RouteFrameRecord, RouteFrameScope, RouteFrameStatus,
+    };
     pub use crate::history::{HistoryError, MemoryHistory};
     pub use crate::ids::{
         RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId, RouterInstanceId,
