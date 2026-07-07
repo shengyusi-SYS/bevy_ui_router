@@ -1,18 +1,151 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    not(feature = "test-support"),
+    doc = r#"
+```compile_fail
+use bevy_ui_router_view::FakeViewRenderer;
+```
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct ViewBindingKey(String);
+```compile_fail
+use bevy_ui_router_view::prelude::FakeViewRenderer;
+```
 
-impl ViewBindingKey {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
+```compile_fail
+use bevy_ui_router_view::prelude::FakeViewRendererMode;
+```
 
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+```compile_fail
+use bevy_ui_router_view::test_support::FakeViewRenderer;
+```
+"#
+)]
+#![cfg_attr(
+    feature = "test-support",
+    doc = r#"
+```compile_fail
+use bevy_ui_router_view::FakeViewRenderer;
+```
+
+```compile_fail
+use bevy_ui_router_view::prelude::{FakeViewRenderer, FakeViewRendererMode};
+
+let mut renderer = FakeViewRenderer::new(FakeViewRendererMode::Success);
+renderer.commit();
+```
+
+```compile_fail
+use bevy_ui_router_view::prelude::{FakeViewRenderer, FakeViewRendererMode};
+use bevy_ui_router_core::prelude::FrameApplyToken;
+
+let mut renderer = FakeViewRenderer::new(FakeViewRendererMode::Success);
+let token: FrameApplyToken = unimplemented!();
+renderer.accept_apply_token(token);
+```
+
+```compile_fail
+use bevy_ui_router_view::prelude::{FakeViewRenderer, FakeViewRendererMode};
+use bevy_ui_router_core::prelude::FrameApplyRequest;
+
+let mut renderer = FakeViewRenderer::new(FakeViewRendererMode::Success);
+let request: FrameApplyRequest = unimplemented!();
+renderer.finalize(request);
+```
+
+```compile_fail
+use bevy_ui_router_view::prelude::ViewCommitAuthority;
+```
+
+```compile_fail
+use bevy_ui_router_view::test_support::ViewFinalizeAuthority;
+```
+"#
+)]
+
+//! ```compile_fail
+//! use bevy_ui_router_view::prelude::ViewBuildRequest;
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::prelude::ViewApplyOutcome;
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::ViewRequestId;
+//!
+//! let _ = ViewRequestId::from_raw(1);
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::ViewBuildRequest;
+//!
+//! let _ = ViewBuildRequest::new;
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::ViewOutputId;
+//!
+//! let _ = ViewOutputId::from_raw(1);
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::{ViewBuildRequest, ViewRenderPlan};
+//!
+//! let request: &ViewBuildRequest = unimplemented!();
+//! let _ = ViewRenderPlan::new(request);
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::ViewDisposalHint;
+//!
+//! let _ = ViewDisposalHint::new("fake-output");
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::{
+//!     ViewBindingKey, ViewOutputId, ViewPartialOutput, ViewRequestId,
+//! };
+//!
+//! let request_id: ViewRequestId = unimplemented!();
+//! let output_id: ViewOutputId = unimplemented!();
+//! let _ = ViewPartialOutput::new(request_id, output_id, ViewBindingKey::new("leaf"), None);
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::{ViewFailure, ViewRequestId};
+//!
+//! let request_id: ViewRequestId = unimplemented!();
+//! let _ = ViewFailure::build_failed(request_id, "build failed");
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::{ViewFailure, ViewRequestId};
+//!
+//! let request_id: ViewRequestId = unimplemented!();
+//! let _ = ViewFailure::apply_failed(request_id, "apply failed", None);
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::{ViewFailure, ViewRequestId};
+//!
+//! let request_id: ViewRequestId = unimplemented!();
+//! let _ = ViewFailure::stale_result(request_id, "stale result");
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::prelude::FrameApplyToken;
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::prelude::NavigationTransaction;
+//! ```
+
+mod contract;
+
+pub use contract::{
+    RouteViewDescriptor, ViewApplyOutcome, ViewBindingKey, ViewBuildOutcome, ViewBuildRequest,
+    ViewDisposalHint, ViewFailure, ViewOutputId, ViewPartialOutput, ViewRenderPlan, ViewRequestId,
+};
 
 pub mod prelude {
-    pub use crate::ViewBindingKey;
+    pub use crate::{RouteViewDescriptor, ViewBindingKey};
 }

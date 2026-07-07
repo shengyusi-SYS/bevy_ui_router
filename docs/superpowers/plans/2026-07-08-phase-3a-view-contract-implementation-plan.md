@@ -202,6 +202,7 @@ Task 0 gate PASS, recorded on 2026-07-08.
 ### Task 1: Renderer-Neutral Contract Boundary
 
 **Files:**
+- Modify: `crates/bevy_ui_router_view/Cargo.toml`
 - Modify: `crates/bevy_ui_router_view/src/lib.rs`
 - Create: `crates/bevy_ui_router_view/src/contract.rs`
 
@@ -222,6 +223,21 @@ Task 0 gate PASS, recorded on 2026-07-08.
   - `ViewApplyOutcome`
 
 - [ ] **Step 1: Add RED contract tests**
+
+Update `crates/bevy_ui_router_view/Cargo.toml` so the Task 1 `cfg(feature = "test-support")` guards are recognized without enabling fake renderer behavior yet:
+
+```toml
+[package]
+name = "bevy_ui_router_view"
+version.workspace = true
+edition.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+bevy_ui_router_core = { path = "../bevy_ui_router_core" }
+```
 
 Create `crates/bevy_ui_router_view/src/contract.rs` with tests first:
 
@@ -842,24 +858,13 @@ use bevy_ui_router_view::test_support::ViewFinalizeAuthority;
 //!
 mod contract;
 
-#[cfg(feature = "test-support")]
-mod testing;
-
 pub use contract::{
     RouteViewDescriptor, ViewApplyOutcome, ViewBindingKey, ViewBuildOutcome, ViewBuildRequest,
     ViewDisposalHint, ViewFailure, ViewOutputId, ViewPartialOutput, ViewRenderPlan, ViewRequestId,
 };
 
-#[cfg(feature = "test-support")]
-pub mod test_support {
-    pub use crate::testing::{FakeViewRenderer, FakeViewRendererMode};
-}
-
 pub mod prelude {
     pub use crate::{RouteViewDescriptor, ViewBindingKey};
-
-    #[cfg(feature = "test-support")]
-    pub use crate::test_support::{FakeViewRenderer, FakeViewRendererMode};
 }
 ```
 
@@ -1249,7 +1254,7 @@ Expected:
 Run:
 
 ```powershell
-git add crates/bevy_ui_router_view/src/lib.rs crates/bevy_ui_router_view/src/contract.rs crates/bevy_ui_router_view/tests/compile_fail_boundary.rs crates/bevy_ui_router_view/tests/authority_surface_boundary.rs
+git add crates/bevy_ui_router_view/Cargo.toml crates/bevy_ui_router_view/src/lib.rs crates/bevy_ui_router_view/src/contract.rs crates/bevy_ui_router_view/tests/compile_fail_boundary.rs crates/bevy_ui_router_view/tests/authority_surface_boundary.rs
 git commit -m "feat(view): add renderer-neutral view contract"
 ```
 

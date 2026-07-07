@@ -3,5 +3,8 @@ name = "bevy_ui_router_view"
 version.workspace = true
 edition.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 bevy_ui_router_core = { path = "../bevy_ui_router_core" }
