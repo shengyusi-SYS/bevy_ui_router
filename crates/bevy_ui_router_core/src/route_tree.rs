@@ -3,6 +3,30 @@
 //!
 //! let _ = RouteId::new(99);
 //! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_core::route_tree::RouteNode;
+//!
+//! fn requires_partial_eq<T: PartialEq>() {}
+//!
+//! requires_partial_eq::<RouteNode>();
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_core::route_tree::RouteTree;
+//!
+//! fn requires_partial_eq<T: PartialEq>() {}
+//!
+//! requires_partial_eq::<RouteTree>();
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_core::route_tree::RouteTreeBuilder;
+//!
+//! fn requires_partial_eq<T: PartialEq>() {}
+//!
+//! requires_partial_eq::<RouteTreeBuilder>();
+//! ```
 
 use std::{collections::BTreeMap, fmt};
 

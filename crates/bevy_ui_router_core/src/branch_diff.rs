@@ -1,3 +1,9 @@
+//! ```compile_fail
+//! use bevy_ui_router_core::prelude::BranchDiffRoute;
+//!
+//! let _ = core::mem::size_of::<BranchDiffRoute>();
+//! ```
+
 use crate::branch::{MatchedBranch, MatchedRoute};
 use crate::ids::RouteId;
 use crate::slot::RouteSlotKey;

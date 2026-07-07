@@ -1,3 +1,56 @@
+//! ```compile_fail
+//! use bevy_ui_router_core::fingerprint::{
+//!     RouteBranchFingerprint, RouteSearchFingerprint, RouteSegmentReuseKey,
+//! };
+//!
+//! fn forge(segment: &RouteSegmentReuseKey, search: &RouteSearchFingerprint) {
+//!     let _ = RouteBranchFingerprint::from_parts([segment], search);
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_core::fingerprint::{RouteParamsFingerprint, RouteSegmentReuseKey};
+//! use bevy_ui_router_core::prelude::{RouteExplicitKey, RouteId, RouteSlotKey};
+//!
+//! fn forge(
+//!     route: RouteId,
+//!     slot: &RouteSlotKey,
+//!     key: &RouteExplicitKey,
+//!     params: &RouteParamsFingerprint,
+//! ) {
+//!     let _ = RouteSegmentReuseKey::from_parts(route, slot, Some(key), params);
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_core::prelude::RouteBranchProvenance;
+//!
+//! let _ = core::mem::size_of::<RouteBranchProvenance>();
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_core::fingerprint::RouteBranchProvenance;
+//!
+//! let _ = core::mem::size_of::<RouteBranchProvenance>();
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_core::fingerprint::RouteSearchFingerprint;
+//! use bevy_ui_router_core::prelude::RouteLocation;
+//!
+//! let location = RouteLocation::new("/items");
+//! let _ = RouteSearchFingerprint::from_location(&location);
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_core::fingerprint::RouteParamsFingerprint;
+//! use bevy_ui_router_core::prelude::{RouteId, RouteParams};
+//!
+//! fn forge(route: RouteId, params: &RouteParams) {
+//!     let _ = RouteParamsFingerprint::from_route_params(route, params);
+//! }
+//! ```
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::branch::RouteParams;

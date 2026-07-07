@@ -31,6 +31,12 @@
 //!     let _ = DiagnosticSnapshot::new().with_active(identity);
 //! }
 //! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_core::prelude::BranchPlanningDiagnostic;
+//!
+//! let _ = BranchPlanningDiagnostic::new(0, 0, 0, false, false, false);
+//! ```
 
 use crate::ids::{
     RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId, RouterInstanceId,
@@ -98,12 +104,68 @@ pub enum DiagnosticEventKind {
     HostOrSlotUnavailable,
     MatchFailed,
     MatchConflict,
+    BranchPlanned,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchPlanningDiagnostic {
+    common_prefix_len: usize,
+    leaving_len: usize,
+    entering_len: usize,
+    provenance_changed: bool,
+    search_changed: bool,
+    branch_fingerprint_changed: bool,
+}
+
+impl BranchPlanningDiagnostic {
+    pub const fn new(
+        common_prefix_len: usize,
+        leaving_len: usize,
+        entering_len: usize,
+        provenance_changed: bool,
+        search_changed: bool,
+        branch_fingerprint_changed: bool,
+    ) -> Self {
+        Self {
+            common_prefix_len,
+            leaving_len,
+            entering_len,
+            provenance_changed,
+            search_changed,
+            branch_fingerprint_changed,
+        }
+    }
+
+    pub const fn common_prefix_len(&self) -> usize {
+        self.common_prefix_len
+    }
+
+    pub const fn leaving_len(&self) -> usize {
+        self.leaving_len
+    }
+
+    pub const fn entering_len(&self) -> usize {
+        self.entering_len
+    }
+
+    pub const fn provenance_changed(&self) -> bool {
+        self.provenance_changed
+    }
+
+    pub const fn search_changed(&self) -> bool {
+        self.search_changed
+    }
+
+    pub const fn branch_fingerprint_changed(&self) -> bool {
+        self.branch_fingerprint_changed
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiagnosticEvent {
     kind: DiagnosticEventKind,
     identity: Option<DiagnosticIdentity>,
+    branch_planning: Option<BranchPlanningDiagnostic>,
     redacted_message: String,
 }
 
@@ -116,6 +178,7 @@ impl DiagnosticEvent {
         Self {
             kind: DiagnosticEventKind::PendingOverwrite,
             identity: Some(identity),
+            branch_planning: None,
             redacted_message: redacted_message.into(),
         }
     }
@@ -125,6 +188,7 @@ impl DiagnosticEvent {
         Self {
             kind: DiagnosticEventKind::HostOrSlotUnavailable,
             identity: None,
+            branch_planning: None,
             redacted_message: redacted_message.into(),
         }
     }
@@ -134,6 +198,7 @@ impl DiagnosticEvent {
         Self {
             kind: DiagnosticEventKind::MatchFailed,
             identity: None,
+            branch_planning: None,
             redacted_message: redacted_message.into(),
         }
     }
@@ -143,7 +208,18 @@ impl DiagnosticEvent {
         Self {
             kind: DiagnosticEventKind::MatchConflict,
             identity: None,
+            branch_planning: None,
             redacted_message: redacted_message.into(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn branch_planned(branch_planning: BranchPlanningDiagnostic) -> Self {
+        Self {
+            kind: DiagnosticEventKind::BranchPlanned,
+            identity: None,
+            branch_planning: Some(branch_planning),
+            redacted_message: "branch planned".to_owned(),
         }
     }
 
@@ -153,6 +229,10 @@ impl DiagnosticEvent {
 
     pub const fn identity(&self) -> Option<DiagnosticIdentity> {
         self.identity
+    }
+
+    pub fn branch_planning(&self) -> Option<&BranchPlanningDiagnostic> {
+        self.branch_planning.as_ref()
     }
 
     pub fn redacted_message(&self) -> &str {
@@ -311,5 +391,29 @@ mod tests {
         assert_eq!(event.kind(), DiagnosticEventKind::MatchConflict);
         assert!(event.identity().is_none());
         assert_eq!(event.redacted_message(), "ambiguous route match");
+    }
+
+    #[test]
+    fn branch_planning_event_has_no_active_identity() {
+        let payload = BranchPlanningDiagnostic::new(2, 1, 1, true, false, true);
+        let event = DiagnosticEvent::branch_planned(payload.clone());
+
+        assert_eq!(event.kind(), DiagnosticEventKind::BranchPlanned);
+        assert!(event.identity().is_none());
+        assert_eq!(event.branch_planning(), Some(&payload));
+        assert_eq!(event.branch_planning().unwrap().common_prefix_len(), 2);
+        assert_eq!(event.branch_planning().unwrap().leaving_len(), 1);
+        assert_eq!(event.branch_planning().unwrap().entering_len(), 1);
+        assert!(event.branch_planning().unwrap().provenance_changed());
+        assert!(!event.branch_planning().unwrap().search_changed());
+        assert!(
+            event
+                .branch_planning()
+                .unwrap()
+                .branch_fingerprint_changed()
+        );
+        assert_eq!(event.redacted_message(), "branch planned");
+        assert!(!event.redacted_message().contains("frame"));
+        assert!(!event.redacted_message().contains("generation"));
     }
 }

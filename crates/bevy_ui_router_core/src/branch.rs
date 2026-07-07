@@ -1,3 +1,54 @@
+//! ```compile_fail
+//! use bevy_ui_router_core::branch::{MatchedBranch, MatchedRoute};
+//! use bevy_ui_router_core::fingerprint::{
+//!     RouteBranchFingerprint, RouteBranchProvenance, RouteSearchFingerprint,
+//! };
+//!
+//! fn forge(
+//!     routes: Vec<MatchedRoute>,
+//!     provenance: RouteBranchProvenance,
+//!     search_fingerprint: RouteSearchFingerprint,
+//!     branch_fingerprint: RouteBranchFingerprint,
+//! ) {
+//!     let _ = MatchedBranch::new(
+//!         routes,
+//!         provenance,
+//!         search_fingerprint,
+//!         branch_fingerprint,
+//!     );
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_core::fingerprint::{RouteParamsFingerprint, RouteSegmentReuseKey};
+//! use bevy_ui_router_core::prelude::{
+//!     ErrorBoundaryKey, MatchedRoute, RouteExplicitKey, RouteId, RouteMeta,
+//!     RouteParams, RouteSlotKey,
+//! };
+//!
+//! fn forge(
+//!     route: RouteId,
+//!     params: RouteParams,
+//!     slot: RouteSlotKey,
+//!     explicit_key: Option<RouteExplicitKey>,
+//!     error_boundary: Option<ErrorBoundaryKey>,
+//!     meta: RouteMeta,
+//!     params_fingerprint: RouteParamsFingerprint,
+//!     segment_reuse_key: RouteSegmentReuseKey,
+//! ) {
+//!     let _ = MatchedRoute::new(
+//!         route,
+//!         params,
+//!         slot,
+//!         explicit_key,
+//!         error_boundary,
+//!         meta,
+//!         params_fingerprint,
+//!         segment_reuse_key,
+//!     );
+//! }
+//! ```
+
 use std::{collections::BTreeMap, fmt};
 
 use crate::fingerprint::{

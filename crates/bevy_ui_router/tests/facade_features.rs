@@ -249,3 +249,26 @@ fn facade_prelude_exposes_core_matcher_contracts() {
     fn assert_types<T>() {}
     assert_types::<MatchedBranch>();
 }
+
+#[test]
+fn facade_prelude_exposes_branch_planning_contracts() {
+    use bevy_ui_router::prelude::{
+        BranchDiff, ErrorBoundaryKey, MatchedBranch, MatchedRoute, RouteExplicitKey, RouteId,
+        RouteLocation, RouteMeta, RouteNodeOptions, RouteParams, RouteSlotKey,
+    };
+
+    let _slot = RouteSlotKey::default();
+    let _key = RouteExplicitKey::new("stable").unwrap();
+    let _boundary = ErrorBoundaryKey::named("root").unwrap();
+    let _location = RouteLocation::new("/items");
+    let _meta = RouteMeta::new();
+    let _options = RouteNodeOptions::new();
+
+    fn assert_types<T>() {}
+    assert_types::<BranchDiff>();
+    assert_types::<MatchedBranch>();
+    assert_types::<MatchedRoute>();
+    assert_types::<RouteId>();
+    assert_types::<RouteLocation>();
+    assert_types::<RouteParams>();
+}
