@@ -4,8 +4,10 @@ use crate::fingerprint::{RouteBranchFingerprint, RouteSegmentReuseKey};
 use crate::ids::{
     RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId, RouterInstanceId,
 };
+use crate::meta::ErrorBoundaryKey;
 use crate::ownership::CleanupScope;
 use crate::slot::RouteSlotKey;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RouteFrameScope {
@@ -258,6 +260,7 @@ pub struct FrameReconciliationPlan {
     entering: Vec<RouteFrameRecord>,
     baseline_fingerprint: Option<RouteBranchFingerprint>,
     target_fingerprint: RouteBranchFingerprint,
+    error_boundaries: BTreeMap<RouteId, Option<ErrorBoundaryKey>>,
 }
 
 impl FrameReconciliationPlan {
@@ -324,6 +327,7 @@ impl FrameReconciliationPlan {
             entering,
             baseline_fingerprint,
             target_fingerprint,
+            error_boundaries: BTreeMap::new(),
         }
     }
 
@@ -341,7 +345,23 @@ impl FrameReconciliationPlan {
             entering,
             baseline_fingerprint: None,
             target_fingerprint: target.branch_fingerprint().clone(),
+            error_boundaries: BTreeMap::new(),
         }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_error_boundaries_from(mut self, branch: &MatchedBranch) -> Self {
+        self.error_boundaries = branch
+            .routes()
+            .iter()
+            .map(|route| {
+                (
+                    route.route(),
+                    branch.nearest_error_boundary_for(route.route()).cloned(),
+                )
+            })
+            .collect();
+        self
     }
 
     pub fn preserved(&self) -> &[RouteFrameRecord] {
@@ -362,6 +382,10 @@ impl FrameReconciliationPlan {
 
     pub const fn target_fingerprint(&self) -> &RouteBranchFingerprint {
         &self.target_fingerprint
+    }
+
+    pub(crate) fn nearest_error_boundary_for(&self, route: RouteId) -> Option<&ErrorBoundaryKey> {
+        self.error_boundaries.get(&route).and_then(Option::as_ref)
     }
 }
 
@@ -434,8 +458,9 @@ mod tests {
     use crate::fingerprint::{RouteParamsFingerprint, RouteSearchFingerprint};
     use crate::location::RouteLocation;
     use crate::matcher::RouteMatcher;
+    use crate::meta::ErrorBoundaryKey;
     use crate::pattern::RoutePattern;
-    use crate::route_tree::RouteTree;
+    use crate::route_tree::{RouteNodeOptions, RouteTree};
 
     fn sample_items_matcher() -> RouteMatcher {
         let mut builder = RouteTree::builder()
@@ -444,6 +469,33 @@ mod tests {
         let root = builder.root_id().unwrap();
         let items = builder
             .route(root, RoutePattern::path("items").unwrap())
+            .unwrap();
+        builder
+            .route(items, RoutePattern::path(":id").unwrap())
+            .unwrap();
+        RouteMatcher::new(builder.build().unwrap())
+    }
+
+    fn sample_nested_boundary_matcher() -> RouteMatcher {
+        let mut builder = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let section = builder
+            .route_with_options(
+                root,
+                RoutePattern::path("section").unwrap(),
+                RouteNodeOptions::new()
+                    .with_error_boundary(ErrorBoundaryKey::named("section").unwrap()),
+            )
+            .unwrap();
+        let items = builder
+            .route_with_options(
+                section,
+                RoutePattern::path("items").unwrap(),
+                RouteNodeOptions::new()
+                    .with_error_boundary(ErrorBoundaryKey::named("items").unwrap()),
+            )
             .unwrap();
         builder
             .route(items, RoutePattern::path(":id").unwrap())
@@ -790,5 +842,44 @@ mod tests {
         assert!(plan.preserved().is_empty());
         assert_eq!(plan.leaving().len(), active.frames().len());
         assert_eq!(plan.entering().len(), new_branch.routes().len());
+    }
+
+    #[test]
+    fn reconciliation_plan_tracks_nearest_error_boundary_by_route() {
+        let matcher = sample_nested_boundary_matcher();
+        let old_branch = matcher
+            .match_location(&RouteLocation::new("/section/items/1"))
+            .unwrap();
+        let new_branch = matcher
+            .match_location(&RouteLocation::new("/section/items/2"))
+            .unwrap();
+        let diff = BranchDiff::compare(&old_branch, &new_branch);
+        let mut allocator = FrameAllocator::new();
+        let scope = RouteFrameScope::new(
+            RouterInstanceId::new(1),
+            RouteHostId::new(2),
+            RouteSlotId::new(3),
+        );
+        let active = RouteFrameBranch::from_matched_branch(scope, &old_branch, &mut allocator);
+
+        let plan = FrameReconciliationPlan::from_diff(
+            scope,
+            Some(&active),
+            &new_branch,
+            &diff,
+            &mut allocator,
+        )
+        .with_error_boundaries_from(&new_branch);
+
+        let leaf = new_branch.leaf().unwrap().route();
+        let root = new_branch.routes()[0].route();
+
+        assert_eq!(
+            plan.nearest_error_boundary_for(leaf)
+                .map(ErrorBoundaryKey::as_str),
+            Some("items")
+        );
+        assert_eq!(plan.nearest_error_boundary_for(root), None);
+        assert_eq!(plan.nearest_error_boundary_for(RouteId::new(999)), None);
     }
 }

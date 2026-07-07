@@ -7,6 +7,7 @@ use crate::frame::{
 use crate::ids::{
     RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId, RouterInstanceId,
 };
+use crate::meta::ErrorBoundaryKey;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NavigationTransactionState {
@@ -193,10 +194,25 @@ impl TransactionCommitError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransactionFailure {
+    failing_route: RouteId,
+    error: RouteError,
+    nearest_error_boundary: Option<ErrorBoundaryKey>,
     cleanup: Vec<FrameCleanupPlan>,
 }
 
 impl TransactionFailure {
+    pub const fn failing_route(&self) -> RouteId {
+        self.failing_route
+    }
+
+    pub fn error(&self) -> &RouteError {
+        &self.error
+    }
+
+    pub fn nearest_error_boundary(&self) -> Option<&ErrorBoundaryKey> {
+        self.nearest_error_boundary.as_ref()
+    }
+
     pub fn cleanup(&self) -> &[FrameCleanupPlan] {
         &self.cleanup
     }
@@ -305,9 +321,26 @@ impl NavigationTransaction {
                 }
             }
             FrameApplyOutcome::Failed(error) => {
+                let error_kind = error.kind();
+                let failed_record = self
+                    .plan
+                    .entering()
+                    .iter()
+                    .find(|record| record.identity().frame() == token.frame())
+                    .expect("token was checked against entering records");
                 self.state = NavigationTransactionState::Failed;
                 self.failure = Some(TransactionFailure {
-                    cleanup: self.cleanup_for_failure(token.frame(), error.kind()),
+                    failing_route: token.route(),
+                    error,
+                    nearest_error_boundary: self
+                        .plan
+                        .nearest_error_boundary_for(token.route())
+                        .cloned(),
+                    cleanup: self.cleanup_for_failure(
+                        *failed_record.identity(),
+                        token.frame(),
+                        error_kind,
+                    ),
                 });
             }
         }
@@ -359,26 +392,31 @@ impl NavigationTransaction {
 
     fn cleanup_for_failure(
         &self,
+        failed_identity: crate::frame::RouteFrameIdentity,
         failed_frame: RouteFrameId,
         error_kind: RouteErrorKind,
     ) -> Vec<FrameCleanupPlan> {
-        let mut frame_ids = self.accepted.clone();
-        if error_kind == RouteErrorKind::ViewApplyFailed && !frame_ids.contains(&failed_frame) {
-            frame_ids.push(failed_frame);
-        }
-
-        frame_ids
-            .into_iter()
-            .filter_map(|frame_id| {
-                self.requests
+        let mut cleanup = self
+            .accepted
+            .iter()
+            .filter_map(|frame| {
+                self.plan
+                    .entering()
                     .iter()
-                    .map(FrameApplyRequest::frame)
-                    .find(|record| record.identity().frame() == frame_id)
-                    .map(RouteFrameRecord::identity)
-                    .copied()
-                    .map(FrameCleanupPlan::router_owned_partial_output)
+                    .find(|record| record.identity().frame() == *frame)
             })
-            .collect()
+            .map(|record| FrameCleanupPlan::router_owned_partial_output(*record.identity()))
+            .collect::<Vec<_>>();
+        if error_kind == RouteErrorKind::ViewApplyFailed
+            && !cleanup
+                .iter()
+                .any(|plan| plan.identity().frame() == failed_frame)
+        {
+            cleanup.push(FrameCleanupPlan::router_owned_partial_output(
+                failed_identity,
+            ));
+        }
+        cleanup
     }
 }
 
@@ -468,8 +506,9 @@ mod tests {
     };
     use crate::location::RouteLocation;
     use crate::matcher::RouteMatcher;
+    use crate::meta::ErrorBoundaryKey;
     use crate::pattern::RoutePattern;
-    use crate::route_tree::RouteTree;
+    use crate::route_tree::{RouteNodeOptions, RouteTree};
 
     fn branches() -> (RouteFrameBranch, FrameReconciliationPlan) {
         let mut builder = RouteTree::builder()
@@ -504,6 +543,132 @@ mod tests {
             &diff,
             &mut allocator,
         );
+        (active, plan)
+    }
+
+    fn branches_with_error_boundary() -> (RouteFrameBranch, FrameReconciliationPlan) {
+        let mut builder = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let section = builder
+            .route_with_options(
+                root,
+                RoutePattern::path("section").unwrap(),
+                RouteNodeOptions::new()
+                    .with_error_boundary(ErrorBoundaryKey::named("section").unwrap()),
+            )
+            .unwrap();
+        let items = builder
+            .route_with_options(
+                section,
+                RoutePattern::path("items").unwrap(),
+                RouteNodeOptions::new()
+                    .with_error_boundary(ErrorBoundaryKey::named("items").unwrap()),
+            )
+            .unwrap();
+        builder
+            .route(items, RoutePattern::path(":id").unwrap())
+            .unwrap();
+        let matcher = RouteMatcher::new(builder.build().unwrap());
+        let old_branch = matcher
+            .match_location(&RouteLocation::new("/section/items/1"))
+            .unwrap();
+        let new_branch = matcher
+            .match_location(&RouteLocation::new("/section/items/2"))
+            .unwrap();
+        let diff = BranchDiff::compare(&old_branch, &new_branch);
+        let mut allocator = FrameAllocator::new();
+        let scope = RouteFrameScope::new(
+            RouterInstanceId::new(1),
+            RouteHostId::new(2),
+            RouteSlotId::new(3),
+        );
+        let active = RouteFrameBranch::from_matched_branch(scope, &old_branch, &mut allocator);
+        let plan = FrameReconciliationPlan::from_diff(
+            scope,
+            Some(&active),
+            &new_branch,
+            &diff,
+            &mut allocator,
+        )
+        .with_error_boundaries_from(&new_branch);
+        (active, plan)
+    }
+
+    fn branches_without_error_boundary() -> (RouteFrameBranch, FrameReconciliationPlan) {
+        let mut builder = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let items = builder
+            .route(root, RoutePattern::path("items").unwrap())
+            .unwrap();
+        builder
+            .route(items, RoutePattern::path(":id").unwrap())
+            .unwrap();
+        let matcher = RouteMatcher::new(builder.build().unwrap());
+        let old_branch = matcher
+            .match_location(&RouteLocation::new("/items/1"))
+            .unwrap();
+        let new_branch = matcher
+            .match_location(&RouteLocation::new("/items/2"))
+            .unwrap();
+        let diff = BranchDiff::compare(&old_branch, &new_branch);
+        let mut allocator = FrameAllocator::new();
+        let scope = RouteFrameScope::new(
+            RouterInstanceId::new(1),
+            RouteHostId::new(2),
+            RouteSlotId::new(3),
+        );
+        let active = RouteFrameBranch::from_matched_branch(scope, &old_branch, &mut allocator);
+        let plan = FrameReconciliationPlan::from_diff(
+            scope,
+            Some(&active),
+            &new_branch,
+            &diff,
+            &mut allocator,
+        )
+        .with_error_boundaries_from(&new_branch);
+        (active, plan)
+    }
+
+    fn branches_with_three_entering_frames() -> (RouteFrameBranch, FrameReconciliationPlan) {
+        let mut builder = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let section = builder
+            .route(root, RoutePattern::path("section").unwrap())
+            .unwrap();
+        let items = builder
+            .route(section, RoutePattern::path("items").unwrap())
+            .unwrap();
+        builder
+            .route(items, RoutePattern::path(":id").unwrap())
+            .unwrap();
+        let matcher = RouteMatcher::new(builder.build().unwrap());
+        let old_branch = matcher.match_location(&RouteLocation::new("/")).unwrap();
+        let new_branch = matcher
+            .match_location(&RouteLocation::new("/section/items/1"))
+            .unwrap();
+        let diff = BranchDiff::compare(&old_branch, &new_branch);
+        let mut allocator = FrameAllocator::new();
+        let scope = RouteFrameScope::new(
+            RouterInstanceId::new(1),
+            RouteHostId::new(2),
+            RouteSlotId::new(3),
+        );
+        let active = RouteFrameBranch::from_matched_branch(scope, &old_branch, &mut allocator);
+        let plan = FrameReconciliationPlan::from_diff(
+            scope,
+            Some(&active),
+            &new_branch,
+            &diff,
+            &mut allocator,
+        )
+        .with_error_boundaries_from(&new_branch);
+        assert_eq!(plan.entering().len(), 3);
         (active, plan)
     }
 
@@ -700,6 +865,123 @@ mod tests {
         assert_eq!(frame_ids[0], first_token.frame());
         assert_eq!(frame_ids[1], failed_frame);
         assert!(!frame_ids.contains(&transaction.snapshot().requests()[2].token().frame()));
+    }
+
+    #[test]
+    fn apply_failure_preserves_old_active_and_limits_cleanup_scope() {
+        let (active, plan) = branches_with_error_boundary();
+        let mut transaction = NavigationTransaction::new(plan);
+        let token = transaction.snapshot().requests()[0].token().clone();
+
+        transaction
+            .accept_apply_result(
+                &token,
+                FrameApplyOutcome::Failed(RouteError::new(
+                    RouteErrorKind::ViewApplyFailed,
+                    RouteErrorSourceCategory::RendererContract,
+                    "view apply failed",
+                )),
+            )
+            .unwrap();
+
+        assert_eq!(
+            transaction.snapshot().state(),
+            NavigationTransactionState::Failed
+        );
+        let snapshot = transaction.snapshot();
+        let failure = snapshot.failure().unwrap();
+        assert_eq!(failure.failing_route(), token.route());
+        assert_eq!(failure.cleanup().len(), 1);
+        assert!(failure.cleanup()[0].scope().excludes_app_owned_host());
+        assert_eq!(active.frames()[0].status(), RouteFrameStatus::Active);
+    }
+
+    #[test]
+    fn failure_prefers_nearest_nested_error_boundary() {
+        let (_active, plan) = branches_with_error_boundary();
+        let mut transaction = NavigationTransaction::new(plan);
+        let token = transaction.snapshot().requests()[0].token().clone();
+
+        transaction
+            .accept_apply_result(
+                &token,
+                FrameApplyOutcome::Failed(RouteError::new(
+                    RouteErrorKind::ViewApplyFailed,
+                    RouteErrorSourceCategory::RendererContract,
+                    "view apply failed",
+                )),
+            )
+            .unwrap();
+
+        assert_eq!(
+            transaction
+                .snapshot()
+                .failure()
+                .unwrap()
+                .nearest_error_boundary()
+                .map(ErrorBoundaryKey::as_str),
+            Some("items")
+        );
+    }
+
+    #[test]
+    fn failure_without_boundary_records_router_fallback() {
+        let (_active, plan) = branches_without_error_boundary();
+        let mut transaction = NavigationTransaction::new(plan);
+        let token = transaction.snapshot().requests()[0].token().clone();
+
+        transaction
+            .accept_apply_result(
+                &token,
+                FrameApplyOutcome::Failed(RouteError::new(
+                    RouteErrorKind::ViewApplyFailed,
+                    RouteErrorSourceCategory::RendererContract,
+                    "view apply failed",
+                )),
+            )
+            .unwrap();
+
+        assert!(
+            transaction
+                .snapshot()
+                .failure()
+                .unwrap()
+                .nearest_error_boundary()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn multi_frame_failure_cleans_only_attempted_transaction_output() {
+        let (_active, plan) = branches_with_three_entering_frames();
+        let mut transaction = NavigationTransaction::new(plan);
+        let first = transaction.snapshot().requests()[0].token().clone();
+        let second = transaction.snapshot().requests()[1].token().clone();
+
+        transaction
+            .accept_apply_result(&first, FrameApplyOutcome::Applied)
+            .unwrap();
+        transaction
+            .accept_apply_result(
+                &second,
+                FrameApplyOutcome::Failed(RouteError::new(
+                    RouteErrorKind::ViewApplyFailed,
+                    RouteErrorSourceCategory::RendererContract,
+                    "view apply failed",
+                )),
+            )
+            .unwrap();
+
+        let snapshot = transaction.snapshot();
+        let cleanup = snapshot.failure().unwrap().cleanup();
+        assert_eq!(cleanup.len(), 2);
+        assert_eq!(cleanup[0].identity().frame(), first.frame());
+        assert_eq!(cleanup[1].identity().frame(), second.frame());
+        assert!(
+            cleanup
+                .iter()
+                .all(|plan| plan.scope().excludes_app_owned_host())
+        );
     }
 
     #[test]
