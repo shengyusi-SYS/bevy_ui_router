@@ -37,6 +37,15 @@
 //!
 //! let _ = BranchPlanningDiagnostic::new(0, 0, 0, false, false, false);
 //! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_core::diagnostics::FrameLifecycleDiagnostic;
+//! use bevy_ui_router_core::prelude::{RouteFrameIdentity, RouteFrameStatus};
+//!
+//! fn forge(identity: RouteFrameIdentity) {
+//!     let _ = FrameLifecycleDiagnostic::new(identity, RouteFrameStatus::Active);
+//! }
+//! ```
 
 use crate::frame::{RouteFrameIdentity, RouteFrameStatus};
 use crate::ids::{

@@ -1,3 +1,27 @@
+//! ```compile_fail
+//! use bevy_ui_router_core::prelude::{
+//!     RouteFrameId, RouteFrameIdentity, RouteGeneration, RouteHostId, RouteId,
+//!     RouteSlotId, RouterInstanceId,
+//! };
+//!
+//! fn forge(
+//!     router: RouterInstanceId,
+//!     host: RouteHostId,
+//!     slot: RouteSlotId,
+//!     route: RouteId,
+//!     frame: RouteFrameId,
+//!     generation: RouteGeneration,
+//! ) {
+//!     let _ = RouteFrameIdentity::new(router, host, slot, route, frame, generation);
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_core::frame::FrameAllocator;
+//!
+//! let _ = FrameAllocator::new();
+//! ```
+
 use crate::branch::MatchedBranch;
 use crate::branch_diff::BranchDiff;
 use crate::fingerprint::{RouteBranchFingerprint, RouteSegmentReuseKey};

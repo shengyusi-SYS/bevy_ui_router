@@ -1,3 +1,20 @@
+//! ```compile_fail
+//! use bevy_ui_router_core::prelude::{
+//!     CleanupScope, RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId,
+//!     RouterInstanceId,
+//! };
+//!
+//! fn forge(
+//!     router: RouterInstanceId,
+//!     host: RouteHostId,
+//!     slot: RouteSlotId,
+//!     frame: RouteFrameId,
+//!     generation: RouteGeneration,
+//! ) {
+//!     let _ = CleanupScope::router_owned_subtree(router, host, slot, frame, generation);
+//! }
+//! ```
+
 use crate::ids::{RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId, RouterInstanceId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

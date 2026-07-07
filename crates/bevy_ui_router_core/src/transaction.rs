@@ -1,3 +1,30 @@
+//! ```compile_fail
+//! use bevy_ui_router_core::transaction::NavigationTransaction;
+//!
+//! let _ = core::mem::size_of::<NavigationTransaction>();
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_core::transaction::NavigationTransactionId;
+//!
+//! let _ = core::mem::size_of::<NavigationTransactionId>();
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_core::prelude::FrameApplyToken;
+//!
+//! let _ = FrameApplyToken {
+//!     transaction: unreachable!(),
+//!     sequence: 0,
+//!     router: unreachable!(),
+//!     host: unreachable!(),
+//!     slot: unreachable!(),
+//!     route: unreachable!(),
+//!     frame: unreachable!(),
+//!     generation: unreachable!(),
+//! };
+//! ```
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{RouteError, RouteErrorKind};

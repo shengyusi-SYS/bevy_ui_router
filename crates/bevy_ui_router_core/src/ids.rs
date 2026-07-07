@@ -15,6 +15,13 @@
 //!
 //! let _ = RouteGeneration::next;
 //! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_core::prelude::RouteGeneration;
+//!
+//! let generation = RouteGeneration::initial();
+//! let _ = generation.next();
+//! ```
 
 macro_rules! id_type {
     ($name:ident) => {
