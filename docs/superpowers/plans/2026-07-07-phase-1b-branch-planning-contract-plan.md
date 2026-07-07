@@ -2489,3 +2489,54 @@ The lead agent must evaluate findings before accepting them. If multiple finding
 - Phase 1B adds only local route declaration validation errors if missing; it preserves existing Phase 0 / Phase 1A error variants and does not add or reinterpret resolve/apply, stale-result, adapter, transaction, finalization, or cleanup errors.
 - The plan distinguishes RED evidence from coverage and boundary-verification steps.
 - The plan lists concrete verification commands and requires command output before success claims.
+
+---
+
+## 10. Phase 1B Verification Record
+
+Recorded on 2026-07-08 after Task 1 through Task 7 implementation and task-scoped review.
+
+Final implementation commits:
+
+- `780cd67 feat(core): add route declaration planning keys`
+- `6eee798 feat(core): add route node planning options`
+- `9098786 feat(core): add raw branch fingerprints`
+- `8d21453 feat(core): enrich matched branch planning data`
+- `2a95c70 feat(core): add branch diff contract`
+- `c066251 test(core): cover branch search diff policy`
+- `35a1069 test(core): cover branch planning boundaries`
+- `1c4a686 test(core): add branch planning dependency boundary guard`
+- `23ab674 test: expose branch planning contracts`
+
+Final verification commands were run with `--config "build.rustc-wrapper = ''"` for Cargo commands to avoid local `sccache` sandbox access failures:
+
+- `cargo fmt --all --check`
+  - Result: passed.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_core`
+  - Result: passed.
+  - Evidence: 62 core unit tests, 4 `dependency_boundary` integration tests, 1 `public_api` integration test, and 20 core doctests passed.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --doc`
+  - Result: passed.
+  - Evidence: 20 doctests passed, including compile-fail public-boundary checks.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --test public_api`
+  - Result: passed.
+  - Evidence: 1 integration test passed.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --test dependency_boundary`
+  - Result: passed.
+  - Evidence: 4 integration tests passed.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features`
+  - Result: passed.
+  - Evidence: 4 facade integration tests passed.
+- `cargo check --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features platform`
+  - Result: passed.
+- `cargo check --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features bsn`
+  - Result: passed.
+- `rg -n "BranchDiff|RouteBranchFingerprint|RouteSearchFingerprint|RouteSlotKey|ErrorBoundaryKey" crates\bevy_ui_router_core\src`
+  - Result: found the Phase 1B branch-planning contracts in core source files.
+- `git status --short`
+  - Result before writing this verification record: clean after removing the generated untracked `Cargo.lock`.
+
+Phase 2 handoff status:
+
+- Branch diff, raw params/search fingerprints, route declaration slots, explicit keys, route metadata, error-boundary candidates, diagnostics, public module-path coverage, facade prelude coverage, dependency boundary checks, and constructor/provenance compile-fail boundaries are present.
+- Phase 1B remains data-only. It does not allocate frames or generations, mark active UI, mutate ECS hierarchy, run async resolve/apply, retain hidden subtrees, manage focus, or introduce platform/BSN/app-shell assumptions into core.
