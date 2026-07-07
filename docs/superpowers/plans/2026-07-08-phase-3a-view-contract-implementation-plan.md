@@ -1282,11 +1282,11 @@ git commit -m "feat(view): add renderer-neutral view contract"
   - `ViewRenderPlan`
   - `ViewRequestId`
 - Produces:
-  - `test-support` feature
+  - populated `test-support` feature behavior
   - `FakeViewRenderer`
   - `FakeViewRendererMode`
 
-- [ ] **Step 1: Add the `test-support` feature and RED fake renderer tests**
+- [ ] **Step 1: Keep the `test-support` feature and add RED fake renderer tests**
 
 Replace `crates/bevy_ui_router_view/Cargo.toml` with:
 
