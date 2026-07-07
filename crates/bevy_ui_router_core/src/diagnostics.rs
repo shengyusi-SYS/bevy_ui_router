@@ -38,6 +38,7 @@
 //! let _ = BranchPlanningDiagnostic::new(0, 0, 0, false, false, false);
 //! ```
 
+use crate::frame::{RouteFrameIdentity, RouteFrameStatus};
 use crate::ids::{
     RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId, RouterInstanceId,
 };
@@ -105,6 +106,28 @@ pub enum DiagnosticEventKind {
     MatchFailed,
     MatchConflict,
     BranchPlanned,
+    FrameLifecycle,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrameLifecycleDiagnostic {
+    identity: RouteFrameIdentity,
+    status: RouteFrameStatus,
+}
+
+impl FrameLifecycleDiagnostic {
+    #[allow(dead_code)]
+    pub(crate) const fn new(identity: RouteFrameIdentity, status: RouteFrameStatus) -> Self {
+        Self { identity, status }
+    }
+
+    pub const fn identity(&self) -> &RouteFrameIdentity {
+        &self.identity
+    }
+
+    pub const fn status(&self) -> RouteFrameStatus {
+        self.status
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -166,7 +189,12 @@ pub struct DiagnosticEvent {
     kind: DiagnosticEventKind,
     identity: Option<DiagnosticIdentity>,
     branch_planning: Option<BranchPlanningDiagnostic>,
+    frame_lifecycle: Option<FrameLifecycleDiagnostic>,
     redacted_message: String,
+}
+
+pub trait DiagnosticEventFrameLifecycle {
+    fn frame_lifecycle(&self) -> Option<&FrameLifecycleDiagnostic>;
 }
 
 impl DiagnosticEvent {
@@ -179,6 +207,7 @@ impl DiagnosticEvent {
             kind: DiagnosticEventKind::PendingOverwrite,
             identity: Some(identity),
             branch_planning: None,
+            frame_lifecycle: None,
             redacted_message: redacted_message.into(),
         }
     }
@@ -189,6 +218,7 @@ impl DiagnosticEvent {
             kind: DiagnosticEventKind::HostOrSlotUnavailable,
             identity: None,
             branch_planning: None,
+            frame_lifecycle: None,
             redacted_message: redacted_message.into(),
         }
     }
@@ -199,6 +229,7 @@ impl DiagnosticEvent {
             kind: DiagnosticEventKind::MatchFailed,
             identity: None,
             branch_planning: None,
+            frame_lifecycle: None,
             redacted_message: redacted_message.into(),
         }
     }
@@ -209,6 +240,7 @@ impl DiagnosticEvent {
             kind: DiagnosticEventKind::MatchConflict,
             identity: None,
             branch_planning: None,
+            frame_lifecycle: None,
             redacted_message: redacted_message.into(),
         }
     }
@@ -219,7 +251,27 @@ impl DiagnosticEvent {
             kind: DiagnosticEventKind::BranchPlanned,
             identity: None,
             branch_planning: Some(branch_planning),
+            frame_lifecycle: None,
             redacted_message: "branch planned".to_owned(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn frame_lifecycle(frame_lifecycle: FrameLifecycleDiagnostic) -> Self {
+        let identity = frame_lifecycle.identity();
+        Self {
+            kind: DiagnosticEventKind::FrameLifecycle,
+            identity: Some(DiagnosticIdentity::new(
+                identity.router(),
+                identity.host(),
+                identity.slot(),
+                identity.frame(),
+                identity.generation(),
+                Some(identity.route()),
+            )),
+            branch_planning: None,
+            frame_lifecycle: Some(frame_lifecycle),
+            redacted_message: "frame lifecycle changed".to_owned(),
         }
     }
 
@@ -237,6 +289,12 @@ impl DiagnosticEvent {
 
     pub fn redacted_message(&self) -> &str {
         &self.redacted_message
+    }
+}
+
+impl DiagnosticEventFrameLifecycle for DiagnosticEvent {
+    fn frame_lifecycle(&self) -> Option<&FrameLifecycleDiagnostic> {
+        self.frame_lifecycle.as_ref()
     }
 }
 
@@ -285,6 +343,7 @@ impl DiagnosticSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::{RouteFrameIdentity, RouteFrameStatus};
 
     #[test]
     fn identity_chain_records_router_host_slot_frame_generation_and_route() {
@@ -415,5 +474,28 @@ mod tests {
         assert_eq!(event.redacted_message(), "branch planned");
         assert!(!event.redacted_message().contains("frame"));
         assert!(!event.redacted_message().contains("generation"));
+    }
+
+    #[test]
+    fn frame_lifecycle_diagnostic_records_identity_and_status() {
+        let identity = RouteFrameIdentity::new(
+            RouterInstanceId::new(1),
+            RouteHostId::new(2),
+            RouteSlotId::new(3),
+            RouteId::new(5),
+            RouteFrameId::new(4),
+            RouteGeneration::initial(),
+        );
+        let payload = FrameLifecycleDiagnostic::new(identity, RouteFrameStatus::ApplyingView);
+        let event = DiagnosticEvent::frame_lifecycle(payload.clone());
+
+        assert_eq!(event.kind(), DiagnosticEventKind::FrameLifecycle);
+        assert_eq!(
+            event.identity().map(DiagnosticIdentity::frame),
+            Some(RouteFrameId::new(4))
+        );
+        assert_eq!(event.frame_lifecycle(), Some(&payload));
+        assert_eq!(event.redacted_message(), "frame lifecycle changed");
+        assert!(!event.redacted_message().contains("/"));
     }
 }
