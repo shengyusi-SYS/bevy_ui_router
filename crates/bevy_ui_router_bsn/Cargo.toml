@@ -1,0 +1,9 @@
+[package]
+name = "bevy_ui_router_bsn"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bevy_ui_router_core = { path = "../bevy_ui_router_core" }
+bevy_ui_router_ecs = { path = "../bevy_ui_router_ecs" }
+bevy_ui_router_view = { path = "../bevy_ui_router_view" }

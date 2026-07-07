@@ -1,12 +1,14 @@
-[package]
-name = "bevy_ui_router"
+[workspace]
+members = [
+    "crates/bevy_ui_router_core",
+    "crates/bevy_ui_router_view",
+    "crates/bevy_ui_router_ecs",
+    "crates/bevy_ui_router_bsn",
+    "crates/bevy_ui_router_platform",
+    "crates/bevy_ui_router",
+]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-
-[dependencies]
-bevy = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "sys/bevy-0.19-router", version = "0.19.0", default-features = false, features = [
-    "ui",
-    "debug",
-    "bevy_dev_tools",
-    "bevy_ui_widgets",
-] }
