@@ -1606,6 +1606,24 @@ git add docs/superpowers/plans/2026-07-07-phase-1a-route-model-matcher-contract-
 git commit -m "docs: record phase 1a matcher verification"
 ```
 
+#### Verification Evidence
+
+Recorded on 2026-07-07 after implementation commits `dcd2837` through `2b89032` and review-fix commit `b6d5c96`.
+
+- `cargo fmt --all --check`: exit 0.
+- `cargo test -p bevy_ui_router_core`: exit 0; 35 unit tests, 3 dependency-boundary integration tests, and 7 doc-tests passed.
+- `cargo test -p bevy_ui_router_core --doc`: exit 0; 7 doc-tests passed.
+- `cargo test -p bevy_ui_router_core --test dependency_boundary`: exit 0; 3 dependency-boundary tests passed.
+- `cargo test -p bevy_ui_router --no-default-features`: exit 0; 3 facade integration tests passed.
+- `cargo check -p bevy_ui_router --no-default-features --features platform`: exit 0.
+- `cargo check -p bevy_ui_router --no-default-features --features bsn`: exit 0.
+- `git ls-files Cargo.lock`: no tracked lockfile.
+- `git status --short`: clean after removing the generated untracked `Cargo.lock`, before writing this verification evidence note.
+
+Independent review found two implementation issues after the first verification pass: matcher conflict detection could run before considering all higher-specificity candidates, and route tree derived `Debug`/equality exposed internal matcher inputs. Commit `b6d5c96` fixed both and added regression coverage. A minor missing diagnostic conflict test was also added.
+
+Cargo invocations that needed `rustc` through local `sccache` were rerun with approved elevated execution after sandboxed execution returned Windows `os error 5` before compilation.
+
 ---
 
 ## 7. Review Gate Before Implementation
