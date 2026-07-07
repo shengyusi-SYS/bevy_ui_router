@@ -303,6 +303,33 @@ mod tests {
     }
 
     #[test]
+    fn search_change_fails_closed_by_raw_search_policy() {
+        let mut builder = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        builder
+            .route(root, RoutePattern::path("items").unwrap())
+            .unwrap();
+        let tree = builder.build().unwrap();
+        let matcher = RouteMatcher::new(tree);
+
+        let first = matcher
+            .match_location(&RouteLocation::new("/items").with_search("a=1&a=2"))
+            .unwrap();
+        let second = matcher
+            .match_location(&RouteLocation::new("/items").with_search("a=2&a=1"))
+            .unwrap();
+        let diff = BranchDiff::compare(&first, &second);
+
+        assert!(diff.search_changed());
+        assert!(diff.branch_fingerprint_changed());
+        assert_eq!(diff.common_prefix_len(), 0);
+        assert_eq!(diff.leaving().len(), first.routes().len());
+        assert_eq!(diff.entering().len(), second.routes().len());
+    }
+
+    #[test]
     fn identical_independent_trees_fail_closed_by_provenance() {
         let old_matcher = sample_items_matcher();
         let new_matcher = sample_items_matcher();
