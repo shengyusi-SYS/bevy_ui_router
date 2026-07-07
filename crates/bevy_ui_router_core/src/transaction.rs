@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::error::RouteError;
+use crate::error::{RouteError, RouteErrorKind};
 use crate::frame::{
     FrameCleanupPlan, FrameReconciliationPlan, RouteFrameBranch, RouteFrameRecord, RouteFrameStatus,
 };
@@ -94,7 +94,7 @@ impl FrameApplyToken {
 
     #[cfg(test)]
     pub(crate) fn testing_set_transaction_for_stale_check(&mut self) {
-        self.transaction = NavigationTransactionId(self.transaction.0 + 1);
+        self.transaction = NavigationTransactionId(self.transaction.0 + 1_024);
     }
 
     #[cfg(test)]
@@ -291,6 +291,10 @@ impl NavigationTransaction {
 
         check_token(expected, token)?;
 
+        if self.state == NavigationTransactionState::Failed {
+            return Ok(());
+        }
+
         match outcome {
             FrameApplyOutcome::Applied => {
                 if !self.accepted.contains(&token.frame()) {
@@ -300,17 +304,10 @@ impl NavigationTransaction {
                     self.state = NavigationTransactionState::ReadyToCommit;
                 }
             }
-            FrameApplyOutcome::Failed(_) => {
+            FrameApplyOutcome::Failed(error) => {
                 self.state = NavigationTransactionState::Failed;
                 self.failure = Some(TransactionFailure {
-                    cleanup: self
-                        .requests
-                        .iter()
-                        .map(FrameApplyRequest::frame)
-                        .map(RouteFrameRecord::identity)
-                        .copied()
-                        .map(FrameCleanupPlan::router_owned_partial_output)
-                        .collect(),
+                    cleanup: self.cleanup_for_failure(token.frame(), error.kind()),
                 });
             }
         }
@@ -358,6 +355,30 @@ impl NavigationTransaction {
             frames,
             self.plan.target_fingerprint().clone(),
         ))
+    }
+
+    fn cleanup_for_failure(
+        &self,
+        failed_frame: RouteFrameId,
+        error_kind: RouteErrorKind,
+    ) -> Vec<FrameCleanupPlan> {
+        let mut frame_ids = self.accepted.clone();
+        if error_kind == RouteErrorKind::ViewApplyFailed && !frame_ids.contains(&failed_frame) {
+            frame_ids.push(failed_frame);
+        }
+
+        frame_ids
+            .into_iter()
+            .filter_map(|frame_id| {
+                self.requests
+                    .iter()
+                    .map(FrameApplyRequest::frame)
+                    .find(|record| record.identity().frame() == frame_id)
+                    .map(RouteFrameRecord::identity)
+                    .copied()
+                    .map(FrameCleanupPlan::router_owned_partial_output)
+            })
+            .collect()
     }
 }
 
@@ -486,6 +507,38 @@ mod tests {
         (active, plan)
     }
 
+    fn plan_with_three_entering_requests() -> FrameReconciliationPlan {
+        let mut builder = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let items = builder
+            .route(root, RoutePattern::path("items").unwrap())
+            .unwrap();
+        builder
+            .route(items, RoutePattern::path(":id").unwrap())
+            .unwrap();
+        let matcher = RouteMatcher::new(builder.build().unwrap());
+        let target = matcher
+            .match_location(&RouteLocation::new("/items/2"))
+            .unwrap();
+        let mut allocator = FrameAllocator::new();
+        let scope = RouteFrameScope::new(
+            RouterInstanceId::new(1),
+            RouteHostId::new(2),
+            RouteSlotId::new(3),
+        );
+        FrameReconciliationPlan::from_first_navigation(scope, &target, &mut allocator)
+    }
+
+    fn cleanup_frame_ids(failure: &TransactionFailure) -> Vec<RouteFrameId> {
+        failure
+            .cleanup()
+            .iter()
+            .map(|plan| plan.identity().frame())
+            .collect()
+    }
+
     #[test]
     fn all_apply_token_identity_mismatches_are_stale_without_side_effects() {
         let (_active, plan) = branches();
@@ -570,6 +623,115 @@ mod tests {
             apply_failure.snapshot().state(),
             NavigationTransactionState::Failed
         );
+    }
+
+    #[test]
+    fn failed_transactions_ignore_later_valid_apply_results_but_still_reject_stale_tokens() {
+        let (_active, plan) = branches();
+        let mut transaction = NavigationTransaction::new(plan);
+        let token = transaction.snapshot().requests()[0].token().clone();
+        let stale = {
+            let mut token = token.clone();
+            token.testing_set_router(RouterInstanceId::new(9));
+            token
+        };
+
+        transaction
+            .accept_apply_result(
+                &token,
+                FrameApplyOutcome::Failed(RouteError::new(
+                    RouteErrorKind::ViewApplyFailed,
+                    RouteErrorSourceCategory::RendererContract,
+                    "apply failed",
+                )),
+            )
+            .unwrap();
+        let failed_snapshot = transaction.snapshot();
+
+        let stale_result = transaction.accept_apply_result(&stale, FrameApplyOutcome::Applied);
+        assert_eq!(
+            stale_result.unwrap_err().reason(),
+            StaleApplyReason::RouterMismatch
+        );
+
+        transaction
+            .accept_apply_result(&token, FrameApplyOutcome::Applied)
+            .unwrap();
+
+        assert_eq!(transaction.snapshot(), failed_snapshot);
+        assert_eq!(transaction.accepted_count(), 0);
+        assert_eq!(
+            transaction.snapshot().state(),
+            NavigationTransactionState::Failed
+        );
+    }
+
+    #[test]
+    fn cleanup_tracks_only_actual_partial_output_for_apply_failures() {
+        let plan = plan_with_three_entering_requests();
+        let mut transaction = NavigationTransaction::new(plan);
+
+        let first_built =
+            FakeApplyHarness::build_success(transaction.snapshot().requests()[0].token());
+        let (first_token, first_outcome) = FakeApplyHarness::apply_success(first_built);
+        transaction
+            .accept_apply_result(&first_token, first_outcome)
+            .unwrap();
+
+        let second_built =
+            FakeApplyHarness::build_success(transaction.snapshot().requests()[1].token());
+        let failed_frame = second_built.frame();
+        let (second_token, second_outcome) = FakeApplyHarness::apply_failure(
+            second_built,
+            RouteError::new(
+                RouteErrorKind::ViewApplyFailed,
+                RouteErrorSourceCategory::RendererContract,
+                "apply failed",
+            ),
+        );
+        transaction
+            .accept_apply_result(&second_token, second_outcome)
+            .unwrap();
+
+        let failure = transaction.snapshot().failure().cloned().unwrap();
+        let frame_ids = cleanup_frame_ids(&failure);
+
+        assert_eq!(frame_ids.len(), 2);
+        assert_eq!(frame_ids[0], first_token.frame());
+        assert_eq!(frame_ids[1], failed_frame);
+        assert!(!frame_ids.contains(&transaction.snapshot().requests()[2].token().frame()));
+    }
+
+    #[test]
+    fn build_failure_before_partial_output_does_not_cleanup_failed_frame() {
+        let plan = plan_with_three_entering_requests();
+        let mut transaction = NavigationTransaction::new(plan);
+
+        let first_built =
+            FakeApplyHarness::build_success(transaction.snapshot().requests()[0].token());
+        let (first_token, first_outcome) = FakeApplyHarness::apply_success(first_built);
+        transaction
+            .accept_apply_result(&first_token, first_outcome)
+            .unwrap();
+
+        let failed_token = transaction.snapshot().requests()[1].token().clone();
+        let (second_token, second_outcome) = FakeApplyHarness::build_failure(
+            &failed_token,
+            RouteError::new(
+                RouteErrorKind::ViewBuildFailed,
+                RouteErrorSourceCategory::RendererContract,
+                "build failed",
+            ),
+        );
+        transaction
+            .accept_apply_result(&second_token, second_outcome)
+            .unwrap();
+
+        let failure = transaction.snapshot().failure().cloned().unwrap();
+        let frame_ids = cleanup_frame_ids(&failure);
+
+        assert_eq!(frame_ids, vec![first_token.frame()]);
+        assert!(!frame_ids.contains(&failed_token.frame()));
     }
 
     fn stale_token_cases(
