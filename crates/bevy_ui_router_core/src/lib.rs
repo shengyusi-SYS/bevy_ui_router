@@ -16,6 +16,7 @@ pub mod ownership;
 pub mod pattern;
 pub mod route_tree;
 pub mod slot;
+pub mod transaction;
 
 pub mod prelude {
     pub use crate::back::{BackCapabilitySnapshot, BackIntent, BackPolicy};
@@ -39,4 +40,9 @@ pub mod prelude {
     pub use crate::pattern::{RoutePathSegment, RoutePattern, RoutePatternKind};
     pub use crate::route_tree::{RouteNodeOptions, RouteTree, RouteTreeBuilder};
     pub use crate::slot::RouteSlotKey;
+    pub use crate::transaction::{
+        FrameApplyOutcome, FrameApplyRequest, FrameApplyToken, NavigationTransactionSnapshot,
+        NavigationTransactionState, StaleApplyReason, StaleApplyResult, TransactionCommitError,
+        TransactionCommitErrorKind, TransactionFailure,
+    };
 }
