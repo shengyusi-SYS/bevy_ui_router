@@ -189,6 +189,16 @@ impl RouteFrameBranch {
         &self.branch_fingerprint
     }
 
+    fn belongs_to_scope(&self, scope: RouteFrameScope) -> bool {
+        !self.frames.is_empty()
+            && self.frames.iter().all(|record| {
+                let identity = record.identity();
+                identity.router() == scope.router()
+                    && identity.host() == scope.host()
+                    && identity.slot() == scope.slot()
+            })
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_matched_branch(
         scope: RouteFrameScope,
@@ -259,44 +269,61 @@ impl FrameReconciliationPlan {
         diff: &BranchDiff,
         allocator: &mut FrameAllocator,
     ) -> Self {
+        let in_scope_active = active.filter(|branch| branch.belongs_to_scope(scope));
+        let baseline_fingerprint =
+            in_scope_active.map(|branch| branch.branch_fingerprint().clone());
+        let target_fingerprint = target.branch_fingerprint().clone();
         let common = diff.common_prefix_len();
-        let active_frames: &[RouteFrameRecord] =
-            active.map(RouteFrameBranch::frames).unwrap_or(&[]);
-        let preserved = active_frames[..common].to_vec();
-        let leaving = active_frames[common..]
-            .iter()
-            .rev()
-            .map(|record| record.with_status(RouteFrameStatus::Leaving))
-            .collect();
-        let entering = target.routes()[common..]
-            .iter()
-            .enumerate()
-            .map(|(offset, matched)| {
-                let branch_index = common + offset;
-                let identity = RouteFrameIdentity::new(
-                    scope.router(),
-                    scope.host(),
-                    scope.slot(),
-                    matched.route(),
-                    allocator.allocate(),
-                    RouteGeneration::initial(),
-                );
-                RouteFrameRecord::new(
-                    identity,
-                    branch_index,
-                    matched.slot().clone(),
-                    matched.segment_reuse_key().clone(),
+        let can_reuse = in_scope_active.is_some_and(|branch| {
+            branch.branch_fingerprint() == diff.baseline_branch_fingerprint()
+                && &target_fingerprint == diff.target_branch_fingerprint()
+                && common <= branch.frames().len()
+                && common <= target.routes().len()
+        });
+
+        let (preserved, leaving, entering) = if let Some(branch) = in_scope_active {
+            if can_reuse {
+                let active_frames = branch.frames();
+                let preserved = active_frames[..common].to_vec();
+                let leaving = active_frames[common..]
+                    .iter()
+                    .rev()
+                    .map(|record| record.with_status(RouteFrameStatus::Leaving))
+                    .collect();
+                let entering = build_entering_records(
+                    scope,
+                    target,
+                    common,
                     RouteFrameStatus::Building,
+                    allocator,
+                );
+                (preserved, leaving, entering)
+            } else {
+                (
+                    Vec::new(),
+                    branch
+                        .frames()
+                        .iter()
+                        .rev()
+                        .map(|record| record.with_status(RouteFrameStatus::Leaving))
+                        .collect(),
+                    build_entering_records(scope, target, 0, RouteFrameStatus::Building, allocator),
                 )
-            })
-            .collect();
+            }
+        } else {
+            (
+                Vec::new(),
+                Vec::new(),
+                build_entering_records(scope, target, 0, RouteFrameStatus::Building, allocator),
+            )
+        };
 
         Self {
             preserved,
             leaving,
             entering,
-            baseline_fingerprint: active.map(|branch| branch.branch_fingerprint().clone()),
-            target_fingerprint: target.branch_fingerprint().clone(),
+            baseline_fingerprint,
+            target_fingerprint,
         }
     }
 
@@ -306,28 +333,8 @@ impl FrameReconciliationPlan {
         target: &MatchedBranch,
         allocator: &mut FrameAllocator,
     ) -> Self {
-        let entering = target
-            .routes()
-            .iter()
-            .enumerate()
-            .map(|(index, matched)| {
-                let identity = RouteFrameIdentity::new(
-                    scope.router(),
-                    scope.host(),
-                    scope.slot(),
-                    matched.route(),
-                    allocator.allocate(),
-                    RouteGeneration::initial(),
-                );
-                RouteFrameRecord::new(
-                    identity,
-                    index,
-                    matched.slot().clone(),
-                    matched.segment_reuse_key().clone(),
-                    RouteFrameStatus::Building,
-                )
-            })
-            .collect();
+        let entering =
+            build_entering_records(scope, target, 0, RouteFrameStatus::Building, allocator);
         Self {
             preserved: Vec::new(),
             leaving: Vec::new(),
@@ -356,6 +363,37 @@ impl FrameReconciliationPlan {
     pub const fn target_fingerprint(&self) -> &RouteBranchFingerprint {
         &self.target_fingerprint
     }
+}
+
+fn build_entering_records(
+    scope: RouteFrameScope,
+    target: &MatchedBranch,
+    start_index: usize,
+    status: RouteFrameStatus,
+    allocator: &mut FrameAllocator,
+) -> Vec<RouteFrameRecord> {
+    target.routes()[start_index..]
+        .iter()
+        .enumerate()
+        .map(|(offset, matched)| {
+            let branch_index = start_index + offset;
+            let identity = RouteFrameIdentity::new(
+                scope.router(),
+                scope.host(),
+                scope.slot(),
+                matched.route(),
+                allocator.allocate(),
+                RouteGeneration::initial(),
+            );
+            RouteFrameRecord::new(
+                identity,
+                branch_index,
+                matched.slot().clone(),
+                matched.segment_reuse_key().clone(),
+                status,
+            )
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -613,6 +651,87 @@ mod tests {
             active.frames()[2].identity().frame()
         );
         assert_eq!(plan.entering()[0].status(), RouteFrameStatus::Building);
+    }
+
+    #[test]
+    fn reconciliation_fails_closed_when_active_branch_does_not_match_diff_baseline() {
+        let matcher = sample_items_matcher();
+        let stale_branch = matcher
+            .match_location(&RouteLocation::new("/items/1"))
+            .unwrap();
+        let old_branch = matcher
+            .match_location(&RouteLocation::new("/items/2"))
+            .unwrap();
+        let new_branch = matcher
+            .match_location(&RouteLocation::new("/items/3"))
+            .unwrap();
+        let diff = BranchDiff::compare(&old_branch, &new_branch);
+        let mut allocator = FrameAllocator::new();
+        let scope = RouteFrameScope::new(
+            RouterInstanceId::new(1),
+            RouteHostId::new(2),
+            RouteSlotId::new(3),
+        );
+        let active = RouteFrameBranch::from_matched_branch(scope, &stale_branch, &mut allocator);
+
+        let plan = FrameReconciliationPlan::from_diff(
+            scope,
+            Some(&active),
+            &new_branch,
+            &diff,
+            &mut allocator,
+        );
+
+        assert_eq!(
+            plan.baseline_fingerprint(),
+            Some(active.branch_fingerprint())
+        );
+        assert!(plan.preserved().is_empty());
+        assert_eq!(plan.leaving().len(), active.frames().len());
+        assert_eq!(plan.entering().len(), new_branch.routes().len());
+        assert_eq!(plan.entering()[0].branch_index(), 0);
+    }
+
+    #[test]
+    fn reconciliation_does_not_leave_or_preserve_foreign_scope_active_branch() {
+        let matcher = sample_items_matcher();
+        let old_branch = matcher
+            .match_location(&RouteLocation::new("/items/1"))
+            .unwrap();
+        let new_branch = matcher
+            .match_location(&RouteLocation::new("/items/2"))
+            .unwrap();
+        let diff = BranchDiff::compare(&old_branch, &new_branch);
+        let mut allocator = FrameAllocator::new();
+        let active_scope = RouteFrameScope::new(
+            RouterInstanceId::new(9),
+            RouteHostId::new(9),
+            RouteSlotId::new(9),
+        );
+        let requested_scope = RouteFrameScope::new(
+            RouterInstanceId::new(1),
+            RouteHostId::new(2),
+            RouteSlotId::new(3),
+        );
+        let active =
+            RouteFrameBranch::from_matched_branch(active_scope, &old_branch, &mut allocator);
+
+        let plan = FrameReconciliationPlan::from_diff(
+            requested_scope,
+            Some(&active),
+            &new_branch,
+            &diff,
+            &mut allocator,
+        );
+
+        assert!(plan.baseline_fingerprint().is_none());
+        assert!(plan.preserved().is_empty());
+        assert!(plan.leaving().is_empty());
+        assert_eq!(plan.entering().len(), new_branch.routes().len());
+        assert_eq!(
+            plan.entering()[0].identity().router(),
+            requested_scope.router()
+        );
     }
 
     #[test]

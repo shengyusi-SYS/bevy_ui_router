@@ -5,6 +5,7 @@
 //! ```
 
 use crate::branch::{MatchedBranch, MatchedRoute};
+use crate::fingerprint::RouteBranchFingerprint;
 use crate::ids::RouteId;
 use crate::slot::RouteSlotKey;
 
@@ -42,6 +43,8 @@ pub struct BranchDiff {
     common_prefix_len: usize,
     leaving: Vec<BranchDiffRoute>,
     entering: Vec<BranchDiffRoute>,
+    baseline_branch_fingerprint: RouteBranchFingerprint,
+    target_branch_fingerprint: RouteBranchFingerprint,
     provenance_changed: bool,
     search_changed: bool,
     branch_fingerprint_changed: bool,
@@ -77,6 +80,8 @@ impl BranchDiff {
             common_prefix_len,
             leaving,
             entering,
+            baseline_branch_fingerprint: old.branch_fingerprint().clone(),
+            target_branch_fingerprint: new.branch_fingerprint().clone(),
             provenance_changed,
             search_changed,
             branch_fingerprint_changed: old.branch_fingerprint() != new.branch_fingerprint(),
@@ -93,6 +98,14 @@ impl BranchDiff {
 
     pub fn entering(&self) -> &[BranchDiffRoute] {
         &self.entering
+    }
+
+    pub(crate) const fn baseline_branch_fingerprint(&self) -> &RouteBranchFingerprint {
+        &self.baseline_branch_fingerprint
+    }
+
+    pub(crate) const fn target_branch_fingerprint(&self) -> &RouteBranchFingerprint {
+        &self.target_branch_fingerprint
     }
 
     pub const fn provenance_changed(&self) -> bool {
@@ -154,6 +167,8 @@ mod tests {
         assert_eq!(diff.leaving().len(), 1);
         assert_eq!(diff.entering().len(), 1);
         assert!(diff.branch_fingerprint_changed());
+        assert_eq!(diff.baseline_branch_fingerprint(), old.branch_fingerprint());
+        assert_eq!(diff.target_branch_fingerprint(), new.branch_fingerprint());
     }
 
     #[test]
