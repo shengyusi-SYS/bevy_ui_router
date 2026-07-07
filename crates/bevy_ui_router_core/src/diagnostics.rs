@@ -303,4 +303,13 @@ mod tests {
         );
         assert!(snapshot.events()[0].identity().is_none());
     }
+
+    #[test]
+    fn match_conflict_diagnostics_record_no_active_identity() {
+        let event = DiagnosticEvent::match_conflict("ambiguous route match");
+
+        assert_eq!(event.kind(), DiagnosticEventKind::MatchConflict);
+        assert!(event.identity().is_none());
+        assert_eq!(event.redacted_message(), "ambiguous route match");
+    }
 }

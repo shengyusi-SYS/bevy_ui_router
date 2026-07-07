@@ -7,7 +7,7 @@ use crate::location::RouteLocation;
 use crate::pattern::{RoutePathSegment, RoutePatternKind};
 use crate::route_tree::{RouteNode, RouteTree};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct RouteMatcher {
     tree: RouteTree,
 }
@@ -187,22 +187,26 @@ fn split_location_path(path: &str) -> Vec<&str> {
         .collect()
 }
 
-fn select_candidate(mut candidates: Vec<Candidate>) -> Result<MatchedBranch, RouteError> {
-    let Some(mut best) = candidates.pop() else {
+fn select_candidate(candidates: Vec<Candidate>) -> Result<MatchedBranch, RouteError> {
+    let Some(best_key) = candidates
+        .iter()
+        .map(|candidate| candidate.specificity)
+        .max_by(|left, right| left.preference_cmp(right))
+    else {
         return Err(RouteError::not_found("no route matched requested location"));
     };
 
-    for candidate in candidates {
-        match candidate.specificity.preference_cmp(&best.specificity) {
-            Ordering::Greater => best = candidate,
-            Ordering::Equal => {
-                if candidate.branch.leaf().map(MatchedRoute::route)
-                    != best.branch.leaf().map(MatchedRoute::route)
-                {
-                    return Err(RouteError::match_conflict("ambiguous route match"));
-                }
-            }
-            Ordering::Less => {}
+    let mut best_candidates = candidates
+        .into_iter()
+        .filter(|candidate| candidate.specificity.preference_cmp(&best_key) == Ordering::Equal);
+    let best = best_candidates
+        .next()
+        .expect("best key came from at least one candidate");
+    let best_leaf = best.branch.leaf().map(MatchedRoute::route);
+
+    for candidate in best_candidates {
+        if candidate.branch.leaf().map(MatchedRoute::route) != best_leaf {
+            return Err(RouteError::match_conflict("ambiguous route match"));
         }
     }
 
@@ -386,6 +390,33 @@ mod tests {
         assert_eq!(
             error.source_category(),
             RouteErrorSourceCategory::RouterCore
+        );
+    }
+
+    #[test]
+    fn higher_specificity_candidate_wins_before_conflict_detection() {
+        let mut builder = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let _first_dynamic = builder
+            .route(root, RoutePattern::path("settings/:id").unwrap())
+            .unwrap();
+        let exact = builder
+            .route(root, RoutePattern::path("settings/profile").unwrap())
+            .unwrap();
+        let _second_dynamic = builder
+            .route(root, RoutePattern::path("settings/:slug").unwrap())
+            .unwrap();
+        let matcher = RouteMatcher::new(builder.build().unwrap());
+
+        assert_eq!(
+            matcher
+                .match_location(&RouteLocation::new("/settings/profile"))
+                .unwrap()
+                .leaf()
+                .map(MatchedRoute::route),
+            Some(exact)
         );
     }
 }

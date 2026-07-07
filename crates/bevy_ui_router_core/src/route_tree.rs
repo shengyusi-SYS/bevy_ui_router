@@ -4,19 +4,30 @@
 //! let _ = RouteId::new(99);
 //! ```
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use crate::error::RouteError;
 use crate::ids::RouteId;
 use crate::pattern::RoutePattern;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct RouteNode {
     id: RouteId,
     parent: Option<RouteId>,
     pattern: RoutePattern,
     declaration_index: usize,
     children: Vec<RouteId>,
+}
+
+impl fmt::Debug for RouteNode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RouteNode")
+            .field("id", &self.id)
+            .field("parent", &self.parent)
+            .field("pattern", &self.pattern)
+            .finish()
+    }
 }
 
 impl RouteNode {
@@ -43,10 +54,20 @@ impl RouteNode {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct RouteTree {
     root: RouteId,
     nodes: BTreeMap<RouteId, RouteNode>,
+}
+
+impl fmt::Debug for RouteTree {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RouteTree")
+            .field("root", &self.root)
+            .field("route_count", &self.nodes.len())
+            .finish()
+    }
 }
 
 impl RouteTree {
@@ -63,12 +84,22 @@ impl RouteTree {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct RouteTreeBuilder {
     root: Option<RouteId>,
     nodes: BTreeMap<RouteId, RouteNode>,
     next_id: u64,
     next_declaration_index: usize,
+}
+
+impl fmt::Debug for RouteTreeBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RouteTreeBuilder")
+            .field("root", &self.root)
+            .field("route_count", &self.nodes.len())
+            .finish()
+    }
 }
 
 impl RouteTreeBuilder {
@@ -214,5 +245,26 @@ mod tests {
         let tree = builder.build().unwrap();
 
         assert_eq!(tree.node(root).unwrap().children(), &[first, second]);
+    }
+
+    #[test]
+    fn debug_output_does_not_expose_internal_matcher_inputs() {
+        let mut builder = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let _child = builder
+            .route(root, RoutePattern::path("settings").unwrap())
+            .unwrap();
+        let builder_debug = format!("{:?}", builder);
+        let tree = builder.build().unwrap();
+        let node_debug = format!("{:?}", tree.node(root).unwrap());
+        let tree_debug = format!("{:?}", tree);
+
+        for output in [builder_debug, node_debug, tree_debug] {
+            assert!(!output.contains("children"));
+            assert!(!output.contains("declaration_index"));
+            assert!(!output.contains("next_declaration_index"));
+        }
     }
 }
