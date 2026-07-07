@@ -2,6 +2,9 @@ use std::cmp::Ordering;
 
 use crate::branch::{MatchedBranch, MatchedRoute, RouteParams};
 use crate::error::{RouteError, RouteErrorKind, RouteErrorSourceCategory};
+use crate::fingerprint::{
+    RouteBranchFingerprint, RouteParamsFingerprint, RouteSearchFingerprint, RouteSegmentReuseKey,
+};
 use crate::ids::RouteId;
 use crate::location::RouteLocation;
 use crate::pattern::{RoutePathSegment, RoutePatternKind};
@@ -19,6 +22,7 @@ impl RouteMatcher {
 
     pub fn match_location(&self, location: &RouteLocation) -> Result<MatchedBranch, RouteError> {
         let segments = split_location_path(location.path());
+        let search_fingerprint = RouteSearchFingerprint::from_location(location);
         let mut candidates = Vec::new();
         self.visit(
             self.tree.root(),
@@ -26,6 +30,7 @@ impl RouteMatcher {
             0,
             Vec::new(),
             SpecificityKey::default(),
+            &search_fingerprint,
             &mut candidates,
         )?;
         select_candidate(candidates)
@@ -38,6 +43,7 @@ impl RouteMatcher {
         cursor: usize,
         branch: Vec<MatchedRoute>,
         specificity: SpecificityKey,
+        search_fingerprint: &RouteSearchFingerprint,
         candidates: &mut Vec<Candidate>,
     ) -> Result<(), RouteError> {
         let node = self
@@ -48,13 +54,39 @@ impl RouteMatcher {
             return Ok(());
         };
 
+        let options = node.options();
+        let params_fingerprint = RouteParamsFingerprint::from_route_params(route, &matched.params);
+        let segment_reuse_key = RouteSegmentReuseKey::from_parts(
+            route,
+            options.slot(),
+            options.explicit_key(),
+            &params_fingerprint,
+        );
         let mut next_branch = branch;
-        next_branch.push(MatchedRoute::new(route, matched.params));
+        next_branch.push(MatchedRoute::new(
+            route,
+            matched.params,
+            options.slot().clone(),
+            options.explicit_key().cloned(),
+            options.error_boundary().cloned(),
+            options.meta().clone(),
+            params_fingerprint,
+            segment_reuse_key,
+        ));
         let next_specificity = specificity.add(matched.specificity);
 
         if matched.next_cursor == segments.len() {
+            let branch_fingerprint = RouteBranchFingerprint::from_parts(
+                next_branch.iter().map(MatchedRoute::segment_reuse_key),
+                search_fingerprint,
+            );
             candidates.push(Candidate {
-                branch: MatchedBranch::new(next_branch.clone()),
+                branch: MatchedBranch::new(
+                    next_branch.clone(),
+                    self.tree.provenance().clone(),
+                    search_fingerprint.clone(),
+                    branch_fingerprint,
+                ),
                 specificity: next_specificity,
             });
         }
@@ -66,6 +98,7 @@ impl RouteMatcher {
                 matched.next_cursor,
                 next_branch.clone(),
                 next_specificity,
+                search_fingerprint,
                 candidates,
             )?;
         }
@@ -74,7 +107,7 @@ impl RouteMatcher {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct Candidate {
     branch: MatchedBranch,
     specificity: SpecificityKey,
@@ -224,12 +257,14 @@ fn internal_error(message: &'static str) -> RouteError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::branch::MatchedRoute;
+    use crate::branch::{MatchedBranch, MatchedRoute};
     use crate::error::{RouteErrorKind, RouteErrorSourceCategory};
     use crate::ids::RouteId;
     use crate::location::RouteLocation;
+    use crate::meta::{ErrorBoundaryKey, RouteExplicitKey, RouteMeta};
     use crate::pattern::RoutePattern;
-    use crate::route_tree::RouteTree;
+    use crate::route_tree::{RouteNodeOptions, RouteTree};
+    use crate::slot::RouteSlotKey;
 
     fn sample_tree() -> (RouteTree, RouteId, RouteId, RouteId, RouteId, RouteId) {
         let mut builder = RouteTree::builder()
@@ -418,5 +453,147 @@ mod tests {
                 .map(MatchedRoute::route),
             Some(exact)
         );
+    }
+
+    #[test]
+    fn matched_branch_carries_slot_metadata_boundaries_and_fingerprints() {
+        let mut builder = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let layout_options = RouteNodeOptions::new()
+            .with_error_boundary(ErrorBoundaryKey::named("root-boundary").unwrap())
+            .with_meta(RouteMeta::new().with_diagnostic_label("layout").unwrap());
+        let layout = builder
+            .route_with_options(root, RoutePattern::pathless(), layout_options)
+            .unwrap();
+        let detail_options = RouteNodeOptions::new()
+            .with_slot(RouteSlotKey::named("details").unwrap())
+            .with_explicit_key(RouteExplicitKey::new("detail-v1").unwrap())
+            .with_error_boundary(ErrorBoundaryKey::named("detail-boundary").unwrap())
+            .with_meta(
+                RouteMeta::new()
+                    .with_diagnostic_label("detail-label")
+                    .unwrap(),
+            );
+        builder
+            .route_with_options(
+                layout,
+                RoutePattern::path("items/:id").unwrap(),
+                detail_options,
+            )
+            .unwrap();
+
+        let branch = RouteMatcher::new(builder.build().unwrap())
+            .match_location(&RouteLocation::new("/items/42").with_search("tab=files"))
+            .unwrap();
+        let detail = branch.leaf().unwrap();
+
+        assert_eq!(detail.slot().as_str(), "details");
+        assert_eq!(
+            detail.explicit_key().map(RouteExplicitKey::as_str),
+            Some("detail-v1")
+        );
+        assert_eq!(detail.meta().diagnostic_label(), Some("detail-label"));
+        assert_eq!(
+            branch
+                .nearest_error_boundary_for(detail.route())
+                .map(ErrorBoundaryKey::as_str),
+            Some("detail-boundary")
+        );
+        assert!(
+            detail
+                .params_fingerprint()
+                .as_str()
+                .contains("param:2:id=2:42")
+        );
+        assert!(branch.search_fingerprint().as_str().contains("tab=files"));
+        assert!(detail.segment_reuse_key().as_str().contains("detail-v1"));
+        assert!(!detail.segment_reuse_key().as_str().contains("detail-label"));
+        assert!(
+            !detail
+                .segment_reuse_key()
+                .as_str()
+                .contains("detail-boundary")
+        );
+        assert!(
+            !branch
+                .branch_fingerprint()
+                .as_str()
+                .contains("detail-label")
+        );
+        assert!(
+            !branch
+                .branch_fingerprint()
+                .as_str()
+                .contains("detail-boundary")
+        );
+    }
+
+    #[test]
+    fn matched_branch_fingerprints_do_not_merge_ancestor_params() {
+        let mut builder = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let project = builder
+            .route(root, RoutePattern::path("projects/:project_id").unwrap())
+            .unwrap();
+        builder
+            .route(project, RoutePattern::path("files/:file_id").unwrap())
+            .unwrap();
+
+        let branch = RouteMatcher::new(builder.build().unwrap())
+            .match_location(&RouteLocation::new("/projects/alpha/files/readme"))
+            .unwrap();
+        let project_route = &branch.routes()[1];
+        let leaf = branch.leaf().unwrap();
+
+        assert_eq!(project_route.params().get("project_id"), Some("alpha"));
+        assert_eq!(leaf.params().get("project_id"), None);
+        assert!(
+            project_route
+                .params_fingerprint()
+                .as_str()
+                .contains("param:10:project_id=5:alpha")
+        );
+        assert!(
+            leaf.params_fingerprint()
+                .as_str()
+                .contains("param:7:file_id=6:readme")
+        );
+        assert!(!leaf.params_fingerprint().as_str().contains("project_id"));
+    }
+
+    fn branch_with_metadata(label: &str, boundary: &str) -> MatchedBranch {
+        let mut builder = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let options = RouteNodeOptions::new()
+            .with_slot(RouteSlotKey::named("details").unwrap())
+            .with_explicit_key(RouteExplicitKey::new("detail-v1").unwrap())
+            .with_error_boundary(ErrorBoundaryKey::named(boundary).unwrap())
+            .with_meta(RouteMeta::new().with_diagnostic_label(label).unwrap());
+        builder
+            .route_with_options(root, RoutePattern::path("items/:id").unwrap(), options)
+            .unwrap();
+
+        RouteMatcher::new(builder.build().unwrap())
+            .match_location(&RouteLocation::new("/items/42").with_search("tab=files"))
+            .unwrap()
+    }
+
+    #[test]
+    fn metadata_and_error_boundaries_do_not_change_reuse_or_branch_fingerprints() {
+        let first = branch_with_metadata("alpha-label", "alpha-boundary");
+        let second = branch_with_metadata("beta-label", "beta-boundary");
+
+        assert!(first.provenance() != second.provenance());
+        assert_eq!(
+            first.leaf().unwrap().segment_reuse_key(),
+            second.leaf().unwrap().segment_reuse_key()
+        );
+        assert_eq!(first.branch_fingerprint(), second.branch_fingerprint());
     }
 }

@@ -7,6 +7,7 @@
 use std::{collections::BTreeMap, fmt};
 
 use crate::error::RouteError;
+use crate::fingerprint::RouteBranchProvenance;
 use crate::ids::RouteId;
 use crate::meta::{ErrorBoundaryKey, RouteExplicitKey, RouteMeta};
 use crate::pattern::RoutePattern;
@@ -126,6 +127,7 @@ impl RouteNode {
 pub struct RouteTree {
     root: RouteId,
     nodes: BTreeMap<RouteId, RouteNode>,
+    provenance: RouteBranchProvenance,
 }
 
 impl fmt::Debug for RouteTree {
@@ -149,6 +151,10 @@ impl RouteTree {
 
     pub fn node(&self, id: RouteId) -> Option<&RouteNode> {
         self.nodes.get(&id)
+    }
+
+    pub(crate) fn provenance(&self) -> &RouteBranchProvenance {
+        &self.provenance
     }
 }
 
@@ -233,6 +239,7 @@ impl RouteTreeBuilder {
         Ok(RouteTree {
             root,
             nodes: self.nodes,
+            provenance: RouteBranchProvenance::next_tree_source(),
         })
     }
 
@@ -411,5 +418,32 @@ mod tests {
         assert!(node.options().explicit_key().is_none());
         assert!(node.options().error_boundary().is_none());
         assert!(node.options().meta().diagnostic_label().is_none());
+    }
+
+    #[test]
+    fn route_tree_provenance_is_internal_stable_for_clones_and_distinct_for_builds() {
+        let tree = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        let cloned = tree.clone();
+        let other = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert!(tree.provenance() == cloned.provenance());
+        assert!(tree.provenance() != other.provenance());
+
+        for output in [
+            format!("{:?}", tree),
+            format!("{:?}", cloned),
+            format!("{:?}", other),
+        ] {
+            assert!(!output.contains("provenance"));
+            assert!(!output.contains("RouteBranchProvenance"));
+        }
     }
 }
