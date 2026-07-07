@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::error::{RouteError, RouteErrorKind, RouteErrorSourceCategory};
+use crate::error::RouteError;
 use crate::ids::RouteId;
 use crate::pattern::RoutePattern;
 
@@ -133,11 +133,7 @@ impl RouteTreeBuilder {
 }
 
 fn invalid_tree(message: &'static str) -> RouteError {
-    RouteError::new(
-        RouteErrorKind::InvalidRouteTree,
-        RouteErrorSourceCategory::RouterCore,
-        message,
-    )
+    RouteError::invalid_route_tree(message)
 }
 
 #[cfg(test)]

@@ -96,6 +96,8 @@ impl DiagnosticIdentity {
 pub enum DiagnosticEventKind {
     PendingOverwrite,
     HostOrSlotUnavailable,
+    MatchFailed,
+    MatchConflict,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,6 +124,24 @@ impl DiagnosticEvent {
     pub(crate) fn host_or_slot_unavailable(redacted_message: impl Into<String>) -> Self {
         Self {
             kind: DiagnosticEventKind::HostOrSlotUnavailable,
+            identity: None,
+            redacted_message: redacted_message.into(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn match_failed(redacted_message: impl Into<String>) -> Self {
+        Self {
+            kind: DiagnosticEventKind::MatchFailed,
+            identity: None,
+            redacted_message: redacted_message.into(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn match_conflict(redacted_message: impl Into<String>) -> Self {
+        Self {
+            kind: DiagnosticEventKind::MatchConflict,
             identity: None,
             redacted_message: redacted_message.into(),
         }
@@ -262,5 +282,25 @@ mod tests {
         );
         assert_eq!(snapshot.active(), Some(identity));
         assert!(snapshot.events().is_empty());
+    }
+
+    #[test]
+    fn match_diagnostics_record_requested_location_without_active_identity() {
+        let snapshot = DiagnosticSnapshot::new()
+            .with_requested(RouteLocation::new("/missing"))
+            .with_event(DiagnosticEvent::match_failed(
+                "no route matched requested location",
+            ));
+
+        assert_eq!(
+            snapshot.requested().map(RouteLocation::path),
+            Some("/missing")
+        );
+        assert!(snapshot.active().is_none());
+        assert_eq!(
+            snapshot.events()[0].kind(),
+            DiagnosticEventKind::MatchFailed
+        );
+        assert!(snapshot.events()[0].identity().is_none());
     }
 }

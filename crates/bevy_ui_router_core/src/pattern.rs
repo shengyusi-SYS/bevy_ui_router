@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::error::{RouteError, RouteErrorKind, RouteErrorSourceCategory};
+use crate::error::RouteError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RoutePatternKind {
@@ -123,11 +123,7 @@ fn validate_capture_name(name: &str, seen_names: &mut BTreeSet<String>) -> Resul
 }
 
 fn invalid_pattern(message: &'static str) -> RouteError {
-    RouteError::new(
-        RouteErrorKind::InvalidRoutePattern,
-        RouteErrorSourceCategory::RouterCore,
-        message,
-    )
+    RouteError::invalid_route_pattern(message)
 }
 
 #[cfg(test)]

@@ -189,11 +189,7 @@ fn split_location_path(path: &str) -> Vec<&str> {
 
 fn select_candidate(mut candidates: Vec<Candidate>) -> Result<MatchedBranch, RouteError> {
     let Some(mut best) = candidates.pop() else {
-        return Err(RouteError::new(
-            RouteErrorKind::NotFound,
-            RouteErrorSourceCategory::RouterCore,
-            "route location did not match any route",
-        ));
+        return Err(RouteError::not_found("no route matched requested location"));
     };
 
     for candidate in candidates {
@@ -203,11 +199,7 @@ fn select_candidate(mut candidates: Vec<Candidate>) -> Result<MatchedBranch, Rou
                 if candidate.branch.leaf().map(MatchedRoute::route)
                     != best.branch.leaf().map(MatchedRoute::route)
                 {
-                    return Err(RouteError::new(
-                        RouteErrorKind::MatchConflict,
-                        RouteErrorSourceCategory::RouterCore,
-                        "ambiguous route match",
-                    ));
+                    return Err(RouteError::match_conflict("ambiguous route match"));
                 }
             }
             Ordering::Less => {}

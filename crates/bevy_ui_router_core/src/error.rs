@@ -44,6 +44,38 @@ impl RouteError {
         }
     }
 
+    pub fn invalid_route_pattern(redacted_message: impl Into<String>) -> Self {
+        Self::new(
+            RouteErrorKind::InvalidRoutePattern,
+            RouteErrorSourceCategory::RouterCore,
+            redacted_message,
+        )
+    }
+
+    pub fn invalid_route_tree(redacted_message: impl Into<String>) -> Self {
+        Self::new(
+            RouteErrorKind::InvalidRouteTree,
+            RouteErrorSourceCategory::RouterCore,
+            redacted_message,
+        )
+    }
+
+    pub fn not_found(redacted_message: impl Into<String>) -> Self {
+        Self::new(
+            RouteErrorKind::NotFound,
+            RouteErrorSourceCategory::RouterCore,
+            redacted_message,
+        )
+    }
+
+    pub fn match_conflict(redacted_message: impl Into<String>) -> Self {
+        Self::new(
+            RouteErrorKind::MatchConflict,
+            RouteErrorSourceCategory::RouterCore,
+            redacted_message,
+        )
+    }
+
     pub const fn kind(&self) -> RouteErrorKind {
         self.kind
     }
@@ -82,5 +114,23 @@ mod tests {
             format!("{:?}", RouteErrorKind::FinalizeFailed),
             "FinalizeFailed"
         );
+    }
+
+    #[test]
+    fn match_errors_are_router_core_errors_with_redacted_messages() {
+        let not_found = RouteError::not_found("no route matched requested location");
+        let conflict = RouteError::match_conflict("ambiguous route match");
+
+        assert_eq!(not_found.kind(), RouteErrorKind::NotFound);
+        assert_eq!(conflict.kind(), RouteErrorKind::MatchConflict);
+        assert_eq!(
+            not_found.source_category(),
+            RouteErrorSourceCategory::RouterCore
+        );
+        assert_eq!(
+            conflict.source_category(),
+            RouteErrorSourceCategory::RouterCore
+        );
+        assert!(!not_found.redacted_message().contains("/"));
     }
 }
