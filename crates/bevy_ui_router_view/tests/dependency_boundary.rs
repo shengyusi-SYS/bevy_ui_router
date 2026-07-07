@@ -64,6 +64,7 @@ fn package_rename(key: &str, value: &str) -> Option<String> {
 fn dependency_entries(manifest: &str) -> Vec<String> {
     let mut current_section = None;
     let mut entries = Vec::new();
+    let mut in_dependency_subtable = false;
 
     for raw_line in manifest.lines() {
         let line = raw_line.trim();
@@ -73,10 +74,20 @@ fn dependency_entries(manifest: &str) -> Vec<String> {
 
         if let Some(section) = section_name(line) {
             current_section = Some(section);
+            if let Some(alias) = dependency_subtable_alias(section) {
+                entries.push(alias.to_owned());
+                in_dependency_subtable = true;
+            } else {
+                in_dependency_subtable = false;
+            }
             continue;
         }
 
         if !current_section.is_some_and(|section| dependency_section_kind(section).is_some()) {
+            continue;
+        }
+
+        if in_dependency_subtable {
             continue;
         }
 
@@ -251,6 +262,25 @@ package = "bsn"
             "line 9: forbidden dependency subtable `target.'cfg(target_os = \"linux\")'.dev-dependencies.bevy_input`",
             "line 13: forbidden package rename to `bsn`",
         ]
+    );
+}
+
+#[test]
+fn dependency_entries_include_dependency_subtable_aliases() {
+    let manifest = r#"
+[dependencies]
+bevy_ui_router_core = { path = "../bevy_ui_router_core" }
+
+[dependencies.some_allowed_crate]
+version = "1"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies.target_helper]
+version = "1"
+"#;
+
+    assert_eq!(
+        dependency_entries(manifest),
+        vec!["bevy_ui_router_core", "some_allowed_crate", "target_helper",]
     );
 }
 

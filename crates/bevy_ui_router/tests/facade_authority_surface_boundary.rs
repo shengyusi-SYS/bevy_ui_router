@@ -1,6 +1,43 @@
 #[test]
 fn facade_does_not_expose_active_commit_or_acceptance_surface() {
-    let source = source_without_doc_text(include_str!("../src/lib.rs"));
+    for (file, source) in facade_exported_surface_sources() {
+        assert_forbidden_public_fragments_absent(file, source);
+    }
+}
+
+#[test]
+fn facade_authority_scan_covers_reexported_view_sources() {
+    let files = facade_exported_surface_sources()
+        .into_iter()
+        .map(|(file, _source)| file)
+        .collect::<Vec<_>>();
+
+    assert!(files.contains(&"facade src/lib.rs"));
+    assert!(files.contains(&"view src/lib.rs"));
+    assert!(files.contains(&"view src/contract.rs"));
+    assert!(files.contains(&"view src/testing.rs"));
+}
+
+fn facade_exported_surface_sources() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("facade src/lib.rs", include_str!("../src/lib.rs")),
+        (
+            "view src/lib.rs",
+            include_str!("../../bevy_ui_router_view/src/lib.rs"),
+        ),
+        (
+            "view src/contract.rs",
+            include_str!("../../bevy_ui_router_view/src/contract.rs"),
+        ),
+        (
+            "view src/testing.rs",
+            include_str!("../../bevy_ui_router_view/src/testing.rs"),
+        ),
+    ]
+}
+
+fn assert_forbidden_public_fragments_absent(file: &str, source: &str) {
+    let source = source_without_doc_text(source);
     let forbidden = [
         "pub fn commit",
         "pub fn finalize",
@@ -38,7 +75,7 @@ fn facade_does_not_expose_active_commit_or_acceptance_surface() {
     for fragment in forbidden {
         assert!(
             !source.contains(fragment),
-            "facade exposes forbidden Phase 3A authority surface fragment `{fragment}`"
+            "{file} exposes forbidden Phase 3A authority surface fragment `{fragment}`"
         );
     }
 }
