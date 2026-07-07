@@ -133,6 +133,7 @@ fn invalid_pattern(message: &'static str) -> RouteError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::{RouteErrorKind, RouteErrorSourceCategory};
 
     #[test]
     fn path_pattern_normalizes_leading_slash_and_segments() {
@@ -161,5 +162,19 @@ mod tests {
         assert_eq!(RoutePattern::pathless().kind(), RoutePatternKind::Pathless);
         assert!(RoutePattern::index().segments().is_empty());
         assert!(RoutePattern::pathless().segments().is_empty());
+    }
+
+    #[test]
+    fn invalid_patterns_return_router_core_errors() {
+        for pattern in [":", "*", ":id/:id", "files/*rest/edit", "settings//profile"] {
+            let error = RoutePattern::path(pattern).unwrap_err();
+
+            assert_eq!(error.kind(), RouteErrorKind::InvalidRoutePattern);
+            assert_eq!(
+                error.source_category(),
+                RouteErrorSourceCategory::RouterCore
+            );
+            assert!(!error.redacted_message().is_empty());
+        }
     }
 }
