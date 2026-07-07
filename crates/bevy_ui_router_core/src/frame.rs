@@ -152,6 +152,13 @@ impl RouteFrameRecord {
     pub const fn status(&self) -> RouteFrameStatus {
         self.status
     }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_status(&self, status: RouteFrameStatus) -> Self {
+        let mut next = self.clone();
+        next.status = status;
+        next
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -279,6 +286,34 @@ mod tests {
         assert_eq!(record.slot_key().as_str(), "detail");
         assert_eq!(record.status(), RouteFrameStatus::Building);
         assert_eq!(record.segment_reuse_key().as_str(), segment(route).as_str());
+    }
+
+    #[test]
+    fn frame_record_with_status_preserves_identity_and_metadata() {
+        let route = RouteId::new(13);
+        let identity = RouteFrameIdentity::new(
+            RouterInstanceId::new(1),
+            RouteHostId::new(2),
+            RouteSlotId::new(3),
+            route,
+            RouteFrameId::new(14),
+            RouteGeneration::initial(),
+        );
+        let record = RouteFrameRecord::new(
+            identity,
+            4,
+            RouteSlotKey::named("detail").unwrap(),
+            segment(route),
+            RouteFrameStatus::Building,
+        );
+        let next = record.with_status(RouteFrameStatus::Active);
+
+        assert_eq!(next.identity(), record.identity());
+        assert_eq!(next.branch_index(), record.branch_index());
+        assert_eq!(next.slot_key(), record.slot_key());
+        assert_eq!(next.segment_reuse_key(), record.segment_reuse_key());
+        assert_eq!(next.status(), RouteFrameStatus::Active);
+        assert_eq!(record.status(), RouteFrameStatus::Building);
     }
 
     #[test]
