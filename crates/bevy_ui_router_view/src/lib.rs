@@ -141,11 +141,22 @@ use bevy_ui_router_view::test_support::ViewFinalizeAuthority;
 
 mod contract;
 
+#[cfg(feature = "test-support")]
+mod testing;
+
 pub use contract::{
     RouteViewDescriptor, ViewApplyOutcome, ViewBindingKey, ViewBuildOutcome, ViewBuildRequest,
     ViewDisposalHint, ViewFailure, ViewOutputId, ViewPartialOutput, ViewRenderPlan, ViewRequestId,
 };
 
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    pub use crate::testing::{FakeViewRenderer, FakeViewRendererMode};
+}
+
 pub mod prelude {
     pub use crate::{RouteViewDescriptor, ViewBindingKey};
+
+    #[cfg(feature = "test-support")]
+    pub use crate::test_support::{FakeViewRenderer, FakeViewRendererMode};
 }

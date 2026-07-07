@@ -76,4 +76,5 @@ fn source_without_doc_text(source: &str) -> String {
 fn view_crate_does_not_expose_active_commit_or_acceptance_surface() {
     assert_forbidden_public_fragments_absent("src/lib.rs", include_str!("../src/lib.rs"));
     assert_forbidden_public_fragments_absent("src/contract.rs", include_str!("../src/contract.rs"));
+    assert_forbidden_public_fragments_absent("src/testing.rs", include_str!("../src/testing.rs"));
 }
