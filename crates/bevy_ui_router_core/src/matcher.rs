@@ -596,4 +596,58 @@ mod tests {
         );
         assert_eq!(first.branch_fingerprint(), second.branch_fingerprint());
     }
+
+    #[test]
+    fn nearest_error_boundary_uses_matched_ancestor_chain_only() {
+        let mut builder = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let root_layout = builder
+            .route_with_options(
+                root,
+                RoutePattern::pathless(),
+                RouteNodeOptions::new()
+                    .with_error_boundary(ErrorBoundaryKey::named("root").unwrap()),
+            )
+            .unwrap();
+        let section = builder
+            .route_with_options(
+                root_layout,
+                RoutePattern::path("settings").unwrap(),
+                RouteNodeOptions::new()
+                    .with_error_boundary(ErrorBoundaryKey::named("settings").unwrap()),
+            )
+            .unwrap();
+        let leaf = builder
+            .route(section, RoutePattern::path("profile").unwrap())
+            .unwrap();
+        let billing = builder
+            .route_with_options(
+                root_layout,
+                RoutePattern::path("billing").unwrap(),
+                RouteNodeOptions::new()
+                    .with_error_boundary(ErrorBoundaryKey::named("billing").unwrap()),
+            )
+            .unwrap();
+
+        let branch = RouteMatcher::new(builder.build().unwrap())
+            .match_location(&RouteLocation::new("/settings/profile"))
+            .unwrap();
+
+        assert_eq!(
+            branch
+                .nearest_error_boundary_for(leaf)
+                .map(ErrorBoundaryKey::as_str),
+            Some("settings")
+        );
+        assert_eq!(
+            branch
+                .nearest_error_boundary_for(root_layout)
+                .map(ErrorBoundaryKey::as_str),
+            Some("root")
+        );
+        assert_eq!(branch.nearest_error_boundary_for(billing), None);
+        assert_eq!(branch.nearest_error_boundary_for(RouteId::new(999)), None);
+    }
 }

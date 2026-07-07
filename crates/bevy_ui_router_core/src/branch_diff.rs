@@ -330,6 +330,38 @@ mod tests {
     }
 
     #[test]
+    fn fragment_only_change_does_not_change_search_or_branch_diff() {
+        let mut builder = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        builder
+            .route(root, RoutePattern::path("items").unwrap())
+            .unwrap();
+        let matcher = RouteMatcher::new(builder.build().unwrap());
+
+        let first = matcher
+            .match_location(&RouteLocation::new("/items").with_search("a=1"))
+            .unwrap();
+        let second = matcher
+            .match_location(
+                &RouteLocation::new("/items")
+                    .with_search("a=1")
+                    .with_fragment("ignored"),
+            )
+            .unwrap();
+        let diff = BranchDiff::compare(&first, &second);
+
+        assert_eq!(first.search_fingerprint(), second.search_fingerprint());
+        assert_eq!(first.branch_fingerprint(), second.branch_fingerprint());
+        assert!(!diff.search_changed());
+        assert!(!diff.branch_fingerprint_changed());
+        assert_eq!(diff.common_prefix_len(), first.routes().len());
+        assert!(diff.leaving().is_empty());
+        assert!(diff.entering().is_empty());
+    }
+
+    #[test]
     fn identical_independent_trees_fail_closed_by_provenance() {
         let old_matcher = sample_items_matcher();
         let new_matcher = sample_items_matcher();
