@@ -1144,6 +1144,7 @@ Create `crates/bevy_ui_router_view/tests/authority_surface_boundary.rs`:
 
 ```rust
 fn assert_forbidden_public_fragments_absent(file: &str, source: &str) {
+    let source = source_without_doc_text(source);
     let forbidden = [
         "pub fn commit",
         "pub fn finalize",
@@ -1184,6 +1185,36 @@ fn assert_forbidden_public_fragments_absent(file: &str, source: &str) {
             "{file} exposes forbidden Phase 3A authority surface fragment `{fragment}`"
         );
     }
+}
+
+fn source_without_doc_text(source: &str) -> String {
+    let mut cleaned = String::new();
+    let mut in_doc_attr = false;
+
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+
+        if in_doc_attr {
+            if trimmed.starts_with("\"#") {
+                in_doc_attr = false;
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("//!") || trimmed.starts_with("///") {
+            continue;
+        }
+
+        if trimmed.contains("doc = r#\"") {
+            in_doc_attr = true;
+            continue;
+        }
+
+        cleaned.push_str(line);
+        cleaned.push('\n');
+    }
+
+    cleaned
 }
 
 #[test]
@@ -2619,7 +2650,7 @@ Create `crates/bevy_ui_router/tests/facade_authority_surface_boundary.rs`:
 ```rust
 #[test]
 fn facade_does_not_expose_active_commit_or_acceptance_surface() {
-    let source = include_str!("../src/lib.rs");
+    let source = source_without_doc_text(include_str!("../src/lib.rs"));
     let forbidden = [
         "pub fn commit",
         "pub fn finalize",
@@ -2660,6 +2691,36 @@ fn facade_does_not_expose_active_commit_or_acceptance_surface() {
             "facade exposes forbidden Phase 3A authority surface fragment `{fragment}`"
         );
     }
+}
+
+fn source_without_doc_text(source: &str) -> String {
+    let mut cleaned = String::new();
+    let mut in_doc_attr = false;
+
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+
+        if in_doc_attr {
+            if trimmed.starts_with("\"#") {
+                in_doc_attr = false;
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("//!") || trimmed.starts_with("///") {
+            continue;
+        }
+
+        if trimmed.contains("doc = r#\"") {
+            in_doc_attr = true;
+            continue;
+        }
+
+        cleaned.push_str(line);
+        cleaned.push('\n');
+    }
+
+    cleaned
 }
 ```
 
