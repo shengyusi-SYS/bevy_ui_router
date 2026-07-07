@@ -327,7 +327,7 @@ impl FrameReconciliationPlan {
             entering,
             baseline_fingerprint,
             target_fingerprint,
-            error_boundaries: BTreeMap::new(),
+            error_boundaries: error_boundaries_from(target),
         }
     }
 
@@ -345,23 +345,8 @@ impl FrameReconciliationPlan {
             entering,
             baseline_fingerprint: None,
             target_fingerprint: target.branch_fingerprint().clone(),
-            error_boundaries: BTreeMap::new(),
+            error_boundaries: error_boundaries_from(target),
         }
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn with_error_boundaries_from(mut self, branch: &MatchedBranch) -> Self {
-        self.error_boundaries = branch
-            .routes()
-            .iter()
-            .map(|route| {
-                (
-                    route.route(),
-                    branch.nearest_error_boundary_for(route.route()).cloned(),
-                )
-            })
-            .collect();
-        self
     }
 
     pub fn preserved(&self) -> &[RouteFrameRecord] {
@@ -387,6 +372,19 @@ impl FrameReconciliationPlan {
     pub(crate) fn nearest_error_boundary_for(&self, route: RouteId) -> Option<&ErrorBoundaryKey> {
         self.error_boundaries.get(&route).and_then(Option::as_ref)
     }
+}
+
+fn error_boundaries_from(branch: &MatchedBranch) -> BTreeMap<RouteId, Option<ErrorBoundaryKey>> {
+    branch
+        .routes()
+        .iter()
+        .map(|route| {
+            (
+                route.route(),
+                branch.nearest_error_boundary_for(route.route()).cloned(),
+            )
+        })
+        .collect()
 }
 
 fn build_entering_records(
@@ -868,8 +866,7 @@ mod tests {
             &new_branch,
             &diff,
             &mut allocator,
-        )
-        .with_error_boundaries_from(&new_branch);
+        );
 
         let leaf = new_branch.leaf().unwrap().route();
         let root = new_branch.routes()[0].route();
@@ -881,5 +878,24 @@ mod tests {
         );
         assert_eq!(plan.nearest_error_boundary_for(root), None);
         assert_eq!(plan.nearest_error_boundary_for(RouteId::new(999)), None);
+    }
+
+    #[test]
+    fn first_navigation_constructor_records_router_level_fallback_without_attachment_step() {
+        let matcher = sample_items_matcher();
+        let target = matcher
+            .match_location(&RouteLocation::new("/items/1"))
+            .unwrap();
+        let leaf = target.leaf().unwrap().route();
+        let mut allocator = FrameAllocator::new();
+        let scope = RouteFrameScope::new(
+            RouterInstanceId::new(1),
+            RouteHostId::new(2),
+            RouteSlotId::new(3),
+        );
+
+        let plan = FrameReconciliationPlan::from_first_navigation(scope, &target, &mut allocator);
+
+        assert_eq!(plan.nearest_error_boundary_for(leaf), None);
     }
 }

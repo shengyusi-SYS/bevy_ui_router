@@ -591,8 +591,7 @@ mod tests {
             &new_branch,
             &diff,
             &mut allocator,
-        )
-        .with_error_boundaries_from(&new_branch);
+        );
         (active, plan)
     }
 
@@ -628,8 +627,7 @@ mod tests {
             &new_branch,
             &diff,
             &mut allocator,
-        )
-        .with_error_boundaries_from(&new_branch);
+        );
         (active, plan)
     }
 
@@ -666,8 +664,7 @@ mod tests {
             &new_branch,
             &diff,
             &mut allocator,
-        )
-        .with_error_boundaries_from(&new_branch);
+        );
         assert_eq!(plan.entering().len(), 3);
         (active, plan)
     }
