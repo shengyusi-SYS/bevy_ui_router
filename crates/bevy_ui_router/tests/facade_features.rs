@@ -176,6 +176,10 @@ fn facade_default_keeps_bevy_out_of_the_default_path() {
             "view".to_owned(),
             "[\"dep:bevy_ui_router_view\"]".to_owned(),
         ),
+        (
+            "view-test-support".to_owned(),
+            "[\"view\", \"bevy_ui_router_view/test-support\"]".to_owned(),
+        ),
     ]);
 
     assert_eq!(feature_entries(&manifest), expected_features);
@@ -301,4 +305,58 @@ fn facade_prelude_exposes_phase_2_observation_contracts() {
     assert_public::<TransactionCommitErrorKind>();
     assert_public::<TransactionFailure>();
     assert_eq!(RouteFrameStatus::Active, RouteFrameStatus::Active);
+}
+
+#[cfg(feature = "view")]
+#[test]
+fn facade_default_prelude_exposes_phase_3a_view_binding_contracts() {
+    use bevy_ui_router::prelude::{RouteViewDescriptor, ViewBindingKey};
+
+    fn assert_public<T>() {}
+    assert_public::<RouteViewDescriptor>();
+    assert_public::<ViewBindingKey>();
+
+    let descriptor = RouteViewDescriptor::new(ViewBindingKey::new("leaf"));
+    assert_eq!(descriptor.binding().as_str(), "leaf");
+}
+
+#[cfg(feature = "view")]
+#[test]
+fn facade_view_module_exposes_phase_3a_protocol_observations_by_explicit_path() {
+    use bevy_ui_router::view::{
+        ViewApplyOutcome, ViewBuildOutcome, ViewBuildRequest, ViewDisposalHint, ViewFailure,
+        ViewOutputId, ViewPartialOutput, ViewRenderPlan, ViewRequestId,
+    };
+
+    fn assert_public<T>() {}
+    assert_public::<ViewApplyOutcome>();
+    assert_public::<ViewBuildOutcome>();
+    assert_public::<ViewBuildRequest>();
+    assert_public::<ViewDisposalHint>();
+    assert_public::<ViewFailure>();
+    assert_public::<ViewOutputId>();
+    assert_public::<ViewPartialOutput>();
+    assert_public::<ViewRenderPlan>();
+    assert_public::<ViewRequestId>();
+}
+
+#[cfg(feature = "view-test-support")]
+#[test]
+fn facade_test_support_prelude_exposes_phase_3a_fake_renderer() {
+    use bevy_ui_router::prelude::{
+        FakeViewRenderer, FakeViewRendererMode, RouteViewDescriptor, ViewBindingKey,
+    };
+    use bevy_ui_router::view::{ViewApplyOutcome, ViewBuildOutcome};
+
+    let mut renderer = FakeViewRenderer::new(FakeViewRendererMode::Success);
+    let request = renderer.request(RouteViewDescriptor::new(ViewBindingKey::new("leaf")));
+    let ViewBuildOutcome::Built(plan) = renderer.build(&request) else {
+        panic!("success mode should build");
+    };
+    let ViewApplyOutcome::Applied(output) = renderer.apply(plan) else {
+        panic!("success mode should apply");
+    };
+
+    assert_eq!(output.request_id(), request.request_id());
+    assert_eq!(output.binding().as_str(), "leaf");
 }

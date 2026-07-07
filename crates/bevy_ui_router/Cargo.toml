@@ -6,6 +6,7 @@ edition.workspace = true
 [features]
 default = ["view"]
 view = ["dep:bevy_ui_router_view"]
+view-test-support = ["view", "bevy_ui_router_view/test-support"]
 ecs = ["dep:bevy_ui_router_ecs"]
 bsn = ["ecs", "dep:bevy_ui_router_bsn"]
 platform = ["dep:bevy_ui_router_platform"]
@@ -13,7 +14,7 @@ devtools = []
 
 [dependencies]
 bevy_ui_router_core = { path = "../bevy_ui_router_core" }
-bevy_ui_router_view = { path = "../bevy_ui_router_view", optional = true }
+bevy_ui_router_view = { path = "../bevy_ui_router_view", optional = true, default-features = false }
 bevy_ui_router_ecs = { path = "../bevy_ui_router_ecs", optional = true }
 bevy_ui_router_bsn = { path = "../bevy_ui_router_bsn", optional = true }
 bevy_ui_router_platform = { path = "../bevy_ui_router_platform", optional = true }

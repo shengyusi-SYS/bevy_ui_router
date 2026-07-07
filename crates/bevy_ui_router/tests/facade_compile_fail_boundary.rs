@@ -1,0 +1,193 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+struct Fixture<'a> {
+    name: &'a str,
+    code: &'a str,
+    default_features: bool,
+    features: &'a [&'a str],
+    expected_stderr: &'a [&'a str],
+}
+
+fn path_for_toml(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
+fn scratch_dir(name: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("bevy-ui-router-facade-ui-{name}-{stamp}"))
+}
+
+fn dependency_features(features: &[&str]) -> String {
+    if features.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", features = [{}]",
+            features
+                .iter()
+                .map(|feature| format!("\"{feature}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn assert_compile_fails(fixture: Fixture<'_>) {
+    let root = scratch_dir(fixture.name);
+    fs::create_dir_all(root.join("src")).expect("fixture src directory should be created");
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "{name}"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+bevy_ui_router = {{ path = "{path}", default-features = {default_features}{features} }}
+"#,
+            name = fixture.name.replace('_', "-"),
+            path = path_for_toml(manifest_dir),
+            default_features = fixture.default_features,
+            features = dependency_features(fixture.features),
+        ),
+    )
+    .expect("fixture manifest should be written");
+    fs::write(root.join("src/main.rs"), fixture.code).expect("fixture source should be written");
+
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let output = Command::new(cargo)
+        .arg("check")
+        .arg("--config")
+        .arg("build.rustc-wrapper = ''")
+        .arg("--manifest-path")
+        .arg(root.join("Cargo.toml"))
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .output()
+        .expect("cargo check should run");
+
+    assert!(
+        !output.status.success(),
+        "fixture `{}` unexpectedly compiled",
+        fixture.name
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in fixture.expected_stderr {
+        assert!(
+            stderr.contains(expected),
+            "fixture `{}` stderr did not contain `{expected}`:\n{stderr}",
+            fixture.name
+        );
+    }
+}
+
+#[test]
+fn no_default_view_module_names_missing_module() {
+    assert_compile_fails(Fixture {
+        name: "no_default_has_no_view_module",
+        code: "use bevy_ui_router::view::RouteViewDescriptor; fn main() {}",
+        default_features: false,
+        features: &[],
+        expected_stderr: &["error[E0432]", "could not find `view` in `bevy_ui_router`"],
+    });
+}
+
+#[test]
+fn default_protocol_record_not_in_prelude_names_missing_symbol() {
+    assert_compile_fails(Fixture {
+        name: "default_protocol_not_in_prelude",
+        code: "use bevy_ui_router::prelude::ViewBuildRequest; fn main() {}",
+        default_features: true,
+        features: &[],
+        expected_stderr: &["error[E0432]", "no `ViewBuildRequest` in `prelude`"],
+    });
+}
+
+#[test]
+fn default_fake_renderer_view_root_names_missing_symbol() {
+    assert_compile_fails(Fixture {
+        name: "default_fake_renderer_not_exposed",
+        code: "use bevy_ui_router::view::FakeViewRenderer; fn main() {}",
+        default_features: true,
+        features: &[],
+        expected_stderr: &["error[E0432]", "no `FakeViewRenderer` in the root"],
+    });
+}
+
+#[test]
+fn test_support_fake_renderer_view_root_still_names_missing_symbol() {
+    assert_compile_fails(Fixture {
+        name: "test_support_fake_renderer_not_view_root",
+        code: "use bevy_ui_router::view::FakeViewRenderer; fn main() {}",
+        default_features: false,
+        features: &["view-test-support"],
+        expected_stderr: &["error[E0432]", "no `FakeViewRenderer` in the root"],
+    });
+}
+
+#[test]
+fn test_support_fake_renderer_commit_names_missing_method() {
+    assert_compile_fails(Fixture {
+        name: "test_support_fake_renderer_has_no_commit",
+        code: "use bevy_ui_router::prelude::{FakeViewRenderer, FakeViewRendererMode}; fn main() { let mut renderer = FakeViewRenderer::new(FakeViewRendererMode::Success); renderer.commit(); }",
+        default_features: false,
+        features: &["view-test-support"],
+        expected_stderr: &["error[E0599]", "no method named `commit` found"],
+    });
+}
+
+#[test]
+fn test_support_fake_renderer_finalize_names_missing_method() {
+    assert_compile_fails(Fixture {
+        name: "test_support_fake_renderer_has_no_finalize",
+        code: "use bevy_ui_router::prelude::{FakeViewRenderer, FakeViewRendererMode, FrameApplyRequest}; fn main() { let mut renderer = FakeViewRenderer::new(FakeViewRendererMode::Success); let request: FrameApplyRequest = unreachable!(); renderer.finalize(request); }",
+        default_features: false,
+        features: &["view-test-support"],
+        expected_stderr: &["error[E0599]", "no method named `finalize` found"],
+    });
+}
+
+#[test]
+fn test_support_fake_renderer_token_accept_names_missing_method() {
+    assert_compile_fails(Fixture {
+        name: "test_support_fake_renderer_has_no_token_accept",
+        code: "use bevy_ui_router::prelude::{FakeViewRenderer, FakeViewRendererMode, FrameApplyToken}; fn main() { let mut renderer = FakeViewRenderer::new(FakeViewRendererMode::Success); let token: FrameApplyToken = unreachable!(); renderer.accept_apply_token(token); }",
+        default_features: false,
+        features: &["view-test-support"],
+        expected_stderr: &["error[E0599]", "no method named `accept_apply_token` found"],
+    });
+}
+
+#[test]
+fn test_support_commit_authority_trait_names_missing_symbol() {
+    assert_compile_fails(Fixture {
+        name: "test_support_no_named_commit_authority",
+        code: "use bevy_ui_router::prelude::ViewCommitAuthority; fn main() {}",
+        default_features: false,
+        features: &["view-test-support"],
+        expected_stderr: &["error[E0432]", "no `ViewCommitAuthority` in `prelude`"],
+    });
+}
+
+#[test]
+fn test_support_finalize_authority_trait_names_missing_symbol() {
+    assert_compile_fails(Fixture {
+        name: "test_support_no_named_finalize_authority",
+        code: "use bevy_ui_router::view::test_support::ViewFinalizeAuthority; fn main() {}",
+        default_features: false,
+        features: &["view-test-support"],
+        expected_stderr: &[
+            "error[E0432]",
+            "no `ViewFinalizeAuthority` in `test_support`",
+        ],
+    });
+}
