@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod back;
+pub mod branch;
 pub mod diagnostics;
 pub mod error;
 pub mod history;
@@ -11,6 +12,7 @@ pub mod pattern;
 
 pub mod prelude {
     pub use crate::back::{BackCapabilitySnapshot, BackIntent, BackPolicy};
+    pub use crate::branch::{MatchedBranch, MatchedRoute, RouteParams};
     pub use crate::diagnostics::{
         DiagnosticEvent, DiagnosticEventKind, DiagnosticIdentity, DiagnosticSnapshot,
     };
