@@ -1,10 +1,14 @@
 #![forbid(unsafe_code)]
 
+pub mod back;
+pub mod error;
 pub mod history;
 pub mod ids;
 pub mod location;
 
 pub mod prelude {
+    pub use crate::back::{BackCapabilitySnapshot, BackIntent, BackPolicy};
+    pub use crate::error::{RouteError, RouteErrorKind, RouteErrorSourceCategory};
     pub use crate::history::{HistoryError, MemoryHistory};
     pub use crate::ids::{
         RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId, RouterInstanceId,
