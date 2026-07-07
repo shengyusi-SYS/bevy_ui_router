@@ -193,10 +193,6 @@ pub struct DiagnosticEvent {
     redacted_message: String,
 }
 
-pub trait DiagnosticEventFrameLifecycle {
-    fn frame_lifecycle(&self) -> Option<&FrameLifecycleDiagnostic>;
-}
-
 impl DiagnosticEvent {
     #[allow(dead_code)]
     pub(crate) fn pending_overwrite(
@@ -257,7 +253,7 @@ impl DiagnosticEvent {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn frame_lifecycle(frame_lifecycle: FrameLifecycleDiagnostic) -> Self {
+    pub(crate) fn frame_lifecycle_changed(frame_lifecycle: FrameLifecycleDiagnostic) -> Self {
         let identity = frame_lifecycle.identity();
         Self {
             kind: DiagnosticEventKind::FrameLifecycle,
@@ -287,14 +283,12 @@ impl DiagnosticEvent {
         self.branch_planning.as_ref()
     }
 
+    pub fn frame_lifecycle(&self) -> Option<&FrameLifecycleDiagnostic> {
+        self.frame_lifecycle.as_ref()
+    }
+
     pub fn redacted_message(&self) -> &str {
         &self.redacted_message
-    }
-}
-
-impl DiagnosticEventFrameLifecycle for DiagnosticEvent {
-    fn frame_lifecycle(&self) -> Option<&FrameLifecycleDiagnostic> {
-        self.frame_lifecycle.as_ref()
     }
 }
 
@@ -487,7 +481,7 @@ mod tests {
             RouteGeneration::initial(),
         );
         let payload = FrameLifecycleDiagnostic::new(identity, RouteFrameStatus::ApplyingView);
-        let event = DiagnosticEvent::frame_lifecycle(payload.clone());
+        let event = DiagnosticEvent::frame_lifecycle_changed(payload.clone());
 
         assert_eq!(event.kind(), DiagnosticEventKind::FrameLifecycle);
         assert_eq!(
