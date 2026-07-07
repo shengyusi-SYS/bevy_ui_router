@@ -7,6 +7,7 @@ pub mod error;
 pub mod history;
 pub mod ids;
 pub mod location;
+pub mod matcher;
 pub mod ownership;
 pub mod pattern;
 pub mod route_tree;
@@ -23,6 +24,7 @@ pub mod prelude {
         RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId, RouterInstanceId,
     };
     pub use crate::location::RouteLocation;
+    pub use crate::matcher::RouteMatcher;
     pub use crate::ownership::{CleanupScope, OwnedRegion};
     pub use crate::pattern::{RoutePathSegment, RoutePattern, RoutePatternKind};
     pub use crate::route_tree::{RouteTree, RouteTreeBuilder};
