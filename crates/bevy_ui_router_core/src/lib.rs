@@ -2,6 +2,7 @@
 
 pub mod back;
 pub mod branch;
+pub mod branch_diff;
 pub mod diagnostics;
 pub mod error;
 pub mod fingerprint;
@@ -18,6 +19,7 @@ pub mod slot;
 pub mod prelude {
     pub use crate::back::{BackCapabilitySnapshot, BackIntent, BackPolicy};
     pub use crate::branch::{MatchedBranch, MatchedRoute, RouteParams};
+    pub use crate::branch_diff::BranchDiff;
     pub use crate::diagnostics::{
         DiagnosticEvent, DiagnosticEventKind, DiagnosticIdentity, DiagnosticSnapshot,
     };
