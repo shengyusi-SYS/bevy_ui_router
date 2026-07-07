@@ -2762,6 +2762,8 @@ The lead agent must evaluate findings before accepting them. If multiple finding
 
 Recorded on 2026-07-08 after implementation and whole-branch review.
 
+Final Phase 2 evidence commit: `bd9c625` `docs: record phase 2 frame transaction verification`.
+
 ### Implementation Commits
 
 - `fbb99ca` `feat(core): add route frame records`
@@ -2784,21 +2786,21 @@ Recorded on 2026-07-08 after implementation and whole-branch review.
 ### Final Verification Commands
 
 - `cargo fmt --all --check`
-  - Result: passed.
+  - Result: passed with exit code 0.
 - `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_core`
-  - Result: passed.
+  - Result: passed with exit code 0.
   - Counts: 87 unit tests, 5 `dependency_boundary` integration tests, 2 `public_api` integration tests, and 28 doctests passed.
 - `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --doc`
-  - Result: passed.
+  - Result: passed with exit code 0.
   - Count: 28 doctests passed.
 - `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --test public_api`
-  - Result: passed.
+  - Result: passed with exit code 0.
   - Count: 2 integration tests passed.
 - `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --test dependency_boundary`
-  - Result: passed.
+  - Result: passed with exit code 0.
   - Count: 5 integration tests passed.
 - `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features`
-  - Result: passed.
+  - Result: passed with exit code 0.
   - Counts: 5 `facade_features` integration tests passed; facade lib and doctest harnesses each ran 0 tests.
 
 ### Handoff Checks
@@ -2813,13 +2815,18 @@ Recorded on 2026-07-08 after implementation and whole-branch review.
 - Architecture/API/lifecycle review initially returned `With fixes` because commit rechecked the active branch baseline only by `RouteBranchFingerprint`.
 - The blocker was fixed by `964321c`, which stores a private active-branch baseline snapshot and compares branch fingerprint plus frame count, router, host, slot, route, frame id, generation, and branch index before commit can publish a new active branch.
 - Architecture/API/lifecycle re-review reported `Critical fixed: Yes` and `Ready to proceed: Yes`.
-- Fact/evidence review returned `With fixes` because this final verification record and final full-phase pass counts were not yet present in the reviewed range. This section records the missing evidence.
+- Initial fact/evidence review had a `With fixes` finding because this final verification record and final full-phase pass counts were not yet present in the reviewed range. This section records the missing evidence.
+- Fact/evidence re-review is now reconciled as PASS with the ledger update applied; the missing final evidence is present in this record.
 
 ### Unresolved Risks
 
 - Public API and facade observation coverage proves type exposure and authority boundaries, but remains mostly import/type-smoke coverage rather than behavioral observation coverage.
 - `RouteError` crate-visible helper constructors described in Task 4 were conditional on implementation need. The implementation uses `RouteError::new` directly, so unused helpers were not added.
 - Hidden/retained subtree input isolation and focus release remain future work because Phase 2 does not implement retained subtrees or Bevy ECS mutation.
+
+### Next Phase Authorization
+
+Phase 2 gate PASS. Phase 3A planning is authorized because final verification commands exited 0, whole-branch review blockers were fixed, fact/evidence review is reconciled, and unresolved risks are documented above.
 
 ### Phase 3A Handoff
 

@@ -94,7 +94,7 @@ Phase 0 必须冻结 feature 名称和默认组合。若要推翻 default 不拉
 - fake/test renderer 的归属策略。
 - view build failure 与 apply failure 的报告方向。
 
-Phase 0 不要求 fake renderer 行为完整落地；Phase 3A 才实现 view contract 的成功、失败、cleanup 和 active commit ordering 测试。
+Phase 0 不要求 fake renderer 行为完整落地；Phase 3A 实现 view contract 的成功、失败、cleanup、stale result 和 plan provenance 测试。active commit ordering 由 Phase 3B 的 ECS finalization 与 core commit integration 测试证明。
 
 ### 3.4 Public Type Ownership 冻结项
 
@@ -266,7 +266,8 @@ Phase 2 至少需要：
 
 Phase 3A-3D 至少需要：
 
-- fake renderer success/failure/cleanup/active commit ordering tests。
+- fake renderer success/failure/cleanup/stale-result/plan-provenance tests。
+- Phase 3B ECS/core handoff、controlled reporter/session、core-owned stale acceptance、active commit ordering tests。
 - ECS host/slot missing、route-owned marker、cleanup boundary、focus release、pickability/visibility convergence fixtures。
 - BSN adapter resolve/apply error mapping tests。
 - neutral minimal nested routes example assertions。

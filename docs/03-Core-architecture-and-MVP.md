@@ -1,6 +1,6 @@
 # 03 — Core Architecture And MVP
 
-**日期**: 2026-07-06  
+**日期**: 2026-07-06
 **目标**: 定义通用 Bevy UI Router 的架构分层、核心概念、状态机、MVP 与模块边界。
 
 ---
@@ -70,7 +70,7 @@ Preferred split:
 
 - route view factory produces a view description or render plan
 - renderer applies the plan to a router-owned host or slot
-- renderer cleans up partial output on failure
+- renderer reports partial output and disposal hints; Router/ECS performs cleanup through a controlled cleanup API
 - router commits a frame only after apply and finalization succeed
 
 This keeps routing state separate from scene construction details.
@@ -85,7 +85,7 @@ Responsibilities:
 - map route props into BSN scene inputs
 - apply BSN scenes under a `RouteSlot`
 - report scene resolve or apply failures as router errors
-- clean up partially created frame roots on failure
+- report partially created router-owned output and request cleanup through the controlled cleanup API
 
 Deferred features:
 
@@ -435,4 +435,3 @@ bevy_ui_router_examples
 ```
 
 The first release should keep core small, testable, and renderer-agnostic. Bevy ECS integration and BSN support should be real, but layered so future renderers or application profiles can be added without changing the routing model.
-

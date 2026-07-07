@@ -520,7 +520,10 @@ orchestration 模式：
 
 - core 拥有 lifecycle authority 和 commit 判断。
 - ECS schedule 驱动 Bevy World mutation。
-- ECS finalization outcome 通过 core public API 或受控 token 回报。
+- Phase 3B 以 core-issued `FrameApplyRequest` 作为 canonical ECS/view handoff unit。
+- non-fake adapter 的 renderer success/failure/partial output/disposal hint reporting 必须通过由 ECS bridge 从 `FrameApplyRequest` mint 的 controlled reporter/session；不能把 Phase 3A raw protocol constructors 改成 public。
+- ECS finalization outcome 必须翻译为 core `FrameApplyOutcome`，并与该 request 的 token 一起通过 core public API 或受控 token 回报。
+- 最终 sequence/router/host/slot/route/frame/generation/transaction stale acceptance 留在 core 内部；ECS/view/BSN/facade/adapter 不得基于公开 token 字段自行重建 stale check。
 - core 根据回报结果决定 commit active、进入 error，或丢弃 stale transaction。
 - ECS 不直接把 frame 标记为 active；adapter 也不能直接切换 active frame。
 
@@ -927,7 +930,7 @@ extension 不能让 core 固定某个应用的权限、服务、主题、文案�
 **前置条件**
 
 - Phase 2 的 identity/generation/error/transaction/stale 合同稳定。
-- fake apply-result harness 已能验证 apply outcome 与 active commit ordering。
+- fake apply-result harness 已能验证 apply outcome；active commit ordering 由 Phase 3B ECS finalization 与 core commit integration 验证。
 - core lifecycle authority 不被 ECS 或 adapter 绕开。
 
 **范围**
@@ -970,13 +973,13 @@ extension 不能让 core 固定某个应用的权限、服务、主题、文案�
 **最低验证**
 
 - Phase 3A: view contract/fake renderer tests。
-- Phase 3B: `cargo test -p bevy_ui_router_ecs --features ecs` 或等价 ECS integration tests。
+- Phase 3B: `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs` 加 `cargo check --config "build.rustc-wrapper = ''" -p bevy_ui_router --features ecs`，或等价 ECS integration/facade wiring tests；必须覆盖 core-issued `FrameApplyRequest` handoff、controlled reporter/session、core-owned stale acceptance 和 active commit ordering。
 - Phase 3C: `cargo check -p bevy_ui_router --features bsn`；BSN adapter error mapping tests。
 - Phase 3D: minimal nested routes example 的 run/test 命令；diagnostics 和 frame marker 断言。
 
 **退出标准**
 
-- fake renderer 合同测试证明 build/apply success、failure cleanup、active commit ordering。
+- Phase 3A fake renderer 合同测试证明 build/apply success、failure cleanup、stale result 无 partial output、apply failure partial cleanup 与 plan provenance；Phase 3B ECS/core integration 测试证明 core-issued `FrameApplyRequest` handoff、controlled reporter/session、core-owned stale acceptance 和 active commit ordering。
 - ECS 测试证明 ownership cleanup 不触碰 app-owned host。
 - BSN example 证明 immediate scene apply 能挂载 nested route。
 - BSN failure 映射为 Router error。
@@ -987,7 +990,7 @@ extension 不能让 core 固定某个应用的权限、服务、主题、文案�
 **建议里程碑**
 
 - Phase 3A: view contract 与 fake renderer 完整化。
-- Phase 3B: ECS host/slot/frame root、ownership cleanup 与 finalization。
+- Phase 3B: ECS host/slot/frame root、ownership cleanup、controlled reporter/session、core apply handoff 与 finalization。
 - Phase 3C: immediate BSN adapter。
 - Phase 3D: minimal nested routes example。
 
@@ -1078,7 +1081,7 @@ Phase 0-3 重点：
 | Phase 1 | Phase 0 验证；matcher/branch diff 合同测试；raw fingerprint canonicalization 测试 |
 | Phase 2 | Phase 1 验证；frame lifecycle/error/transaction/fake apply-result 测试；adapter identity compile-fail 或等价可见性测试 |
 | Phase 3A | view contract/fake renderer tests |
-| Phase 3B | `cargo test -p bevy_ui_router_ecs --features ecs` 或等价 ECS integration tests |
+| Phase 3B | `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs` 加 `cargo check --config "build.rustc-wrapper = ''" -p bevy_ui_router --features ecs`，或等价 ECS integration/facade wiring tests |
 | Phase 3C | `cargo check -p bevy_ui_router --features bsn`；BSN adapter error mapping tests |
 | Phase 3D | minimal nested routes example 的 run/test 命令；diagnostics 和 frame marker 断言 |
 

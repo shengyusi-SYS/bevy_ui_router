@@ -265,7 +265,7 @@ Phase 0-3 的每个 milestone 都必须有聚焦的合同测试。Phase 3 还必
 - code-driven BSN route views
 - immediate BSN scene apply
 - scene resolve/apply error mapping
-- 清理部分创建的 router-owned output
+- 报告已创建的 router-owned partial output，并通过受控 cleanup API 请求清理
 
 它不能拥有：
 
@@ -396,6 +396,7 @@ RouteLocation
 - 本文保留 Phase 3 的聚合决策口径。
 - 后续执行流程已将 Phase 3 拆为 Phase 3A view contract/fake renderer、Phase 3B ECS integration、Phase 3C immediate BSN adapter、Phase 3D minimal nested routes example。
 - 实施时以 `docs/superpowers/plans/2026-07-07-phase-0-3-execution-flow.md` 的 gate 拆分为准。
+- Phase 3B 以 core-issued `FrameApplyRequest` 作为 ECS/view canonical handoff unit；non-fake adapter 的 renderer result reporting 必须通过 ECS bridge 从该 request mint 的 controlled reporter/session；ECS bridge 只能把 finalized renderer output 翻译为 core `FrameApplyOutcome` 并交回 core，最终 stale acceptance 和 active commit authority 留在 core。
 
 目的：
 
@@ -414,7 +415,7 @@ RouteLocation
 
 退出标准：
 
-- Fake renderer tests 证明 apply success、apply failure cleanup 和 active commit ordering。
+- Phase 3A fake renderer tests 证明 apply success、apply failure cleanup、stale result 无 partial output 和 plan provenance；controlled reporter/session、core-issued `FrameApplyRequest` handoff、core-owned stale acceptance 和 active commit ordering 由 Phase 3B ECS finalization 与 core commit integration 测试证明。
 - BSN adapter 在中性 example 中展示 immediate scene apply。
 - renderer apply 与 ECS finalization 完成前，frame 不能标记为 active。
 - BSN failures 映射为 route view/apply errors。

@@ -102,8 +102,8 @@ If implementation discovers a better layout, update the active phase plan first 
 | Phase 0 | Workspace, core isolation, raw location, ids, memory history, diagnostics baseline | core compiles without Bevy; facade default does not pull Bevy; identity chain is testable |
 | Phase 1 | Route tree, matcher, branch diff, stable ordering | matcher and branch diff contract tests pass; raw fingerprint rules are frozen |
 | Phase 2 | Frame state, transaction, stale gates, error boundary | stale result cannot mutate visible state; old active survives failed transaction; adapter cannot forge identity |
-| Phase 3A | View contract and fake renderer | fake renderer proves build/apply success and failure paths |
-| Phase 3B | ECS host/slot/frame root and cleanup | router-owned cleanup cannot touch app-owned host |
+| Phase 3A | View contract and fake renderer | fake renderer proves build/apply success/failure, stale-result, failure cleanup, plan provenance, and negative authority boundaries |
+| Phase 3B | ECS host/slot/frame root, cleanup, and core apply handoff | core-owned apply acceptance gates active commit; router-owned cleanup cannot touch app-owned host |
 | Phase 3C | Immediate BSN adapter | BSN errors map to Router errors; adapter uses public APIs only |
 | Phase 3D | Minimal nested routes example | example asserts active branch, frame markers, generation, diagnostics |
 
@@ -498,7 +498,7 @@ Expected: Phase 3A planning starts only after this gate passes and Phase 2 gate 
 ### Task 7A: Create Phase 3A View Contract Plan
 
 **Files:**
-- Create: `docs/superpowers/plans/2026-07-07-phase-3a-view-contract-implementation-plan.md`
+- Create: `docs/superpowers/plans/2026-07-08-phase-3a-view-contract-implementation-plan.md`
 - Read: all source documents listed in Section 2
 - Read: Phase 2 implementation result and Phase 2 gate evidence
 
@@ -511,7 +511,7 @@ git log -1 --oneline
 git status --short
 ```
 
-Expected: Phase 2 commit exists and worktree is clean.
+Expected: Phase 2 commit exists and `git status --short` shows no unrelated source changes. In-flight Phase 3A planning document changes are allowed only if the gate evidence names them explicitly. If Cargo verification generated an untracked root `Cargo.lock`, remove that generated root file before recording final gate status.
 
 Also confirm Phase 2 gate evidence records frame lifecycle, transaction, stale gate, error boundary verification, unresolved risks, and authorized continuation to Phase 3A.
 
@@ -522,8 +522,9 @@ Create a detailed plan for:
 - Phase 3A: view contract and fake/test renderer;
 - renderer-agnostic view descriptor/result contracts;
 - fake renderer build/apply success and failure paths;
+- fake renderer plan provenance and stale-result modeling;
 - failure cleanup reporting;
-- active commit ordering tests.
+- negative boundary checks proving Phase 3A does not expose active UI or commit authority.
 
 - [ ] **Step 3: Phase 3A plan self-review**
 
@@ -532,8 +533,8 @@ Run:
 ```powershell
 $terms = @('T'+'BD','TO'+'DO','FIX'+'ME','待'+'定','未'+'定','稍'+'后','implement'+' later','fill'+' in')
 $pattern = $terms -join '|'
-rg -n $pattern 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-phase-3a-view-contract-implementation-plan.md'
-rg -n "[ \t]+$" 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-07-phase-3a-view-contract-implementation-plan.md'
+rg -n $pattern 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-08-phase-3a-view-contract-implementation-plan.md'
+rg -n "[ \t]+$" 'C:\projects\bevy_ui_router\docs\superpowers\plans\2026-07-08-phase-3a-view-contract-implementation-plan.md'
 git diff --check
 ```
 
@@ -548,12 +549,12 @@ Expected: Phase 3A implementation does not begin until this plan acceptance gate
 ### Task 8A: Execute Phase 3A
 
 **Files:**
-- Follow: `docs/superpowers/plans/2026-07-07-phase-3a-view-contract-implementation-plan.md`
+- Follow: `docs/superpowers/plans/2026-07-08-phase-3a-view-contract-implementation-plan.md`
 - Modify: files listed by the Phase 3A plan
 
 - [ ] **Step 1: Execute Phase 3A**
 
-Expected: fake renderer proves build/apply success, failure cleanup, and active commit ordering, with RED and GREEN evidence recorded.
+Expected: fake renderer proves build/apply success, failure cleanup reporting, stale-result modeling, fake-issued plan provenance, and no active UI or commit authority exposure, with RED and GREEN evidence recorded.
 
 - [ ] **Step 2: Run Phase 3A verification**
 
@@ -561,19 +562,41 @@ Minimum baseline:
 
 ```powershell
 cargo fmt --all --check
-cargo test -p bevy_ui_router_view
-cargo test -p bevy_ui_router_core
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_view --lib
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_view --features test-support --lib
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_view --doc
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_view --features test-support --doc
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_view --test compile_fail_boundary
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_view --features test-support --test compile_fail_boundary
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_view --test authority_surface_boundary
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_view --test dependency_boundary
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_core
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --test facade_features
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_compile_fail_boundary
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_authority_surface_boundary
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --doc
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --features view-test-support --doc
+cargo check --config "build.rustc-wrapper = ''" -p bevy_ui_router --features ecs
+cargo check --config "build.rustc-wrapper = ''" -p bevy_ui_router --features bsn
+cargo check --config "build.rustc-wrapper = ''" -p bevy_ui_router --features platform
+cargo check --config "build.rustc-wrapper = ''" -p bevy_ui_router --all-features
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_features facade_default_prelude_exposes_phase_3a_view_binding_contracts -- --nocapture
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_features facade_view_module_exposes_phase_3a_protocol_observations_by_explicit_path -- --nocapture
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --features view-test-support --test facade_features facade_test_support_prelude_exposes_phase_3a_fake_renderer -- --nocapture
 ```
 
-Expected: all required commands pass. Failed commands block Phase 3A completion.
+Expected: all required commands pass. Failed commands block Phase 3A completion. Compile-fail boundary harness results must record nonzero test counts and confirm stderr fragments name the intended missing/private APIs rather than unrelated missing modules, wrong features, or wrong targets. Authority-surface audits and optional feature checks must pass before Phase 3B planning begins.
 
 - [ ] **Step 3: Phase 3A review gate**
 
 Confirm:
 
 - fake renderer tests cover success and failure paths;
+- fake renderer tests cover stale-result without partial output and foreign-plan provenance rejection;
 - adapter-facing contracts do not expose forgeable identity;
-- active commit ordering is tested.
+- authority-surface audits reject accidental public commit, accept, finalize, activate, or frame-apply conversion APIs;
+- facade optional feature checks pass for `ecs`, `bsn`, `platform`, and `--all-features`;
+- Phase 3A does not claim commit-ordering behavior; Phase 3B owns ECS finalization and active commit integration.
 
 Expected: Phase 3B planning starts only after this gate passes and Phase 3A gate evidence is recorded.
 
@@ -606,6 +629,11 @@ Create a detailed plan for:
 - `RouteSlot`;
 - frame root marker;
 - schedule sets;
+- core-issued `FrameApplyRequest` as the canonical ECS/view handoff unit;
+- controlled reporter/session capability minted from `FrameApplyRequest` for non-fake adapter renderer-result reporting, without public raw protocol constructors;
+- translation of finalized renderer output into core `FrameApplyOutcome` paired with the request token;
+- final stale acceptance inside core, not in ECS, view, BSN, facade, or adapters;
+- active commit ordering after view apply, ECS finalization, and core acceptance;
 - controlled cleanup API;
 - visibility, pickability, and focus finalization;
 - ownership tests proving app-owned host is not touched.
@@ -638,7 +666,7 @@ Expected: Phase 3B implementation does not begin until this plan acceptance gate
 
 - [ ] **Step 1: Execute Phase 3B task-by-task**
 
-Expected: ECS ownership, cleanup, and finalization behavior are built through tests first, with RED and GREEN evidence recorded.
+Expected: ECS ownership, cleanup, finalization, core apply handoff, and active commit ordering behavior are built through tests first, with RED and GREEN evidence recorded.
 
 - [ ] **Step 2: Run Phase 3B verification**
 
@@ -646,10 +674,11 @@ Minimum baseline:
 
 ```powershell
 cargo fmt --all --check
-cargo test -p bevy_ui_router_ecs --features ecs
+cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs
+cargo check --config "build.rustc-wrapper = ''" -p bevy_ui_router --features ecs
 ```
 
-If Phase 0 or Phase 3B freezes a different feature name, run the equivalent ECS integration test command recorded in the Phase 3B plan.
+If Phase 0 or Phase 3B freezes a different facade feature name, run the equivalent ECS integration and facade wiring commands recorded in the Phase 3B plan.
 
 Expected: all required commands pass. Failed commands block Phase 3B completion.
 
@@ -659,6 +688,11 @@ Confirm:
 
 - router-owned cleanup does not touch app-owned host;
 - frame root markers include router, host, slot, frame, generation, and route identity;
+- ECS bridge uses core-issued `FrameApplyRequest` as the canonical handoff unit;
+- non-fake adapters report renderer success/failure/partial output/disposal hints through a controlled reporter/session minted from `FrameApplyRequest`, not public raw constructors;
+- finalized renderer output is translated into core `FrameApplyOutcome` and submitted back to core for stale acceptance;
+- ECS/view/BSN/facade/adapter code does not reconstruct stale checks from public token fields or commit active branches directly;
+- active commit ordering is tested: view apply and ECS finalization complete before core accepts and commits active UI;
 - focus, pickability, and visibility finalization has tests.
 
 Expected: Phase 3C planning starts only after this gate passes and Phase 3B gate evidence is recorded.
@@ -689,7 +723,7 @@ Create a detailed plan for:
 
 - immediate code-driven BSN adapter;
 - BSN resolve/apply error mapping;
-- partial output reporting;
+- partial output reporting through the controlled reporter/session produced by Phase 3B;
 - controlled cleanup API use;
 - proof that adapter only uses public Router/ECS APIs.
 
