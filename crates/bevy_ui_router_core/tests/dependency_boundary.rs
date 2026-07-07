@@ -133,3 +133,16 @@ package = "bevy_ecs"
         ]
     );
 }
+
+#[test]
+fn phase_2_frame_transaction_manifest_stays_dependency_free() {
+    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest = fs::read_to_string(manifest_path).expect("core manifest should be readable");
+    let dependency_entries = dependency_entries(&manifest);
+
+    assert!(
+        dependency_entries.is_empty(),
+        "Phase 2 frame and transaction work must not add dependency-like entries:\n{}",
+        dependency_entries.join("\n")
+    );
+}

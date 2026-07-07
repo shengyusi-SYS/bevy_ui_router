@@ -272,3 +272,33 @@ fn facade_prelude_exposes_branch_planning_contracts() {
     assert_types::<RouteLocation>();
     assert_types::<RouteParams>();
 }
+
+#[test]
+fn facade_prelude_exposes_phase_2_observation_contracts() {
+    use bevy_ui_router::core::frame::{FrameReconciliationPlan, RouteFrameBranch};
+    use bevy_ui_router::prelude::{
+        FrameApplyOutcome, FrameApplyRequest, FrameApplyToken, FrameCleanupPlan,
+        NavigationTransactionSnapshot, NavigationTransactionState, RouteFrameIdentity,
+        RouteFrameRecord, RouteFrameScope, RouteFrameStatus, StaleApplyReason, StaleApplyResult,
+        TransactionCommitError, TransactionCommitErrorKind, TransactionFailure,
+    };
+
+    fn assert_public<T>() {}
+    assert_public::<FrameApplyOutcome>();
+    assert_public::<FrameApplyRequest>();
+    assert_public::<FrameApplyToken>();
+    assert_public::<FrameCleanupPlan>();
+    assert_public::<FrameReconciliationPlan>();
+    assert_public::<NavigationTransactionSnapshot>();
+    assert_public::<NavigationTransactionState>();
+    assert_public::<RouteFrameBranch>();
+    assert_public::<RouteFrameIdentity>();
+    assert_public::<RouteFrameRecord>();
+    assert_public::<RouteFrameScope>();
+    assert_public::<StaleApplyReason>();
+    assert_public::<StaleApplyResult>();
+    assert_public::<TransactionCommitError>();
+    assert_public::<TransactionCommitErrorKind>();
+    assert_public::<TransactionFailure>();
+    assert_eq!(RouteFrameStatus::Active, RouteFrameStatus::Active);
+}
