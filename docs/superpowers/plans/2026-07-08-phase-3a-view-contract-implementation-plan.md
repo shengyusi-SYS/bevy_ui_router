@@ -27,7 +27,7 @@
 - Active UI still comes only from core-owned transaction commit after identity checks; Phase 3A must not introduce an alternate active-frame path.
 - View build, apply, and stale failures map to `RouteErrorSourceCategory::RendererContract`.
 - View build failures use `RouteErrorKind::ViewBuildFailed`; view apply failures use `RouteErrorKind::ViewApplyFailed`; stale renderer results use `RouteErrorKind::StaleResult`.
-- Public module coverage may expose stable view protocol records by explicit path. Default view/facade preludes expose only `ViewBindingKey` and `RouteViewDescriptor`; protocol observation records stay out of default preludes.
+- Public module coverage may expose stable view protocol records by explicit path. The view prelude and Phase 3A view-facing facade prelude additions expose only `ViewBindingKey` and `RouteViewDescriptor`; protocol observation records stay out of default preludes.
 - Public module/prelude/facade coverage must not expose fake renderer unless the explicit test-support feature is enabled.
 - Compile-fail boundary evidence that gates implementation must assert stderr fragments naming the intended missing/private API. Rustdoc `compile_fail` examples are allowed only as supplemental smoke coverage.
 - Every filtered GREEN or final `cargo test` command is invalid evidence if no intended target harness runs nonzero tests.
@@ -2819,7 +2819,7 @@ Expected:
 
 - No-default facade tests compile and run only core-compatible tests.
 - Facade compile-fail boundary harness runs 9 tests and asserts stderr fragments for no-default, default, and `view-test-support` negative boundaries.
-- Facade authority-surface boundary harness runs 1 test and rejects accidental public commit, accept, finalize, activate, or frame-apply conversion APIs.
+- Facade authority-surface boundary harness runs 2 tests and rejects accidental public commit, accept, finalize, activate, or frame-apply conversion APIs across facade and re-exported view sources.
 - Default facade doctests prove `FakeViewRenderer` and `FakeViewRendererMode` are not exposed from prelude, root view, view prelude, or `test_support` paths without `view-test-support`, and protocol observation records are not in the default facade prelude.
 - View-test-support facade doctests prove fake renderer exposure still does not provide commit, token-acceptance, finalize, or named authority-trait paths.
 - Facade optional feature checks compile `ecs`, `bsn`, `platform`, and `--all-features` combinations after the view re-export changes.
@@ -2850,10 +2850,10 @@ cargo fmt --check
 
 Expected:
 
-- View dependency-boundary integration test runs 4 tests and passes.
+- View dependency-boundary integration test runs 5 tests and passes.
 - No-default facade test target runs its core-compatible tests and passes.
 - Facade compile-fail boundary harness runs 9 tests and asserts exact stderr fragments for negative boundaries.
-- Facade authority-surface boundary harness runs 1 test and passes.
+- Facade authority-surface boundary harness runs 2 tests and passes.
 - Default facade doctests pass and include the fake-renderer non-exposure and default-prelude protocol non-exposure compile-fail guards.
 - View-test-support facade doctests pass and include no commit, token-acceptance, finalize, or named authority-trait compile-fail guards.
 - Facade optional feature checks pass for `ecs`, `bsn`, `platform`, and `--all-features`.
@@ -2965,6 +2965,65 @@ git add docs/superpowers/plans/2026-07-08-phase-3a-view-contract-implementation-
 git commit -m "docs: record phase 3a view contract verification"
 ```
 
+#### Phase 3A Verification Record
+
+Phase 3A verification PASS, recorded on 2026-07-08.
+
+Implementation commits:
+
+- `38e092d feat(view): add renderer-neutral view contract`
+- `1cbd9e9 docs: clarify phase 3a task 2 feature handoff`
+- `8b08bfb feat(view): add fake renderer test support`
+- `c9036ad test: expose view contract through gated facade features`
+- `8f51ed3 test: harden phase 3a facade boundaries`
+
+Fresh final verification commands:
+
+- `cargo fmt --all --check` exited 0.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_view --lib` passed `4 passed; 0 failed`.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_view --features test-support --lib` passed `16 passed; 0 failed`.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_view --doc` passed `17 passed; 0 failed`.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_view --features test-support --doc` passed `19 passed; 0 failed`.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_view --test compile_fail_boundary` passed `11 passed; 0 failed`.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_view --features test-support --test compile_fail_boundary` passed `17 passed; 0 failed`.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_view --test authority_surface_boundary` passed `1 passed; 0 failed`.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_view --test dependency_boundary` passed `5 passed; 0 failed`.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_core` passed `87` unit tests, `5` dependency-boundary tests, `2` public API tests, and `28` doctests; all reported `0 failed`.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --test facade_features` passed `5 passed; 0 failed`.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_compile_fail_boundary` passed `9 passed; 0 failed`.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_authority_surface_boundary` passed `2 passed; 0 failed`.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --doc` passed `6 passed; 0 failed`.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --features view-test-support --doc` passed `5 passed; 0 failed`.
+- `cargo check --config "build.rustc-wrapper = ''" -p bevy_ui_router --features ecs` exited 0.
+- `cargo check --config "build.rustc-wrapper = ''" -p bevy_ui_router --features bsn` exited 0.
+- `cargo check --config "build.rustc-wrapper = ''" -p bevy_ui_router --features platform` exited 0.
+- `cargo check --config "build.rustc-wrapper = ''" -p bevy_ui_router --all-features` exited 0.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_features facade_default_prelude_exposes_phase_3a_view_binding_contracts -- --nocapture` passed `1 passed; 0 failed`.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_features facade_view_module_exposes_phase_3a_protocol_observations_by_explicit_path -- --nocapture` passed `1 passed; 0 failed`.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --features view-test-support --test facade_features facade_test_support_prelude_exposes_phase_3a_fake_renderer -- --nocapture` passed `1 passed; 0 failed`.
+
+Supplemental Phase 3B handoff audit:
+
+- `rg -n "FakeViewRenderer|ViewBuildRequest|ViewApplyOutcome|RouteViewDescriptor|ViewPartialOutput|ViewRenderPlan|ViewDisposalHint" crates\bevy_ui_router_view crates\bevy_ui_router\tests` showed Phase 3A contract symbols in the view crate and facade tests, covering public binding declarations, explicit facade `view` protocol paths, `view-test-support` fake renderer exposure, and negative missing-symbol/missing-method boundaries.
+- `rg -n "ViewRequestId::from_raw|ViewOutputId::from_raw|ViewBuildRequest::new|ViewRenderPlan::new|ViewDisposalHint::new|ViewPartialOutput::new|ViewFailure::" crates\bevy_ui_router_view\src crates\bevy_ui_router_view\tests crates\bevy_ui_router\tests` showed raw protocol constructors confined to `bevy_ui_router_view` internals/tests and negative compile-fail fixture strings; no facade production source uses them.
+- After removing the generated root `Cargo.lock`, `git status --short` was clean before this documentation update.
+
+Whole-branch review result:
+
+- Architecture and lifecycle review reported no Critical, Important, or Minor issues.
+- API and authority review reported no Critical, Important, or Minor issues.
+- Test and risk review reported no Critical or Important issues. It recorded one non-blocking Minor risk: authority-surface checks remain name-based source scans rather than a structured public-API allow-list.
+- Fact and source review reported no source-level contradiction and confirmed the pass counts, feature names, dependency boundaries, file paths, and Phase 3B handoff wording line up with current source. It identified a documentation/evidence gap before this record was written and a wording precision issue around facade prelude scope; this record resolves both by recording review results, unresolved risks, and by describing facade exposure as Phase 3A view-facing additions rather than the full facade prelude.
+
+Unresolved risks:
+
+- No blocking Phase 3A risks remain.
+- Residual future-facing risk: the Phase 3A authority-surface guards are deny-list/name-scan checks. When Phase 3B introduces a controlled bridge, reporter, or session API, Phase 3B should replace or supplement these with an explicit allow-list proving the new API does not grant active commit, stale acceptance, token construction, or lifecycle authority outside core.
+
+Phase 3B handoff statement:
+
+Phase 3B uses core-issued `FrameApplyRequest` as the canonical handoff unit. Non-fake adapters report renderer observations only through a controlled reporter/session minted from that request. The bridge may translate finalized renderer output into core's `FrameApplyOutcome` paired with the request token, but final sequence/router/host/slot/route/frame/generation/transaction stale checks stay inside core.
+
 ---
 
 ## Review Gate Before Implementation
@@ -2989,7 +3048,7 @@ After the plan passes review, ask independent agents whether the document needs 
 - `bevy_ui_router_view` depends only on `bevy_ui_router_core`.
 - `bevy_ui_router_view` does not depend on Bevy, BSN, platform crates, facade crate, or app profile concepts.
 - View contract types model descriptor, build request, render plan, apply-created partial output, disposal hint, build failure, apply failure, stale result, and apply success.
-- Default view and facade preludes expose only the user-facing `ViewBindingKey` and `RouteViewDescriptor` view declaration types.
+- The view prelude and Phase 3A view-facing facade prelude additions expose only the user-facing `ViewBindingKey` and `RouteViewDescriptor` view declaration types; the facade prelude also continues to re-export the existing core prelude.
 - Protocol observation records such as build request, render plan, outcomes, failures, ids, disposal hints, and partial output remain public only by explicit view crate or facade `view` module paths.
 - `ViewRenderPlan` does not contain `ViewPartialOutput`.
 - `ViewPartialOutput` contains request id, output id, binding key, and optional renderer-local disposal hint.
