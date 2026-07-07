@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteErrorKind {
     InvalidRoutePattern,
+    InvalidRouteTree,
     NotFound,
     MatchConflict,
     GuardRejected,

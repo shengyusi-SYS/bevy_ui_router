@@ -9,6 +9,7 @@ pub mod ids;
 pub mod location;
 pub mod ownership;
 pub mod pattern;
+pub mod route_tree;
 
 pub mod prelude {
     pub use crate::back::{BackCapabilitySnapshot, BackIntent, BackPolicy};
@@ -24,4 +25,5 @@ pub mod prelude {
     pub use crate::location::RouteLocation;
     pub use crate::ownership::{CleanupScope, OwnedRegion};
     pub use crate::pattern::{RoutePathSegment, RoutePattern, RoutePatternKind};
+    pub use crate::route_tree::{RouteTree, RouteTreeBuilder};
 }
