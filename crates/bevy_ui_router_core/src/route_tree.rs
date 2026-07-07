@@ -1,3 +1,9 @@
+//! ```compile_fail
+//! use bevy_ui_router_core::prelude::RouteId;
+//!
+//! let _ = RouteId::new(99);
+//! ```
+
 use std::collections::BTreeMap;
 
 use crate::error::RouteError;

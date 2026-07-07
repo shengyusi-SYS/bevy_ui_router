@@ -74,6 +74,19 @@ fn core_manifest_does_not_define_dependency_entries() {
 }
 
 #[test]
+fn core_manifest_still_has_no_dependency_entries_after_matcher() {
+    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest = fs::read_to_string(manifest_path).expect("core manifest should be readable");
+    let dependency_entries = dependency_entries(&manifest);
+
+    assert!(
+        dependency_entries.is_empty(),
+        "matcher phase must not add dependency-like entries:\n{}",
+        dependency_entries.join("\n")
+    );
+}
+
+#[test]
 fn dependency_subtables_are_treated_as_violations() {
     let manifest = r#"
 [dependencies]
