@@ -391,8 +391,7 @@ impl NavigationTransaction {
             });
         }
 
-        let current_fingerprint = current_active.map(RouteFrameBranch::branch_fingerprint);
-        if current_fingerprint != self.plan.baseline_fingerprint() {
+        if !self.plan.matches_current_active(current_active) {
             return Err(TransactionCommitError {
                 kind: TransactionCommitErrorKind::ChangedCurrentBranch,
             });
@@ -527,7 +526,9 @@ mod tests {
     use super::*;
     use crate::branch_diff::BranchDiff;
     use crate::error::{RouteError, RouteErrorKind, RouteErrorSourceCategory};
-    use crate::frame::{FrameAllocator, RouteFrameScope};
+    use crate::frame::{
+        FrameAllocator, RouteFrameIdentity, RouteFrameRecord, RouteFrameScope, RouteFrameStatus,
+    };
     use crate::ids::{
         RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId, RouterInstanceId,
     };
@@ -758,6 +759,50 @@ mod tests {
         let changed_active = RouteFrameBranch::new(Vec::new(), plan.target_fingerprint().clone());
 
         let result = transaction.commit(Some(&changed_active));
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            TransactionCommitErrorKind::ChangedCurrentBranch
+        );
+    }
+
+    #[test]
+    fn commit_rejects_remounted_current_active_branch_with_same_fingerprint() {
+        let (active, plan) = branches();
+        let mut transaction = NavigationTransaction::new(plan);
+        let requests = transaction.snapshot().requests().to_vec();
+        for request in requests {
+            transaction
+                .accept_apply_result(request.token(), FrameApplyOutcome::Applied)
+                .unwrap();
+        }
+        let remounted_active = RouteFrameBranch::new(
+            active
+                .frames()
+                .iter()
+                .enumerate()
+                .map(|(index, record)| {
+                    let route = record.identity().route();
+                    RouteFrameRecord::new(
+                        RouteFrameIdentity::new(
+                            record.identity().router(),
+                            record.identity().host(),
+                            record.identity().slot(),
+                            route,
+                            RouteFrameId::new(100 + index as u64),
+                            RouteGeneration::initial().next(),
+                        ),
+                        record.branch_index(),
+                        record.slot_key().clone(),
+                        record.segment_reuse_key().clone(),
+                        RouteFrameStatus::Active,
+                    )
+                })
+                .collect(),
+            active.branch_fingerprint().clone(),
+        );
+
+        let result = transaction.commit(Some(&remounted_active));
 
         assert_eq!(
             result.unwrap_err().kind(),

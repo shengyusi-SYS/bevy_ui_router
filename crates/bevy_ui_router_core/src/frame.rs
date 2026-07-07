@@ -278,11 +278,70 @@ impl FrameAllocator {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ActiveFrameBaseline {
+    identity: RouteFrameIdentity,
+    branch_index: usize,
+}
+
+impl ActiveFrameBaseline {
+    fn from_record(record: &RouteFrameRecord) -> Self {
+        Self {
+            identity: *record.identity(),
+            branch_index: record.branch_index(),
+        }
+    }
+
+    fn matches_record(&self, record: &RouteFrameRecord) -> bool {
+        let identity = record.identity();
+        self.identity.router() == identity.router()
+            && self.identity.host() == identity.host()
+            && self.identity.slot() == identity.slot()
+            && self.identity.route() == identity.route()
+            && self.identity.frame() == identity.frame()
+            && self.identity.generation() == identity.generation()
+            && self.branch_index == record.branch_index()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ActiveBranchBaseline {
+    branch_fingerprint: RouteBranchFingerprint,
+    frames: Vec<ActiveFrameBaseline>,
+}
+
+impl ActiveBranchBaseline {
+    fn from_branch(branch: &RouteFrameBranch) -> Self {
+        Self {
+            branch_fingerprint: branch.branch_fingerprint().clone(),
+            frames: branch
+                .frames()
+                .iter()
+                .map(ActiveFrameBaseline::from_record)
+                .collect(),
+        }
+    }
+
+    fn matches_branch(&self, branch: &RouteFrameBranch) -> bool {
+        self.branch_fingerprint == *branch.branch_fingerprint()
+            && self.frames.len() == branch.frames().len()
+            && self
+                .frames
+                .iter()
+                .zip(branch.frames())
+                .all(|(baseline, current)| baseline.matches_record(current))
+    }
+
+    pub(crate) const fn branch_fingerprint(&self) -> &RouteBranchFingerprint {
+        &self.branch_fingerprint
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrameReconciliationPlan {
     preserved: Vec<RouteFrameRecord>,
     leaving: Vec<RouteFrameRecord>,
     entering: Vec<RouteFrameRecord>,
-    baseline_fingerprint: Option<RouteBranchFingerprint>,
+    baseline_branch: Option<ActiveBranchBaseline>,
     target_fingerprint: RouteBranchFingerprint,
     error_boundaries: BTreeMap<RouteId, Option<ErrorBoundaryKey>>,
 }
@@ -297,8 +356,7 @@ impl FrameReconciliationPlan {
         allocator: &mut FrameAllocator,
     ) -> Self {
         let in_scope_active = active.filter(|branch| branch.belongs_to_scope(scope));
-        let baseline_fingerprint =
-            in_scope_active.map(|branch| branch.branch_fingerprint().clone());
+        let baseline_branch = in_scope_active.map(ActiveBranchBaseline::from_branch);
         let target_fingerprint = target.branch_fingerprint().clone();
         let common = diff.common_prefix_len();
         let can_reuse = in_scope_active.is_some_and(|branch| {
@@ -349,7 +407,7 @@ impl FrameReconciliationPlan {
             preserved,
             leaving,
             entering,
-            baseline_fingerprint,
+            baseline_branch,
             target_fingerprint,
             error_boundaries: error_boundaries_from(target),
         }
@@ -367,7 +425,7 @@ impl FrameReconciliationPlan {
             preserved: Vec::new(),
             leaving: Vec::new(),
             entering,
-            baseline_fingerprint: None,
+            baseline_branch: None,
             target_fingerprint: target.branch_fingerprint().clone(),
             error_boundaries: error_boundaries_from(target),
         }
@@ -385,12 +443,22 @@ impl FrameReconciliationPlan {
         &self.entering
     }
 
-    pub const fn baseline_fingerprint(&self) -> Option<&RouteBranchFingerprint> {
-        self.baseline_fingerprint.as_ref()
+    pub fn baseline_fingerprint(&self) -> Option<&RouteBranchFingerprint> {
+        self.baseline_branch
+            .as_ref()
+            .map(ActiveBranchBaseline::branch_fingerprint)
     }
 
     pub const fn target_fingerprint(&self) -> &RouteBranchFingerprint {
         &self.target_fingerprint
+    }
+
+    pub(crate) fn matches_current_active(&self, current_active: Option<&RouteFrameBranch>) -> bool {
+        match (&self.baseline_branch, current_active) {
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+            (Some(baseline), Some(current)) => baseline.matches_branch(current),
+        }
     }
 
     pub(crate) fn nearest_error_boundary_for(&self, route: RouteId) -> Option<&ErrorBoundaryKey> {
