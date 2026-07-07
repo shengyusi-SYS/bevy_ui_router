@@ -2755,3 +2755,77 @@ The lead agent must evaluate findings before accepting them. If multiple finding
 - Compile-fail doctests prove frame, generation, transaction, token, cleanup-scope, and lifecycle-diagnostic authority cannot be forged through public APIs.
 - Dependency-boundary tests prove core remains dependency-free.
 - Final verification record lists commands, pass counts, review result, and Phase 3A handoff.
+
+---
+
+## 10. Phase 2 Verification Record
+
+Recorded on 2026-07-08 after implementation and whole-branch review.
+
+### Implementation Commits
+
+- `fbb99ca` `feat(core): add route frame records`
+- `d4b129b` `fix(core): add frame status cloning`
+- `3d03937` `feat(core): plan frame reconciliation`
+- `7f2606b` `fix(core): fail closed on stale frame diffs`
+- `63fff7f` `feat(core): add navigation transaction stale gate`
+- `97b6105` `fix(core): make transaction failure cleanup precise`
+- `43d7f54` `feat(core): record transaction failure cleanup`
+- `df5baca` `fix(core): populate plan error boundaries in constructors`
+- `0b400ed` `feat(core): add frame lifecycle diagnostics`
+- `3a7492c` `fix(core): expose frame lifecycle diagnostics as inherent API`
+- `50803ec` `docs: record phase 2 task 5 review fix`
+- `b9add4f` `test(core): lock frame transaction authority boundaries`
+- `66925db` `test: expose frame transaction facade contracts`
+- `676778a` `fix: expose frame planning observations through prelude`
+- `964321c` `fix(core): recheck frame baseline before commit`
+- `c9d17d8` `docs: update phase 2 final review fix report`
+
+### Final Verification Commands
+
+- `cargo fmt --all --check`
+  - Result: passed.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_core`
+  - Result: passed.
+  - Counts: 87 unit tests, 5 `dependency_boundary` integration tests, 2 `public_api` integration tests, and 28 doctests passed.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --doc`
+  - Result: passed.
+  - Count: 28 doctests passed.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --test public_api`
+  - Result: passed.
+  - Count: 2 integration tests passed.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --test dependency_boundary`
+  - Result: passed.
+  - Count: 5 integration tests passed.
+- `cargo test --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features`
+  - Result: passed.
+  - Counts: 5 `facade_features` integration tests passed; facade lib and doctest harnesses each ran 0 tests.
+
+### Handoff Checks
+
+- `rg -n "RouteFrameStatus|NavigationTransaction|FrameApplyToken|StaleApplyResult|TransactionFailure" crates\bevy_ui_router_core\src`
+  - Result: matched the Phase 2 frame, transaction, diagnostics, and prelude contracts in core source.
+- `git status --short`
+  - Result before writing this record: no output after removing Cargo's generated root `Cargo.lock` verification artifact.
+
+### Whole-Branch Review Result
+
+- Architecture/API/lifecycle review initially returned `With fixes` because commit rechecked the active branch baseline only by `RouteBranchFingerprint`.
+- The blocker was fixed by `964321c`, which stores a private active-branch baseline snapshot and compares branch fingerprint plus frame count, router, host, slot, route, frame id, generation, and branch index before commit can publish a new active branch.
+- Architecture/API/lifecycle re-review reported `Critical fixed: Yes` and `Ready to proceed: Yes`.
+- Fact/evidence review returned `With fixes` because this final verification record and final full-phase pass counts were not yet present in the reviewed range. This section records the missing evidence.
+
+### Unresolved Risks
+
+- Public API and facade observation coverage proves type exposure and authority boundaries, but remains mostly import/type-smoke coverage rather than behavioral observation coverage.
+- `RouteError` crate-visible helper constructors described in Task 4 were conditional on implementation need. The implementation uses `RouteError::new` directly, so unused helpers were not added.
+- Hidden/retained subtree input isolation and focus release remain future work because Phase 2 does not implement retained subtrees or Bevy ECS mutation.
+
+### Phase 3A Handoff
+
+Phase 2 leaves a core-only frame and transaction contract ready for the next planning phase. Phase 3A can build on:
+
+- observable frame scope, identity, status, branch, reconciliation plan, cleanup plan, and lifecycle diagnostics;
+- internal navigation transaction authority with apply tokens, stale token checks, failure records, router-owned cleanup, nearest error-boundary metadata, and active-baseline commit recheck;
+- compile-fail coverage for non-forgeable frame, generation, transaction, token, cleanup, and diagnostic authority;
+- public module, core prelude, and facade prelude observation coverage without exposing `NavigationTransaction` or other commit authority.
