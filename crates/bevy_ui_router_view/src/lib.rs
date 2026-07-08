@@ -70,6 +70,14 @@ use bevy_ui_router_view::test_support::ViewFinalizeAuthority;
 //! ```
 //!
 //! ```compile_fail
+//! use bevy_ui_router_view::prelude::ViewReportSession;
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::prelude::ViewReportedOutput;
+//! ```
+//!
+//! ```compile_fail
 //! use bevy_ui_router_view::ViewRequestId;
 //!
 //! let _ = ViewRequestId::from_raw(1);
@@ -132,6 +140,13 @@ use bevy_ui_router_view::test_support::ViewFinalizeAuthority;
 //! ```
 //!
 //! ```compile_fail
+//! use bevy_ui_router_view::{RouteViewDescriptor, ViewBindingKey, ViewReportSession};
+//!
+//! let descriptor = RouteViewDescriptor::new(ViewBindingKey::new("leaf"));
+//! let _ = ViewReportSession::from_frame_request(&descriptor, descriptor.clone());
+//! ```
+//!
+//! ```compile_fail
 //! use bevy_ui_router_view::prelude::FrameApplyToken;
 //! ```
 //!
@@ -146,7 +161,8 @@ mod testing;
 
 pub use contract::{
     RouteViewDescriptor, ViewApplyOutcome, ViewBindingKey, ViewBuildOutcome, ViewBuildRequest,
-    ViewDisposalHint, ViewFailure, ViewOutputId, ViewPartialOutput, ViewRenderPlan, ViewRequestId,
+    ViewDisposalHint, ViewFailure, ViewOutputId, ViewPartialOutput, ViewRenderPlan,
+    ViewReportSession, ViewReportedOutput, ViewRequestId,
 };
 
 #[cfg(feature = "test-support")]

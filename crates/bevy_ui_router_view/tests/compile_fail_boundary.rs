@@ -115,6 +115,26 @@ fn default_protocol_record_not_in_prelude_names_missing_symbol() {
 }
 
 #[test]
+fn default_report_session_not_in_prelude_names_missing_symbol() {
+    assert_compile_fails(Fixture {
+        name: "default_report_session_not_in_prelude",
+        code: "use bevy_ui_router_view::prelude::ViewReportSession; fn main() {}",
+        features: &[],
+        expected_stderr: &["error[E0432]", "no `ViewReportSession` in `prelude`"],
+    });
+}
+
+#[test]
+fn default_reported_output_not_in_prelude_names_missing_symbol() {
+    assert_compile_fails(Fixture {
+        name: "default_reported_output_not_in_prelude",
+        code: "use bevy_ui_router_view::prelude::ViewReportedOutput; fn main() {}",
+        features: &[],
+        expected_stderr: &["error[E0432]", "no `ViewReportedOutput` in `prelude`"],
+    });
+}
+
+#[test]
 fn private_request_id_constructor_names_private_function() {
     assert_compile_fails(Fixture {
         name: "private_request_id_constructor",
@@ -209,6 +229,19 @@ fn private_view_failure_stale_constructor_names_private_function() {
         expected_stderr: &[
             "error[E0624]",
             "associated function `stale_result` is private",
+        ],
+    });
+}
+
+#[test]
+fn report_session_requires_frame_apply_request() {
+    assert_compile_fails(Fixture {
+        name: "report_session_requires_frame_apply_request",
+        code: "use bevy_ui_router_view::{RouteViewDescriptor, ViewBindingKey, ViewReportSession}; fn main() { let descriptor = RouteViewDescriptor::new(ViewBindingKey::new(\"leaf\")); let _ = ViewReportSession::from_frame_request(&descriptor, descriptor.clone()); }",
+        features: &[],
+        expected_stderr: &[
+            "error[E0308]",
+            "expected `&FrameApplyRequest`, found `&RouteViewDescriptor`",
         ],
     });
 }

@@ -1,3 +1,82 @@
+struct AllowedPublicSurface<'a> {
+    file: &'a str,
+    fragment: &'a str,
+}
+
+const ALLOWED_REPORTING_SURFACE: &[AllowedPublicSurface<'_>] = &[
+    AllowedPublicSurface {
+        file: "view src/contract.rs",
+        fragment: "pub struct ViewReportSession",
+    },
+    AllowedPublicSurface {
+        file: "view src/contract.rs",
+        fragment: "pub struct ViewReportedOutput",
+    },
+    AllowedPublicSurface {
+        file: "view src/contract.rs",
+        fragment: "pub fn from_frame_request(",
+    },
+    AllowedPublicSurface {
+        file: "view src/contract.rs",
+        fragment: "pub fn frame_request(&self) -> &FrameApplyRequest",
+    },
+    AllowedPublicSurface {
+        file: "view src/contract.rs",
+        fragment: "pub fn build_request(&self) -> ViewBuildRequest",
+    },
+    AllowedPublicSurface {
+        file: "view src/contract.rs",
+        fragment: "pub fn build_success(&mut self) -> ViewBuildOutcome",
+    },
+    AllowedPublicSurface {
+        file: "view src/contract.rs",
+        fragment: "pub fn build_failed(&mut self, redacted_message: impl Into<String>) -> ViewBuildOutcome",
+    },
+    AllowedPublicSurface {
+        file: "view src/contract.rs",
+        fragment: "pub fn applied(",
+    },
+    AllowedPublicSurface {
+        file: "view src/contract.rs",
+        fragment: "pub fn apply_failed(",
+    },
+    AllowedPublicSurface {
+        file: "view src/contract.rs",
+        fragment: "pub fn stale(&mut self, redacted_message: impl Into<String>) -> ViewApplyOutcome",
+    },
+    AllowedPublicSurface {
+        file: "view src/contract.rs",
+        fragment: "pub fn outcome(&self) -> &ViewApplyOutcome",
+    },
+    AllowedPublicSurface {
+        file: "view src/lib.rs",
+        fragment: "ViewReportSession",
+    },
+    AllowedPublicSurface {
+        file: "view src/lib.rs",
+        fragment: "ViewReportedOutput",
+    },
+];
+
+#[test]
+fn facade_allow_lists_reporting_only_surface() {
+    let sources = facade_exported_surface_sources();
+
+    for allowed in ALLOWED_REPORTING_SURFACE {
+        let source = sources
+            .iter()
+            .find(|(file, _)| *file == allowed.file)
+            .map(|(_, source)| *source)
+            .unwrap_or_else(|| panic!("missing source file `{}`", allowed.file));
+        assert!(
+            source.contains(allowed.fragment),
+            "{} is missing allowed reporting surface fragment `{}`",
+            allowed.file,
+            allowed.fragment
+        );
+    }
+}
+
 #[test]
 fn facade_does_not_expose_active_commit_or_acceptance_surface() {
     for (file, source) in facade_exported_surface_sources() {
@@ -56,6 +135,13 @@ fn assert_forbidden_public_fragments_absent(file: &str, source: &str) {
         "pub fn to_frame_apply",
         "pub fn into_core_apply",
         "pub fn to_core_apply",
+        "pub fn cleanup",
+        "pub fn into_cleanup",
+        "pub fn to_cleanup",
+        "pub fn advance_generation",
+        "pub fn next_generation",
+        "pub fn emit_diagnostic",
+        "pub fn diagnostic",
         "Accept",
         "Approve",
         "Activate",
@@ -64,18 +150,14 @@ fn assert_forbidden_public_fragments_absent(file: &str, source: &str) {
         "MarkActive",
         "Commit",
         "Finalize",
-        "FrameApply",
-        "CoreApply",
-        "pub trait ViewCommitAuthority",
-        "pub trait ViewFinalizeAuthority",
-        "pub struct ViewCommitAuthority",
-        "pub struct ViewFinalizeAuthority",
+        "ViewCommitAuthority",
+        "ViewFinalizeAuthority",
     ];
 
     for fragment in forbidden {
         assert!(
             !source.contains(fragment),
-            "{file} exposes forbidden Phase 3A authority surface fragment `{fragment}`"
+            "{file} exposes forbidden authority surface fragment `{fragment}`"
         );
     }
 }
