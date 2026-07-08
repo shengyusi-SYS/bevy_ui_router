@@ -71,6 +71,49 @@ fn ecs_root_exports_apply_bridge_types_without_prelude_promotion() {
 }
 
 #[test]
+fn cleanup_stays_crate_private_while_report_exposes_read_only_ordered_evidence() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lib_source =
+        fs::read_to_string(manifest_dir.join("src").join("lib.rs")).expect("lib source readable");
+    let cleanup_source = fs::read_to_string(manifest_dir.join("src").join("cleanup.rs"))
+        .expect("cleanup source should be readable");
+
+    assert!(
+        lib_source.contains("pub(crate) mod cleanup;"),
+        "cleanup module should stay crate-private"
+    );
+    for forbidden in [
+        "pub mod cleanup;",
+        "pub use cleanup::CleanupCapability",
+        "pub use cleanup::cleanup_router_owned_subtree",
+        "pub use cleanup::CleanupReport",
+        "CleanupCapability",
+        "cleanup_router_owned_subtree",
+    ] {
+        let prelude_start = lib_source
+            .find("pub mod prelude {")
+            .expect("lib.rs should define a prelude block");
+        let prelude = &lib_source[prelude_start..];
+        assert!(
+            !prelude.contains(forbidden),
+            "prelude should not expose cleanup authority fragment `{forbidden}`"
+        );
+    }
+    for required in [
+        "pub(crate) struct CleanupCapability;",
+        "pub(crate) fn cleanup_router_owned_subtree(",
+        "pub struct CleanupReport",
+        "pub fn removed(&self) -> &[Entity]",
+        "pub fn skipped_mismatches(&self) -> &[Entity]",
+    ] {
+        assert!(
+            cleanup_source.contains(required),
+            "cleanup source should contain `{required}`"
+        );
+    }
+}
+
+#[test]
 fn route_host_and_slot_observe_core_issued_identity() {
     let state = RouterEcsState::new();
     let host = state.route_host();

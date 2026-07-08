@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod bridge;
+pub(crate) mod cleanup;
 mod components;
 mod plugin;
 mod state;
