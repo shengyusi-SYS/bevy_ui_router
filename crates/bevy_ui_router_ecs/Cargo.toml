@@ -8,3 +8,6 @@ bevy_app = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "sys/be
 bevy_ecs = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "sys/bevy-0.19-router", version = "0.19.0", default-features = false }
 bevy_ui_router_core = { path = "../bevy_ui_router_core" }
 bevy_ui_router_view = { path = "../bevy_ui_router_view" }
+
+[dev-dependencies]
+bevy_ui_router_core = { path = "../bevy_ui_router_core", features = ["test-support"] }

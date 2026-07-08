@@ -151,6 +151,7 @@ mod tests {
     use bevy_ui_router_core::pattern::RoutePattern;
     use bevy_ui_router_core::route_tree::RouteTree;
     use bevy_ui_router_core::runtime::RouterRuntime;
+    use bevy_ui_router_core::test_support::frame_apply_request_with_next_generation;
     use bevy_ui_router_core::transaction::FrameApplyOutcome;
 
     use crate::components::{RouteFrameRoot, RouteHost};
@@ -255,6 +256,129 @@ mod tests {
             expected_skipped
                 .into_iter()
                 .map(|(entity, _root)| entity)
+                .collect::<Vec<_>>()
+                .as_slice()
+        );
+    }
+
+    #[test]
+    fn cleanup_skips_same_frame_with_different_generation_from_core_test_support() {
+        let (runtime, request_roots, cleanup_plan) = failure_fixture("/items/42", 1);
+        let mut world = World::new();
+
+        let host = world.spawn((RouteHost::from_runtime(&runtime),)).id();
+        let matching_root = world
+            .spawn((RouteFrameRoot::from_frame_request(&request_roots[1]),))
+            .id();
+        let next_generation_request = frame_apply_request_with_next_generation(&request_roots[1]);
+        let next_generation_root = world
+            .spawn((RouteFrameRoot::from_frame_request(&next_generation_request),))
+            .id();
+
+        world
+            .entity_mut(host)
+            .add_children(&[next_generation_root, matching_root]);
+
+        let report = cleanup_router_owned_subtree(&mut world, &cleanup_plan, CleanupCapability);
+
+        assert!(world.get_entity(host).is_ok(), "app-owned host must remain");
+        assert!(
+            world.get_entity(matching_root).is_err(),
+            "matching generation should be removed"
+        );
+        assert!(
+            world.get_entity(next_generation_root).is_ok(),
+            "same frame id with different generation must survive cleanup"
+        );
+        assert_eq!(report.removed(), &[matching_root]);
+        assert_eq!(report.skipped_mismatches(), &[next_generation_root]);
+    }
+
+    #[test]
+    fn cleanup_orders_removed_and_skipped_reports_deterministically_at_runtime() {
+        let (runtime, request_roots, cleanup_plan) = failure_fixture("/items/42", 1);
+        let (_foreign_runtime, foreign_requests, _foreign_plan) = failure_fixture("/", 0);
+        let mut world = World::new();
+
+        let host = world.spawn((RouteHost::from_runtime(&runtime),)).id();
+        let matching_root_low = world
+            .spawn((RouteFrameRoot::from_frame_request(&request_roots[1]),))
+            .id();
+        let matching_root_high = world
+            .spawn((RouteFrameRoot::from_frame_request(&request_roots[1]),))
+            .id();
+        let mismatch_other_frame = world
+            .spawn((RouteFrameRoot::from_frame_request(&request_roots[0]),))
+            .id();
+        let mismatch_foreign_router = world
+            .spawn((RouteFrameRoot::from_frame_request(&foreign_requests[0]),))
+            .id();
+        let mismatch_next_generation_request =
+            frame_apply_request_with_next_generation(&request_roots[1]);
+        let mismatch_next_generation = world
+            .spawn((RouteFrameRoot::from_frame_request(
+                &mismatch_next_generation_request,
+            ),))
+            .id();
+
+        let matching_low_child_low = world.spawn_empty().id();
+        let matching_low_child_high = world.spawn_empty().id();
+        let matching_low_grandchild = world.spawn_empty().id();
+        let matching_high_child_low = world.spawn_empty().id();
+        let matching_high_child_high = world.spawn_empty().id();
+
+        world.entity_mut(host).add_children(&[
+            mismatch_next_generation,
+            mismatch_foreign_router,
+            matching_root_high,
+            mismatch_other_frame,
+            matching_root_low,
+        ]);
+        world
+            .entity_mut(matching_root_low)
+            .add_children(&[matching_low_child_high, matching_low_child_low]);
+        world
+            .entity_mut(matching_low_child_high)
+            .add_child(matching_low_grandchild);
+        world
+            .entity_mut(matching_root_high)
+            .add_children(&[matching_high_child_high, matching_high_child_low]);
+
+        let report = cleanup_router_owned_subtree(&mut world, &cleanup_plan, CleanupCapability);
+
+        let matching_identity = RouteFrameRoot::from_frame_request(&request_roots[1]);
+        let mut expected_removed = vec![
+            matching_root_low,
+            matching_low_child_low,
+            matching_low_child_high,
+            matching_low_grandchild,
+            matching_root_high,
+            matching_high_child_low,
+            matching_high_child_high,
+        ];
+        expected_removed.sort_by_key(|entity| cleanup_sort_key(&matching_identity, *entity));
+        assert_eq!(report.removed(), expected_removed.as_slice());
+
+        let mut expected_skipped = vec![
+            (
+                mismatch_next_generation,
+                RouteFrameRoot::from_frame_request(&mismatch_next_generation_request),
+            ),
+            (
+                mismatch_foreign_router,
+                RouteFrameRoot::from_frame_request(&foreign_requests[0]),
+            ),
+            (
+                mismatch_other_frame,
+                RouteFrameRoot::from_frame_request(&request_roots[0]),
+            ),
+        ];
+        expected_skipped.sort_by_key(|(entity, root)| cleanup_sort_key(root, *entity));
+        assert_eq!(
+            report.skipped_mismatches(),
+            expected_skipped
+                .iter()
+                .map(|(entity, _root)| *entity)
                 .collect::<Vec<_>>()
                 .as_slice()
         );

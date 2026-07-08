@@ -17,6 +17,8 @@ pub mod pattern;
 pub mod route_tree;
 pub mod runtime;
 pub mod slot;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod transaction;
 
 pub mod prelude {

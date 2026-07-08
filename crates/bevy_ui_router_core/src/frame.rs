@@ -132,6 +132,18 @@ impl RouteFrameIdentity {
     pub const fn generation(&self) -> RouteGeneration {
         self.generation
     }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn with_next_generation(&self) -> Self {
+        Self::new(
+            self.router,
+            self.host,
+            self.slot,
+            self.route,
+            self.frame,
+            self.generation.next(),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -185,6 +197,13 @@ impl RouteFrameRecord {
     pub(crate) fn with_status(&self, status: RouteFrameStatus) -> Self {
         let mut next = self.clone();
         next.status = status;
+        next
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn with_next_generation(&self) -> Self {
+        let mut next = self.clone();
+        next.identity = self.identity.with_next_generation();
         next
     }
 }

@@ -170,6 +170,14 @@ impl FrameApplyRequest {
     pub fn frame(&self) -> &RouteFrameRecord {
         &self.frame
     }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn clone_with_next_generation(&self) -> Self {
+        let frame = self.frame.with_next_generation();
+        let mut token = self.token.clone();
+        token.generation = frame.identity().generation();
+        Self { token, frame }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

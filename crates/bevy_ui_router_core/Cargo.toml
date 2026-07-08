@@ -3,4 +3,7 @@ name = "bevy_ui_router_core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]

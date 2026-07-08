@@ -77,6 +77,15 @@ fn cleanup_stays_crate_private_while_report_exposes_read_only_ordered_evidence()
         fs::read_to_string(manifest_dir.join("src").join("lib.rs")).expect("lib source readable");
     let cleanup_source = fs::read_to_string(manifest_dir.join("src").join("cleanup.rs"))
         .expect("cleanup source should be readable");
+    let core_lib_source = fs::read_to_string(
+        manifest_dir
+            .parent()
+            .expect("ecs crate should live under crates/")
+            .join("bevy_ui_router_core")
+            .join("src")
+            .join("lib.rs"),
+    )
+    .expect("core lib source should be readable");
 
     assert!(
         lib_source.contains("pub(crate) mod cleanup;"),
@@ -109,6 +118,20 @@ fn cleanup_stays_crate_private_while_report_exposes_read_only_ordered_evidence()
         assert!(
             cleanup_source.contains(required),
             "cleanup source should contain `{required}`"
+        );
+    }
+    assert!(
+        core_lib_source.contains("#[cfg(feature = \"test-support\")]\npub mod test_support;"),
+        "core should gate test support behind the narrow feature flag"
+    );
+    let core_prelude_start = core_lib_source
+        .find("pub mod prelude {")
+        .expect("core lib.rs should define a prelude block");
+    let core_prelude = &core_lib_source[core_prelude_start..];
+    for forbidden in ["test_support", "frame_apply_request_with_next_generation"] {
+        assert!(
+            !core_prelude.contains(forbidden),
+            "core prelude should not expose test-support fragment `{forbidden}`"
         );
     }
 }

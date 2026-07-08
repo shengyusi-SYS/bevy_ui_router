@@ -87,6 +87,7 @@ fn ecs_manifest_keeps_task_3_dependency_boundary() {
             "bevy_ecs",
             "bevy_ui_router_core",
             "bevy_ui_router_view",
+            "bevy_ui_router_core",
         ]
     );
 
@@ -131,4 +132,13 @@ fn ecs_manifest_keeps_task_3_dependency_boundary() {
             "{dependency} should disable default features"
         );
     }
+
+    assert!(
+        manifest_contains_dependency_config(
+            &manifest,
+            "bevy_ui_router_core",
+            "features = [\"test-support\"]"
+        ),
+        "ecs tests should enable only the narrow core test-support feature through dev-dependencies"
+    );
 }
