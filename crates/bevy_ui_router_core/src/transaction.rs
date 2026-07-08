@@ -217,6 +217,12 @@ impl TransactionCommitError {
     pub const fn kind(&self) -> TransactionCommitErrorKind {
         self.kind
     }
+
+    pub(crate) const fn pending_apply() -> Self {
+        Self {
+            kind: TransactionCommitErrorKind::PendingApply,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

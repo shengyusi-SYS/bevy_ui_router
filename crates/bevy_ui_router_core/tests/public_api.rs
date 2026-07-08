@@ -54,3 +54,21 @@ fn phase_2_frame_transaction_types_are_public_observation_api() {
         RouteFrameStatus::ApplyingView
     );
 }
+
+#[test]
+fn phase_3b_runtime_bridge_is_explicit_low_level_core_api() {
+    use bevy_ui_router_core::runtime::{
+        BeginNavigationError, FailureCleanupAckError, FrameApplyReportError, RouterRuntime,
+    };
+
+    fn assert_public<T>() {}
+    assert_public::<RouterRuntime>();
+    assert_public::<BeginNavigationError>();
+    assert_public::<FrameApplyReportError>();
+    assert_public::<FailureCleanupAckError>();
+
+    let runtime = RouterRuntime::new();
+    assert!(runtime.pending_snapshot().is_none());
+    assert!(runtime.active_branch().is_none());
+    assert_eq!(runtime.scope().router(), runtime.router());
+}
