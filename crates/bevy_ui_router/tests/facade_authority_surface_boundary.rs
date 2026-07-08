@@ -6,11 +6,11 @@ struct AllowedPublicSurface<'a> {
 const ALLOWED_REPORTING_SURFACE: &[AllowedPublicSurface<'_>] = &[
     AllowedPublicSurface {
         file: "view src/contract.rs",
-        fragment: "pub struct ViewReportSession",
+        fragment: "pub struct ViewReportSession {",
     },
     AllowedPublicSurface {
         file: "view src/contract.rs",
-        fragment: "pub struct ViewReportedOutput",
+        fragment: "pub struct ViewReportedOutput {",
     },
     AllowedPublicSurface {
         file: "view src/contract.rs",
@@ -50,11 +50,7 @@ const ALLOWED_REPORTING_SURFACE: &[AllowedPublicSurface<'_>] = &[
     },
     AllowedPublicSurface {
         file: "view src/lib.rs",
-        fragment: "ViewReportSession",
-    },
-    AllowedPublicSurface {
-        file: "view src/lib.rs",
-        fragment: "ViewReportedOutput",
+        fragment: "pub use contract::{\n    RouteViewDescriptor, ViewApplyOutcome, ViewBindingKey, ViewBuildOutcome, ViewBuildRequest,\n    ViewDisposalHint, ViewFailure, ViewOutputId, ViewPartialOutput, ViewRenderPlan,\n    ViewReportSession, ViewReportedOutput, ViewRequestId,\n};",
     },
 ];
 
@@ -66,7 +62,7 @@ fn facade_allow_lists_reporting_only_surface() {
         let source = sources
             .iter()
             .find(|(file, _)| *file == allowed.file)
-            .map(|(_, source)| *source)
+            .map(|(_, source)| source_without_doc_text(source))
             .unwrap_or_else(|| panic!("missing source file `{}`", allowed.file));
         assert!(
             source.contains(allowed.fragment),

@@ -104,7 +104,7 @@ impl ViewBuildRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct ViewReportSession {
     frame_request: FrameApplyRequest,
     issuer: ViewRendererIssuer,

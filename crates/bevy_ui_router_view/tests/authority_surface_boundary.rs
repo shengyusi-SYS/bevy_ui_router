@@ -6,11 +6,11 @@ struct AllowedPublicSurface<'a> {
 const ALLOWED_REPORTING_SURFACE: &[AllowedPublicSurface<'_>] = &[
     AllowedPublicSurface {
         file: "src/contract.rs",
-        fragment: "pub struct ViewReportSession",
+        fragment: "pub struct ViewReportSession {",
     },
     AllowedPublicSurface {
         file: "src/contract.rs",
-        fragment: "pub struct ViewReportedOutput",
+        fragment: "pub struct ViewReportedOutput {",
     },
     AllowedPublicSurface {
         file: "src/contract.rs",
@@ -50,11 +50,7 @@ const ALLOWED_REPORTING_SURFACE: &[AllowedPublicSurface<'_>] = &[
     },
     AllowedPublicSurface {
         file: "src/lib.rs",
-        fragment: "ViewReportSession",
-    },
-    AllowedPublicSurface {
-        file: "src/lib.rs",
-        fragment: "ViewReportedOutput",
+        fragment: "pub use contract::{\n    RouteViewDescriptor, ViewApplyOutcome, ViewBindingKey, ViewBuildOutcome, ViewBuildRequest,\n    ViewDisposalHint, ViewFailure, ViewOutputId, ViewPartialOutput, ViewRenderPlan,\n    ViewReportSession, ViewReportedOutput, ViewRequestId,\n};",
     },
 ];
 
@@ -78,11 +74,11 @@ fn view_crate_does_not_expose_active_commit_or_acceptance_surface() {
     assert_forbidden_public_fragments_absent("src/testing.rs", include_str!("../src/testing.rs"));
 }
 
-fn source_for(file: &str) -> &'static str {
+fn source_for(file: &str) -> String {
     match file {
-        "src/lib.rs" => include_str!("../src/lib.rs"),
-        "src/contract.rs" => include_str!("../src/contract.rs"),
-        "src/testing.rs" => include_str!("../src/testing.rs"),
+        "src/lib.rs" => source_without_doc_text(include_str!("../src/lib.rs")),
+        "src/contract.rs" => source_without_doc_text(include_str!("../src/contract.rs")),
+        "src/testing.rs" => source_without_doc_text(include_str!("../src/testing.rs")),
         other => panic!("unexpected source file `{other}`"),
     }
 }
