@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
+mod bridge;
 mod components;
 mod plugin;
 mod state;
 
+pub use bridge::{EcsFrameApplyReport, EcsFrameApplySession, EcsFrameApplyStatus};
 pub use components::{
     RouteFocusSnapshot, RouteFrameInteractionSnapshot, RouteFrameRoot,
     RouteFrameRootLifecycleSnapshot, RouteHost, RouteSlot,

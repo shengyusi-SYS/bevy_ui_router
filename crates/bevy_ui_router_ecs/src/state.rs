@@ -1,17 +1,22 @@
 use bevy_ecs::prelude::{Entity, Resource};
 use bevy_ui_router_core::runtime::RouterRuntime;
+use bevy_ui_router_core::transaction::FrameApplyRequest;
+use bevy_ui_router_view::RouteViewDescriptor;
 
+use crate::bridge::EcsFrameApplySession;
 use crate::components::{RouteFocusSnapshot, RouteHost, RouteSlot};
 
 #[derive(Resource, Debug)]
 pub struct RouterEcsState {
     runtime: RouterRuntime,
+    pending_apply_requests: Vec<FrameApplyRequest>,
 }
 
 impl RouterEcsState {
     pub fn new() -> Self {
         Self {
             runtime: RouterRuntime::new(),
+            pending_apply_requests: Vec::new(),
         }
     }
 
@@ -37,6 +42,23 @@ impl RouterEcsState {
 
     pub fn route_slot(&self) -> RouteSlot {
         RouteSlot::from_state(self)
+    }
+
+    pub fn begin_frame_apply_session(
+        &mut self,
+        request: &FrameApplyRequest,
+        descriptor: RouteViewDescriptor,
+    ) -> Result<EcsFrameApplySession, ()> {
+        if self
+            .pending_apply_requests
+            .iter()
+            .any(|pending| pending == request)
+        {
+            return Err(());
+        }
+
+        self.pending_apply_requests.push(request.clone());
+        Ok(EcsFrameApplySession::new(request, descriptor))
     }
 }
 

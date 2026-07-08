@@ -9,6 +9,7 @@ use bevy_ui_router_core::runtime::RouterRuntime;
 use bevy_ui_router_ecs::prelude::{
     BevyUiRouterPlugin, RouteFrameRoot, RouteHost, RouteSlot, RouterEcsState, RouterScheduleSet,
 };
+use bevy_ui_router_ecs::{EcsFrameApplyReport, EcsFrameApplySession, EcsFrameApplyStatus};
 
 #[test]
 fn ecs_prelude_exposes_host_slot_frame_root_plugin_and_schedule_labels() {
@@ -26,6 +27,36 @@ fn ecs_prelude_exposes_host_slot_frame_root_plugin_and_schedule_labels() {
         RouterScheduleSet::CollectNavigation
     );
     assert_eq!(RouterScheduleSet::Cleanup, RouterScheduleSet::Cleanup);
+}
+
+#[test]
+fn ecs_root_exports_apply_bridge_types_without_prelude_promotion() {
+    fn assert_public<T>() {}
+
+    assert_public::<EcsFrameApplySession>();
+    assert_public::<EcsFrameApplyReport>();
+    assert_public::<EcsFrameApplyStatus>();
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source =
+        fs::read_to_string(manifest_dir.join("src").join("lib.rs")).expect("lib source readable");
+
+    assert!(
+        source.contains(
+            "pub use bridge::{EcsFrameApplyReport, EcsFrameApplySession, EcsFrameApplyStatus};"
+        ),
+        "crate root should export apply bridge foundation types"
+    );
+    let prelude_start = source
+        .find("pub mod prelude {")
+        .expect("lib.rs should define a prelude block");
+    let prelude = &source[prelude_start..];
+    assert!(
+        !prelude.contains("EcsFrameApplySession")
+            && !prelude.contains("EcsFrameApplyReport")
+            && !prelude.contains("EcsFrameApplyStatus"),
+        "prelude should stay focused and not promote apply bridge foundation types"
+    );
 }
 
 #[test]
@@ -132,6 +163,8 @@ fn ecs_public_sources_do_not_expose_router_runtime_signatures() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let components = fs::read_to_string(manifest_dir.join("src").join("components.rs"))
         .expect("components source should be readable");
+    let bridge = fs::read_to_string(manifest_dir.join("src").join("bridge.rs"))
+        .expect("bridge source should be readable");
     let state = fs::read_to_string(manifest_dir.join("src").join("state.rs"))
         .expect("state source should be readable");
 
@@ -143,7 +176,9 @@ fn ecs_public_sources_do_not_expose_router_runtime_signatures() {
         "pub fn from_runtime(runtime: RouterRuntime) -> Self",
     ] {
         assert!(
-            !components.contains(forbidden) && !state.contains(forbidden),
+            !components.contains(forbidden)
+                && !bridge.contains(forbidden)
+                && !state.contains(forbidden),
             "ecs public source exposes forbidden runtime authority fragment `{forbidden}`"
         );
     }
