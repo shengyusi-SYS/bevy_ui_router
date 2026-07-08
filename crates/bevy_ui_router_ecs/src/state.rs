@@ -15,24 +15,28 @@ impl RouterEcsState {
         }
     }
 
-    pub fn from_runtime(runtime: RouterRuntime) -> Self {
-        Self { runtime }
-    }
-
-    pub const fn runtime(&self) -> &RouterRuntime {
+    pub(crate) const fn runtime(&self) -> &RouterRuntime {
         &self.runtime
     }
 
-    pub fn runtime_mut(&mut self) -> &mut RouterRuntime {
-        &mut self.runtime
+    pub const fn router(&self) -> bevy_ui_router_core::ids::RouterInstanceId {
+        self.runtime.router()
+    }
+
+    pub const fn host(&self) -> bevy_ui_router_core::ids::RouteHostId {
+        self.runtime.host()
+    }
+
+    pub const fn slot(&self) -> bevy_ui_router_core::ids::RouteSlotId {
+        self.runtime.slot()
     }
 
     pub fn route_host(&self) -> RouteHost {
-        RouteHost::from_runtime(self.runtime())
+        RouteHost::from_state(self)
     }
 
     pub fn route_slot(&self) -> RouteSlot {
-        RouteSlot::from_runtime(self.runtime())
+        RouteSlot::from_state(self)
     }
 }
 

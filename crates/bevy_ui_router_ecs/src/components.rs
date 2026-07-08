@@ -13,14 +13,14 @@ pub struct RouteHost {
 }
 
 impl RouteHost {
-    pub fn from_runtime(runtime: &RouterRuntime) -> Self {
+    pub(crate) fn from_runtime(runtime: &RouterRuntime) -> Self {
         Self {
             router: runtime.router(),
             host: runtime.host(),
         }
     }
 
-    pub fn from_state(state: &RouterEcsState) -> Self {
+    pub(crate) fn from_state(state: &RouterEcsState) -> Self {
         Self::from_runtime(state.runtime())
     }
 
@@ -41,7 +41,7 @@ pub struct RouteSlot {
 }
 
 impl RouteSlot {
-    pub fn from_runtime(runtime: &RouterRuntime) -> Self {
+    pub(crate) fn from_runtime(runtime: &RouterRuntime) -> Self {
         Self {
             router: runtime.router(),
             host: runtime.host(),
@@ -49,7 +49,7 @@ impl RouteSlot {
         }
     }
 
-    pub fn from_state(state: &RouterEcsState) -> Self {
+    pub(crate) fn from_state(state: &RouterEcsState) -> Self {
         Self::from_runtime(state.runtime())
     }
 

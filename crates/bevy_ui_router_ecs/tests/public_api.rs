@@ -30,15 +30,15 @@ fn ecs_prelude_exposes_host_slot_frame_root_plugin_and_schedule_labels() {
 
 #[test]
 fn route_host_and_slot_observe_core_issued_identity() {
-    let runtime = RouterRuntime::new();
-    let host = RouteHost::from_runtime(&runtime);
-    let slot = RouteSlot::from_runtime(&runtime);
+    let state = RouterEcsState::new();
+    let host = state.route_host();
+    let slot = state.route_slot();
 
-    assert_eq!(host.router(), runtime.router());
-    assert_eq!(host.host(), runtime.host());
-    assert_eq!(slot.router(), runtime.router());
-    assert_eq!(slot.host(), runtime.host());
-    assert_eq!(slot.slot(), runtime.slot());
+    assert_eq!(host.router(), state.router());
+    assert_eq!(host.host(), state.host());
+    assert_eq!(slot.router(), state.router());
+    assert_eq!(slot.host(), state.host());
+    assert_eq!(slot.slot(), state.slot());
 }
 
 #[test]
@@ -80,15 +80,32 @@ fn route_host_does_not_provide_raw_id_constructors() {
         "impl RouteHost {\n    pub fn new(",
         "impl RouteHost {\n    pub const fn new(",
         "impl RouteHost {\n    pub fn from_raw(",
+        "impl RouteHost {\n    pub fn from_runtime(",
+        "impl RouteHost {\n    pub fn from_state(",
         "impl RouteSlot {\n    pub fn new(",
         "impl RouteSlot {\n    pub const fn new(",
         "impl RouteSlot {\n    pub fn from_raw(",
+        "impl RouteSlot {\n    pub fn from_runtime(",
+        "impl RouteSlot {\n    pub fn from_state(",
     ] {
         assert!(
             !source.contains(forbidden),
             "components.rs exposes forbidden raw identity constructor fragment `{forbidden}`"
         );
     }
+}
+
+#[test]
+fn router_ecs_state_exposes_identity_accessors_without_public_runtime_bridge() {
+    let state = RouterEcsState::new();
+    let host = state.route_host();
+    let slot = state.route_slot();
+
+    assert_eq!(host.router(), state.router());
+    assert_eq!(host.host(), state.host());
+    assert_eq!(slot.router(), state.router());
+    assert_eq!(slot.host(), state.host());
+    assert_eq!(slot.slot(), state.slot());
 }
 
 #[test]
@@ -111,14 +128,55 @@ fn route_frame_root_does_not_offer_raw_identity_constructor() {
 }
 
 #[test]
-fn plugin_registers_router_resources_without_creating_host_entities() {
-    let mut app = App::new();
-    let initial_entities = app.world().entities().count_spawned();
+fn ecs_public_sources_do_not_expose_router_runtime_signatures() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let components = fs::read_to_string(manifest_dir.join("src").join("components.rs"))
+        .expect("components source should be readable");
+    let state = fs::read_to_string(manifest_dir.join("src").join("state.rs"))
+        .expect("state source should be readable");
 
+    for forbidden in [
+        "pub fn from_runtime(",
+        "pub fn from_state(",
+        "pub const fn runtime(&self) -> &RouterRuntime",
+        "pub fn runtime_mut(&mut self) -> &mut RouterRuntime",
+        "pub fn from_runtime(runtime: RouterRuntime) -> Self",
+    ] {
+        assert!(
+            !components.contains(forbidden) && !state.contains(forbidden),
+            "ecs public source exposes forbidden runtime authority fragment `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn plugin_registers_router_resources_without_creating_host_entities() {
+    use bevy_ecs::entity::Entity;
+    use bevy_ecs::query::With;
+
+    let mut app = App::new();
     app.add_plugins(BevyUiRouterPlugin);
 
     assert!(app.world().contains_resource::<RouterEcsState>());
-    assert_eq!(app.world().entities().count_spawned(), initial_entities + 2);
+    let host_components = {
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<Entity, With<RouteHost>>();
+        query.iter(world).count()
+    };
+    let slot_components = {
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<Entity, With<RouteSlot>>();
+        query.iter(world).count()
+    };
+    let frame_root_components = {
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<Entity, With<RouteFrameRoot>>();
+        query.iter(world).count()
+    };
+
+    assert_eq!(host_components, 0);
+    assert_eq!(slot_components, 0);
+    assert_eq!(frame_root_components, 0);
 }
 
 #[test]
