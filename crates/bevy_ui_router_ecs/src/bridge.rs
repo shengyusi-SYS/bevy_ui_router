@@ -2,8 +2,19 @@ use bevy_ui_router_core::frame::RouteFrameRecord;
 use bevy_ui_router_core::transaction::FrameApplyRequest;
 use bevy_ui_router_view::{
     RouteViewDescriptor, ViewApplyOutcome, ViewBuildOutcome, ViewBuildRequest, ViewFailure,
-    ViewPartialOutput, ViewReportSession, ViewReportedOutput,
+    ViewPartialOutput, ViewReportSession, ViewReportedOutput, ViewRequestId,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BeginFrameApplySessionError {
+    RequestAlreadyPending,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinishFrameApplySessionError {
+    SessionNotRegistered,
+    SessionNotTerminal,
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct EcsFrameApplySession {
@@ -41,6 +52,10 @@ impl EcsFrameApplySession {
 
     pub const fn finalized(&self) -> bool {
         self.finalized
+    }
+
+    pub fn status(&self) -> Option<EcsFrameApplyStatus> {
+        self.report.as_ref().map(EcsFrameApplyReport::status)
     }
 
     pub fn accepts_report_session(&self, report_session: &ViewReportSession) -> bool {
@@ -107,6 +122,17 @@ impl EcsFrameApplySession {
 
     fn record_reported_output(&mut self, output: ViewReportedOutput) -> &EcsFrameApplyReport {
         self.record_apply_outcome(output.outcome().clone())
+    }
+
+    pub(crate) fn view_request_id(&self) -> ViewRequestId {
+        self.report_session.build_request().request_id()
+    }
+
+    pub(crate) fn can_finish(&self) -> bool {
+        matches!(
+            self.status(),
+            Some(EcsFrameApplyStatus::Failed | EcsFrameApplyStatus::StaleDiscarded)
+        )
     }
 }
 

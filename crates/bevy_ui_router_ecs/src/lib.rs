@@ -5,6 +5,7 @@ mod components;
 mod plugin;
 mod state;
 
+pub use bridge::{BeginFrameApplySessionError, FinishFrameApplySessionError};
 pub use bridge::{EcsFrameApplyReport, EcsFrameApplySession, EcsFrameApplyStatus};
 pub use components::{
     RouteFocusSnapshot, RouteFrameInteractionSnapshot, RouteFrameRoot,

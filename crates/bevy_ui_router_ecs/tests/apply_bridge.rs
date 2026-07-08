@@ -9,7 +9,8 @@ use bevy_ui_router_core::route_tree::RouteTree;
 use bevy_ui_router_core::runtime::RouterRuntime;
 use bevy_ui_router_core::transaction::FrameApplyRequest;
 use bevy_ui_router_ecs::{
-    EcsFrameApplyReport, EcsFrameApplySession, EcsFrameApplyStatus, RouterEcsState,
+    BeginFrameApplySessionError, EcsFrameApplyReport, EcsFrameApplySession, EcsFrameApplyStatus,
+    FinishFrameApplySessionError, RouterEcsState,
 };
 use bevy_ui_router_view::{RouteViewDescriptor, ViewBindingKey, ViewReportSession};
 
@@ -37,10 +38,98 @@ fn bridge_mints_session_from_core_frame_apply_request() {
     assert!(session.report().is_none());
     assert!(!session.finalized());
     assert!(
-        state
-            .begin_frame_apply_session(&request, descriptor)
-            .is_err(),
+        matches!(
+            state.begin_frame_apply_session(&request, descriptor),
+            Err(BeginFrameApplySessionError::RequestAlreadyPending)
+        ),
         "duplicate pending frame requests should be rejected"
+    );
+}
+
+#[test]
+fn bridge_releases_build_failed_session_for_same_request_after_finish() {
+    let request = issued_request("/items/42", 1);
+    let descriptor = descriptor("leaf");
+    let mut state = RouterEcsState::new();
+    let mut session = state
+        .begin_frame_apply_session(&request, descriptor.clone())
+        .expect("session should mint");
+
+    let _report = session.record_build_failure("renderer build failed");
+    state
+        .finish_frame_apply_session(&session)
+        .expect("terminal build failure should release the pending request");
+
+    let reminted = state.begin_frame_apply_session(&request, descriptor);
+
+    assert!(
+        reminted.is_ok(),
+        "the same frame request should be allowed again after terminal build failure is retired"
+    );
+}
+
+#[test]
+fn bridge_releases_apply_failed_session_for_same_request_after_finish() {
+    let request = issued_request("/items/42", 1);
+    let descriptor = descriptor("leaf");
+    let mut state = RouterEcsState::new();
+    let mut session = state
+        .begin_frame_apply_session(&request, descriptor.clone())
+        .expect("session should mint");
+
+    let _report = session.record_apply_failure("renderer apply failed", Some("renderer-output"));
+    state
+        .finish_frame_apply_session(&session)
+        .expect("terminal apply failure should release the pending request");
+
+    let reminted = state.begin_frame_apply_session(&request, descriptor);
+
+    assert!(
+        reminted.is_ok(),
+        "the same frame request should be allowed again after terminal apply failure is retired"
+    );
+}
+
+#[test]
+fn bridge_releases_stale_discarded_session_for_same_request_after_finish() {
+    let request = issued_request("/items/42", 1);
+    let descriptor = descriptor("leaf");
+    let mut state = RouterEcsState::new();
+    let mut session = state
+        .begin_frame_apply_session(&request, descriptor.clone())
+        .expect("session should mint");
+
+    let _report = session.discard_stale("renderer stale");
+    state
+        .finish_frame_apply_session(&session)
+        .expect("terminal stale discard should release the pending request");
+
+    let reminted = state.begin_frame_apply_session(&request, descriptor);
+
+    assert!(
+        reminted.is_ok(),
+        "the same frame request should be allowed again after terminal stale discard is retired"
+    );
+}
+
+#[test]
+fn bridge_keeps_apply_success_session_pending_until_later_finalization() {
+    let request = issued_request("/items/42", 1);
+    let descriptor = descriptor("leaf");
+    let mut state = RouterEcsState::new();
+    let mut session = state
+        .begin_frame_apply_session(&request, descriptor.clone())
+        .expect("session should mint");
+
+    let _report = session.record_apply_success(Some("renderer-output"));
+
+    assert_eq!(
+        state.finish_frame_apply_session(&session),
+        Err(FinishFrameApplySessionError::SessionNotTerminal)
+    );
+    assert_eq!(
+        state.begin_frame_apply_session(&request, descriptor),
+        Err(BeginFrameApplySessionError::RequestAlreadyPending)
     );
 }
 

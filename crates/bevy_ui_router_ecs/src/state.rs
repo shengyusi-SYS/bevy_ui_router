@@ -1,15 +1,23 @@
 use bevy_ecs::prelude::{Entity, Resource};
 use bevy_ui_router_core::runtime::RouterRuntime;
 use bevy_ui_router_core::transaction::FrameApplyRequest;
-use bevy_ui_router_view::RouteViewDescriptor;
+use bevy_ui_router_view::{RouteViewDescriptor, ViewRequestId};
 
-use crate::bridge::EcsFrameApplySession;
+use crate::bridge::{
+    BeginFrameApplySessionError, EcsFrameApplySession, FinishFrameApplySessionError,
+};
 use crate::components::{RouteFocusSnapshot, RouteHost, RouteSlot};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingFrameApplySession {
+    request: FrameApplyRequest,
+    view_request_id: ViewRequestId,
+}
 
 #[derive(Resource, Debug)]
 pub struct RouterEcsState {
     runtime: RouterRuntime,
-    pending_apply_requests: Vec<FrameApplyRequest>,
+    pending_apply_requests: Vec<PendingFrameApplySession>,
 }
 
 impl RouterEcsState {
@@ -48,17 +56,40 @@ impl RouterEcsState {
         &mut self,
         request: &FrameApplyRequest,
         descriptor: RouteViewDescriptor,
-    ) -> Result<EcsFrameApplySession, ()> {
+    ) -> Result<EcsFrameApplySession, BeginFrameApplySessionError> {
         if self
             .pending_apply_requests
             .iter()
-            .any(|pending| pending == request)
+            .any(|pending| pending.request == *request)
         {
-            return Err(());
+            return Err(BeginFrameApplySessionError::RequestAlreadyPending);
         }
 
-        self.pending_apply_requests.push(request.clone());
-        Ok(EcsFrameApplySession::new(request, descriptor))
+        let session = EcsFrameApplySession::new(request, descriptor);
+        self.pending_apply_requests.push(PendingFrameApplySession {
+            request: request.clone(),
+            view_request_id: session.view_request_id(),
+        });
+        Ok(session)
+    }
+
+    pub fn finish_frame_apply_session(
+        &mut self,
+        session: &EcsFrameApplySession,
+    ) -> Result<(), FinishFrameApplySessionError> {
+        if !session.can_finish() {
+            return Err(FinishFrameApplySessionError::SessionNotTerminal);
+        }
+
+        let Some(index) = self.pending_apply_requests.iter().position(|pending| {
+            pending.request == *session.request()
+                && pending.view_request_id == session.view_request_id()
+        }) else {
+            return Err(FinishFrameApplySessionError::SessionNotRegistered);
+        };
+
+        self.pending_apply_requests.remove(index);
+        Ok(())
     }
 }
 

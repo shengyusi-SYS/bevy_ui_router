@@ -9,7 +9,10 @@ use bevy_ui_router_core::runtime::RouterRuntime;
 use bevy_ui_router_ecs::prelude::{
     BevyUiRouterPlugin, RouteFrameRoot, RouteHost, RouteSlot, RouterEcsState, RouterScheduleSet,
 };
-use bevy_ui_router_ecs::{EcsFrameApplyReport, EcsFrameApplySession, EcsFrameApplyStatus};
+use bevy_ui_router_ecs::{
+    BeginFrameApplySessionError, EcsFrameApplyReport, EcsFrameApplySession, EcsFrameApplyStatus,
+    FinishFrameApplySessionError,
+};
 
 #[test]
 fn ecs_prelude_exposes_host_slot_frame_root_plugin_and_schedule_labels() {
@@ -36,17 +39,25 @@ fn ecs_root_exports_apply_bridge_types_without_prelude_promotion() {
     assert_public::<EcsFrameApplySession>();
     assert_public::<EcsFrameApplyReport>();
     assert_public::<EcsFrameApplyStatus>();
+    assert_public::<BeginFrameApplySessionError>();
+    assert_public::<FinishFrameApplySessionError>();
 
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let source =
         fs::read_to_string(manifest_dir.join("src").join("lib.rs")).expect("lib source readable");
 
-    assert!(
-        source.contains(
-            "pub use bridge::{EcsFrameApplyReport, EcsFrameApplySession, EcsFrameApplyStatus};"
-        ),
-        "crate root should export apply bridge foundation types"
-    );
+    for exported in [
+        "BeginFrameApplySessionError",
+        "EcsFrameApplyReport",
+        "EcsFrameApplySession",
+        "EcsFrameApplyStatus",
+        "FinishFrameApplySessionError",
+    ] {
+        assert!(
+            source.contains(exported),
+            "crate root should export apply bridge foundation type `{exported}`"
+        );
+    }
     let prelude_start = source
         .find("pub mod prelude {")
         .expect("lib.rs should define a prelude block");
