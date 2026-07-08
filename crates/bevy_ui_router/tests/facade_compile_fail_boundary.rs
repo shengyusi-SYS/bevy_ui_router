@@ -191,3 +191,30 @@ fn test_support_finalize_authority_trait_names_missing_symbol() {
         ],
     });
 }
+
+#[test]
+fn default_prelude_runtime_bridge_names_missing_router_runtime() {
+    assert_compile_fails(Fixture {
+        name: "default_prelude_no_router_runtime",
+        code: "use bevy_ui_router::prelude::RouterRuntime; fn main() {}",
+        default_features: true,
+        features: &[],
+        expected_stderr: &["error[E0432]", "no `RouterRuntime` in `prelude`"],
+    });
+}
+
+#[test]
+fn default_prelude_runtime_bridge_error_types_name_missing_symbols() {
+    assert_compile_fails(Fixture {
+        name: "default_prelude_no_runtime_bridge_errors",
+        code: "use bevy_ui_router::prelude::{BeginNavigationError, FrameApplyReportError, FailureCleanupAckError}; fn main() {}",
+        default_features: true,
+        features: &[],
+        expected_stderr: &[
+            "error[E0432]",
+            "no `BeginNavigationError` in `prelude`",
+            "no `FrameApplyReportError` in `prelude`",
+            "no `FailureCleanupAckError` in `prelude`",
+        ],
+    });
+}

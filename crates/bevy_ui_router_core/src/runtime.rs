@@ -103,6 +103,7 @@ impl RouterRuntime {
         &mut self,
         target: &MatchedBranch,
     ) -> Result<NavigationTransactionSnapshot, BeginNavigationError> {
+        self.ensure_can_begin_navigation()?;
         let plan = FrameReconciliationPlan::from_first_navigation(
             self.scope(),
             target,
@@ -116,6 +117,7 @@ impl RouterRuntime {
         target: &MatchedBranch,
         diff: &BranchDiff,
     ) -> Result<NavigationTransactionSnapshot, BeginNavigationError> {
+        self.ensure_can_begin_navigation()?;
         let plan = FrameReconciliationPlan::from_diff(
             self.scope(),
             self.active.as_ref(),
@@ -196,6 +198,19 @@ impl RouterRuntime {
         let snapshot = pending.snapshot();
         self.pending = Some(pending);
         Ok(snapshot)
+    }
+
+    fn ensure_can_begin_navigation(&self) -> Result<(), BeginNavigationError> {
+        if let Some(pending) = self.pending.as_ref() {
+            return Err(match pending.snapshot().state() {
+                NavigationTransactionState::Failed => {
+                    BeginNavigationError::FailedNavigationNeedsCleanup
+                }
+                _ => BeginNavigationError::PendingNavigation,
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -299,6 +314,37 @@ mod tests {
         let error = runtime.begin_first_navigation(&target).unwrap_err();
 
         assert_eq!(error, BeginNavigationError::PendingNavigation);
+    }
+
+    #[test]
+    fn runtime_rejected_begin_first_navigation_is_allocator_side_effect_free() {
+        let matcher = items_matcher();
+        let initial = matched_branch(&matcher, "/items/1");
+        let target = matched_branch(&matcher, "/items/2");
+
+        let expected = {
+            let mut control = RouterRuntime::new();
+            let initial_snapshot = control.begin_first_navigation(&initial).unwrap();
+            fail_pending_with_build_error(&mut control, initial_snapshot.requests()[0].token());
+            control.acknowledge_failed_navigation_cleanup(&[]).unwrap();
+            frame_id_raws(&control.begin_first_navigation(&target).unwrap())
+        };
+
+        let actual = {
+            let mut experiment = RouterRuntime::new();
+            let initial_snapshot = experiment.begin_first_navigation(&initial).unwrap();
+            assert_eq!(
+                experiment.begin_first_navigation(&target).unwrap_err(),
+                BeginNavigationError::PendingNavigation
+            );
+            fail_pending_with_build_error(&mut experiment, initial_snapshot.requests()[0].token());
+            experiment
+                .acknowledge_failed_navigation_cleanup(&[])
+                .unwrap();
+            frame_id_raws(&experiment.begin_first_navigation(&target).unwrap())
+        };
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -476,6 +522,58 @@ mod tests {
     }
 
     #[test]
+    fn runtime_rejected_begin_reconciled_navigation_is_allocator_side_effect_free() {
+        let matcher = items_matcher();
+        let initial = matched_branch(&matcher, "/items/1");
+        let failed_target = matched_branch(&matcher, "/items/2");
+        let target = matched_branch(&matcher, "/items/3");
+
+        let expected = {
+            let mut control = RouterRuntime::new();
+            commit_branch(&mut control, &initial);
+            let failed_diff = BranchDiff::compare(&initial, &failed_target);
+            let failed_snapshot = control
+                .begin_reconciled_navigation(&failed_target, &failed_diff)
+                .unwrap();
+            fail_pending_with_build_error(&mut control, failed_snapshot.requests()[0].token());
+            control.acknowledge_failed_navigation_cleanup(&[]).unwrap();
+            let target_diff = BranchDiff::compare(&initial, &target);
+            frame_id_raws(
+                &control
+                    .begin_reconciled_navigation(&target, &target_diff)
+                    .unwrap(),
+            )
+        };
+
+        let actual = {
+            let mut experiment = RouterRuntime::new();
+            commit_branch(&mut experiment, &initial);
+            let failed_diff = BranchDiff::compare(&initial, &failed_target);
+            let failed_snapshot = experiment
+                .begin_reconciled_navigation(&failed_target, &failed_diff)
+                .unwrap();
+            fail_pending_with_build_error(&mut experiment, failed_snapshot.requests()[0].token());
+            let target_diff = BranchDiff::compare(&initial, &target);
+            assert_eq!(
+                experiment
+                    .begin_reconciled_navigation(&target, &target_diff)
+                    .unwrap_err(),
+                BeginNavigationError::FailedNavigationNeedsCleanup
+            );
+            experiment
+                .acknowledge_failed_navigation_cleanup(&[])
+                .unwrap();
+            frame_id_raws(
+                &experiment
+                    .begin_reconciled_navigation(&target, &target_diff)
+                    .unwrap(),
+            )
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn runtime_cleanup_ack_rejects_mismatched_cleanup_plans() {
         let matcher = items_matcher();
         let target = matched_branch(&matcher, "/items/2");
@@ -566,6 +664,36 @@ mod tests {
                 .report_frame_apply(request.token(), FrameApplyOutcome::Applied)
                 .unwrap();
         }
+    }
+
+    fn commit_branch(runtime: &mut RouterRuntime, target: &MatchedBranch) {
+        let snapshot = runtime.begin_first_navigation(target).unwrap();
+        apply_all_success(runtime, &snapshot);
+        runtime.commit_ready_navigation().unwrap();
+    }
+
+    fn fail_pending_with_build_error(
+        runtime: &mut RouterRuntime,
+        token: &crate::transaction::FrameApplyToken,
+    ) {
+        runtime
+            .report_frame_apply(
+                token,
+                FrameApplyOutcome::Failed(RouteError::new(
+                    RouteErrorKind::ViewBuildFailed,
+                    RouteErrorSourceCategory::RendererContract,
+                    "view build failed",
+                )),
+            )
+            .unwrap();
+    }
+
+    fn frame_id_raws(snapshot: &NavigationTransactionSnapshot) -> Vec<u64> {
+        snapshot
+            .requests()
+            .iter()
+            .map(|request| request.token().frame().raw())
+            .collect()
     }
 
     fn assert_stale_reason(error: FrameApplyReportError, expected: StaleApplyReason) {
