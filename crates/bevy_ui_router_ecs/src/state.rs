@@ -423,7 +423,10 @@ mod tests {
     use bevy_ui_router_core::runtime::BeginNavigationError;
     use bevy_ui_router_view::{RouteViewDescriptor, ViewBindingKey};
 
-    use crate::components::RouteFrameRoot;
+    use crate::components::{
+        RouteFrameInteractionBarrier, RouteFrameInteractionSnapshot, RouteFrameRoot,
+        RouteFrameRootLifecycleSnapshot, RouteFrameRootLifecycleState,
+    };
 
     use super::{CompleteFrameApplySessionError, RouterEcsState};
 
@@ -626,6 +629,18 @@ mod tests {
 
     fn assert_active_root(world: &World, root: Entity) {
         assert!(world.get_entity(root).is_ok(), "active root should exist");
+        assert_eq!(
+            world
+                .get::<RouteFrameRootLifecycleState>(root)
+                .map(RouteFrameRootLifecycleState::snapshot),
+            Some(RouteFrameRootLifecycleSnapshot::Active)
+        );
+        assert_eq!(
+            world
+                .get::<RouteFrameInteractionBarrier>(root)
+                .map(RouteFrameInteractionBarrier::snapshot),
+            Some(RouteFrameInteractionSnapshot::new(true, true, true))
+        );
         assert_eq!(world.get::<Visibility>(root), Some(&Visibility::Visible));
         assert_eq!(world.get::<Pickable>(root), Some(&Pickable::default()));
         assert!(world.get::<InteractionDisabled>(root).is_none());
