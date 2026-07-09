@@ -84,7 +84,11 @@ fn ecs_manifest_keeps_task_3_dependency_boundary() {
         entries,
         vec![
             "bevy_app",
+            "bevy_camera",
             "bevy_ecs",
+            "bevy_input_focus",
+            "bevy_picking",
+            "bevy_ui",
             "bevy_ui_router_core",
             "bevy_ui_router_view",
             "bevy_ui_router_core",
@@ -106,7 +110,14 @@ fn ecs_manifest_keeps_task_3_dependency_boundary() {
         );
     }
 
-    for dependency in ["bevy_app", "bevy_ecs"] {
+    for dependency in [
+        "bevy_app",
+        "bevy_camera",
+        "bevy_ecs",
+        "bevy_input_focus",
+        "bevy_picking",
+        "bevy_ui",
+    ] {
         assert!(
             manifest_contains_dependency_config(
                 &manifest,
