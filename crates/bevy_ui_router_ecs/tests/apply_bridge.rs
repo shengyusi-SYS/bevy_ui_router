@@ -424,7 +424,7 @@ fn mismatched_root_identity_is_rejected_before_core_report_or_inert_preparation(
         .begin_frame_apply_session(&request, descriptor("root"))
         .expect("session should mint from the state-owned request");
     let mut world = World::new();
-    let (host, _slot, root, _child) =
+    let (host, _slot, root, child) =
         mount_frame_root_for_request(&mut world, &state, &mismatched_request);
 
     session.record_apply_success(Some("renderer-output"));
@@ -435,7 +435,14 @@ fn mismatched_root_identity_is_rejected_before_core_report_or_inert_preparation(
     assert_eq!(error, CompleteFrameApplySessionError::InvalidRoot);
     assert!(session.finalized());
     assert!(world.get_entity(host).is_ok(), "app-owned host must remain");
-    assert_active_root(&world, root);
+    assert!(
+        world.get_entity(root).is_err(),
+        "mismatched unclaimed root should be cleaned"
+    );
+    assert!(
+        world.get_entity(child).is_err(),
+        "mismatched unclaimed subtree should be cleaned"
+    );
     assert_eq!(
         state.begin_first_navigation(&single_match("/")),
         Err(bevy_ui_router_core::runtime::BeginNavigationError::PendingNavigation),
@@ -604,6 +611,7 @@ fn assert_inert_root(world: &World, root: Entity) {
 }
 
 fn assert_active_root(world: &World, root: Entity) {
+    assert!(world.get_entity(root).is_ok(), "active root should exist");
     assert_ne!(world.get::<Visibility>(root), Some(&Visibility::Hidden));
     assert_ne!(world.get::<Pickable>(root), Some(&Pickable::IGNORE));
     assert!(world.get::<InteractionDisabled>(root).is_none());

@@ -221,7 +221,7 @@ impl RouterEcsState {
         self.pending_apply_requests[pending_index].reported_root = Some(root);
 
         if snapshot.state() == NavigationTransactionState::ReadyToCommit {
-            self.commit_and_activate_reported_roots(world)?;
+            self.commit_and_activate_reported_roots(world, &snapshot)?;
         } else {
             session.mark_reported_to_core();
         }
@@ -292,13 +292,20 @@ impl RouterEcsState {
     fn commit_and_activate_reported_roots(
         &mut self,
         world: &mut World,
+        snapshot: &NavigationTransactionSnapshot,
     ) -> Result<(), CompleteFrameApplySessionError> {
         self.runtime
             .commit_ready_navigation()
             .map_err(|_error| CompleteFrameApplySessionError::CoreCommitRejected)?;
+        let current_requests = snapshot.requests();
         let mut reported_roots = self
             .pending_apply_requests
             .iter()
+            .filter(|pending| {
+                current_requests
+                    .iter()
+                    .any(|request| request == &pending.request)
+            })
             .filter_map(|pending| {
                 pending.reported_root.map(|root| {
                     (
@@ -406,6 +413,9 @@ mod tests {
     use bevy_camera::visibility::Visibility;
     use bevy_ecs::prelude::{Entity, World};
     use bevy_picking::Pickable;
+    use bevy_ui::InteractionDisabled;
+    use bevy_ui_router_core::branch::MatchedBranch;
+    use bevy_ui_router_core::branch_diff::BranchDiff;
     use bevy_ui_router_core::location::RouteLocation;
     use bevy_ui_router_core::matcher::RouteMatcher;
     use bevy_ui_router_core::pattern::RoutePattern;
@@ -464,6 +474,97 @@ mod tests {
             .expect("stale-cleaned session should release ECS pending state");
     }
 
+    #[test]
+    fn later_commit_does_not_reactivate_unfinished_sessions_from_previous_navigation() {
+        let tree = items_route_tree();
+        let matcher = RouteMatcher::new(tree);
+        let first_target = matched_branch(&matcher, "/items/1");
+        let second_target = matched_branch(&matcher, "/items/2");
+        let diff = BranchDiff::compare(&first_target, &second_target);
+        let mut state = RouterEcsState::new();
+        let mut world = World::new();
+
+        let first_snapshot = state
+            .begin_first_navigation(&first_target)
+            .expect("first navigation should begin");
+        let first_requests = first_snapshot.requests().to_vec();
+        let mut first_sessions = begin_sessions(&mut state, &first_requests, "first");
+        let first_roots = first_requests
+            .iter()
+            .map(|request| {
+                let (_host, root, _child) = mount_frame_root(&mut world, &state, request);
+                root
+            })
+            .collect::<Vec<_>>();
+
+        complete_successful_sessions(&mut state, &mut world, &mut first_sessions, &first_roots);
+        for root in &first_roots {
+            assert_active_root(&world, *root);
+        }
+
+        let second_snapshot = state
+            .runtime
+            .begin_reconciled_navigation(&second_target, &diff)
+            .expect("second reconciled navigation should begin");
+        let second_requests = second_snapshot.requests().to_vec();
+        assert!(
+            !second_requests.is_empty(),
+            "second navigation should have entering frame requests"
+        );
+        let mut second_sessions = begin_sessions(&mut state, &second_requests, "second");
+        let second_roots = second_requests
+            .iter()
+            .map(|request| {
+                let (_host, root, _child) = mount_frame_root(&mut world, &state, request);
+                root
+            })
+            .collect::<Vec<_>>();
+
+        complete_successful_sessions(&mut state, &mut world, &mut second_sessions, &second_roots);
+
+        for root in &first_roots {
+            assert_active_root(&world, *root);
+        }
+        for root in &second_roots {
+            assert_active_root(&world, *root);
+        }
+        for session in &first_sessions {
+            state
+                .finish_frame_apply_session(session)
+                .expect("old finalized sessions should remain finishable after later commit");
+        }
+    }
+
+    fn complete_successful_sessions(
+        state: &mut RouterEcsState,
+        world: &mut World,
+        sessions: &mut [crate::bridge::EcsFrameApplySession],
+        roots: &[Entity],
+    ) {
+        for (index, session) in sessions.iter_mut().enumerate() {
+            session.record_apply_success(Some(format!("frame-{index}")));
+            state
+                .complete_frame_apply_session(world, session, Some(roots[index]), &[])
+                .expect("session should complete successfully");
+        }
+    }
+
+    fn begin_sessions(
+        state: &mut RouterEcsState,
+        requests: &[bevy_ui_router_core::transaction::FrameApplyRequest],
+        prefix: &str,
+    ) -> Vec<crate::bridge::EcsFrameApplySession> {
+        requests
+            .iter()
+            .enumerate()
+            .map(|(index, request)| {
+                state
+                    .begin_frame_apply_session(request, descriptor(format!("{prefix}-{index}")))
+                    .expect("session should mint from pending request")
+            })
+            .collect()
+    }
+
     fn mount_frame_root(
         world: &mut World,
         state: &RouterEcsState,
@@ -487,7 +588,7 @@ mod tests {
         (host, root, child)
     }
 
-    fn descriptor(binding: &str) -> RouteViewDescriptor {
+    fn descriptor(binding: impl Into<String>) -> RouteViewDescriptor {
         RouteViewDescriptor::new(ViewBindingKey::new(binding))
     }
 
@@ -497,11 +598,36 @@ mod tests {
             .unwrap()
     }
 
+    fn matched_branch(matcher: &RouteMatcher, path: &str) -> MatchedBranch {
+        matcher.match_location(&RouteLocation::new(path)).unwrap()
+    }
+
     fn route_tree() -> RouteTree {
         RouteTree::builder()
             .root(RoutePattern::path("/").unwrap())
             .unwrap()
             .build()
             .unwrap()
+    }
+
+    fn items_route_tree() -> RouteTree {
+        let mut builder = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let items = builder
+            .route(root, RoutePattern::path("items").unwrap())
+            .unwrap();
+        builder
+            .route(items, RoutePattern::path(":id").unwrap())
+            .unwrap();
+        builder.build().unwrap()
+    }
+
+    fn assert_active_root(world: &World, root: Entity) {
+        assert!(world.get_entity(root).is_ok(), "active root should exist");
+        assert_ne!(world.get::<Visibility>(root), Some(&Visibility::Hidden));
+        assert_ne!(world.get::<Pickable>(root), Some(&Pickable::IGNORE));
+        assert!(world.get::<InteractionDisabled>(root).is_none());
     }
 }
