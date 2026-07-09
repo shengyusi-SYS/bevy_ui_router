@@ -129,10 +129,32 @@ impl EcsFrameApplySession {
     }
 
     pub(crate) fn can_finish(&self) -> bool {
-        matches!(
-            self.status(),
-            Some(EcsFrameApplyStatus::Failed | EcsFrameApplyStatus::StaleDiscarded)
-        )
+        self.finalized
+            || matches!(
+                self.status(),
+                Some(
+                    EcsFrameApplyStatus::Finalized
+                        | EcsFrameApplyStatus::Failed
+                        | EcsFrameApplyStatus::StaleDiscarded
+                )
+            )
+    }
+
+    pub(crate) fn mark_reported_to_core(&mut self) {
+        if let Some(report) = self.report.as_mut() {
+            report.status = EcsFrameApplyStatus::ReportedToCore;
+        }
+    }
+
+    pub(crate) fn mark_finalized(&mut self) {
+        self.finalized = true;
+        if let Some(report) = self.report.as_mut() {
+            report.status = EcsFrameApplyStatus::Finalized;
+        }
+    }
+
+    pub(crate) fn mark_terminal_cleanup_complete(&mut self) {
+        self.finalized = true;
     }
 }
 

@@ -1,6 +1,10 @@
 use std::fs;
 use std::path::Path;
 
+use bevy_camera::visibility::Visibility;
+use bevy_ecs::prelude::{Entity, World};
+use bevy_picking::Pickable;
+use bevy_ui::InteractionDisabled;
 use bevy_ui_router_core::error::RouteErrorKind;
 use bevy_ui_router_core::location::RouteLocation;
 use bevy_ui_router_core::matcher::RouteMatcher;
@@ -9,8 +13,9 @@ use bevy_ui_router_core::route_tree::RouteTree;
 use bevy_ui_router_core::runtime::RouterRuntime;
 use bevy_ui_router_core::transaction::FrameApplyRequest;
 use bevy_ui_router_ecs::{
-    BeginFrameApplySessionError, EcsFrameApplyReport, EcsFrameApplySession, EcsFrameApplyStatus,
-    FinishFrameApplySessionError, RouterEcsState,
+    BeginFrameApplySessionError, CompleteFrameApplySessionError, EcsFrameApplyReport,
+    EcsFrameApplySession, EcsFrameApplyStatus, FinishFrameApplySessionError, RouteFrameRoot,
+    RouterEcsState,
 };
 use bevy_ui_router_view::{RouteViewDescriptor, ViewBindingKey, ViewReportSession};
 
@@ -273,11 +278,348 @@ fn bridge_discards_renderer_local_stale_without_core_report() {
     assert!(!session.finalized());
 }
 
+#[test]
+fn renderer_success_is_not_active_until_ecs_finalization_and_core_commit() {
+    let mut state = RouterEcsState::new();
+    let snapshot = state_navigation(&mut state, "/");
+    let request = snapshot.requests()[0].clone();
+    let descriptor = descriptor("root");
+    let mut session = state
+        .begin_frame_apply_session(&request, descriptor)
+        .expect("session should mint from state-issued request");
+    let mut world = World::new();
+    let (_host, _slot, root, _child) = mount_frame_root(&mut world, &state, &request);
+
+    session.record_apply_success(Some("renderer-output"));
+
+    assert_eq!(session.status(), Some(EcsFrameApplyStatus::Pending));
+    assert!(world.get::<InteractionDisabled>(root).is_none());
+
+    let report = state
+        .complete_frame_apply_session(&mut world, &mut session, Some(root), &[])
+        .expect("single successful request should finalize and commit");
+
+    assert_eq!(report.status(), EcsFrameApplyStatus::Finalized);
+    assert!(session.finalized());
+    assert_active_root(&world, root);
+}
+
+#[test]
+fn renderer_build_failure_reports_core_failure_without_partial_output_or_host_cleanup() {
+    let mut state = RouterEcsState::new();
+    let snapshot = state_navigation(&mut state, "/");
+    let request = snapshot.requests()[0].clone();
+    let mut session = state
+        .begin_frame_apply_session(&request, descriptor("root"))
+        .expect("session should mint");
+    let mut world = World::new();
+    let host = world.spawn((state.route_host(),)).id();
+
+    session.record_build_failure("renderer build failed");
+    let report = state
+        .complete_frame_apply_session(&mut world, &mut session, None, &[])
+        .expect("build failure should report and acknowledge core cleanup");
+
+    assert_eq!(report.status(), EcsFrameApplyStatus::Failed);
+    assert!(report.partial_output().is_none());
+    assert!(session.finalized());
+    assert!(world.get_entity(host).is_ok(), "app-owned host must remain");
+    assert!(
+        state.begin_first_navigation(&single_match("/")).is_ok(),
+        "failed navigation cleanup acknowledgement should unblock later navigation"
+    );
+}
+
+#[test]
+fn renderer_apply_failure_cleans_partial_router_owned_output_and_preserves_host() {
+    let mut state = RouterEcsState::new();
+    let snapshot = state_navigation(&mut state, "/");
+    let request = snapshot.requests()[0].clone();
+    let mut session = state
+        .begin_frame_apply_session(&request, descriptor("root"))
+        .expect("session should mint");
+    let mut world = World::new();
+    let (host, _slot, root, child) = mount_frame_root(&mut world, &state, &request);
+
+    session.record_apply_failure("renderer apply failed", Some("renderer-output"));
+    let report = state
+        .complete_frame_apply_session(&mut world, &mut session, Some(root), &[])
+        .expect("apply failure should report, cleanup, and acknowledge");
+
+    assert_eq!(report.status(), EcsFrameApplyStatus::Failed);
+    assert!(session.finalized());
+    assert!(world.get_entity(host).is_ok(), "app-owned host must remain");
+    assert!(
+        world.get_entity(root).is_err(),
+        "partial root should be removed"
+    );
+    assert!(
+        world.get_entity(child).is_err(),
+        "router-owned partial subtree should be removed"
+    );
+}
+
+#[test]
+fn renderer_stale_result_is_discarded_without_core_commit_or_visible_output() {
+    let mut state = RouterEcsState::new();
+    let snapshot = state_navigation(&mut state, "/");
+    let request = snapshot.requests()[0].clone();
+    let mut session = state
+        .begin_frame_apply_session(&request, descriptor("root"))
+        .expect("session should mint");
+    let mut world = World::new();
+    let (host, _slot, root, _child) = mount_frame_root(&mut world, &state, &request);
+
+    session.discard_stale("renderer stale");
+    let report = state
+        .complete_frame_apply_session(&mut world, &mut session, Some(root), &[])
+        .expect("renderer-local stale should be discarded locally");
+
+    assert_eq!(report.status(), EcsFrameApplyStatus::StaleDiscarded);
+    assert!(session.finalized());
+    assert!(world.get_entity(host).is_ok(), "app-owned host must remain");
+    assert!(
+        world.get_entity(root).is_err(),
+        "stale partial root should be removed"
+    );
+    assert_eq!(
+        state.begin_first_navigation(&single_match("/")),
+        Err(bevy_ui_router_core::runtime::BeginNavigationError::PendingNavigation),
+        "renderer-local stale must not report to core or clear the pending navigation"
+    );
+}
+
+#[test]
+fn foreign_view_report_session_is_rejected_before_core_report() {
+    bridge_rejects_view_report_from_foreign_frame_request();
+}
+
+#[test]
+fn duplicate_same_request_view_report_session_is_rejected_before_core_report() {
+    let request = issued_request("/items/42", 1);
+    let descriptor = descriptor("leaf");
+    let mut state = RouterEcsState::new();
+    let session = state
+        .begin_frame_apply_session(&request, descriptor.clone())
+        .expect("session should mint");
+    let duplicate = ViewReportSession::from_frame_request(&request, descriptor);
+
+    assert!(
+        !session.accepts_report_session(&duplicate),
+        "same frame request through a different report session must be rejected"
+    );
+}
+
+#[test]
+fn core_report_error_branch_cleans_local_partial_output_without_active_ui_or_host_cleanup() {
+    let mut request_owner = RouterEcsState::new();
+    let snapshot = state_navigation(&mut request_owner, "/");
+    let request = snapshot.requests()[0].clone();
+    let mut reporting_state = RouterEcsState::new();
+    let mut session = reporting_state
+        .begin_frame_apply_session(&request, descriptor("root"))
+        .expect("session should mint even before core has pending navigation");
+    let mut world = World::new();
+    let (host, _slot, root, _child) =
+        mount_frame_root_for_request(&mut world, &request_owner, &request);
+
+    session.record_apply_success(Some("renderer-output"));
+    let error = reporting_state
+        .complete_frame_apply_session(&mut world, &mut session, Some(root), &[])
+        .expect_err("core should reject reports without pending navigation");
+
+    assert_eq!(error, CompleteFrameApplySessionError::CoreReportRejected);
+    assert!(session.finalized());
+    assert!(world.get_entity(host).is_ok(), "app-owned host must remain");
+    assert!(
+        world.get_entity(root).is_err(),
+        "local partial output must be cleaned"
+    );
+    reporting_state
+        .finish_frame_apply_session(&session)
+        .expect("locally cleaned core rejection should release ecs pending state");
+}
+
+#[test]
+fn multiple_frame_requests_report_and_cleanup_in_branch_index_order() {
+    let mut state = RouterEcsState::new();
+    let snapshot = state_navigation(&mut state, "/items/42");
+    assert!(
+        snapshot.requests().len() >= 2,
+        "nested route should issue multiple frame requests"
+    );
+    let requests = snapshot.requests().to_vec();
+    let mut sessions = requests
+        .iter()
+        .enumerate()
+        .map(|(index, request)| {
+            state
+                .begin_frame_apply_session(request, descriptor(&format!("frame-{index}")))
+                .expect("session should mint")
+        })
+        .collect::<Vec<_>>();
+    let mut world = World::new();
+    let roots = requests
+        .iter()
+        .rev()
+        .map(|request| {
+            let (_host, _slot, root, _child) = mount_frame_root(&mut world, &state, request);
+            root
+        })
+        .collect::<Vec<_>>();
+
+    for reverse_index in 0..sessions.len() {
+        let session_index = sessions.len() - 1 - reverse_index;
+        sessions[session_index].record_apply_success(Some(format!("frame-{session_index}")));
+        let report = state
+            .complete_frame_apply_session(
+                &mut world,
+                &mut sessions[session_index],
+                Some(roots[reverse_index]),
+                &[],
+            )
+            .expect("reported requests should be accepted by core");
+
+        if reverse_index + 1 == sessions.len() {
+            assert_eq!(report.status(), EcsFrameApplyStatus::Finalized);
+        } else {
+            assert_eq!(report.status(), EcsFrameApplyStatus::ReportedToCore);
+            assert_inert_root(&world, roots[reverse_index]);
+        }
+    }
+
+    for root in roots {
+        assert_active_root(&world, root);
+    }
+}
+
+#[test]
+fn reported_session_cannot_finish_before_navigation_end_but_can_after_commit() {
+    let mut state = RouterEcsState::new();
+    let snapshot = state_navigation(&mut state, "/items/42");
+    assert!(
+        snapshot.requests().len() >= 2,
+        "nested route should issue multiple frame requests"
+    );
+    let requests = snapshot.requests().to_vec();
+    let mut sessions = requests
+        .iter()
+        .enumerate()
+        .map(|(index, request)| {
+            state
+                .begin_frame_apply_session(request, descriptor(&format!("frame-{index}")))
+                .expect("session should mint")
+        })
+        .collect::<Vec<_>>();
+    let mut world = World::new();
+    let roots = requests
+        .iter()
+        .map(|request| {
+            let (_host, _slot, root, _child) = mount_frame_root(&mut world, &state, request);
+            root
+        })
+        .collect::<Vec<_>>();
+
+    sessions[0].record_apply_success(Some("frame-0"));
+    let first_report = state
+        .complete_frame_apply_session(&mut world, &mut sessions[0], Some(roots[0]), &[])
+        .expect("first report should reach core");
+    assert_eq!(first_report.status(), EcsFrameApplyStatus::ReportedToCore);
+    assert_eq!(
+        state.finish_frame_apply_session(&sessions[0]),
+        Err(FinishFrameApplySessionError::SessionNotTerminal),
+        "reported roots must stay tracked until navigation is committed or failed"
+    );
+
+    for index in 1..sessions.len() {
+        sessions[index].record_apply_success(Some(format!("frame-{index}")));
+        state
+            .complete_frame_apply_session(&mut world, &mut sessions[index], Some(roots[index]), &[])
+            .expect("remaining reports should reach core");
+    }
+
+    for root in &roots {
+        assert_active_root(&world, *root);
+    }
+    for session in &sessions {
+        state
+            .finish_frame_apply_session(session)
+            .expect("reported sessions should release after navigation ends");
+    }
+}
+
 fn descriptor(binding: &str) -> RouteViewDescriptor {
     RouteViewDescriptor::new(ViewBindingKey::new(binding))
 }
 
+fn mount_frame_root(
+    world: &mut World,
+    state: &RouterEcsState,
+    request: &FrameApplyRequest,
+) -> (Entity, Entity, Entity, Entity) {
+    mount_frame_root_for_request(world, state, request)
+}
+
+fn mount_frame_root_for_request(
+    world: &mut World,
+    state: &RouterEcsState,
+    request: &FrameApplyRequest,
+) -> (Entity, Entity, Entity, Entity) {
+    let host = world.spawn((state.route_host(),)).id();
+    let slot = world.spawn((state.route_slot(),)).id();
+    let root = world
+        .spawn((
+            RouteFrameRoot::from_frame_request(request),
+            Visibility::Visible,
+            Pickable::default(),
+        ))
+        .id();
+    let child = world.spawn((Visibility::Visible, Pickable::default())).id();
+
+    world.entity_mut(host).add_child(slot);
+    world.entity_mut(slot).add_child(root);
+    world.entity_mut(root).add_child(child);
+
+    (host, slot, root, child)
+}
+
+fn assert_inert_root(world: &World, root: Entity) {
+    assert_eq!(world.get::<Visibility>(root), Some(&Visibility::Hidden));
+    assert_eq!(world.get::<Pickable>(root), Some(&Pickable::IGNORE));
+    assert!(world.get::<InteractionDisabled>(root).is_some());
+}
+
+fn assert_active_root(world: &World, root: Entity) {
+    assert_ne!(world.get::<Visibility>(root), Some(&Visibility::Hidden));
+    assert_ne!(world.get::<Pickable>(root), Some(&Pickable::IGNORE));
+    assert!(world.get::<InteractionDisabled>(root).is_none());
+}
+
+fn state_navigation(
+    state: &mut RouterEcsState,
+    path: &str,
+) -> bevy_ui_router_core::transaction::NavigationTransactionSnapshot {
+    state
+        .begin_first_navigation(&single_match(path))
+        .expect("state runtime should begin navigation")
+}
+
+fn single_match(path: &str) -> bevy_ui_router_core::branch::MatchedBranch {
+    RouteMatcher::new(route_tree())
+        .match_location(&RouteLocation::new(path))
+        .unwrap()
+}
+
 fn issued_request(path: &str, request_index: usize) -> FrameApplyRequest {
+    let target = RouteMatcher::new(route_tree())
+        .match_location(&RouteLocation::new(path))
+        .unwrap();
+    let mut runtime = RouterRuntime::new();
+
+    runtime.begin_first_navigation(&target).unwrap().requests()[request_index].clone()
+}
+
+fn route_tree() -> RouteTree {
     let mut builder = RouteTree::builder()
         .root(RoutePattern::path("/").unwrap())
         .unwrap();
@@ -288,10 +630,5 @@ fn issued_request(path: &str, request_index: usize) -> FrameApplyRequest {
     builder
         .route(items, RoutePattern::path(":id").unwrap())
         .unwrap();
-    let target = RouteMatcher::new(builder.build().unwrap())
-        .match_location(&RouteLocation::new(path))
-        .unwrap();
-    let mut runtime = RouterRuntime::new();
-
-    runtime.begin_first_navigation(&target).unwrap().requests()[request_index].clone()
+    builder.build().unwrap()
 }

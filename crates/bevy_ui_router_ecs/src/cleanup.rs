@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use bevy_ecs::hierarchy::Children;
 use bevy_ecs::prelude::{Entity, World};
 use bevy_ui_router_core::frame::FrameCleanupPlan;
+use bevy_ui_router_core::transaction::FrameApplyRequest;
 
 use crate::components::RouteFrameRoot;
 
@@ -82,6 +83,60 @@ pub(crate) fn cleanup_router_owned_subtree(
 }
 
 #[allow(dead_code)]
+pub(crate) fn cleanup_frame_apply_request_subtree(
+    world: &mut World,
+    request: &FrameApplyRequest,
+    _capability: CleanupCapability,
+) -> CleanupReport {
+    let mut frame_roots = world
+        .query::<(Entity, &RouteFrameRoot)>()
+        .iter(world)
+        .map(|(entity, root)| (entity, *root))
+        .collect::<Vec<_>>();
+
+    frame_roots.sort_by_key(|(entity, root)| cleanup_sort_key(root, *entity));
+
+    let mut removed_targets = Vec::new();
+    let mut skipped_mismatches = Vec::new();
+    let mut direct_despawn_roots = Vec::new();
+    let mut seen_removed = HashSet::new();
+
+    for (entity, root) in frame_roots {
+        if matches_frame_apply_request(&root, request) {
+            direct_despawn_roots.push((entity, root));
+            for descendant in collect_router_owned_subtree(world, entity) {
+                if seen_removed.insert(descendant) {
+                    removed_targets.push((descendant, root));
+                }
+            }
+        } else {
+            skipped_mismatches.push((entity, root));
+        }
+    }
+
+    direct_despawn_roots.sort_by_key(|(entity, root)| cleanup_sort_key(root, *entity));
+    removed_targets.sort_by_key(|(entity, root)| cleanup_sort_key(root, *entity));
+    skipped_mismatches.sort_by_key(|(entity, root)| cleanup_sort_key(root, *entity));
+
+    for (entity, _root) in direct_despawn_roots {
+        if let Ok(entity_mut) = world.get_entity_mut(entity) {
+            entity_mut.despawn();
+        }
+    }
+
+    CleanupReport {
+        removed: removed_targets
+            .into_iter()
+            .map(|(entity, _root)| entity)
+            .collect(),
+        skipped_mismatches: skipped_mismatches
+            .into_iter()
+            .map(|(entity, _root)| entity)
+            .collect(),
+    }
+}
+
+#[allow(dead_code)]
 fn matches_cleanup_plan(root: &RouteFrameRoot, plan: &FrameCleanupPlan) -> bool {
     let identity = root.identity();
 
@@ -91,6 +146,19 @@ fn matches_cleanup_plan(root: &RouteFrameRoot, plan: &FrameCleanupPlan) -> bool 
         && identity.route() == plan.identity().route()
         && identity.frame() == plan.identity().frame()
         && identity.generation() == plan.identity().generation()
+}
+
+#[allow(dead_code)]
+fn matches_frame_apply_request(root: &RouteFrameRoot, request: &FrameApplyRequest) -> bool {
+    let identity = root.identity();
+    let request_identity = request.frame().identity();
+
+    identity.router() == request_identity.router()
+        && identity.host() == request_identity.host()
+        && identity.slot() == request_identity.slot()
+        && identity.route() == request_identity.route()
+        && identity.frame() == request_identity.frame()
+        && identity.generation() == request_identity.generation()
 }
 
 #[allow(dead_code)]

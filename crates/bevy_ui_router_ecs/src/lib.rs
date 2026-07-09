@@ -14,7 +14,7 @@ pub use components::{
     RouteFrameRootLifecycleSnapshot, RouteHost, RouteSlot,
 };
 pub use plugin::{BevyUiRouterPlugin, RouterScheduleSet};
-pub use state::RouterEcsState;
+pub use state::{CompleteFrameApplySessionError, RouterEcsState};
 
 pub mod prelude {
     pub use crate::{

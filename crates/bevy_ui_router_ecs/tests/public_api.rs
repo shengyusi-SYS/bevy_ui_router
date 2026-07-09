@@ -10,8 +10,8 @@ use bevy_ui_router_ecs::prelude::{
     BevyUiRouterPlugin, RouteFrameRoot, RouteHost, RouteSlot, RouterEcsState, RouterScheduleSet,
 };
 use bevy_ui_router_ecs::{
-    BeginFrameApplySessionError, EcsFrameApplyReport, EcsFrameApplySession, EcsFrameApplyStatus,
-    FinishFrameApplySessionError,
+    BeginFrameApplySessionError, CompleteFrameApplySessionError, EcsFrameApplyReport,
+    EcsFrameApplySession, EcsFrameApplyStatus, FinishFrameApplySessionError,
 };
 
 #[test]
@@ -40,6 +40,7 @@ fn ecs_root_exports_apply_bridge_types_without_prelude_promotion() {
     assert_public::<EcsFrameApplyReport>();
     assert_public::<EcsFrameApplyStatus>();
     assert_public::<BeginFrameApplySessionError>();
+    assert_public::<CompleteFrameApplySessionError>();
     assert_public::<FinishFrameApplySessionError>();
 
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -52,6 +53,7 @@ fn ecs_root_exports_apply_bridge_types_without_prelude_promotion() {
         "EcsFrameApplySession",
         "EcsFrameApplyStatus",
         "FinishFrameApplySessionError",
+        "CompleteFrameApplySessionError",
     ] {
         assert!(
             source.contains(exported),
@@ -65,7 +67,8 @@ fn ecs_root_exports_apply_bridge_types_without_prelude_promotion() {
     assert!(
         !prelude.contains("EcsFrameApplySession")
             && !prelude.contains("EcsFrameApplyReport")
-            && !prelude.contains("EcsFrameApplyStatus"),
+            && !prelude.contains("EcsFrameApplyStatus")
+            && !prelude.contains("CompleteFrameApplySessionError"),
         "prelude should stay focused and not promote apply bridge foundation types"
     );
 }
