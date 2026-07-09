@@ -612,8 +612,8 @@ fn assert_inert_root(world: &World, root: Entity) {
 
 fn assert_active_root(world: &World, root: Entity) {
     assert!(world.get_entity(root).is_ok(), "active root should exist");
-    assert_ne!(world.get::<Visibility>(root), Some(&Visibility::Hidden));
-    assert_ne!(world.get::<Pickable>(root), Some(&Pickable::IGNORE));
+    assert_eq!(world.get::<Visibility>(root), Some(&Visibility::Visible));
+    assert_eq!(world.get::<Pickable>(root), Some(&Pickable::default()));
     assert!(world.get::<InteractionDisabled>(root).is_none());
 }
 
