@@ -27,9 +27,8 @@ fn bridge_mints_session_from_core_frame_apply_request() {
     assert_public::<EcsFrameApplyReport>();
     assert_public::<EcsFrameApplyStatus>();
 
-    let request = issued_request("/items/42", 1);
+    let (mut state, request) = state_with_request("/items/42", 1);
     let descriptor = descriptor("leaf");
-    let mut state = RouterEcsState::new();
     let session = state
         .begin_frame_apply_session(&request, descriptor.clone())
         .expect("core-issued frame requests should mint ecs apply sessions");
@@ -53,9 +52,8 @@ fn bridge_mints_session_from_core_frame_apply_request() {
 
 #[test]
 fn bridge_releases_build_failed_session_for_same_request_after_finish() {
-    let request = issued_request("/items/42", 1);
+    let (mut state, request) = state_with_request("/items/42", 1);
     let descriptor = descriptor("leaf");
-    let mut state = RouterEcsState::new();
     let mut session = state
         .begin_frame_apply_session(&request, descriptor.clone())
         .expect("session should mint");
@@ -75,9 +73,8 @@ fn bridge_releases_build_failed_session_for_same_request_after_finish() {
 
 #[test]
 fn bridge_releases_apply_failed_session_for_same_request_after_finish() {
-    let request = issued_request("/items/42", 1);
+    let (mut state, request) = state_with_request("/items/42", 1);
     let descriptor = descriptor("leaf");
-    let mut state = RouterEcsState::new();
     let mut session = state
         .begin_frame_apply_session(&request, descriptor.clone())
         .expect("session should mint");
@@ -97,9 +94,8 @@ fn bridge_releases_apply_failed_session_for_same_request_after_finish() {
 
 #[test]
 fn bridge_releases_stale_discarded_session_for_same_request_after_finish() {
-    let request = issued_request("/items/42", 1);
+    let (mut state, request) = state_with_request("/items/42", 1);
     let descriptor = descriptor("leaf");
-    let mut state = RouterEcsState::new();
     let mut session = state
         .begin_frame_apply_session(&request, descriptor.clone())
         .expect("session should mint");
@@ -119,9 +115,8 @@ fn bridge_releases_stale_discarded_session_for_same_request_after_finish() {
 
 #[test]
 fn bridge_keeps_apply_success_session_pending_until_later_finalization() {
-    let request = issued_request("/items/42", 1);
+    let (mut state, request) = state_with_request("/items/42", 1);
     let descriptor = descriptor("leaf");
-    let mut state = RouterEcsState::new();
     let mut session = state
         .begin_frame_apply_session(&request, descriptor.clone())
         .expect("session should mint");
@@ -164,10 +159,9 @@ fn bridge_does_not_expose_frame_apply_token_mutation() {
 
 #[test]
 fn bridge_rejects_view_report_from_foreign_frame_request() {
-    let request = issued_request("/items/42", 1);
+    let (mut state, request) = state_with_request("/items/42", 1);
     let foreign_request = issued_request("/items/42", 0);
     let descriptor = descriptor("leaf");
-    let mut state = RouterEcsState::new();
     let session = state
         .begin_frame_apply_session(&request, descriptor.clone())
         .expect("session should mint");
@@ -186,8 +180,7 @@ fn bridge_rejects_view_report_from_foreign_frame_request() {
 
 #[test]
 fn bridge_records_renderer_build_failure_without_partial_output() {
-    let request = issued_request("/items/42", 1);
-    let mut state = RouterEcsState::new();
+    let (mut state, request) = state_with_request("/items/42", 1);
     let mut session = state
         .begin_frame_apply_session(&request, descriptor("leaf"))
         .expect("session should mint");
@@ -209,8 +202,7 @@ fn bridge_records_renderer_build_failure_without_partial_output() {
 
 #[test]
 fn bridge_records_renderer_apply_success_as_unfinalized_observation() {
-    let request = issued_request("/items/42", 1);
-    let mut state = RouterEcsState::new();
+    let (mut state, request) = state_with_request("/items/42", 1);
     let mut session = state
         .begin_frame_apply_session(&request, descriptor("leaf"))
         .expect("session should mint");
@@ -234,8 +226,7 @@ fn bridge_records_renderer_apply_success_as_unfinalized_observation() {
 
 #[test]
 fn bridge_records_renderer_apply_failure_as_unfinalized_failure() {
-    let request = issued_request("/items/42", 1);
-    let mut state = RouterEcsState::new();
+    let (mut state, request) = state_with_request("/items/42", 1);
     let mut session = state
         .begin_frame_apply_session(&request, descriptor("leaf"))
         .expect("session should mint");
@@ -257,8 +248,7 @@ fn bridge_records_renderer_apply_failure_as_unfinalized_failure() {
 
 #[test]
 fn bridge_discards_renderer_local_stale_without_core_report() {
-    let request = issued_request("/items/42", 1);
-    let mut state = RouterEcsState::new();
+    let (mut state, request) = state_with_request("/items/42", 1);
     let mut session = state
         .begin_frame_apply_session(&request, descriptor("leaf"))
         .expect("session should mint");
@@ -396,9 +386,8 @@ fn foreign_view_report_session_is_rejected_before_core_report() {
 
 #[test]
 fn duplicate_same_request_view_report_session_is_rejected_before_core_report() {
-    let request = issued_request("/items/42", 1);
+    let (mut state, request) = state_with_request("/items/42", 1);
     let descriptor = descriptor("leaf");
-    let mut state = RouterEcsState::new();
     let session = state
         .begin_frame_apply_session(&request, descriptor.clone())
         .expect("session should mint");
@@ -411,33 +400,50 @@ fn duplicate_same_request_view_report_session_is_rejected_before_core_report() {
 }
 
 #[test]
-fn core_report_error_branch_cleans_local_partial_output_without_active_ui_or_host_cleanup() {
-    let mut request_owner = RouterEcsState::new();
-    let snapshot = state_navigation(&mut request_owner, "/");
+fn unowned_frame_request_is_rejected_before_core_report() {
+    let request = issued_request("/items/42", 1);
+    let mut state = RouterEcsState::new();
+
+    assert_eq!(
+        state.begin_frame_apply_session(&request, descriptor("leaf")),
+        Err(BeginFrameApplySessionError::RequestNotPending)
+    );
+}
+
+#[test]
+fn mismatched_root_identity_is_rejected_before_core_report_or_inert_preparation() {
+    let mut state = RouterEcsState::new();
+    let snapshot = state_navigation(&mut state, "/items/42");
+    assert!(
+        snapshot.requests().len() >= 2,
+        "nested route should issue multiple frame requests"
+    );
     let request = snapshot.requests()[0].clone();
-    let mut reporting_state = RouterEcsState::new();
-    let mut session = reporting_state
+    let mismatched_request = snapshot.requests()[1].clone();
+    let mut session = state
         .begin_frame_apply_session(&request, descriptor("root"))
-        .expect("session should mint even before core has pending navigation");
+        .expect("session should mint from the state-owned request");
     let mut world = World::new();
     let (host, _slot, root, _child) =
-        mount_frame_root_for_request(&mut world, &request_owner, &request);
+        mount_frame_root_for_request(&mut world, &state, &mismatched_request);
 
     session.record_apply_success(Some("renderer-output"));
-    let error = reporting_state
+    let error = state
         .complete_frame_apply_session(&mut world, &mut session, Some(root), &[])
-        .expect_err("core should reject reports without pending navigation");
+        .expect_err("root identity mismatch should be rejected before core report");
 
-    assert_eq!(error, CompleteFrameApplySessionError::CoreReportRejected);
+    assert_eq!(error, CompleteFrameApplySessionError::InvalidRoot);
     assert!(session.finalized());
     assert!(world.get_entity(host).is_ok(), "app-owned host must remain");
-    assert!(
-        world.get_entity(root).is_err(),
-        "local partial output must be cleaned"
+    assert_active_root(&world, root);
+    assert_eq!(
+        state.begin_first_navigation(&single_match("/")),
+        Err(bevy_ui_router_core::runtime::BeginNavigationError::PendingNavigation),
+        "invalid root must not be reported to core or clear the pending navigation"
     );
-    reporting_state
+    state
         .finish_frame_apply_session(&session)
-        .expect("locally cleaned core rejection should release ecs pending state");
+        .expect("locally rejected invalid root should release ecs pending state");
 }
 
 #[test]
@@ -491,6 +497,10 @@ fn multiple_frame_requests_report_and_cleanup_in_branch_index_order() {
     for root in roots {
         assert_active_root(&world, root);
     }
+    for session in &sessions {
+        assert_eq!(session.status(), Some(EcsFrameApplyStatus::Finalized));
+        assert!(session.finalized());
+    }
 }
 
 #[test]
@@ -541,6 +551,10 @@ fn reported_session_cannot_finish_before_navigation_end_but_can_after_commit() {
     for root in &roots {
         assert_active_root(&world, *root);
     }
+    assert!(
+        state.begin_first_navigation(&single_match("/")).is_ok(),
+        "a later navigation may begin before old reported sessions are explicitly finished"
+    );
     for session in &sessions {
         state
             .finish_frame_apply_session(session)
@@ -608,6 +622,12 @@ fn single_match(path: &str) -> bevy_ui_router_core::branch::MatchedBranch {
     RouteMatcher::new(route_tree())
         .match_location(&RouteLocation::new(path))
         .unwrap()
+}
+
+fn state_with_request(path: &str, request_index: usize) -> (RouterEcsState, FrameApplyRequest) {
+    let mut state = RouterEcsState::new();
+    let snapshot = state_navigation(&mut state, path);
+    (state, snapshot.requests()[request_index].clone())
 }
 
 fn issued_request(path: &str, request_index: usize) -> FrameApplyRequest {

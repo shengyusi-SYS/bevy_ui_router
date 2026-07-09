@@ -137,6 +137,38 @@ pub(crate) fn cleanup_frame_apply_request_subtree(
 }
 
 #[allow(dead_code)]
+pub(crate) fn cleanup_unclaimed_frame_root_subtree(
+    world: &mut World,
+    root: Entity,
+    _capability: CleanupCapability,
+) -> CleanupReport {
+    let Some(frame_root) = world.get::<RouteFrameRoot>(root).copied() else {
+        return CleanupReport {
+            removed: Vec::new(),
+            skipped_mismatches: Vec::new(),
+        };
+    };
+
+    let mut removed_targets = collect_router_owned_subtree(world, root)
+        .into_iter()
+        .map(|entity| (entity, frame_root))
+        .collect::<Vec<_>>();
+    removed_targets.sort_by_key(|(entity, frame_root)| cleanup_sort_key(frame_root, *entity));
+
+    if let Ok(entity_mut) = world.get_entity_mut(root) {
+        entity_mut.despawn();
+    }
+
+    CleanupReport {
+        removed: removed_targets
+            .into_iter()
+            .map(|(entity, _root)| entity)
+            .collect(),
+        skipped_mismatches: Vec::new(),
+    }
+}
+
+#[allow(dead_code)]
 fn matches_cleanup_plan(root: &RouteFrameRoot, plan: &FrameCleanupPlan) -> bool {
     let identity = root.identity();
 

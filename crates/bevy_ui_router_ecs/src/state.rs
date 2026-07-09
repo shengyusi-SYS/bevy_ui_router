@@ -1,20 +1,23 @@
 use bevy_ecs::prelude::{Entity, Resource, World};
 use bevy_ui_router_core::branch::MatchedBranch;
 use bevy_ui_router_core::frame::FrameCleanupPlan;
-use bevy_ui_router_core::runtime::{BeginNavigationError, RouterRuntime};
+use bevy_ui_router_core::runtime::{BeginNavigationError, FrameApplyReportError, RouterRuntime};
 use bevy_ui_router_core::transaction::{
     FrameApplyOutcome, FrameApplyRequest, NavigationTransactionSnapshot, NavigationTransactionState,
 };
 use bevy_ui_router_view::{RouteViewDescriptor, ViewRequestId};
 
 use crate::bridge::{
-    BeginFrameApplySessionError, EcsFrameApplyReport, EcsFrameApplySession, EcsFrameApplyStatus,
-    FinishFrameApplySessionError,
+    BeginFrameApplySessionError, EcsFrameApplyReport, EcsFrameApplySession,
+    EcsFrameApplySessionStateHandle, EcsFrameApplyStatus, FinishFrameApplySessionError,
 };
 use crate::cleanup::{
     CleanupCapability, cleanup_frame_apply_request_subtree, cleanup_router_owned_subtree,
+    cleanup_unclaimed_frame_root_subtree,
 };
-use crate::components::{RouteFocusSnapshot, RouteHost, RouteSlot};
+use crate::components::{
+    RouteFocusSnapshot, RouteFrameRoot, RouteFrameRootLifecycleState, RouteHost, RouteSlot,
+};
 use crate::finalize::{
     InactiveFinalizationCapability, PostCommitActivation, PrepareInertCapability,
     activate_committed_root, finalize_inactive_root, prepare_inert_root,
@@ -24,6 +27,7 @@ use crate::finalize::{
 struct PendingFrameApplySession {
     request: FrameApplyRequest,
     view_request_id: ViewRequestId,
+    session_state: EcsFrameApplySessionStateHandle,
     reported_root: Option<Entity>,
 }
 
@@ -33,6 +37,7 @@ pub enum CompleteFrameApplySessionError {
     MissingReport,
     MissingRoot,
     InvalidRoot,
+    CoreStaleRejected,
     CoreReportRejected,
     CoreCommitRejected,
     CleanupAckRejected,
@@ -96,10 +101,22 @@ impl RouterEcsState {
             return Err(BeginFrameApplySessionError::RequestAlreadyPending);
         }
 
+        let Some(pending) = self.runtime.pending_snapshot() else {
+            return Err(BeginFrameApplySessionError::RequestNotPending);
+        };
+        if !pending
+            .requests()
+            .iter()
+            .any(|candidate| candidate == request)
+        {
+            return Err(BeginFrameApplySessionError::RequestNotPending);
+        }
+
         let session = EcsFrameApplySession::new(request, descriptor);
         self.pending_apply_requests.push(PendingFrameApplySession {
             request: request.clone(),
             view_request_id: session.view_request_id(),
+            session_state: session.state_handle(),
             reported_root: None,
         });
         Ok(session)
@@ -117,7 +134,6 @@ impl RouterEcsState {
             .ok_or(CompleteFrameApplySessionError::SessionNotRegistered)?;
         let report = session
             .report()
-            .cloned()
             .ok_or(CompleteFrameApplySessionError::MissingReport)?;
 
         match report.status() {
@@ -136,8 +152,7 @@ impl RouterEcsState {
                 session.mark_terminal_cleanup_complete();
                 Ok(session
                     .report()
-                    .expect("stale report should remain recorded")
-                    .clone())
+                    .expect("stale report should remain recorded"))
             }
             EcsFrameApplyStatus::Finalized | EcsFrameApplyStatus::ReportedToCore => Ok(report),
         }
@@ -151,9 +166,7 @@ impl RouterEcsState {
             return Err(FinishFrameApplySessionError::SessionNotRegistered);
         };
 
-        if !session.can_finish()
-            && !self.reported_session_can_finish_after_navigation_end(index, session)
-        {
+        if !session.can_finish() {
             return Err(FinishFrameApplySessionError::SessionNotTerminal);
         }
 
@@ -170,6 +183,12 @@ impl RouterEcsState {
         inactive_roots: &[Entity],
     ) -> Result<EcsFrameApplyReport, CompleteFrameApplySessionError> {
         let root = root.ok_or(CompleteFrameApplySessionError::MissingRoot)?;
+        if !root_matches_request(world, root, session.request()) {
+            cleanup_invalid_apply_root(world, root, session.request());
+            session.mark_terminal_cleanup_complete();
+            return Err(CompleteFrameApplySessionError::InvalidRoot);
+        }
+
         let prepared = prepare_inert_root(world, root, PrepareInertCapability);
         if prepared.lifecycle()
             != Some(crate::components::RouteFrameRootLifecycleSnapshot::PreparedInert)
@@ -188,6 +207,11 @@ impl RouterEcsState {
             .report_frame_apply(session.request().token(), FrameApplyOutcome::Applied)
         {
             Ok(snapshot) => snapshot,
+            Err(FrameApplyReportError::Stale(_stale)) => {
+                cleanup_frame_apply_request_subtree(world, session.request(), CleanupCapability);
+                session.mark_terminal_cleanup_complete();
+                return Err(CompleteFrameApplySessionError::CoreStaleRejected);
+            }
             Err(_error) => {
                 cleanup_frame_apply_request_subtree(world, session.request(), CleanupCapability);
                 session.mark_terminal_cleanup_complete();
@@ -197,15 +221,14 @@ impl RouterEcsState {
         self.pending_apply_requests[pending_index].reported_root = Some(root);
 
         if snapshot.state() == NavigationTransactionState::ReadyToCommit {
-            self.commit_and_activate_reported_roots(world, session)?;
+            self.commit_and_activate_reported_roots(world)?;
         } else {
             session.mark_reported_to_core();
         }
 
         Ok(session
             .report()
-            .expect("success report should remain recorded")
-            .clone())
+            .expect("success report should remain recorded"))
     }
 
     fn complete_failed_apply(
@@ -223,6 +246,17 @@ impl RouterEcsState {
             FrameApplyOutcome::Failed(failure.error().clone()),
         ) {
             Ok(snapshot) => snapshot,
+            Err(FrameApplyReportError::Stale(_stale)) => {
+                if root.is_some() {
+                    cleanup_frame_apply_request_subtree(
+                        world,
+                        session.request(),
+                        CleanupCapability,
+                    );
+                }
+                session.mark_terminal_cleanup_complete();
+                return Err(CompleteFrameApplySessionError::CoreStaleRejected);
+            }
             Err(_error) => {
                 if root.is_some() {
                     cleanup_frame_apply_request_subtree(
@@ -247,18 +281,17 @@ impl RouterEcsState {
         self.runtime
             .acknowledge_failed_navigation_cleanup(&cleanup)
             .map_err(|_error| CompleteFrameApplySessionError::CleanupAckRejected)?;
+        self.mark_reported_sessions_terminal_cleanup_complete();
         session.mark_terminal_cleanup_complete();
 
         Ok(session
             .report()
-            .expect("failure report should remain recorded")
-            .clone())
+            .expect("failure report should remain recorded"))
     }
 
     fn commit_and_activate_reported_roots(
         &mut self,
         world: &mut World,
-        session: &mut EcsFrameApplySession,
     ) -> Result<(), CompleteFrameApplySessionError> {
         self.runtime
             .commit_ready_navigation()
@@ -272,16 +305,18 @@ impl RouterEcsState {
                         pending.request.frame().branch_index(),
                         pending.request.token().sequence(),
                         root,
+                        pending.session_state.clone(),
                     )
                 })
             })
             .collect::<Vec<_>>();
-        reported_roots.sort_by_key(|(branch_index, sequence, _root)| (*branch_index, *sequence));
+        reported_roots
+            .sort_by_key(|(branch_index, sequence, _root, _state)| (*branch_index, *sequence));
 
-        for (_branch_index, _sequence, root) in reported_roots {
+        for (_branch_index, _sequence, root, session_state) in reported_roots {
             activate_committed_root(world, root, PostCommitActivation);
+            session_state.mark_finalized();
         }
-        session.mark_finalized();
         Ok(())
     }
 
@@ -310,16 +345,32 @@ impl RouterEcsState {
         })
     }
 
-    fn reported_session_can_finish_after_navigation_end(
-        &self,
-        pending_index: usize,
-        session: &EcsFrameApplySession,
-    ) -> bool {
-        session.status() == Some(EcsFrameApplyStatus::ReportedToCore)
-            && self.pending_apply_requests[pending_index]
-                .reported_root
-                .is_some()
-            && self.runtime.pending_snapshot().is_none()
+    fn mark_reported_sessions_terminal_cleanup_complete(&self) {
+        for pending in &self.pending_apply_requests {
+            if pending.reported_root.is_some() {
+                pending.session_state.mark_terminal_cleanup_complete();
+            }
+        }
+    }
+}
+
+fn root_matches_request(world: &World, root: Entity, request: &FrameApplyRequest) -> bool {
+    let Some(frame_root) = world.get::<RouteFrameRoot>(root) else {
+        return false;
+    };
+    let request_identity = request.frame().identity();
+
+    frame_root.identity() == request_identity
+        && frame_root.branch_index() == request.frame().branch_index()
+}
+
+fn cleanup_invalid_apply_root(world: &mut World, root: Entity, request: &FrameApplyRequest) {
+    if world.get::<RouteFrameRoot>(root).is_some()
+        && world.get::<RouteFrameRootLifecycleState>(root).is_none()
+    {
+        cleanup_unclaimed_frame_root_subtree(world, root, CleanupCapability);
+    } else {
+        cleanup_frame_apply_request_subtree(world, request, CleanupCapability);
     }
 }
 
@@ -347,5 +398,110 @@ impl RouteFocusState {
 
     pub(crate) const fn snapshot(&self) -> RouteFocusSnapshot {
         RouteFocusSnapshot::new(self.focused)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy_camera::visibility::Visibility;
+    use bevy_ecs::prelude::{Entity, World};
+    use bevy_picking::Pickable;
+    use bevy_ui_router_core::location::RouteLocation;
+    use bevy_ui_router_core::matcher::RouteMatcher;
+    use bevy_ui_router_core::pattern::RoutePattern;
+    use bevy_ui_router_core::route_tree::RouteTree;
+    use bevy_ui_router_core::runtime::BeginNavigationError;
+    use bevy_ui_router_view::{RouteViewDescriptor, ViewBindingKey};
+
+    use crate::components::RouteFrameRoot;
+
+    use super::{CompleteFrameApplySessionError, RouterEcsState};
+
+    #[test]
+    fn core_stale_rejection_discards_local_partial_output_without_forged_ecs_token() {
+        let target = single_match("/");
+        let mut state = RouterEcsState::new();
+        let snapshot = state
+            .begin_first_navigation(&target)
+            .expect("navigation should begin");
+        let request = snapshot.requests()[0].clone();
+        let mut session = state
+            .begin_frame_apply_session(&request, descriptor("root"))
+            .expect("session should mint from the original pending request");
+        let mut world = World::new();
+        let (host, root, child) = mount_frame_root(&mut world, &state, &request);
+
+        session.record_apply_success(Some("renderer-output"));
+
+        let mut replacement_runtime = bevy_ui_router_core::runtime::RouterRuntime::new();
+        replacement_runtime
+            .begin_first_navigation(&target)
+            .expect("replacement runtime should hold a different pending transaction");
+        state.runtime = replacement_runtime;
+
+        let error = state
+            .complete_frame_apply_session(&mut world, &mut session, Some(root), &[])
+            .expect_err("replacement runtime should reject the original token as stale");
+
+        assert_eq!(error, CompleteFrameApplySessionError::CoreStaleRejected);
+        assert!(session.finalized());
+        assert!(world.get_entity(host).is_ok(), "app-owned host must remain");
+        assert!(
+            world.get_entity(root).is_err(),
+            "stale partial root is removed"
+        );
+        assert!(
+            world.get_entity(child).is_err(),
+            "stale partial subtree is removed"
+        );
+        assert_eq!(
+            state.begin_first_navigation(&target),
+            Err(BeginNavigationError::PendingNavigation),
+            "core stale rejection must leave the replacement pending navigation unchanged"
+        );
+        state
+            .finish_frame_apply_session(&session)
+            .expect("stale-cleaned session should release ECS pending state");
+    }
+
+    fn mount_frame_root(
+        world: &mut World,
+        state: &RouterEcsState,
+        request: &bevy_ui_router_core::transaction::FrameApplyRequest,
+    ) -> (Entity, Entity, Entity) {
+        let host = world.spawn((state.route_host(),)).id();
+        let slot = world.spawn((state.route_slot(),)).id();
+        let root = world
+            .spawn((
+                RouteFrameRoot::from_frame_request(request),
+                Visibility::Visible,
+                Pickable::default(),
+            ))
+            .id();
+        let child = world.spawn((Visibility::Visible, Pickable::default())).id();
+
+        world.entity_mut(host).add_child(slot);
+        world.entity_mut(slot).add_child(root);
+        world.entity_mut(root).add_child(child);
+
+        (host, root, child)
+    }
+
+    fn descriptor(binding: &str) -> RouteViewDescriptor {
+        RouteViewDescriptor::new(ViewBindingKey::new(binding))
+    }
+
+    fn single_match(path: &str) -> bevy_ui_router_core::branch::MatchedBranch {
+        RouteMatcher::new(route_tree())
+            .match_location(&RouteLocation::new(path))
+            .unwrap()
+    }
+
+    fn route_tree() -> RouteTree {
+        RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
     }
 }
