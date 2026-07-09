@@ -137,6 +137,62 @@ fn cleanup_stays_crate_private_while_report_exposes_read_only_ordered_evidence()
 }
 
 #[test]
+fn finalize_stays_crate_private_without_public_activation_or_finalization_entrypoints() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let ecs_lib_source =
+        fs::read_to_string(manifest_dir.join("src").join("lib.rs")).expect("lib source readable");
+    let finalize_source = fs::read_to_string(manifest_dir.join("src").join("finalize.rs"))
+        .expect("finalize source should be readable");
+    let facade_source = fs::read_to_string(
+        manifest_dir
+            .parent()
+            .expect("ecs crate should live under crates/")
+            .join("bevy_ui_router")
+            .join("src")
+            .join("lib.rs"),
+    )
+    .expect("facade lib source should be readable");
+
+    assert!(
+        ecs_lib_source.contains("pub(crate) mod finalize;"),
+        "finalize module should stay crate-private"
+    );
+    for forbidden in [
+        "pub mod finalize;",
+        "pub use finalize::PrepareInertCapability",
+        "pub use finalize::PostCommitActivation",
+        "pub use finalize::InactiveFinalizationCapability",
+        "pub use finalize::prepare_inert_root",
+        "pub use finalize::activate_committed_root",
+        "pub use finalize::finalize_inactive_root",
+        "pub use finalize::FinalizationReport",
+    ] {
+        assert!(
+            !ecs_lib_source.contains(forbidden),
+            "ecs crate root should not expose finalization fragment `{forbidden}`"
+        );
+        assert!(
+            !facade_source.contains(forbidden),
+            "facade should not expose finalization fragment `{forbidden}`"
+        );
+    }
+    for required in [
+        "pub(crate) struct PrepareInertCapability;",
+        "pub(crate) struct PostCommitActivation;",
+        "pub(crate) struct InactiveFinalizationCapability;",
+        "pub(crate) fn prepare_inert_root(",
+        "pub(crate) fn activate_committed_root(",
+        "pub(crate) fn finalize_inactive_root(",
+        "pub struct FinalizationReport",
+    ] {
+        assert!(
+            finalize_source.contains(required),
+            "finalize source should contain `{required}`"
+        );
+    }
+}
+
+#[test]
 fn route_host_and_slot_observe_core_issued_identity() {
     let state = RouterEcsState::new();
     let host = state.route_host();

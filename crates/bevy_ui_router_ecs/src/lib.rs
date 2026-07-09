@@ -3,6 +3,7 @@
 mod bridge;
 pub(crate) mod cleanup;
 mod components;
+pub(crate) mod finalize;
 mod plugin;
 mod state;
 
