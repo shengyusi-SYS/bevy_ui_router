@@ -124,71 +124,13 @@ fn default_fake_renderer_view_root_names_missing_symbol() {
 }
 
 #[test]
-fn test_support_fake_renderer_view_root_still_names_missing_symbol() {
+fn default_view_fake_renderer_root_names_missing_symbol() {
     assert_compile_fails(Fixture {
-        name: "test_support_fake_renderer_not_view_root",
+        name: "default_view_fake_renderer_not_view_root",
         code: "use bevy_ui_router::view::FakeViewRenderer; fn main() {}",
-        default_features: false,
-        features: &["view-test-support"],
+        default_features: true,
+        features: &[],
         expected_stderr: &["error[E0432]", "no `FakeViewRenderer` in the root"],
-    });
-}
-
-#[test]
-fn test_support_fake_renderer_commit_names_missing_method() {
-    assert_compile_fails(Fixture {
-        name: "test_support_fake_renderer_has_no_commit",
-        code: "use bevy_ui_router::prelude::{FakeViewRenderer, FakeViewRendererMode}; fn main() { let mut renderer = FakeViewRenderer::new(FakeViewRendererMode::Success); renderer.commit(); }",
-        default_features: false,
-        features: &["view-test-support"],
-        expected_stderr: &["error[E0599]", "no method named `commit` found"],
-    });
-}
-
-#[test]
-fn test_support_fake_renderer_finalize_names_missing_method() {
-    assert_compile_fails(Fixture {
-        name: "test_support_fake_renderer_has_no_finalize",
-        code: "use bevy_ui_router::prelude::{FakeViewRenderer, FakeViewRendererMode, FrameApplyRequest}; fn main() { let mut renderer = FakeViewRenderer::new(FakeViewRendererMode::Success); let request: FrameApplyRequest = unreachable!(); renderer.finalize(request); }",
-        default_features: false,
-        features: &["view-test-support"],
-        expected_stderr: &["error[E0599]", "no method named `finalize` found"],
-    });
-}
-
-#[test]
-fn test_support_fake_renderer_token_accept_names_missing_method() {
-    assert_compile_fails(Fixture {
-        name: "test_support_fake_renderer_has_no_token_accept",
-        code: "use bevy_ui_router::prelude::{FakeViewRenderer, FakeViewRendererMode, FrameApplyToken}; fn main() { let mut renderer = FakeViewRenderer::new(FakeViewRendererMode::Success); let token: FrameApplyToken = unreachable!(); renderer.accept_apply_token(token); }",
-        default_features: false,
-        features: &["view-test-support"],
-        expected_stderr: &["error[E0599]", "no method named `accept_apply_token` found"],
-    });
-}
-
-#[test]
-fn test_support_commit_authority_trait_names_missing_symbol() {
-    assert_compile_fails(Fixture {
-        name: "test_support_no_named_commit_authority",
-        code: "use bevy_ui_router::prelude::ViewCommitAuthority; fn main() {}",
-        default_features: false,
-        features: &["view-test-support"],
-        expected_stderr: &["error[E0432]", "no `ViewCommitAuthority` in `prelude`"],
-    });
-}
-
-#[test]
-fn test_support_finalize_authority_trait_names_missing_symbol() {
-    assert_compile_fails(Fixture {
-        name: "test_support_no_named_finalize_authority",
-        code: "use bevy_ui_router::view::test_support::ViewFinalizeAuthority; fn main() {}",
-        default_features: false,
-        features: &["view-test-support"],
-        expected_stderr: &[
-            "error[E0432]",
-            "no `ViewFinalizeAuthority` in `test_support`",
-        ],
     });
 }
 

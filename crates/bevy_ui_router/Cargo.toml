@@ -25,3 +25,4 @@ bevy_app = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f756
 bevy_ecs = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
 bevy_ui = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
 syn = { version = "2", features = ["full"] }
+toml = "1.1.2"

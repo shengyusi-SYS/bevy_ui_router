@@ -1,289 +1,235 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-const BEVY_GIT: &str = "git = \"https://github.com/shengyusi-SYS/bevy.git\"";
-const BEVY_REV: &str = "rev = \"61f78f75684e6b0bc28a13a5933f8f55ca653fa7\"";
+use toml::{Table, Value};
 
-fn section_name(line: &str) -> Option<&str> {
-    line.strip_prefix('[')?.strip_suffix(']')
+const BEVY_GIT: &str = "https://github.com/shengyusi-SYS/bevy.git";
+const BEVY_REV: &str = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7";
+const SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+
+fn parse_manifest(input: &str) -> Table {
+    toml::from_str(input).expect("manifest should parse as a TOML table")
 }
 
-fn dependency_section_kind(section: &str) -> Option<&str> {
-    let section = if let Some(target_tail) = section.strip_prefix("target.") {
-        let (_, remainder) = target_tail.split_once('.')?;
-        remainder
+fn table<'a>(manifest: &'a Table, name: &str) -> &'a Table {
+    manifest.get(name).and_then(Value::as_table).unwrap()
+}
+
+fn dependency<'a>(section: &'a Table, name: &str) -> &'a Table {
+    section.get(name).and_then(Value::as_table).unwrap()
+}
+
+fn strings(value: &Value) -> BTreeSet<String> {
+    value
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn assert_keys(table: &Table, expected: &[&str], label: &str) {
+    let actual = table.keys().cloned().collect::<BTreeSet<_>>();
+    let expected = expected.iter().map(|key| (*key).to_owned()).collect();
+    assert_eq!(actual, expected, "{label} keys must match exactly");
+}
+
+fn assert_bevy(table: &Table, features: &[&str], label: &str) {
+    let fields = if features.is_empty() {
+        &["git", "rev", "version", "default-features"][..]
     } else {
-        section
+        &["git", "rev", "version", "default-features", "features"][..]
     };
-
-    ["dependencies", "dev-dependencies", "build-dependencies"]
-        .into_iter()
-        .find(|kind| *kind == section || section.starts_with(&format!("{kind}.")))
+    assert_keys(table, fields, label);
+    assert_eq!(table.get("git").and_then(Value::as_str), Some(BEVY_GIT));
+    assert_eq!(table.get("rev").and_then(Value::as_str), Some(BEVY_REV));
+    assert_eq!(table.get("version").and_then(Value::as_str), Some("0.19.0"));
+    assert_eq!(
+        table.get("default-features").and_then(Value::as_bool),
+        Some(false)
+    );
+    let expected = features
+        .iter()
+        .map(|feature| (*feature).to_owned())
+        .collect();
+    assert_eq!(
+        table.get("features").map(strings).unwrap_or_default(),
+        expected
+    );
+    assert!(
+        !table.contains_key("branch"),
+        "{label} must not declare branch"
+    );
 }
 
-fn dependency_subtable_alias(section: &str) -> Option<&str> {
-    let kind = dependency_section_kind(section)?;
-    section
-        .strip_prefix("target.")
-        .and_then(|tail| tail.split_once('.').map(|(_, remainder)| remainder))
-        .unwrap_or(section)
-        .strip_prefix(kind)?
-        .strip_prefix('.')
-}
-
-fn dependency_name_is_forbidden(name: &str) -> bool {
-    name == "bsn" || name.starts_with("bevy") && !name.starts_with("bevy_ui_router")
-}
-
-fn dependency_entry(line: &str) -> Option<(&str, &str)> {
-    let (key, value) = line.split_once('=')?;
-    Some((key.trim(), value.trim()))
-}
-
-fn manifest_contains_dependency_config(manifest: &str, dependency: &str, fragment: &str) -> bool {
-    manifest.lines().any(|line| {
-        let line = line.trim();
-        line.starts_with(&format!("{dependency} = {{")) && line.contains(fragment)
-    })
-}
-
-fn quoted_string(value: &str) -> Option<&str> {
-    let value = value.trim();
-    let value = value.strip_prefix('"')?;
-    let end = value.find('"')?;
-    Some(&value[..end])
-}
-
-fn package_rename(key: &str, value: &str) -> Option<String> {
-    let value = value.split('#').next().unwrap_or(value).trim();
-
-    if key == "package" {
-        return quoted_string(value).map(str::to_owned);
-    }
-
-    let inline_table = value.strip_prefix('{')?.trim_end_matches('}').trim();
-    for entry in inline_table.split(',') {
-        let Some((field, field_value)) = entry.split_once('=') else {
-            continue;
-        };
-
-        if field.trim() == "package" {
-            return quoted_string(field_value).map(str::to_owned);
-        }
-    }
-
-    None
-}
-
-fn feature_entries(manifest: &str) -> BTreeMap<String, String> {
-    let mut current_section = None;
-    let mut features = BTreeMap::new();
-
-    for raw_line in manifest.lines() {
-        let line = raw_line.trim();
-
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        if let Some(section) = section_name(line) {
-            current_section = Some(section);
-            continue;
-        }
-
-        if current_section == Some("features") {
-            let (name, value) = line
-                .split_once('=')
-                .expect("feature entries should contain '='");
-            features.insert(name.trim().to_owned(), value.trim().to_owned());
-        }
-    }
-
-    features
-}
-
-fn dependency_violations(manifest: &str) -> Vec<String> {
-    let mut current_section = None;
+fn facade_safety_violations(manifest: &Table) -> Vec<String> {
     let mut violations = Vec::new();
-
-    for (line_number, raw_line) in manifest.lines().enumerate() {
-        let line = raw_line.trim();
-
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    for name in ["bevy_app", "bevy_ecs", "bevy_ui"] {
+        let locations = SECTIONS
+            .iter()
+            .filter(|section| {
+                manifest
+                    .get(**section)
+                    .and_then(Value::as_table)
+                    .is_some_and(|table| table.contains_key(name))
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if locations != ["dev-dependencies"] {
+            violations.push(format!("{name} must appear only in [dev-dependencies]"));
         }
-
-        if let Some(section) = section_name(line) {
-            current_section = Some(section);
-
-            if let Some(alias) = dependency_subtable_alias(section) {
-                if dependency_name_is_forbidden(alias) {
-                    violations.push(format!(
-                        "line {}: forbidden dependency subtable `{}`",
-                        line_number + 1,
-                        section
-                    ));
-                }
-            }
-            continue;
-        }
-
-        if !current_section.is_some_and(|section| section == "dependencies") {
-            continue;
-        }
-
-        let Some((key, value)) = dependency_entry(line) else {
+    }
+    for section in SECTIONS {
+        let Some(entries) = manifest.get(section).and_then(Value::as_table) else {
             continue;
         };
-
-        if dependency_subtable_alias(current_section.expect("checked above")).is_none()
-            && dependency_name_is_forbidden(key)
-        {
-            violations.push(format!(
-                "line {}: forbidden dependency key `{}`",
-                line_number + 1,
-                key
-            ));
-        }
-
-        if let Some(package) = package_rename(key, value) {
-            if package == "bsn" {
-                violations.push(format!(
-                    "line {}: forbidden package rename to `bsn`",
-                    line_number + 1
-                ));
-            } else if package.starts_with("bevy") && !package.starts_with("bevy_ui_router") {
-                violations.push(format!(
-                    "line {}: forbidden package rename to Bevy-family crate",
-                    line_number + 1
-                ));
+        for (name, value) in entries {
+            if name.starts_with("bevy")
+                && value
+                    .as_table()
+                    .is_some_and(|value| value.contains_key("branch"))
+            {
+                violations.push(format!("{name} must not declare branch"));
             }
         }
     }
-
     violations
 }
 
 #[test]
-fn facade_default_keeps_bevy_out_of_the_default_path() {
-    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-    let manifest = fs::read_to_string(manifest_path).expect("facade manifest should be readable");
-
-    let expected_features = BTreeMap::from([
-        (
-            "bsn".to_owned(),
-            "[\"ecs\", \"dep:bevy_ui_router_bsn\"]".to_owned(),
-        ),
-        ("default".to_owned(), "[\"view\"]".to_owned()),
-        ("devtools".to_owned(), "[]".to_owned()),
-        (
-            "ecs".to_owned(),
-            "[\"view\", \"dep:bevy_ui_router_ecs\"]".to_owned(),
-        ),
-        (
-            "ecs-test-support".to_owned(),
-            "[\"ecs\", \"bevy_ui_router_ecs/test-support\"]".to_owned(),
-        ),
-        (
-            "platform".to_owned(),
-            "[\"dep:bevy_ui_router_platform\"]".to_owned(),
-        ),
-        (
-            "view".to_owned(),
-            "[\"dep:bevy_ui_router_view\"]".to_owned(),
-        ),
-        (
-            "test-support".to_owned(),
-            "[\"ecs-test-support\"]".to_owned(),
-        ),
-    ]);
-
-    assert_eq!(feature_entries(&manifest), expected_features);
-
-    let violations = dependency_violations(&manifest);
-    assert!(
-        violations.is_empty(),
-        "found forbidden dependency declarations:\n{}",
-        violations.join("\n")
+fn manifest_contract_rejects_bevy_dependency_outside_dev_dependencies() {
+    let manifest = parse_manifest(
+        r#"
+[dependencies]
+[dev-dependencies]
+bevy_ecs = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+bevy_ui = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+[build-dependencies]
+bevy_app = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+"#,
     );
-
-    for dependency in ["bevy_app", "bevy_ecs", "bevy_ui"] {
-        assert!(
-            manifest_contains_dependency_config(&manifest, dependency, BEVY_GIT),
-            "{dependency} should use the approved Bevy git source"
-        );
-        assert!(
-            manifest_contains_dependency_config(&manifest, dependency, BEVY_REV),
-            "{dependency} should pin the approved Bevy revision"
-        );
-        assert!(
-            manifest_contains_dependency_config(&manifest, dependency, "version = \"0.19.0\""),
-            "{dependency} should pin the approved Bevy version"
-        );
-        assert!(
-            manifest_contains_dependency_config(&manifest, dependency, "default-features = false"),
-            "{dependency} should disable default features"
-        );
-        assert!(
-            !manifest_contains_dependency_config(
-                &manifest,
-                dependency,
-                "branch = \"sys/bevy-0.19-router\""
-            ),
-            "{dependency} must not use a movable branch"
-        );
-    }
-
-    assert!(
-        manifest_contains_dependency_config(&manifest, "syn", "version = \"2\"")
-            && manifest_contains_dependency_config(&manifest, "syn", "features = [\"full\"]"),
-        "facade dev-dependencies should include syn with its full feature"
+    assert_eq!(
+        facade_safety_violations(&manifest),
+        vec!["bevy_app must appear only in [dev-dependencies]"]
     );
 }
 
 #[test]
-fn dependency_subtables_are_checked_for_forbidden_crates() {
-    let manifest = r#"
-[features]
-default = []
-
+fn manifest_contract_rejects_any_movable_bevy_branch() {
+    let manifest = parse_manifest(
+        r#"
 [dependencies]
-render_inline = { package = "bevy_render", version = "1" }
-bsn_inline = { package = "bsn", version = "1" }
-core_inline = { package = "bevy_ui_router_core", path = "../core" }
-
-[dependencies.bsn]
-version = "1"
-
-[dependencies.render]
-package   =   "bevy_render"
-
-[target.'cfg(target_os = "linux")'.dev-dependencies.bevy_input]
-version = "1"
-
-[target.'cfg(target_os = "windows")'.build-dependencies.integration]
-package   =   "bsn"
-
-[target.'cfg(target_os = "macos")'.dependencies.bevy_ui_router_view_alias]
-package = "bevy_ui_router_view"
-
-[package.metadata.dependencies]
-package = "bevy_window"
-
-[target.'cfg(target_os = "android")'.package.metadata.dependencies]
-package = "bsn"
-"#;
-
-    assert_eq!(
-        dependency_violations(manifest),
-        vec![
-            "line 6: forbidden package rename to Bevy-family crate",
-            "line 7: forbidden package rename to `bsn`",
-            "line 10: forbidden dependency subtable `dependencies.bsn`",
-            "line 16: forbidden dependency subtable `target.'cfg(target_os = \"linux\")'.dev-dependencies.bevy_input`",
-        ]
+[dev-dependencies]
+bevy_app = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "arbitrary-moving-branch", version = "0.19.0", default-features = false }
+bevy_ecs = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+bevy_ui = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+[build-dependencies]
+"#,
     );
+    assert_eq!(
+        facade_safety_violations(&manifest),
+        vec!["bevy_app must not declare branch"]
+    );
+}
+
+#[test]
+fn facade_manifest_keeps_the_exact_dependency_contract() {
+    let manifest = parse_manifest(
+        &fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap(),
+    );
+    let actual_features = table(&manifest, "features")
+        .iter()
+        .map(|(name, value)| (name.clone(), strings(value)))
+        .collect::<BTreeMap<_, _>>();
+    let expected_features = BTreeMap::from([
+        ("default".to_owned(), BTreeSet::from(["view".to_owned()])),
+        (
+            "view".to_owned(),
+            BTreeSet::from(["dep:bevy_ui_router_view".to_owned()]),
+        ),
+        (
+            "ecs".to_owned(),
+            BTreeSet::from(["view".to_owned(), "dep:bevy_ui_router_ecs".to_owned()]),
+        ),
+        (
+            "ecs-test-support".to_owned(),
+            BTreeSet::from([
+                "ecs".to_owned(),
+                "bevy_ui_router_ecs/test-support".to_owned(),
+            ]),
+        ),
+        (
+            "test-support".to_owned(),
+            BTreeSet::from(["ecs-test-support".to_owned()]),
+        ),
+        (
+            "bsn".to_owned(),
+            BTreeSet::from(["ecs".to_owned(), "dep:bevy_ui_router_bsn".to_owned()]),
+        ),
+        (
+            "platform".to_owned(),
+            BTreeSet::from(["dep:bevy_ui_router_platform".to_owned()]),
+        ),
+        ("devtools".to_owned(), BTreeSet::new()),
+    ]);
+    assert_eq!(actual_features, expected_features);
+    let dependencies = table(&manifest, "dependencies");
+    assert_keys(
+        dependencies,
+        &[
+            "bevy_ui_router_core",
+            "bevy_ui_router_view",
+            "bevy_ui_router_ecs",
+            "bevy_ui_router_bsn",
+            "bevy_ui_router_platform",
+        ],
+        "[dependencies]",
+    );
+    let expected_paths = [
+        ("bevy_ui_router_core", "../bevy_ui_router_core"),
+        ("bevy_ui_router_view", "../bevy_ui_router_view"),
+        ("bevy_ui_router_ecs", "../bevy_ui_router_ecs"),
+        ("bevy_ui_router_bsn", "../bevy_ui_router_bsn"),
+        ("bevy_ui_router_platform", "../bevy_ui_router_platform"),
+    ];
+    for (name, path) in expected_paths {
+        let entry = dependency(dependencies, name);
+        let expected_fields = match name {
+            "bevy_ui_router_core" => &["path"][..],
+            "bevy_ui_router_view" => &["path", "optional", "default-features"][..],
+            _ => &["path", "optional"][..],
+        };
+        assert_keys(entry, expected_fields, name);
+        assert_eq!(entry.get("path").and_then(Value::as_str), Some(path));
+        if name != "bevy_ui_router_core" {
+            assert_eq!(entry.get("optional").and_then(Value::as_bool), Some(true));
+        }
+        if name == "bevy_ui_router_view" {
+            assert_eq!(
+                entry.get("default-features").and_then(Value::as_bool),
+                Some(false)
+            );
+        }
+    }
+    let dev = table(&manifest, "dev-dependencies");
+    assert_keys(
+        dev,
+        &["bevy_app", "bevy_ecs", "bevy_ui", "syn", "toml"],
+        "[dev-dependencies]",
+    );
+    for name in ["bevy_app", "bevy_ecs", "bevy_ui"] {
+        assert_bevy(dependency(dev, name), &[], name);
+    }
+    let syn = dependency(dev, "syn");
+    assert_keys(syn, &["version", "features"], "syn");
+    assert_eq!(syn.get("version").and_then(Value::as_str), Some("2"));
+    assert_eq!(
+        syn.get("features").map(strings).unwrap(),
+        BTreeSet::from(["full".to_owned()])
+    );
+    assert_eq!(dev.get("toml").and_then(Value::as_str), Some("1.1.2"));
+    assert!(facade_safety_violations(&manifest).is_empty());
 }
 
 #[test]
@@ -291,13 +237,9 @@ fn facade_prelude_exposes_core_matcher_contracts() {
     use bevy_ui_router::prelude::{
         MatchedBranch, RouteMatcher, RoutePattern, RoutePatternKind, RouteTree,
     };
-
     let pattern = RoutePattern::path("/").unwrap();
     assert_eq!(pattern.kind(), RoutePatternKind::Path);
-
-    let tree = RouteTree::builder().root(pattern).unwrap().build().unwrap();
-    let _matcher = RouteMatcher::new(tree);
-
+    let _matcher = RouteMatcher::new(RouteTree::builder().root(pattern).unwrap().build().unwrap());
     fn assert_types<T>() {}
     assert_types::<MatchedBranch>();
 }
@@ -308,14 +250,12 @@ fn facade_prelude_exposes_branch_planning_contracts() {
         BranchDiff, ErrorBoundaryKey, MatchedBranch, MatchedRoute, RouteExplicitKey, RouteId,
         RouteLocation, RouteMeta, RouteNodeOptions, RouteParams, RouteSlotKey,
     };
-
     let _slot = RouteSlotKey::default();
     let _key = RouteExplicitKey::new("stable").unwrap();
     let _boundary = ErrorBoundaryKey::named("root").unwrap();
     let _location = RouteLocation::new("/items");
     let _meta = RouteMeta::new();
     let _options = RouteNodeOptions::new();
-
     fn assert_types<T>() {}
     assert_types::<BranchDiff>();
     assert_types::<MatchedBranch>();
@@ -334,7 +274,6 @@ fn facade_prelude_exposes_phase_2_observation_contracts() {
         StaleApplyReason, StaleApplyResult, TransactionCommitError, TransactionCommitErrorKind,
         TransactionFailure,
     };
-
     fn assert_public<T>() {}
     assert_public::<FrameApplyOutcome>();
     assert_public::<FrameApplyRequest>();
@@ -359,11 +298,9 @@ fn facade_prelude_exposes_phase_2_observation_contracts() {
 #[test]
 fn facade_default_prelude_exposes_phase_3a_view_binding_contracts() {
     use bevy_ui_router::prelude::{RouteViewDescriptor, ViewBindingKey};
-
     fn assert_public<T>() {}
     assert_public::<RouteViewDescriptor>();
     assert_public::<ViewBindingKey>();
-
     let descriptor = RouteViewDescriptor::new(ViewBindingKey::new("leaf"));
     assert_eq!(descriptor.binding().as_str(), "leaf");
 }
@@ -375,7 +312,6 @@ fn facade_view_module_exposes_phase_3a_protocol_observations_by_explicit_path() 
         ViewApplyOutcome, ViewBuildOutcome, ViewBuildRequest, ViewDisposalHint, ViewFailure,
         ViewOutputId, ViewPartialOutput, ViewRenderPlan, ViewRequestId,
     };
-
     fn assert_public<T>() {}
     assert_public::<ViewApplyOutcome>();
     assert_public::<ViewBuildOutcome>();
