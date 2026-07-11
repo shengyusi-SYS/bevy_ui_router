@@ -248,10 +248,10 @@ mod tests {
     use bevy_ui_router_core::frame::FrameCleanupPlan;
     use bevy_ui_router_core::location::RouteLocation;
     use bevy_ui_router_core::matcher::RouteMatcher;
-    use bevy_ui_router_core::pattern::RoutePattern;
-    use bevy_ui_router_core::route_tree::RouteTree;
     use bevy_ui_router_core::runtime::RouterRuntime;
-    use bevy_ui_router_core::test_support::frame_apply_request_with_next_generation;
+    use bevy_ui_router_core::test_support::{
+        frame_apply_request_with_next_generation, nested_items_route_tree,
+    };
     use bevy_ui_router_core::transaction::FrameApplyOutcome;
 
     use crate::components::{RouteFrameRoot, RouteHost};
@@ -562,16 +562,6 @@ mod tests {
     }
 
     fn route_matcher() -> RouteMatcher {
-        let mut builder = RouteTree::builder()
-            .root(RoutePattern::path("/").unwrap())
-            .unwrap();
-        let root = builder.root_id().unwrap();
-        let items = builder
-            .route(root, RoutePattern::path("items").unwrap())
-            .unwrap();
-        builder
-            .route(items, RoutePattern::path(":id").unwrap())
-            .unwrap();
-        RouteMatcher::new(builder.build().unwrap())
+        RouteMatcher::new(nested_items_route_tree())
     }
 }

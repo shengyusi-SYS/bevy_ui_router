@@ -394,9 +394,8 @@ mod tests {
     use bevy_ui_router_core::error::{RouteErrorKind, RouteErrorSourceCategory};
     use bevy_ui_router_core::location::RouteLocation;
     use bevy_ui_router_core::matcher::RouteMatcher;
-    use bevy_ui_router_core::pattern::RoutePattern;
-    use bevy_ui_router_core::route_tree::RouteTree;
     use bevy_ui_router_core::runtime::RouterRuntime;
+    use bevy_ui_router_core::test_support::nested_items_route_tree;
 
     #[test]
     fn descriptor_and_build_request_preserve_binding_and_request_id() {
@@ -649,17 +648,7 @@ mod tests {
         }
 
         fn issued_requests(path: &str) -> Vec<bevy_ui_router_core::transaction::FrameApplyRequest> {
-            let mut builder = RouteTree::builder()
-                .root(RoutePattern::path("/").unwrap())
-                .unwrap();
-            let root = builder.root_id().unwrap();
-            let items = builder
-                .route(root, RoutePattern::path("items").unwrap())
-                .unwrap();
-            builder
-                .route(items, RoutePattern::path(":id").unwrap())
-                .unwrap();
-            let target = RouteMatcher::new(builder.build().unwrap())
+            let target = RouteMatcher::new(nested_items_route_tree())
                 .match_location(&RouteLocation::new(path))
                 .unwrap();
             let mut runtime = RouterRuntime::new();

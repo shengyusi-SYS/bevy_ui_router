@@ -73,6 +73,7 @@ impl RouteNodeOptions {
     #[allow(dead_code)]
     pub(crate) fn with_error_boundary(mut self, key: ErrorBoundaryKey) -> Self {
         self.error_boundary = Some(key);
+        self.error_view = None;
         self
     }
 
@@ -268,18 +269,6 @@ impl RouteTreeBuilder {
         self.root
     }
 
-    #[cfg(feature = "test-support")]
-    #[allow(dead_code)]
-    pub fn route_with_options(
-        &mut self,
-        parent: RouteId,
-        pattern: RoutePattern,
-        options: RouteNodeOptions,
-    ) -> Result<RouteId, RouteError> {
-        self.route_inner(parent, pattern, options)
-    }
-
-    #[cfg(not(feature = "test-support"))]
     #[allow(dead_code)]
     pub(crate) fn route_with_options(
         &mut self,
@@ -290,13 +279,6 @@ impl RouteTreeBuilder {
         self.route_inner(parent, pattern, options)
     }
 
-    #[cfg(feature = "test-support")]
-    #[allow(dead_code)]
-    pub fn route(&mut self, parent: RouteId, pattern: RoutePattern) -> Result<RouteId, RouteError> {
-        self.route_inner(parent, pattern, RouteNodeOptions::new())
-    }
-
-    #[cfg(not(feature = "test-support"))]
     #[allow(dead_code)]
     pub(crate) fn route(
         &mut self,
@@ -523,6 +505,54 @@ mod tests {
         assert_eq!(
             tree.node(detail).unwrap().options().error_view_binding(),
             Some((&boundary, &error_view))
+        );
+    }
+
+    #[test]
+    fn route_options_keep_normal_and_error_views_on_the_same_node() {
+        let normal_view = RouteViewKey::new("detail").unwrap();
+        let error_view = RouteViewKey::new("detail-error").unwrap();
+        let boundary = ErrorBoundaryKey::named("detail-boundary").unwrap();
+        let options = RouteNodeOptions::new()
+            .with_view(normal_view.clone())
+            .with_error_view(boundary.clone(), error_view.clone());
+
+        assert_eq!(options.view_binding(), Some(&normal_view));
+        assert_eq!(options.error_view_binding(), Some((&boundary, &error_view)));
+    }
+
+    #[test]
+    fn replacing_error_boundary_clears_existing_error_view_binding() {
+        let error_view = RouteViewKey::new("detail-error").unwrap();
+        let first_boundary = ErrorBoundaryKey::named("first").unwrap();
+        let replacement_boundary = ErrorBoundaryKey::named("replacement").unwrap();
+        let options = RouteNodeOptions::new()
+            .with_error_view(first_boundary, error_view)
+            .with_error_boundary(replacement_boundary.clone());
+
+        assert_eq!(
+            options.error_boundary().map(ErrorBoundaryKey::as_str),
+            Some("replacement")
+        );
+        assert!(options.error_view_binding().is_none());
+    }
+
+    #[test]
+    fn error_view_binding_replaces_the_observed_error_boundary() {
+        let first_boundary = ErrorBoundaryKey::named("first").unwrap();
+        let binding_boundary = ErrorBoundaryKey::named("binding").unwrap();
+        let error_view = RouteViewKey::new("detail-error").unwrap();
+        let options = RouteNodeOptions::new()
+            .with_error_boundary(first_boundary)
+            .with_error_view(binding_boundary.clone(), error_view.clone());
+
+        assert_eq!(
+            options.error_boundary().map(ErrorBoundaryKey::as_str),
+            Some("binding")
+        );
+        assert_eq!(
+            options.error_view_binding(),
+            Some((&binding_boundary, &error_view))
         );
     }
 

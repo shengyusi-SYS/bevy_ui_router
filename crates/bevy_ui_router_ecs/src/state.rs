@@ -421,6 +421,7 @@ mod tests {
     use bevy_ui_router_core::pattern::RoutePattern;
     use bevy_ui_router_core::route_tree::RouteTree;
     use bevy_ui_router_core::runtime::BeginNavigationError;
+    use bevy_ui_router_core::test_support::nested_items_route_tree;
     use bevy_ui_router_view::{RouteViewDescriptor, ViewBindingKey};
 
     use crate::components::{
@@ -614,17 +615,7 @@ mod tests {
     }
 
     fn items_route_tree() -> RouteTree {
-        let mut builder = RouteTree::builder()
-            .root(RoutePattern::path("/").unwrap())
-            .unwrap();
-        let root = builder.root_id().unwrap();
-        let items = builder
-            .route(root, RoutePattern::path("items").unwrap())
-            .unwrap();
-        builder
-            .route(items, RoutePattern::path(":id").unwrap())
-            .unwrap();
-        builder.build().unwrap()
+        nested_items_route_tree()
     }
 
     fn assert_active_root(world: &World, root: Entity) {

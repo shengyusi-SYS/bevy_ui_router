@@ -83,6 +83,7 @@ fn route_view_key_is_public_without_raw_value_access() {
     assert!(RouteViewKey::new("").is_err());
 
     let source = include_str!("../src/view_key.rs");
+    assert!(source.contains("pub struct RouteViewKeyError {\n    _private: (),\n}"));
     for forbidden in [
         "pub struct RouteViewKey(pub ",
         "pub struct RouteViewKeyError(pub ",
@@ -101,16 +102,19 @@ fn root_profile_hides_deferred_route_declaration_methods() {
     let source = include_str!("../src/route_tree.rs");
 
     assert!(source.contains("pub fn root_with_options("));
-    for forbidden in ["pub fn with_error_boundary(", "pub fn with_error_view("] {
+    for forbidden in [
+        "pub fn with_error_boundary(",
+        "pub fn with_error_view(",
+        "pub fn route(",
+        "pub fn route_with_options(",
+        "#[cfg(feature = \"test-support\")]",
+    ] {
         assert!(
             !source.contains(forbidden),
             "root profile must not publicly expose `{forbidden}`"
         );
     }
-    for required in [
-        "#[cfg(not(feature = \"test-support\"))]\n    #[allow(dead_code)]\n    pub(crate) fn route(",
-        "#[cfg(not(feature = \"test-support\"))]\n    #[allow(dead_code)]\n    pub(crate) fn route_with_options(",
-    ] {
+    for required in ["pub(crate) fn route(", "pub(crate) fn route_with_options("] {
         assert!(
             source.contains(required),
             "root profile must retain crate-private `{required}`"

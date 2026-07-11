@@ -5,7 +5,7 @@ impl RouteViewKey {
     pub fn new(value: impl Into<String>) -> Result<Self, RouteViewKeyError> {
         let value = value.into();
         if value.is_empty() {
-            return Err(RouteViewKeyError);
+            return Err(RouteViewKeyError { _private: () });
         }
 
         Ok(Self(value))
@@ -13,7 +13,9 @@ impl RouteViewKey {
 }
 
 #[derive(Debug)]
-pub struct RouteViewKeyError;
+pub struct RouteViewKeyError {
+    _private: (),
+}
 
 impl std::fmt::Display for RouteViewKeyError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
