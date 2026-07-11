@@ -1,0 +1,1202 @@
+# bevy-ui-router-facade-associated-api-v1
+# columns: feature | facade canonical path | owner crate | item kind | normalized public API
+# sort: feature-rank(default,view,ecs,ecs-test-support,platform), canonical-path ASCII, source/fixture declaration order; compile-assert entries follow their associated source contract
+# normalization: Self names the canonical-path type; lifetimes are normalized to 'a; impl Trait syntax is preserved; omitted field records mean zero public fields; compile-assert records are compiler-verified requirements rather than source-enumerated impls; the sole allowed public unit/zero-field struct is bevy_ui_router::ecs::BevyUiRouterPlugin
+
+default | bevy_ui_router::core::ActivePresentation | bevy_ui_router_core | struct | pub struct ActivePresentation
+default | bevy_ui_router::core::ActivePresentation | bevy_ui_router_core | method | pub fn kind(&self) -> ActivePresentationKind
+default | bevy_ui_router::core::ActivePresentation | bevy_ui_router_core | method | pub fn location(&self) -> Option<&RouteLocation>
+default | bevy_ui_router::core::ActivePresentation | bevy_ui_router_core | method | pub fn requested(&self) -> Option<&RouteLocation>
+default | bevy_ui_router::core::ActivePresentation | bevy_ui_router_core | method | pub fn frames(&self) -> &[RouteFrameVersion]
+default | bevy_ui_router::core::ActivePresentation | bevy_ui_router_core | method | pub fn failure(&self) -> Option<&NavigationFailure>
+default | bevy_ui_router::core::ActivePresentation | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::ActivePresentation | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::ActivePresentation | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::ActivePresentation | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::ActivePresentationKind | bevy_ui_router_core | enum | pub enum ActivePresentationKind
+default | bevy_ui_router::core::ActivePresentationKind | bevy_ui_router_core | variant | None
+default | bevy_ui_router::core::ActivePresentationKind | bevy_ui_router_core | variant | Route
+default | bevy_ui_router::core::ActivePresentationKind | bevy_ui_router_core | variant | Error
+default | bevy_ui_router::core::ActivePresentationKind | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::ActivePresentationKind | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::ActivePresentationKind | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::ActivePresentationKind | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::ActivePresentationKind | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::BackCapabilitySnapshot | bevy_ui_router_core | struct | pub struct BackCapabilitySnapshot
+default | bevy_ui_router::core::BackCapabilitySnapshot | bevy_ui_router_core | method | pub const fn new(can_pop_history: bool, has_local_layer: bool, host_may_handle: bool) -> Self
+default | bevy_ui_router::core::BackCapabilitySnapshot | bevy_ui_router_core | method | pub const fn can_pop_history(self) -> bool
+default | bevy_ui_router::core::BackCapabilitySnapshot | bevy_ui_router_core | method | pub const fn has_local_layer(self) -> bool
+default | bevy_ui_router::core::BackCapabilitySnapshot | bevy_ui_router_core | method | pub const fn host_may_handle(self) -> bool
+default | bevy_ui_router::core::BackCapabilitySnapshot | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::BackCapabilitySnapshot | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::BackCapabilitySnapshot | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::BackCapabilitySnapshot | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::BackCapabilitySnapshot | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::BackIntent | bevy_ui_router_core | enum | pub enum BackIntent
+default | bevy_ui_router::core::BackIntent | bevy_ui_router_core | variant | NavigateBack
+default | bevy_ui_router::core::BackIntent | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::BackIntent | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::BackIntent | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::BackIntent | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::BackIntent | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::BackPolicy | bevy_ui_router_core | enum | pub enum BackPolicy
+default | bevy_ui_router::core::BackPolicy | bevy_ui_router_core | variant | PopHistory
+default | bevy_ui_router::core::BackPolicy | bevy_ui_router_core | variant | Block
+default | bevy_ui_router::core::BackPolicy | bevy_ui_router_core | variant | DelegateToHost
+default | bevy_ui_router::core::BackPolicy | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::BackPolicy | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::BackPolicy | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::BackPolicy | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::BackPolicy | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::BranchDiff | bevy_ui_router_core | struct | pub struct BranchDiff
+default | bevy_ui_router::core::BranchDiff | bevy_ui_router_core | method | pub fn compare(old: &MatchedBranch, new: &MatchedBranch) -> Self
+default | bevy_ui_router::core::BranchDiff | bevy_ui_router_core | method | pub const fn common_prefix_len(&self) -> usize
+default | bevy_ui_router::core::BranchDiff | bevy_ui_router_core | method | pub fn leaving(&self) -> &[BranchDiffRoute]
+default | bevy_ui_router::core::BranchDiff | bevy_ui_router_core | method | pub fn entering(&self) -> &[BranchDiffRoute]
+default | bevy_ui_router::core::BranchDiff | bevy_ui_router_core | method | pub const fn provenance_changed(&self) -> bool
+default | bevy_ui_router::core::BranchDiff | bevy_ui_router_core | method | pub const fn search_changed(&self) -> bool
+default | bevy_ui_router::core::BranchDiff | bevy_ui_router_core | method | pub const fn branch_fingerprint_changed(&self) -> bool
+default | bevy_ui_router::core::BranchDiff | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::BranchDiff | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::BranchDiff | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::BranchDiff | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::BranchDiffRoute | bevy_ui_router_core | struct | pub struct BranchDiffRoute
+default | bevy_ui_router::core::BranchDiffRoute | bevy_ui_router_core | method | pub const fn route(&self) -> RouteId
+default | bevy_ui_router::core::BranchDiffRoute | bevy_ui_router_core | method | pub const fn index(&self) -> usize
+default | bevy_ui_router::core::BranchDiffRoute | bevy_ui_router_core | method | pub fn slot(&self) -> &RouteSlotKey
+default | bevy_ui_router::core::BranchDiffRoute | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::BranchDiffRoute | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::BranchDiffRoute | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::BranchDiffRoute | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::CleanupDisposition | bevy_ui_router_core | enum | pub enum CleanupDisposition
+default | bevy_ui_router::core::CleanupDisposition | bevy_ui_router_core | variant | Removed
+default | bevy_ui_router::core::CleanupDisposition | bevy_ui_router_core | variant | RemovedDetached
+default | bevy_ui_router::core::CleanupDisposition | bevy_ui_router_core | variant | AlreadyAbsent
+default | bevy_ui_router::core::CleanupDisposition | bevy_ui_router_core | variant | RejectedProtected
+default | bevy_ui_router::core::CleanupDisposition | bevy_ui_router_core | variant | QuarantinedForeignDescendant
+default | bevy_ui_router::core::CleanupDisposition | bevy_ui_router_core | variant | QuarantinedProtectedParent
+default | bevy_ui_router::core::CleanupDisposition | bevy_ui_router_core | variant | QuarantinedForeignComponent
+default | bevy_ui_router::core::CleanupDisposition | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::CleanupDisposition | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::CleanupDisposition | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::CleanupDisposition | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::CleanupDisposition | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::CleanupSummary | bevy_ui_router_core | struct | pub struct CleanupSummary
+default | bevy_ui_router::core::CleanupSummary | bevy_ui_router_core | method | pub fn foreground_pending(&self) -> bool
+default | bevy_ui_router::core::CleanupSummary | bevy_ui_router_core | method | pub fn quarantine_count(&self) -> usize
+default | bevy_ui_router::core::CleanupSummary | bevy_ui_router_core | method | pub fn last_disposition(&self) -> Option<CleanupDisposition>
+default | bevy_ui_router::core::CleanupSummary | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::CleanupSummary | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::CleanupSummary | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::CleanupSummary | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::DiagnosticEvent | bevy_ui_router_core | struct | pub struct DiagnosticEvent
+default | bevy_ui_router::core::DiagnosticEvent | bevy_ui_router_core | method | pub fn kind(&self) -> DiagnosticEventKind
+default | bevy_ui_router::core::DiagnosticEvent | bevy_ui_router_core | method | pub fn severity(&self) -> DiagnosticSeverity
+default | bevy_ui_router::core::DiagnosticEvent | bevy_ui_router_core | method | pub fn request(&self) -> Option<NavigationRequestId>
+default | bevy_ui_router::core::DiagnosticEvent | bevy_ui_router_core | method | pub fn frame(&self) -> Option<&RouteFrameVersion>
+default | bevy_ui_router::core::DiagnosticEvent | bevy_ui_router_core | method | pub fn report_disposition(&self) -> Option<ReportDisposition>
+default | bevy_ui_router::core::DiagnosticEvent | bevy_ui_router_core | method | pub fn redacted_message(&self) -> &str
+default | bevy_ui_router::core::DiagnosticEvent | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::DiagnosticEvent | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::DiagnosticEvent | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::DiagnosticEvent | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::DiagnosticEventKind | bevy_ui_router_core | enum | pub enum DiagnosticEventKind
+default | bevy_ui_router::core::DiagnosticEventKind | bevy_ui_router_core | variant | PendingOverwrite
+default | bevy_ui_router::core::DiagnosticEventKind | bevy_ui_router_core | variant | HostOrSlotUnavailable
+default | bevy_ui_router::core::DiagnosticEventKind | bevy_ui_router_core | variant | MatchFailed
+default | bevy_ui_router::core::DiagnosticEventKind | bevy_ui_router_core | variant | MatchConflict
+default | bevy_ui_router::core::DiagnosticEventKind | bevy_ui_router_core | variant | BranchPlanned
+default | bevy_ui_router::core::DiagnosticEventKind | bevy_ui_router_core | variant | FrameLifecycle
+default | bevy_ui_router::core::DiagnosticEventKind | bevy_ui_router_core | variant | ReportDisposition
+default | bevy_ui_router::core::DiagnosticEventKind | bevy_ui_router_core | variant | CleanupDisposition
+default | bevy_ui_router::core::DiagnosticEventKind | bevy_ui_router_core | variant | HostLifecycle
+default | bevy_ui_router::core::DiagnosticEventKind | bevy_ui_router_core | variant | AuthorityInvariantViolation
+default | bevy_ui_router::core::DiagnosticEventKind | bevy_ui_router_core | variant | PostCommitCleanupAnomaly
+default | bevy_ui_router::core::DiagnosticEventKind | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::DiagnosticEventKind | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::DiagnosticEventKind | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::DiagnosticEventKind | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::DiagnosticEventKind | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::DiagnosticSeverity | bevy_ui_router_core | enum | pub enum DiagnosticSeverity
+default | bevy_ui_router::core::DiagnosticSeverity | bevy_ui_router_core | variant | Info
+default | bevy_ui_router::core::DiagnosticSeverity | bevy_ui_router_core | variant | Warning
+default | bevy_ui_router::core::DiagnosticSeverity | bevy_ui_router_core | variant | Error
+default | bevy_ui_router::core::DiagnosticSeverity | bevy_ui_router_core | variant | Severe
+default | bevy_ui_router::core::DiagnosticSeverity | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::DiagnosticSeverity | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::DiagnosticSeverity | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::DiagnosticSeverity | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::DiagnosticSeverity | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::DiagnosticSnapshot | bevy_ui_router_core | struct | pub struct DiagnosticSnapshot
+default | bevy_ui_router::core::DiagnosticSnapshot | bevy_ui_router_core | method | pub fn events(&self) -> &[DiagnosticEvent]
+default | bevy_ui_router::core::DiagnosticSnapshot | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::DiagnosticSnapshot | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::DiagnosticSnapshot | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::DiagnosticSnapshot | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::ErrorBoundaryKey | bevy_ui_router_core | struct | pub struct ErrorBoundaryKey
+default | bevy_ui_router::core::ErrorBoundaryKey | bevy_ui_router_core | method | pub fn named(name: impl Into<String>) -> Result<Self, RouteError>
+default | bevy_ui_router::core::ErrorBoundaryKey | bevy_ui_router_core | method | pub fn as_str(&self) -> &str
+default | bevy_ui_router::core::ErrorBoundaryKey | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::ErrorBoundaryKey | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::ErrorBoundaryKey | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::ErrorBoundaryKey | bevy_ui_router_core | trait-impl | impl Hash for Self
+default | bevy_ui_router::core::ErrorBoundaryKey | bevy_ui_router_core | trait-impl | impl Ord for Self
+default | bevy_ui_router::core::ErrorBoundaryKey | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::ErrorBoundaryKey | bevy_ui_router_core | trait-impl | impl PartialOrd for Self
+default | bevy_ui_router::core::FrameOrigin | bevy_ui_router_core | enum | pub enum FrameOrigin
+default | bevy_ui_router::core::FrameOrigin | bevy_ui_router_core | variant | MatchedRoute(RouteId)
+default | bevy_ui_router::core::FrameOrigin | bevy_ui_router_core | variant | RouteError(RouteId)
+default | bevy_ui_router::core::FrameOrigin | bevy_ui_router_core | variant | RouterFallback
+default | bevy_ui_router::core::FrameOrigin | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::FrameOrigin | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::FrameOrigin | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::FrameOrigin | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::HistoryError | bevy_ui_router_core | enum | pub enum HistoryError
+default | bevy_ui_router::core::HistoryError | bevy_ui_router_core | variant | Empty
+default | bevy_ui_router::core::HistoryError | bevy_ui_router_core | variant | AtStart
+default | bevy_ui_router::core::HistoryError | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::HistoryError | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::HistoryError | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::HistoryError | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::HistorySnapshot | bevy_ui_router_core | struct | pub struct HistorySnapshot
+default | bevy_ui_router::core::HistorySnapshot | bevy_ui_router_core | method | pub fn current(&self) -> Option<&RouteLocation>
+default | bevy_ui_router::core::HistorySnapshot | bevy_ui_router_core | method | pub fn entries(&self) -> &[RouteLocation]
+default | bevy_ui_router::core::HistorySnapshot | bevy_ui_router_core | method | pub fn cursor(&self) -> Option<usize>
+default | bevy_ui_router::core::HistorySnapshot | bevy_ui_router_core | method | pub fn len(&self) -> usize
+default | bevy_ui_router::core::HistorySnapshot | bevy_ui_router_core | method | pub fn can_back(&self) -> bool
+default | bevy_ui_router::core::HistorySnapshot | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::HistorySnapshot | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::HistorySnapshot | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::HistorySnapshot | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::HostSnapshot | bevy_ui_router_core | struct | pub struct HostSnapshot
+default | bevy_ui_router::core::HostSnapshot | bevy_ui_router_core | method | pub fn version(&self) -> Option<&HostVersion>
+default | bevy_ui_router::core::HostSnapshot | bevy_ui_router_core | method | pub fn top_slot(&self) -> Option<RouteSlotId>
+default | bevy_ui_router::core::HostSnapshot | bevy_ui_router_core | method | pub fn trace(&self) -> &[HostTraceEvent]
+default | bevy_ui_router::core::HostSnapshot | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::HostSnapshot | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::HostSnapshot | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::HostSnapshot | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::HostTraceEvent | bevy_ui_router_core | struct | pub struct HostTraceEvent
+default | bevy_ui_router::core::HostTraceEvent | bevy_ui_router_core | method | pub fn kind(&self) -> HostTraceEventKind
+default | bevy_ui_router::core::HostTraceEvent | bevy_ui_router_core | method | pub fn version(&self) -> Option<&HostVersion>
+default | bevy_ui_router::core::HostTraceEvent | bevy_ui_router_core | method | pub fn slot(&self) -> Option<RouteSlotId>
+default | bevy_ui_router::core::HostTraceEvent | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::HostTraceEvent | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::HostTraceEvent | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::HostTraceEvent | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::HostTraceEventKind | bevy_ui_router_core | enum | pub enum HostTraceEventKind
+default | bevy_ui_router::core::HostTraceEventKind | bevy_ui_router_core | variant | AdmissionRequested
+default | bevy_ui_router::core::HostTraceEventKind | bevy_ui_router_core | variant | AdmissionRejected
+default | bevy_ui_router::core::HostTraceEventKind | bevy_ui_router_core | variant | AdmissionRejectedAfterMutation
+default | bevy_ui_router::core::HostTraceEventKind | bevy_ui_router_core | variant | HostGranted
+default | bevy_ui_router::core::HostTraceEventKind | bevy_ui_router_core | variant | TopSlotRegistered
+default | bevy_ui_router::core::HostTraceEventKind | bevy_ui_router_core | variant | HostReady
+default | bevy_ui_router::core::HostTraceEventKind | bevy_ui_router_core | variant | SettlementStarted
+default | bevy_ui_router::core::HostTraceEventKind | bevy_ui_router_core | variant | SettlementCompleted
+default | bevy_ui_router::core::HostTraceEventKind | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::HostTraceEventKind | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::HostTraceEventKind | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::HostTraceEventKind | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::HostTraceEventKind | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::HostVersion | bevy_ui_router_core | struct | pub struct HostVersion
+default | bevy_ui_router::core::HostVersion | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::HostVersion | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::HostVersion | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::HostVersion | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::MatchedBranch | bevy_ui_router_core | struct | pub struct MatchedBranch
+default | bevy_ui_router::core::MatchedBranch | bevy_ui_router_core | method | pub fn routes(&self) -> &[MatchedRoute]
+default | bevy_ui_router::core::MatchedBranch | bevy_ui_router_core | method | pub fn leaf(&self) -> Option<&MatchedRoute>
+default | bevy_ui_router::core::MatchedBranch | bevy_ui_router_core | method | pub fn is_empty(&self) -> bool
+default | bevy_ui_router::core::MatchedBranch | bevy_ui_router_core | method | pub fn search_fingerprint(&self) -> &RouteSearchFingerprint
+default | bevy_ui_router::core::MatchedBranch | bevy_ui_router_core | method | pub fn branch_fingerprint(&self) -> &RouteBranchFingerprint
+default | bevy_ui_router::core::MatchedBranch | bevy_ui_router_core | method | pub fn nearest_error_boundary_for(&self, route: RouteId) -> Option<&ErrorBoundaryKey>
+default | bevy_ui_router::core::MatchedBranch | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::MatchedBranch | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::MatchedRoute | bevy_ui_router_core | struct | pub struct MatchedRoute
+default | bevy_ui_router::core::MatchedRoute | bevy_ui_router_core | method | pub const fn route(&self) -> RouteId
+default | bevy_ui_router::core::MatchedRoute | bevy_ui_router_core | method | pub const fn params(&self) -> &RouteParams
+default | bevy_ui_router::core::MatchedRoute | bevy_ui_router_core | method | pub const fn slot(&self) -> &RouteSlotKey
+default | bevy_ui_router::core::MatchedRoute | bevy_ui_router_core | method | pub const fn explicit_key(&self) -> Option<&RouteExplicitKey>
+default | bevy_ui_router::core::MatchedRoute | bevy_ui_router_core | method | pub const fn error_boundary(&self) -> Option<&ErrorBoundaryKey>
+default | bevy_ui_router::core::MatchedRoute | bevy_ui_router_core | method | pub const fn meta(&self) -> &RouteMeta
+default | bevy_ui_router::core::MatchedRoute | bevy_ui_router_core | method | pub const fn params_fingerprint(&self) -> &RouteParamsFingerprint
+default | bevy_ui_router::core::MatchedRoute | bevy_ui_router_core | method | pub const fn segment_reuse_key(&self) -> &RouteSegmentReuseKey
+default | bevy_ui_router::core::MatchedRoute | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::MatchedRoute | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::MatchedRoute | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::MatchedRoute | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::MemoryHistory | bevy_ui_router_core | struct | pub struct MemoryHistory
+default | bevy_ui_router::core::MemoryHistory | bevy_ui_router_core | method | pub fn new() -> Self
+default | bevy_ui_router::core::MemoryHistory | bevy_ui_router_core | method | pub fn push(&mut self, location: RouteLocation)
+default | bevy_ui_router::core::MemoryHistory | bevy_ui_router_core | method | pub fn replace(&mut self, location: RouteLocation)
+default | bevy_ui_router::core::MemoryHistory | bevy_ui_router_core | method | pub fn back(&mut self) -> Result<RouteLocation, HistoryError>
+default | bevy_ui_router::core::MemoryHistory | bevy_ui_router_core | method | pub fn current(&self) -> Option<&RouteLocation>
+default | bevy_ui_router::core::MemoryHistory | bevy_ui_router_core | method | pub fn len(&self) -> usize
+default | bevy_ui_router::core::MemoryHistory | bevy_ui_router_core | method | pub fn is_empty(&self) -> bool
+default | bevy_ui_router::core::MemoryHistory | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::MemoryHistory | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::MemoryHistory | bevy_ui_router_core | trait-impl | impl Default for Self
+default | bevy_ui_router::core::MemoryHistory | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::MemoryHistory | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::MountRejectionKind | bevy_ui_router_core | enum | pub enum MountRejectionKind
+default | bevy_ui_router::core::MountRejectionKind | bevy_ui_router_core | variant | MissingOutlet
+default | bevy_ui_router::core::MountRejectionKind | bevy_ui_router_core | variant | InvalidOutlet
+default | bevy_ui_router::core::MountRejectionKind | bevy_ui_router_core | variant | ParentAuthorityLost
+default | bevy_ui_router::core::MountRejectionKind | bevy_ui_router_core | variant | RejectedAfterMutation
+default | bevy_ui_router::core::MountRejectionKind | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::MountRejectionKind | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::MountRejectionKind | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::MountRejectionKind | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::MountRejectionKind | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::NavigationFailure | bevy_ui_router_core | struct | pub struct NavigationFailure
+default | bevy_ui_router::core::NavigationFailure | bevy_ui_router_core | method | pub fn kind(&self) -> NavigationFailureKind
+default | bevy_ui_router::core::NavigationFailure | bevy_ui_router_core | method | pub fn message(&self) -> &str
+default | bevy_ui_router::core::NavigationFailure | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::NavigationFailure | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::NavigationFailure | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::NavigationFailure | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::NavigationFailureKind | bevy_ui_router_core | enum | pub enum NavigationFailureKind
+default | bevy_ui_router::core::NavigationFailureKind | bevy_ui_router_core | variant | Match
+default | bevy_ui_router::core::NavigationFailureKind | bevy_ui_router_core | variant | Build
+default | bevy_ui_router::core::NavigationFailureKind | bevy_ui_router_core | variant | Apply
+default | bevy_ui_router::core::NavigationFailureKind | bevy_ui_router_core | variant | Mount
+default | bevy_ui_router::core::NavigationFailureKind | bevy_ui_router_core | variant | HostLost
+default | bevy_ui_router::core::NavigationFailureKind | bevy_ui_router_core | variant | AuthorityLost
+default | bevy_ui_router::core::NavigationFailureKind | bevy_ui_router_core | variant | RecoveryFailed
+default | bevy_ui_router::core::NavigationFailureKind | bevy_ui_router_core | variant | BackTargetUnavailable
+default | bevy_ui_router::core::NavigationFailureKind | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::NavigationFailureKind | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::NavigationFailureKind | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::NavigationFailureKind | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::NavigationFailureKind | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::NavigationPhase | bevy_ui_router_core | enum | pub enum NavigationPhase
+default | bevy_ui_router::core::NavigationPhase | bevy_ui_router_core | variant | Matching
+default | bevy_ui_router::core::NavigationPhase | bevy_ui_router_core | variant | Planning
+default | bevy_ui_router::core::NavigationPhase | bevy_ui_router_core | variant | ResolvingMount
+default | bevy_ui_router::core::NavigationPhase | bevy_ui_router_core | variant | PreparingFrame(usize)
+default | bevy_ui_router::core::NavigationPhase | bevy_ui_router_core | variant | ApplyingFrame(usize)
+default | bevy_ui_router::core::NavigationPhase | bevy_ui_router_core | variant | RegisteringOutlets(usize)
+default | bevy_ui_router::core::NavigationPhase | bevy_ui_router_core | variant | ReadyToSwitch
+default | bevy_ui_router::core::NavigationPhase | bevy_ui_router_core | variant | Recovering
+default | bevy_ui_router::core::NavigationPhase | bevy_ui_router_core | variant | CleanupPending
+default | bevy_ui_router::core::NavigationPhase | bevy_ui_router_core | variant | PostCommitCleanup
+default | bevy_ui_router::core::NavigationPhase | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::NavigationPhase | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::NavigationPhase | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::NavigationPhase | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::NavigationRequestId | bevy_ui_router_core | struct | pub struct NavigationRequestId
+default | bevy_ui_router::core::NavigationRequestId | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::NavigationRequestId | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::NavigationRequestId | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::NavigationRequestId | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::NavigationRequestId | bevy_ui_router_core | trait-impl | impl Hash for Self
+default | bevy_ui_router::core::NavigationRequestId | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::NavigationTraceEvent | bevy_ui_router_core | struct | pub struct NavigationTraceEvent
+default | bevy_ui_router::core::NavigationTraceEvent | bevy_ui_router_core | method | pub fn kind(&self) -> NavigationTraceEventKind
+default | bevy_ui_router::core::NavigationTraceEvent | bevy_ui_router_core | method | pub fn frame(&self) -> Option<&RouteFrameVersion>
+default | bevy_ui_router::core::NavigationTraceEvent | bevy_ui_router_core | method | pub fn outlet(&self) -> Option<&RouteSlotKey>
+default | bevy_ui_router::core::NavigationTraceEvent | bevy_ui_router_core | method | pub fn slot(&self) -> Option<RouteSlotId>
+default | bevy_ui_router::core::NavigationTraceEvent | bevy_ui_router_core | method | pub fn phase(&self) -> Option<&NavigationPhase>
+default | bevy_ui_router::core::NavigationTraceEvent | bevy_ui_router_core | method | pub fn mount_rejection(&self) -> Option<MountRejectionKind>
+default | bevy_ui_router::core::NavigationTraceEvent | bevy_ui_router_core | method | pub fn cleanup_disposition(&self) -> Option<CleanupDisposition>
+default | bevy_ui_router::core::NavigationTraceEvent | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::NavigationTraceEvent | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::NavigationTraceEvent | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::NavigationTraceEvent | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | enum | pub enum NavigationTraceEventKind
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | variant | FrameTaskIssued
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | variant | RequestPhaseChanged
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | variant | HistoryIntentRejected
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | variant | MountRequested
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | variant | MountResolved
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | variant | MountGranted
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | variant | MountRejected
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | variant | MountRejectedAfterMutation
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | variant | ShellPrepared
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | variant | ViewApplied
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | variant | OutletRegistered
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | variant | FrameIsolated
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | variant | FrameActivated
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | variant | CommitPublished
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | variant | CleanupSettled
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | variant | RequestTerminal
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::NavigationTraceEventKind | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::ReportDisposition | bevy_ui_router_core | enum | pub enum ReportDisposition
+default | bevy_ui_router::core::ReportDisposition | bevy_ui_router_core | variant | Accepted
+default | bevy_ui_router::core::ReportDisposition | bevy_ui_router_core | variant | StaleDiscarded
+default | bevy_ui_router::core::ReportDisposition | bevy_ui_router_core | variant | DuplicateRejected
+default | bevy_ui_router::core::ReportDisposition | bevy_ui_router_core | variant | InvalidRejected
+default | bevy_ui_router::core::ReportDisposition | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::ReportDisposition | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::ReportDisposition | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::ReportDisposition | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::ReportDisposition | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RequestStatus | bevy_ui_router_core | enum | pub enum RequestStatus
+default | bevy_ui_router::core::RequestStatus | bevy_ui_router_core | variant | Queued
+default | bevy_ui_router::core::RequestStatus | bevy_ui_router_core | variant | Running(NavigationPhase)
+default | bevy_ui_router::core::RequestStatus | bevy_ui_router_core | variant | Succeeded
+default | bevy_ui_router::core::RequestStatus | bevy_ui_router_core | variant | Failed(NavigationFailure)
+default | bevy_ui_router::core::RequestStatus | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RequestStatus | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RequestStatus | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RequestStatus | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteBranchFingerprint | bevy_ui_router_core | struct | pub struct RouteBranchFingerprint
+default | bevy_ui_router::core::RouteBranchFingerprint | bevy_ui_router_core | method | pub fn as_str(&self) -> &str
+default | bevy_ui_router::core::RouteBranchFingerprint | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteBranchFingerprint | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteBranchFingerprint | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteBranchFingerprint | bevy_ui_router_core | trait-impl | impl Hash for Self
+default | bevy_ui_router::core::RouteBranchFingerprint | bevy_ui_router_core | trait-impl | impl Ord for Self
+default | bevy_ui_router::core::RouteBranchFingerprint | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteBranchFingerprint | bevy_ui_router_core | trait-impl | impl PartialOrd for Self
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | struct | pub struct RouteError
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | method | pub fn new(kind: RouteErrorKind, source_category: RouteErrorSourceCategory, redacted_message: impl Into<String>) -> Self
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | method | pub fn invalid_route_pattern(redacted_message: impl Into<String>) -> Self
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | method | pub fn invalid_route_tree(redacted_message: impl Into<String>) -> Self
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | method | pub fn not_found(redacted_message: impl Into<String>) -> Self
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | method | pub fn match_conflict(redacted_message: impl Into<String>) -> Self
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | method | pub const fn kind(&self) -> RouteErrorKind
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | method | pub const fn source_category(&self) -> RouteErrorSourceCategory
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | method | pub fn redacted_message(&self) -> &str
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | trait-impl | impl Display for Self
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | trait-impl | impl std::error::Error for Self
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | compile-assert | Self: Send
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | compile-assert | Self: Sync
+default | bevy_ui_router::core::RouteError | bevy_ui_router_core | compile-assert | Self: 'static
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | enum | pub enum RouteErrorKind
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | variant | InvalidRoutePattern
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | variant | InvalidRouteDeclaration
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | variant | InvalidRouteTree
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | variant | NotFound
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | variant | MatchConflict
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | variant | GuardRejected
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | variant | ViewBuildFailed
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | variant | ViewApplyFailed
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | variant | StaleResult
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | variant | AdapterFailed
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | variant | HostOrSlotUnavailable
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | variant | FinalizeFailed
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | variant | CleanupFailed
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | variant | Internal
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteErrorKind | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteErrorSourceCategory | bevy_ui_router_core | enum | pub enum RouteErrorSourceCategory
+default | bevy_ui_router::core::RouteErrorSourceCategory | bevy_ui_router_core | variant | RouterCore
+default | bevy_ui_router::core::RouteErrorSourceCategory | bevy_ui_router_core | variant | RendererContract
+default | bevy_ui_router::core::RouteErrorSourceCategory | bevy_ui_router_core | variant | HostSlotIntegration
+default | bevy_ui_router::core::RouteErrorSourceCategory | bevy_ui_router_core | variant | InputLocationIntegration
+default | bevy_ui_router::core::RouteErrorSourceCategory | bevy_ui_router_core | variant | AppExtension
+default | bevy_ui_router::core::RouteErrorSourceCategory | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteErrorSourceCategory | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::RouteErrorSourceCategory | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteErrorSourceCategory | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteErrorSourceCategory | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteExplicitKey | bevy_ui_router_core | struct | pub struct RouteExplicitKey
+default | bevy_ui_router::core::RouteExplicitKey | bevy_ui_router_core | method | pub fn new(value: impl Into<String>) -> Result<Self, RouteError>
+default | bevy_ui_router::core::RouteExplicitKey | bevy_ui_router_core | method | pub fn as_str(&self) -> &str
+default | bevy_ui_router::core::RouteExplicitKey | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteExplicitKey | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteExplicitKey | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteExplicitKey | bevy_ui_router_core | trait-impl | impl Hash for Self
+default | bevy_ui_router::core::RouteExplicitKey | bevy_ui_router_core | trait-impl | impl Ord for Self
+default | bevy_ui_router::core::RouteExplicitKey | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteExplicitKey | bevy_ui_router_core | trait-impl | impl PartialOrd for Self
+default | bevy_ui_router::core::RouteFrameId | bevy_ui_router_core | struct | pub struct RouteFrameId
+default | bevy_ui_router::core::RouteFrameId | bevy_ui_router_core | method | pub const fn raw(self) -> u64
+default | bevy_ui_router::core::RouteFrameId | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteFrameId | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::RouteFrameId | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteFrameId | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteFrameId | bevy_ui_router_core | trait-impl | impl Hash for Self
+default | bevy_ui_router::core::RouteFrameId | bevy_ui_router_core | trait-impl | impl Ord for Self
+default | bevy_ui_router::core::RouteFrameId | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteFrameId | bevy_ui_router_core | trait-impl | impl PartialOrd for Self
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | enum | pub enum RouteFrameStatus
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | variant | Matching
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | variant | Guarding
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | variant | Redirecting
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | variant | Building
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | variant | ResolvingView
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | variant | ApplyingView
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | variant | Entering
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | variant | Active
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | variant | Pausing
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | variant | Leaving
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | variant | Cached
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | variant | Error
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteFrameStatus | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteFrameVersion | bevy_ui_router_core | struct | pub struct RouteFrameVersion
+default | bevy_ui_router::core::RouteFrameVersion | bevy_ui_router_core | method | pub fn router(&self) -> RouterInstanceId
+default | bevy_ui_router::core::RouteFrameVersion | bevy_ui_router_core | method | pub fn host(&self) -> RouteHostId
+default | bevy_ui_router::core::RouteFrameVersion | bevy_ui_router_core | method | pub fn slot(&self) -> RouteSlotId
+default | bevy_ui_router::core::RouteFrameVersion | bevy_ui_router_core | method | pub fn origin(&self) -> &FrameOrigin
+default | bevy_ui_router::core::RouteFrameVersion | bevy_ui_router_core | method | pub fn frame(&self) -> RouteFrameId
+default | bevy_ui_router::core::RouteFrameVersion | bevy_ui_router_core | method | pub fn generation(&self) -> RouteGeneration
+default | bevy_ui_router::core::RouteFrameVersion | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteFrameVersion | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteFrameVersion | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteFrameVersion | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteGeneration | bevy_ui_router_core | struct | pub struct RouteGeneration
+default | bevy_ui_router::core::RouteGeneration | bevy_ui_router_core | method | pub const fn raw(self) -> u64
+default | bevy_ui_router::core::RouteGeneration | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteGeneration | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::RouteGeneration | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteGeneration | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteGeneration | bevy_ui_router_core | trait-impl | impl Hash for Self
+default | bevy_ui_router::core::RouteGeneration | bevy_ui_router_core | trait-impl | impl Ord for Self
+default | bevy_ui_router::core::RouteGeneration | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteGeneration | bevy_ui_router_core | trait-impl | impl PartialOrd for Self
+default | bevy_ui_router::core::RouteHostId | bevy_ui_router_core | struct | pub struct RouteHostId
+default | bevy_ui_router::core::RouteHostId | bevy_ui_router_core | method | pub const fn raw(self) -> u64
+default | bevy_ui_router::core::RouteHostId | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteHostId | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::RouteHostId | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteHostId | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteHostId | bevy_ui_router_core | trait-impl | impl Hash for Self
+default | bevy_ui_router::core::RouteHostId | bevy_ui_router_core | trait-impl | impl Ord for Self
+default | bevy_ui_router::core::RouteHostId | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteHostId | bevy_ui_router_core | trait-impl | impl PartialOrd for Self
+default | bevy_ui_router::core::RouteId | bevy_ui_router_core | struct | pub struct RouteId
+default | bevy_ui_router::core::RouteId | bevy_ui_router_core | method | pub const fn raw(self) -> u64
+default | bevy_ui_router::core::RouteId | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteId | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::RouteId | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteId | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteId | bevy_ui_router_core | trait-impl | impl Hash for Self
+default | bevy_ui_router::core::RouteId | bevy_ui_router_core | trait-impl | impl Ord for Self
+default | bevy_ui_router::core::RouteId | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteId | bevy_ui_router_core | trait-impl | impl PartialOrd for Self
+default | bevy_ui_router::core::RouteLocation | bevy_ui_router_core | struct | pub struct RouteLocation
+default | bevy_ui_router::core::RouteLocation | bevy_ui_router_core | method | pub fn new(path: impl Into<String>) -> Self
+default | bevy_ui_router::core::RouteLocation | bevy_ui_router_core | method | pub fn with_search(self, search: impl Into<String>) -> Self
+default | bevy_ui_router::core::RouteLocation | bevy_ui_router_core | method | pub fn with_fragment(self, fragment: impl Into<String>) -> Self
+default | bevy_ui_router::core::RouteLocation | bevy_ui_router_core | method | pub fn path(&self) -> &str
+default | bevy_ui_router::core::RouteLocation | bevy_ui_router_core | method | pub fn search(&self) -> Option<&str>
+default | bevy_ui_router::core::RouteLocation | bevy_ui_router_core | method | pub fn fragment(&self) -> Option<&str>
+default | bevy_ui_router::core::RouteLocation | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteLocation | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteLocation | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteLocation | bevy_ui_router_core | trait-impl | impl Hash for Self
+default | bevy_ui_router::core::RouteLocation | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteMatcher | bevy_ui_router_core | struct | pub struct RouteMatcher
+default | bevy_ui_router::core::RouteMatcher | bevy_ui_router_core | method | pub fn new(tree: RouteTree) -> Self
+default | bevy_ui_router::core::RouteMatcher | bevy_ui_router_core | method | pub fn match_location(&self, location: &RouteLocation) -> Result<MatchedBranch, RouteError>
+default | bevy_ui_router::core::RouteMatcher | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteMatcher | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteMeta | bevy_ui_router_core | struct | pub struct RouteMeta
+default | bevy_ui_router::core::RouteMeta | bevy_ui_router_core | method | pub fn new() -> Self
+default | bevy_ui_router::core::RouteMeta | bevy_ui_router_core | method | pub fn with_diagnostic_label(self, label: impl Into<String>) -> Result<Self, RouteError>
+default | bevy_ui_router::core::RouteMeta | bevy_ui_router_core | method | pub fn diagnostic_label(&self) -> Option<&str>
+default | bevy_ui_router::core::RouteMeta | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteMeta | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteMeta | bevy_ui_router_core | trait-impl | impl Default for Self
+default | bevy_ui_router::core::RouteMeta | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteMeta | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteNode | bevy_ui_router_core | struct | pub struct RouteNode
+default | bevy_ui_router::core::RouteNode | bevy_ui_router_core | method | pub const fn id(&self) -> RouteId
+default | bevy_ui_router::core::RouteNode | bevy_ui_router_core | method | pub const fn parent(&self) -> Option<RouteId>
+default | bevy_ui_router::core::RouteNode | bevy_ui_router_core | method | pub const fn pattern(&self) -> &RoutePattern
+default | bevy_ui_router::core::RouteNode | bevy_ui_router_core | method | pub const fn options(&self) -> &RouteNodeOptions
+default | bevy_ui_router::core::RouteNode | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteNode | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | struct | pub struct RouteNodeOptions
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub fn new() -> Self
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub fn with_slot(self, slot: RouteSlotKey) -> Self
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub fn with_explicit_key(self, key: RouteExplicitKey) -> Self
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub fn with_view(self, view: RouteViewKey) -> Self
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub fn with_error_boundary(self, boundary: ErrorBoundaryKey) -> Self
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub fn with_error_view(self, boundary: ErrorBoundaryKey, view: RouteViewKey) -> Self
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub fn with_meta(self, meta: RouteMeta) -> Self
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub const fn slot(&self) -> &RouteSlotKey
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub const fn explicit_key(&self) -> Option<&RouteExplicitKey>
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub const fn error_boundary(&self) -> Option<&ErrorBoundaryKey>
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub const fn meta(&self) -> &RouteMeta
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | trait-impl | impl Default for Self
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteParams | bevy_ui_router_core | struct | pub struct RouteParams
+default | bevy_ui_router::core::RouteParams | bevy_ui_router_core | method | pub fn get(&self, name: &str) -> Option<&str>
+default | bevy_ui_router::core::RouteParams | bevy_ui_router_core | method | pub fn iter(&self) -> impl Iterator<Item = (&str, &str)>
+default | bevy_ui_router::core::RouteParams | bevy_ui_router_core | method | pub fn is_empty(&self) -> bool
+default | bevy_ui_router::core::RouteParams | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteParams | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteParams | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteParams | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteParamsFingerprint | bevy_ui_router_core | struct | pub struct RouteParamsFingerprint
+default | bevy_ui_router::core::RouteParamsFingerprint | bevy_ui_router_core | method | pub fn as_str(&self) -> &str
+default | bevy_ui_router::core::RouteParamsFingerprint | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteParamsFingerprint | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteParamsFingerprint | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteParamsFingerprint | bevy_ui_router_core | trait-impl | impl Hash for Self
+default | bevy_ui_router::core::RouteParamsFingerprint | bevy_ui_router_core | trait-impl | impl Ord for Self
+default | bevy_ui_router::core::RouteParamsFingerprint | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteParamsFingerprint | bevy_ui_router_core | trait-impl | impl PartialOrd for Self
+default | bevy_ui_router::core::RoutePathSegment | bevy_ui_router_core | enum | pub enum RoutePathSegment
+default | bevy_ui_router::core::RoutePathSegment | bevy_ui_router_core | variant | Static(String)
+default | bevy_ui_router::core::RoutePathSegment | bevy_ui_router_core | variant | Param(String)
+default | bevy_ui_router::core::RoutePathSegment | bevy_ui_router_core | variant | Wildcard(String)
+default | bevy_ui_router::core::RoutePathSegment | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RoutePathSegment | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RoutePathSegment | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RoutePathSegment | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RoutePattern | bevy_ui_router_core | struct | pub struct RoutePattern
+default | bevy_ui_router::core::RoutePattern | bevy_ui_router_core | method | pub fn path(pattern: impl Into<String>) -> Result<Self, RouteError>
+default | bevy_ui_router::core::RoutePattern | bevy_ui_router_core | method | pub fn index() -> Self
+default | bevy_ui_router::core::RoutePattern | bevy_ui_router_core | method | pub fn pathless() -> Self
+default | bevy_ui_router::core::RoutePattern | bevy_ui_router_core | method | pub const fn kind(&self) -> RoutePatternKind
+default | bevy_ui_router::core::RoutePattern | bevy_ui_router_core | method | pub fn segments(&self) -> &[RoutePathSegment]
+default | bevy_ui_router::core::RoutePattern | bevy_ui_router_core | method | pub fn original(&self) -> &str
+default | bevy_ui_router::core::RoutePattern | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RoutePattern | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RoutePattern | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RoutePattern | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RoutePatternKind | bevy_ui_router_core | enum | pub enum RoutePatternKind
+default | bevy_ui_router::core::RoutePatternKind | bevy_ui_router_core | variant | Path
+default | bevy_ui_router::core::RoutePatternKind | bevy_ui_router_core | variant | Index
+default | bevy_ui_router::core::RoutePatternKind | bevy_ui_router_core | variant | Pathless
+default | bevy_ui_router::core::RoutePatternKind | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RoutePatternKind | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::RoutePatternKind | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RoutePatternKind | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RoutePatternKind | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteSearchFingerprint | bevy_ui_router_core | struct | pub struct RouteSearchFingerprint
+default | bevy_ui_router::core::RouteSearchFingerprint | bevy_ui_router_core | method | pub fn as_str(&self) -> &str
+default | bevy_ui_router::core::RouteSearchFingerprint | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteSearchFingerprint | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteSearchFingerprint | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteSearchFingerprint | bevy_ui_router_core | trait-impl | impl Hash for Self
+default | bevy_ui_router::core::RouteSearchFingerprint | bevy_ui_router_core | trait-impl | impl Ord for Self
+default | bevy_ui_router::core::RouteSearchFingerprint | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteSearchFingerprint | bevy_ui_router_core | trait-impl | impl PartialOrd for Self
+default | bevy_ui_router::core::RouteSegmentReuseKey | bevy_ui_router_core | struct | pub struct RouteSegmentReuseKey
+default | bevy_ui_router::core::RouteSegmentReuseKey | bevy_ui_router_core | method | pub fn as_str(&self) -> &str
+default | bevy_ui_router::core::RouteSegmentReuseKey | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteSegmentReuseKey | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteSegmentReuseKey | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteSegmentReuseKey | bevy_ui_router_core | trait-impl | impl Hash for Self
+default | bevy_ui_router::core::RouteSegmentReuseKey | bevy_ui_router_core | trait-impl | impl Ord for Self
+default | bevy_ui_router::core::RouteSegmentReuseKey | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteSegmentReuseKey | bevy_ui_router_core | trait-impl | impl PartialOrd for Self
+default | bevy_ui_router::core::RouteSlotId | bevy_ui_router_core | struct | pub struct RouteSlotId
+default | bevy_ui_router::core::RouteSlotId | bevy_ui_router_core | method | pub const fn raw(self) -> u64
+default | bevy_ui_router::core::RouteSlotId | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteSlotId | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::RouteSlotId | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteSlotId | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteSlotId | bevy_ui_router_core | trait-impl | impl Hash for Self
+default | bevy_ui_router::core::RouteSlotId | bevy_ui_router_core | trait-impl | impl Ord for Self
+default | bevy_ui_router::core::RouteSlotId | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteSlotId | bevy_ui_router_core | trait-impl | impl PartialOrd for Self
+default | bevy_ui_router::core::RouteSlotKey | bevy_ui_router_core | struct | pub struct RouteSlotKey
+default | bevy_ui_router::core::RouteSlotKey | bevy_ui_router_core | method | pub fn default() -> Self
+default | bevy_ui_router::core::RouteSlotKey | bevy_ui_router_core | method | pub fn named(name: impl Into<String>) -> Result<Self, RouteError>
+default | bevy_ui_router::core::RouteSlotKey | bevy_ui_router_core | method | pub fn as_str(&self) -> &str
+default | bevy_ui_router::core::RouteSlotKey | bevy_ui_router_core | method | pub fn is_default(&self) -> bool
+default | bevy_ui_router::core::RouteSlotKey | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteSlotKey | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteSlotKey | bevy_ui_router_core | trait-impl | impl Default for Self
+default | bevy_ui_router::core::RouteSlotKey | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteSlotKey | bevy_ui_router_core | trait-impl | impl Hash for Self
+default | bevy_ui_router::core::RouteSlotKey | bevy_ui_router_core | trait-impl | impl Ord for Self
+default | bevy_ui_router::core::RouteSlotKey | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteSlotKey | bevy_ui_router_core | trait-impl | impl PartialOrd for Self
+default | bevy_ui_router::core::RouteTree | bevy_ui_router_core | struct | pub struct RouteTree
+default | bevy_ui_router::core::RouteTree | bevy_ui_router_core | method | pub fn builder() -> RouteTreeBuilder
+default | bevy_ui_router::core::RouteTree | bevy_ui_router_core | method | pub const fn root(&self) -> RouteId
+default | bevy_ui_router::core::RouteTree | bevy_ui_router_core | method | pub fn node(&self, id: RouteId) -> Option<&RouteNode>
+default | bevy_ui_router::core::RouteTree | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteTree | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteTreeBuilder | bevy_ui_router_core | struct | pub struct RouteTreeBuilder
+default | bevy_ui_router::core::RouteTreeBuilder | bevy_ui_router_core | method | pub fn root(self, pattern: RoutePattern) -> Result<Self, RouteError>
+default | bevy_ui_router::core::RouteTreeBuilder | bevy_ui_router_core | method | pub fn root_with_options(self, pattern: RoutePattern, options: RouteNodeOptions) -> Result<Self, RouteError>
+default | bevy_ui_router::core::RouteTreeBuilder | bevy_ui_router_core | method | pub const fn root_id(&self) -> Option<RouteId>
+default | bevy_ui_router::core::RouteTreeBuilder | bevy_ui_router_core | method | pub fn route_with_options(&mut self, parent: RouteId, pattern: RoutePattern, options: RouteNodeOptions) -> Result<RouteId, RouteError>
+default | bevy_ui_router::core::RouteTreeBuilder | bevy_ui_router_core | method | pub fn route(&mut self, parent: RouteId, pattern: RoutePattern) -> Result<RouteId, RouteError>
+default | bevy_ui_router::core::RouteTreeBuilder | bevy_ui_router_core | method | pub fn build(self) -> Result<RouteTree, RouteError>
+default | bevy_ui_router::core::RouteTreeBuilder | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteTreeBuilder | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteViewInput | bevy_ui_router_core | struct | pub struct RouteViewInput
+default | bevy_ui_router::core::RouteViewInput | bevy_ui_router_core | method | pub fn location(&self) -> &RouteLocation
+default | bevy_ui_router::core::RouteViewInput | bevy_ui_router_core | method | pub fn route(&self) -> Option<RouteId>
+default | bevy_ui_router::core::RouteViewInput | bevy_ui_router_core | method | pub fn params(&self) -> &RouteParams
+default | bevy_ui_router::core::RouteViewInput | bevy_ui_router_core | method | pub fn raw_search(&self) -> Option<&str>
+default | bevy_ui_router::core::RouteViewInput | bevy_ui_router_core | method | pub fn fragment(&self) -> Option<&str>
+default | bevy_ui_router::core::RouteViewInput | bevy_ui_router_core | method | pub fn origin(&self) -> &FrameOrigin
+default | bevy_ui_router::core::RouteViewInput | bevy_ui_router_core | method | pub fn failure(&self) -> Option<&NavigationFailure>
+default | bevy_ui_router::core::RouteViewKey | bevy_ui_router_core | struct | pub struct RouteViewKey
+default | bevy_ui_router::core::RouteViewKey | bevy_ui_router_core | method | pub fn new(value: impl Into<String>) -> Result<Self, RouteViewKeyError>
+default | bevy_ui_router::core::RouteViewKey | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouteViewKey | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteViewKey | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouteViewKey | bevy_ui_router_core | trait-impl | impl Hash for Self
+default | bevy_ui_router::core::RouteViewKey | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouteViewKeyError | bevy_ui_router_core | struct | pub struct RouteViewKeyError
+default | bevy_ui_router::core::RouteViewKeyError | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouteViewKeyError | bevy_ui_router_core | trait-impl | impl Display for Self
+default | bevy_ui_router::core::RouteViewKeyError | bevy_ui_router_core | trait-impl | impl std::error::Error for Self
+default | bevy_ui_router::core::RouteViewKeyError | bevy_ui_router_core | compile-assert | Self: Send
+default | bevy_ui_router::core::RouteViewKeyError | bevy_ui_router_core | compile-assert | Self: Sync
+default | bevy_ui_router::core::RouteViewKeyError | bevy_ui_router_core | compile-assert | Self: 'static
+default | bevy_ui_router::core::RouterAvailability | bevy_ui_router_core | enum | pub enum RouterAvailability
+default | bevy_ui_router::core::RouterAvailability | bevy_ui_router_core | variant | AwaitingHost
+default | bevy_ui_router::core::RouterAvailability | bevy_ui_router_core | variant | Ready
+default | bevy_ui_router::core::RouterAvailability | bevy_ui_router_core | variant | RecoveringAuthority
+default | bevy_ui_router::core::RouterAvailability | bevy_ui_router_core | variant | Unavailable(RouterUnavailableReason)
+default | bevy_ui_router::core::RouterAvailability | bevy_ui_router_core | method | pub fn unavailable_reason(&self) -> Option<RouterUnavailableReason>
+default | bevy_ui_router::core::RouterAvailability | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouterAvailability | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouterAvailability | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouterAvailability | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouterInstanceId | bevy_ui_router_core | struct | pub struct RouterInstanceId
+default | bevy_ui_router::core::RouterInstanceId | bevy_ui_router_core | method | pub const fn raw(self) -> u64
+default | bevy_ui_router::core::RouterInstanceId | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouterInstanceId | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::RouterInstanceId | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouterInstanceId | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouterInstanceId | bevy_ui_router_core | trait-impl | impl Hash for Self
+default | bevy_ui_router::core::RouterInstanceId | bevy_ui_router_core | trait-impl | impl Ord for Self
+default | bevy_ui_router::core::RouterInstanceId | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+default | bevy_ui_router::core::RouterInstanceId | bevy_ui_router_core | trait-impl | impl PartialOrd for Self
+default | bevy_ui_router::core::RouterUnavailableReason | bevy_ui_router_core | enum | pub enum RouterUnavailableReason
+default | bevy_ui_router::core::RouterUnavailableReason | bevy_ui_router_core | variant | HostConflict
+default | bevy_ui_router::core::RouterUnavailableReason | bevy_ui_router_core | variant | InvalidHostUiTopology
+default | bevy_ui_router::core::RouterUnavailableReason | bevy_ui_router_core | variant | HostLost
+default | bevy_ui_router::core::RouterUnavailableReason | bevy_ui_router_core | variant | AuthorityEstablishmentFailed
+default | bevy_ui_router::core::RouterUnavailableReason | bevy_ui_router_core | variant | RegistryInvariantViolation
+default | bevy_ui_router::core::RouterUnavailableReason | bevy_ui_router_core | trait-impl | impl Clone for Self
+default | bevy_ui_router::core::RouterUnavailableReason | bevy_ui_router_core | trait-impl | impl Copy for Self
+default | bevy_ui_router::core::RouterUnavailableReason | bevy_ui_router_core | trait-impl | impl Debug for Self
+default | bevy_ui_router::core::RouterUnavailableReason | bevy_ui_router_core | trait-impl | impl Eq for Self
+default | bevy_ui_router::core::RouterUnavailableReason | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+
+view | bevy_ui_router::view::RouteViewDescriptor | bevy_ui_router_view | struct | pub struct RouteViewDescriptor
+view | bevy_ui_router::view::RouteViewDescriptor | bevy_ui_router_view | method | pub fn new(driver: ViewDriverKey) -> Self
+view | bevy_ui_router::view::RouteViewDescriptor | bevy_ui_router_view | trait-impl | impl Clone for Self
+view | bevy_ui_router::view::RouteViewDescriptor | bevy_ui_router_view | trait-impl | impl Debug for Self
+view | bevy_ui_router::view::RouteViewDescriptor | bevy_ui_router_view | trait-impl | impl Eq for Self
+view | bevy_ui_router::view::RouteViewDescriptor | bevy_ui_router_view | trait-impl | impl PartialEq for Self
+view | bevy_ui_router::view::RouteViewRegistry | bevy_ui_router_view | struct | pub struct RouteViewRegistry
+view | bevy_ui_router::view::RouteViewRegistry | bevy_ui_router_view | method | pub fn new() -> Self
+view | bevy_ui_router::view::RouteViewRegistry | bevy_ui_router_view | method | pub fn insert(&mut self, view: RouteViewKey, descriptor: RouteViewDescriptor) -> Result<(), RouteViewRegistryError>
+view | bevy_ui_router::view::RouteViewRegistryError | bevy_ui_router_view | struct | pub struct RouteViewRegistryError
+view | bevy_ui_router::view::RouteViewRegistryError | bevy_ui_router_view | trait-impl | impl Debug for Self
+view | bevy_ui_router::view::RouteViewRegistryError | bevy_ui_router_view | trait-impl | impl Display for Self
+view | bevy_ui_router::view::RouteViewRegistryError | bevy_ui_router_view | trait-impl | impl std::error::Error for Self
+view | bevy_ui_router::view::RouteViewRegistryError | bevy_ui_router_view | compile-assert | Self: Send
+view | bevy_ui_router::view::RouteViewRegistryError | bevy_ui_router_view | compile-assert | Self: Sync
+view | bevy_ui_router::view::RouteViewRegistryError | bevy_ui_router_view | compile-assert | Self: 'static
+view | bevy_ui_router::view::ViewBuildEffect | bevy_ui_router_view | struct | pub struct ViewBuildEffect
+view | bevy_ui_router::view::ViewBuildEffect | bevy_ui_router_view | method | pub fn view(&self) -> &RouteViewKey
+view | bevy_ui_router::view::ViewBuildEffect | bevy_ui_router_view | method | pub fn request_id(&self) -> ViewRequestId
+view | bevy_ui_router::view::ViewBuildEffect | bevy_ui_router_view | method | pub fn input(&self) -> &RouteViewInput
+view | bevy_ui_router::view::ViewDriverKey | bevy_ui_router_view | struct | pub struct ViewDriverKey
+view | bevy_ui_router::view::ViewDriverKey | bevy_ui_router_view | method | pub fn new(value: impl Into<String>) -> Result<Self, ViewDriverKeyError>
+view | bevy_ui_router::view::ViewDriverKey | bevy_ui_router_view | trait-impl | impl Clone for Self
+view | bevy_ui_router::view::ViewDriverKey | bevy_ui_router_view | trait-impl | impl Debug for Self
+view | bevy_ui_router::view::ViewDriverKey | bevy_ui_router_view | trait-impl | impl Eq for Self
+view | bevy_ui_router::view::ViewDriverKey | bevy_ui_router_view | trait-impl | impl Hash for Self
+view | bevy_ui_router::view::ViewDriverKey | bevy_ui_router_view | trait-impl | impl PartialEq for Self
+view | bevy_ui_router::view::ViewDriverKeyError | bevy_ui_router_view | struct | pub struct ViewDriverKeyError
+view | bevy_ui_router::view::ViewDriverKeyError | bevy_ui_router_view | trait-impl | impl Debug for Self
+view | bevy_ui_router::view::ViewDriverKeyError | bevy_ui_router_view | trait-impl | impl Display for Self
+view | bevy_ui_router::view::ViewDriverKeyError | bevy_ui_router_view | trait-impl | impl std::error::Error for Self
+view | bevy_ui_router::view::ViewDriverKeyError | bevy_ui_router_view | compile-assert | Self: Send
+view | bevy_ui_router::view::ViewDriverKeyError | bevy_ui_router_view | compile-assert | Self: Sync
+view | bevy_ui_router::view::ViewDriverKeyError | bevy_ui_router_view | compile-assert | Self: 'static
+view | bevy_ui_router::view::ViewRequestId | bevy_ui_router_view | struct | pub struct ViewRequestId
+view | bevy_ui_router::view::ViewRequestId | bevy_ui_router_view | method | pub const fn raw(self) -> u64
+view | bevy_ui_router::view::ViewRequestId | bevy_ui_router_view | trait-impl | impl Clone for Self
+view | bevy_ui_router::view::ViewRequestId | bevy_ui_router_view | trait-impl | impl Copy for Self
+view | bevy_ui_router::view::ViewRequestId | bevy_ui_router_view | trait-impl | impl Debug for Self
+view | bevy_ui_router::view::ViewRequestId | bevy_ui_router_view | trait-impl | impl Eq for Self
+view | bevy_ui_router::view::ViewRequestId | bevy_ui_router_view | trait-impl | impl Hash for Self
+view | bevy_ui_router::view::ViewRequestId | bevy_ui_router_view | trait-impl | impl Ord for Self
+view | bevy_ui_router::view::ViewRequestId | bevy_ui_router_view | trait-impl | impl PartialEq for Self
+view | bevy_ui_router::view::ViewRequestId | bevy_ui_router_view | trait-impl | impl PartialOrd for Self
+
+ecs | bevy_ui_router::ecs::AppRouterExt | bevy_ui_router_ecs | trait | pub trait AppRouterExt
+ecs | bevy_ui_router::ecs::AppRouterExt | bevy_ui_router_ecs | trait-method | fn register_ui_view_driver<D: EcsViewDriver>(&mut self, driver: D) -> Result<ViewDriverKey, ViewDriverRegistrationError>
+ecs | bevy_ui_router::ecs::AppRouterExt | bevy_ui_router_ecs | trait-method | fn add_ui_router(&mut self, config: RouterConfig) -> Result<RouterHandle, RouterInstallError>
+ecs | bevy_ui_router::ecs::AppRouterExt | bevy_ui_router_ecs | trait-impl | impl AppRouterExt for bevy_app::App
+ecs | bevy_ui_router::ecs::BevyUiRouterPlugin | bevy_ui_router_ecs | struct | pub struct BevyUiRouterPlugin
+ecs | bevy_ui_router::ecs::BevyUiRouterPlugin | bevy_ui_router_ecs | trait-impl | impl Default for Self
+ecs | bevy_ui_router::ecs::BevyUiRouterPlugin | bevy_ui_router_ecs | trait-impl | impl bevy_app::Plugin for Self
+ecs | bevy_ui_router::ecs::ContentColor | bevy_ui_router_ecs | struct | pub struct ContentColor
+ecs | bevy_ui_router::ecs::ContentColor | bevy_ui_router_ecs | method | pub const fn srgba8(red: u8, green: u8, blue: u8, alpha: u8) -> Self
+ecs | bevy_ui_router::ecs::ContentColor | bevy_ui_router_ecs | method | pub const fn red(&self) -> u8
+ecs | bevy_ui_router::ecs::ContentColor | bevy_ui_router_ecs | method | pub const fn green(&self) -> u8
+ecs | bevy_ui_router::ecs::ContentColor | bevy_ui_router_ecs | method | pub const fn blue(&self) -> u8
+ecs | bevy_ui_router::ecs::ContentColor | bevy_ui_router_ecs | method | pub const fn alpha(&self) -> u8
+ecs | bevy_ui_router::ecs::ContentColor | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs | bevy_ui_router::ecs::ContentColor | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs | bevy_ui_router::ecs::ContentColor | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::ContentColor | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs | bevy_ui_router::ecs::ContentColor | bevy_ui_router_ecs | trait-impl | impl Hash for Self
+ecs | bevy_ui_router::ecs::ContentColor | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs | bevy_ui_router::ecs::ContentEntity | bevy_ui_router_ecs | struct | pub struct ContentEntity
+ecs | bevy_ui_router::ecs::ContentEntity | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs | bevy_ui_router::ecs::ContentEntity | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs | bevy_ui_router::ecs::ContentEntity | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::ContentEntity | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs | bevy_ui_router::ecs::ContentEntity | bevy_ui_router_ecs | trait-impl | impl Hash for Self
+ecs | bevy_ui_router::ecs::ContentEntity | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs | bevy_ui_router::ecs::ContentPrimitiveError | bevy_ui_router_ecs | struct | pub struct ContentPrimitiveError
+ecs | bevy_ui_router::ecs::ContentPrimitiveError | bevy_ui_router_ecs | method | pub fn kind(&self) -> ContentPrimitiveErrorKind
+ecs | bevy_ui_router::ecs::ContentPrimitiveError | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::ContentPrimitiveError | bevy_ui_router_ecs | trait-impl | impl Display for Self
+ecs | bevy_ui_router::ecs::ContentPrimitiveError | bevy_ui_router_ecs | trait-impl | impl std::error::Error for Self
+ecs | bevy_ui_router::ecs::ContentPrimitiveError | bevy_ui_router_ecs | compile-assert | Self: Send
+ecs | bevy_ui_router::ecs::ContentPrimitiveError | bevy_ui_router_ecs | compile-assert | Self: Sync
+ecs | bevy_ui_router::ecs::ContentPrimitiveError | bevy_ui_router_ecs | compile-assert | Self: 'static
+ecs | bevy_ui_router::ecs::ContentPrimitiveErrorKind | bevy_ui_router_ecs | enum | pub enum ContentPrimitiveErrorKind
+ecs | bevy_ui_router::ecs::ContentPrimitiveErrorKind | bevy_ui_router_ecs | variant | ZeroWidth
+ecs | bevy_ui_router::ecs::ContentPrimitiveErrorKind | bevy_ui_router_ecs | variant | ZeroHeight
+ecs | bevy_ui_router::ecs::ContentPrimitiveErrorKind | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs | bevy_ui_router::ecs::ContentPrimitiveErrorKind | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs | bevy_ui_router::ecs::ContentPrimitiveErrorKind | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::ContentPrimitiveErrorKind | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs | bevy_ui_router::ecs::ContentPrimitiveErrorKind | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs | bevy_ui_router::ecs::ContentPrimitiveKind | bevy_ui_router_ecs | enum | pub enum ContentPrimitiveKind
+ecs | bevy_ui_router::ecs::ContentPrimitiveKind | bevy_ui_router_ecs | variant | SolidRect
+ecs | bevy_ui_router::ecs::ContentPrimitiveKind | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs | bevy_ui_router::ecs::ContentPrimitiveKind | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs | bevy_ui_router::ecs::ContentPrimitiveKind | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::ContentPrimitiveKind | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs | bevy_ui_router::ecs::ContentPrimitiveKind | bevy_ui_router_ecs | trait-impl | impl Hash for Self
+ecs | bevy_ui_router::ecs::ContentPrimitiveKind | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs | bevy_ui_router::ecs::ContentWriteError | bevy_ui_router_ecs | struct | pub struct ContentWriteError
+ecs | bevy_ui_router::ecs::ContentWriteError | bevy_ui_router_ecs | method | pub fn kind(&self) -> ContentWriteErrorKind
+ecs | bevy_ui_router::ecs::ContentWriteError | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::ContentWriteError | bevy_ui_router_ecs | trait-impl | impl Display for Self
+ecs | bevy_ui_router::ecs::ContentWriteError | bevy_ui_router_ecs | trait-impl | impl std::error::Error for Self
+ecs | bevy_ui_router::ecs::ContentWriteError | bevy_ui_router_ecs | compile-assert | Self: Send
+ecs | bevy_ui_router::ecs::ContentWriteError | bevy_ui_router_ecs | compile-assert | Self: Sync
+ecs | bevy_ui_router::ecs::ContentWriteError | bevy_ui_router_ecs | compile-assert | Self: 'static
+ecs | bevy_ui_router::ecs::ContentWriteErrorKind | bevy_ui_router_ecs | enum | pub enum ContentWriteErrorKind
+ecs | bevy_ui_router::ecs::ContentWriteErrorKind | bevy_ui_router_ecs | variant | UnknownHandle
+ecs | bevy_ui_router::ecs::ContentWriteErrorKind | bevy_ui_router_ecs | variant | ForeignSession
+ecs | bevy_ui_router::ecs::ContentWriteErrorKind | bevy_ui_router_ecs | variant | SelfParent
+ecs | bevy_ui_router::ecs::ContentWriteErrorKind | bevy_ui_router_ecs | variant | DuplicateEdge
+ecs | bevy_ui_router::ecs::ContentWriteErrorKind | bevy_ui_router_ecs | variant | DuplicateParent
+ecs | bevy_ui_router::ecs::ContentWriteErrorKind | bevy_ui_router_ecs | variant | RelationshipCycle
+ecs | bevy_ui_router::ecs::ContentWriteErrorKind | bevy_ui_router_ecs | variant | DuplicateOutlet
+ecs | bevy_ui_router::ecs::ContentWriteErrorKind | bevy_ui_router_ecs | variant | InvalidDespawn
+ecs | bevy_ui_router::ecs::ContentWriteErrorKind | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs | bevy_ui_router::ecs::ContentWriteErrorKind | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs | bevy_ui_router::ecs::ContentWriteErrorKind | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::ContentWriteErrorKind | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs | bevy_ui_router::ecs::ContentWriteErrorKind | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs | bevy_ui_router::ecs::EcsViewDriver | bevy_ui_router_ecs | trait | pub trait EcsViewDriver: Send + Sync + 'static
+ecs | bevy_ui_router::ecs::EcsViewDriver | bevy_ui_router_ecs | trait-method | fn key(&self) -> ViewDriverKey
+ecs | bevy_ui_router::ecs::EcsViewDriver | bevy_ui_router_ecs | trait-method | fn apply(&mut self, effect: &ViewBuildEffect, content: &mut FrameContentWriter<'_>, report: EcsViewReportSession<'_>) -> ViewBuildReport
+ecs | bevy_ui_router::ecs::EcsViewReportSession | bevy_ui_router_ecs | struct | pub struct EcsViewReportSession<'a>
+ecs | bevy_ui_router::ecs::EcsViewReportSession | bevy_ui_router_ecs | method | pub fn applied(self) -> ViewBuildReport
+ecs | bevy_ui_router::ecs::EcsViewReportSession | bevy_ui_router_ecs | method | pub fn build_failed(self, message: impl Into<String>) -> ViewBuildReport
+ecs | bevy_ui_router::ecs::EcsViewReportSession | bevy_ui_router_ecs | method | pub fn apply_failed(self, message: impl Into<String>) -> ViewBuildReport
+ecs | bevy_ui_router::ecs::FrameContentWriter | bevy_ui_router_ecs | struct | pub struct FrameContentWriter<'a>
+ecs | bevy_ui_router::ecs::FrameContentWriter | bevy_ui_router_ecs | method | pub fn spawn_empty(&mut self) -> Result<ContentEntity, ContentWriteError>
+ecs | bevy_ui_router::ecs::FrameContentWriter | bevy_ui_router_ecs | method | pub fn spawn_solid_rect(&mut self, rect: SolidRect) -> Result<ContentEntity, ContentWriteError>
+ecs | bevy_ui_router::ecs::FrameContentWriter | bevy_ui_router_ecs | method | pub fn add_child(&mut self, parent: ContentEntity, child: ContentEntity) -> Result<(), ContentWriteError>
+ecs | bevy_ui_router::ecs::FrameContentWriter | bevy_ui_router_ecs | method | pub fn despawn(&mut self, entity: ContentEntity) -> Result<(), ContentWriteError>
+ecs | bevy_ui_router::ecs::FrameContentWriter | bevy_ui_router_ecs | method | pub fn declare_outlet(&mut self, anchor: ContentEntity, key: RouteSlotKey) -> Result<(), ContentWriteError>
+ecs | bevy_ui_router::ecs::NavigationEnqueueError | bevy_ui_router_ecs | struct | pub struct NavigationEnqueueError
+ecs | bevy_ui_router::ecs::NavigationEnqueueError | bevy_ui_router_ecs | method | pub fn kind(&self) -> NavigationEnqueueErrorKind
+ecs | bevy_ui_router::ecs::NavigationEnqueueError | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::NavigationEnqueueError | bevy_ui_router_ecs | trait-impl | impl Display for Self
+ecs | bevy_ui_router::ecs::NavigationEnqueueError | bevy_ui_router_ecs | trait-impl | impl std::error::Error for Self
+ecs | bevy_ui_router::ecs::NavigationEnqueueError | bevy_ui_router_ecs | compile-assert | Self: Send
+ecs | bevy_ui_router::ecs::NavigationEnqueueError | bevy_ui_router_ecs | compile-assert | Self: Sync
+ecs | bevy_ui_router::ecs::NavigationEnqueueError | bevy_ui_router_ecs | compile-assert | Self: 'static
+ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | enum | pub enum NavigationEnqueueErrorKind
+ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | variant | UnknownRouter
+ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | variant | HostUnavailable
+ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | variant | AuthorityRecovering
+ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | variant | NoBackEntry
+ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs | bevy_ui_router::ecs::NavigationRequestSnapshot | bevy_ui_router_ecs | struct | pub struct NavigationRequestSnapshot
+ecs | bevy_ui_router::ecs::NavigationRequestSnapshot | bevy_ui_router_ecs | method | pub fn requested(&self) -> &RouteLocation
+ecs | bevy_ui_router::ecs::NavigationRequestSnapshot | bevy_ui_router_ecs | method | pub fn matched(&self) -> Option<&RouteBranchFingerprint>
+ecs | bevy_ui_router::ecs::NavigationRequestSnapshot | bevy_ui_router_ecs | method | pub fn status(&self) -> &RequestStatus
+ecs | bevy_ui_router::ecs::NavigationRequestSnapshot | bevy_ui_router_ecs | method | pub fn trace(&self) -> &[NavigationTraceEvent]
+ecs | bevy_ui_router::ecs::NavigationRequestSnapshot | bevy_ui_router_ecs | method | pub fn diagnostics(&self) -> &[DiagnosticEvent]
+ecs | bevy_ui_router::ecs::NavigationRequestSnapshot | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs | bevy_ui_router::ecs::NavigationRequestSnapshot | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::NavigationRequestSnapshot | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs | bevy_ui_router::ecs::NavigationRequestSnapshot | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs | bevy_ui_router::ecs::RequestLookup | bevy_ui_router_ecs | enum | pub enum RequestLookup<'a>
+ecs | bevy_ui_router::ecs::RequestLookup | bevy_ui_router_ecs | variant | Found(&'a NavigationRequestSnapshot)
+ecs | bevy_ui_router::ecs::RequestLookup | bevy_ui_router_ecs | variant | NotRetained
+ecs | bevy_ui_router::ecs::RequestLookup | bevy_ui_router_ecs | variant | Unknown
+ecs | bevy_ui_router::ecs::RequestLookup | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs | bevy_ui_router::ecs::RequestLookup | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::RequestLookup | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs | bevy_ui_router::ecs::RequestLookup | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs | bevy_ui_router::ecs::RouterConfig | bevy_ui_router_ecs | struct | pub struct RouterConfig
+ecs | bevy_ui_router::ecs::RouterConfig | bevy_ui_router_ecs | method | pub fn new(routes: RouteTree, views: RouteViewRegistry, fallback: RouteViewKey) -> Self
+ecs | bevy_ui_router::ecs::RouterHandle | bevy_ui_router_ecs | struct | pub struct RouterHandle
+ecs | bevy_ui_router::ecs::RouterHandle | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs | bevy_ui_router::ecs::RouterHandle | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs | bevy_ui_router::ecs::RouterHandle | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::RouterHandle | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs | bevy_ui_router::ecs::RouterHandle | bevy_ui_router_ecs | trait-impl | impl Hash for Self
+ecs | bevy_ui_router::ecs::RouterHandle | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs | bevy_ui_router::ecs::RouterHostRegistration | bevy_ui_router_ecs | struct | pub struct RouterHostRegistration
+ecs | bevy_ui_router::ecs::RouterHostRegistration | bevy_ui_router_ecs | method | pub fn new(router: RouterHandle) -> Self
+ecs | bevy_ui_router::ecs::RouterHostRegistration | bevy_ui_router_ecs | trait-impl | impl bevy_ecs::component::Component for Self
+ecs | bevy_ui_router::ecs::RouterInputGate | bevy_ui_router_ecs | struct | pub struct RouterInputGate
+ecs | bevy_ui_router::ecs::RouterInputGate | bevy_ui_router_ecs | method | pub fn allows_pointer(&self, target: bevy_ecs::entity::Entity) -> bool
+ecs | bevy_ui_router::ecs::RouterInputGate | bevy_ui_router_ecs | method | pub fn allows_keyboard(&self, target: bevy_ecs::entity::Entity) -> bool
+ecs | bevy_ui_router::ecs::RouterInputGate | bevy_ui_router_ecs | method | pub fn allows_gamepad(&self, target: bevy_ecs::entity::Entity) -> bool
+ecs | bevy_ui_router::ecs::RouterInputGate | bevy_ui_router_ecs | trait-impl | impl bevy_ecs::component::Component for Self
+ecs | bevy_ui_router::ecs::RouterInputGate | bevy_ui_router_ecs | trait-impl | impl bevy_ecs::resource::Resource for Self
+ecs | bevy_ui_router::ecs::RouterInputSet | bevy_ui_router_ecs | enum | pub enum RouterInputSet
+ecs | bevy_ui_router::ecs::RouterInputSet | bevy_ui_router_ecs | variant | Refresh
+ecs | bevy_ui_router::ecs::RouterInputSet | bevy_ui_router_ecs | variant | Ready
+ecs | bevy_ui_router::ecs::RouterInputSet | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs | bevy_ui_router::ecs::RouterInputSet | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs | bevy_ui_router::ecs::RouterInputSet | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::RouterInputSet | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs | bevy_ui_router::ecs::RouterInputSet | bevy_ui_router_ecs | trait-impl | impl Hash for Self
+ecs | bevy_ui_router::ecs::RouterInputSet | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs | bevy_ui_router::ecs::RouterInputSet | bevy_ui_router_ecs | trait-impl | impl bevy_ecs::schedule::SystemSet for Self
+ecs | bevy_ui_router::ecs::RouterInstallError | bevy_ui_router_ecs | struct | pub struct RouterInstallError
+ecs | bevy_ui_router::ecs::RouterInstallError | bevy_ui_router_ecs | method | pub fn kind(&self) -> RouterInstallErrorKind
+ecs | bevy_ui_router::ecs::RouterInstallError | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::RouterInstallError | bevy_ui_router_ecs | trait-impl | impl Display for Self
+ecs | bevy_ui_router::ecs::RouterInstallError | bevy_ui_router_ecs | trait-impl | impl std::error::Error for Self
+ecs | bevy_ui_router::ecs::RouterInstallError | bevy_ui_router_ecs | compile-assert | Self: Send
+ecs | bevy_ui_router::ecs::RouterInstallError | bevy_ui_router_ecs | compile-assert | Self: Sync
+ecs | bevy_ui_router::ecs::RouterInstallError | bevy_ui_router_ecs | compile-assert | Self: 'static
+ecs | bevy_ui_router::ecs::RouterInstallErrorKind | bevy_ui_router_ecs | enum | pub enum RouterInstallErrorKind
+ecs | bevy_ui_router::ecs::RouterInstallErrorKind | bevy_ui_router_ecs | variant | MissingRouteView
+ecs | bevy_ui_router::ecs::RouterInstallErrorKind | bevy_ui_router_ecs | variant | MissingErrorView
+ecs | bevy_ui_router::ecs::RouterInstallErrorKind | bevy_ui_router_ecs | variant | UnknownRouteView
+ecs | bevy_ui_router::ecs::RouterInstallErrorKind | bevy_ui_router_ecs | variant | UnknownViewDriver
+ecs | bevy_ui_router::ecs::RouterInstallErrorKind | bevy_ui_router_ecs | variant | MissingFallbackView
+ecs | bevy_ui_router::ecs::RouterInstallErrorKind | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs | bevy_ui_router::ecs::RouterInstallErrorKind | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs | bevy_ui_router::ecs::RouterInstallErrorKind | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::RouterInstallErrorKind | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs | bevy_ui_router::ecs::RouterInstallErrorKind | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs | bevy_ui_router::ecs::RouterNavigation | bevy_ui_router_ecs | struct | pub struct RouterNavigation
+ecs | bevy_ui_router::ecs::RouterNavigation | bevy_ui_router_ecs | method | pub fn push(&mut self, router: RouterHandle, location: RouteLocation) -> Result<NavigationRequestId, NavigationEnqueueError>
+ecs | bevy_ui_router::ecs::RouterNavigation | bevy_ui_router_ecs | method | pub fn replace(&mut self, router: RouterHandle, location: RouteLocation) -> Result<NavigationRequestId, NavigationEnqueueError>
+ecs | bevy_ui_router::ecs::RouterNavigation | bevy_ui_router_ecs | method | pub fn back(&mut self, router: RouterHandle) -> Result<NavigationRequestId, NavigationEnqueueError>
+ecs | bevy_ui_router::ecs::RouterNavigation | bevy_ui_router_ecs | trait-impl | impl bevy_ecs::component::Component for Self
+ecs | bevy_ui_router::ecs::RouterNavigation | bevy_ui_router_ecs | trait-impl | impl bevy_ecs::resource::Resource for Self
+ecs | bevy_ui_router::ecs::RouterScheduleSet | bevy_ui_router_ecs | enum | pub enum RouterScheduleSet
+ecs | bevy_ui_router::ecs::RouterScheduleSet | bevy_ui_router_ecs | variant | ObserveAuthority
+ecs | bevy_ui_router::ecs::RouterScheduleSet | bevy_ui_router_ecs | variant | CollectNavigation
+ecs | bevy_ui_router::ecs::RouterScheduleSet | bevy_ui_router_ecs | variant | DriveNavigation
+ecs | bevy_ui_router::ecs::RouterScheduleSet | bevy_ui_router_ecs | variant | CommitPresentation
+ecs | bevy_ui_router::ecs::RouterScheduleSet | bevy_ui_router_ecs | variant | SettleCleanup
+ecs | bevy_ui_router::ecs::RouterScheduleSet | bevy_ui_router_ecs | variant | ReapQuarantines
+ecs | bevy_ui_router::ecs::RouterScheduleSet | bevy_ui_router_ecs | variant | PublishSnapshots
+ecs | bevy_ui_router::ecs::RouterScheduleSet | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs | bevy_ui_router::ecs::RouterScheduleSet | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs | bevy_ui_router::ecs::RouterScheduleSet | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::RouterScheduleSet | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs | bevy_ui_router::ecs::RouterScheduleSet | bevy_ui_router_ecs | trait-impl | impl Hash for Self
+ecs | bevy_ui_router::ecs::RouterScheduleSet | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs | bevy_ui_router::ecs::RouterScheduleSet | bevy_ui_router_ecs | trait-impl | impl bevy_ecs::schedule::SystemSet for Self
+ecs | bevy_ui_router::ecs::RouterSnapshot | bevy_ui_router_ecs | struct | pub struct RouterSnapshot
+ecs | bevy_ui_router::ecs::RouterSnapshot | bevy_ui_router_ecs | method | pub fn requested(&self) -> Option<&RouteLocation>
+ecs | bevy_ui_router::ecs::RouterSnapshot | bevy_ui_router_ecs | method | pub fn matched(&self) -> Option<&RouteBranchFingerprint>
+ecs | bevy_ui_router::ecs::RouterSnapshot | bevy_ui_router_ecs | method | pub fn active(&self) -> &ActivePresentation
+ecs | bevy_ui_router::ecs::RouterSnapshot | bevy_ui_router_ecs | method | pub fn availability(&self) -> &RouterAvailability
+ecs | bevy_ui_router::ecs::RouterSnapshot | bevy_ui_router_ecs | method | pub fn pending_phase(&self) -> Option<&NavigationPhase>
+ecs | bevy_ui_router::ecs::RouterSnapshot | bevy_ui_router_ecs | method | pub fn history(&self) -> &HistorySnapshot
+ecs | bevy_ui_router::ecs::RouterSnapshot | bevy_ui_router_ecs | method | pub fn running_request(&self) -> Option<NavigationRequestId>
+ecs | bevy_ui_router::ecs::RouterSnapshot | bevy_ui_router_ecs | method | pub fn earliest_retained_sequence(&self) -> Option<u64>
+ecs | bevy_ui_router::ecs::RouterSnapshot | bevy_ui_router_ecs | method | pub fn cleanup(&self) -> &CleanupSummary
+ecs | bevy_ui_router::ecs::RouterSnapshot | bevy_ui_router_ecs | method | pub fn host(&self) -> &HostSnapshot
+ecs | bevy_ui_router::ecs::RouterSnapshot | bevy_ui_router_ecs | method | pub fn diagnostics(&self) -> &DiagnosticSnapshot
+ecs | bevy_ui_router::ecs::RouterSnapshot | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs | bevy_ui_router::ecs::RouterSnapshot | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::RouterSnapshot | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs | bevy_ui_router::ecs::RouterSnapshot | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs | bevy_ui_router::ecs::RouterSnapshots | bevy_ui_router_ecs | struct | pub struct RouterSnapshots
+ecs | bevy_ui_router::ecs::RouterSnapshots | bevy_ui_router_ecs | method | pub fn get(&self, router: RouterHandle) -> Option<&RouterSnapshot>
+ecs | bevy_ui_router::ecs::RouterSnapshots | bevy_ui_router_ecs | method | pub fn request(&self, router: RouterHandle, request: NavigationRequestId) -> RequestLookup<'_>
+ecs | bevy_ui_router::ecs::RouterSnapshots | bevy_ui_router_ecs | trait-impl | impl bevy_ecs::component::Component for Self
+ecs | bevy_ui_router::ecs::RouterSnapshots | bevy_ui_router_ecs | trait-impl | impl bevy_ecs::resource::Resource for Self
+ecs | bevy_ui_router::ecs::SolidRect | bevy_ui_router_ecs | struct | pub struct SolidRect
+ecs | bevy_ui_router::ecs::SolidRect | bevy_ui_router_ecs | method | pub fn new(width_px: u16, height_px: u16, color: ContentColor) -> Result<Self, ContentPrimitiveError>
+ecs | bevy_ui_router::ecs::SolidRect | bevy_ui_router_ecs | method | pub const fn width_px(&self) -> u16
+ecs | bevy_ui_router::ecs::SolidRect | bevy_ui_router_ecs | method | pub const fn height_px(&self) -> u16
+ecs | bevy_ui_router::ecs::SolidRect | bevy_ui_router_ecs | method | pub const fn color(&self) -> ContentColor
+ecs | bevy_ui_router::ecs::SolidRect | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs | bevy_ui_router::ecs::SolidRect | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs | bevy_ui_router::ecs::SolidRect | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::SolidRect | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs | bevy_ui_router::ecs::SolidRect | bevy_ui_router_ecs | trait-impl | impl Hash for Self
+ecs | bevy_ui_router::ecs::SolidRect | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs | bevy_ui_router::ecs::ViewBuildReport | bevy_ui_router_ecs | struct | pub struct ViewBuildReport
+ecs | bevy_ui_router::ecs::ViewBuildReport | bevy_ui_router_ecs | method | pub fn kind(&self) -> ViewBuildReportKind
+ecs | bevy_ui_router::ecs::ViewBuildReport | bevy_ui_router_ecs | method | pub fn message(&self) -> Option<&str>
+ecs | bevy_ui_router::ecs::ViewBuildReport | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::ViewBuildReportKind | bevy_ui_router_ecs | enum | pub enum ViewBuildReportKind
+ecs | bevy_ui_router::ecs::ViewBuildReportKind | bevy_ui_router_ecs | variant | Applied
+ecs | bevy_ui_router::ecs::ViewBuildReportKind | bevy_ui_router_ecs | variant | BuildFailed
+ecs | bevy_ui_router::ecs::ViewBuildReportKind | bevy_ui_router_ecs | variant | ApplyFailed
+ecs | bevy_ui_router::ecs::ViewBuildReportKind | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs | bevy_ui_router::ecs::ViewBuildReportKind | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs | bevy_ui_router::ecs::ViewBuildReportKind | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::ViewBuildReportKind | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs | bevy_ui_router::ecs::ViewBuildReportKind | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs | bevy_ui_router::ecs::ViewDriverRegistrationError | bevy_ui_router_ecs | struct | pub struct ViewDriverRegistrationError
+ecs | bevy_ui_router::ecs::ViewDriverRegistrationError | bevy_ui_router_ecs | method | pub fn kind(&self) -> ViewDriverRegistrationErrorKind
+ecs | bevy_ui_router::ecs::ViewDriverRegistrationError | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::ViewDriverRegistrationError | bevy_ui_router_ecs | trait-impl | impl Display for Self
+ecs | bevy_ui_router::ecs::ViewDriverRegistrationError | bevy_ui_router_ecs | trait-impl | impl std::error::Error for Self
+ecs | bevy_ui_router::ecs::ViewDriverRegistrationError | bevy_ui_router_ecs | compile-assert | Self: Send
+ecs | bevy_ui_router::ecs::ViewDriverRegistrationError | bevy_ui_router_ecs | compile-assert | Self: Sync
+ecs | bevy_ui_router::ecs::ViewDriverRegistrationError | bevy_ui_router_ecs | compile-assert | Self: 'static
+ecs | bevy_ui_router::ecs::ViewDriverRegistrationErrorKind | bevy_ui_router_ecs | enum | pub enum ViewDriverRegistrationErrorKind
+ecs | bevy_ui_router::ecs::ViewDriverRegistrationErrorKind | bevy_ui_router_ecs | variant | DuplicateKey
+ecs | bevy_ui_router::ecs::ViewDriverRegistrationErrorKind | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs | bevy_ui_router::ecs::ViewDriverRegistrationErrorKind | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs | bevy_ui_router::ecs::ViewDriverRegistrationErrorKind | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs | bevy_ui_router::ecs::ViewDriverRegistrationErrorKind | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs | bevy_ui_router::ecs::ViewDriverRegistrationErrorKind | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+
+ecs-test-support | bevy_ui_router::ecs::AuditEntityId | bevy_ui_router_ecs | struct | pub struct AuditEntityId
+ecs-test-support | bevy_ui_router::ecs::AuditEntityId | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::AuditEntityId | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs-test-support | bevy_ui_router::ecs::AuditEntityId | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::AuditEntityId | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::AuditEntityId | bevy_ui_router_ecs | trait-impl | impl Hash for Self
+ecs-test-support | bevy_ui_router::ecs::AuditEntityId | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs-test-support | bevy_ui_router::ecs::AuditEntityState | bevy_ui_router_ecs | enum | pub enum AuditEntityState
+ecs-test-support | bevy_ui_router::ecs::AuditEntityState | bevy_ui_router_ecs | variant | PresentOwned
+ecs-test-support | bevy_ui_router::ecs::AuditEntityState | bevy_ui_router_ecs | variant | Quarantined
+ecs-test-support | bevy_ui_router::ecs::AuditEntityState | bevy_ui_router_ecs | variant | Removed
+ecs-test-support | bevy_ui_router::ecs::AuditEntityState | bevy_ui_router_ecs | variant | NotRetained
+ecs-test-support | bevy_ui_router::ecs::AuditEntityState | bevy_ui_router_ecs | variant | Unknown
+ecs-test-support | bevy_ui_router::ecs::AuditEntityState | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::AuditEntityState | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs-test-support | bevy_ui_router::ecs::AuditEntityState | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::AuditEntityState | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::AuditEntityState | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityContentMapping | bevy_ui_router_ecs | struct | pub struct AuthorityContentMapping
+ecs-test-support | bevy_ui_router::ecs::AuthorityContentMapping | bevy_ui_router_ecs | method | pub fn frame(&self) -> &RouteFrameVersion
+ecs-test-support | bevy_ui_router::ecs::AuthorityContentMapping | bevy_ui_router_ecs | method | pub fn entity(&self) -> AuditEntityId
+ecs-test-support | bevy_ui_router::ecs::AuthorityContentMapping | bevy_ui_router_ecs | method | pub fn primitive(&self) -> ContentPrimitiveKind
+ecs-test-support | bevy_ui_router::ecs::AuthorityContentMapping | bevy_ui_router_ecs | method | pub fn width_px(&self) -> u16
+ecs-test-support | bevy_ui_router::ecs::AuthorityContentMapping | bevy_ui_router_ecs | method | pub fn height_px(&self) -> u16
+ecs-test-support | bevy_ui_router::ecs::AuthorityContentMapping | bevy_ui_router_ecs | method | pub fn color(&self) -> ContentColor
+ecs-test-support | bevy_ui_router::ecs::AuthorityContentMapping | bevy_ui_router_ecs | method | pub fn visibility_hidden(&self) -> bool
+ecs-test-support | bevy_ui_router::ecs::AuthorityContentMapping | bevy_ui_router_ecs | method | pub fn pickable_active(&self) -> bool
+ecs-test-support | bevy_ui_router::ecs::AuthorityContentMapping | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityContentMapping | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityContentMapping | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityContentMapping | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameLifecycle | bevy_ui_router_ecs | enum | pub enum AuthorityFrameLifecycle
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameLifecycle | bevy_ui_router_ecs | variant | PreparedInert
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameLifecycle | bevy_ui_router_ecs | variant | Active
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameLifecycle | bevy_ui_router_ecs | variant | LeavingInert
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameLifecycle | bevy_ui_router_ecs | variant | Quarantined
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameLifecycle | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameLifecycle | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameLifecycle | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameLifecycle | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameLifecycle | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameMapping | bevy_ui_router_ecs | struct | pub struct AuthorityFrameMapping
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameMapping | bevy_ui_router_ecs | method | pub fn frame(&self) -> &RouteFrameVersion
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameMapping | bevy_ui_router_ecs | method | pub fn root(&self) -> AuditEntityId
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameMapping | bevy_ui_router_ecs | method | pub fn slot_entity(&self) -> AuditEntityId
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameMapping | bevy_ui_router_ecs | method | pub fn lifecycle(&self) -> AuthorityFrameLifecycle
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameMapping | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameMapping | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameMapping | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityFrameMapping | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityHostMapping | bevy_ui_router_ecs | struct | pub struct AuthorityHostMapping
+ecs-test-support | bevy_ui_router::ecs::AuthorityHostMapping | bevy_ui_router_ecs | method | pub fn version(&self) -> &HostVersion
+ecs-test-support | bevy_ui_router::ecs::AuthorityHostMapping | bevy_ui_router_ecs | method | pub fn entity(&self) -> AuditEntityId
+ecs-test-support | bevy_ui_router::ecs::AuthorityHostMapping | bevy_ui_router_ecs | method | pub fn top_slot(&self) -> AuditEntityId
+ecs-test-support | bevy_ui_router::ecs::AuthorityHostMapping | bevy_ui_router_ecs | method | pub fn matches_app_entity(&self, entity: bevy_ecs::entity::Entity) -> bool
+ecs-test-support | bevy_ui_router::ecs::AuthorityHostMapping | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityHostMapping | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityHostMapping | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityHostMapping | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityOutletMapping | bevy_ui_router_ecs | struct | pub struct AuthorityOutletMapping
+ecs-test-support | bevy_ui_router::ecs::AuthorityOutletMapping | bevy_ui_router_ecs | method | pub fn parent(&self) -> &RouteFrameVersion
+ecs-test-support | bevy_ui_router::ecs::AuthorityOutletMapping | bevy_ui_router_ecs | method | pub fn key(&self) -> &RouteSlotKey
+ecs-test-support | bevy_ui_router::ecs::AuthorityOutletMapping | bevy_ui_router_ecs | method | pub fn anchor(&self) -> AuditEntityId
+ecs-test-support | bevy_ui_router::ecs::AuthorityOutletMapping | bevy_ui_router_ecs | method | pub fn child_slot(&self) -> Option<AuditEntityId>
+ecs-test-support | bevy_ui_router::ecs::AuthorityOutletMapping | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityOutletMapping | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityOutletMapping | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::AuthorityOutletMapping | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotKind | bevy_ui_router_ecs | enum | pub enum AuthoritySlotKind
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotKind | bevy_ui_router_ecs | variant | HostTop
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotKind | bevy_ui_router_ecs | variant | ChildOutlet
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotKind | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotKind | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotKind | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotKind | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotKind | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotMapping | bevy_ui_router_ecs | struct | pub struct AuthoritySlotMapping
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotMapping | bevy_ui_router_ecs | method | pub fn id(&self) -> RouteSlotId
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotMapping | bevy_ui_router_ecs | method | pub fn entity(&self) -> AuditEntityId
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotMapping | bevy_ui_router_ecs | method | pub fn host(&self) -> &HostVersion
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotMapping | bevy_ui_router_ecs | method | pub fn kind(&self) -> AuthoritySlotKind
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotMapping | bevy_ui_router_ecs | method | pub fn parent_frame(&self) -> Option<&RouteFrameVersion>
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotMapping | bevy_ui_router_ecs | method | pub fn outlet(&self) -> Option<&RouteSlotKey>
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotMapping | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotMapping | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotMapping | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::AuthoritySlotMapping | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs-test-support | bevy_ui_router::ecs::InputProbeResult | bevy_ui_router_ecs | enum | pub enum InputProbeResult
+ecs-test-support | bevy_ui_router::ecs::InputProbeResult | bevy_ui_router_ecs | variant | Delivered
+ecs-test-support | bevy_ui_router::ecs::InputProbeResult | bevy_ui_router_ecs | variant | Blocked
+ecs-test-support | bevy_ui_router::ecs::InputProbeResult | bevy_ui_router_ecs | variant | Unknown
+ecs-test-support | bevy_ui_router::ecs::InputProbeResult | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::InputProbeResult | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs-test-support | bevy_ui_router::ecs::InputProbeResult | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::InputProbeResult | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::InputProbeResult | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineLeaseId | bevy_ui_router_ecs | struct | pub struct QuarantineLeaseId
+ecs-test-support | bevy_ui_router::ecs::QuarantineLeaseId | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineLeaseId | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineLeaseId | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineLeaseId | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineLeaseId | bevy_ui_router_ecs | trait-impl | impl Hash for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineLeaseId | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerKind | bevy_ui_router_ecs | enum | pub enum QuarantineOwnerKind
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerKind | bevy_ui_router_ecs | variant | HostTopSlot
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerKind | bevy_ui_router_ecs | variant | ChildSlot
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerKind | bevy_ui_router_ecs | variant | FrameShell
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerKind | bevy_ui_router_ecs | variant | FrameOutput
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerKind | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerKind | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerKind | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerKind | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerKind | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerSnapshot | bevy_ui_router_ecs | struct | pub struct QuarantineOwnerSnapshot
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerSnapshot | bevy_ui_router_ecs | method | pub fn lease_id(&self) -> QuarantineLeaseId
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerSnapshot | bevy_ui_router_ecs | method | pub fn kind(&self) -> QuarantineOwnerKind
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerSnapshot | bevy_ui_router_ecs | method | pub fn former_host(&self) -> &HostVersion
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerSnapshot | bevy_ui_router_ecs | method | pub fn entity_count(&self) -> usize
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerSnapshot | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerSnapshot | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerSnapshot | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineOwnerSnapshot | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineSnapshot | bevy_ui_router_ecs | struct | pub struct QuarantineSnapshot
+ecs-test-support | bevy_ui_router::ecs::QuarantineSnapshot | bevy_ui_router_ecs | method | pub fn former_host(&self) -> &HostVersion
+ecs-test-support | bevy_ui_router::ecs::QuarantineSnapshot | bevy_ui_router_ecs | method | pub fn root(&self) -> AuditEntityId
+ecs-test-support | bevy_ui_router::ecs::QuarantineSnapshot | bevy_ui_router_ecs | method | pub fn foreign_targets(&self) -> &[AuditEntityId]
+ecs-test-support | bevy_ui_router::ecs::QuarantineSnapshot | bevy_ui_router_ecs | method | pub fn root_owner(&self) -> &QuarantineOwnerSnapshot
+ecs-test-support | bevy_ui_router::ecs::QuarantineSnapshot | bevy_ui_router_ecs | method | pub fn foreign_count(&self) -> usize
+ecs-test-support | bevy_ui_router::ecs::QuarantineSnapshot | bevy_ui_router_ecs | method | pub fn foreign_component_count(&self) -> usize
+ecs-test-support | bevy_ui_router::ecs::QuarantineSnapshot | bevy_ui_router_ecs | method | pub fn protected_parent(&self) -> bool
+ecs-test-support | bevy_ui_router::ecs::QuarantineSnapshot | bevy_ui_router_ecs | method | pub fn inert(&self) -> bool
+ecs-test-support | bevy_ui_router::ecs::QuarantineSnapshot | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineSnapshot | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineSnapshot | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::QuarantineSnapshot | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAuditSnapshot | bevy_ui_router_ecs | struct | pub struct RouterAuthorityAuditSnapshot
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAuditSnapshot | bevy_ui_router_ecs | method | pub fn host(&self) -> Option<&AuthorityHostMapping>
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAuditSnapshot | bevy_ui_router_ecs | method | pub fn slots(&self) -> &[AuthoritySlotMapping]
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAuditSnapshot | bevy_ui_router_ecs | method | pub fn frames(&self) -> &[AuthorityFrameMapping]
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAuditSnapshot | bevy_ui_router_ecs | method | pub fn outlets(&self) -> &[AuthorityOutletMapping]
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAuditSnapshot | bevy_ui_router_ecs | method | pub fn content(&self) -> &[AuthorityContentMapping]
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAuditSnapshot | bevy_ui_router_ecs | method | pub fn orphan_slots(&self) -> &[RouteSlotId]
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAuditSnapshot | bevy_ui_router_ecs | method | pub fn quarantines(&self) -> &[QuarantineSnapshot]
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAuditSnapshot | bevy_ui_router_ecs | method | pub fn events(&self) -> &[RouterLifecycleAuditEvent]
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAuditSnapshot | bevy_ui_router_ecs | method | pub fn owned_entity_state(&self, entity: AuditEntityId) -> AuditEntityState
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAuditSnapshot | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAuditSnapshot | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAuditSnapshot | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAuditSnapshot | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAudits | bevy_ui_router_ecs | struct | pub struct RouterAuthorityAudits
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAudits | bevy_ui_router_ecs | method | pub fn get(&self, router: RouterHandle) -> Option<&RouterAuthorityAuditSnapshot>
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAudits | bevy_ui_router_ecs | trait-impl | impl bevy_ecs::component::Component for Self
+ecs-test-support | bevy_ui_router::ecs::RouterAuthorityAudits | bevy_ui_router_ecs | trait-impl | impl bevy_ecs::resource::Resource for Self
+ecs-test-support | bevy_ui_router::ecs::RouterInputModality | bevy_ui_router_ecs | enum | pub enum RouterInputModality
+ecs-test-support | bevy_ui_router::ecs::RouterInputModality | bevy_ui_router_ecs | variant | Pointer
+ecs-test-support | bevy_ui_router::ecs::RouterInputModality | bevy_ui_router_ecs | variant | Keyboard
+ecs-test-support | bevy_ui_router::ecs::RouterInputModality | bevy_ui_router_ecs | variant | Gamepad
+ecs-test-support | bevy_ui_router::ecs::RouterInputModality | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::RouterInputModality | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs-test-support | bevy_ui_router::ecs::RouterInputModality | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::RouterInputModality | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::RouterInputModality | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs-test-support | bevy_ui_router::ecs::RouterInputProbes | bevy_ui_router_ecs | struct | pub struct RouterInputProbes
+ecs-test-support | bevy_ui_router::ecs::RouterInputProbes | bevy_ui_router_ecs | method | pub fn dispatch(&mut self, router: RouterHandle, target: AuditEntityId, modality: RouterInputModality) -> InputProbeResult
+ecs-test-support | bevy_ui_router::ecs::RouterInputProbes | bevy_ui_router_ecs | method | pub fn delivery_count(&self, target: AuditEntityId, modality: RouterInputModality) -> u64
+ecs-test-support | bevy_ui_router::ecs::RouterInputProbes | bevy_ui_router_ecs | trait-impl | impl bevy_ecs::component::Component for Self
+ecs-test-support | bevy_ui_router::ecs::RouterInputProbes | bevy_ui_router_ecs | trait-impl | impl bevy_ecs::resource::Resource for Self
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEvent | bevy_ui_router_ecs | struct | pub struct RouterLifecycleAuditEvent
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEvent | bevy_ui_router_ecs | method | pub fn kind(&self) -> RouterLifecycleAuditEventKind
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEvent | bevy_ui_router_ecs | method | pub fn frame(&self) -> Option<&RouteFrameVersion>
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEvent | bevy_ui_router_ecs | method | pub fn entity(&self) -> Option<AuditEntityId>
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEvent | bevy_ui_router_ecs | method | pub fn visibility_hidden(&self) -> bool
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEvent | bevy_ui_router_ecs | method | pub fn accepts_pointer(&self) -> bool
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEvent | bevy_ui_router_ecs | method | pub fn accepts_keyboard(&self) -> bool
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEvent | bevy_ui_router_ecs | method | pub fn accepts_gamepad(&self) -> bool
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEvent | bevy_ui_router_ecs | method | pub fn focused(&self) -> bool
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEvent | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEvent | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEvent | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEvent | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEventKind | bevy_ui_router_ecs | enum | pub enum RouterLifecycleAuditEventKind
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEventKind | bevy_ui_router_ecs | variant | ShellPrepared
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEventKind | bevy_ui_router_ecs | variant | FrameIsolated
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEventKind | bevy_ui_router_ecs | variant | FrameActivated
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEventKind | bevy_ui_router_ecs | variant | RegistryPublished
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEventKind | bevy_ui_router_ecs | variant | QuarantineOpened
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEventKind | bevy_ui_router_ecs | variant | QuarantineReaped
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEventKind | bevy_ui_router_ecs | trait-impl | impl Clone for Self
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEventKind | bevy_ui_router_ecs | trait-impl | impl Copy for Self
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEventKind | bevy_ui_router_ecs | trait-impl | impl Debug for Self
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEventKind | bevy_ui_router_ecs | trait-impl | impl Eq for Self
+ecs-test-support | bevy_ui_router::ecs::RouterLifecycleAuditEventKind | bevy_ui_router_ecs | trait-impl | impl PartialEq for Self
+
+platform | bevy_ui_router::platform::prelude::BackCapabilitySnapshot | bevy_ui_router_core | struct | pub struct BackCapabilitySnapshot
+platform | bevy_ui_router::platform::prelude::BackCapabilitySnapshot | bevy_ui_router_core | method | pub const fn new(can_pop_history: bool, has_local_layer: bool, host_may_handle: bool) -> Self
+platform | bevy_ui_router::platform::prelude::BackCapabilitySnapshot | bevy_ui_router_core | method | pub const fn can_pop_history(self) -> bool
+platform | bevy_ui_router::platform::prelude::BackCapabilitySnapshot | bevy_ui_router_core | method | pub const fn has_local_layer(self) -> bool
+platform | bevy_ui_router::platform::prelude::BackCapabilitySnapshot | bevy_ui_router_core | method | pub const fn host_may_handle(self) -> bool
+platform | bevy_ui_router::platform::prelude::BackCapabilitySnapshot | bevy_ui_router_core | trait-impl | impl Clone for Self
+platform | bevy_ui_router::platform::prelude::BackCapabilitySnapshot | bevy_ui_router_core | trait-impl | impl Copy for Self
+platform | bevy_ui_router::platform::prelude::BackCapabilitySnapshot | bevy_ui_router_core | trait-impl | impl Debug for Self
+platform | bevy_ui_router::platform::prelude::BackCapabilitySnapshot | bevy_ui_router_core | trait-impl | impl Eq for Self
+platform | bevy_ui_router::platform::prelude::BackCapabilitySnapshot | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+platform | bevy_ui_router::platform::prelude::BackIntent | bevy_ui_router_core | enum | pub enum BackIntent
+platform | bevy_ui_router::platform::prelude::BackIntent | bevy_ui_router_core | variant | NavigateBack
+platform | bevy_ui_router::platform::prelude::BackIntent | bevy_ui_router_core | trait-impl | impl Clone for Self
+platform | bevy_ui_router::platform::prelude::BackIntent | bevy_ui_router_core | trait-impl | impl Copy for Self
+platform | bevy_ui_router::platform::prelude::BackIntent | bevy_ui_router_core | trait-impl | impl Debug for Self
+platform | bevy_ui_router::platform::prelude::BackIntent | bevy_ui_router_core | trait-impl | impl Eq for Self
+platform | bevy_ui_router::platform::prelude::BackIntent | bevy_ui_router_core | trait-impl | impl PartialEq for Self
+platform | bevy_ui_router::platform::prelude::BackPolicy | bevy_ui_router_core | enum | pub enum BackPolicy
+platform | bevy_ui_router::platform::prelude::BackPolicy | bevy_ui_router_core | variant | PopHistory
+platform | bevy_ui_router::platform::prelude::BackPolicy | bevy_ui_router_core | variant | Block
+platform | bevy_ui_router::platform::prelude::BackPolicy | bevy_ui_router_core | variant | DelegateToHost
+platform | bevy_ui_router::platform::prelude::BackPolicy | bevy_ui_router_core | trait-impl | impl Clone for Self
+platform | bevy_ui_router::platform::prelude::BackPolicy | bevy_ui_router_core | trait-impl | impl Copy for Self
+platform | bevy_ui_router::platform::prelude::BackPolicy | bevy_ui_router_core | trait-impl | impl Debug for Self
+platform | bevy_ui_router::platform::prelude::BackPolicy | bevy_ui_router_core | trait-impl | impl Eq for Self
+platform | bevy_ui_router::platform::prelude::BackPolicy | bevy_ui_router_core | trait-impl | impl PartialEq for Self

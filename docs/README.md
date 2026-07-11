@@ -1,66 +1,58 @@
-# Bevy UI Router 独立开发资料包
+# Bevy UI Router 文档索引
 
-**日期**: 2026-07-06  
-**用途**: 面向外部独立开发者的通用 Bevy UI Router 设计交接资料。  
-**范围**: Bevy UI 路由框架、ECS 集成、BSN view adapter、平台 adapter、测试与交付边界。  
+**状态**: Phase 3B.1 `Plan PASS`
+**基准提交**: `23fe826033d09716553dd6922dd204c4a45b1a6c`
+**更新时间**: 2026-07-11
 
----
+## 权威顺序
 
-## 资料包目标
+发生冲突时，按以下顺序判断：
 
-本文档集只描述一个通用 Bevy UI Router 框架。它不假设任何具体产品、宿主应用、业务领域、通信协议、主题系统、页面结构或迁移历史。
+1. 已确认的用户决策与仓库根目录 [`AGENTS.md`](../AGENTS.md)。
+2. [Target Architecture](target-architecture.md) 的架构边界、依赖方向与不变量。
+3. [Authority Transition Matrix](authority-transition-matrix.md) 的生命周期转换细节；若生命周期细节与 Target 的概括冲突，以 Matrix 为准，但不得违反 Target 的架构不变量。
+4. [Facade Contract Fixture](facade-contract-fixture.md) 的公共签名与消费者装配形状。
+5. [Facade Export Allowlist](facade-export-allowlist.md) 的公共 module、path、prelude 与 feature 边界。
+6. [Facade Associated API Golden](facade-associated-api-golden.txt) 的逐类型 associated item、trait 与签名类型图闭包。
+7. [MVP Acceptance Journeys](mvp-acceptance-journeys.md) 的外部行为和验收门槛。
+8. [Current Architecture](current-architecture.md) 对基准提交的事实描述。
+9. [Roadmap](roadmap.md) 的执行顺序。
+10. 历史计划、研究资料和审查记录仅作为证据，不定义当前目标。
 
-设计目标是：
+## 当前文档
 
-1. 借鉴 Web Router 生态成熟模式，建立 route tree、nested outlet、layout route、typed navigation、error boundary 等核心合同。
-2. 适配 Bevy ECS 的实体生命周期、schedule、relationship、focus、visibility、pickability 与 World 访问约束。
-3. 将 BSN 作为首个 view adapter，而不是 Router core。
-4. 保持 Router core 独立、可测试、renderer-agnostic，并允许应用通过 integration profile 注入自身约定。
-5. 为外部开发者提供清晰的模块边界、MVP 范围、风险清单和测试矩阵。
-
----
-
-## 文档索引
-
-| 文档 | 内容 |
+| 文档 | 作用 |
 | --- | --- |
-| [AGENTS.md](AGENTS.md) | 纯 Bevy UI Router 开发环境的 agent 协作规范 |
-| [01-BSN-scene-authoring-boundaries.md](01-BSN-scene-authoring-boundaries.md) | Bevy 0.19 BSN 的能力、边界、风险，以及作为 Router view adapter 的设计原则 |
-| [02-Web-router-patterns-for-Bevy.md](02-Web-router-patterns-for-Bevy.md) | React Router、Remix、TanStack Router、Next、Vue Router、SvelteKit 可迁移模式和 Bevy 改造点 |
-| [03-Core-architecture-and-MVP.md](03-Core-architecture-and-MVP.md) | 通用 Router core、Bevy ECS integration、view adapter、BSN adapter、platform adapter 的架构与 MVP |
-| [04-Risks-tests-and-handoff.md](04-Risks-tests-and-handoff.md) | 风险、测试矩阵、阶段路线、交接边界和脱敏检查清单 |
-| [05-Non-MVP-capabilities-in-Bevy.md](05-Non-MVP-capabilities-in-Bevy.md) | 非 MVP 能力在纯 Bevy 环境中的真实场景、必要性和架构预留方式 |
+| [Current Architecture](current-architecture.md) | 记录当前代码已经实现、已经集成、公共可达和已演示的能力 |
+| [Target Architecture](target-architecture.md) | 定义 Phase 3B.1 的模块边界、身份模型、数据流和提交语义 |
+| [MVP Acceptance Journeys](mvp-acceptance-journeys.md) | 从 facade 公共 API 描述 MVP 必须通过的完整用户旅程 |
+| [Facade Contract Fixture](facade-contract-fixture.md) | 固定可编译的消费者装配、fault driver 与 trace 观察合同 |
+| [Facade Export Allowlist](facade-export-allowlist.md) | 固定逐 feature、逐 module、逐 symbol 的公共导出边界 |
+| [Facade Associated API Golden](facade-associated-api-golden.txt) | 固定所有允许类型的字段、variant、method、trait 与签名闭包 |
+| [Authority Transition Matrix](authority-transition-matrix.md) | 固定 token、closure、preflight、quarantine、epoch 与 request 终态 |
+| [Roadmap](roadmap.md) | 记录 Now、Next 和暂停项，不重复架构正文 |
+| [Phase 3B.1 Review Log](phase-3b1-architecture-review-log.md) | 记录审查共同根因、负责人处置和复审结论 |
+| [历史证据说明](superpowers/README.md) | 冻结旧计划和审查记录，说明其证据范围 |
 
----
+## 按问题查找
 
-## 核心原则
+- 架构边界、crate归属与数据流：查 [Target Architecture](target-architecture.md)。
+- token、commit、cleanup、quarantine与终态：查 [Authority Transition Matrix](authority-transition-matrix.md)。
+- 公共签名与消费者装配：查 [Facade Contract Fixture](facade-contract-fixture.md)；导出路径查 [Facade Export Allowlist](facade-export-allowlist.md)；逐类型关联API查 [Facade Associated API Golden](facade-associated-api-golden.txt)。
+- 用户可观察行为与最终门槛：查 [MVP Acceptance Journeys](mvp-acceptance-journeys.md)。
+- 实施顺序与当前基线差距：分别查 [Roadmap](roadmap.md) 与 [Current Architecture](current-architecture.md)。
 
-1. **Router core 不依赖 BSN**  
-   Core 只理解 route、location、branch、frame、state、cache、error 与 diagnostics。
+## 参考资料
 
-2. **BSN 是 view adapter**  
-   BSN 负责描述、resolve、apply Bevy scene，不负责 history、guard、loader、transition 或 back policy。
+- [01 BSN scene authoring boundaries](01-BSN-scene-authoring-boundaries.md) 与 [02 Web router patterns for Bevy](02-Web-router-patterns-for-Bevy.md) 是研究参考，不是当前实现事实。
+- [03 Core architecture and MVP](03-Core-architecture-and-MVP.md)、[04 Risks, tests and handoff](04-Risks-tests-and-handoff.md) 与 [05 Non-MVP capabilities](05-Non-MVP-capabilities-in-Bevy.md) 是早期设计基线；其中与当前权威文档冲突的内容已被取代。
 
-3. **Bevy ECS integration 是单独层**  
-   `RouteHost`、`RouteSlot`、frame root marker、entity ownership、hierarchy mutation、visibility、pickability 和 focus 收敛都属于 ECS integration。
+## 状态用语
 
-4. **应用约定通过 integration profile 注入**  
-   主题、文案、权限、数据服务、持久 shell 策略、业务错误 payload 都不能进入 Router core。
+- **Implemented**：局部算法或类型存在并有针对性验证。
+- **Integrated**：能力已接入统一运行路径。
+- **Low-level reachable**：外部可以通过 facade 的 crate/module re-export 直接调用局部协议，其中部分受 feature 控制。
+- **Facade reachable**：外部只用推荐的高层 facade API 即可触发完整流程。
+- **Demonstrated**：真实 `App::update` 旅程已证明用户可观察行为。
 
-5. **MVP 要小而可验证**  
-   首版优先证明 route tree、matcher、branch reconciliation、frame lifecycle、BSN immediate apply、failure cleanup 和 diagnostics。
-
----
-
-## 建议交付物
-
-外部独立开发应至少产出：
-
-- Public API draft
-- State machine diagram
-- Error taxonomy
-- Test harness
-- Minimal examples
-- Adapter responsibility table
-- Known non-goals
-- Desensitization checklist
+只有实现、集成、推荐 facade 可达和真实旅程演示全部成立，才能把一项能力计入 MVP 完成度；低层可达只记录兼容面。`Plan PASS`、`Task PASS`、`Journey PASS` 和 `MVP PASS` 必须分别使用，不能相互替代。
