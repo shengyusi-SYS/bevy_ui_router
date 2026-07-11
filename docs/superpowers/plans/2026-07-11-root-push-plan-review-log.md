@@ -38,3 +38,13 @@ Two fresh reviewers independently returned `NO REWRITE`. They found the final-sp
 ## Conclusion
 
 Root push planning is `Plan PASS`. Implementation must begin at Task 1 and may claim only per-task completion until Task 12 evidence and independent implementation reviews pass.
+
+## Implementation Clarification: Task 3
+
+During Task 3, an independent factual checklist exposed two stage-plan transcription errors and one facade projection omission. The lead evaluated them against the documented authority order instead of accepting the findings mechanically:
+
+- The blanket ban on public ID `raw()` access was narrowed to `RouterHandle` and `NavigationRequestId`; other read-only ID projections remain exactly as frozen by the associated-API golden, while every constructor and allocator stays crate-private.
+- The final public `NavigationRequestSnapshot` remains ECS-owned. Task 3 produces only the Core-private request-record foundation used by the later ECS snapshot projection.
+- Target Architecture consistently requires committed error presentation to expose its matched fingerprint, while Fixture/Golden omitted the accessor. The omission was corrected with `ActivePresentation::matched()` and explicit match-failure/post-match recovery assertions; no new runtime capability or Root-profile exception was introduced.
+
+These are local consistency corrections. They do not change module authority, lifecycle semantics, task order, or the Root push scope. A `gpt-5.6-sol` high factual/facade re-review and a `gpt-5.6-terra` high implementation-sequencing re-review both returned `PASS` with no findings, so the plan remains `Plan PASS`.

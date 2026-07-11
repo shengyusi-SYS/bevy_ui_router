@@ -70,12 +70,13 @@ Facade journey 的“稳定”只依赖生产观察面：该 router 没有 runni
 - 原 active presentation 在 recovery commit 前保持可见。
 - 最近绑定 boundary 或 router fallback 使用新的 recovery attempt 和完整 identity。
 - recovery 成功后 snapshot 为 `ActivePresentation::Error` 且 request 为 `Failed`；core/ECS 对 error frames 一一对应。
+- 成功 match 后进入 recovery 的 error presentation，其 `matched()` 与原 request 保存的 immutable fingerprint 一致。
 - recovery失败则旧presentation保持active，所有attempt的inert roots被清理，request精确为`Failed(RecoveryFailed)`；原始failure与recovery failure均保留在trace/diagnostics。
 - 稳定后下一次合法导航可以执行。
 
 ECS crate-private regression 另外在 accepted entering output realization 后破坏 outlet authority，要求 `MountRequested -> MountRejected(InvalidOutlet)`、`PendingRejected` 且旧 active 不变；再破坏 preserved/current parent 的既有 outlet，要求 `MountRequested -> MountRejected(ParentAuthorityLost)` 后进入 `AuthorityLost` settlement、清空失效 active且绝不渲染 fallback。这样 plan writer 错误、pending mount 缺陷和现有 authority 丢失不会被同一个通用 `ApplyFailed` 掩盖。
 
-match failure时对应`NavigationRequestSnapshot::matched()`必须为`None`；router snapshot的running摘要在该request terminal后清空，不能用来替代request记录。mandatory fallback经顶层host outlet构建`RouterFallback` error frame。fallback成功后request按原始`Match` cause为`Failed`、history不推进、error presentation原子提交；fallback也失败时request为`Failed(RecoveryFailed)`，保留旧presentation，首次导航则保持`None`。
+match failure时对应`NavigationRequestSnapshot::matched()`与 committed error presentation 的 `matched()` 必须均为`None`；router snapshot的running摘要在该request terminal后清空，不能用来替代request记录或active presentation。mandatory fallback经顶层host outlet构建`RouterFallback` error frame。fallback成功后request按原始`Match` cause为`Failed`、history不推进、error presentation原子提交；fallback也失败时request为`Failed(RecoveryFailed)`，保留旧presentation，首次导航则保持`None`。
 
 缺少普通 view 的 route node、无法解析的 route/fallback binding 和未注册 driver 都是 `add_ui_router` 的同步 `RouterInstallError` 合同，由 facade consumer test 验证；MVP 没有动态 unregister，因此不伪造成 runtime Journey D。
 

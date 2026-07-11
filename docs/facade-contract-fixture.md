@@ -241,6 +241,7 @@ impl ActivePresentation {
     pub fn kind(&self) -> ActivePresentationKind;
     pub fn location(&self) -> Option<&RouteLocation>;
     pub fn requested(&self) -> Option<&RouteLocation>;
+    pub fn matched(&self) -> Option<&RouteBranchFingerprint>;
     pub fn frames(&self) -> &[RouteFrameVersion];
     pub fn failure(&self) -> Option<&NavigationFailure>;
 }
@@ -635,7 +636,7 @@ pub enum RouterLifecycleAuditEventKind {
 
 Writer 只维护 session-local `ContentPlan`，所有方法在 driver 返回前 World 零变化。`spawn_empty` 创建无业务primitive数据的结构handle，但成功realization必须把它变为100% width/height、透明、始终`Pickable::IGNORE`的Router-owned `Node`，不能留下physical non-Node Entity；它可作为parent/outlet anchor并进入FrameOutput manifest/audit。`spawn_solid_rect` 只接受已验证的 data-only `SolidRect`，不存在接受 `Bundle`、component、asset handle、effect、callback、hook 或 observer 的重载；hierarchy 只能通过同 session handles调用 `add_child`，且在写 plan 前拒绝 self-edge、duplicate edge/parent 和 visited-reachability cycle。`despawn` 只接受本 session 创建、仍为空且尚未声明为 outlet/authority boundary 的 planned output；driver 返回成功后 ECS 才 staging-realize完整 plan并复验。方法不暴露 raw `World`、`Commands` 或 Entity。ECS 对所有handles先施加hidden/gate deny/`Pickable::IGNORE`并插入锁定Bevy `Node`递归closure；`SolidRect`再增加指定 `BackgroundColor`。
 
-`ActivePresentation::location()` 只在 `Route` 返回值，`requested()` 与 `failure()` 只在 `Error` 返回值；`None` 的 frames 为空。`pending_phase()` 在没有 running request 时为 `None`；`earliest_retained_sequence()` 在尚无 retained terminal record 时为 `None`。`NavigationFailure` 只含分类和脱敏 message，不含 raw source、Entity 或 authority identity。
+`ActivePresentation::location()` 只在 `Route` 返回值，`requested()`、`matched()` 与 `failure()` 只在 `Error` 返回值；match failure 的 error presentation 中 `matched()` 为 `None`，成功 match 后的 build/apply/mount recovery error 中为原 request 的 immutable fingerprint；`None` 的 frames 为空。`pending_phase()` 在没有 running request 时为 `None`；`earliest_retained_sequence()` 在尚无 retained terminal record 时为 `None`。`NavigationFailure` 只含分类和脱敏 message，不含 raw source、Entity 或 authority identity。
 
 `AuditEntityId`、`QuarantineLeaseId` 都没有 raw constructor、数值 accessor 或到 Bevy `Entity` 的转换；前者由 audit registry 全局唯一、独立分配，不是 Entity bits/index/generation/hash 的投影，只实现 `Clone + Copy + Debug + Eq + Hash`，用于跨 router/audit snapshot 关联 exact Entity generation。`AuthorityHostMapping::matches_app_entity` 只做 equality probe，不返回 raw internal Entity；host/top-slot、slot/frame/outlet 的 Audit IDs 必须相互可连接。`AuthorityOutletMapping` 按 parent frame version 与 outlet key 唯一排序，anchor 可跨 leaf replacement 比较；child 未挂载时 `child_slot()` 为 `None`。
 

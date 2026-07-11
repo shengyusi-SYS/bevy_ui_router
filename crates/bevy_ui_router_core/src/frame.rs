@@ -33,6 +33,68 @@ use crate::ownership::CleanupScope;
 use crate::slot::RouteSlotKey;
 use std::collections::BTreeMap;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FrameOrigin {
+    MatchedRoute(RouteId),
+    RouteError(RouteId),
+    RouterFallback,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteFrameVersion {
+    router: RouterInstanceId,
+    host: RouteHostId,
+    slot: RouteSlotId,
+    origin: FrameOrigin,
+    frame: RouteFrameId,
+    generation: RouteGeneration,
+}
+
+impl RouteFrameVersion {
+    #[allow(dead_code)]
+    pub(crate) const fn new(
+        router: RouterInstanceId,
+        host: RouteHostId,
+        slot: RouteSlotId,
+        origin: FrameOrigin,
+        frame: RouteFrameId,
+        generation: RouteGeneration,
+    ) -> Self {
+        Self {
+            router,
+            host,
+            slot,
+            origin,
+            frame,
+            generation,
+        }
+    }
+
+    pub const fn router(&self) -> RouterInstanceId {
+        self.router
+    }
+
+    pub const fn host(&self) -> RouteHostId {
+        self.host
+    }
+
+    pub const fn slot(&self) -> RouteSlotId {
+        self.slot
+    }
+
+    pub const fn origin(&self) -> &FrameOrigin {
+        &self.origin
+    }
+
+    pub const fn frame(&self) -> RouteFrameId {
+        self.frame
+    }
+
+    pub const fn generation(&self) -> RouteGeneration {
+        self.generation
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RouteFrameScope {
     router: RouterInstanceId,

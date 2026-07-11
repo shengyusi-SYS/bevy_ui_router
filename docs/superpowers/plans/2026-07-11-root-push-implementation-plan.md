@@ -250,7 +250,7 @@ Commit: `feat(core): add canonical route view model`
 - Modify: `crates/bevy_ui_router_core/src/lib.rs`
 
 **Interfaces:**
-- Produces: non-forgeable router/request/frame/task identities, orthogonal availability/request/presentation states, core-owned `RouteViewInput`, host admission protocol, and append-only trace DTOs.
+- Produces: non-forgeable router/request/frame/task identities, orthogonal availability/request/presentation states, the Core request-record foundation later projected by ECS as `NavigationRequestSnapshot`, core-owned `RouteViewInput`, host admission protocol, and append-only trace DTOs. The final public `NavigationRequestSnapshot` remains ECS-owned as frozen by Target Architecture and the facade golden.
 
 - [ ] **Step 1: Write type-state RED tests**
 
@@ -264,7 +264,7 @@ Expected: modules/types do not exist.
 
 - [ ] **Step 3: Implement exact read-only states**
 
-Implement `RouterAvailability`, `RequestStatus`, `NavigationPhase`, `ActivePresentation`, `NavigationRequestSnapshot`, `NavigationTraceEvent`, `FrameOrigin`, `RouteViewInput`, and sealed admission token/grant/confirmation. Public IDs have no raw constructor/accessor; only crate-private allocators create them.
+Implement `RouterAvailability`, `RequestStatus`, `NavigationPhase`, `ActivePresentation`, Core-private request-record state, `NavigationTraceEvent`, `FrameOrigin`, `RouteViewInput`, and sealed admission token/grant/confirmation. `RouterHandle` and `NavigationRequestId` have no raw constructor/accessor; all identity constructors and allocators remain crate-private. Read-only `raw()` access on the other facade IDs follows the associated-API golden exactly and does not grant construction authority.
 
 - [ ] **Step 4: Add compile-boundary assertions**
 
@@ -542,7 +542,7 @@ Bind the ECS ledger to the engine token/digest/count and preserve the immutable 
 
 Use the Task 9 Root-profile facade wrappers so the journey cannot import whole owner crates or deferred methods. On normal root failure, the engine cancels history intent and issues a fresh `RouterFallback` task with a new frame/task/generation and the same confirmed top slot. Fallback success uses the same preflight/publication protocol to commit `ActivePresentation::Error`; fallback failure settles its own staging output and leaves presentation/history unchanged.
 
-The root cases in `public_navigation_journeys.rs` use only `bevy_ui_router::prelude::*`, register an immediate driver, install single-node routes and fallback, create an app-owned Node host with a sentinel and existing child, and settle each request within 16 updates. They prove first push, equivalent repeated push, fragment-only remount, and changed-root replacement; assertions cover history, ordered commit/cleanup/terminal trace, old-root isolation/removal, real active `SolidRect`, and untouched host-owned state.
+The root cases in `public_navigation_journeys.rs` use only `bevy_ui_router::prelude::*`, register an immediate driver, install single-node routes and fallback, create an app-owned Node host with a sentinel and existing child, and settle each request within 16 updates. They prove first push, equivalent repeated push, fragment-only remount, and changed-root replacement; assertions cover history, ordered commit/cleanup/terminal trace, old-root isolation/removal, real active `SolidRect`, untouched host-owned state, `ActivePresentation::matched() == None` for match failure, and the original immutable fingerprint for post-match build/apply recovery.
 
 - [ ] **Step 5: Verify and commit**
 

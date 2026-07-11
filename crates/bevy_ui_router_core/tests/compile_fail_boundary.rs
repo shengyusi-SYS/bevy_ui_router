@@ -153,3 +153,80 @@ fn test_support_consumer_cannot_declare_child_route_with_options() {
         expected_stderr: &["error[E0624]", "method `route_with_options` is private"],
     });
 }
+
+#[test]
+fn consumer_cannot_mint_host_admission_tokens() {
+    assert_compile_fails(Fixture {
+        name: "host_admission_token_constructor",
+        code: "use bevy_ui_router_core::admission::HostAdmissionToken; fn main() { let _ = HostAdmissionToken::new(); }",
+        features: &[],
+        expected_stderr: &["error[E0624]", "associated function `new` is private"],
+    });
+}
+
+#[test]
+fn consumer_cannot_mint_logical_host_slot_frame_or_generation_ids() {
+    for fixture in [
+        Fixture {
+            name: "route_host_id_constructor",
+            code: "use bevy_ui_router_core::ids::RouteHostId; fn main() { let _ = RouteHostId::new(1); }",
+            features: &[],
+            expected_stderr: &["error[E0624]", "associated function `new` is private"],
+        },
+        Fixture {
+            name: "route_slot_id_constructor",
+            code: "use bevy_ui_router_core::ids::RouteSlotId; fn main() { let _ = RouteSlotId::new(1); }",
+            features: &[],
+            expected_stderr: &["error[E0624]", "associated function `new` is private"],
+        },
+        Fixture {
+            name: "route_frame_id_constructor",
+            code: "use bevy_ui_router_core::ids::RouteFrameId; fn main() { let _ = RouteFrameId::new(1); }",
+            features: &[],
+            expected_stderr: &["error[E0624]", "associated function `new` is private"],
+        },
+        Fixture {
+            name: "route_generation_constructor",
+            code: "use bevy_ui_router_core::ids::RouteGeneration; fn main() { let _ = RouteGeneration::initial(); }",
+            features: &[],
+            expected_stderr: &["error[E0624]", "associated function `initial` is private"],
+        },
+    ] {
+        assert_compile_fails(fixture);
+    }
+}
+
+#[test]
+fn consumer_cannot_name_core_private_task_or_transaction_identities() {
+    for fixture in [
+        Fixture {
+            name: "frame_task_id_private",
+            code: "use bevy_ui_router_core::ids::FrameTaskId; fn main() {}",
+            features: &[],
+            expected_stderr: &["error[E0603]", "struct `FrameTaskId` is private"],
+        },
+        Fixture {
+            name: "transaction_id_private",
+            code: "use bevy_ui_router_core::ids::TransactionId; fn main() {}",
+            features: &[],
+            expected_stderr: &["error[E0603]", "struct `TransactionId` is private"],
+        },
+        Fixture {
+            name: "navigation_request_id_constructor",
+            code: "use bevy_ui_router_core::ids::NavigationRequestId; fn main() { let _ = NavigationRequestId::new(); }",
+            features: &[],
+            expected_stderr: &[
+                "error[E0599]",
+                "no associated function or constant named `new`",
+            ],
+        },
+        Fixture {
+            name: "navigation_request_id_raw_accessor",
+            code: "use bevy_ui_router_core::ids::NavigationRequestId; fn inspect(id: NavigationRequestId) { let _ = id.raw(); } fn main() {}",
+            features: &[],
+            expected_stderr: &["error[E0599]", "no method named `raw`"],
+        },
+    ] {
+        assert_compile_fails(fixture);
+    }
+}
