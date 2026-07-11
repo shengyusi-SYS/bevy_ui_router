@@ -59,17 +59,44 @@ fn assert_bevy(table: &Table, features: &[&str], label: &str) {
     );
 }
 
-fn assert_no_branch(section: &Table, label: &str) {
-    for (name, value) in section {
-        let Some(dependency) = value.as_table() else {
-            continue;
-        };
-        assert!(
-            !name.starts_with("bevy") || !dependency.contains_key("branch"),
-            "{label}.{name} must not declare branch"
-        );
-        assert_no_branch(dependency, label);
+fn assert_no_branch(manifest: &Table) {
+    visit_dependency_tables(manifest, |entries| {
+        for (name, value) in entries {
+            let Some(dependency) = value.as_table() else {
+                continue;
+            };
+            assert!(
+                !is_bevy_family(name, dependency) || !dependency.contains_key("branch"),
+                "dependency `{name}` must not declare branch"
+            );
+        }
+    });
+}
+
+fn visit_dependency_tables(manifest: &Table, mut visit: impl FnMut(&Table)) {
+    for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if let Some(entries) = manifest.get(section).and_then(Value::as_table) {
+            visit(entries);
+        }
     }
+    if let Some(selectors) = manifest.get("target").and_then(Value::as_table) {
+        for selector in selectors.values().filter_map(Value::as_table) {
+            for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                if let Some(entries) = selector.get(section).and_then(Value::as_table) {
+                    visit(entries);
+                }
+            }
+        }
+    }
+}
+
+fn is_bevy_family(name: &str, dependency: &Table) -> bool {
+    let package = dependency
+        .get("package")
+        .and_then(Value::as_str)
+        .unwrap_or(name);
+    (package.starts_with("bevy") && !package.starts_with("bevy_ui_router"))
+        || dependency.get("git").and_then(Value::as_str) == Some(BEVY_GIT)
 }
 
 #[test]
@@ -84,12 +111,38 @@ bevy_internal = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "t
 "#,
     );
 
-    let result =
-        std::panic::catch_unwind(|| assert_no_branch(table(&manifest, "target"), "[target]"));
+    let result = std::panic::catch_unwind(|| assert_no_branch(&manifest));
     assert!(
         result.is_err(),
         "target-specific Bevy branches must be rejected"
     );
+}
+
+#[test]
+fn ecs_manifest_rejects_target_alias_for_bevy_package() {
+    let manifest = parse_manifest(
+        r#"
+[target.'cfg(unix)'.build-dependencies]
+render = { package = "bevy_render", git = "https://github.com/shengyusi-SYS/bevy.git", branch = "moving" }
+"#,
+    );
+    let result = std::panic::catch_unwind(|| assert_no_branch(&manifest));
+    assert!(
+        result.is_err(),
+        "target Bevy package aliases must be rejected"
+    );
+}
+
+#[test]
+fn ecs_manifest_ignores_non_dependency_metadata() {
+    let manifest = parse_manifest(
+        r#"
+[package.metadata.bevy_fake]
+branch = "not-a-dependency"
+"#,
+    );
+    let result = std::panic::catch_unwind(|| assert_no_branch(&manifest));
+    assert!(result.is_ok(), "package metadata is not a dependency table");
 }
 
 #[test]
@@ -176,6 +229,5 @@ fn ecs_manifest_locks_the_dependency_boundary() {
         BTreeSet::from(["full".to_owned()])
     );
     assert_eq!(dev.get("toml").and_then(Value::as_str), Some("1.1.2"));
-    assert_no_branch(dependencies, "[dependencies]");
-    assert_no_branch(dev, "[dev-dependencies]");
+    assert_no_branch(&manifest);
 }

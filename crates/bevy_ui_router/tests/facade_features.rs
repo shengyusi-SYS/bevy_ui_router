@@ -80,20 +80,43 @@ fn facade_safety_violations(manifest: &Table) -> Vec<String> {
             violations.push(format!("{name} must appear only in [dev-dependencies]"));
         }
     }
-    collect_bevy_branch_violations(manifest, &mut violations);
+    visit_dependency_tables(manifest, |entries| {
+        for (name, value) in entries {
+            let Some(dependency) = value.as_table() else {
+                continue;
+            };
+            if is_bevy_family(name, dependency) && dependency.contains_key("branch") {
+                violations.push(format!("{name} must not declare branch"));
+            }
+        }
+    });
     violations
 }
 
-fn collect_bevy_branch_violations(table: &Table, violations: &mut Vec<String>) {
-    for (name, value) in table {
-        let Some(nested) = value.as_table() else {
-            continue;
-        };
-        if name.starts_with("bevy") && nested.contains_key("branch") {
-            violations.push(format!("{name} must not declare branch"));
+fn visit_dependency_tables(manifest: &Table, mut visit: impl FnMut(&Table)) {
+    for section in SECTIONS {
+        if let Some(entries) = manifest.get(section).and_then(Value::as_table) {
+            visit(entries);
         }
-        collect_bevy_branch_violations(nested, violations);
     }
+    if let Some(selectors) = manifest.get("target").and_then(Value::as_table) {
+        for selector in selectors.values().filter_map(Value::as_table) {
+            for section in SECTIONS {
+                if let Some(entries) = selector.get(section).and_then(Value::as_table) {
+                    visit(entries);
+                }
+            }
+        }
+    }
+}
+
+fn is_bevy_family(name: &str, dependency: &Table) -> bool {
+    let package = dependency
+        .get("package")
+        .and_then(Value::as_str)
+        .unwrap_or(name);
+    (package.starts_with("bevy") && !package.starts_with("bevy_ui_router"))
+        || dependency.get("git").and_then(Value::as_str) == Some(BEVY_GIT)
 }
 
 #[test]
@@ -149,6 +172,29 @@ bevy_render = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "tar
     assert_eq!(
         facade_safety_violations(&manifest),
         vec!["bevy_render must not declare branch"]
+    );
+}
+
+#[test]
+fn manifest_contract_classifies_only_cargo_dependency_tables() {
+    let manifest = parse_manifest(
+        r#"
+[dependencies]
+[dev-dependencies]
+bevy_app = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+bevy_ecs = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+bevy_ui = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+
+[target.'cfg(unix)'.build-dependencies]
+render = { package = "bevy_render", git = "https://github.com/shengyusi-SYS/bevy.git", branch = "moving" }
+
+[package.metadata.bevy_fake]
+branch = "not-a-dependency"
+"#,
+    );
+    assert_eq!(
+        facade_safety_violations(&manifest),
+        vec!["render must not declare branch"]
     );
 }
 

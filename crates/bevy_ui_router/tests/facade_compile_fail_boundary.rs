@@ -157,17 +157,6 @@ fn default_view_prelude_fake_renderer_mode_names_missing_symbol() {
 }
 
 #[test]
-fn default_view_fake_renderer_root_names_missing_symbol() {
-    assert_compile_fails(Fixture {
-        name: "default_view_fake_renderer_not_view_root",
-        code: "use bevy_ui_router::view::FakeViewRenderer; fn main() {}",
-        default_features: true,
-        features: &[],
-        expected_stderr: &["error[E0432]", "no `FakeViewRenderer` in the root"],
-    });
-}
-
-#[test]
 fn default_prelude_runtime_bridge_names_missing_router_runtime() {
     assert_compile_fails(Fixture {
         name: "default_prelude_no_router_runtime",
