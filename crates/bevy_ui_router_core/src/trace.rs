@@ -65,6 +65,13 @@ impl NavigationTraceEvent {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn cleanup_settled(disposition: Option<CleanupDisposition>) -> Self {
+        let mut event = Self::new(NavigationTraceEventKind::CleanupSettled);
+        event.cleanup_disposition = disposition;
+        event
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn request_terminal() -> Self {
         Self::new(NavigationTraceEventKind::RequestTerminal)
     }

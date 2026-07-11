@@ -68,15 +68,46 @@ impl NavigationRequestId {
     pub(crate) const fn router_identity(self) -> RouterIdentity {
         self.router
     }
+
+    pub(crate) const fn sequence(self) -> u64 {
+        self.sequence
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct FrameTaskId(u64);
 
+impl FrameTaskId {
+    pub(crate) const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct TransactionId(u64);
+
+impl TransactionId {
+    pub(crate) const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct CleanupBatchId(u64);
+
+impl CleanupBatchId {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) const fn raw(self) -> u64 {
+        self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct WorldDomainId(u64);
@@ -91,6 +122,52 @@ impl RouterIdentity {
     pub(crate) const fn router(self) -> RouterInstanceId {
         self.router
     }
+
+    pub(crate) const fn provenance(self) -> (u64, u64) {
+        (self.domain.0, self.router.raw())
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReservedNavigationIds {
+    request: NavigationRequestId,
+    transaction: TransactionId,
+    frame_task: FrameTaskId,
+    candidate_frame: RouteFrameId,
+    cleanup_batch: CleanupBatchId,
+}
+
+impl ReservedNavigationIds {
+    pub(crate) const fn request(self) -> NavigationRequestId {
+        self.request
+    }
+
+    pub(crate) const fn transaction(self) -> TransactionId {
+        self.transaction
+    }
+
+    pub(crate) const fn frame_task(self) -> FrameTaskId {
+        self.frame_task
+    }
+
+    pub(crate) const fn candidate_frame(self) -> RouteFrameId {
+        self.candidate_frame
+    }
+
+    pub(crate) const fn cleanup_batch(self) -> CleanupBatchId {
+        self.cleanup_batch
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReservationCounter {
+    Request,
+    Transaction,
+    FrameTask,
+    CandidateFrame,
+    CleanupBatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,6 +189,7 @@ pub(crate) struct CoreIdAllocator {
     next_frame: u64,
     next_task: u64,
     next_transaction: u64,
+    next_cleanup_batch: u64,
     next_request_by_router: BTreeMap<RouterIdentity, u64>,
 }
 
@@ -128,6 +206,7 @@ impl CoreIdAllocator {
             next_frame: 1,
             next_task: 1,
             next_transaction: 1,
+            next_cleanup_batch: 1,
             next_request_by_router: BTreeMap::new(),
         })
     }
@@ -209,6 +288,56 @@ impl CoreIdAllocator {
         Ok(id)
     }
 
+    pub(crate) fn reserve_navigation(
+        &mut self,
+        router: RouterIdentity,
+    ) -> Result<ReservedNavigationIds, RequestAllocationError> {
+        if router.domain != self.domain {
+            return Err(RequestAllocationError::ForeignRouter);
+        }
+        let request = self
+            .next_request_by_router
+            .get(&router)
+            .copied()
+            .unwrap_or(1);
+        let next_request = request
+            .checked_add(1)
+            .ok_or(RequestAllocationError::Exhausted)?;
+        let next_transaction = self
+            .next_transaction
+            .checked_add(1)
+            .ok_or(RequestAllocationError::Exhausted)?;
+        let next_task = self
+            .next_task
+            .checked_add(1)
+            .ok_or(RequestAllocationError::Exhausted)?;
+        let next_frame = self
+            .next_frame
+            .checked_add(1)
+            .ok_or(RequestAllocationError::Exhausted)?;
+        let next_cleanup_batch = self
+            .next_cleanup_batch
+            .checked_add(1)
+            .ok_or(RequestAllocationError::Exhausted)?;
+
+        let reserved = ReservedNavigationIds {
+            request: NavigationRequestId {
+                router,
+                sequence: request,
+            },
+            transaction: TransactionId(self.next_transaction),
+            frame_task: FrameTaskId(self.next_task),
+            candidate_frame: RouteFrameId::new(self.next_frame),
+            cleanup_batch: CleanupBatchId(self.next_cleanup_batch),
+        };
+        self.next_request_by_router.insert(router, next_request);
+        self.next_transaction = next_transaction;
+        self.next_task = next_task;
+        self.next_frame = next_frame;
+        self.next_cleanup_batch = next_cleanup_batch;
+        Ok(reserved)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn owns_request(
         &self,
@@ -221,8 +350,31 @@ impl CoreIdAllocator {
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> CoreIdAllocatorSnapshot {
         CoreIdAllocatorSnapshot {
+            next_router: self.next_router,
             next_host: self.next_host,
             next_slot: self.next_slot,
+            next_frame: self.next_frame,
+            next_task: self.next_task,
+            next_transaction: self.next_transaction,
+            next_cleanup_batch: self.next_cleanup_batch,
+            next_request_by_router: self.next_request_by_router.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_exhaust_reservation_counter(
+        &mut self,
+        router: RouterIdentity,
+        counter: ReservationCounter,
+    ) {
+        match counter {
+            ReservationCounter::Request => {
+                self.next_request_by_router.insert(router, u64::MAX);
+            }
+            ReservationCounter::Transaction => self.next_transaction = u64::MAX,
+            ReservationCounter::FrameTask => self.next_task = u64::MAX,
+            ReservationCounter::CandidateFrame => self.next_frame = u64::MAX,
+            ReservationCounter::CleanupBatch => self.next_cleanup_batch = u64::MAX,
         }
     }
 }
@@ -245,10 +397,16 @@ fn checked_take(counter: &mut u64) -> Result<u64, IdExhaustion> {
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CoreIdAllocatorSnapshot {
+    next_router: u64,
     next_host: u64,
     next_slot: u64,
+    next_frame: u64,
+    next_task: u64,
+    next_transaction: u64,
+    next_cleanup_batch: u64,
+    next_request_by_router: BTreeMap<RouterIdentity, u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -278,6 +436,11 @@ impl RouteGeneration {
 
     pub const fn raw(self) -> u64 {
         self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn testing_max() -> Self {
+        Self(u64::MAX)
     }
 }
 
@@ -431,5 +594,24 @@ mod tests {
 
         assert_eq!(allocator.allocate_host_slot(), Err(IdExhaustion));
         assert_eq!(allocator.snapshot(), before);
+    }
+
+    #[test]
+    fn navigation_reservation_is_atomic_for_every_reserved_counter() {
+        for counter in [
+            ReservationCounter::Request,
+            ReservationCounter::Transaction,
+            ReservationCounter::FrameTask,
+            ReservationCounter::CandidateFrame,
+            ReservationCounter::CleanupBatch,
+        ] {
+            let mut allocator = CoreIdAllocator::new().unwrap();
+            let router = allocator.allocate_router_identity().unwrap();
+            allocator.testing_exhaust_reservation_counter(router, counter);
+            let before = allocator.snapshot();
+
+            assert!(allocator.reserve_navigation(router).is_err());
+            assert_eq!(allocator.snapshot(), before, "counter: {counter:?}");
+        }
     }
 }

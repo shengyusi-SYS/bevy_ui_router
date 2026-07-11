@@ -10,8 +10,8 @@ use crate::cleanup::{CleanupBatchToken, CleanupCompletion};
 use crate::frame::{FrameOrigin, RouteFrameVersion};
 use crate::history::{HistoryIntent, MemoryHistory};
 use crate::ids::{
-    CoreIdAllocator, FrameTaskId, IdExhaustion, NavigationRequestId, RouteFrameId, RouteGeneration,
-    RouteHostId, RouteSlotId, RouterIdentity, TransactionId,
+    CoreIdAllocator, FrameTaskId, NavigationRequestId, ReservedNavigationIds, RouteFrameId,
+    RouteGeneration, RouteHostId, RouteSlotId, RouterIdentity, TransactionId,
 };
 use crate::location::RouteLocation;
 use crate::matcher::RouteMatcher;
@@ -162,6 +162,7 @@ pub(crate) enum EngineAction {
 #[derive(Debug)]
 pub(crate) struct CommitTicket {
     identity: RootTaskIdentity,
+    cleanup: CleanupBatchToken,
 }
 
 impl CommitTicket {
@@ -169,6 +170,7 @@ impl CommitTicket {
     fn testing_duplicate(&self) -> Self {
         Self {
             identity: self.identity.clone(),
+            cleanup: self.cleanup.clone(),
         }
     }
 
@@ -184,7 +186,14 @@ impl CommitTicket {
 
     #[cfg(test)]
     fn testing_with_identity(&self, identity: RootTaskIdentity) -> Self {
-        Self { identity }
+        Self {
+            identity,
+            cleanup: self.cleanup.clone(),
+        }
+    }
+
+    pub(crate) const fn cleanup(&self) -> &CleanupBatchToken {
+        &self.cleanup
     }
 }
 
@@ -207,7 +216,6 @@ pub(crate) enum ReportError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommitError {
     Stale,
-    IdExhausted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -235,9 +243,14 @@ struct CurrentWork {
     branch: MatchedBranch,
     target_frame: RouteFrameVersion,
     history_intent: Option<HistoryIntent>,
-    leaving_obligations: usize,
     stage: WorkStage,
-    cleanup: Option<CleanupBatchToken>,
+    cleanup: CleanupBatchToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QueuedWork {
+    request: NavigationRequestId,
+    reserved: ReservedNavigationIds,
 }
 
 #[derive(Debug)]
@@ -249,11 +262,11 @@ pub(crate) struct RouterEngine {
     history: MemoryHistory,
     active_branch: Option<MatchedBranch>,
     records: VecDeque<NavigationRequestRecord>,
-    evicted: Vec<NavigationRequestId>,
-    queue: VecDeque<NavigationRequestId>,
+    evicted_through: Option<u64>,
+    highest_issued: Option<u64>,
+    queue: VecDeque<QueuedWork>,
     current: Option<CurrentWork>,
     action: Option<EngineAction>,
-    allocation_count: u64,
 }
 
 impl RouterEngine {
@@ -270,11 +283,11 @@ impl RouterEngine {
             history: MemoryHistory::new(),
             active_branch: None,
             records: VecDeque::new(),
-            evicted: Vec::new(),
+            evicted_through: None,
+            highest_issued: None,
             queue: VecDeque::new(),
             current: None,
             action: None,
-            allocation_count: 1,
         })
     }
 
@@ -282,6 +295,9 @@ impl RouterEngine {
         &mut self,
         issuer: &mut HostAdmissionIssuer,
     ) -> Result<HostAdmissionToken, AdmissionError> {
+        if self.state.host().is_some() {
+            return Err(AdmissionError::AuthorityExists);
+        }
         issuer.issue(self.router)
     }
 
@@ -290,9 +306,7 @@ impl RouterEngine {
         issuer: &mut HostAdmissionIssuer,
         token: &HostAdmissionToken,
     ) -> Result<HostGrant, AdmissionError> {
-        let grant = issuer.grant(token, &mut self.ids)?;
-        self.allocation_count += 2;
-        Ok(grant)
+        issuer.grant(token, &mut self.ids)
     }
 
     pub(crate) fn confirm_host(
@@ -310,16 +324,17 @@ impl RouterEngine {
         if self.state.host().is_none() {
             return Err(PushError::AwaitingHost);
         }
-        let request = self
+        let reserved = self
             .ids
-            .allocate_request(self.router)
+            .reserve_navigation(self.router)
             .map_err(|_| PushError::IdExhausted)?;
-        self.allocation_count += 1;
+        let request = reserved.request();
         self.records
             .push_back(NavigationRequestRecord::new(request, location));
-        self.queue.push_back(request);
+        self.highest_issued = Some(request.sequence());
+        self.queue.push_back(QueuedWork { request, reserved });
         if self.current.is_none() {
-            self.start_next()?;
+            self.start_next();
         }
         Ok(request)
     }
@@ -350,29 +365,18 @@ impl RouterEngine {
         mutation: F,
     ) -> Result<CommitReceipt, CommitError>
     where
-        F: for<'a> FnOnce(PublicationCapability<'a>) -> CommitReceipt,
+        F: FnOnce(),
     {
         let valid = self.current.as_ref().is_some_and(|current| {
-            current.stage == WorkStage::ReadyToCommit && current.identity == ticket.identity
+            current.stage == WorkStage::ReadyToCommit
+                && current.identity == ticket.identity
+                && current.cleanup == ticket.cleanup
         });
         if !valid {
             return Err(CommitError::Stale);
         }
-        let batch = self
-            .ids
-            .allocate_frame_task()
-            .map_err(|_| CommitError::IdExhausted)?;
-        self.allocation_count += 1;
-        let obligations = self
-            .current
-            .as_ref()
-            .expect("validated current work")
-            .leaving_obligations;
-        let cleanup = CleanupBatchToken::sealed(ticket.identity, batch, obligations);
-        Ok(mutation(PublicationCapability {
-            engine: self,
-            cleanup,
-        }))
+        mutation();
+        Ok(self.publish(ticket.cleanup))
     }
 
     pub(crate) fn complete_cleanup(
@@ -380,11 +384,7 @@ impl RouterEngine {
         completion: CleanupCompletion,
     ) -> Result<(), CleanupError> {
         let valid = self.current.as_ref().is_some_and(|current| {
-            current.stage == WorkStage::PostCommitCleanup
-                && current
-                    .cleanup
-                    .as_ref()
-                    .is_some_and(|expected| completion.matches(expected))
+            current.stage == WorkStage::PostCommitCleanup && completion.matches(&current.cleanup)
         });
         if !valid {
             return Err(CleanupError::Stale);
@@ -399,11 +399,19 @@ impl RouterEngine {
         let record = self
             .record_mut(request)
             .expect("running record is retained");
-        record
-            .append_trace(NavigationTraceEvent::new(
-                NavigationTraceEventKind::CleanupSettled,
-            ))
-            .expect("terminal trace is open");
+        if completion.receipts().is_empty() {
+            record
+                .append_trace(NavigationTraceEvent::cleanup_settled(None))
+                .expect("terminal trace is open");
+        } else {
+            for receipt in completion.receipts() {
+                record
+                    .append_trace(NavigationTraceEvent::cleanup_settled(Some(
+                        receipt.disposition(),
+                    )))
+                    .expect("terminal trace is open");
+            }
+        }
         record
             .transition(RequestStatus::Succeeded)
             .expect("request is running");
@@ -413,7 +421,7 @@ impl RouterEngine {
         self.current = None;
         self.state.set_request(None);
         self.retain_terminal_records();
-        self.start_next().map_err(|_| CleanupError::Stale)?;
+        self.start_next();
         Ok(())
     }
 
@@ -432,7 +440,11 @@ impl RouterEngine {
     pub(crate) fn private_lookup(&self, id: NavigationRequestId) -> PrivateRequestLookup<'_> {
         if let Some(record) = self.request(id) {
             PrivateRequestLookup::Retained(record)
-        } else if self.evicted.contains(&id) {
+        } else if id.router_identity() == self.router
+            && self
+                .evicted_through
+                .is_some_and(|sequence| id.sequence() <= sequence)
+        {
             PrivateRequestLookup::Evicted
         } else {
             PrivateRequestLookup::Unknown
@@ -444,16 +456,17 @@ impl RouterEngine {
         self.state.current_request()
     }
 
-    fn start_next(&mut self) -> Result<(), PushError> {
-        let Some(request) = self.queue.pop_front() else {
-            return Ok(());
+    fn start_next(&mut self) {
+        let Some(queued) = self.queue.pop_front() else {
+            self.state.set_request(None);
+            return;
         };
+        let request = queued.request;
         let location = self
             .request(request)
             .expect("queued record is retained")
             .requested()
             .clone();
-        self.transition_with_trace(request, NavigationPhase::Matching);
         let branch = match self.matcher.match_location(&location) {
             Ok(branch) => branch,
             Err(error) => {
@@ -468,16 +481,16 @@ impl RouterEngine {
                 record
                     .append_trace(NavigationTraceEvent::request_terminal())
                     .expect("terminal status precedes terminal event");
+                self.state.set_request(None);
                 self.retain_terminal_records();
-                return self.start_next();
+                self.start_next();
+                return;
             }
         };
         self.record_mut(request)
             .expect("running record is retained")
             .set_matched(branch.branch_fingerprint().clone())
             .expect("match is written once");
-        self.transition_with_trace(request, NavigationPhase::Planning);
-
         let active_location = self.state.active().location();
         let active_frame = self.state.active().frames().first();
         let equivalent = active_location == Some(&location);
@@ -491,8 +504,6 @@ impl RouterEngine {
                 .current_active_branch()
                 .is_some_and(|active| active.branch_fingerprint() == branch.branch_fingerprint());
 
-        let transaction = self.ids.allocate_transaction().map_err(id_push_error)?;
-        let frame_task = self.ids.allocate_frame_task().map_err(id_push_error)?;
         let (frame, generation) = if equivalent {
             let active = active_frame.expect("route presentation has one active root");
             (active.frame(), active.generation())
@@ -500,15 +511,27 @@ impl RouterEngine {
             let active = active_frame.expect("fragment remount has an active root");
             (
                 active.frame(),
-                active.generation().checked_next().map_err(id_push_error)?,
+                match active.generation().checked_next() {
+                    Ok(generation) => generation,
+                    Err(_) => {
+                        self.fail_reserved_request(
+                            request,
+                            NavigationFailure::new(
+                                NavigationFailureKind::AuthorityLost,
+                                "route generation exhausted",
+                            ),
+                        );
+                        self.start_next();
+                        return;
+                    }
+                },
             )
         } else {
             (
-                self.ids.allocate_frame().map_err(id_push_error)?,
+                queued.reserved.candidate_frame(),
                 RouteGeneration::initial(),
             )
         };
-        self.allocation_count += if equivalent || fragment_only { 2 } else { 3 };
 
         let leaf = branch
             .leaf()
@@ -523,8 +546,8 @@ impl RouterEngine {
             host_epoch: host.epoch(),
             top_slot,
             request,
-            transaction,
-            frame_task,
+            transaction: queued.reserved.transaction(),
+            frame_task: queued.reserved.frame_task(),
             frame,
             generation,
             origin: origin.clone(),
@@ -537,7 +560,16 @@ impl RouterEngine {
             frame,
             generation,
         );
-        let leaving_obligations = usize::from(active_frame.is_some() && !equivalent);
+        let cleanup_manifest = if active_frame.is_some() && !equivalent {
+            vec![active_frame.expect("checked active frame").clone()]
+        } else {
+            Vec::new()
+        };
+        let cleanup = CleanupBatchToken::sealed(
+            identity.clone(),
+            queued.reserved.cleanup_batch(),
+            cleanup_manifest,
+        );
         let stage = if equivalent {
             WorkStage::ReadyToCommit
         } else {
@@ -548,14 +580,13 @@ impl RouterEngine {
             branch,
             target_frame,
             history_intent: Some(HistoryIntent::Push(location.clone())),
-            leaving_obligations,
             stage,
-            cleanup: None,
+            cleanup: cleanup.clone(),
         });
 
         if equivalent {
             self.transition_with_trace(request, NavigationPhase::ReadyToSwitch);
-            self.action = Some(EngineAction::Commit(CommitTicket { identity }));
+            self.action = Some(EngineAction::Commit(CommitTicket { identity, cleanup }));
         } else {
             let record = self
                 .record_mut(request)
@@ -582,7 +613,6 @@ impl RouterEngine {
                 matched: leaf,
             }));
         }
-        Ok(())
     }
 
     fn current_active_branch(&self) -> Option<&MatchedBranch> {
@@ -602,6 +632,20 @@ impl RouterEngine {
 
     fn record_mut(&mut self, id: NavigationRequestId) -> Option<&mut NavigationRequestRecord> {
         self.records.iter_mut().find(|record| record.id() == id)
+    }
+
+    fn fail_reserved_request(&mut self, request: NavigationRequestId, failure: NavigationFailure) {
+        let record = self
+            .record_mut(request)
+            .expect("accepted request is retained");
+        record
+            .transition(RequestStatus::Failed(failure))
+            .expect("request is not terminal");
+        record
+            .append_trace(NavigationTraceEvent::request_terminal())
+            .expect("terminal status precedes terminal event");
+        self.state.set_request(None);
+        self.retain_terminal_records();
     }
 
     fn publish(&mut self, cleanup: CleanupBatchToken) -> CommitReceipt {
@@ -626,7 +670,7 @@ impl RouterEngine {
             .expect("commit has one private history intent")
             .publish(&mut self.history);
         current.stage = WorkStage::PostCommitCleanup;
-        current.cleanup = Some(cleanup.clone());
+        debug_assert_eq!(current.cleanup, cleanup);
         self.active_branch = Some(branch);
         self.state.set_active(active);
         let record = self
@@ -663,7 +707,11 @@ impl RouterEngine {
                 .position(|record| is_terminal(record.status()))
                 .expect("terminal count was nonzero");
             let evicted = self.records.remove(index).expect("index came from records");
-            self.evicted.push(evicted.id());
+            let sequence = evicted.id().sequence();
+            self.evicted_through = Some(
+                self.evicted_through
+                    .map_or(sequence, |current| current.max(sequence)),
+            );
         }
     }
 
@@ -671,23 +719,57 @@ impl RouterEngine {
     fn snapshot(&self) -> EngineSnapshot {
         EngineSnapshot {
             state: self.state.snapshot(),
+            ids: self.ids.snapshot(),
             history: self.history.clone(),
             active_branch: self
                 .active_branch
                 .as_ref()
                 .map(|branch| format!("{branch:?}")),
             records: self.records.clone(),
-            evicted: self.evicted.clone(),
+            evicted_through: self.evicted_through,
+            highest_issued: self.highest_issued,
             queue: self.queue.clone(),
             current: self.current.as_ref().map(|current| format!("{current:?}")),
             action: self.action.as_ref().map(ActionSnapshot::from),
-            allocation_count: self.allocation_count,
         }
     }
-}
 
-fn id_push_error(_: IdExhaustion) -> PushError {
-    PushError::IdExhausted
+    #[cfg(test)]
+    fn testing_exhaust_reservation_counter(&mut self, counter: crate::ids::ReservationCounter) {
+        self.ids
+            .testing_exhaust_reservation_counter(self.router, counter);
+    }
+
+    #[cfg(test)]
+    const fn testing_evicted_watermark(&self) -> Option<u64> {
+        self.evicted_through
+    }
+
+    #[cfg(test)]
+    fn testing_set_active_generation(&mut self, generation: RouteGeneration) {
+        let active = self
+            .state
+            .active()
+            .frames()
+            .first()
+            .expect("test requires active route")
+            .clone();
+        self.state.set_active(ActivePresentation::route(
+            self.state
+                .active()
+                .location()
+                .expect("test requires active route")
+                .clone(),
+            vec![RouteFrameVersion::new(
+                active.router_identity(),
+                active.host(),
+                active.slot(),
+                active.origin().clone(),
+                active.frame(),
+                generation,
+            )],
+        ));
+    }
 }
 
 fn is_terminal(status: &RequestStatus) -> bool {
@@ -727,18 +809,14 @@ impl ViewReportSession<'_> {
             .transition_with_trace(request, NavigationPhase::ReadyToSwitch);
         CommitTicket {
             identity: self.identity,
+            cleanup: self
+                .engine
+                .current
+                .as_ref()
+                .expect("report retains current work")
+                .cleanup
+                .clone(),
         }
-    }
-}
-
-pub(crate) struct PublicationCapability<'a> {
-    engine: &'a mut RouterEngine,
-    cleanup: CleanupBatchToken,
-}
-
-impl PublicationCapability<'_> {
-    pub(crate) fn publish(self) -> CommitReceipt {
-        self.engine.publish(self.cleanup)
     }
 }
 
@@ -774,14 +852,15 @@ impl From<&EngineAction> for ActionSnapshot {
 #[derive(Clone, Debug, PartialEq)]
 struct EngineSnapshot {
     state: RouterNavigationState,
+    ids: crate::ids::CoreIdAllocatorSnapshot,
     history: MemoryHistory,
     active_branch: Option<String>,
     records: VecDeque<NavigationRequestRecord>,
-    evicted: Vec<NavigationRequestId>,
-    queue: VecDeque<NavigationRequestId>,
+    evicted_through: Option<u64>,
+    highest_issued: Option<u64>,
+    queue: VecDeque<QueuedWork>,
     current: Option<String>,
     action: Option<ActionSnapshot>,
-    allocation_count: u64,
 }
 
 #[cfg(test)]
@@ -791,14 +870,14 @@ mod tests {
         RouterEngine,
     };
     use crate::admission::HostAdmissionIssuer;
-    use crate::frame::FrameOrigin;
-    use crate::ids::{RouteGeneration, RouteHostId, RouteSlotId};
+    use crate::frame::{FrameOrigin, RouteFrameVersion};
+    use crate::ids::{ReservationCounter, RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId};
     use crate::location::RouteLocation;
     use crate::pattern::RoutePattern;
     use crate::presentation::ActivePresentationKind;
     use crate::request::{NavigationPhase, RequestStatus};
     use crate::route_tree::RouteTree;
-    use crate::trace::NavigationTraceEventKind;
+    use crate::trace::{CleanupDisposition, NavigationTraceEventKind};
 
     fn tree() -> RouteTree {
         let mut builder = RouteTree::builder()
@@ -839,16 +918,22 @@ mod tests {
             }
             EngineAction::Commit(ticket) => ticket,
         };
-        engine
-            .commit(ticket, |publication| publication.publish())
-            .unwrap()
-            .cleanup()
-            .clone()
+        engine.commit(ticket, || {}).unwrap().cleanup().clone()
     }
 
     fn settle_current(engine: &mut RouterEngine) {
         let cleanup = publish_current(engine);
-        engine.complete_cleanup(cleanup.completion()).unwrap();
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+    }
+
+    fn valid_completion(
+        cleanup: &crate::cleanup::CleanupBatchToken,
+    ) -> crate::cleanup::CleanupCompletion {
+        if cleanup.obligation_count() == 0 {
+            cleanup.zero_completion().unwrap()
+        } else {
+            cleanup.testing_removed_completion().unwrap()
+        }
     }
 
     fn distinct_identity() -> RootTaskIdentity {
@@ -960,7 +1045,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_report_does_not_publish_until_single_use_commit_capability_is_consumed() {
+    fn successful_report_does_not_publish_until_preflighted_commit_returns_normally() {
         let mut engine = ready_engine();
         engine.push(RouteLocation::new("/items/1")).unwrap();
         let EngineAction::FrameTask(task) = engine.action().unwrap() else {
@@ -974,17 +1059,10 @@ mod tests {
         let mut stale = ticket.testing_duplicate();
         stale.testing_set_host_epoch(stale.identity().host_epoch() + 1);
         let before = engine.snapshot();
-        assert_eq!(
-            engine
-                .commit(stale, |publication| publication.publish())
-                .unwrap_err(),
-            CommitError::Stale
-        );
+        assert_eq!(engine.commit(stale, || {}).unwrap_err(), CommitError::Stale);
         assert_eq!(engine.snapshot(), before);
 
-        let receipt = engine
-            .commit(ticket, |publication| publication.publish())
-            .unwrap();
+        let receipt = engine.commit(ticket, || {}).unwrap();
         assert_eq!(engine.active().kind(), ActivePresentationKind::Route);
         assert_eq!(engine.history().len(), 1);
         assert_eq!(
@@ -1007,21 +1085,12 @@ mod tests {
         for mismatch in identity_mismatches(exact.identity(), &foreign) {
             let before = engine.snapshot();
             let stale = exact.testing_with_identity(mismatch);
-            assert_eq!(
-                engine
-                    .commit(stale, |publication| publication.publish())
-                    .unwrap_err(),
-                CommitError::Stale
-            );
+            assert_eq!(engine.commit(stale, || {}).unwrap_err(), CommitError::Stale);
             assert_eq!(engine.snapshot(), before);
         }
 
-        let cleanup = engine
-            .commit(exact, |publication| publication.publish())
-            .unwrap()
-            .cleanup()
-            .clone();
-        engine.complete_cleanup(cleanup.completion()).unwrap();
+        let cleanup = engine.commit(exact, || {}).unwrap().cleanup().clone();
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
     }
 
     #[test]
@@ -1037,7 +1106,7 @@ mod tests {
         let equivalent_cleanup = publish_action(&mut engine, equivalent);
         assert_eq!(equivalent_cleanup.obligation_count(), 0);
         engine
-            .complete_cleanup(equivalent_cleanup.completion())
+            .complete_cleanup(valid_completion(&equivalent_cleanup))
             .unwrap();
         assert_eq!(engine.active().frames()[0], first);
 
@@ -1052,7 +1121,7 @@ mod tests {
         let fragment_cleanup = publish_action(&mut engine, EngineAction::FrameTask(fragment));
         assert_eq!(fragment_cleanup.obligation_count(), 1);
         engine
-            .complete_cleanup(fragment_cleanup.completion())
+            .complete_cleanup(valid_completion(&fragment_cleanup))
             .unwrap();
 
         engine.push(RouteLocation::new("/about")).unwrap();
@@ -1064,7 +1133,7 @@ mod tests {
         let changed_cleanup = publish_action(&mut engine, EngineAction::FrameTask(changed));
         assert_eq!(changed_cleanup.obligation_count(), 1);
         engine
-            .complete_cleanup(changed_cleanup.completion())
+            .complete_cleanup(valid_completion(&changed_cleanup))
             .unwrap();
         assert_eq!(engine.history().len(), 4);
     }
@@ -1074,7 +1143,7 @@ mod tests {
         let mut engine = ready_engine();
         let request = engine.push(RouteLocation::new("/items/1")).unwrap();
         let cleanup = publish_current(&mut engine);
-        let replay = cleanup.completion();
+        let replay = valid_completion(&cleanup);
 
         assert_eq!(
             engine.request(request).unwrap().status(),
@@ -1090,7 +1159,7 @@ mod tests {
                 .count(),
             0
         );
-        engine.complete_cleanup(cleanup.completion()).unwrap();
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
         let terminal = engine.snapshot();
         assert_eq!(
             engine.request(request).unwrap().status(),
@@ -1135,16 +1204,16 @@ mod tests {
         for mismatch in identity_mismatches(cleanup.testing_identity(), &foreign) {
             let before = engine.snapshot();
             let stale = cleanup.testing_with_identity(mismatch);
-            assert!(engine.complete_cleanup(stale.completion()).is_err());
+            assert!(engine.complete_cleanup(valid_completion(&stale)).is_err());
             assert_eq!(engine.snapshot(), before);
         }
 
-        let mut wrong_digest = cleanup.completion();
+        let mut wrong_digest = valid_completion(&cleanup);
         wrong_digest.testing_set_digest(u64::MAX);
         let before = engine.snapshot();
         assert!(engine.complete_cleanup(wrong_digest).is_err());
         assert_eq!(engine.snapshot(), before);
-        engine.complete_cleanup(cleanup.completion()).unwrap();
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
     }
 
     #[test]
@@ -1182,5 +1251,269 @@ mod tests {
             engine.private_lookup(unknown),
             PrivateRequestLookup::Unknown
         ));
+        assert_eq!(
+            engine.testing_evicted_watermark(),
+            Some(requests[1].sequence())
+        );
+    }
+
+    #[test]
+    fn confirmed_engine_rejects_new_host_admission_before_touching_fresh_issuer() {
+        let mut engine = ready_engine();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+        let before = engine.snapshot();
+
+        assert_eq!(
+            engine.request_host_admission(&mut issuer),
+            Err(crate::admission::AdmissionError::AuthorityExists)
+        );
+        assert!(!issuer.has_outstanding());
+        assert_eq!(engine.snapshot(), before);
+    }
+
+    #[test]
+    fn push_reservation_exhaustion_is_zero_change_for_every_counter() {
+        for counter in [
+            ReservationCounter::Request,
+            ReservationCounter::Transaction,
+            ReservationCounter::FrameTask,
+            ReservationCounter::CandidateFrame,
+            ReservationCounter::CleanupBatch,
+        ] {
+            let mut engine = ready_engine();
+            engine.testing_exhaust_reservation_counter(counter);
+            let before = engine.snapshot();
+
+            assert_eq!(
+                engine.push(RouteLocation::new("/items/1")),
+                Err(super::PushError::IdExhausted),
+                "counter: {counter:?}"
+            );
+            assert_eq!(engine.snapshot(), before, "counter: {counter:?}");
+        }
+    }
+
+    #[test]
+    fn commit_runs_unit_mutation_then_automatically_publishes_presealed_cleanup() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("expected frame task");
+        };
+        let ticket = engine.begin_view_report(task.identity()).unwrap().applied();
+        let expected_cleanup = ticket.cleanup().clone();
+        let ids_after_action = engine.ids.snapshot();
+        let mut mutated = false;
+
+        let receipt = engine
+            .commit(ticket, || {
+                mutated = true;
+            })
+            .unwrap();
+
+        assert!(mutated);
+        assert_eq!(receipt.cleanup(), &expected_cleanup);
+        assert_eq!(engine.ids.snapshot(), ids_after_action);
+        assert_eq!(engine.active().kind(), ActivePresentationKind::Route);
+    }
+
+    #[test]
+    fn fragment_and_replacement_freeze_exact_old_frame_cleanup_manifest() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let first = engine.active().frames()[0].clone();
+
+        engine
+            .push(RouteLocation::new("/items/1").with_fragment("details"))
+            .unwrap();
+        let EngineAction::FrameTask(fragment) = engine.action().unwrap() else {
+            panic!("expected fragment task");
+        };
+        let fragment_ticket = engine
+            .begin_view_report(fragment.identity())
+            .unwrap()
+            .applied();
+        assert_eq!(fragment_ticket.cleanup().obligations(), &[first.clone()]);
+        let fragment_cleanup = engine
+            .commit(fragment_ticket, || {})
+            .unwrap()
+            .cleanup()
+            .clone();
+        engine
+            .complete_cleanup(fragment_cleanup.testing_removed_completion().unwrap())
+            .unwrap();
+        let fragment_active = engine.active().frames()[0].clone();
+
+        engine.push(RouteLocation::new("/about")).unwrap();
+        let EngineAction::FrameTask(replacement) = engine.action().unwrap() else {
+            panic!("expected replacement task");
+        };
+        let replacement_ticket = engine
+            .begin_view_report(replacement.identity())
+            .unwrap()
+            .applied();
+        assert_eq!(
+            replacement_ticket.cleanup().obligations(),
+            &[fragment_active]
+        );
+    }
+
+    #[test]
+    fn nonzero_cleanup_rejects_missing_duplicate_foreign_and_out_of_order_receipts() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let request = engine.push(RouteLocation::new("/about")).unwrap();
+        let cleanup = publish_current(&mut engine);
+        assert_eq!(cleanup.obligation_count(), 1);
+
+        for invalid in [
+            cleanup.testing_missing_completion(),
+            cleanup.testing_duplicate_completion(CleanupDisposition::Removed),
+            cleanup.testing_foreign_completion(CleanupDisposition::Removed),
+            cleanup.testing_foreign_batch_completion(CleanupDisposition::Removed),
+            cleanup.testing_out_of_order_completion(CleanupDisposition::Removed),
+        ] {
+            let before = engine.snapshot();
+            assert!(engine.complete_cleanup(invalid).is_err());
+            assert_eq!(engine.snapshot(), before);
+        }
+
+        engine
+            .complete_cleanup(cleanup.testing_removed_completion().unwrap())
+            .unwrap();
+        let settled = engine
+            .request(request)
+            .unwrap()
+            .trace()
+            .iter()
+            .filter(|event| event.kind() == NavigationTraceEventKind::CleanupSettled)
+            .collect::<Vec<_>>();
+        assert_eq!(settled.len(), 1);
+        assert_eq!(
+            settled[0].cleanup_disposition(),
+            Some(CleanupDisposition::Removed)
+        );
+    }
+
+    #[test]
+    fn cleanup_ledger_rejects_two_exact_receipts_in_reverse_manifest_order() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        engine.push(RouteLocation::new("/about")).unwrap();
+        let cleanup = publish_current(&mut engine);
+        let first = cleanup.obligations()[0].clone();
+        let second = RouteFrameVersion::new(
+            first.router_identity(),
+            first.host(),
+            first.slot(),
+            first.origin().clone(),
+            RouteFrameId::new(first.frame().raw() + 1),
+            first.generation(),
+        );
+        let two = cleanup.testing_with_manifest(vec![first, second]);
+        let reversed = cleanup
+            .testing_with_manifest(two.obligations().iter().cloned().rev().collect::<Vec<_>>());
+        assert_ne!(
+            two.testing_manifest_digest(),
+            reversed.testing_manifest_digest()
+        );
+        assert_ne!(
+            cleanup.testing_manifest_digest(),
+            cleanup.testing_with_next_batch().testing_manifest_digest()
+        );
+        let receipts = vec![
+            two.receipt(1, CleanupDisposition::Removed).unwrap(),
+            two.receipt(0, CleanupDisposition::Removed).unwrap(),
+        ];
+
+        assert_eq!(
+            two.completion_from_receipts(receipts),
+            Err(crate::cleanup::CleanupLedgerError::DuplicateOrOutOfOrderReceipt)
+        );
+        assert_eq!(
+            cleanup.zero_completion(),
+            Err(crate::cleanup::CleanupLedgerError::MissingReceipt)
+        );
+    }
+
+    #[test]
+    fn generation_overflow_settles_accepted_request_and_does_not_poison_prior_cleanup() {
+        let mut engine = ready_engine();
+        let first = engine.push(RouteLocation::new("/items/1")).unwrap();
+        let cleanup = publish_current(&mut engine);
+        engine.testing_set_active_generation(RouteGeneration::testing_max());
+        let overflow = engine
+            .push(RouteLocation::new("/items/1").with_fragment("details"))
+            .unwrap();
+
+        engine
+            .complete_cleanup(cleanup.zero_completion().unwrap())
+            .unwrap();
+
+        assert_eq!(
+            engine.request(first).unwrap().status(),
+            &RequestStatus::Succeeded
+        );
+        assert!(matches!(
+            engine.request(overflow).unwrap().status(),
+            RequestStatus::Failed(_)
+        ));
+        assert_eq!(engine.current_status(), None);
+        assert!(engine.action().is_none());
+    }
+
+    #[test]
+    fn match_failure_clears_running_summary_and_advances_queue_consistently() {
+        let mut engine = ready_engine();
+        let failed = engine.push(RouteLocation::new("/missing")).unwrap();
+
+        assert!(matches!(
+            engine.request(failed).unwrap().status(),
+            RequestStatus::Failed(_)
+        ));
+        assert_eq!(engine.current_status(), None);
+
+        let next = engine.push(RouteLocation::new("/items/1")).unwrap();
+        assert_eq!(
+            engine.request(next).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::ApplyingFrame(0))
+        );
+    }
+
+    #[test]
+    fn queued_match_failure_is_settled_before_next_reserved_request_starts() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        let cleanup = publish_current(&mut engine);
+        let failed = engine.push(RouteLocation::new("/missing")).unwrap();
+        let next = engine.push(RouteLocation::new("/about")).unwrap();
+
+        engine
+            .complete_cleanup(cleanup.zero_completion().unwrap())
+            .unwrap();
+
+        assert!(matches!(
+            engine.request(failed).unwrap().status(),
+            RequestStatus::Failed(_)
+        ));
+        assert_eq!(
+            engine.request(next).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::ApplyingFrame(0))
+        );
+        assert!(matches!(engine.action(), Some(EngineAction::FrameTask(_))));
+    }
+
+    #[test]
+    fn frame_task_issued_is_the_first_trace_event_for_normal_push() {
+        let mut engine = ready_engine();
+        let request = engine.push(RouteLocation::new("/items/1")).unwrap();
+
+        assert_eq!(
+            engine.request(request).unwrap().trace()[0].kind(),
+            NavigationTraceEventKind::FrameTaskIssued
+        );
     }
 }
