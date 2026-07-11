@@ -49,6 +49,8 @@ Commit has two phases. Read-only preflight validates the complete tuple, current
 
 New authority code may coexist in source with the legacy prototype only while it is private and disconnected from every plugin/system/public path. A dedicated workspace cutover task migrates all callers, wires the new system chain, removes legacy exports/integration, and proves by compile gates that exactly one authority can publish active/history.
 
+Through Tasks 4-8, each owner crate may add and test private, disconnected foundations, plus final data-only public DTOs that carry no authority. Existing live cross-crate callers remain unchanged. Cross-crate consumption of the new engine/report/admission protocols, behavioral facade methods, caller migration, old-path removal, and lifecycle wiring all occur together in Task 9.
+
 Repeated single-root branches use these exact terminal rules:
 
 - Equivalent canonical path/search/fragment and branch: no entering or leaving frame, zero cleanup obligations, but the push history intent still appends the canonical location. The engine publishes the unchanged presentation, appends `CommitPublished`, enters `PostCommitCleanup`, completes the zero batch, and terminates `Succeeded`.
@@ -283,8 +285,8 @@ Commit: `feat(core): define root navigation state model`
 - Create: `crates/bevy_ui_router_core/src/cleanup.rs`
 - Modify: `crates/bevy_ui_router_core/src/history.rs`
 - Modify: `crates/bevy_ui_router_core/src/lib.rs`
-- Keep temporarily private and disconnected until Task 9 cutover: `crates/bevy_ui_router_core/src/runtime.rs`
-- Keep temporarily private and disconnected until Task 9 cutover: `crates/bevy_ui_router_core/src/transaction.rs`
+- Retain unchanged for existing live callers until the Task 9 caller migration and cutover: `crates/bevy_ui_router_core/src/runtime.rs`
+- Retain unchanged for existing live callers until the Task 9 caller migration and cutover: `crates/bevy_ui_router_core/src/transaction.rs`
 
 **Interfaces:**
 - Consumes: Task 2 route bindings and Task 3 state types.
@@ -310,11 +312,13 @@ After `CommitPublished`, issue a cleanup batch with count zero, append `PostComm
 
 - [ ] **Step 5: Keep the new engine disconnected until workspace cutover**
 
-Make the legacy runtime/transaction surface private now, but do not wire `RouterEngine` into the existing ECS plugin in this task. Tests may construct the engine only through core-private fixtures. Task 9 performs the one workspace cutover; no intermediate commit has two integrated publishers.
+Keep `RouterEngine` and its cleanup protocol core-private and disconnected from every plugin, system, facade, and prelude path through Task 8. Tests construct them only through Core-private unit fixtures. Do not change the visibility, exports, or existing ECS/View/facade callers of legacy `runtime.rs` and `transaction.rs` in this task; add no new legacy caller or export. The legacy path remains the sole integrated active/history publisher through Task 8. Task 9 performs the single caller migration, removes legacy integration/exports/tests/sources, and wires `RouterEngine` in the same workspace commit. No intermediate commit may contain zero or two integrated publishers.
 
 - [ ] **Step 6: Verify and commit**
 
 Run: `cargo test --locked -p bevy_ui_router_core`
+
+Run: `cargo check --locked --workspace --all-targets --all-features`
 
 Commit: `feat(core): build router engine authority`
 
@@ -324,12 +328,12 @@ Commit: `feat(core): build router engine authority`
 - Create: `crates/bevy_ui_router_view/src/registry.rs`
 - Create: `crates/bevy_ui_router_view/src/effect.rs`
 - Modify: `crates/bevy_ui_router_view/src/lib.rs`
-- Remove or rewrite: `crates/bevy_ui_router_view/src/contract.rs`
-- Remove facade forwarding of: `crates/bevy_ui_router_view/src/testing.rs`
+- Retain unchanged for existing live callers until Task 9: `crates/bevy_ui_router_view/src/contract.rs`
+- Retain unchanged for existing live callers until Task 9: `crates/bevy_ui_router_view/src/testing.rs`
 
 **Interfaces:**
 - Consumes: core `RouteViewKey`, canonical location, matched route, frame origin, and navigation failure.
-- Produces: `ViewDriverKey`, `RouteViewDescriptor`, `RouteViewRegistry`, `ViewRequestId`, and `ViewBuildEffect`; no World or acceptance capability.
+- Produces: authority-free final public DTOs `ViewDriverKey`, `RouteViewRegistry`, and `ViewBuildEffect`, plus owner-private final definitions for the legacy-colliding `RouteViewDescriptor` and `ViewRequestId`; no World or acceptance capability. Colliding names remain unexported until Task 9 removes the legacy definitions.
 
 - [ ] **Step 1: Write RED tests for keys, registry, and immutable effect input**
 
@@ -339,13 +343,15 @@ Cover invalid keys, duplicate registry entries, stable lookup, route-local param
 
 Run: `cargo test --locked -p bevy_ui_router_view`
 
-- [ ] **Step 3: Implement pure data contracts and remove old authority-shaped reports**
+- [ ] **Step 3: Implement pure data contracts alongside the unchanged live path**
 
-The view crate remains dependency-limited to core. Move immediate ECS report/session ownership out of view. Do not retain aliases for `ViewBindingKey`, `ViewReportSession`, partial output, disposal hints, or fake facade renderers.
+The view crate remains dependency-limited to core. Add the final renderer-neutral registry/effect data model without wiring it into the existing View/ECS bridge. Root-export only the final allowlisted, non-colliding, authority-free DTOs needed by later disconnected foundations; keep `RouteViewDescriptor` and `ViewRequestId` private because their legacy names are still live. Do not add aliases, adapters, shims, or new callers for `ViewBindingKey`, `ViewReportSession`, partial output, disposal hints, or fake facade renderers. Task 9 removes the colliding legacy definitions, exports the final replacements, migrates existing callers, and removes legacy testing exports in the same cutover commit.
 
 - [ ] **Step 4: Verify dependency and compile boundaries**
 
 Run: `cargo test --locked -p bevy_ui_router_view`
+
+Run: `cargo check --locked --workspace --all-targets --all-features`
 
 Commit: `feat(view): define renderer-neutral view effects`
 
@@ -355,11 +361,11 @@ Commit: `feat(view): define renderer-neutral view effects`
 - Create: `crates/bevy_ui_router_ecs/src/content.rs`
 - Create: `crates/bevy_ui_router_ecs/src/driver.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/lib.rs`
-- Replace callers in: `crates/bevy_ui_router_ecs/src/bridge.rs`
+- Retain unchanged for existing live callers until Task 9: `crates/bevy_ui_router_ecs/src/bridge.rs`
 
 **Interfaces:**
 - Consumes: `ViewBuildEffect`.
-- Produces: sealed `SolidRect`, `ContentColor`, session-local `ContentEntity`, `FrameContentWriter`, `EcsViewDriver`, `EcsViewReportSession`, and `ViewBuildReport`.
+- Produces: owner-private sealed `SolidRect`, `ContentColor`, session-local `ContentEntity`, `FrameContentWriter`, `EcsViewDriver`, `EcsViewReportSession`, and `ViewBuildReport` foundations. Task 9 makes only the final allowlisted surface public while wiring the bridge.
 
 - [ ] **Step 1: Write content-plan RED tests**
 
@@ -375,15 +381,17 @@ Run: `cargo test --locked -p bevy_ui_router_ecs`
 
 - [ ] **Step 4: Implement same-crate report authority**
 
-Only ECS constructs `EcsViewReportSession`; consumers can call `applied`, `build_failed`, or `apply_failed` once. The report carries kind/message only; the accepted plan remains ECS-private.
+Only ECS constructs `EcsViewReportSession`; consumers can call `applied`, `build_failed`, or `apply_failed` once. The report carries kind/message only; the accepted plan remains ECS-private. Keep this new report/content protocol private and disconnected in Task 6; do not adapt or replace the live bridge until Task 9.
 
 - [ ] **Step 5: Verify and commit**
 
 Run: `cargo test --locked -p bevy_ui_router_ecs`
 
+Run: `cargo check --locked --workspace --all-targets --all-features`
+
 Commit: `feat(ecs): add closed content planning protocol`
 
-### Task 7: Plugin, App Extension, Navigation, And Snapshots
+### Task 7: Plugin, Resource, And Facade DTO Foundations
 
 **Files:**
 - Create: `crates/bevy_ui_router_ecs/src/app_ext.rs`
@@ -393,12 +401,12 @@ Commit: `feat(ecs): add closed content planning protocol`
 - Modify: `crates/bevy_ui_router_ecs/src/lib.rs`
 
 **Interfaces:**
-- Consumes: engine, view registry, and driver store.
-- Produces: `BevyUiRouterPlugin: Default + Plugin`, `AppRouterExt`, `RouterConfig`, `RouterHandle`, `RouterNavigation`, `RouterSnapshots`, public schedule/input labels, install marker, and resources ready for the Task 9 workspace cutover.
+- Consumes: Task 3 public DTO shapes plus the view-registry and driver-store definitions; it does not name, store, or call the Core-private engine.
+- Produces: public schedule/input labels, install marker, configuration/resource type foundations, and final public DTO shapes ready for Task 9 to add behavior and engine-backed storage.
 
 - [ ] **Step 1: Write plugin and install RED tests**
 
-Cover automatic install, explicit preinstall then extension use, duplicate driver rejection, synchronous config validation, missing normal/error/fallback/driver binding errors, initial `AwaitingHost`, and no router-created host entity.
+Cover plugin resource installation/idempotence, schedule labels, duplicate driver definition rejection, synchronous configuration-shape validation, and the absence of lifecycle systems or router-created host entities. Defer engine-backed router installation, request IDs, binding-resolution errors, and initial router snapshots to Task 9.
 
 - [ ] **Step 2: Verify RED**
 
@@ -406,19 +414,21 @@ Run: `cargo test --locked -p bevy_ui_router_ecs`
 
 - [ ] **Step 3: Define installation and scheduling contracts without wiring lifecycle systems**
 
-Define the exact `RouterScheduleSet` and `RouterInputSet` variants and an internal install marker. Automatic and explicit plugin installation create each public resource/driver/router store once. Do not register placeholder lifecycle systems before host/registry/presentation functions exist; Task 9 wires the complete chain in one cutover.
+Define the exact `RouterScheduleSet` and `RouterInputSet` variants and an internal install marker. Plugin installation creates each disconnected resource/driver foundation once. Do not register placeholder lifecycle systems or construct a router/engine before host/registry/presentation functions exist; Task 9 wires the complete chain in one cutover.
 
-- [ ] **Step 4: Implement public command/snapshot resources**
+- [ ] **Step 4: Implement command/snapshot DTO and storage foundations**
 
-Commands enqueue with exact World/router provenance and are consumed only in `CollectNavigation`. Snapshots publish after lifecycle work and retain the engine's request records without exposing mutation capability.
+Define the final public command/snapshot data shapes and ECS-private disconnected storage foundations without allocating request IDs, accepting commands, retaining engine records, or publishing lifecycle state. Task 9 adds `AppRouterExt`/`RouterNavigation` behavior, exact World/router provenance, engine storage/projection, and `CollectNavigation` consumption atomically with the cutover.
 
 - [ ] **Step 5: Verify and commit**
 
 Run: `cargo test --locked -p bevy_ui_router_ecs`
 
-Commit: `feat(ecs): define root navigation facade resources`
+Run: `cargo check --locked --workspace --all-targets --all-features`
 
-### Task 8: Host Admission And Entity Registry Foundation
+Commit: `feat(ecs): define root navigation resource foundations`
+
+### Task 8: Host Candidate And Entity Registry Foundation
 
 **Files:**
 - Create: `crates/bevy_ui_router_ecs/src/host.rs`
@@ -427,12 +437,12 @@ Commit: `feat(ecs): define root navigation facade resources`
 - Modify: `crates/bevy_ui_router_ecs/src/plugin.rs`
 
 **Interfaces:**
-- Consumes: `RouterHostRegistration` candidates and engine admission protocol.
-- Produces: one confirmed app-host mapping, one inert router-owned top slot, `EntityOwner`, ownership seal, component manifest, candidate revision latch, inbound-parent/cycle classification, and a private quarantine lease table ready to receive staging residuals.
+- Consumes: `RouterHostRegistration` candidate data only; it does not name or call the Core-private engine admission protocol.
+- Produces: read-only candidate classification, `EntityOwner`, ownership seal, component manifest, candidate revision latch, inert provisional-staging primitives, and a private quarantine lease table ready for Task 9 integration.
 
 - [ ] **Step 1: Write host-admission RED tests**
 
-Cover no host, unique Node host, non-Node host, non-Node/cyclic ancestry, competing candidates, extra candidate after confirmation, app host sentinel, existing child identity/order, post-write observer drift, and candidate-revision latch.
+Cover no host, unique Node host, non-Node host, non-Node/cyclic ancestry, competing candidates, app host sentinel, existing child identity/order, private provisional-staging post-write observer drift, and candidate-revision latch. Defer engine confirmation, post-confirmation competing candidates, and published availability to Task 9.
 
 - [ ] **Step 2: Verify RED**
 
@@ -440,19 +450,21 @@ Run: `cargo test --locked -p bevy_ui_router_ecs`
 
 - [ ] **Step 3: Implement read-only candidate classification**
 
-Never repair app topology. Preflight the exact host generation and full actual Node ancestry. Allocate logical host/epoch/top-slot only after preflight succeeds.
+Never repair app topology. Preflight the exact host generation and full actual Node ancestry. Do not allocate logical host/epoch/top-slot IDs in this disconnected task. Return an ECS-private, read-only classification that Task 9 can present to the engine admission protocol.
 
 - [ ] **Step 4: Implement inert staging and confirmation**
 
-Empty-allocate the top slot, staging-register identity/owner/seal/manifest, insert full Node + visibility/input/picking barrier, attach only its authorized host edge, post-write validate, then confirm. On rejection, keep IDs burned and settle only the staging residual.
+Implement and unit-test an ECS-private inert provisional-staging primitive that receives a sealed same-crate test specification, empty-allocates the provisional top slot, staging-registers owner/seal/manifest, inserts the full Node + visibility/input/picking barrier, attaches only its authorized host edge, and post-write validates. It must not be called by a production system, publish `Ready`, or confirm Core authority in Task 8. Task 9 binds the real engine grant, exact logical IDs, rejection settlement, and confirmation to this primitive.
 
-If a protected parent/component/foreign descendant prevents safe removal of a staging residual, transfer only its immutable exact owned set into the independent inert quarantine table. Do not implement background reaping behavior in this task.
+If a protected parent/component/foreign descendant prevents safe removal in the private staging regression, transfer only its immutable exact owned set into the independent inert quarantine table. Do not implement background reaping behavior in this task.
 
 - [ ] **Step 5: Verify and commit**
 
 Run: `cargo test --locked -p bevy_ui_router_ecs`
 
-Commit: `feat(ecs): admit app hosts without taking ownership`
+Run: `cargo check --locked --workspace --all-targets --all-features`
+
+Commit: `feat(ecs): classify host candidates and stage inert slots`
 
 ### Task 9: Root Frame Realization, Atomic Commit, And Workspace Cutover
 
@@ -463,9 +475,14 @@ Commit: `feat(ecs): admit app hosts without taking ownership`
 - Rewrite foundation in: `crates/bevy_ui_router_ecs/src/cleanup.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/registry.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/plugin.rs`
+- Modify for deferred behavior/export completion: `crates/bevy_ui_router_ecs/src/lib.rs`, `content.rs`, `driver.rs`, `app_ext.rs`, `navigation.rs`, `snapshots.rs`, and `host.rs`
+- Modify for final exports/caller migration: `crates/bevy_ui_router_view/src/lib.rs`, `registry.rs`, and `effect.rs`
+- Modify for sealed cross-crate integration: `crates/bevy_ui_router_core/src/lib.rs`, `engine.rs`, `cleanup.rs`, and `admission.rs`
 - Replace integrated use of: `state.rs`, `finalize.rs`, and `bridge.rs`
+- Remove after caller migration: `crates/bevy_ui_router_view/src/contract.rs` and `testing.rs`
 - Modify for minimal cutover: `crates/bevy_ui_router/src/lib.rs`
 - Add minimal authority RED cases to: `crates/bevy_ui_router/tests/facade_authority_compile_fail.rs`
+- Add focused positive facade RED/GREEN target: `crates/bevy_ui_router/tests/root_navigation_surface.rs`
 - Remove after caller migration: `crates/bevy_ui_router_core/src/runtime.rs`
 - Remove after caller migration: `crates/bevy_ui_router_core/src/transaction.rs`
 
@@ -501,11 +518,17 @@ Under ECS `test-support`, expose opaque host/top-slot/frame/content mappings, li
 
 First add minimal compile-fail cases proving the current whole-crate facade exposes legacy active/history authority and deferred Root-profile methods; run them to observe RED. Then implement the minimum new cleanup ledger needed for zero-obligation first push and exact normal-leaving roots, plus the no-op reaper interface. Wire `ObserveAuthority -> CollectNavigation -> DriveNavigation -> CommitPresentation -> SettleCleanup -> ReapQuarantines -> PublishSnapshots` in `Update` and `RouterInputSet::Refresh -> Ready` in `PreUpdate`. `Refresh` reads the now-existing registry/quarantine/ancestry facts and only narrows permission. Migrate every ECS/view/facade caller to the new engine/content/cleanup protocol, replace whole-crate facade reexports with the minimal Root-profile wrappers, remove legacy runtime/transaction integration and exports, then delete the legacy source/tests. The workspace compile gate fails if any old active/history publication entrypoint remains reachable.
 
+Complete every behavior intentionally deferred by Tasks 5-8 in this same cutover: expose only the narrow sealed Core integration protocol required by ECS while the facade simultaneously stops whole-crate aliasing; replace the live View/ECS report bridge; construct engine-backed router stores; implement `AppRouterExt` and `RouterNavigation` request allocation/queueing; project retained engine records into snapshots; bind host classification/staging to real admission grants; and publish confirmation only after post-write validation. No earlier foundation receives a second compatibility path, and the facade cannot name or construct the Core integration authority.
+
+Before implementing those behaviors, add `root_navigation_surface.rs` as a positive facade RED test. Using only `bevy_ui_router::prelude::*`, it installs the plugin/router configuration, registers the Root driver and app-owned host, enqueues one `push`, and observes the returned request through the public snapshot surface after updates. It proves the Task 9 behavioral facade and queue/snapshot integration only; cleanup terminality, fallback, repeated push, and full Root journey assertions remain Task 10.
+
 - [ ] **Step 8: Verify and commit**
 
 Run: `cargo test --locked -p bevy_ui_router_ecs`
 
 Run: `cargo test --locked -p bevy_ui_router --all-features --test facade_authority_compile_fail cutover`
+
+Run: `cargo test --locked -p bevy_ui_router --no-default-features --features ecs --test root_navigation_surface`
 
 Run: `cargo check --locked --workspace --all-targets --all-features`
 

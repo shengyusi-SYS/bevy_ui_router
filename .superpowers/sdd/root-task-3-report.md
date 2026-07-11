@@ -82,6 +82,6 @@ then passed after suppression was narrowed to concrete test-aware types and meth
   projection.
 - Admission settlement and `RouterNavigationState` remain crate-private foundations for Task 4;
   no public host lease or settlement API was introduced.
-- The legacy runtime finding is explicitly deferred to the planned Task 4 private cutover and Task
-  9 integration cutover; this mechanical follow-up does not remove it or claim that cutover.
+- The existing live legacy runtime remains the sole publisher until the planned Task 9 caller
+  migration/removal/integration cutover; Task 3 adds no adapter, alias, shim, or new caller.
 - No authoritative documentation was modified by this follow-up.
