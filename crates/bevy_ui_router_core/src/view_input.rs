@@ -1,12 +1,9 @@
-#![allow(dead_code)]
-
 use crate::branch::RouteParams;
 use crate::frame::FrameOrigin;
 use crate::ids::RouteId;
 use crate::location::RouteLocation;
 use crate::request::NavigationFailure;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteViewInput {
     location: RouteLocation,
     route: Option<RouteId>,
@@ -16,6 +13,7 @@ pub struct RouteViewInput {
 }
 
 impl RouteViewInput {
+    #[allow(dead_code)]
     pub(crate) fn new(
         location: RouteLocation,
         route: Option<RouteId>,
@@ -32,15 +30,15 @@ impl RouteViewInput {
         }
     }
 
-    pub const fn location(&self) -> &RouteLocation {
+    pub fn location(&self) -> &RouteLocation {
         &self.location
     }
 
-    pub const fn route(&self) -> Option<RouteId> {
+    pub fn route(&self) -> Option<RouteId> {
         self.route
     }
 
-    pub const fn params(&self) -> &RouteParams {
+    pub fn params(&self) -> &RouteParams {
         &self.params
     }
 
@@ -52,11 +50,11 @@ impl RouteViewInput {
         self.location.fragment()
     }
 
-    pub const fn origin(&self) -> &FrameOrigin {
+    pub fn origin(&self) -> &FrameOrigin {
         &self.origin
     }
 
-    pub const fn failure(&self) -> Option<&NavigationFailure> {
+    pub fn failure(&self) -> Option<&NavigationFailure> {
         self.failure.as_ref()
     }
 }

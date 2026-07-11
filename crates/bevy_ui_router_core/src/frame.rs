@@ -70,27 +70,27 @@ impl RouteFrameVersion {
         }
     }
 
-    pub const fn router(&self) -> RouterInstanceId {
+    pub fn router(&self) -> RouterInstanceId {
         self.router
     }
 
-    pub const fn host(&self) -> RouteHostId {
+    pub fn host(&self) -> RouteHostId {
         self.host
     }
 
-    pub const fn slot(&self) -> RouteSlotId {
+    pub fn slot(&self) -> RouteSlotId {
         self.slot
     }
 
-    pub const fn origin(&self) -> &FrameOrigin {
+    pub fn origin(&self) -> &FrameOrigin {
         &self.origin
     }
 
-    pub const fn frame(&self) -> RouteFrameId {
+    pub fn frame(&self) -> RouteFrameId {
         self.frame
     }
 
-    pub const fn generation(&self) -> RouteGeneration {
+    pub fn generation(&self) -> RouteGeneration {
         self.generation
     }
 }

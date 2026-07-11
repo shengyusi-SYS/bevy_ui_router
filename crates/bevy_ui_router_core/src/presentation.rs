@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::admission::{HostAdmissionConfirmation, HostVersion};
 use crate::fingerprint::RouteBranchFingerprint;
 use crate::frame::RouteFrameVersion;
@@ -39,12 +37,12 @@ pub enum ActivePresentationKind {
     Error,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ActivePresentationState {
     None,
     Route {
         location: RouteLocation,
-        matched: Option<RouteBranchFingerprint>,
         frames: Vec<RouteFrameVersion>,
     },
     Error {
@@ -67,20 +65,14 @@ impl ActivePresentation {
         }
     }
 
-    pub(crate) fn route(
-        location: RouteLocation,
-        matched: Option<RouteBranchFingerprint>,
-        frames: Vec<RouteFrameVersion>,
-    ) -> Self {
+    #[allow(dead_code)]
+    pub(crate) fn route(location: RouteLocation, frames: Vec<RouteFrameVersion>) -> Self {
         Self {
-            state: ActivePresentationState::Route {
-                location,
-                matched,
-                frames,
-            },
+            state: ActivePresentationState::Route { location, frames },
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn error(
         requested: RouteLocation,
         matched: Option<RouteBranchFingerprint>,
@@ -97,7 +89,7 @@ impl ActivePresentation {
         }
     }
 
-    pub const fn kind(&self) -> ActivePresentationKind {
+    pub fn kind(&self) -> ActivePresentationKind {
         match self.state {
             ActivePresentationState::None => ActivePresentationKind::None,
             ActivePresentationState::Route { .. } => ActivePresentationKind::Route,
@@ -142,21 +134,30 @@ impl ActivePresentation {
     }
 }
 
-#[derive(Debug)]
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConfirmedHostAuthority {
+    version: HostVersion,
+    top_slot: crate::ids::RouteSlotId,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RouterNavigationState {
     availability: RouterAvailability,
     current_request: Option<RequestStatus>,
     active: ActivePresentation,
-    host: Option<HostVersion>,
+    authority: Option<ConfirmedHostAuthority>,
 }
 
+#[allow(dead_code)]
 impl RouterNavigationState {
     pub(crate) const fn new() -> Self {
         Self {
             availability: RouterAvailability::AwaitingHost,
             current_request: None,
             active: ActivePresentation::none(),
-            host: None,
+            authority: None,
         }
     }
 
@@ -168,23 +169,59 @@ impl RouterNavigationState {
         &self.active
     }
 
+    pub(crate) const fn current_request(&self) -> Option<&RequestStatus> {
+        self.current_request.as_ref()
+    }
+
     pub(crate) const fn host(&self) -> Option<&HostVersion> {
-        self.host.as_ref()
+        match &self.authority {
+            Some(authority) => Some(&authority.version),
+            None => None,
+        }
     }
 
-    pub(crate) fn confirm_host(&mut self, confirmation: HostAdmissionConfirmation) {
-        self.host = Some(confirmation.version().clone());
+    pub(crate) fn top_slot(&self) -> Option<crate::ids::RouteSlotId> {
+        self.authority.as_ref().map(|authority| authority.top_slot)
+    }
+
+    pub(crate) fn confirm_host(
+        &mut self,
+        issuer: &crate::admission::HostAdmissionIssuer,
+        confirmation: &HostAdmissionConfirmation,
+    ) -> Result<(), AuthorityConfirmationError> {
+        if self.authority.is_some()
+            || self.availability != RouterAvailability::AwaitingHost
+            || !issuer.is_current_confirmation(confirmation)
+        {
+            return Err(AuthorityConfirmationError);
+        }
+        self.authority = Some(ConfirmedHostAuthority {
+            version: confirmation.version().clone(),
+            top_slot: confirmation.top_slot(),
+        });
         self.availability = RouterAvailability::Ready;
+        Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn set_request(&mut self, status: Option<RequestStatus>) {
         self.current_request = status;
     }
 
+    #[allow(dead_code)]
     pub(crate) fn set_active(&mut self, active: ActivePresentation) {
         self.active = active;
     }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> Self {
+        self.clone()
+    }
 }
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthorityConfirmationError;
 
 #[cfg(test)]
 mod tests {
@@ -214,7 +251,7 @@ mod tests {
             NavigationFailure::new(NavigationFailureKind::Match, "no match"),
             Vec::new(),
         );
-        let route = ActivePresentation::route(requested, Some(matched.clone()), Vec::new());
+        let route = ActivePresentation::route(requested, Vec::new());
 
         assert_eq!(recovered.matched(), Some(&matched));
         assert!(match_failure.matched().is_none());

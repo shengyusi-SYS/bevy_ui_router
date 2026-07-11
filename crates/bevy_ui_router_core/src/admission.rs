@@ -1,6 +1,6 @@
-#![allow(dead_code)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::ids::{CoreIdAllocator, RouteHostId, RouteSlotId, RouterInstanceId};
+use crate::ids::{CoreIdAllocator, IdExhaustion, RouteHostId, RouteSlotId, RouterInstanceId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostVersion {
@@ -9,99 +9,395 @@ pub struct HostVersion {
     epoch: u64,
 }
 
-#[derive(Debug)]
-pub struct HostAdmissionToken {
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdmissionKey {
+    issuer: AdmissionIssuerId,
     router: RouterInstanceId,
     sequence: u64,
 }
 
-#[derive(Debug)]
-pub struct HostGrant {
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdmissionIssuerId(u64);
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionToken {
+    key: AdmissionKey,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostGrant {
+    key: AdmissionKey,
     version: HostVersion,
     top_slot: RouteSlotId,
 }
 
-#[derive(Debug)]
-pub struct HostAdmissionConfirmation {
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionConfirmation {
+    key: AdmissionKey,
     version: HostVersion,
     top_slot: RouteSlotId,
 }
 
-#[derive(Debug)]
-pub(crate) struct HostAdmissionIssuer {
-    next_sequence: u64,
-    next_epoch: u64,
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OutstandingAdmission {
+    Requested(AdmissionKey),
+    Granted(GrantIdentity),
 }
 
-impl HostAdmissionIssuer {
-    pub(crate) const fn new() -> Self {
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GrantIdentity {
+    key: AdmissionKey,
+    version: HostVersion,
+    top_slot: RouteSlotId,
+}
+
+#[allow(dead_code)]
+impl GrantIdentity {
+    fn from_grant(grant: &HostGrant) -> Self {
         Self {
-            next_sequence: 1,
-            next_epoch: 1,
+            key: grant.key,
+            version: grant.version.clone(),
+            top_slot: grant.top_slot,
         }
     }
 
-    pub(crate) fn issue(&mut self, router: RouterInstanceId) -> HostAdmissionToken {
-        let token = HostAdmissionToken::new(router, self.next_sequence);
-        self.next_sequence += 1;
-        token
+    fn from_confirmation(confirmation: &HostAdmissionConfirmation) -> Self {
+        Self {
+            key: confirmation.key,
+            version: confirmation.version.clone(),
+            top_slot: confirmation.top_slot,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmissionError {
+    OutstandingExists,
+    Stale,
+    Exhausted,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct HostAdmissionIssuer {
+    issuer: AdmissionIssuerId,
+    next_sequence: u64,
+    next_epoch: u64,
+    outstanding: Option<OutstandingAdmission>,
+    current: Option<GrantIdentity>,
+}
+
+#[allow(dead_code)]
+impl HostAdmissionIssuer {
+    pub(crate) fn new() -> Result<Self, IdExhaustion> {
+        static NEXT_ISSUER: AtomicU64 = AtomicU64::new(1);
+
+        Ok(Self {
+            issuer: allocate_issuer(&NEXT_ISSUER)?,
+            next_sequence: 1,
+            next_epoch: 1,
+            outstanding: None,
+            current: None,
+        })
+    }
+
+    pub(crate) fn issue(
+        &mut self,
+        router: RouterInstanceId,
+    ) -> Result<HostAdmissionToken, AdmissionError> {
+        if self.outstanding.is_some() {
+            return Err(AdmissionError::OutstandingExists);
+        }
+        let next = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or(AdmissionError::Exhausted)?;
+        let token = HostAdmissionToken {
+            key: AdmissionKey {
+                issuer: self.issuer,
+                router,
+                sequence: self.next_sequence,
+            },
+        };
+        self.next_sequence = next;
+        self.outstanding = Some(OutstandingAdmission::Requested(token.key));
+        Ok(token)
     }
 
     pub(crate) fn grant(
         &mut self,
-        token: HostAdmissionToken,
+        token: &HostAdmissionToken,
         ids: &mut CoreIdAllocator,
-    ) -> HostGrant {
+    ) -> Result<HostGrant, AdmissionError> {
+        if self.outstanding != Some(OutstandingAdmission::Requested(token.key)) {
+            return Err(AdmissionError::Stale);
+        }
+        let next_epoch = self
+            .next_epoch
+            .checked_add(1)
+            .ok_or(AdmissionError::Exhausted)?;
+        let (host, top_slot) = ids
+            .allocate_host_slot()
+            .map_err(|_| AdmissionError::Exhausted)?;
         let epoch = self.next_epoch;
-        self.next_epoch += 1;
-        HostGrant {
+        let grant = HostGrant {
+            key: token.key,
             version: HostVersion {
-                router: token.router,
-                host: ids.allocate_host(),
+                router: token.key.router,
+                host,
                 epoch,
             },
-            top_slot: ids.allocate_slot(),
-        }
+            top_slot,
+        };
+        self.next_epoch = next_epoch;
+        self.outstanding = Some(OutstandingAdmission::Granted(GrantIdentity::from_grant(
+            &grant,
+        )));
+        Ok(grant)
     }
 
-    pub(crate) fn confirm(&mut self, grant: HostGrant) -> HostAdmissionConfirmation {
-        HostAdmissionConfirmation {
-            version: grant.version,
+    pub(crate) fn reject(&mut self, token: &HostAdmissionToken) -> Result<(), AdmissionError> {
+        self.finish_requested(token)
+    }
+
+    pub(crate) fn cancel(&mut self, token: &HostAdmissionToken) -> Result<(), AdmissionError> {
+        self.finish_requested(token)
+    }
+
+    fn finish_requested(&mut self, token: &HostAdmissionToken) -> Result<(), AdmissionError> {
+        if self.outstanding != Some(OutstandingAdmission::Requested(token.key)) {
+            return Err(AdmissionError::Stale);
+        }
+        self.outstanding = None;
+        Ok(())
+    }
+
+    pub(crate) fn confirm(
+        &mut self,
+        grant: &HostGrant,
+    ) -> Result<HostAdmissionConfirmation, AdmissionError> {
+        let identity = GrantIdentity::from_grant(grant);
+        if self.outstanding.as_ref() != Some(&OutstandingAdmission::Granted(identity.clone())) {
+            return Err(AdmissionError::Stale);
+        }
+        let confirmation = HostAdmissionConfirmation {
+            key: grant.key,
+            version: grant.version.clone(),
             top_slot: grant.top_slot,
+        };
+        self.outstanding = None;
+        self.current = Some(identity);
+        Ok(confirmation)
+    }
+
+    pub(crate) fn reject_after_mutation(
+        &mut self,
+        grant: &HostGrant,
+    ) -> Result<(), AdmissionError> {
+        let identity = GrantIdentity::from_grant(grant);
+        if self.outstanding.as_ref() != Some(&OutstandingAdmission::Granted(identity)) {
+            return Err(AdmissionError::Stale);
+        }
+        self.outstanding = None;
+        Ok(())
+    }
+
+    pub(crate) fn is_current_confirmation(&self, confirmation: &HostAdmissionConfirmation) -> bool {
+        self.current.as_ref() == Some(&GrantIdentity::from_confirmation(confirmation))
+    }
+
+    pub(crate) fn has_outstanding(&self) -> bool {
+        self.outstanding.is_some()
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> HostAdmissionIssuerSnapshot {
+        HostAdmissionIssuerSnapshot {
+            next_sequence: self.next_sequence,
+            next_epoch: self.next_epoch,
+            outstanding: self.outstanding.clone(),
+            current: self.current.clone(),
         }
     }
 }
 
 impl HostAdmissionToken {
-    fn new(router: RouterInstanceId, sequence: u64) -> Self {
-        Self { router, sequence }
+    #[cfg(test)]
+    fn router(&self) -> RouterInstanceId {
+        self.key.router
     }
 }
 
-impl HostAdmissionConfirmation {
-    pub(crate) const fn version(&self) -> &HostVersion {
+#[allow(dead_code)]
+impl HostGrant {
+    pub(crate) fn version(&self) -> &HostVersion {
         &self.version
     }
 
-    pub(crate) const fn top_slot(&self) -> RouteSlotId {
+    pub(crate) fn top_slot(&self) -> RouteSlotId {
         self.top_slot
     }
+}
+
+#[allow(dead_code)]
+impl HostAdmissionConfirmation {
+    pub(crate) fn version(&self) -> &HostVersion {
+        &self.version
+    }
+
+    pub(crate) fn top_slot(&self) -> RouteSlotId {
+        self.top_slot
+    }
+
+    #[cfg(test)]
+    fn router(&self) -> RouterInstanceId {
+        self.key.router
+    }
+}
+
+#[allow(dead_code)]
+fn allocate_issuer(counter: &AtomicU64) -> Result<AdmissionIssuerId, IdExhaustion> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map(AdmissionIssuerId)
+        .map_err(|_| IdExhaustion)
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HostAdmissionIssuerSnapshot {
+    next_sequence: u64,
+    next_epoch: u64,
+    outstanding: Option<OutstandingAdmission>,
+    current: Option<GrantIdentity>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn host_and_slot_ids_are_allocated_only_after_token_issue() {
-        let mut ids = CoreIdAllocator::new();
-        let router = ids.allocate_router();
-        let mut issuer = HostAdmissionIssuer::new();
-        let token = issuer.issue(router);
-        let grant = issuer.grant(token, &mut ids);
-        let confirmation = issuer.confirm(grant);
+    fn setup() -> (CoreIdAllocator, RouterInstanceId, HostAdmissionIssuer) {
+        let mut ids = CoreIdAllocator::new().unwrap();
+        let router = ids.allocate_router().unwrap();
+        let issuer = HostAdmissionIssuer::new().unwrap();
+        (ids, router, issuer)
+    }
 
-        assert_eq!(confirmation.version().router, router);
-        assert_ne!(confirmation.top_slot(), RouteSlotId::new(0));
+    #[test]
+    fn issuer_allows_only_one_outstanding_admission() {
+        let (_ids, router, mut issuer) = setup();
+        let token = issuer.issue(router).unwrap();
+        let before = issuer.snapshot();
+
+        assert_eq!(issuer.issue(router), Err(AdmissionError::OutstandingExists));
+        assert_eq!(issuer.snapshot(), before);
+        assert_eq!(token.router(), router);
+    }
+
+    #[test]
+    fn pre_write_reject_and_cancel_allocate_no_host_or_slot_ids() {
+        for terminal in [HostAdmissionIssuer::reject, HostAdmissionIssuer::cancel] {
+            let (ids, router, mut issuer) = setup();
+            let token = issuer.issue(router).unwrap();
+            let ids_before = ids.snapshot();
+
+            terminal(&mut issuer, &token).unwrap();
+
+            assert_eq!(ids.snapshot(), ids_before);
+            assert!(!issuer.has_outstanding());
+            assert_eq!(terminal(&mut issuer, &token), Err(AdmissionError::Stale));
+            assert_eq!(ids.snapshot(), ids_before);
+        }
+    }
+
+    #[test]
+    fn grant_is_one_shot_and_confirm_rejects_replay() {
+        let (mut ids, router, mut issuer) = setup();
+        let token = issuer.issue(router).unwrap();
+        let grant = issuer.grant(&token, &mut ids).unwrap();
+        let granted = issuer.snapshot();
+
+        assert_eq!(issuer.reject(&token), Err(AdmissionError::Stale));
+        assert_eq!(issuer.snapshot(), granted);
+
+        let confirmation = issuer.confirm(&grant).unwrap();
+        let confirmed = issuer.snapshot();
+        assert_eq!(confirmation.router(), router);
+        assert_eq!(issuer.confirm(&grant), Err(AdmissionError::Stale));
+        assert_eq!(issuer.snapshot(), confirmed);
+    }
+
+    #[test]
+    fn rejection_after_mutation_burns_granted_host_and_slot_ids() {
+        let (mut ids, router, mut issuer) = setup();
+        let first_token = issuer.issue(router).unwrap();
+        let first_grant = issuer.grant(&first_token, &mut ids).unwrap();
+        let first_host = first_grant.version().host;
+        let first_slot = first_grant.top_slot();
+
+        issuer.reject_after_mutation(&first_grant).unwrap();
+        assert_eq!(
+            issuer.reject_after_mutation(&first_grant),
+            Err(AdmissionError::Stale)
+        );
+
+        let second_token = issuer.issue(router).unwrap();
+        let second_grant = issuer.grant(&second_token, &mut ids).unwrap();
+        assert_ne!(second_grant.version().host, first_host);
+        assert_ne!(second_grant.top_slot(), first_slot);
+    }
+
+    #[test]
+    fn foreign_and_out_of_order_values_are_zero_change() {
+        let (mut ids, router, mut issuer) = setup();
+        let (_foreign_ids, _foreign_router, mut foreign) = setup();
+        let token = issuer.issue(router).unwrap();
+        let issuer_before = issuer.snapshot();
+        let foreign_before = foreign.snapshot();
+
+        assert_eq!(foreign.reject(&token), Err(AdmissionError::Stale));
+        assert_eq!(issuer.snapshot(), issuer_before);
+        assert_eq!(foreign.snapshot(), foreign_before);
+
+        let grant = issuer.grant(&token, &mut ids).unwrap();
+        let granted = issuer.snapshot();
+        assert_eq!(foreign.confirm(&grant), Err(AdmissionError::Stale));
+        assert_eq!(issuer.snapshot(), granted);
+        assert_eq!(foreign.snapshot(), foreign_before);
+    }
+
+    #[test]
+    fn issuer_sequence_and_epoch_exhaustion_are_checked_and_zero_change() {
+        let (mut ids, router, mut issuer) = setup();
+        issuer.next_sequence = u64::MAX;
+        let before = issuer.snapshot();
+        assert_eq!(issuer.issue(router), Err(AdmissionError::Exhausted));
+        assert_eq!(issuer.snapshot(), before);
+
+        issuer.next_sequence = 1;
+        let token = issuer.issue(router).unwrap();
+        issuer.next_epoch = u64::MAX;
+        let issuer_before = issuer.snapshot();
+        let ids_before = ids.snapshot();
+        assert_eq!(
+            issuer.grant(&token, &mut ids),
+            Err(AdmissionError::Exhausted)
+        );
+        assert_eq!(issuer.snapshot(), issuer_before);
+        assert_eq!(ids.snapshot(), ids_before);
+
+        let issuer_counter = AtomicU64::new(u64::MAX);
+        assert_eq!(allocate_issuer(&issuer_counter), Err(IdExhaustion));
+        assert_eq!(issuer_counter.load(Ordering::Relaxed), u64::MAX);
     }
 }

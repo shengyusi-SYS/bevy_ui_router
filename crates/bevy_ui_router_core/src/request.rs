@@ -1,10 +1,10 @@
-#![allow(dead_code)]
-
 use crate::diagnostics::DiagnosticEvent;
 use crate::fingerprint::RouteBranchFingerprint;
 use crate::ids::NavigationRequestId;
 use crate::location::RouteLocation;
-use crate::trace::NavigationTraceEvent;
+use crate::trace::{
+    NavigationTraceError, NavigationTraceEvent, NavigationTraceEventKind, NavigationTraceLog,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NavigationFailureKind {
@@ -25,6 +25,7 @@ pub struct NavigationFailure {
 }
 
 impl NavigationFailure {
+    #[allow(dead_code)]
     pub(crate) fn new(kind: NavigationFailureKind, message: impl Into<String>) -> Self {
         Self {
             kind,
@@ -32,7 +33,7 @@ impl NavigationFailure {
         }
     }
 
-    pub const fn kind(&self) -> NavigationFailureKind {
+    pub fn kind(&self) -> NavigationFailureKind {
         self.kind
     }
 
@@ -63,16 +64,18 @@ pub enum RequestStatus {
     Failed(NavigationFailure),
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NavigationRequestRecord {
     id: NavigationRequestId,
     requested: RouteLocation,
     matched: Option<RouteBranchFingerprint>,
     status: RequestStatus,
-    trace: Vec<NavigationTraceEvent>,
+    trace: NavigationTraceLog,
     diagnostics: Vec<DiagnosticEvent>,
 }
 
+#[allow(dead_code)]
 impl NavigationRequestRecord {
     pub(crate) fn new(id: NavigationRequestId, requested: RouteLocation) -> Self {
         Self {
@@ -80,48 +83,174 @@ impl NavigationRequestRecord {
             requested,
             matched: None,
             status: RequestStatus::Queued,
-            trace: Vec::new(),
+            trace: NavigationTraceLog::new(),
             diagnostics: Vec::new(),
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn id(&self) -> NavigationRequestId {
         self.id
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn requested(&self) -> &RouteLocation {
         &self.requested
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn matched(&self) -> Option<&RouteBranchFingerprint> {
         self.matched.as_ref()
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn status(&self) -> &RequestStatus {
         &self.status
     }
 
     pub(crate) fn trace(&self) -> &[NavigationTraceEvent] {
-        &self.trace
+        self.trace.events()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn diagnostics(&self) -> &[DiagnosticEvent] {
         &self.diagnostics
     }
 
-    pub(crate) fn set_matched(&mut self, matched: RouteBranchFingerprint) {
+    #[allow(dead_code)]
+    pub(crate) fn set_matched(
+        &mut self,
+        matched: RouteBranchFingerprint,
+    ) -> Result<(), RequestRecordError> {
+        if self.matched.is_some() || self.status.is_terminal() {
+            return Err(RequestRecordError::ImmutableMatch);
+        }
         self.matched = Some(matched);
+        Ok(())
     }
 
-    pub(crate) fn set_status(&mut self, status: RequestStatus) {
+    pub(crate) fn transition(&mut self, status: RequestStatus) -> Result<(), RequestRecordError> {
+        if self.status.is_terminal() {
+            return Err(RequestRecordError::AlreadyTerminal);
+        }
         self.status = status;
+        Ok(())
     }
 
-    pub(crate) fn push_trace(&mut self, event: NavigationTraceEvent) {
-        self.trace.push(event);
+    pub(crate) fn append_trace(
+        &mut self,
+        event: NavigationTraceEvent,
+    ) -> Result<(), RequestRecordError> {
+        if self.trace.is_closed() {
+            return Err(RequestRecordError::TraceClosed);
+        }
+        let terminal_event = event.kind() == NavigationTraceEventKind::RequestTerminal;
+        if terminal_event && !self.status.is_terminal() {
+            return Err(RequestRecordError::TerminalStatusRequired);
+        }
+        if !terminal_event && self.status.is_terminal() {
+            return Err(RequestRecordError::TerminalEventRequired);
+        }
+        self.trace.append(event).map_err(RequestRecordError::from)
     }
 
-    pub(crate) fn push_diagnostic(&mut self, event: DiagnosticEvent) {
+    #[allow(dead_code)]
+    pub(crate) fn push_diagnostic(
+        &mut self,
+        event: DiagnosticEvent,
+    ) -> Result<(), RequestRecordError> {
+        if self.trace.is_closed() {
+            return Err(RequestRecordError::TraceClosed);
+        }
         self.diagnostics.push(event);
+        Ok(())
+    }
+}
+
+impl RequestStatus {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed(_))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequestRecordError {
+    AlreadyTerminal,
+    ImmutableMatch,
+    TerminalStatusRequired,
+    TerminalEventRequired,
+    TraceClosed,
+}
+
+impl From<NavigationTraceError> for RequestRecordError {
+    fn from(error: NavigationTraceError) -> Self {
+        match error {
+            NavigationTraceError::Closed => Self::TraceClosed,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::CoreIdAllocator;
+    use crate::trace::NavigationTraceEventKind;
+
+    fn record() -> NavigationRequestRecord {
+        let mut ids = CoreIdAllocator::new().unwrap();
+        let router = ids.allocate_router().unwrap();
+        NavigationRequestRecord::new(
+            ids.allocate_request(router).unwrap(),
+            RouteLocation::new("/items/7"),
+        )
+    }
+
+    #[test]
+    fn terminal_status_cannot_return_to_running() {
+        let mut record = record();
+        record.transition(RequestStatus::Succeeded).unwrap();
+        let before = record.clone();
+
+        assert_eq!(
+            record.transition(RequestStatus::Running(NavigationPhase::Recovering)),
+            Err(RequestRecordError::AlreadyTerminal)
+        );
+        assert_eq!(record, before);
+    }
+
+    #[test]
+    fn request_terminal_requires_terminal_status_and_is_always_last() {
+        let mut record = record();
+        let before = record.clone();
+        assert_eq!(
+            record.append_trace(NavigationTraceEvent::request_terminal()),
+            Err(RequestRecordError::TerminalStatusRequired)
+        );
+        assert_eq!(record, before);
+
+        record.transition(RequestStatus::Succeeded).unwrap();
+        assert_eq!(
+            record.append_trace(NavigationTraceEvent::commit_published()),
+            Err(RequestRecordError::TerminalEventRequired)
+        );
+        record
+            .append_trace(NavigationTraceEvent::request_terminal())
+            .unwrap();
+        let terminal = record.clone();
+
+        assert_eq!(
+            record.append_trace(NavigationTraceEvent::commit_published()),
+            Err(RequestRecordError::TraceClosed)
+        );
+        assert_eq!(
+            record.append_trace(NavigationTraceEvent::request_terminal()),
+            Err(RequestRecordError::TraceClosed)
+        );
+        assert_eq!(record, terminal);
+        assert_eq!(
+            record.trace().last().map(NavigationTraceEvent::kind),
+            Some(NavigationTraceEventKind::RequestTerminal)
+        );
     }
 }

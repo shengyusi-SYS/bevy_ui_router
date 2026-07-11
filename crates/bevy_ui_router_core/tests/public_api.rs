@@ -121,3 +121,76 @@ fn root_profile_hides_deferred_route_declaration_methods() {
         );
     }
 }
+
+#[test]
+fn task_3_public_methods_match_the_corrected_golden_shape() {
+    use bevy_ui_router_core::HostVersion;
+    use bevy_ui_router_core::prelude::HostVersion as PreludeHostVersion;
+
+    fn assert_public<T>() {}
+    assert_public::<HostVersion>();
+    assert_public::<PreludeHostVersion>();
+
+    let frame = include_str!("../src/frame.rs");
+    let presentation = include_str!("../src/presentation.rs");
+    let request = include_str!("../src/request.rs");
+    let trace = include_str!("../src/trace.rs");
+    let view_input = include_str!("../src/view_input.rs");
+
+    for signature in [
+        "pub fn router(&self) -> RouterInstanceId",
+        "pub fn host(&self) -> RouteHostId",
+        "pub fn slot(&self) -> RouteSlotId",
+        "pub fn origin(&self) -> &FrameOrigin",
+        "pub fn frame(&self) -> RouteFrameId",
+        "pub fn generation(&self) -> RouteGeneration",
+    ] {
+        assert!(
+            frame.contains(signature),
+            "missing golden signature `{signature}`"
+        );
+    }
+    for signature in [
+        "pub fn kind(&self) -> ActivePresentationKind",
+        "pub fn location(&self) -> Option<&RouteLocation>",
+        "pub fn requested(&self) -> Option<&RouteLocation>",
+        "pub fn matched(&self) -> Option<&RouteBranchFingerprint>",
+        "pub fn frames(&self) -> &[RouteFrameVersion]",
+        "pub fn failure(&self) -> Option<&NavigationFailure>",
+    ] {
+        assert!(
+            presentation.contains(signature),
+            "missing golden signature `{signature}`"
+        );
+    }
+    assert!(request.contains("pub fn kind(&self) -> NavigationFailureKind"));
+    for signature in [
+        "pub fn kind(&self) -> NavigationTraceEventKind",
+        "pub fn frame(&self) -> Option<&RouteFrameVersion>",
+        "pub fn outlet(&self) -> Option<&RouteSlotKey>",
+        "pub fn slot(&self) -> Option<RouteSlotId>",
+        "pub fn phase(&self) -> Option<&NavigationPhase>",
+        "pub fn mount_rejection(&self) -> Option<MountRejectionKind>",
+        "pub fn cleanup_disposition(&self) -> Option<CleanupDisposition>",
+    ] {
+        assert!(
+            trace.contains(signature),
+            "missing golden signature `{signature}`"
+        );
+    }
+    for signature in [
+        "pub fn location(&self) -> &RouteLocation",
+        "pub fn route(&self) -> Option<RouteId>",
+        "pub fn params(&self) -> &RouteParams",
+        "pub fn raw_search(&self) -> Option<&str>",
+        "pub fn fragment(&self) -> Option<&str>",
+        "pub fn origin(&self) -> &FrameOrigin",
+        "pub fn failure(&self) -> Option<&NavigationFailure>",
+    ] {
+        assert!(
+            view_input.contains(signature),
+            "missing golden signature `{signature}`"
+        );
+    }
+    assert!(!view_input.contains("#[derive("));
+}

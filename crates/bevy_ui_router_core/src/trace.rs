@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::frame::RouteFrameVersion;
 use crate::ids::RouteSlotId;
 use crate::request::NavigationPhase;
@@ -56,18 +54,22 @@ pub struct NavigationTraceEvent {
 }
 
 impl NavigationTraceEvent {
+    #[allow(dead_code)]
     pub(crate) fn request_phase_changed(phase: NavigationPhase) -> Self {
         Self::new(NavigationTraceEventKind::RequestPhaseChanged).with_phase(phase)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn commit_published() -> Self {
         Self::new(NavigationTraceEventKind::CommitPublished)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn request_terminal() -> Self {
         Self::new(NavigationTraceEventKind::RequestTerminal)
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn new(kind: NavigationTraceEventKind) -> Self {
         Self {
             kind,
@@ -80,55 +82,81 @@ impl NavigationTraceEvent {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn with_phase(mut self, phase: NavigationPhase) -> Self {
         self.phase = Some(phase);
         self
     }
 
-    pub const fn kind(&self) -> NavigationTraceEventKind {
+    pub fn kind(&self) -> NavigationTraceEventKind {
         self.kind
     }
 
-    pub const fn frame(&self) -> Option<&RouteFrameVersion> {
+    pub fn frame(&self) -> Option<&RouteFrameVersion> {
         self.frame.as_ref()
     }
 
-    pub const fn outlet(&self) -> Option<&RouteSlotKey> {
+    pub fn outlet(&self) -> Option<&RouteSlotKey> {
         self.outlet.as_ref()
     }
 
-    pub const fn slot(&self) -> Option<RouteSlotId> {
+    pub fn slot(&self) -> Option<RouteSlotId> {
         self.slot
     }
 
-    pub const fn phase(&self) -> Option<&NavigationPhase> {
+    pub fn phase(&self) -> Option<&NavigationPhase> {
         self.phase.as_ref()
     }
 
-    pub const fn mount_rejection(&self) -> Option<MountRejectionKind> {
+    pub fn mount_rejection(&self) -> Option<MountRejectionKind> {
         self.mount_rejection
     }
 
-    pub const fn cleanup_disposition(&self) -> Option<CleanupDisposition> {
+    pub fn cleanup_disposition(&self) -> Option<CleanupDisposition> {
         self.cleanup_disposition
     }
 }
 
-#[derive(Debug, Default)]
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NavigationTraceLog {
     events: Vec<NavigationTraceEvent>,
+    closed: bool,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NavigationTraceError {
+    Closed,
+}
+
+#[allow(dead_code)]
 impl NavigationTraceLog {
     pub(crate) const fn new() -> Self {
-        Self { events: Vec::new() }
+        Self {
+            events: Vec::new(),
+            closed: false,
+        }
     }
 
-    pub(crate) fn append(&mut self, event: NavigationTraceEvent) {
+    pub(crate) fn append(
+        &mut self,
+        event: NavigationTraceEvent,
+    ) -> Result<(), NavigationTraceError> {
+        if self.closed {
+            return Err(NavigationTraceError::Closed);
+        }
+        let terminal = event.kind() == NavigationTraceEventKind::RequestTerminal;
         self.events.push(event);
+        self.closed = terminal;
+        Ok(())
     }
 
     pub(crate) fn events(&self) -> &[NavigationTraceEvent] {
         &self.events
+    }
+
+    pub(crate) const fn is_closed(&self) -> bool {
+        self.closed
     }
 }

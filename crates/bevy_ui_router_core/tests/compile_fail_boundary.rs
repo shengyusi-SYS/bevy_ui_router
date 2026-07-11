@@ -155,18 +155,45 @@ fn test_support_consumer_cannot_declare_child_route_with_options() {
 }
 
 #[test]
-fn consumer_cannot_mint_host_admission_tokens() {
+fn admission_module_and_protocol_names_are_unreachable() {
     assert_compile_fails(Fixture {
-        name: "host_admission_token_constructor",
-        code: "use bevy_ui_router_core::admission::HostAdmissionToken; fn main() { let _ = HostAdmissionToken::new(); }",
+        name: "admission_module_private",
+        code: "use bevy_ui_router_core::admission::HostAdmissionToken; fn main() {}",
         features: &[],
-        expected_stderr: &["error[E0624]", "associated function `new` is private"],
+        expected_stderr: &["error[E0603]", "module `admission` is private"],
     });
+    for (name, code) in [
+        (
+            "host_admission_token_unreachable",
+            "use bevy_ui_router_core::HostAdmissionToken; fn main() {}",
+        ),
+        (
+            "host_grant_unreachable",
+            "use bevy_ui_router_core::HostGrant; fn main() {}",
+        ),
+        (
+            "host_confirmation_unreachable",
+            "use bevy_ui_router_core::HostAdmissionConfirmation; fn main() {}",
+        ),
+    ] {
+        assert_compile_fails(Fixture {
+            name,
+            code,
+            features: &[],
+            expected_stderr: &["error[E0432]", "unresolved import"],
+        });
+    }
 }
 
 #[test]
 fn consumer_cannot_mint_logical_host_slot_frame_or_generation_ids() {
     for fixture in [
+        Fixture {
+            name: "router_instance_id_constructor",
+            code: "use bevy_ui_router_core::ids::RouterInstanceId; fn main() { let _ = RouterInstanceId::new(1); }",
+            features: &[],
+            expected_stderr: &["error[E0624]", "associated function `new` is private"],
+        },
         Fixture {
             name: "route_host_id_constructor",
             code: "use bevy_ui_router_core::ids::RouteHostId; fn main() { let _ = RouteHostId::new(1); }",
@@ -193,6 +220,26 @@ fn consumer_cannot_mint_logical_host_slot_frame_or_generation_ids() {
         },
     ] {
         assert_compile_fails(fixture);
+    }
+}
+
+#[test]
+fn route_view_input_has_no_unlisted_public_traits() {
+    for (name, bound) in [
+        ("route_view_input_not_clone", "Clone"),
+        ("route_view_input_not_debug", "std::fmt::Debug"),
+        ("route_view_input_not_partial_eq", "PartialEq"),
+        ("route_view_input_not_eq", "Eq"),
+    ] {
+        let code = format!(
+            "use bevy_ui_router_core::prelude::RouteViewInput; fn require<T: {bound}>() {{}} fn main() {{ require::<RouteViewInput>(); }}"
+        );
+        assert_compile_fails(Fixture {
+            name,
+            code: Box::leak(code.into_boxed_str()),
+            features: &[],
+            expected_stderr: &["error[E0277]"],
+        });
     }
 }
 

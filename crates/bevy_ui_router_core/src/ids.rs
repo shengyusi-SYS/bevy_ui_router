@@ -52,7 +52,6 @@ id_type!(RouteSlotId);
 id_type!(RouteId);
 id_type!(RouteFrameId);
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct NavigationRequestId {
     domain: WorldDomainId,
@@ -61,6 +60,7 @@ pub struct NavigationRequestId {
 }
 
 impl NavigationRequestId {
+    #[allow(dead_code)]
     pub(crate) const fn router(self) -> RouterInstanceId {
         self.router
     }
@@ -77,6 +77,9 @@ pub(crate) struct TransactionId(u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct WorldDomainId(u64);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IdExhaustion;
+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct CoreIdAllocator {
@@ -92,11 +95,11 @@ pub(crate) struct CoreIdAllocator {
 
 #[allow(dead_code)]
 impl CoreIdAllocator {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new() -> Result<Self, IdExhaustion> {
         static NEXT_WORLD_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
-        Self {
-            domain: WorldDomainId(NEXT_WORLD_DOMAIN.fetch_add(1, Ordering::Relaxed)),
+        Ok(Self {
+            domain: allocate_world_domain(&NEXT_WORLD_DOMAIN)?,
             next_router: 1,
             next_host: 1,
             next_slot: 1,
@@ -104,54 +107,64 @@ impl CoreIdAllocator {
             next_task: 1,
             next_transaction: 1,
             next_request_by_router: BTreeMap::new(),
-        }
+        })
     }
 
-    pub(crate) fn allocate_router(&mut self) -> RouterInstanceId {
-        let id = RouterInstanceId::new(self.next_router);
-        self.next_router += 1;
-        id
+    pub(crate) fn allocate_router(&mut self) -> Result<RouterInstanceId, IdExhaustion> {
+        checked_take(&mut self.next_router).map(RouterInstanceId::new)
     }
 
-    pub(crate) fn allocate_host(&mut self) -> RouteHostId {
-        let id = RouteHostId::new(self.next_host);
-        self.next_host += 1;
-        id
+    pub(crate) fn allocate_host(&mut self) -> Result<RouteHostId, IdExhaustion> {
+        checked_take(&mut self.next_host).map(RouteHostId::new)
     }
 
-    pub(crate) fn allocate_slot(&mut self) -> RouteSlotId {
-        let id = RouteSlotId::new(self.next_slot);
-        self.next_slot += 1;
-        id
+    pub(crate) fn allocate_slot(&mut self) -> Result<RouteSlotId, IdExhaustion> {
+        checked_take(&mut self.next_slot).map(RouteSlotId::new)
     }
 
-    pub(crate) fn allocate_frame(&mut self) -> RouteFrameId {
-        let id = RouteFrameId::new(self.next_frame);
-        self.next_frame += 1;
-        id
+    pub(crate) fn allocate_host_slot(
+        &mut self,
+    ) -> Result<(RouteHostId, RouteSlotId), IdExhaustion> {
+        let next_host = self.next_host.checked_add(1).ok_or(IdExhaustion)?;
+        let next_slot = self.next_slot.checked_add(1).ok_or(IdExhaustion)?;
+        let result = (
+            RouteHostId::new(self.next_host),
+            RouteSlotId::new(self.next_slot),
+        );
+        self.next_host = next_host;
+        self.next_slot = next_slot;
+        Ok(result)
     }
 
-    pub(crate) fn allocate_frame_task(&mut self) -> FrameTaskId {
-        let id = FrameTaskId(self.next_task);
-        self.next_task += 1;
-        id
+    pub(crate) fn allocate_frame(&mut self) -> Result<RouteFrameId, IdExhaustion> {
+        checked_take(&mut self.next_frame).map(RouteFrameId::new)
     }
 
-    pub(crate) fn allocate_transaction(&mut self) -> TransactionId {
-        let id = TransactionId(self.next_transaction);
-        self.next_transaction += 1;
-        id
+    pub(crate) fn allocate_frame_task(&mut self) -> Result<FrameTaskId, IdExhaustion> {
+        checked_take(&mut self.next_task).map(FrameTaskId)
     }
 
-    pub(crate) fn allocate_request(&mut self, router: RouterInstanceId) -> NavigationRequestId {
-        let sequence = self.next_request_by_router.entry(router).or_insert(1);
+    pub(crate) fn allocate_transaction(&mut self) -> Result<TransactionId, IdExhaustion> {
+        checked_take(&mut self.next_transaction).map(TransactionId)
+    }
+
+    pub(crate) fn allocate_request(
+        &mut self,
+        router: RouterInstanceId,
+    ) -> Result<NavigationRequestId, IdExhaustion> {
+        let current = self
+            .next_request_by_router
+            .get(&router)
+            .copied()
+            .unwrap_or(1);
+        let next = current.checked_add(1).ok_or(IdExhaustion)?;
         let id = NavigationRequestId {
             domain: self.domain,
             router,
-            sequence: *sequence,
+            sequence: current,
         };
-        *sequence += 1;
-        id
+        self.next_request_by_router.insert(router, next);
+        Ok(id)
     }
 
     pub(crate) fn owns_request(
@@ -161,6 +174,38 @@ impl CoreIdAllocator {
     ) -> bool {
         request.domain == self.domain && request.router() == router
     }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> CoreIdAllocatorSnapshot {
+        CoreIdAllocatorSnapshot {
+            next_host: self.next_host,
+            next_slot: self.next_slot,
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn allocate_world_domain(counter: &AtomicU64) -> Result<WorldDomainId, IdExhaustion> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map(WorldDomainId)
+        .map_err(|_| IdExhaustion)
+}
+
+#[allow(dead_code)]
+fn checked_take(counter: &mut u64) -> Result<u64, IdExhaustion> {
+    let current = *counter;
+    *counter = current.checked_add(1).ok_or(IdExhaustion)?;
+    Ok(current)
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CoreIdAllocatorSnapshot {
+    next_host: u64,
+    next_slot: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -173,8 +218,19 @@ impl RouteGeneration {
     }
 
     #[allow(dead_code)]
+    pub(crate) const fn checked_next(self) -> Result<Self, IdExhaustion> {
+        match self.0.checked_add(1) {
+            Some(next) => Ok(Self(next)),
+            None => Err(IdExhaustion),
+        }
+    }
+
+    #[allow(dead_code)]
     pub(crate) const fn next(self) -> Self {
-        Self(self.0 + 1)
+        match self.checked_next() {
+            Ok(next) => next,
+            Err(_) => panic!("route generation exhausted"),
+        }
     }
 
     pub const fn raw(self) -> u64 {
@@ -213,20 +269,80 @@ mod tests {
 
     #[test]
     fn core_allocator_burns_request_task_and_transaction_identities() {
-        let mut allocator = CoreIdAllocator::new();
-        let router = allocator.allocate_router();
-        let first_request = allocator.allocate_request(router);
-        let second_request = allocator.allocate_request(router);
+        let mut allocator = CoreIdAllocator::new().unwrap();
+        let router = allocator.allocate_router().unwrap();
+        let first_request = allocator.allocate_request(router).unwrap();
+        let second_request = allocator.allocate_request(router).unwrap();
 
         assert!(allocator.owns_request(first_request, router));
         assert_ne!(first_request, second_request);
         assert_ne!(
-            allocator.allocate_frame_task(),
-            allocator.allocate_frame_task()
+            allocator.allocate_frame_task().unwrap(),
+            allocator.allocate_frame_task().unwrap()
         );
         assert_ne!(
-            allocator.allocate_transaction(),
-            allocator.allocate_transaction()
+            allocator.allocate_transaction().unwrap(),
+            allocator.allocate_transaction().unwrap()
         );
+    }
+
+    #[test]
+    fn every_allocator_counter_reports_exhaustion_without_wrapping() {
+        let mut allocator = CoreIdAllocator::new().unwrap();
+
+        allocator.next_router = u64::MAX;
+        assert_eq!(allocator.allocate_router(), Err(IdExhaustion));
+        assert_eq!(allocator.next_router, u64::MAX);
+        allocator.next_router = 1;
+
+        allocator.next_host = u64::MAX;
+        assert_eq!(allocator.allocate_host(), Err(IdExhaustion));
+        assert_eq!(allocator.next_host, u64::MAX);
+        allocator.next_host = 1;
+
+        allocator.next_slot = u64::MAX;
+        assert_eq!(allocator.allocate_slot(), Err(IdExhaustion));
+        assert_eq!(allocator.next_slot, u64::MAX);
+        allocator.next_slot = 1;
+
+        allocator.next_frame = u64::MAX;
+        assert_eq!(allocator.allocate_frame(), Err(IdExhaustion));
+        assert_eq!(allocator.next_frame, u64::MAX);
+        allocator.next_frame = 1;
+
+        allocator.next_task = u64::MAX;
+        assert_eq!(allocator.allocate_frame_task(), Err(IdExhaustion));
+        assert_eq!(allocator.next_task, u64::MAX);
+        allocator.next_task = 1;
+
+        allocator.next_transaction = u64::MAX;
+        assert_eq!(allocator.allocate_transaction(), Err(IdExhaustion));
+        assert_eq!(allocator.next_transaction, u64::MAX);
+
+        let router = RouterInstanceId::new(7);
+        allocator.next_request_by_router.insert(router, u64::MAX);
+        assert_eq!(allocator.allocate_request(router), Err(IdExhaustion));
+        assert_eq!(allocator.next_request_by_router[&router], u64::MAX);
+    }
+
+    #[test]
+    fn world_domain_and_generation_exhaustion_are_checked() {
+        let domain_counter = AtomicU64::new(u64::MAX);
+        assert_eq!(allocate_world_domain(&domain_counter), Err(IdExhaustion));
+        assert_eq!(domain_counter.load(Ordering::Relaxed), u64::MAX);
+
+        let exhausted = RouteGeneration(u64::MAX);
+        assert_eq!(exhausted.checked_next(), Err(IdExhaustion));
+        assert_eq!(exhausted.raw(), u64::MAX);
+    }
+
+    #[test]
+    fn host_slot_pair_exhaustion_is_atomic() {
+        let mut allocator = CoreIdAllocator::new().unwrap();
+        allocator.next_slot = u64::MAX;
+        let before = allocator.snapshot();
+
+        assert_eq!(allocator.allocate_host_slot(), Err(IdExhaustion));
+        assert_eq!(allocator.snapshot(), before);
     }
 }

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
-pub mod admission;
+mod admission;
+pub use admission::HostVersion;
 pub mod back;
 pub mod branch;
 pub mod branch_diff;
@@ -28,6 +29,7 @@ pub mod view_input;
 pub mod view_key;
 
 pub mod prelude {
+    pub use crate::HostVersion;
     pub use crate::back::{BackCapabilitySnapshot, BackIntent, BackPolicy};
     pub use crate::branch::{MatchedBranch, MatchedRoute, RouteParams};
     pub use crate::branch_diff::BranchDiff;
@@ -83,31 +85,49 @@ mod root_navigation_state_tests {
 
         assert_eq!(state.availability(), &RouterAvailability::AwaitingHost);
         assert_eq!(state.active().kind(), ActivePresentationKind::None);
+        assert!(state.current_request().is_none());
         assert!(state.host().is_none());
 
-        let mut ids = CoreIdAllocator::new();
-        let router = ids.allocate_router();
-        let mut admission = HostAdmissionIssuer::new();
-        let token = admission.issue(router);
-        let grant = admission.grant(token, &mut ids);
+        let mut ids = CoreIdAllocator::new().unwrap();
+        let router = ids.allocate_router().unwrap();
+        let mut admission = HostAdmissionIssuer::new().unwrap();
+        let token = admission.issue(router).unwrap();
+        let grant = admission.grant(&token, &mut ids).unwrap();
 
         assert!(state.host().is_none());
+        assert!(state.top_slot().is_none());
 
-        state.confirm_host(admission.confirm(grant));
+        let confirmation = admission.confirm(&grant).unwrap();
+        let mut foreign = HostAdmissionIssuer::new().unwrap();
+        assert!(state.confirm_host(&foreign, &confirmation).is_err());
+        assert!(state.host().is_none());
+        assert!(state.top_slot().is_none());
 
-        assert!(state.host().is_some());
+        state.confirm_host(&admission, &confirmation).unwrap();
+
+        assert_eq!(state.host(), Some(confirmation.version()));
+        assert_eq!(state.top_slot(), Some(confirmation.top_slot()));
+        let ready = state.snapshot();
+        assert!(state.confirm_host(&admission, &confirmation).is_err());
+        assert_eq!(state.snapshot(), ready);
+
+        let foreign_token = foreign.issue(router).unwrap();
+        let foreign_grant = foreign.grant(&foreign_token, &mut ids).unwrap();
+        let foreign_confirmation = foreign.confirm(&foreign_grant).unwrap();
+        assert!(state.confirm_host(&foreign, &foreign_confirmation).is_err());
+        assert_eq!(state.snapshot(), ready);
     }
 
     #[test]
     fn request_ids_bind_the_allocator_domain_router_and_monotonic_sequence() {
-        let mut first = CoreIdAllocator::new();
-        let first_router = first.allocate_router();
-        let first_request = first.allocate_request(first_router);
-        let second_request = first.allocate_request(first_router);
+        let mut first = CoreIdAllocator::new().unwrap();
+        let first_router = first.allocate_router().unwrap();
+        let first_request = first.allocate_request(first_router).unwrap();
+        let second_request = first.allocate_request(first_router).unwrap();
 
-        let mut second = CoreIdAllocator::new();
-        let second_router = second.allocate_router();
-        let foreign_request = second.allocate_request(second_router);
+        let mut second = CoreIdAllocator::new().unwrap();
+        let second_router = second.allocate_router().unwrap();
+        let foreign_request = second.allocate_request(second_router).unwrap();
 
         assert!(first.owns_request(first_request, first_router));
         assert!(first.owns_request(second_request, first_router));
@@ -117,13 +137,43 @@ mod root_navigation_state_tests {
     }
 
     #[test]
+    fn navigation_state_accepts_only_the_issuers_current_confirmation() {
+        let mut ids = CoreIdAllocator::new().unwrap();
+        let router = ids.allocate_router().unwrap();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+
+        let first_token = issuer.issue(router).unwrap();
+        let first_grant = issuer.grant(&first_token, &mut ids).unwrap();
+        let first = issuer.confirm(&first_grant).unwrap();
+
+        let second_token = issuer.issue(router).unwrap();
+        let second_grant = issuer.grant(&second_token, &mut ids).unwrap();
+        let second = issuer.confirm(&second_grant).unwrap();
+
+        let mut state = RouterNavigationState::new();
+        let before = state.snapshot();
+        assert!(state.confirm_host(&issuer, &first).is_err());
+        assert_eq!(state.snapshot(), before);
+
+        state.confirm_host(&issuer, &second).unwrap();
+        assert_eq!(state.host(), Some(second.version()));
+        assert_eq!(state.top_slot(), Some(second.top_slot()));
+    }
+
+    #[test]
     fn trace_observations_preserve_emission_order_within_one_update() {
         let mut trace = NavigationTraceLog::new();
-        trace.append(NavigationTraceEvent::request_phase_changed(
-            NavigationPhase::Matching,
-        ));
-        trace.append(NavigationTraceEvent::commit_published());
-        trace.append(NavigationTraceEvent::request_terminal());
+        trace
+            .append(NavigationTraceEvent::request_phase_changed(
+                NavigationPhase::Matching,
+            ))
+            .unwrap();
+        trace
+            .append(NavigationTraceEvent::commit_published())
+            .unwrap();
+        trace
+            .append(NavigationTraceEvent::request_terminal())
+            .unwrap();
 
         assert_eq!(
             trace
