@@ -80,21 +80,20 @@ fn facade_safety_violations(manifest: &Table) -> Vec<String> {
             violations.push(format!("{name} must appear only in [dev-dependencies]"));
         }
     }
-    for section in SECTIONS {
-        let Some(entries) = manifest.get(section).and_then(Value::as_table) else {
+    collect_bevy_branch_violations(manifest, &mut violations);
+    violations
+}
+
+fn collect_bevy_branch_violations(table: &Table, violations: &mut Vec<String>) {
+    for (name, value) in table {
+        let Some(nested) = value.as_table() else {
             continue;
         };
-        for (name, value) in entries {
-            if name.starts_with("bevy")
-                && value
-                    .as_table()
-                    .is_some_and(|value| value.contains_key("branch"))
-            {
-                violations.push(format!("{name} must not declare branch"));
-            }
+        if name.starts_with("bevy") && nested.contains_key("branch") {
+            violations.push(format!("{name} must not declare branch"));
         }
+        collect_bevy_branch_violations(nested, violations);
     }
-    violations
 }
 
 #[test]
@@ -130,6 +129,26 @@ bevy_ui = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f7568
     assert_eq!(
         facade_safety_violations(&manifest),
         vec!["bevy_app must not declare branch"]
+    );
+}
+
+#[test]
+fn manifest_contract_rejects_target_specific_bevy_branch() {
+    let manifest = parse_manifest(
+        r#"
+[dependencies]
+[dev-dependencies]
+bevy_app = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+bevy_ecs = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+bevy_ui = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+
+[target.'cfg(unix)'.build-dependencies]
+bevy_render = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "target-moving-branch", version = "0.19.0", default-features = false }
+"#,
+    );
+    assert_eq!(
+        facade_safety_violations(&manifest),
+        vec!["bevy_render must not declare branch"]
     );
 }
 

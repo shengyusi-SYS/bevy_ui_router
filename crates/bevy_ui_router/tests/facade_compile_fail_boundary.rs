@@ -124,6 +124,39 @@ fn default_fake_renderer_view_root_names_missing_symbol() {
 }
 
 #[test]
+fn default_fake_renderer_prelude_names_missing_symbol() {
+    assert_compile_fails(Fixture {
+        name: "default_fake_renderer_not_in_prelude",
+        code: "use bevy_ui_router::prelude::FakeViewRenderer; fn main() {}",
+        default_features: true,
+        features: &[],
+        expected_stderr: &["error[E0432]", "no `FakeViewRenderer` in `prelude`"],
+    });
+}
+
+#[test]
+fn default_view_test_support_fake_renderer_names_missing_module() {
+    assert_compile_fails(Fixture {
+        name: "default_fake_renderer_no_view_test_support",
+        code: "use bevy_ui_router::view::test_support::FakeViewRenderer; fn main() {}",
+        default_features: true,
+        features: &[],
+        expected_stderr: &["error[E0432]", "could not find `test_support` in `view`"],
+    });
+}
+
+#[test]
+fn default_view_prelude_fake_renderer_mode_names_missing_symbol() {
+    assert_compile_fails(Fixture {
+        name: "default_fake_renderer_mode_not_in_view_prelude",
+        code: "use bevy_ui_router::view::prelude::FakeViewRendererMode; fn main() {}",
+        default_features: true,
+        features: &[],
+        expected_stderr: &["error[E0432]", "no `FakeViewRendererMode` in `prelude`"],
+    });
+}
+
+#[test]
 fn default_view_fake_renderer_root_names_missing_symbol() {
     assert_compile_fails(Fixture {
         name: "default_view_fake_renderer_not_view_root",

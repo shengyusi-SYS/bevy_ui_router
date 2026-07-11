@@ -61,13 +61,35 @@ fn assert_bevy(table: &Table, features: &[&str], label: &str) {
 
 fn assert_no_branch(section: &Table, label: &str) {
     for (name, value) in section {
+        let Some(dependency) = value.as_table() else {
+            continue;
+        };
         assert!(
-            value
-                .as_table()
-                .is_none_or(|dependency| !dependency.contains_key("branch")),
+            !name.starts_with("bevy") || !dependency.contains_key("branch"),
             "{label}.{name} must not declare branch"
         );
+        assert_no_branch(dependency, label);
     }
+}
+
+#[test]
+fn ecs_manifest_rejects_target_specific_bevy_branch() {
+    let manifest = parse_manifest(
+        r#"
+[dependencies]
+[dev-dependencies]
+
+[target.'cfg(unix)'.dev-dependencies]
+bevy_internal = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "target-moving-branch", version = "0.19.0", default-features = false }
+"#,
+    );
+
+    let result =
+        std::panic::catch_unwind(|| assert_no_branch(table(&manifest, "target"), "[target]"));
+    assert!(
+        result.is_err(),
+        "target-specific Bevy branches must be rejected"
+    );
 }
 
 #[test]
