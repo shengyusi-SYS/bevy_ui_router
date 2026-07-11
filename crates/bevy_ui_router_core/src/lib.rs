@@ -20,6 +20,7 @@ pub mod slot;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod transaction;
+pub mod view_key;
 
 pub mod prelude {
     pub use crate::back::{BackCapabilitySnapshot, BackIntent, BackPolicy};
@@ -49,4 +50,5 @@ pub mod prelude {
         NavigationTransactionState, StaleApplyReason, StaleApplyResult, TransactionCommitError,
         TransactionCommitErrorKind, TransactionFailure,
     };
+    pub use crate::view_key::{RouteViewKey, RouteViewKeyError};
 }

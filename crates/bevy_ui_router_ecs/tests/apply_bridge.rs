@@ -8,9 +8,9 @@ use bevy_ui::InteractionDisabled;
 use bevy_ui_router_core::error::RouteErrorKind;
 use bevy_ui_router_core::location::RouteLocation;
 use bevy_ui_router_core::matcher::RouteMatcher;
-use bevy_ui_router_core::pattern::RoutePattern;
 use bevy_ui_router_core::route_tree::RouteTree;
 use bevy_ui_router_core::runtime::RouterRuntime;
+use bevy_ui_router_core::test_support::nested_items_route_tree;
 use bevy_ui_router_core::transaction::FrameApplyRequest;
 use bevy_ui_router_ecs::{
     BeginFrameApplySessionError, CompleteFrameApplySessionError, EcsFrameApplyReport,
@@ -648,15 +648,5 @@ fn issued_request(path: &str, request_index: usize) -> FrameApplyRequest {
 }
 
 fn route_tree() -> RouteTree {
-    let mut builder = RouteTree::builder()
-        .root(RoutePattern::path("/").unwrap())
-        .unwrap();
-    let root = builder.root_id().unwrap();
-    let items = builder
-        .route(root, RoutePattern::path("items").unwrap())
-        .unwrap();
-    builder
-        .route(items, RoutePattern::path(":id").unwrap())
-        .unwrap();
-    builder.build().unwrap()
+    nested_items_route_tree()
 }

@@ -36,12 +36,15 @@ use crate::ids::RouteId;
 use crate::meta::{ErrorBoundaryKey, RouteExplicitKey, RouteMeta};
 use crate::pattern::RoutePattern;
 use crate::slot::RouteSlotKey;
+use crate::view_key::RouteViewKey;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteNodeOptions {
     slot: RouteSlotKey,
     explicit_key: Option<RouteExplicitKey>,
     error_boundary: Option<ErrorBoundaryKey>,
+    view: Option<RouteViewKey>,
+    error_view: Option<(ErrorBoundaryKey, RouteViewKey)>,
     meta: RouteMeta,
 }
 
@@ -51,6 +54,8 @@ impl RouteNodeOptions {
             slot: RouteSlotKey::default(),
             explicit_key: None,
             error_boundary: None,
+            view: None,
+            error_view: None,
             meta: RouteMeta::new(),
         }
     }
@@ -65,8 +70,25 @@ impl RouteNodeOptions {
         self
     }
 
-    pub fn with_error_boundary(mut self, key: ErrorBoundaryKey) -> Self {
+    #[allow(dead_code)]
+    pub(crate) fn with_error_boundary(mut self, key: ErrorBoundaryKey) -> Self {
         self.error_boundary = Some(key);
+        self
+    }
+
+    pub fn with_view(mut self, view: RouteViewKey) -> Self {
+        self.view = Some(view);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_error_view(
+        mut self,
+        boundary: ErrorBoundaryKey,
+        view: RouteViewKey,
+    ) -> Self {
+        self.error_boundary = Some(boundary.clone());
+        self.error_view = Some((boundary, view));
         self
     }
 
@@ -89,6 +111,18 @@ impl RouteNodeOptions {
 
     pub const fn meta(&self) -> &RouteMeta {
         &self.meta
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn view_binding(&self) -> Option<&RouteViewKey> {
+        self.view.as_ref()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn error_view_binding(&self) -> Option<(&ErrorBoundaryKey, &RouteViewKey)> {
+        self.error_view
+            .as_ref()
+            .map(|(boundary, view)| (boundary, view))
     }
 }
 
@@ -210,13 +244,21 @@ impl RouteTreeBuilder {
         }
     }
 
-    pub fn root(mut self, pattern: RoutePattern) -> Result<Self, RouteError> {
+    pub fn root(self, pattern: RoutePattern) -> Result<Self, RouteError> {
+        self.root_with_options(pattern, RouteNodeOptions::new())
+    }
+
+    pub fn root_with_options(
+        mut self,
+        pattern: RoutePattern,
+        options: RouteNodeOptions,
+    ) -> Result<Self, RouteError> {
         if self.root.is_some() {
             return Err(invalid_tree("route tree root is already declared"));
         }
 
         let id = self.allocate_id();
-        let node = self.node(id, None, pattern, RouteNodeOptions::new());
+        let node = self.node(id, None, pattern, options);
         self.root = Some(id);
         self.nodes.insert(id, node);
         Ok(self)
@@ -226,6 +268,8 @@ impl RouteTreeBuilder {
         self.root
     }
 
+    #[cfg(feature = "test-support")]
+    #[allow(dead_code)]
     pub fn route_with_options(
         &mut self,
         parent: RouteId,
@@ -235,10 +279,34 @@ impl RouteTreeBuilder {
         self.route_inner(parent, pattern, options)
     }
 
+    #[cfg(not(feature = "test-support"))]
+    #[allow(dead_code)]
+    pub(crate) fn route_with_options(
+        &mut self,
+        parent: RouteId,
+        pattern: RoutePattern,
+        options: RouteNodeOptions,
+    ) -> Result<RouteId, RouteError> {
+        self.route_inner(parent, pattern, options)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[allow(dead_code)]
     pub fn route(&mut self, parent: RouteId, pattern: RoutePattern) -> Result<RouteId, RouteError> {
         self.route_inner(parent, pattern, RouteNodeOptions::new())
     }
 
+    #[cfg(not(feature = "test-support"))]
+    #[allow(dead_code)]
+    pub(crate) fn route(
+        &mut self,
+        parent: RouteId,
+        pattern: RoutePattern,
+    ) -> Result<RouteId, RouteError> {
+        self.route_inner(parent, pattern, RouteNodeOptions::new())
+    }
+
+    #[allow(dead_code)]
     fn route_inner(
         &mut self,
         parent: RouteId,
@@ -305,6 +373,7 @@ mod tests {
     use crate::meta::{ErrorBoundaryKey, RouteExplicitKey, RouteMeta};
     use crate::pattern::RoutePattern;
     use crate::slot::RouteSlotKey;
+    use crate::view_key::RouteViewKey;
 
     #[test]
     fn builder_allocates_stable_route_ids_in_declaration_order() {
@@ -424,6 +493,55 @@ mod tests {
             Some("detail-boundary")
         );
         assert_eq!(node.options().meta().diagnostic_label(), Some("detail"));
+    }
+
+    #[test]
+    fn route_options_store_normal_and_error_view_bindings() {
+        let root_view = RouteViewKey::new("root").unwrap();
+        let error_view = RouteViewKey::new("detail-error").unwrap();
+        let boundary = ErrorBoundaryKey::named("detail-boundary").unwrap();
+        let mut builder = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(root_view.clone()),
+            )
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let detail = builder
+            .route_with_options(
+                root,
+                RoutePattern::path("details").unwrap(),
+                RouteNodeOptions::new().with_error_view(boundary.clone(), error_view.clone()),
+            )
+            .unwrap();
+        let tree = builder.build().unwrap();
+
+        assert_eq!(
+            tree.node(root).unwrap().options().view_binding(),
+            Some(&root_view)
+        );
+        assert_eq!(
+            tree.node(detail).unwrap().options().error_view_binding(),
+            Some((&boundary, &error_view))
+        );
+    }
+
+    #[test]
+    fn root_with_options_attaches_root_declaration_data() {
+        let root_view = RouteViewKey::new("root").unwrap();
+        let tree = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(root_view.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            tree.node(tree.root()).unwrap().options().view_binding(),
+            Some(&root_view)
+        );
     }
 
     #[test]

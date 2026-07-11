@@ -72,3 +72,48 @@ fn phase_3b_runtime_bridge_is_explicit_low_level_core_api() {
     assert!(runtime.active_branch().is_none());
     assert_eq!(runtime.scope().router(), runtime.router());
 }
+
+#[test]
+fn route_view_key_is_public_without_raw_value_access() {
+    use bevy_ui_router_core::view_key::RouteViewKey;
+
+    fn assert_key_traits<T: Clone + std::fmt::Debug + Eq + PartialEq + std::hash::Hash>() {}
+
+    assert_key_traits::<RouteViewKey>();
+    assert!(RouteViewKey::new("").is_err());
+
+    let source = include_str!("../src/view_key.rs");
+    for forbidden in [
+        "pub struct RouteViewKey(pub ",
+        "pub struct RouteViewKeyError(pub ",
+        "pub fn as_str(",
+        "pub fn into_inner(",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "route view keys must not expose raw values through `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn root_profile_hides_deferred_route_declaration_methods() {
+    let source = include_str!("../src/route_tree.rs");
+
+    assert!(source.contains("pub fn root_with_options("));
+    for forbidden in ["pub fn with_error_boundary(", "pub fn with_error_view("] {
+        assert!(
+            !source.contains(forbidden),
+            "root profile must not publicly expose `{forbidden}`"
+        );
+    }
+    for required in [
+        "#[cfg(not(feature = \"test-support\"))]\n    #[allow(dead_code)]\n    pub(crate) fn route(",
+        "#[cfg(not(feature = \"test-support\"))]\n    #[allow(dead_code)]\n    pub(crate) fn route_with_options(",
+    ] {
+        assert!(
+            source.contains(required),
+            "root profile must retain crate-private `{required}`"
+        );
+    }
+}
