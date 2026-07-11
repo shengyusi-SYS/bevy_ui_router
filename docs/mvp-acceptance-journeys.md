@@ -164,6 +164,8 @@ crate 私有测试覆盖错误 router、host、slot、route、frame、generation
 
 ## 6. Feature 与命令门槛
 
+本节定义MVP gate的完整终态。实施期间每个垂直切片使用已审查的阶段profile，从同一最终allowlist/golden中做纯减法，并在固定目标文件中逐步增加可兑现case；阶段profile不得增加最终合同之外的临时API。Root push只通过自己的`Task PASS`集合，不能把未到所属切片的target、catalogue项或journey标成已通过。
+
 必须验证以下 feature 合同：
 
 ```powershell
@@ -176,18 +178,18 @@ cargo check --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-
 cargo check --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features devtools
 cargo check --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --all-features
 cargo tree --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs -e features -i bevy_ui
-cargo tree --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --all-targets -e features -i bevy_internal
+cargo tree --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --target all -e features,dev -i bevy_internal
 ```
 
 消费者编译测试必须实际 import 并使用对应公共符号，不能仅依赖 Cargo 命令退出 0。`default_facade_features` 与 isolated default-enabled consumer必须证明 default 精确启用 view 且不引入 Bevy runtime；`ecs` 构建必须同时提供 view、封闭 `SolidRect` primitive和完整 MVP facade API。旧 facade `view-test-support` 必须不存在，`FakeViewRenderer*` 不得从 facade可达。
 
-`bevy_ui` tree输出必须明确包含 feature `bevy_picking` 且不含 `ghost_nodes`，并由factual gate与ECS manifest fixture双重核对；仅看到 direct `bevy_picking` dependency不算通过。`bevy_ui_router_ecs --all-targets`的`bevy_internal` tree必须精确提供物理回归所需`bevy_window, bevy_camera, bevy_ui, bevy_picking`，证明依赖与实际crate-private test属于同一package；测试只注册其`DefaultPlugins`一次，不能重复注册`UiPickingPlugin`。
+`bevy_ui` tree输出必须明确包含 feature `bevy_picking` 且不含 `ghost_nodes`，并由factual gate与ECS manifest fixture双重核对；仅看到 direct `bevy_picking` dependency不算通过。`bevy_ui_router_ecs --target all -e features,dev`的`bevy_internal` tree必须精确提供物理回归所需`bevy_window, bevy_camera, bevy_ui, bevy_picking`，证明依赖与实际crate-private test属于同一package；测试只注册其`DefaultPlugins`一次，不能重复注册`UiPickingPlugin`。
 
 Feature-disabled 与旧 authority 路径必须通过 [Facade Export Allowlist](facade-export-allowlist.md) 规定的隔离 consumer harness 实际编译失败；`required-features` 只负责 Cargo target 调度，不能作为“符号不可达”的证据。负例必须按 case 落入预期的 unresolved/private/missing-method/missing-trait-or-conversion 诊断类别（含转换负例所需 `E0277`），依赖下载、manifest 或 workspace 配置失败一律不算通过。
 
 公共合同测试还必须证明：重复 `ViewDriverKey` 返回 `ViewDriverRegistrationErrorKind::DuplicateKey` 且原 driver 未替换；`BevyUiRouterPlugin::default()` 可被consumer显式预装且随后extension不会重复注册system/resource；只有 `with_error_boundary` 而无 error view 的已配置 route 返回 `RouterInstallErrorKind::MissingErrorView`，同一node同时缺normal/error view时优先返回`MissingRouteView`；第65个以上terminal request按FIFO触发`NotRetained`，queued/running request永不被淘汰；同World跨router、跨App、从未签发、未来sequence或handle/id错误配对均为`Unknown`且绝不误命中，只有同domain/router已签发后淘汰的ID为`NotRetained`。
 
-ECS私有回归函数名形成固定catalogue，均位于`authority_regression_tests` module。专用catalogue target用`syn`同时证明crate root存在exact `#[cfg(test)] mod authority_regression_tests;`声明、以下每个函数有直接`#[test]`且没有`#[ignore]`或额外`cfg`、名称集合双向相等；缺失、重复、额外名称或0项都失败。`scripts/verify-authority-regressions.ps1`再运行`cargo test --lib authority_regression_tests:: -- --list`并把实际注册test集合与同一catalogue双向比较，随后执行该filter并要求passed数等于catalogue数、failed/ignored/measured均为0。源码扫描、binary registration和实际运行三项缺一不可：
+ECS私有回归函数名形成MVP固定catalogue，均位于`authority_regression_tests` module。专用catalogue target用`syn`同时证明crate root存在exact `#[cfg(test)] mod authority_regression_tests;`声明、当前阶段profile激活的每个函数有直接`#[test]`且没有`#[ignore]`或额外`cfg`、名称集合双向相等；缺失、重复、额外名称或0项都失败。`scripts/verify-authority-regressions.ps1`再运行`cargo test --lib authority_regression_tests:: -- --list`并把实际注册test集合与当前profile catalogue双向比较，随后执行该filter并要求passed数等于catalogue数、failed/ignored/measured均为0。源码扫描、binary registration和实际运行三项缺一不可；每个切片只能增加其profile拥有的项，MVP gate必须精确等于以下完整集合：
 
 ```text
 active_cycle_enters_authority_settlement
@@ -222,7 +224,7 @@ stale_report_identity_is_zero_write
 structural_outputs_have_locked_manifest_and_topology
 ```
 
-计划中的测试文件固定为：
+MVP gate中的测试文件固定为；各文件最晚在拥有首个可兑现case的切片创建，Root push不得用额外别名文件替代已经激活的固定路径：
 
 ```text
 crates/bevy_ui_router/tests/public_navigation_journeys.rs
