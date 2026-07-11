@@ -65,10 +65,22 @@ fn assert_no_branch(manifest: &Table) {
             let Some(dependency) = value.as_table() else {
                 continue;
             };
-            assert!(
-                !is_bevy_family(name, dependency) || !dependency.contains_key("branch"),
-                "dependency `{name}` must not declare branch"
-            );
+            if is_bevy_family(name, dependency) {
+                assert_eq!(
+                    dependency.get("git").and_then(Value::as_str),
+                    Some(BEVY_GIT),
+                    "dependency `{name}` must use the approved Bevy git source"
+                );
+                assert_eq!(
+                    dependency.get("rev").and_then(Value::as_str),
+                    Some(BEVY_REV),
+                    "dependency `{name}` must pin the approved Bevy revision"
+                );
+                assert!(
+                    !dependency.contains_key("branch"),
+                    "dependency `{name}` must not declare branch"
+                );
+            }
         }
     });
 }
@@ -143,6 +155,21 @@ branch = "not-a-dependency"
     );
     let result = std::panic::catch_unwind(|| assert_no_branch(&manifest));
     assert!(result.is_ok(), "package metadata is not a dependency table");
+}
+
+#[test]
+fn ecs_manifest_rejects_target_alias_with_wrong_bevy_revision() {
+    let manifest = parse_manifest(
+        r#"
+[target.'cfg(unix)'.build-dependencies]
+render = { package = "bevy_render", git = "https://github.com/shengyusi-SYS/bevy.git", rev = "different" }
+"#,
+    );
+    let result = std::panic::catch_unwind(|| assert_no_branch(&manifest));
+    assert!(
+        result.is_err(),
+        "target Bevy package aliases must pin the approved revision"
+    );
 }
 
 #[test]

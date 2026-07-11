@@ -85,8 +85,16 @@ fn facade_safety_violations(manifest: &Table) -> Vec<String> {
             let Some(dependency) = value.as_table() else {
                 continue;
             };
-            if is_bevy_family(name, dependency) && dependency.contains_key("branch") {
-                violations.push(format!("{name} must not declare branch"));
+            if is_bevy_family(name, dependency) {
+                if dependency.get("git").and_then(Value::as_str) != Some(BEVY_GIT) {
+                    violations.push(format!("{name} must use the approved Bevy git source"));
+                }
+                if dependency.get("rev").and_then(Value::as_str) != Some(BEVY_REV) {
+                    violations.push(format!("{name} must pin the approved Bevy revision"));
+                }
+                if dependency.contains_key("branch") {
+                    violations.push(format!("{name} must not declare branch"));
+                }
             }
         }
     });
@@ -143,7 +151,7 @@ fn manifest_contract_rejects_any_movable_bevy_branch() {
         r#"
 [dependencies]
 [dev-dependencies]
-bevy_app = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "arbitrary-moving-branch", version = "0.19.0", default-features = false }
+bevy_app = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", branch = "arbitrary-moving-branch", version = "0.19.0", default-features = false }
 bevy_ecs = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
 bevy_ui = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
 [build-dependencies]
@@ -166,7 +174,7 @@ bevy_ecs = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f756
 bevy_ui = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
 
 [target.'cfg(unix)'.build-dependencies]
-bevy_render = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "target-moving-branch", version = "0.19.0", default-features = false }
+bevy_render = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", branch = "target-moving-branch", version = "0.19.0", default-features = false }
 "#,
     );
     assert_eq!(
@@ -186,7 +194,7 @@ bevy_ecs = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f756
 bevy_ui = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
 
 [target.'cfg(unix)'.build-dependencies]
-render = { package = "bevy_render", git = "https://github.com/shengyusi-SYS/bevy.git", branch = "moving" }
+render = { package = "bevy_render", git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", branch = "moving" }
 
 [package.metadata.bevy_fake]
 branch = "not-a-dependency"
@@ -195,6 +203,32 @@ branch = "not-a-dependency"
     assert_eq!(
         facade_safety_violations(&manifest),
         vec!["render must not declare branch"]
+    );
+}
+
+#[test]
+fn manifest_contract_enforces_exact_bevy_sources_in_target_tables() {
+    let manifest = parse_manifest(
+        r#"
+[dependencies]
+[dev-dependencies]
+bevy_app = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+bevy_ecs = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+bevy_ui = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+
+[target.'cfg(unix)'.build-dependencies]
+render = { package = "bevy_render", git = "https://github.com/shengyusi-SYS/bevy.git", rev = "different" }
+profile = { package = "bevy_app", git = "https://example.invalid/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7" }
+"#,
+    );
+    assert_eq!(
+        facade_safety_violations(&manifest)
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "render must pin the approved Bevy revision".to_owned(),
+            "profile must use the approved Bevy git source".to_owned(),
+        ])
     );
 }
 
