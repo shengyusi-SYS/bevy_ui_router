@@ -54,14 +54,18 @@ id_type!(RouteFrameId);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct NavigationRequestId {
-    domain: WorldDomainId,
-    router: RouterInstanceId,
+    router: RouterIdentity,
     sequence: u64,
 }
 
 impl NavigationRequestId {
     #[allow(dead_code)]
     pub(crate) const fn router(self) -> RouterInstanceId {
+        self.router.router()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn router_identity(self) -> RouterIdentity {
         self.router
     }
 }
@@ -74,11 +78,29 @@ pub(crate) struct FrameTaskId(u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct TransactionId(u64);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct WorldDomainId(u64);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct RouterIdentity {
+    domain: WorldDomainId,
+    router: RouterInstanceId,
+}
+
+impl RouterIdentity {
+    pub(crate) const fn router(self) -> RouterInstanceId {
+        self.router
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IdExhaustion;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequestAllocationError {
+    ForeignRouter,
+    Exhausted,
+}
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -90,7 +112,7 @@ pub(crate) struct CoreIdAllocator {
     next_frame: u64,
     next_task: u64,
     next_transaction: u64,
-    next_request_by_router: BTreeMap<RouterInstanceId, u64>,
+    next_request_by_router: BTreeMap<RouterIdentity, u64>,
 }
 
 #[allow(dead_code)]
@@ -110,8 +132,15 @@ impl CoreIdAllocator {
         })
     }
 
-    pub(crate) fn allocate_router(&mut self) -> Result<RouterInstanceId, IdExhaustion> {
-        checked_take(&mut self.next_router).map(RouterInstanceId::new)
+    pub(crate) fn allocate_router_identity(&mut self) -> Result<RouterIdentity, IdExhaustion> {
+        Ok(RouterIdentity {
+            domain: self.domain,
+            router: RouterInstanceId::new(checked_take(&mut self.next_router)?),
+        })
+    }
+
+    pub(crate) fn owns_router_identity(&self, router: RouterIdentity) -> bool {
+        router.domain == self.domain
     }
 
     pub(crate) fn allocate_host(&mut self) -> Result<RouteHostId, IdExhaustion> {
@@ -150,16 +179,20 @@ impl CoreIdAllocator {
 
     pub(crate) fn allocate_request(
         &mut self,
-        router: RouterInstanceId,
-    ) -> Result<NavigationRequestId, IdExhaustion> {
+        router: RouterIdentity,
+    ) -> Result<NavigationRequestId, RequestAllocationError> {
+        if router.domain != self.domain {
+            return Err(RequestAllocationError::ForeignRouter);
+        }
         let current = self
             .next_request_by_router
             .get(&router)
             .copied()
             .unwrap_or(1);
-        let next = current.checked_add(1).ok_or(IdExhaustion)?;
+        let next = current
+            .checked_add(1)
+            .ok_or(RequestAllocationError::Exhausted)?;
         let id = NavigationRequestId {
-            domain: self.domain,
             router,
             sequence: current,
         };
@@ -170,9 +203,9 @@ impl CoreIdAllocator {
     pub(crate) fn owns_request(
         &self,
         request: NavigationRequestId,
-        router: RouterInstanceId,
+        router: RouterIdentity,
     ) -> bool {
-        request.domain == self.domain && request.router() == router
+        router.domain == self.domain && request.router_identity() == router
     }
 
     #[cfg(test)]
@@ -258,6 +291,13 @@ mod tests {
     }
 
     #[test]
+    fn exact_router_identity_has_internal_value_traits() {
+        fn assert_traits<T: Copy + Eq + std::hash::Hash>() {}
+
+        assert_traits::<RouterIdentity>();
+    }
+
+    #[test]
     fn generation_advances_inside_core() {
         let first = RouteGeneration::initial();
         let second = first.next();
@@ -270,7 +310,7 @@ mod tests {
     #[test]
     fn core_allocator_burns_request_task_and_transaction_identities() {
         let mut allocator = CoreIdAllocator::new().unwrap();
-        let router = allocator.allocate_router().unwrap();
+        let router = allocator.allocate_router_identity().unwrap();
         let first_request = allocator.allocate_request(router).unwrap();
         let second_request = allocator.allocate_request(router).unwrap();
 
@@ -287,11 +327,41 @@ mod tests {
     }
 
     #[test]
+    fn request_ownership_rejects_foreign_world_with_same_raw_router() {
+        let mut first = CoreIdAllocator::new().unwrap();
+        let first_router = first.allocate_router_identity().unwrap();
+        let request = first.allocate_request(first_router).unwrap();
+
+        let mut second = CoreIdAllocator::new().unwrap();
+        let foreign_router = second.allocate_router_identity().unwrap();
+
+        assert_eq!(first_router.router(), foreign_router.router());
+        assert!(!first.owns_request(request, foreign_router));
+        let before = first.next_request_by_router.clone();
+        assert_eq!(
+            first.allocate_request(foreign_router),
+            Err(RequestAllocationError::ForeignRouter)
+        );
+        assert_eq!(first.next_request_by_router, before);
+    }
+
+    #[test]
+    fn request_ownership_rejects_a_different_router_in_the_same_world() {
+        let mut allocator = CoreIdAllocator::new().unwrap();
+        let router = allocator.allocate_router_identity().unwrap();
+        let other_router = allocator.allocate_router_identity().unwrap();
+        let request = allocator.allocate_request(router).unwrap();
+
+        assert!(!allocator.owns_request(request, other_router));
+        assert_ne!(request, allocator.allocate_request(other_router).unwrap());
+    }
+
+    #[test]
     fn every_allocator_counter_reports_exhaustion_without_wrapping() {
         let mut allocator = CoreIdAllocator::new().unwrap();
 
         allocator.next_router = u64::MAX;
-        assert_eq!(allocator.allocate_router(), Err(IdExhaustion));
+        assert_eq!(allocator.allocate_router_identity(), Err(IdExhaustion));
         assert_eq!(allocator.next_router, u64::MAX);
         allocator.next_router = 1;
 
@@ -319,9 +389,15 @@ mod tests {
         assert_eq!(allocator.allocate_transaction(), Err(IdExhaustion));
         assert_eq!(allocator.next_transaction, u64::MAX);
 
-        let router = RouterInstanceId::new(7);
+        let router = RouterIdentity {
+            domain: allocator.domain,
+            router: RouterInstanceId::new(7),
+        };
         allocator.next_request_by_router.insert(router, u64::MAX);
-        assert_eq!(allocator.allocate_request(router), Err(IdExhaustion));
+        assert_eq!(
+            allocator.allocate_request(router),
+            Err(RequestAllocationError::Exhausted)
+        );
         assert_eq!(allocator.next_request_by_router[&router], u64::MAX);
     }
 

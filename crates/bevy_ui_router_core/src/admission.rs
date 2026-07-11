@@ -1,16 +1,23 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::ids::{CoreIdAllocator, IdExhaustion, RouteHostId, RouteSlotId, RouterInstanceId};
+use crate::ids::{
+    CoreIdAllocator, IdExhaustion, RouteHostId, RouteSlotId, RouterIdentity, RouterInstanceId,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostVersion {
-    router: RouterInstanceId,
+    router: RouterIdentity,
     host: RouteHostId,
     epoch: u64,
 }
 
 impl HostVersion {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn router(&self) -> RouterInstanceId {
+        self.router.router()
+    }
+
+    pub(crate) const fn router_identity(&self) -> RouterIdentity {
         self.router
     }
 
@@ -28,7 +35,7 @@ impl HostVersion {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AdmissionKey {
     issuer: AdmissionIssuerId,
-    router: RouterInstanceId,
+    router: RouterIdentity,
     sequence: u64,
 }
 
@@ -89,6 +96,7 @@ impl GrantIdentity {
 pub(crate) enum AdmissionError {
     OutstandingExists,
     AuthorityExists,
+    ForeignRouter,
     Stale,
     Exhausted,
 }
@@ -119,7 +127,7 @@ impl HostAdmissionIssuer {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn issue(
         &mut self,
-        router: RouterInstanceId,
+        router: RouterIdentity,
     ) -> Result<HostAdmissionToken, AdmissionError> {
         if self.current.is_some() {
             return Err(AdmissionError::AuthorityExists);
@@ -151,6 +159,9 @@ impl HostAdmissionIssuer {
     ) -> Result<HostGrant, AdmissionError> {
         if self.outstanding != Some(OutstandingAdmission::Requested(token.key)) {
             return Err(AdmissionError::Stale);
+        }
+        if !ids.owns_router_identity(token.key.router) {
+            return Err(AdmissionError::ForeignRouter);
         }
         let next_epoch = self
             .next_epoch
@@ -252,7 +263,7 @@ impl HostAdmissionIssuer {
 impl HostAdmissionToken {
     #[cfg(test)]
     fn router(&self) -> RouterInstanceId {
-        self.key.router
+        self.key.router.router()
     }
 }
 
@@ -279,7 +290,7 @@ impl HostAdmissionConfirmation {
 
     #[cfg(test)]
     fn router(&self) -> RouterInstanceId {
-        self.key.router
+        self.key.router.router()
     }
 }
 
@@ -305,9 +316,9 @@ struct HostAdmissionIssuerSnapshot {
 mod tests {
     use super::*;
 
-    fn setup() -> (CoreIdAllocator, RouterInstanceId, HostAdmissionIssuer) {
+    fn setup() -> (CoreIdAllocator, RouterIdentity, HostAdmissionIssuer) {
         let mut ids = CoreIdAllocator::new().unwrap();
-        let router = ids.allocate_router().unwrap();
+        let router = ids.allocate_router_identity().unwrap();
         let issuer = HostAdmissionIssuer::new().unwrap();
         (ids, router, issuer)
     }
@@ -320,7 +331,7 @@ mod tests {
 
         assert_eq!(issuer.issue(router), Err(AdmissionError::OutstandingExists));
         assert_eq!(issuer.snapshot(), before);
-        assert_eq!(token.router(), router);
+        assert_eq!(token.router(), router.router());
     }
 
     #[test]
@@ -351,7 +362,7 @@ mod tests {
 
         let confirmation = issuer.confirm(&grant).unwrap();
         let confirmed = issuer.snapshot();
-        assert_eq!(confirmation.router(), router);
+        assert_eq!(confirmation.router(), router.router());
         assert_eq!(issuer.confirm(&grant), Err(AdmissionError::Stale));
         assert_eq!(issuer.snapshot(), confirmed);
     }
@@ -366,6 +377,24 @@ mod tests {
 
         assert_eq!(issuer.issue(router), Err(AdmissionError::AuthorityExists));
         assert_eq!(issuer.snapshot(), confirmed);
+    }
+
+    #[test]
+    fn host_versions_from_different_worlds_are_not_equal_when_raw_ids_match() {
+        let (mut first_ids, first_router, mut first_issuer) = setup();
+        let first_token = first_issuer.issue(first_router).unwrap();
+        let first_grant = first_issuer.grant(&first_token, &mut first_ids).unwrap();
+        let first = first_issuer.confirm(&first_grant).unwrap();
+
+        let (mut second_ids, second_router, mut second_issuer) = setup();
+        let second_token = second_issuer.issue(second_router).unwrap();
+        let second_grant = second_issuer.grant(&second_token, &mut second_ids).unwrap();
+        let second = second_issuer.confirm(&second_grant).unwrap();
+
+        assert_eq!(first.version().router(), second.version().router());
+        assert_eq!(first.version().host(), second.version().host());
+        assert_eq!(first.version().epoch(), second.version().epoch());
+        assert_ne!(first.version(), second.version());
     }
 
     #[test]
@@ -405,6 +434,24 @@ mod tests {
         assert_eq!(foreign.confirm(&grant), Err(AdmissionError::Stale));
         assert_eq!(issuer.snapshot(), granted);
         assert_eq!(foreign.snapshot(), foreign_before);
+    }
+
+    #[test]
+    fn foreign_world_allocator_cannot_grant_an_outstanding_token() {
+        let (_ids, router, mut issuer) = setup();
+        let token = issuer.issue(router).unwrap();
+        let issuer_before = issuer.snapshot();
+
+        let mut foreign_ids = CoreIdAllocator::new().unwrap();
+        foreign_ids.allocate_router_identity().unwrap();
+        let ids_before = foreign_ids.snapshot();
+
+        assert_eq!(
+            issuer.grant(&token, &mut foreign_ids),
+            Err(AdmissionError::ForeignRouter)
+        );
+        assert_eq!(issuer.snapshot(), issuer_before);
+        assert_eq!(foreign_ids.snapshot(), ids_before);
     }
 
     #[test]

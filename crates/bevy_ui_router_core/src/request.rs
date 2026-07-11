@@ -201,7 +201,7 @@ mod tests {
 
     fn record() -> NavigationRequestRecord {
         let mut ids = CoreIdAllocator::new().unwrap();
-        let router = ids.allocate_router().unwrap();
+        let router = ids.allocate_router_identity().unwrap();
         NavigationRequestRecord::new(
             ids.allocate_request(router).unwrap(),
             RouteLocation::new("/items/7"),

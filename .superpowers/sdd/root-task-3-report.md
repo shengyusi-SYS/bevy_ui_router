@@ -6,7 +6,9 @@ Baseline: `0532589` (`feat(core): define root navigation state model`).
 
 First follow-up: `9f9caa2` (`fix(core): seal root navigation state model`).
 
-Second follow-up: `fix(core): bind confirmed host provenance` (this change).
+Second follow-up: `61c90d9` (`fix(core): bind confirmed host provenance`).
+
+Third follow-up: `fix(core): bind world router provenance` (this change).
 
 ## RED Evidence
 
@@ -22,14 +24,23 @@ because `RouterNavigationState::new` did not accept a router identity. After the
 the new public-API quality regression remained RED until broad dead-code allowances were replaced
 with item-scoped, test-aware allowances.
 
+The third follow-up added cross-World regressions before implementation. With two allocators whose
+first public router IDs were both `1`, four focused tests failed because request ownership accepted
+the foreign router, host and frame versions compared equal, and router state accepted the foreign
+confirmation. A second RED failed on the missing `AdmissionError::ForeignRouter` until host/slot
+allocation also verified the token's exact World-bound router identity before mutation.
+During final takeover review, a focused source-boundary RED also caught the remaining private
+`CoreIdAllocator::allocate_router` path that discarded the World domain. Removing that unused path
+made exact `RouterIdentity` allocation the only router-allocation route.
+
 ## GREEN Evidence
 
 `cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core` passed with:
 
-- 129 unit tests
-- 11 isolated consumer compile-fail tests
+- 136 unit tests
+- 12 isolated consumer compile-fail tests
 - 6 dependency-boundary tests
-- 7 public API tests
+- 8 public API tests
 - 1 consumer state test
 - 31 doctests
 
@@ -50,6 +61,12 @@ with item-scoped, test-aware allowances.
   `HostVersion` identity access for Task 4, and proved it can construct `RouteFrameVersion`.
 - Replaced source-string positive API checks with compiler-checked function pointers and trait
   bounds; source checks remain only for negative `const`, derive, and allow-scope constraints.
+- Added a Core-private `RouterIdentity` that binds World domain and public router ID, and carried it
+  through request ownership, admission, confirmed authority, and route frame versions.
+- Preserved the golden raw router projection while making cross-World request, host, frame, and
+  confirmation identities unequal and non-interchangeable.
+- Removed the allocator's raw-only router allocation path and retained regressions for both
+  cross-World same-raw-router mismatches and same-World different-router mismatches.
 
 ## Concerns
 

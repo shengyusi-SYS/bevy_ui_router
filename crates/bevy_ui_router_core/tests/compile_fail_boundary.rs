@@ -205,6 +205,22 @@ fn host_version_identity_accessors_are_not_public() {
 }
 
 #[test]
+fn exact_router_identity_is_core_private() {
+    assert_compile_fails(Fixture {
+        name: "router_identity_private",
+        code: "use bevy_ui_router_core::ids::RouterIdentity; fn main() {}",
+        features: &[],
+        expected_stderr: &["error[E0603]", "private"],
+    });
+    assert_compile_fails(Fixture {
+        name: "host_version_router_identity_private",
+        code: "use bevy_ui_router_core::HostVersion; fn inspect(version: &HostVersion) { let _ = version.router_identity(); } fn main() {}",
+        features: &[],
+        expected_stderr: &["error[E0624]", "private"],
+    });
+}
+
+#[test]
 fn consumer_cannot_mint_logical_host_slot_frame_or_generation_ids() {
     for fixture in [
         Fixture {

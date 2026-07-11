@@ -26,7 +26,8 @@ use crate::branch::MatchedBranch;
 use crate::branch_diff::BranchDiff;
 use crate::fingerprint::{RouteBranchFingerprint, RouteSegmentReuseKey};
 use crate::ids::{
-    RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId, RouterInstanceId,
+    RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId, RouterIdentity,
+    RouterInstanceId,
 };
 use crate::meta::ErrorBoundaryKey;
 use crate::ownership::CleanupScope;
@@ -42,7 +43,7 @@ pub enum FrameOrigin {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteFrameVersion {
-    router: RouterInstanceId,
+    router: RouterIdentity,
     host: RouteHostId,
     slot: RouteSlotId,
     origin: FrameOrigin,
@@ -53,7 +54,7 @@ pub struct RouteFrameVersion {
 impl RouteFrameVersion {
     #[allow(dead_code)]
     pub(crate) const fn new(
-        router: RouterInstanceId,
+        router: RouterIdentity,
         host: RouteHostId,
         slot: RouteSlotId,
         origin: FrameOrigin,
@@ -71,6 +72,11 @@ impl RouteFrameVersion {
     }
 
     pub fn router(&self) -> RouterInstanceId {
+        self.router.router()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn router_identity(&self) -> RouterIdentity {
         self.router
     }
 
@@ -627,11 +633,40 @@ mod tests {
     use crate::branch::RouteParams;
     use crate::branch_diff::BranchDiff;
     use crate::fingerprint::{RouteParamsFingerprint, RouteSearchFingerprint};
+    use crate::ids::CoreIdAllocator;
     use crate::location::RouteLocation;
     use crate::matcher::RouteMatcher;
     use crate::meta::ErrorBoundaryKey;
     use crate::pattern::RoutePattern;
     use crate::route_tree::{RouteNodeOptions, RouteTree};
+
+    #[test]
+    fn frame_versions_preserve_world_provenance_behind_raw_router_projection() {
+        let mut first = CoreIdAllocator::new().unwrap();
+        let first_frame = RouteFrameVersion::new(
+            first.allocate_router_identity().unwrap(),
+            first.allocate_host().unwrap(),
+            first.allocate_slot().unwrap(),
+            FrameOrigin::RouterFallback,
+            first.allocate_frame().unwrap(),
+            RouteGeneration::initial(),
+        );
+
+        let mut second = CoreIdAllocator::new().unwrap();
+        let second_frame = RouteFrameVersion::new(
+            second.allocate_router_identity().unwrap(),
+            second.allocate_host().unwrap(),
+            second.allocate_slot().unwrap(),
+            FrameOrigin::RouterFallback,
+            second.allocate_frame().unwrap(),
+            RouteGeneration::initial(),
+        );
+
+        assert_eq!(first_frame.router(), second_frame.router());
+        assert_eq!(first_frame.host(), second_frame.host());
+        assert_eq!(first_frame.slot(), second_frame.slot());
+        assert_ne!(first_frame, second_frame);
+    }
 
     fn sample_items_matcher() -> RouteMatcher {
         let mut builder = RouteTree::builder()

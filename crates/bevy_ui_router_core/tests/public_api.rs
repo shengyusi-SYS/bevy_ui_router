@@ -267,3 +267,10 @@ fn task_3_private_foundations_use_item_scoped_test_aware_dead_code_allows() {
         assert!(!nearby.contains("allow(dead_code)"));
     }
 }
+
+#[test]
+fn task_3_private_router_allocation_keeps_world_provenance() {
+    let ids = include_str!("../src/ids.rs");
+
+    assert!(!ids.contains("pub(crate) fn allocate_router(&mut self)"));
+}

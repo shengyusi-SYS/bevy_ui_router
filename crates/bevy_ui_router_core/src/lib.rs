@@ -84,7 +84,7 @@ mod root_navigation_state_tests {
     #[test]
     fn fresh_state_awaits_a_confirmed_host_without_an_active_presentation() {
         let mut ids = CoreIdAllocator::new().unwrap();
-        let router = ids.allocate_router().unwrap();
+        let router = ids.allocate_router_identity().unwrap();
         let mut state = RouterNavigationState::new(router);
 
         assert_eq!(state.availability(), &RouterAvailability::AwaitingHost);
@@ -109,18 +109,19 @@ mod root_navigation_state_tests {
 
         assert_eq!(state.host(), Some(confirmation.version()));
         assert_eq!(state.top_slot(), Some(confirmation.top_slot()));
-        assert_eq!(confirmation.version().router(), router);
+        assert_eq!(confirmation.version().router(), router.router());
         assert_eq!(confirmation.version().host(), grant.version().host());
         assert_eq!(confirmation.version().epoch(), 1);
         let frame = RouteFrameVersion::new(
-            confirmation.version().router(),
+            confirmation.version().router_identity(),
             confirmation.version().host(),
             confirmation.top_slot(),
             FrameOrigin::RouterFallback,
             ids.allocate_frame().unwrap(),
             RouteGeneration::initial(),
         );
-        assert_eq!(frame.router(), router);
+        assert_eq!(frame.router(), router.router());
+        assert_eq!(frame.router_identity(), router);
         assert_eq!(frame.host(), confirmation.version().host());
         assert_eq!(frame.slot(), confirmation.top_slot());
         let ready = state.snapshot();
@@ -137,12 +138,12 @@ mod root_navigation_state_tests {
     #[test]
     fn request_ids_bind_the_allocator_domain_router_and_monotonic_sequence() {
         let mut first = CoreIdAllocator::new().unwrap();
-        let first_router = first.allocate_router().unwrap();
+        let first_router = first.allocate_router_identity().unwrap();
         let first_request = first.allocate_request(first_router).unwrap();
         let second_request = first.allocate_request(first_router).unwrap();
 
         let mut second = CoreIdAllocator::new().unwrap();
-        let second_router = second.allocate_router().unwrap();
+        let second_router = second.allocate_router_identity().unwrap();
         let foreign_request = second.allocate_request(second_router).unwrap();
 
         assert!(first.owns_request(first_request, first_router));
@@ -153,13 +154,32 @@ mod root_navigation_state_tests {
     }
 
     #[test]
-    fn navigation_state_rejects_same_issuer_foreign_router_confirmation_without_change() {
+    fn navigation_state_rejects_same_raw_router_from_foreign_world_without_change() {
         let mut ids = CoreIdAllocator::new().unwrap();
-        let router = ids.allocate_router().unwrap();
-        let foreign_router = ids.allocate_router().unwrap();
+        let router = ids.allocate_router_identity().unwrap();
+        let mut foreign_ids = CoreIdAllocator::new().unwrap();
+        let foreign_router = foreign_ids.allocate_router_identity().unwrap();
         let mut issuer = HostAdmissionIssuer::new().unwrap();
 
         let token = issuer.issue(foreign_router).unwrap();
+        let grant = issuer.grant(&token, &mut foreign_ids).unwrap();
+        let confirmation = issuer.confirm(&grant).unwrap();
+
+        assert_eq!(router.router(), foreign_router.router());
+        let mut state = RouterNavigationState::new(router);
+        let before = state.snapshot();
+        assert!(state.confirm_host(&issuer, &confirmation).is_err());
+        assert_eq!(state.snapshot(), before);
+    }
+
+    #[test]
+    fn navigation_state_rejects_a_different_router_in_the_same_world_without_change() {
+        let mut ids = CoreIdAllocator::new().unwrap();
+        let router = ids.allocate_router_identity().unwrap();
+        let other_router = ids.allocate_router_identity().unwrap();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+
+        let token = issuer.issue(other_router).unwrap();
         let grant = issuer.grant(&token, &mut ids).unwrap();
         let confirmation = issuer.confirm(&grant).unwrap();
 

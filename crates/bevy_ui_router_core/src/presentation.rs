@@ -141,7 +141,7 @@ struct ConfirmedHostAuthority {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RouterNavigationState {
-    router: crate::ids::RouterInstanceId,
+    router: crate::ids::RouterIdentity,
     availability: RouterAvailability,
     current_request: Option<RequestStatus>,
     active: ActivePresentation,
@@ -150,7 +150,7 @@ pub(crate) struct RouterNavigationState {
 
 impl RouterNavigationState {
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) const fn new(router: crate::ids::RouterInstanceId) -> Self {
+    pub(crate) const fn new(router: crate::ids::RouterIdentity) -> Self {
         Self {
             router,
             availability: RouterAvailability::AwaitingHost,
@@ -196,7 +196,7 @@ impl RouterNavigationState {
     ) -> Result<(), AuthorityConfirmationError> {
         if self.authority.is_some()
             || self.availability != RouterAvailability::AwaitingHost
-            || confirmation.version().router() != self.router
+            || confirmation.version().router_identity() != self.router
             || !issuer.is_current_confirmation(confirmation)
         {
             return Err(AuthorityConfirmationError);
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn router_state_keeps_request_and_active_presentation_orthogonal() {
         let mut ids = CoreIdAllocator::new().unwrap();
-        let router = ids.allocate_router().unwrap();
+        let router = ids.allocate_router_identity().unwrap();
         let mut state = RouterNavigationState::new(router);
         let status = RequestStatus::Running(crate::request::NavigationPhase::Matching);
         let active = ActivePresentation::route(RouteLocation::new("/ready"), Vec::new());
