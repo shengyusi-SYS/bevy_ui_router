@@ -31,6 +31,7 @@
 | [Facade Associated API Golden](facade-associated-api-golden.txt) | 固定所有允许类型的字段、variant、method、trait 与签名闭包 |
 | [Authority Transition Matrix](authority-transition-matrix.md) | 固定 token、closure、preflight、quarantine、epoch 与 request 终态 |
 | [Roadmap](roadmap.md) | 记录 Now、Next 和暂停项，不重复架构正文 |
+| [整体实施目标规划](implementation-goals.md) | 概括 MVP 实施目标、阶段主线、质量门槛与范围控制 |
 | [Phase 3B.1 Review Log](phase-3b1-architecture-review-log.md) | 记录审查共同根因、负责人处置和复审结论 |
 | [历史证据说明](superpowers/README.md) | 冻结旧计划和审查记录，说明其证据范围 |
 
