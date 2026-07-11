@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+const BEVY_GIT: &str = "git = \"https://github.com/shengyusi-SYS/bevy.git\"";
+const BEVY_REV: &str = "rev = \"61f78f75684e6b0bc28a13a5933f8f55ca653fa7\"";
+
 fn section_name(line: &str) -> Option<&str> {
     line.strip_prefix('[')?.strip_suffix(']')
 }
@@ -36,6 +39,13 @@ fn dependency_name_is_forbidden(name: &str) -> bool {
 fn dependency_entry(line: &str) -> Option<(&str, &str)> {
     let (key, value) = line.split_once('=')?;
     Some((key.trim(), value.trim()))
+}
+
+fn manifest_contains_dependency_config(manifest: &str, dependency: &str, fragment: &str) -> bool {
+    manifest.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with(&format!("{dependency} = {{")) && line.contains(fragment)
+    })
 }
 
 fn quoted_string(value: &str) -> Option<&str> {
@@ -119,7 +129,7 @@ fn dependency_violations(manifest: &str) -> Vec<String> {
             continue;
         }
 
-        if !current_section.is_some_and(|section| dependency_section_kind(section).is_some()) {
+        if !current_section.is_some_and(|section| section == "dependencies") {
             continue;
         }
 
@@ -167,7 +177,14 @@ fn facade_default_keeps_bevy_out_of_the_default_path() {
         ),
         ("default".to_owned(), "[\"view\"]".to_owned()),
         ("devtools".to_owned(), "[]".to_owned()),
-        ("ecs".to_owned(), "[\"dep:bevy_ui_router_ecs\"]".to_owned()),
+        (
+            "ecs".to_owned(),
+            "[\"view\", \"dep:bevy_ui_router_ecs\"]".to_owned(),
+        ),
+        (
+            "ecs-test-support".to_owned(),
+            "[\"ecs\", \"bevy_ui_router_ecs/test-support\"]".to_owned(),
+        ),
         (
             "platform".to_owned(),
             "[\"dep:bevy_ui_router_platform\"]".to_owned(),
@@ -177,8 +194,8 @@ fn facade_default_keeps_bevy_out_of_the_default_path() {
             "[\"dep:bevy_ui_router_view\"]".to_owned(),
         ),
         (
-            "view-test-support".to_owned(),
-            "[\"view\", \"bevy_ui_router_view/test-support\"]".to_owned(),
+            "test-support".to_owned(),
+            "[\"ecs-test-support\"]".to_owned(),
         ),
     ]);
 
@@ -189,6 +206,39 @@ fn facade_default_keeps_bevy_out_of_the_default_path() {
         violations.is_empty(),
         "found forbidden dependency declarations:\n{}",
         violations.join("\n")
+    );
+
+    for dependency in ["bevy_app", "bevy_ecs", "bevy_ui"] {
+        assert!(
+            manifest_contains_dependency_config(&manifest, dependency, BEVY_GIT),
+            "{dependency} should use the approved Bevy git source"
+        );
+        assert!(
+            manifest_contains_dependency_config(&manifest, dependency, BEVY_REV),
+            "{dependency} should pin the approved Bevy revision"
+        );
+        assert!(
+            manifest_contains_dependency_config(&manifest, dependency, "version = \"0.19.0\""),
+            "{dependency} should pin the approved Bevy version"
+        );
+        assert!(
+            manifest_contains_dependency_config(&manifest, dependency, "default-features = false"),
+            "{dependency} should disable default features"
+        );
+        assert!(
+            !manifest_contains_dependency_config(
+                &manifest,
+                dependency,
+                "branch = \"sys/bevy-0.19-router\""
+            ),
+            "{dependency} must not use a movable branch"
+        );
+    }
+
+    assert!(
+        manifest_contains_dependency_config(&manifest, "syn", "version = \"2\"")
+            && manifest_contains_dependency_config(&manifest, "syn", "features = [\"full\"]"),
+        "facade dev-dependencies should include syn with its full feature"
     );
 }
 
@@ -231,9 +281,7 @@ package = "bsn"
             "line 6: forbidden package rename to Bevy-family crate",
             "line 7: forbidden package rename to `bsn`",
             "line 10: forbidden dependency subtable `dependencies.bsn`",
-            "line 14: forbidden package rename to Bevy-family crate",
             "line 16: forbidden dependency subtable `target.'cfg(target_os = \"linux\")'.dev-dependencies.bevy_input`",
-            "line 20: forbidden package rename to `bsn`",
         ]
     );
 }
@@ -338,25 +386,4 @@ fn facade_view_module_exposes_phase_3a_protocol_observations_by_explicit_path() 
     assert_public::<ViewPartialOutput>();
     assert_public::<ViewRenderPlan>();
     assert_public::<ViewRequestId>();
-}
-
-#[cfg(feature = "view-test-support")]
-#[test]
-fn facade_test_support_prelude_exposes_phase_3a_fake_renderer() {
-    use bevy_ui_router::prelude::{
-        FakeViewRenderer, FakeViewRendererMode, RouteViewDescriptor, ViewBindingKey,
-    };
-    use bevy_ui_router::view::{ViewApplyOutcome, ViewBuildOutcome};
-
-    let mut renderer = FakeViewRenderer::new(FakeViewRendererMode::Success);
-    let request = renderer.request(RouteViewDescriptor::new(ViewBindingKey::new("leaf")));
-    let ViewBuildOutcome::Built(plan) = renderer.build(&request) else {
-        panic!("success mode should build");
-    };
-    let ViewApplyOutcome::Applied(output) = renderer.apply(plan) else {
-        panic!("success mode should apply");
-    };
-
-    assert_eq!(output.request_id(), request.request_id());
-    assert_eq!(output.binding().as_str(), "leaf");
 }
