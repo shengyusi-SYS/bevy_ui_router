@@ -34,7 +34,7 @@ macro_rules! id_type {
         pub struct $name(u64);
 
         impl $name {
-            #[allow(dead_code)]
+            #[cfg_attr(not(test), allow(dead_code))]
             pub(crate) const fn new(raw: u64) -> Self {
                 Self(raw)
             }
@@ -59,7 +59,7 @@ pub struct NavigationRequestId {
 }
 
 impl NavigationRequestId {
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn router(self) -> RouterInstanceId {
         self.router.router()
     }
@@ -70,11 +70,11 @@ impl NavigationRequestId {
     }
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct FrameTaskId(u64);
 
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct TransactionId(u64);
 
@@ -102,7 +102,7 @@ pub(crate) enum RequestAllocationError {
     Exhausted,
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct CoreIdAllocator {
     domain: WorldDomainId,
@@ -115,8 +115,8 @@ pub(crate) struct CoreIdAllocator {
     next_request_by_router: BTreeMap<RouterIdentity, u64>,
 }
 
-#[allow(dead_code)]
 impl CoreIdAllocator {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new() -> Result<Self, IdExhaustion> {
         static NEXT_WORLD_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
@@ -132,6 +132,7 @@ impl CoreIdAllocator {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn allocate_router_identity(&mut self) -> Result<RouterIdentity, IdExhaustion> {
         Ok(RouterIdentity {
             domain: self.domain,
@@ -139,18 +140,22 @@ impl CoreIdAllocator {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn owns_router_identity(&self, router: RouterIdentity) -> bool {
         router.domain == self.domain
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn allocate_host(&mut self) -> Result<RouteHostId, IdExhaustion> {
         checked_take(&mut self.next_host).map(RouteHostId::new)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn allocate_slot(&mut self) -> Result<RouteSlotId, IdExhaustion> {
         checked_take(&mut self.next_slot).map(RouteSlotId::new)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn allocate_host_slot(
         &mut self,
     ) -> Result<(RouteHostId, RouteSlotId), IdExhaustion> {
@@ -165,18 +170,22 @@ impl CoreIdAllocator {
         Ok(result)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn allocate_frame(&mut self) -> Result<RouteFrameId, IdExhaustion> {
         checked_take(&mut self.next_frame).map(RouteFrameId::new)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn allocate_frame_task(&mut self) -> Result<FrameTaskId, IdExhaustion> {
         checked_take(&mut self.next_task).map(FrameTaskId)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn allocate_transaction(&mut self) -> Result<TransactionId, IdExhaustion> {
         checked_take(&mut self.next_transaction).map(TransactionId)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn allocate_request(
         &mut self,
         router: RouterIdentity,
@@ -200,6 +209,7 @@ impl CoreIdAllocator {
         Ok(id)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn owns_request(
         &self,
         request: NavigationRequestId,
@@ -217,7 +227,7 @@ impl CoreIdAllocator {
     }
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn allocate_world_domain(counter: &AtomicU64) -> Result<WorldDomainId, IdExhaustion> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -227,7 +237,7 @@ fn allocate_world_domain(counter: &AtomicU64) -> Result<WorldDomainId, IdExhaust
         .map_err(|_| IdExhaustion)
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn checked_take(counter: &mut u64) -> Result<u64, IdExhaustion> {
     let current = *counter;
     *counter = current.checked_add(1).ok_or(IdExhaustion)?;
@@ -245,12 +255,12 @@ pub(crate) struct CoreIdAllocatorSnapshot {
 pub struct RouteGeneration(u64);
 
 impl RouteGeneration {
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn initial() -> Self {
         Self(0)
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn checked_next(self) -> Result<Self, IdExhaustion> {
         match self.0.checked_add(1) {
             Some(next) => Ok(Self(next)),
@@ -258,7 +268,7 @@ impl RouteGeneration {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn next(self) -> Self {
         match self.checked_next() {
             Ok(next) => next,
@@ -314,6 +324,7 @@ mod tests {
         let first_request = allocator.allocate_request(router).unwrap();
         let second_request = allocator.allocate_request(router).unwrap();
 
+        assert_eq!(first_request.router(), router.router());
         assert!(allocator.owns_request(first_request, router));
         assert_ne!(first_request, second_request);
         assert_ne!(

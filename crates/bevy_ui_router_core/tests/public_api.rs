@@ -248,6 +248,7 @@ fn task_3_private_foundations_use_item_scoped_test_aware_dead_code_allows() {
         include_str!("../src/request.rs"),
         include_str!("../src/trace.rs"),
         include_str!("../src/view_input.rs"),
+        include_str!("../src/ids.rs"),
     ];
 
     for source in sources {

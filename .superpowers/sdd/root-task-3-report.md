@@ -8,7 +8,9 @@ First follow-up: `9f9caa2` (`fix(core): seal root navigation state model`).
 
 Second follow-up: `61c90d9` (`fix(core): bind confirmed host provenance`).
 
-Third follow-up: `fix(core): bind world router provenance` (this change).
+Third follow-up: `61cc14f` (`fix(core): bind world router provenance`).
+
+Final mechanical follow-up: `fix(core): narrow identity dead code guards` (this change).
 
 ## RED Evidence
 
@@ -32,6 +34,10 @@ allocation also verified the token's exact World-bound router identity before mu
 During final takeover review, a focused source-boundary RED also caught the remaining private
 `CoreIdAllocator::allocate_router` path that discarded the World domain. Removing that unused path
 made exact `RouterIdentity` allocation the only router-allocation route.
+
+The final mechanical follow-up extended the Task 3 foundation dead-code guard to `ids.rs`. Its
+focused test failed on plain item allowances and the blanket `CoreIdAllocator` impl allowance,
+then passed after suppression was narrowed to concrete test-aware types and methods.
 
 ## GREEN Evidence
 
@@ -67,6 +73,8 @@ made exact `RouterIdentity` allocation the only router-allocation route.
   confirmation identities unequal and non-interchangeable.
 - Removed the allocator's raw-only router allocation path and retained regressions for both
   cross-World same-raw-router mismatches and same-World different-router mismatches.
+- Removed the blanket `CoreIdAllocator` impl dead-code allowance and covered `ids.rs` with the same
+  Task 3 item-scoped, test-aware guard used by the other private foundations.
 
 ## Concerns
 
@@ -74,4 +82,6 @@ made exact `RouterIdentity` allocation the only router-allocation route.
   projection.
 - Admission settlement and `RouterNavigationState` remain crate-private foundations for Task 4;
   no public host lease or settlement API was introduced.
+- The legacy runtime finding is explicitly deferred to the planned Task 4 private cutover and Task
+  9 integration cutover; this mechanical follow-up does not remove it or claim that cutover.
 - No authoritative documentation was modified by this follow-up.
