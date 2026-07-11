@@ -74,22 +74,24 @@ pub mod prelude {
 #[cfg(test)]
 mod root_navigation_state_tests {
     use crate::admission::HostAdmissionIssuer;
+    use crate::frame::{FrameOrigin, RouteFrameVersion};
     use crate::ids::CoreIdAllocator;
+    use crate::ids::RouteGeneration;
     use crate::presentation::{ActivePresentationKind, RouterAvailability, RouterNavigationState};
     use crate::request::NavigationPhase;
     use crate::trace::{NavigationTraceEvent, NavigationTraceEventKind, NavigationTraceLog};
 
     #[test]
     fn fresh_state_awaits_a_confirmed_host_without_an_active_presentation() {
-        let mut state = RouterNavigationState::new();
+        let mut ids = CoreIdAllocator::new().unwrap();
+        let router = ids.allocate_router().unwrap();
+        let mut state = RouterNavigationState::new(router);
 
         assert_eq!(state.availability(), &RouterAvailability::AwaitingHost);
         assert_eq!(state.active().kind(), ActivePresentationKind::None);
         assert!(state.current_request().is_none());
         assert!(state.host().is_none());
 
-        let mut ids = CoreIdAllocator::new().unwrap();
-        let router = ids.allocate_router().unwrap();
         let mut admission = HostAdmissionIssuer::new().unwrap();
         let token = admission.issue(router).unwrap();
         let grant = admission.grant(&token, &mut ids).unwrap();
@@ -107,6 +109,20 @@ mod root_navigation_state_tests {
 
         assert_eq!(state.host(), Some(confirmation.version()));
         assert_eq!(state.top_slot(), Some(confirmation.top_slot()));
+        assert_eq!(confirmation.version().router(), router);
+        assert_eq!(confirmation.version().host(), grant.version().host());
+        assert_eq!(confirmation.version().epoch(), 1);
+        let frame = RouteFrameVersion::new(
+            confirmation.version().router(),
+            confirmation.version().host(),
+            confirmation.top_slot(),
+            FrameOrigin::RouterFallback,
+            ids.allocate_frame().unwrap(),
+            RouteGeneration::initial(),
+        );
+        assert_eq!(frame.router(), router);
+        assert_eq!(frame.host(), confirmation.version().host());
+        assert_eq!(frame.slot(), confirmation.top_slot());
         let ready = state.snapshot();
         assert!(state.confirm_host(&admission, &confirmation).is_err());
         assert_eq!(state.snapshot(), ready);
@@ -137,27 +153,20 @@ mod root_navigation_state_tests {
     }
 
     #[test]
-    fn navigation_state_accepts_only_the_issuers_current_confirmation() {
+    fn navigation_state_rejects_same_issuer_foreign_router_confirmation_without_change() {
         let mut ids = CoreIdAllocator::new().unwrap();
         let router = ids.allocate_router().unwrap();
+        let foreign_router = ids.allocate_router().unwrap();
         let mut issuer = HostAdmissionIssuer::new().unwrap();
 
-        let first_token = issuer.issue(router).unwrap();
-        let first_grant = issuer.grant(&first_token, &mut ids).unwrap();
-        let first = issuer.confirm(&first_grant).unwrap();
+        let token = issuer.issue(foreign_router).unwrap();
+        let grant = issuer.grant(&token, &mut ids).unwrap();
+        let confirmation = issuer.confirm(&grant).unwrap();
 
-        let second_token = issuer.issue(router).unwrap();
-        let second_grant = issuer.grant(&second_token, &mut ids).unwrap();
-        let second = issuer.confirm(&second_grant).unwrap();
-
-        let mut state = RouterNavigationState::new();
+        let mut state = RouterNavigationState::new(router);
         let before = state.snapshot();
-        assert!(state.confirm_host(&issuer, &first).is_err());
+        assert!(state.confirm_host(&issuer, &confirmation).is_err());
         assert_eq!(state.snapshot(), before);
-
-        state.confirm_host(&issuer, &second).unwrap();
-        assert_eq!(state.host(), Some(second.version()));
-        assert_eq!(state.top_slot(), Some(second.top_slot()));
     }
 
     #[test]

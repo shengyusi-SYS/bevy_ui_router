@@ -4,7 +4,9 @@
 
 Baseline: `0532589` (`feat(core): define root navigation state model`).
 
-Follow-up: `fix(core): seal root navigation state model` (this change).
+First follow-up: `9f9caa2` (`fix(core): seal root navigation state model`).
+
+Second follow-up: `fix(core): bind confirmed host provenance` (this change).
 
 ## RED Evidence
 
@@ -14,14 +16,20 @@ with the expected missing lifecycle/error APIs, including sealed admission settl
 Consumer fixtures also failed until admission protocol names became unreachable and
 `RouteViewInput` lost its unlisted traits.
 
+The second follow-up started with focused Core tests that failed with `E0599` for the missing
+`AdmissionError::AuthorityExists` and crate-private `HostVersion` identity accessors, plus `E0061`
+because `RouterNavigationState::new` did not accept a router identity. After the provenance fix,
+the new public-API quality regression remained RED until broad dead-code allowances were replaced
+with item-scoped, test-aware allowances.
+
 ## GREEN Evidence
 
 `cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core` passed with:
 
-- 125 unit tests
-- 10 isolated consumer compile-fail tests
+- 129 unit tests
+- 11 isolated consumer compile-fail tests
 - 6 dependency-boundary tests
-- 6 public API tests
+- 7 public API tests
 - 1 consumer state test
 - 31 doctests
 
@@ -36,6 +44,12 @@ Consumer fixtures also failed until admission protocol names became unreachable 
   without state advancement.
 - Closed request and trace terminal transitions, aligned public associated items with the golden,
   and tightened isolated consumer non-forgeability tests.
+- Bound `RouterNavigationState` to one router identity and reject same-issuer confirmations for a
+  different router without mutation.
+- Kept confirmed authority single-owner until a future explicit settlement, added crate-private
+  `HostVersion` identity access for Task 4, and proved it can construct `RouteFrameVersion`.
+- Replaced source-string positive API checks with compiler-checked function pointers and trait
+  bounds; source checks remain only for negative `const`, derive, and allow-scope constraints.
 
 ## Concerns
 

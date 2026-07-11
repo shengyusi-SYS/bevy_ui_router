@@ -37,7 +37,6 @@ pub enum ActivePresentationKind {
     Error,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ActivePresentationState {
     None,
@@ -65,14 +64,14 @@ impl ActivePresentation {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn route(location: RouteLocation, frames: Vec<RouteFrameVersion>) -> Self {
         Self {
             state: ActivePresentationState::Route { location, frames },
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn error(
         requested: RouteLocation,
         matched: Option<RouteBranchFingerprint>,
@@ -134,26 +133,26 @@ impl ActivePresentation {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConfirmedHostAuthority {
     version: HostVersion,
     top_slot: crate::ids::RouteSlotId,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RouterNavigationState {
+    router: crate::ids::RouterInstanceId,
     availability: RouterAvailability,
     current_request: Option<RequestStatus>,
     active: ActivePresentation,
     authority: Option<ConfirmedHostAuthority>,
 }
 
-#[allow(dead_code)]
 impl RouterNavigationState {
-    pub(crate) const fn new() -> Self {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn new(router: crate::ids::RouterInstanceId) -> Self {
         Self {
+            router,
             availability: RouterAvailability::AwaitingHost,
             current_request: None,
             active: ActivePresentation::none(),
@@ -161,18 +160,22 @@ impl RouterNavigationState {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn availability(&self) -> &RouterAvailability {
         &self.availability
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn active(&self) -> &ActivePresentation {
         &self.active
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn current_request(&self) -> Option<&RequestStatus> {
         self.current_request.as_ref()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn host(&self) -> Option<&HostVersion> {
         match &self.authority {
             Some(authority) => Some(&authority.version),
@@ -180,10 +183,12 @@ impl RouterNavigationState {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn top_slot(&self) -> Option<crate::ids::RouteSlotId> {
         self.authority.as_ref().map(|authority| authority.top_slot)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn confirm_host(
         &mut self,
         issuer: &crate::admission::HostAdmissionIssuer,
@@ -191,6 +196,7 @@ impl RouterNavigationState {
     ) -> Result<(), AuthorityConfirmationError> {
         if self.authority.is_some()
             || self.availability != RouterAvailability::AwaitingHost
+            || confirmation.version().router() != self.router
             || !issuer.is_current_confirmation(confirmation)
         {
             return Err(AuthorityConfirmationError);
@@ -203,12 +209,12 @@ impl RouterNavigationState {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_request(&mut self, status: Option<RequestStatus>) {
         self.current_request = status;
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_active(&mut self, active: ActivePresentation) {
         self.active = active;
     }
@@ -219,7 +225,6 @@ impl RouterNavigationState {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AuthorityConfirmationError;
 
@@ -227,6 +232,7 @@ pub(crate) struct AuthorityConfirmationError;
 mod tests {
     use super::*;
     use crate::fingerprint::{RouteBranchFingerprint, RouteSearchFingerprint};
+    use crate::ids::CoreIdAllocator;
     use crate::request::NavigationFailureKind;
 
     fn matched_fingerprint() -> RouteBranchFingerprint {
@@ -256,5 +262,21 @@ mod tests {
         assert_eq!(recovered.matched(), Some(&matched));
         assert!(match_failure.matched().is_none());
         assert!(route.matched().is_none());
+    }
+
+    #[test]
+    fn router_state_keeps_request_and_active_presentation_orthogonal() {
+        let mut ids = CoreIdAllocator::new().unwrap();
+        let router = ids.allocate_router().unwrap();
+        let mut state = RouterNavigationState::new(router);
+        let status = RequestStatus::Running(crate::request::NavigationPhase::Matching);
+        let active = ActivePresentation::route(RouteLocation::new("/ready"), Vec::new());
+
+        state.set_request(Some(status.clone()));
+        state.set_active(active.clone());
+
+        assert_eq!(state.current_request(), Some(&status));
+        assert_eq!(state.active(), &active);
+        assert_eq!(state.availability(), &RouterAvailability::AwaitingHost);
     }
 }

@@ -54,22 +54,21 @@ pub struct NavigationTraceEvent {
 }
 
 impl NavigationTraceEvent {
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn request_phase_changed(phase: NavigationPhase) -> Self {
         Self::new(NavigationTraceEventKind::RequestPhaseChanged).with_phase(phase)
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn commit_published() -> Self {
         Self::new(NavigationTraceEventKind::CommitPublished)
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn request_terminal() -> Self {
         Self::new(NavigationTraceEventKind::RequestTerminal)
     }
 
-    #[allow(dead_code)]
     pub(crate) const fn new(kind: NavigationTraceEventKind) -> Self {
         Self {
             kind,
@@ -82,7 +81,6 @@ impl NavigationTraceEvent {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn with_phase(mut self, phase: NavigationPhase) -> Self {
         self.phase = Some(phase);
         self
@@ -117,20 +115,17 @@ impl NavigationTraceEvent {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NavigationTraceLog {
     events: Vec<NavigationTraceEvent>,
     closed: bool,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NavigationTraceError {
     Closed,
 }
 
-#[allow(dead_code)]
 impl NavigationTraceLog {
     pub(crate) const fn new() -> Self {
         Self {

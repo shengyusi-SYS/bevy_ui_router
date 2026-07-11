@@ -9,7 +9,22 @@ pub struct HostVersion {
     epoch: u64,
 }
 
-#[allow(dead_code)]
+impl HostVersion {
+    pub(crate) const fn router(&self) -> RouterInstanceId {
+        self.router
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn host(&self) -> RouteHostId {
+        self.host
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AdmissionKey {
     issuer: AdmissionIssuerId,
@@ -17,17 +32,14 @@ struct AdmissionKey {
     sequence: u64,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AdmissionIssuerId(u64);
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HostAdmissionToken {
     key: AdmissionKey,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HostGrant {
     key: AdmissionKey,
@@ -35,7 +47,6 @@ pub(crate) struct HostGrant {
     top_slot: RouteSlotId,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HostAdmissionConfirmation {
     key: AdmissionKey,
@@ -43,14 +54,12 @@ pub(crate) struct HostAdmissionConfirmation {
     top_slot: RouteSlotId,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OutstandingAdmission {
     Requested(AdmissionKey),
     Granted(GrantIdentity),
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GrantIdentity {
     key: AdmissionKey,
@@ -58,7 +67,6 @@ struct GrantIdentity {
     top_slot: RouteSlotId,
 }
 
-#[allow(dead_code)]
 impl GrantIdentity {
     fn from_grant(grant: &HostGrant) -> Self {
         Self {
@@ -77,15 +85,14 @@ impl GrantIdentity {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionError {
     OutstandingExists,
+    AuthorityExists,
     Stale,
     Exhausted,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct HostAdmissionIssuer {
     issuer: AdmissionIssuerId,
@@ -95,8 +102,8 @@ pub(crate) struct HostAdmissionIssuer {
     current: Option<GrantIdentity>,
 }
 
-#[allow(dead_code)]
 impl HostAdmissionIssuer {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new() -> Result<Self, IdExhaustion> {
         static NEXT_ISSUER: AtomicU64 = AtomicU64::new(1);
 
@@ -109,10 +116,14 @@ impl HostAdmissionIssuer {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn issue(
         &mut self,
         router: RouterInstanceId,
     ) -> Result<HostAdmissionToken, AdmissionError> {
+        if self.current.is_some() {
+            return Err(AdmissionError::AuthorityExists);
+        }
         if self.outstanding.is_some() {
             return Err(AdmissionError::OutstandingExists);
         }
@@ -132,6 +143,7 @@ impl HostAdmissionIssuer {
         Ok(token)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn grant(
         &mut self,
         token: &HostAdmissionToken,
@@ -164,10 +176,12 @@ impl HostAdmissionIssuer {
         Ok(grant)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn reject(&mut self, token: &HostAdmissionToken) -> Result<(), AdmissionError> {
         self.finish_requested(token)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn cancel(&mut self, token: &HostAdmissionToken) -> Result<(), AdmissionError> {
         self.finish_requested(token)
     }
@@ -180,6 +194,7 @@ impl HostAdmissionIssuer {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn confirm(
         &mut self,
         grant: &HostGrant,
@@ -187,6 +202,9 @@ impl HostAdmissionIssuer {
         let identity = GrantIdentity::from_grant(grant);
         if self.outstanding.as_ref() != Some(&OutstandingAdmission::Granted(identity.clone())) {
             return Err(AdmissionError::Stale);
+        }
+        if self.current.is_some() {
+            return Err(AdmissionError::AuthorityExists);
         }
         let confirmation = HostAdmissionConfirmation {
             key: grant.key,
@@ -198,6 +216,7 @@ impl HostAdmissionIssuer {
         Ok(confirmation)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn reject_after_mutation(
         &mut self,
         grant: &HostGrant,
@@ -214,6 +233,7 @@ impl HostAdmissionIssuer {
         self.current.as_ref() == Some(&GrantIdentity::from_confirmation(confirmation))
     }
 
+    #[cfg(test)]
     pub(crate) fn has_outstanding(&self) -> bool {
         self.outstanding.is_some()
     }
@@ -236,18 +256,18 @@ impl HostAdmissionToken {
     }
 }
 
-#[allow(dead_code)]
 impl HostGrant {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn version(&self) -> &HostVersion {
         &self.version
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn top_slot(&self) -> RouteSlotId {
         self.top_slot
     }
 }
 
-#[allow(dead_code)]
 impl HostAdmissionConfirmation {
     pub(crate) fn version(&self) -> &HostVersion {
         &self.version
@@ -263,7 +283,6 @@ impl HostAdmissionConfirmation {
     }
 }
 
-#[allow(dead_code)]
 fn allocate_issuer(counter: &AtomicU64) -> Result<AdmissionIssuerId, IdExhaustion> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -334,6 +353,18 @@ mod tests {
         let confirmed = issuer.snapshot();
         assert_eq!(confirmation.router(), router);
         assert_eq!(issuer.confirm(&grant), Err(AdmissionError::Stale));
+        assert_eq!(issuer.snapshot(), confirmed);
+    }
+
+    #[test]
+    fn confirmed_authority_blocks_new_issue_without_state_change() {
+        let (mut ids, router, mut issuer) = setup();
+        let token = issuer.issue(router).unwrap();
+        let grant = issuer.grant(&token, &mut ids).unwrap();
+        issuer.confirm(&grant).unwrap();
+        let confirmed = issuer.snapshot();
+
+        assert_eq!(issuer.issue(router), Err(AdmissionError::AuthorityExists));
         assert_eq!(issuer.snapshot(), confirmed);
     }
 

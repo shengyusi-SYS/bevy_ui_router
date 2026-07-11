@@ -186,6 +186,25 @@ fn admission_module_and_protocol_names_are_unreachable() {
 }
 
 #[test]
+fn host_version_identity_accessors_are_not_public() {
+    for (name, accessor) in [
+        ("host_version_router_private", "router"),
+        ("host_version_host_private", "host"),
+        ("host_version_epoch_private", "epoch"),
+    ] {
+        let code = format!(
+            "use bevy_ui_router_core::HostVersion; fn inspect(version: &HostVersion) {{ let _ = version.{accessor}(); }} fn main() {{}}"
+        );
+        assert_compile_fails(Fixture {
+            name,
+            code: Box::leak(code.into_boxed_str()),
+            features: &[],
+            expected_stderr: &["error[E0624]", "private"],
+        });
+    }
+}
+
+#[test]
 fn consumer_cannot_mint_logical_host_slot_frame_or_generation_ids() {
     for fixture in [
         Fixture {

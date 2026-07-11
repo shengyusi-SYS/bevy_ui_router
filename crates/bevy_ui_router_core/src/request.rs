@@ -25,7 +25,7 @@ pub struct NavigationFailure {
 }
 
 impl NavigationFailure {
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(kind: NavigationFailureKind, message: impl Into<String>) -> Self {
         Self {
             kind,
@@ -64,7 +64,6 @@ pub enum RequestStatus {
     Failed(NavigationFailure),
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NavigationRequestRecord {
     id: NavigationRequestId,
@@ -75,8 +74,8 @@ pub(crate) struct NavigationRequestRecord {
     diagnostics: Vec<DiagnosticEvent>,
 }
 
-#[allow(dead_code)]
 impl NavigationRequestRecord {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(id: NavigationRequestId, requested: RouteLocation) -> Self {
         Self {
             id,
@@ -88,36 +87,37 @@ impl NavigationRequestRecord {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn id(&self) -> NavigationRequestId {
         self.id
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn requested(&self) -> &RouteLocation {
         &self.requested
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn matched(&self) -> Option<&RouteBranchFingerprint> {
         self.matched.as_ref()
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn status(&self) -> &RequestStatus {
         &self.status
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn trace(&self) -> &[NavigationTraceEvent] {
         self.trace.events()
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn diagnostics(&self) -> &[DiagnosticEvent] {
         &self.diagnostics
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_matched(
         &mut self,
         matched: RouteBranchFingerprint,
@@ -129,6 +129,7 @@ impl NavigationRequestRecord {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn transition(&mut self, status: RequestStatus) -> Result<(), RequestRecordError> {
         if self.status.is_terminal() {
             return Err(RequestRecordError::AlreadyTerminal);
@@ -137,6 +138,7 @@ impl NavigationRequestRecord {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn append_trace(
         &mut self,
         event: NavigationTraceEvent,
@@ -154,7 +156,7 @@ impl NavigationRequestRecord {
         self.trace.append(event).map_err(RequestRecordError::from)
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn push_diagnostic(
         &mut self,
         event: DiagnosticEvent,
@@ -173,7 +175,6 @@ impl RequestStatus {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestRecordError {
     AlreadyTerminal,
@@ -194,6 +195,7 @@ impl From<NavigationTraceError> for RequestRecordError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fingerprint::RouteSearchFingerprint;
     use crate::ids::CoreIdAllocator;
     use crate::trace::NavigationTraceEventKind;
 
@@ -217,6 +219,35 @@ mod tests {
             Err(RequestRecordError::AlreadyTerminal)
         );
         assert_eq!(record, before);
+    }
+
+    #[test]
+    fn request_record_projects_identity_match_status_and_diagnostics() {
+        let mut record = record();
+        let id = record.id;
+        let requested = record.requested.clone();
+
+        assert_eq!(record.id(), id);
+        assert_eq!(record.requested(), &requested);
+        assert!(record.matched().is_none());
+        assert_eq!(record.status(), &RequestStatus::Queued);
+        assert!(record.diagnostics().is_empty());
+
+        let search = RouteSearchFingerprint::from_location(&requested);
+        let matched = RouteBranchFingerprint::from_parts(std::iter::empty(), &search);
+        record.set_matched(matched.clone()).unwrap();
+        assert_eq!(record.matched(), Some(&matched));
+
+        let matched_state = record.clone();
+        assert_eq!(
+            record.set_matched(matched),
+            Err(RequestRecordError::ImmutableMatch)
+        );
+        assert_eq!(record, matched_state);
+
+        let diagnostic = DiagnosticEvent::match_failed("no route");
+        record.push_diagnostic(diagnostic.clone()).unwrap();
+        assert_eq!(record.diagnostics(), &[diagnostic]);
     }
 
     #[test]
