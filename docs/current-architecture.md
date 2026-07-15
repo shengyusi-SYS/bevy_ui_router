@@ -1,9 +1,9 @@
 # Current Architecture
 
 **文档类型**: 当前事实
-**状态**: Root Push Task 4 闭合后的私有地基
-**as_of_commit**: `666bb1f9584bdd68ec0109ae1a720563e1843b40`
-**事实来源**: workspace manifest、公共导出、实现代码、测试代码与可执行验证；历史计划不作为事实来源
+**状态**: Root Push Tasks 1-8 已闭合，准备进入 Task 9 原子切换
+**as_of_commit**: `8ea9c25440e0b6d8d85f947a96173bb6bab6d8a2`
+**事实来源**: workspace manifest、公共导出、实现代码、测试代码与已记录验证；历史计划不作为事实来源
 
 `Cargo.lock` 已跟踪，Bevy dependencies 固定到 exact revision
 `61f78f75684e6b0bc28a13a5933f8f55ca653fa7`；Root Push 后续门禁使用
@@ -11,9 +11,13 @@
 
 ## 1. 当前定位
 
-项目已经从单 crate 占位工程发展为包含 core、view、ECS、BSN、platform 和 facade 的 Cargo workspace。matcher、branch diff、frame identity、generation、transaction stale check、局部清理和输入隔离等基础已有较强的局部合同，但这些能力还没有被一条可由 facade 公共 API 驱动的真实导航路径统一起来。
+项目已经从单 crate 占位工程发展为包含 core、view、ECS、BSN、platform 和 facade 的 Cargo workspace
 
-因此，当前项目应定义为“生命周期安全原型”，而不是已经可用的 MVP Router。已有测试主要证明局部类型与低层协议，不能证明 `push`、`replace`、`back` 已经在 Bevy `App` 中闭环。
+Tasks 1-8 已形成 Core engine/cleanup、View registry/effect、ECS content/driver、plugin/DTO、host candidate、exact Entity registry 与 inert staging 等私有地基，但这些能力还没有被一条可由 facade 公共 API 驱动的真实导航路径统一起来
+
+因此，当前项目仍是“生命周期安全原型”，不是已经可用的 MVP Router
+
+已有测试主要证明局部类型与低层协议，不能证明 `push`、`replace`、`back` 已经在 Bevy `App` 中闭环
 
 ## 2. Workspace 边界
 
@@ -58,7 +62,7 @@ bevy_ui_router            feature-gated facade 与 re-export
 - 新 `RouterEngine` 仍未被 plugin、system、ECS bridge 或 facade 调用。旧路径在 Task 9 原子切换前仍是唯一集成 publisher。
 - 一个 runtime scope 的所有 frame 使用同一个 `RouteSlotId`；`RouteSlotKey` 只记录逻辑名称，尚未形成真实父 frame outlet 身份。
 - 新私有 engine 已覆盖 root generation advancement/remount，但 live ECS/facade 路径尚未接入。
-- Core binding 已存在，但 View registry/effect、ECS content driver 与真实解析链尚未实现。
+- Core binding、View registry/effect 与 ECS content driver 地基均已存在，但尚未组成 engine 驱动的真实解析与 realization 链
 
 ### 3.2 View
 
@@ -66,12 +70,13 @@ bevy_ui_router            feature-gated facade 与 re-export
 
 - `ViewBindingKey`、`RouteViewDescriptor`、build/apply outcome、partial output 和单次 report session。
 - fake renderer 及 authority surface 的正向、负向合同测试。
+- authority-free `ViewDriverKey`、`RouteViewRegistry` 与 `ViewBuildEffect` 根导出
+- effect 构造与 request identity 保持私有，registry descriptor、insert 与 get 也保持私有
 
 尚未集成：
 
-- route node 与 view descriptor 之间没有绑定。
-- 没有生产用 binding registry/resolver。
-- fake renderer 协议和 ECS apply session 处于相邻但独立的路径，没有统一 effect/report 调度入口。
+- registry 尚无生产填充与解析入口，也没有 engine 驱动的 effect dispatch
+- legacy contract、fake renderer 与 ECS apply bridge 仍保留，尚未迁移到统一 effect/report 路径
 
 ### 3.3 ECS
 
@@ -80,27 +85,27 @@ bevy_ui_router            feature-gated facade 与 re-export
 - `RouteHost`、`RouteSlot`、`RouteFrameRoot` 及 lifecycle/interaction 快照。
 - frame apply session、inert prepare、activation、failure/stale cleanup、focus 与输入隔离辅助逻辑。
 - 对 router、host、slot、route、frame、generation 的多字段校验，以及稳定排序。
+- data-only `ContentPlan`、`FrameContentWriter`、`EcsViewDriver` 与一次性 report session 私有协议
+- `RouterConfig`、opaque `RouterHandle`、host registration、navigation/snapshot/error DTO 与 schedule/input labels
+- host candidate incarnation/revision/classification、exact Entity registry、ownership seal、current claim 与 quarantine lease 私有地基
+- register-before-mutate 的 inert provisional top-slot staging 与写后复验
 
 尚未集成或存在语义缺口：
 
-- `RouterEcsState` 的公共导航入口只有 `begin_first_navigation`；二次导航测试绕过公共边界直接访问内部 runtime。
-- `BevyUiRouterPlugin` 只初始化资源和配置 schedule set，没有注册驱动导航的 systems。
-- 当前 host/slot/frame测试不要求 app-owned host是 Bevy `Node`，Router-owned结构层也没有形成从UI root到内容的全Node直接ancestry；因此现有Entity层级不能证明真实UI layout/picking可达。
-- 没有 ECS 唯一 registry 维护 host、slot、frame version 与 Entity 的一对一映射。
-- 当前 ancestry 校验拒绝 slot 上方再出现 slot，因此不能表达 `host -> parent root -> child outlet -> child root` 的真实嵌套拓扑。
-- core 先 commit，随后逐个激活 ECS root；激活没有成为 core publish 前的受检原子步骤。
-- 离场 root 不由统一提交路径自动隔离并清理；已有测试允许前后两批 root 同时保持 active。
-- renderer 可以通过公共 `RouteFrameRoot::from_frame_request` 构造权威 root marker，权限边界过宽。
-- cleanup 主要按 marker 扫描，没有 registry receipt 证明实际移除了哪个已登记实体。
-- 当前 cleanup 对命中 marker 的 root 直接递归 despawn，既不先拒绝 app-owned/foreign descendant，也没有独立 visited/cycle 防护；结合可公开伪造的 root marker，错误或恶意标记可能越权删除应用实体，异常层级还可能使遍历无法可靠收敛。这是重构前基线风险，不是目标架构允许的能力。
-- pending root 由外部先创建再补做 inert prepare，无法结构性保证它从出生起就不可见、不可交互。
+- `RouterEcsState` 与 legacy apply/cleanup 仍是唯一集成路径，新 registry/content/host staging 尚未接入生产 authority
+- `BevyUiRouterPlugin` 已幂等初始化新旧资源并配置 schedule set，但没有注册 lifecycle systems
+- `RouterNavigation` 尚无公开导航行为，router installation、engine store 与 snapshot projection 也未实现
+- provisional staging 尚未绑定真实 Core host grant，也未执行生产 confirmation 与失败 settlement
+- 物理 realization、完整 preflight、同帧 presentation/input 切换与 ECS cleanup ledger 尚未实现
+- legacy 路径仍先提交 Core、再逐个激活 ECS root，旧 marker cleanup 也未使用 exact registry receipt
+- legacy root marker 可公开构造且 cleanup 会递归 despawn，仍是 Task 9 删除旧 authority 前的基线风险
 
 ### 3.4 BSN、Platform 与 Facade
 
 - `bevy_ui_router_bsn` 只有空 prelude，尚无 adapter 实现。
 - `bevy_ui_router_platform` 只 re-export back 相关 core 类型。
-- facade 只按 feature 把 core/view/ECS/BSN/platform 作为整 crate alias re-export；因此 `core::runtime`、旧 transaction/apply/session、ECS authority marker/state 等低层路径仍可达，现有 facade 测试还验证其中部分旧 prelude 类型。
-- facade 没有 router 配置、host 注册、导航命令或状态观察的完整公共流程。Phase 3B.1 必须用 curated wrapper/allowlist 取代整 crate alias，并同步改写这些旧正向测试；这不是当前已经完成的能力。
+- facade 仍按 feature 把 core/view/ECS/BSN/platform 作为整 crate alias re-export，因此旧 authority 与 Tasks 5-8 新 DTO 都只能通过低层 owner-crate 路径到达
+- facade prelude 尚无 install、register-host、push 与 snapshot 的完整公共流程，Task 9 仍需用 curated wrapper/allowlist 取代整 crate alias
 
 ## 4. 能力账本
 
@@ -110,10 +115,13 @@ bevy_ui_router            feature-gated facade 与 re-export
 | branch diff 与 common-prefix | 是 | 低层集成 | 是 | 否 | 否 |
 | frame identity/generation/stale | 私有新 engine 已实现 advancement；旧 live path 未切换 | 局部集成 | 间接 | 否 | 否 |
 | inert/focus/input cleanup | 是 | 局部集成 | feature-gated 低层可达 | 否 | 否 |
-| route-view binding | Core binding 已实现；View registry/effect 未实现 | 否 | Core DTO 可达 | 否 | 否 |
+| route-view binding | Core binding 与 View registry/effect 已实现 | 私有断开 | 低层 DTO 可达 | 否 | 否 |
+| content plan/driver | 是 | 私有断开 | 否 | 否 | 否 |
+| host candidate/inert staging | 是 | 私有断开 | 否 | 否 | 否 |
+| exact ECS registry/claim | 是 | 私有断开 | 否 | 否 | 否 |
 | 真实嵌套 mount | 否 | 否 | 否 | 否 | 否 |
 | push/replace/back | 私有 engine 支持 root push；replace/back 仅 history 算法 | 否 | history 独立可达 | 否 | 否 |
-| plugin 自动驱动 | schedule 结构存在 | 否 | plugin 可添加 | 否 | 否 |
+| plugin 自动驱动 | 资源与 schedule set 地基存在 | 无 lifecycle systems | plugin 可添加 | 否 | 否 |
 | diagnostics 闭环 | 数据类型存在 | 否 | 局部可读 | 否 | 否 |
 | BSN immediate adapter | 否 | 否 | 否 | 否 | 否 |
 
@@ -123,12 +131,25 @@ Phase 3B.1 默认保留以下资产，并通过回归测试防止重构损坏：
 
 - workspace 分层与 core 的 Bevy-free 约束。
 - matcher、fingerprint、稳定声明顺序和 branch diff。
-- frame id、generation 字段、transaction/task identity 与 stale 检查思路；生产 generation advancement 由 Phase 3B.1 补齐。
+- frame id、generation 字段、transaction/task identity 与 stale 检查思路，新 engine 已实现 root generation advancement
 - common-prefix frame 保留策略。
 - app-owned host 与 router-owned subtree 的 ownership 原则。
 - hidden/retained subtree 的输入隔离与 focus 释放规则。
 - adapter 不拥有 commit authority 的负向 API 合同。
 
-## 6. 当前结论
+## 6. Task 9 接线基线
 
-统一逻辑 authority 的 Core-private 地基已经形成，并已按最终分层把物理 cleanup truth 留给 ECS；但它仍完全断开，真实 ECS/facade 主链继续使用旧 authority。因此项目仍是实现早期的生命周期安全原型，不是 Root PASS 或 MVP。下一阶段是 Task 5-8 的私有 View/ECS 地基；Task 9 才能以一个原子提交接线新 engine、完成物理 preflight/commit、迁移 facade 并删除旧 publisher。
+**Readiness**: Ready with in-task risks
+
+- Tasks 1-8 的私有地基足以进入 Task 9，未发现需要提前拆出的实现阻断
+- 新 `RouterEngine` 仍私有断开，legacy runtime/ECS/facade 路径仍是唯一集成 authority，这是原子切换前的预期状态
+- Task 9 必须在同一切换中完成 grant 接线、物理 preflight、同帧 publication、最小 cleanup ledger、plugin/facade migration 与旧 publisher 删除
+- 上述事项均已属于 Task 9 计划范围，因此不另设 readiness 阻断记录
+
+## 7. 当前结论
+
+统一逻辑 authority、View/ECS 私有协议与 exact ownership 地基已经形成，但真实 ECS/facade 主链仍使用旧 authority
+
+项目仍处于实现早期，不是 Root PASS 或 MVP
+
+下一阶段是 Task 9 原子切换，完成前不新增第二条 publisher 或兼容 authority 路径
