@@ -324,6 +324,11 @@ visibility/input/focus/cleanup 遍历必须 frame-local：outlet anchor 按 pare
 
 Registry 对 authority root、slot、content target 及 writer 创建的每个 content Entity逐项保存完整 Entity generation、private ownership seal、显式 owner 和该角色允许的 component-id manifest：
 
+Registry authority保持以下不变量：
+
+- ownership seal首次成功登记后永久消费，不因record删除或转入quarantine而复用
+- lifecycle变更、删除和lease transfer使用包含exact Entity generation、owner、seal与预期lifecycle的current claim执行compare-and-swap，stale claim不得改变registry或lease table
+
 ```text
 EntityOwner = HostTopSlot(host_version, slot_id)
             | ChildSlot(parent_frame_version, outlet_key, slot_id)

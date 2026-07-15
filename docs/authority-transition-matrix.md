@@ -45,7 +45,17 @@ AuthorityLost(AuthoritySettlementPlan)
 
 Preflight failure always consumes the outstanding admission token through a sealed reject/cancel transition. 不存在“未消费但永久 outstanding”的 token。ID 只在 exclusive preflight 成功后分配，允许永久 gap；grant 后任何 Bevy mutation 都视为可重入且需写后复验。只有 validation 后 confirm 才可发布，失败 grant 的 staging residual 必须逐项 settlement。
 
-`HostCandidateRevision` 是ECS私有、稳定单调的candidate revision，绑定registration component instance/revision、app host exact Entity generation与admission topology fingerprint。`RejectedAfterMutation`会闩锁失败revision；只要revision未变，后续update只保持unavailable并记录去重diagnostic，不再签发token、分配ID或创建quarantine。应用移除后重新插入registration，或实际host identity/topology发生可观察变化，才产生新revision并允许一次完整admission。初次安装与authority recovery共用该规则，因此持久observer不能触发无限重试。
+`HostCandidateRevision` 是ECS私有、稳定单调的candidate revision，绑定registration component instance/revision、app host exact Entity generation与admission topology fingerprint：
+
+- 实例身份使用显式incarnation，Bevy change tick只能作为观察事实，不能单独承担身份
+- `RejectedAfterMutation`闩锁当前revision，revision未变时不再签发token、分配ID或创建quarantine
+- registration重插或host identity/topology变化后产生新revision，允许一次新admission
+- 初次安装与authority recovery共用该规则，持久observer不能触发无限重试
+
+ECS ownership record另遵守：
+
+- ownership seal首次成功登记后永久消费，删除、失败清理或转入quarantine都不释放
+- registry transition只接受匹配exact Entity generation、owner、seal和预期lifecycle的当前claim，stale或历史claim零写拒绝
 
 ## 3. Host Loss And Recovery
 

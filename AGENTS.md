@@ -22,6 +22,9 @@
 - core 不绑定具体平台、主题、文案、权限、数据服务或应用 shell 模型。
 - 平台、工具或高级集成能力必须通过 adapter 或明确设计决策接入，不能假设为 core 默认能力。
 - frame/root 身份与 generation 必须可追踪，至少能关联到 Router、host、slot、frame identity 和 generation。
+- 用于 admission 或 authority 的 revision 必须绑定显式实例身份，不能只依赖 change tick、查询时序或可复用数值
+- ownership seal 和 authority ID 一经消费，不得因失败、删除或 quarantine 而复用；registry 变更必须校验当前 exact Entity、owner、seal 和预期 lifecycle
+- Router-created Entity 必须先登记 ownership，再写 component 或 relationship；可能触发 hook/observer 的写入完成后必须复验，drift 时保持 inert 并 fail closed
 - 不持有 `&mut World` 跨 `await`。
 - 异步结果 apply 前必须执行 stale check；身份不匹配必须丢弃，不能产生可见状态变化。
 - pending scene 不能视为 active UI；active UI 只能来自已完成 resolve/apply 且通过身份校验的结果。
@@ -57,6 +60,7 @@
 - 按变更触及区域选择验证，不维护与当前变更无关的长测试矩阵。
 - 只要涉及 Rust 代码，至少运行相关格式检查、静态检查或说明未运行原因。
 - 涉及 ownership 时，验证 Router、host、slot、frame identity 和 generation 标记完整。
+- 涉及 admission、registry 或 staging 时，验证同 tick identity 变化、历史 seal/stale claim 拒绝和 post-write observer drift 不会越权写入
 - 涉及异步逻辑时，验证 stale check 覆盖 router、frame、generation 和 task 身份。
 - 涉及 hidden/retained subtree 时，验证输入隔离与 focus 释放。
 - 涉及 resolve/apply 时，验证失败会清理 router-owned 局部状态，且不触碰 app-owned host。
