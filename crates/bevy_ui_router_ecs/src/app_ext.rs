@@ -1,7 +1,11 @@
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::driver::EcsViewDriver;
-use bevy_ecs::{component::Component, resource::Resource};
+use bevy_ecs::{
+    component::Component, lifecycle::HookContext, resource::Resource, world::DeferredWorld,
+};
 use bevy_ui_router_core::prelude::{RouteTree, RouteViewKey};
 use bevy_ui_router_view::{RouteViewRegistry, ViewDriverKey};
 
@@ -34,18 +38,41 @@ impl RouterHandle {
     }
 }
 
+static NEXT_HOST_REGISTRATION_INCARNATION: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Component)]
+#[component(on_insert)]
 pub struct RouterHostRegistration {
     router: RouterHandle,
+    incarnation: u64,
 }
 
 impl RouterHostRegistration {
     pub fn new(router: RouterHandle) -> Self {
-        Self { router }
+        Self {
+            router,
+            incarnation: 0,
+        }
+    }
+
+    fn on_insert(mut world: DeferredWorld, context: HookContext) {
+        let previous = NEXT_HOST_REGISTRATION_INCARNATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("host registration incarnation exhausted");
+        world
+            .get_mut::<Self>(context.entity)
+            .expect("inserted host registration should exist")
+            .incarnation = previous + 1;
     }
 
     pub(crate) const fn router(&self) -> RouterHandle {
         self.router
+    }
+
+    pub(crate) const fn incarnation(&self) -> u64 {
+        self.incarnation
     }
 }
 

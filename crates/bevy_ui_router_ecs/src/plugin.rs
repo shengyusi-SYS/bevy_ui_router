@@ -3,7 +3,9 @@ use bevy_ecs::prelude::{Resource, SystemSet};
 use bevy_ecs::schedule::IntoScheduleConfigs;
 
 use crate::app_ext::ViewDriverStore;
+use crate::host::{HostCandidateRevisionLatch, HostCandidateRevisionState};
 use crate::navigation::RouterNavigation;
+use crate::registry::{QuarantineLeaseTable, RouteEntityRegistry};
 use crate::snapshots::RouterSnapshots;
 use crate::state::{RouteFocusState, RouterEcsState};
 
@@ -37,7 +39,11 @@ fn install_foundations(app: &mut App) {
 
     app.insert_resource(RouterInstallMarker)
         .init_resource::<RouterEcsState>()
-        .init_resource::<RouteFocusState>();
+        .init_resource::<RouteFocusState>()
+        .init_resource::<HostCandidateRevisionState>()
+        .init_resource::<HostCandidateRevisionLatch>()
+        .init_resource::<RouteEntityRegistry>()
+        .init_resource::<QuarantineLeaseTable>();
 
     if !app.world().contains_resource::<ViewDriverStore>() {
         app.insert_resource(ViewDriverStore::new());
@@ -80,6 +86,10 @@ mod tests {
     use crate::{
         app_ext::ViewDriverStore, navigation::RouterNavigation, snapshots::RouterSnapshots,
     };
+    use crate::{
+        host::{HostCandidateRevisionLatch, HostCandidateRevisionState},
+        registry::{QuarantineLeaseTable, RouteEntityRegistry},
+    };
     use bevy_app::PreUpdate;
     use bevy_ecs::schedule::{ApplyDeferred, ScheduleLabel, Schedules};
     use std::any::TypeId;
@@ -97,6 +107,15 @@ mod tests {
             })
         }
         let mut app = App::new();
+        let router_structure_before = app
+            .world()
+            .iter_entities()
+            .filter(|entity| {
+                entity.contains::<crate::components::RouteOwnershipSeal>()
+                    || entity.contains::<crate::components::ProvisionalSlotLifecycle>()
+                    || entity.contains::<crate::app_ext::RouterHostRegistration>()
+            })
+            .count();
 
         install_foundations(&mut app);
 
@@ -106,6 +125,16 @@ mod tests {
         assert!(app.world().contains_resource::<ViewDriverStore>());
         assert!(app.world().contains_resource::<RouterNavigation>());
         assert!(app.world().contains_resource::<RouterSnapshots>());
+        assert!(
+            app.world()
+                .contains_resource::<HostCandidateRevisionState>()
+        );
+        assert!(
+            app.world()
+                .contains_resource::<HostCandidateRevisionLatch>()
+        );
+        assert!(app.world().contains_resource::<RouteEntityRegistry>());
+        assert!(app.world().contains_resource::<QuarantineLeaseTable>());
 
         let resource_addresses = (
             app.world().resource::<RouterEcsState>() as *const _,
@@ -113,6 +142,10 @@ mod tests {
             app.world().resource::<ViewDriverStore>() as *const _,
             app.world().resource::<RouterNavigation>() as *const _,
             app.world().resource::<RouterSnapshots>() as *const _,
+            app.world().resource::<HostCandidateRevisionState>() as *const _,
+            app.world().resource::<HostCandidateRevisionLatch>() as *const _,
+            app.world().resource::<RouteEntityRegistry>() as *const _,
+            app.world().resource::<QuarantineLeaseTable>() as *const _,
         );
 
         install_foundations(&mut app);
@@ -125,8 +158,23 @@ mod tests {
                 app.world().resource::<ViewDriverStore>() as *const _,
                 app.world().resource::<RouterNavigation>() as *const _,
                 app.world().resource::<RouterSnapshots>() as *const _,
+                app.world().resource::<HostCandidateRevisionState>() as *const _,
+                app.world().resource::<HostCandidateRevisionLatch>() as *const _,
+                app.world().resource::<RouteEntityRegistry>() as *const _,
+                app.world().resource::<QuarantineLeaseTable>() as *const _,
             ),
             "a repeated foundation install must not replace any resource"
+        );
+        assert_eq!(
+            app.world()
+                .iter_entities()
+                .filter(|entity| {
+                    entity.contains::<crate::components::RouteOwnershipSeal>()
+                        || entity.contains::<crate::components::ProvisionalSlotLifecycle>()
+                        || entity.contains::<crate::app_ext::RouterHostRegistration>()
+                })
+                .count(),
+            router_structure_before
         );
         app.update();
 

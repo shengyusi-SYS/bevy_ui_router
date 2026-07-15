@@ -7,8 +7,10 @@ mod components;
 mod content;
 mod driver;
 pub(crate) mod finalize;
+mod host;
 mod navigation;
 mod plugin;
+mod registry;
 mod snapshots;
 mod state;
 
