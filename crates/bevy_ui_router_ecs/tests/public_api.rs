@@ -7,7 +7,9 @@ use bevy_ui_router_core::pattern::RoutePattern;
 use bevy_ui_router_core::route_tree::RouteTree;
 use bevy_ui_router_core::runtime::RouterRuntime;
 use bevy_ui_router_ecs::prelude::{
-    BevyUiRouterPlugin, RouteFrameRoot, RouteHost, RouteSlot, RouterEcsState, RouterScheduleSet,
+    BevyUiRouterPlugin, NavigationRequestSnapshot, RequestLookup, RouteFrameRoot, RouteHost,
+    RouteSlot, RouterConfig, RouterEcsState, RouterHandle, RouterHostRegistration, RouterInputSet,
+    RouterNavigation, RouterScheduleSet, RouterSnapshot, RouterSnapshots,
 };
 use bevy_ui_router_ecs::{
     BeginFrameApplySessionError, CompleteFrameApplySessionError, EcsFrameApplyReport,
@@ -23,13 +25,26 @@ fn ecs_prelude_exposes_host_slot_frame_root_plugin_and_schedule_labels() {
     assert_public::<RouteFrameRoot>();
     assert_public::<RouterEcsState>();
     assert_public::<BevyUiRouterPlugin>();
+    assert_public::<RouterConfig>();
+    assert_public::<RouterHandle>();
+    assert_public::<RouterHostRegistration>();
+    assert_public::<RouterNavigation>();
+    assert_public::<RouterSnapshots>();
+    assert_public::<RouterSnapshot>();
+    assert_public::<NavigationRequestSnapshot>();
+    assert_public::<RequestLookup<'static>>();
 
-    let _plugin = BevyUiRouterPlugin;
-    assert_eq!(
+    let _plugin = BevyUiRouterPlugin::default();
+    let _schedule_sets = [
+        RouterScheduleSet::ObserveAuthority,
         RouterScheduleSet::CollectNavigation,
-        RouterScheduleSet::CollectNavigation
-    );
-    assert_eq!(RouterScheduleSet::Cleanup, RouterScheduleSet::Cleanup);
+        RouterScheduleSet::DriveNavigation,
+        RouterScheduleSet::CommitPresentation,
+        RouterScheduleSet::SettleCleanup,
+        RouterScheduleSet::ReapQuarantines,
+        RouterScheduleSet::PublishSnapshots,
+    ];
+    let _input_sets = [RouterInputSet::Refresh, RouterInputSet::Ready];
 }
 
 #[test]
@@ -325,36 +340,42 @@ fn plugin_registers_router_resources_without_creating_host_entities() {
     use bevy_ecs::entity::Entity;
     use bevy_ecs::query::With;
 
+    fn router_entity_counts(app: &mut App) -> (usize, usize, usize) {
+        let world = app.world_mut();
+        let hosts = world
+            .query_filtered::<Entity, With<RouteHost>>()
+            .iter(world)
+            .count();
+        let slots = world
+            .query_filtered::<Entity, With<RouteSlot>>()
+            .iter(world)
+            .count();
+        let frame_roots = world
+            .query_filtered::<Entity, With<RouteFrameRoot>>()
+            .iter(world)
+            .count();
+        (hosts, slots, frame_roots)
+    }
+
     let mut app = App::new();
     app.add_plugins(BevyUiRouterPlugin);
 
     assert!(app.world().contains_resource::<RouterEcsState>());
-    let host_components = {
-        let world = app.world_mut();
-        let mut query = world.query_filtered::<Entity, With<RouteHost>>();
-        query.iter(world).count()
-    };
-    let slot_components = {
-        let world = app.world_mut();
-        let mut query = world.query_filtered::<Entity, With<RouteSlot>>();
-        query.iter(world).count()
-    };
-    let frame_root_components = {
-        let world = app.world_mut();
-        let mut query = world.query_filtered::<Entity, With<RouteFrameRoot>>();
-        query.iter(world).count()
-    };
+    assert!(app.world().contains_resource::<RouterNavigation>());
+    assert!(app.world().contains_resource::<RouterSnapshots>());
+    assert_eq!(router_entity_counts(&mut app), (0, 0, 0));
 
-    assert_eq!(host_components, 0);
-    assert_eq!(slot_components, 0);
-    assert_eq!(frame_root_components, 0);
+    app.update();
+
+    assert_eq!(router_entity_counts(&mut app), (0, 0, 0));
 }
 
 #[test]
-fn plugin_source_keeps_focus_registration_and_schedule_order_internal() {
+fn plugin_source_keeps_foundation_installation_and_exact_schedule_order_internal() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let source = fs::read_to_string(manifest_dir.join("src").join("plugin.rs"))
         .expect("plugin source should be readable");
+    let compact_source = source.split_whitespace().collect::<String>();
 
     assert!(
         source.contains("init_resource::<RouterEcsState>()"),
@@ -365,11 +386,41 @@ fn plugin_source_keeps_focus_registration_and_schedule_order_internal() {
         "plugin should initialize the crate-private RouteFocusState"
     );
     assert!(
-        source.contains(
-            "(\n                    RouterScheduleSet::CollectNavigation,\n                    RouterScheduleSet::PlanFrames,\n                    RouterScheduleSet::BuildViews,\n                    RouterScheduleSet::ApplyViews,\n                    RouterScheduleSet::PrepareInert,\n                    RouterScheduleSet::ReportToCore,\n                    RouterScheduleSet::ActivateCommitted,\n                    RouterScheduleSet::Cleanup,\n                    RouterScheduleSet::AcknowledgeFailures,\n                )\n                    .chain()"
+        source.contains("struct RouterInstallMarker;")
+            && source.contains("fn install_foundations(app: &mut App)"),
+        "plugin should keep its idempotent install marker and helper private"
+    );
+    assert!(
+        compact_source.contains(
+            "(RouterScheduleSet::ObserveAuthority,RouterScheduleSet::CollectNavigation,RouterScheduleSet::DriveNavigation,RouterScheduleSet::CommitPresentation,RouterScheduleSet::SettleCleanup,RouterScheduleSet::ReapQuarantines,RouterScheduleSet::PublishSnapshots,).chain()"
         ),
         "plugin should configure RouterScheduleSet in the required stable order"
     );
+    assert!(
+        compact_source.contains("(RouterInputSet::Refresh,RouterInputSet::Ready).chain()"),
+        "plugin should configure RouterInputSet in the required stable order"
+    );
+    for legacy in [
+        "PlanFrames",
+        "BuildViews",
+        "ApplyViews",
+        "PrepareInert",
+        "ReportToCore",
+        "ActivateCommitted",
+        "AcknowledgeFailures",
+        "RouterScheduleSet::Cleanup",
+    ] {
+        assert!(
+            !source.contains(legacy),
+            "plugin should not retain legacy schedule label `{legacy}`"
+        );
+    }
+    for forbidden in ["add_systems", "RouterEngine", "spawn(", "spawn_empty"] {
+        assert!(
+            !source.contains(forbidden),
+            "foundation-only plugin should not contain `{forbidden}`"
+        );
+    }
     assert!(
         !source.contains("bsn"),
         "plugin must not register BSN systems or mention BSN integration"
