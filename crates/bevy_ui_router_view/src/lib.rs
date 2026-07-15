@@ -153,8 +153,79 @@ use bevy_ui_router_view::test_support::ViewFinalizeAuthority;
 //! ```compile_fail
 //! use bevy_ui_router_view::prelude::NavigationTransaction;
 //! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::ViewDriverKey;
+//!
+//! let key = ViewDriverKey::new("renderer").unwrap();
+//! let _ = key.as_str();
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::ViewBuildEffect;
+//!
+//! let _ = ViewBuildEffect::new;
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::ViewBuildEffect;
+//!
+//! fn inspect(effect: &ViewBuildEffect) {
+//!     let _ = effect.request_id();
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::ViewBuildEffect;
+//!
+//! fn inspect(effect: &ViewBuildEffect) {
+//!     let _ = effect.generation();
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::ViewBuildEffect;
+//!
+//! fn inspect(effect: &ViewBuildEffect) {
+//!     let _ = effect.entity();
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::ViewBuildEffect;
+//!
+//! fn inspect(effect: &ViewBuildEffect) {
+//!     let _ = effect.task();
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::ViewBuildEffect;
+//!
+//! fn inspect(effect: &ViewBuildEffect) {
+//!     let _ = effect.mount();
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::ViewBuildEffect;
+//!
+//! fn inspect(effect: &ViewBuildEffect) {
+//!     let _ = effect.commit();
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use bevy_ui_router_view::ViewBuildEffect;
+//!
+//! fn inspect(effect: &ViewBuildEffect) {
+//!     let _ = effect.report();
+//! }
+//! ```
 
 mod contract;
+mod effect;
+mod registry;
 
 #[cfg(feature = "test-support")]
 mod testing;
@@ -164,6 +235,8 @@ pub use contract::{
     ViewDisposalHint, ViewFailure, ViewOutputId, ViewPartialOutput, ViewRenderPlan,
     ViewReportSession, ViewReportedOutput, ViewRequestId,
 };
+pub use effect::ViewBuildEffect;
+pub use registry::{RouteViewRegistry, RouteViewRegistryError, ViewDriverKey, ViewDriverKeyError};
 
 #[cfg(feature = "test-support")]
 pub mod test_support {
