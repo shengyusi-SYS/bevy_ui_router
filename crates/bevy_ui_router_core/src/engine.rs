@@ -224,7 +224,8 @@ struct PublicationPlan {
     state: RouterNavigationState,
     history: MemoryHistory,
     active_branch: MatchedBranch,
-    records: VecDeque<NavigationRequestRecord>,
+    record_index: usize,
+    published_record: NavigationRequestRecord,
     current: CurrentWork,
 }
 
@@ -451,18 +452,26 @@ impl RouterEngine {
             return Err(CommitError::Stale);
         }
 
+        let Some(record_slot) = self.records.get_mut(sealed.publication.record_index) else {
+            return Err(CommitError::Stale);
+        };
+        if record_slot.id() != sealed.identity.request {
+            return Err(CommitError::Stale);
+        }
+
         let PublicationPlan {
             state,
             history,
             active_branch,
-            records,
+            record_index: _,
+            published_record,
             current,
         } = sealed.publication;
         mutation();
+        *record_slot = published_record;
         self.state = state;
         self.history = history;
         self.active_branch = Some(active_branch);
-        self.records = records;
         self.current = Some(current);
         Ok(())
     }
@@ -754,18 +763,19 @@ impl RouterEngine {
             NavigationPhase::PostCommitCleanup,
         )));
 
-        let mut records = self.records.clone();
-        let record = records
-            .iter_mut()
-            .find(|record| record.id() == request)
+        let record_index = self
+            .records
+            .iter()
+            .position(|record| record.id() == request)
             .expect("running record is retained");
-        record
+        let mut published_record = self.records[record_index].clone();
+        published_record
             .append_trace(NavigationTraceEvent::commit_published())
             .expect("running trace is open");
-        record
+        published_record
             .transition(RequestStatus::Running(NavigationPhase::PostCommitCleanup))
             .expect("request is running");
-        record
+        published_record
             .append_trace(NavigationTraceEvent::request_phase_changed(
                 NavigationPhase::PostCommitCleanup,
             ))
@@ -781,7 +791,8 @@ impl RouterEngine {
             state,
             history,
             active_branch: current.branch.clone(),
-            records,
+            record_index,
+            published_record,
             current,
         }
     }
@@ -1435,7 +1446,8 @@ mod tests {
             panic!("expected frame task");
         };
         let ticket = engine.begin_view_report(task.identity()).unwrap().applied();
-        assert!(!format!("{ticket:?}").contains("CleanupBatchToken"));
+        let super::CommitTicket { identity } = &ticket;
+        assert_eq!(identity, task.identity());
         let ids_after_action = engine.ids.snapshot();
         let sealed = engine
             .seal_commit(
@@ -1461,6 +1473,51 @@ mod tests {
         assert!(mutated);
         assert_eq!(engine.ids.snapshot(), ids_after_action);
         assert_eq!(engine.active().kind(), ActivePresentationKind::Route);
+    }
+
+    #[test]
+    fn sealed_publication_preserves_later_queue_and_starts_next_request() {
+        let mut engine = ready_engine();
+        let first = engine.push(RouteLocation::new("/items/1")).unwrap();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("expected first frame task");
+        };
+        let ticket = engine.begin_view_report(task.identity()).unwrap().applied();
+        let sealed = seal_current(&mut engine, ticket);
+        let cleanup = sealed.cleanup().clone();
+
+        let second = engine.push(RouteLocation::new("/about")).unwrap();
+        let ids_after_second = engine.ids.snapshot();
+        assert_eq!(
+            engine.request(second).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        assert_eq!(engine.queue.front().unwrap().request, second);
+
+        engine.publish_commit(sealed, || {}).unwrap();
+
+        assert_eq!(engine.ids.snapshot(), ids_after_second);
+        assert_eq!(
+            engine.request(second).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        assert_eq!(engine.queue.front().unwrap().request, second);
+
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        assert_eq!(engine.ids.snapshot(), ids_after_second);
+        assert_eq!(
+            engine.request(first).unwrap().status(),
+            &RequestStatus::Succeeded
+        );
+        assert_eq!(
+            engine.request(second).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::ApplyingFrame(0))
+        );
+        let EngineAction::FrameTask(second_task) = engine.action().unwrap() else {
+            panic!("second request must start after first cleanup");
+        };
+        assert_eq!(second_task.identity().request(), second);
     }
 
     #[test]
@@ -1707,11 +1764,7 @@ mod tests {
             cleanup.testing_with_batch(CleanupBatchId::new(cleanup.testing_batch().raw() + 1));
         for invalid in [
             CleanupCompletion::attest(foreign, CleanupCompletionDigest::canonical_empty(), 0),
-            CleanupCompletion::attest(
-                cleanup.clone(),
-                CleanupCompletionDigest::canonical_empty(),
-                1,
-            ),
+            CleanupCompletion::attest(cleanup.clone(), CleanupCompletionDigest::from_opaque(76), 1),
             CleanupCompletion::attest(cleanup.clone(), CleanupCompletionDigest::from_opaque(77), 0),
             CleanupCompletion::attest(wrong_batch, CleanupCompletionDigest::canonical_empty(), 0),
             wrong_binding,
