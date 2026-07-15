@@ -107,6 +107,35 @@ impl RouterSnapshots {
             })
             .map_or(RequestLookup::Unknown, RequestLookup::Found)
     }
+
+    pub(crate) fn ensure_router(&mut self, router: RouterHandle) {
+        if self.routers.iter().all(|(stored, _)| *stored != router) {
+            self.routers.push((router, RouterSnapshot::new()));
+        }
+    }
+
+    pub(crate) fn publish(&mut self, entries: &[crate::navigation::RouterEntry]) {
+        self.requests.clear();
+        for entry in entries {
+            self.ensure_router(entry.handle);
+            for request in &entry.requests {
+                let Some(view) = entry.engine.request(*request) else {
+                    continue;
+                };
+                self.requests.push(RequestSnapshotEntry {
+                    router: entry.handle,
+                    request: *request,
+                    snapshot: NavigationRequestSnapshot::new(
+                        view.requested().clone(),
+                        view.matched().cloned(),
+                        view.status().clone(),
+                        view.trace().to_vec(),
+                        view.diagnostics().to_vec(),
+                    ),
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]

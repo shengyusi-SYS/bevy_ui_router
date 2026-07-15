@@ -1,42 +1,56 @@
 #![forbid(unsafe_code)]
 
 mod app_ext;
-mod bridge;
-pub(crate) mod cleanup;
+#[cfg(feature = "test-support")]
+mod audit;
+mod cleanup;
 mod components;
 mod content;
 mod driver;
-pub(crate) mod finalize;
 mod host;
+mod input;
 mod navigation;
 mod plugin;
+mod presentation;
 mod registry;
 mod snapshots;
-mod state;
 
 pub use app_ext::{
-    RouterConfig, RouterHandle, RouterHostRegistration, RouterInstallError, RouterInstallErrorKind,
-    ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
+    AppRouterExt, RouterConfig, RouterHandle, RouterHostRegistration, RouterInstallError,
+    RouterInstallErrorKind, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
 };
-pub use bridge::{BeginFrameApplySessionError, FinishFrameApplySessionError};
-pub use bridge::{EcsFrameApplyReport, EcsFrameApplySession, EcsFrameApplyStatus};
-pub use components::{
-    RouteFocusSnapshot, RouteFrameInteractionSnapshot, RouteFrameRoot,
-    RouteFrameRootLifecycleSnapshot, RouteHost, RouteSlot,
+#[cfg(feature = "test-support")]
+pub use audit::{
+    AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
+    AuthorityFrameMapping, AuthorityHostMapping, AuthoritySlotKind, AuthoritySlotMapping,
+    RouterAuthorityAuditSnapshot, RouterAuthorityAudits,
 };
+pub use content::{
+    ContentColor, ContentEntity, ContentPrimitiveError, ContentPrimitiveErrorKind,
+    ContentPrimitiveKind, ContentWriteError, ContentWriteErrorKind, FrameContentWriter, SolidRect,
+};
+pub use driver::{EcsViewDriver, EcsViewReportSession, ViewBuildReport, ViewBuildReportKind};
+pub use input::RouterInputGate;
 pub use navigation::{NavigationEnqueueError, NavigationEnqueueErrorKind, RouterNavigation};
 pub use plugin::{BevyUiRouterPlugin, RouterInputSet, RouterScheduleSet};
 pub use snapshots::{NavigationRequestSnapshot, RequestLookup, RouterSnapshot, RouterSnapshots};
-pub use state::{CompleteFrameApplySessionError, RouterEcsState};
 
 pub mod prelude {
     pub use crate::{
-        BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
-        NavigationRequestSnapshot, RequestLookup, RouteFocusSnapshot,
-        RouteFrameInteractionSnapshot, RouteFrameRoot, RouteFrameRootLifecycleSnapshot, RouteHost,
-        RouteSlot, RouterConfig, RouterEcsState, RouterHandle, RouterHostRegistration,
-        RouterInputSet, RouterInstallError, RouterInstallErrorKind, RouterNavigation,
-        RouterScheduleSet, RouterSnapshot, RouterSnapshots, ViewDriverRegistrationError,
-        ViewDriverRegistrationErrorKind,
+        AppRouterExt, BevyUiRouterPlugin, ContentColor, ContentEntity, ContentPrimitiveError,
+        ContentPrimitiveErrorKind, ContentPrimitiveKind, ContentWriteError, ContentWriteErrorKind,
+        EcsViewDriver, EcsViewReportSession, FrameContentWriter, NavigationEnqueueError,
+        NavigationEnqueueErrorKind, NavigationRequestSnapshot, RequestLookup, RouterConfig,
+        RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet, RouterInstallError,
+        RouterInstallErrorKind, RouterNavigation, RouterScheduleSet, RouterSnapshot,
+        RouterSnapshots, SolidRect, ViewBuildReport, ViewBuildReportKind,
+        ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
+    };
+
+    #[cfg(feature = "test-support")]
+    pub use crate::{
+        AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
+        AuthorityFrameMapping, AuthorityHostMapping, AuthoritySlotKind, AuthoritySlotMapping,
+        RouterAuthorityAuditSnapshot, RouterAuthorityAudits,
     };
 }

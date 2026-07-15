@@ -195,6 +195,7 @@ fn ecs_manifest_locks_the_dependency_boundary() {
         &[
             "bevy_app",
             "bevy_camera",
+            "bevy_color",
             "bevy_ecs",
             "bevy_input_focus",
             "bevy_picking",
@@ -207,6 +208,7 @@ fn ecs_manifest_locks_the_dependency_boundary() {
     for name in [
         "bevy_app",
         "bevy_camera",
+        "bevy_color",
         "bevy_ecs",
         "bevy_input_focus",
         "bevy_picking",

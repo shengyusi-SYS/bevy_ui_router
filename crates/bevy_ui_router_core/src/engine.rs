@@ -22,6 +22,8 @@ use crate::request::{
 };
 use crate::route_tree::RouteTree;
 use crate::trace::{NavigationTraceEvent, NavigationTraceEventKind};
+use crate::view_input::RouteViewInput;
+use crate::view_key::RouteViewKey;
 
 const TERMINAL_RETENTION: usize = 64;
 
@@ -131,16 +133,22 @@ impl RootTaskIdentity {
     }
 }
 
-#[derive(Clone, Debug)]
 pub(crate) struct RootFrameTask {
     identity: RootTaskIdentity,
+    frame: RouteFrameVersion,
     location: RouteLocation,
     matched: MatchedRoute,
+    view: RouteViewKey,
+    input: Option<RouteViewInput>,
 }
 
 impl RootFrameTask {
     pub(crate) const fn identity(&self) -> &RootTaskIdentity {
         &self.identity
+    }
+
+    pub(crate) const fn frame_version(&self) -> &RouteFrameVersion {
+        &self.frame
     }
 
     pub(crate) const fn location(&self) -> &RouteLocation {
@@ -151,9 +159,24 @@ impl RootFrameTask {
     pub(crate) const fn matched(&self) -> &MatchedRoute {
         &self.matched
     }
+
+    pub(crate) const fn view(&self) -> &RouteViewKey {
+        &self.view
+    }
+
+    pub(crate) const fn input(&self) -> &RouteViewInput {
+        self.input
+            .as_ref()
+            .expect("frame task input is available before driver dispatch")
+    }
+
+    pub(crate) fn take_input(&mut self) -> RouteViewInput {
+        self.input
+            .take()
+            .expect("frame task input is consumed exactly once")
+    }
 }
 
-#[derive(Debug)]
 pub(crate) enum EngineAction {
     FrameTask(RootFrameTask),
     Commit(CommitTicket),
@@ -229,6 +252,10 @@ struct PublicationPlan {
     current: CurrentWork,
 }
 
+pub(crate) struct PreparedPublication {
+    sealed: SealedCommit,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EngineInstallError {
     IdExhausted,
@@ -288,7 +315,6 @@ struct QueuedWork {
     reserved: ReservedNavigationIds,
 }
 
-#[derive(Debug)]
 pub(crate) struct RouterEngine {
     matcher: RouteMatcher,
     ids: CoreIdAllocator,
@@ -356,6 +382,15 @@ impl RouterEngine {
         &mut self,
         location: RouteLocation,
     ) -> Result<NavigationRequestId, PushError> {
+        let request = self.enqueue_push(location)?;
+        self.collect();
+        Ok(request)
+    }
+
+    pub(crate) fn enqueue_push(
+        &mut self,
+        location: RouteLocation,
+    ) -> Result<NavigationRequestId, PushError> {
         if self.state.host().is_none() {
             return Err(PushError::AwaitingHost);
         }
@@ -368,10 +403,13 @@ impl RouterEngine {
             .push_back(NavigationRequestRecord::new(request, location));
         self.highest_issued = Some(request.sequence());
         self.queue.push_back(QueuedWork { request, reserved });
+        Ok(request)
+    }
+
+    pub(crate) fn collect(&mut self) {
         if self.current.is_none() {
             self.start_next();
         }
-        Ok(request)
     }
 
     pub(crate) fn action(&mut self) -> Option<EngineAction> {
@@ -396,7 +434,7 @@ impl RouterEngine {
 
     pub(crate) fn seal_commit(
         &mut self,
-        ticket: CommitTicket,
+        ticket: &CommitTicket,
         seal: CleanupManifestSeal,
     ) -> Result<SealedCommit, CommitError> {
         let Some(current) = self.current.as_ref() else {
@@ -427,20 +465,16 @@ impl RouterEngine {
             token: cleanup.clone(),
         };
         Ok(SealedCommit {
-            identity: ticket.identity,
+            identity: ticket.identity.clone(),
             cleanup,
             publication,
         })
     }
 
-    pub(crate) fn publish_commit<F>(
+    pub(crate) fn prepare_publication(
         &mut self,
         sealed: SealedCommit,
-        mutation: F,
-    ) -> Result<(), CommitError>
-    where
-        F: FnOnce(),
-    {
+    ) -> Result<PreparedPublication, CommitError> {
         let valid = self.current.as_ref().is_some_and(|current| {
             current.identity == sealed.identity
                 && matches!(
@@ -451,29 +485,38 @@ impl RouterEngine {
         if !valid {
             return Err(CommitError::Stale);
         }
-
-        let Some(record_slot) = self.records.get_mut(sealed.publication.record_index) else {
+        let Some(record_slot) = self.records.get(sealed.publication.record_index) else {
             return Err(CommitError::Stale);
         };
         if record_slot.id() != sealed.identity.request {
             return Err(CommitError::Stale);
         }
+        Ok(PreparedPublication { sealed })
+    }
 
+    pub(crate) fn publish_prepared<F>(&mut self, prepared: PreparedPublication, mutation: F)
+    where
+        F: FnOnce(),
+    {
+        let SealedCommit {
+            identity: _,
+            cleanup: _,
+            publication,
+        } = prepared.sealed;
         let PublicationPlan {
             state,
             history,
             active_branch,
-            record_index: _,
+            record_index,
             published_record,
             current,
-        } = sealed.publication;
+        } = publication;
         mutation();
-        *record_slot = published_record;
+        self.records[record_index] = published_record;
         self.state = state;
         self.history = history;
         self.active_branch = Some(active_branch);
         self.current = Some(current);
-        Ok(())
     }
 
     pub(crate) fn complete_cleanup(
@@ -629,6 +672,18 @@ impl RouterEngine {
             .expect("route tree matches a nonempty branch")
             .clone();
         let origin = FrameOrigin::MatchedRoute(leaf.route());
+        let view = self
+            .matcher
+            .view_binding(leaf.route())
+            .expect("installed route tree has a root view")
+            .clone();
+        let input = RouteViewInput::new(
+            location.clone(),
+            Some(leaf.route()),
+            leaf.params().clone(),
+            origin.clone(),
+            None,
+        );
         let host = self.state.host().expect("host was checked before push");
         let top_slot = self.state.top_slot().expect("confirmed host has top slot");
         let identity = RootTaskIdentity {
@@ -664,7 +719,7 @@ impl RouterEngine {
         self.current = Some(CurrentWork {
             identity: identity.clone(),
             branch,
-            target_frame,
+            target_frame: target_frame.clone(),
             history_intent: Some(HistoryIntent::Push(location.clone())),
             stage,
             cleanup_batch: queued.reserved.cleanup_batch(),
@@ -696,8 +751,11 @@ impl RouterEngine {
             )));
             self.action = Some(EngineAction::FrameTask(RootFrameTask {
                 identity,
+                frame: target_frame,
                 location,
                 matched: leaf,
+                view,
+                input: Some(input),
             }));
         }
     }
@@ -915,6 +973,14 @@ impl ViewReportSession<'_> {
             identity: self.identity,
         }
     }
+
+    pub(crate) fn failed(self, failure: NavigationFailure) {
+        let request = self.identity.request;
+        self.engine.current = None;
+        self.engine.action = None;
+        self.engine.fail_reserved_request(request, failure);
+        self.engine.start_next();
+    }
 }
 
 #[cfg(test)]
@@ -967,22 +1033,36 @@ mod tests {
     use crate::location::RouteLocation;
     use crate::pattern::RoutePattern;
     use crate::presentation::ActivePresentationKind;
-    use crate::request::{NavigationPhase, RequestStatus};
-    use crate::route_tree::RouteTree;
+    use crate::request::{
+        NavigationFailure, NavigationFailureKind, NavigationPhase, RequestStatus,
+    };
+    use crate::route_tree::{RouteNodeOptions, RouteTree};
     use crate::trace::NavigationTraceEventKind;
+    use crate::view_key::RouteViewKey;
 
     const NONZERO_OBLIGATION_COUNT: usize = 3;
 
     fn tree() -> RouteTree {
         let mut builder = RouteTree::builder()
-            .root(RoutePattern::path("/").unwrap())
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("root").unwrap()),
+            )
             .unwrap();
         let root = builder.root_id().unwrap();
         builder
-            .route(root, RoutePattern::path("items/:id").unwrap())
+            .route_with_options(
+                root,
+                RoutePattern::path("items/:id").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("items").unwrap()),
+            )
             .unwrap();
         builder
-            .route(root, RoutePattern::path("about").unwrap())
+            .route_with_options(
+                root,
+                RoutePattern::path("about").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("about").unwrap()),
+            )
             .unwrap();
         builder.build().unwrap()
     }
@@ -1014,8 +1094,48 @@ mod tests {
         };
         let sealed = seal_current(engine, ticket);
         let cleanup = sealed.cleanup().clone();
-        engine.publish_commit(sealed, || {}).unwrap();
+        publish_sealed(engine, sealed, || {}).unwrap();
         cleanup
+    }
+
+    fn publish_sealed<F>(
+        engine: &mut RouterEngine,
+        sealed: super::SealedCommit,
+        mutation: F,
+    ) -> Result<(), CommitError>
+    where
+        F: FnOnce(),
+    {
+        let prepared = engine.prepare_publication(sealed)?;
+        engine.publish_prepared(prepared, mutation);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_view_report_terminates_without_publishing_history_or_presentation() {
+        let mut engine = ready_engine();
+        let request = engine.enqueue_push(RouteLocation::new("/")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("root frame task expected")
+        };
+
+        engine
+            .begin_view_report(task.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Build,
+                "view build rejected",
+            ));
+
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::Build
+        ));
+        assert_eq!(engine.history().len(), 0);
+        assert!(engine.state.active().location().is_none());
+        assert!(engine.current.is_none());
+        assert!(engine.action.is_none());
     }
 
     fn seal_current(engine: &mut RouterEngine, ticket: super::CommitTicket) -> super::SealedCommit {
@@ -1032,7 +1152,7 @@ mod tests {
         };
         engine
             .seal_commit(
-                ticket,
+                &ticket,
                 CleanupManifestSeal::new(roots, manifest_digest(41), count),
             )
             .unwrap()
@@ -1182,7 +1302,7 @@ mod tests {
         assert_eq!(
             engine
                 .seal_commit(
-                    stale,
+                    &stale,
                     CleanupManifestSeal::new(vec![], manifest_digest(1), 0),
                 )
                 .unwrap_err(),
@@ -1194,7 +1314,7 @@ mod tests {
         assert_eq!(engine.active().kind(), ActivePresentationKind::None);
         assert!(engine.history().is_empty());
         let cleanup = sealed.cleanup().clone();
-        engine.publish_commit(sealed, || {}).unwrap();
+        publish_sealed(&mut engine, sealed, || {}).unwrap();
         assert_eq!(engine.active().kind(), ActivePresentationKind::Route);
         assert_eq!(engine.history().len(), 1);
         assert_eq!(
@@ -1220,7 +1340,7 @@ mod tests {
             assert_eq!(
                 engine
                     .seal_commit(
-                        stale,
+                        &stale,
                         CleanupManifestSeal::new(vec![], manifest_digest(2), 0),
                     )
                     .unwrap_err(),
@@ -1231,7 +1351,7 @@ mod tests {
 
         let sealed = seal_current(&mut engine, exact);
         let cleanup = sealed.cleanup().clone();
-        engine.publish_commit(sealed, || {}).unwrap();
+        publish_sealed(&mut engine, sealed, || {}).unwrap();
         engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
     }
 
@@ -1451,7 +1571,7 @@ mod tests {
         let ids_after_action = engine.ids.snapshot();
         let sealed = engine
             .seal_commit(
-                ticket,
+                &ticket,
                 CleanupManifestSeal::new(vec![], manifest_digest(3), 0),
             )
             .unwrap();
@@ -1464,11 +1584,10 @@ mod tests {
         assert!(engine.history().is_empty());
 
         let mut mutated = false;
-        engine
-            .publish_commit(sealed, || {
-                mutated = true;
-            })
-            .unwrap();
+        publish_sealed(&mut engine, sealed, || {
+            mutated = true;
+        })
+        .unwrap();
 
         assert!(mutated);
         assert_eq!(engine.ids.snapshot(), ids_after_action);
@@ -1494,7 +1613,7 @@ mod tests {
         );
         assert_eq!(engine.queue.front().unwrap().request, second);
 
-        engine.publish_commit(sealed, || {}).unwrap();
+        publish_sealed(&mut engine, sealed, || {}).unwrap();
 
         assert_eq!(engine.ids.snapshot(), ids_after_second);
         assert_eq!(
@@ -1572,7 +1691,7 @@ mod tests {
             assert_eq!(
                 engine
                     .seal_commit(
-                        fragment_ticket.testing_duplicate(),
+                        &fragment_ticket.testing_duplicate(),
                         CleanupManifestSeal::new(invalid, manifest_digest(4), 7),
                     )
                     .unwrap_err(),
@@ -1583,7 +1702,7 @@ mod tests {
 
         let sealed = engine
             .seal_commit(
-                fragment_ticket,
+                &fragment_ticket,
                 CleanupManifestSeal::new(vec![first, second], manifest_digest(4), 7),
             )
             .unwrap();
@@ -1603,7 +1722,7 @@ mod tests {
         assert_eq!(
             engine
                 .seal_commit(
-                    ticket.testing_duplicate(),
+                    &ticket.testing_duplicate(),
                     CleanupManifestSeal::new(vec![], manifest_digest(5), 1),
                 )
                 .unwrap_err(),
@@ -1617,7 +1736,7 @@ mod tests {
         assert_eq!(
             engine
                 .seal_commit(
-                    ticket,
+                    &ticket,
                     CleanupManifestSeal::new(vec![root], manifest_digest(5), 0),
                 )
                 .unwrap_err(),
@@ -1643,26 +1762,24 @@ mod tests {
             let before = engine.snapshot();
             let mut mutated = false;
             assert_eq!(
-                engine
-                    .publish_commit(invalid, || {
-                        mutated = true;
-                    })
-                    .unwrap_err(),
+                publish_sealed(&mut engine, invalid, || {
+                    mutated = true;
+                })
+                .unwrap_err(),
                 CommitError::Stale
             );
             assert!(!mutated);
             assert_eq!(engine.snapshot(), before);
         }
 
-        engine.publish_commit(sealed, || {}).unwrap();
+        publish_sealed(&mut engine, sealed, || {}).unwrap();
         let before = engine.snapshot();
         let mut mutated = false;
         assert_eq!(
-            engine
-                .publish_commit(duplicate, || {
-                    mutated = true;
-                })
-                .unwrap_err(),
+            publish_sealed(&mut engine, duplicate, || {
+                mutated = true;
+            })
+            .unwrap_err(),
             CommitError::Stale
         );
         assert!(!mutated);
@@ -1716,7 +1833,7 @@ mod tests {
 
         let sealed = engine
             .seal_commit(
-                ticket,
+                &ticket,
                 CleanupManifestSeal::new(
                     current.cleanup_roots.clone(),
                     manifest_digest(10),

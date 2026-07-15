@@ -30,12 +30,12 @@ impl std::fmt::Display for ViewDriverKeyError {
 impl std::error::Error for ViewDriverKeyError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RouteViewDescriptor {
+pub struct RouteViewDescriptor {
     driver: ViewDriverKey,
 }
 
 impl RouteViewDescriptor {
-    pub(crate) fn new(driver: ViewDriverKey) -> Self {
+    pub fn new(driver: ViewDriverKey) -> Self {
         Self { driver }
     }
 
@@ -55,7 +55,7 @@ impl RouteViewRegistry {
         }
     }
 
-    pub(crate) fn insert(
+    pub fn insert(
         &mut self,
         view: RouteViewKey,
         descriptor: RouteViewDescriptor,

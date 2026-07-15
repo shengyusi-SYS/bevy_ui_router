@@ -12,6 +12,7 @@ use bevy_ui_router_core::{
 
 use crate::host::HostCandidateRevision;
 use crate::host::VerifiedQuarantineTransfer;
+use crate::presentation::VerifiedFrameQuarantineTransfer;
 
 static NEXT_SEAL_DOMAIN: AtomicU64 = AtomicU64::new(1);
 static NEXT_QUARANTINE_DOMAIN: AtomicU64 = AtomicU64::new(1);
@@ -28,6 +29,7 @@ pub(crate) enum EntityOwner {
         slot: RouteSlotId,
     },
     FrameShell(RouteFrameVersion),
+    FrameContentTarget(RouteFrameVersion),
     FrameOutput {
         frame: RouteFrameVersion,
         output: u64,
@@ -148,9 +150,38 @@ pub(crate) struct ExactRegistryClaim {
     lifecycle: EntityLifecycle,
 }
 
+pub(crate) struct PreparedLifecycleMutation {
+    updates: Vec<(usize, EntityLifecycle)>,
+    resulting_claims: Vec<ExactRegistryClaim>,
+}
+
+impl PreparedLifecycleMutation {
+    pub(crate) fn resulting_claims(&self) -> &[ExactRegistryClaim] {
+        &self.resulting_claims
+    }
+
+    pub(crate) fn apply(self, registry: &mut RouteEntityRegistry) {
+        for (index, lifecycle) in self.updates {
+            registry.records[index].lifecycle = lifecycle;
+        }
+    }
+}
+
 impl ExactRegistryClaim {
     pub(crate) const fn entity(&self) -> Entity {
         self.entity
+    }
+
+    pub(crate) const fn owner(&self) -> &RegistryOwner {
+        &self.owner
+    }
+
+    pub(crate) const fn seal(&self) -> OwnershipSeal {
+        self.seal
+    }
+
+    pub(crate) const fn lifecycle(&self) -> EntityLifecycle {
+        self.lifecycle
     }
 }
 
@@ -249,6 +280,67 @@ impl RouteEntityRegistry {
         Some(record.claim())
     }
 
+    pub(crate) fn prepare_lifecycle_mutation(
+        &self,
+        transitions: &[(ExactRegistryClaim, EntityLifecycle)],
+    ) -> Option<PreparedLifecycleMutation> {
+        let mut updates = Vec::with_capacity(transitions.len());
+        let mut resulting_claims = Vec::with_capacity(transitions.len());
+        for (claim, lifecycle) in transitions {
+            let index = self
+                .records
+                .iter()
+                .position(|record| record.claim() == *claim)?;
+            if updates
+                .iter()
+                .any(|(stored_index, _)| *stored_index == index)
+            {
+                return None;
+            }
+            let mut resulting = claim.clone();
+            resulting.lifecycle = *lifecycle;
+            updates.push((index, *lifecycle));
+            resulting_claims.push(resulting);
+        }
+        Some(PreparedLifecycleMutation {
+            updates,
+            resulting_claims,
+        })
+    }
+
+    pub(crate) fn compare_exchange_owner(
+        &mut self,
+        claim: &ExactRegistryClaim,
+        owner: RegistryOwner,
+    ) -> Option<ExactRegistryClaim> {
+        if self
+            .records
+            .iter()
+            .any(|record| record.owner == owner && record.entity != claim.entity)
+        {
+            return None;
+        }
+        let record = self
+            .records
+            .iter_mut()
+            .find(|record| record.claim() == *claim)?;
+        record.owner = owner;
+        Some(record.claim())
+    }
+
+    pub(crate) fn compare_exchange_manifest(
+        &mut self,
+        claim: &ExactRegistryClaim,
+        manifest: ComponentManifest,
+    ) -> Option<ExactRegistryClaim> {
+        let record = self
+            .records
+            .iter_mut()
+            .find(|record| record.claim() == *claim)?;
+        record.manifest = manifest;
+        Some(record.claim())
+    }
+
     pub(crate) fn remove_exact(&mut self, claim: &ExactRegistryClaim) -> bool {
         let before = self.records.len();
         self.records.retain(|record| record.claim() != *claim);
@@ -300,6 +392,7 @@ pub(crate) struct QuarantineFacts {
     protected_parent: Option<Entity>,
     foreign_descendants: Vec<Entity>,
     foreign_components: Vec<ComponentId>,
+    missing_components: Vec<ComponentId>,
 }
 
 impl QuarantineFacts {
@@ -318,6 +411,29 @@ impl QuarantineFacts {
             protected_parent,
             foreign_descendants,
             foreign_components,
+            missing_components: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_component_drift(
+        former_app_host: Option<Entity>,
+        protected_parent: Option<Entity>,
+        mut foreign_descendants: Vec<Entity>,
+        mut foreign_components: Vec<ComponentId>,
+        mut missing_components: Vec<ComponentId>,
+    ) -> Self {
+        foreign_descendants.sort_by_key(|entity| entity.to_bits());
+        foreign_descendants.dedup();
+        foreign_components.sort_unstable();
+        foreign_components.dedup();
+        missing_components.sort_unstable();
+        missing_components.dedup();
+        Self {
+            former_app_host,
+            protected_parent,
+            foreign_descendants,
+            foreign_components,
+            missing_components,
         }
     }
 }
@@ -329,6 +445,21 @@ pub(crate) struct QuarantineLease {
     operation_sequence: u64,
     records: Vec<RouteEntityRecord>,
     facts: QuarantineFacts,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UnresolvedResidual {
+    sequence: u64,
+    records: Vec<RouteEntityRecord>,
+    actual_manifests: Vec<(Entity, ComponentManifest)>,
+    facts: QuarantineFacts,
+}
+
+impl UnresolvedResidual {
+    #[cfg(test)]
+    pub(crate) fn owned_entities(&self) -> Vec<Entity> {
+        self.records.iter().map(RouteEntityRecord::entity).collect()
+    }
 }
 
 impl QuarantineLease {
@@ -344,13 +475,31 @@ impl QuarantineLease {
 pub(crate) enum QuarantineTransferError {
     EmptyOwnedSet,
     UnknownOwnedEntity,
+    CapacityExhausted,
+}
+
+pub(crate) struct PreparedQuarantineTransfer {
+    id: QuarantineLeaseId,
+    source_claims: Vec<ExactRegistryClaim>,
+    records: Vec<RouteEntityRecord>,
+    facts: QuarantineFacts,
+}
+
+pub(crate) struct PreparedUnresolvedResidualTransfer {
+    sequence: u64,
+    source_claims: Vec<ExactRegistryClaim>,
+    records: Vec<RouteEntityRecord>,
+    actual_manifests: Vec<(Entity, ComponentManifest)>,
+    facts: QuarantineFacts,
 }
 
 #[derive(Resource)]
 pub(crate) struct QuarantineLeaseTable {
     domain: u64,
     next_sequence: u64,
+    next_residual_sequence: u64,
     leases: Vec<QuarantineLease>,
+    unresolved: Vec<UnresolvedResidual>,
 }
 
 impl QuarantineLeaseTable {
@@ -358,44 +507,169 @@ impl QuarantineLeaseTable {
         Self {
             domain: NEXT_QUARANTINE_DOMAIN.fetch_add(1, Ordering::Relaxed),
             next_sequence: 0,
+            next_residual_sequence: 0,
             leases: Vec::new(),
+            unresolved: Vec::new(),
         }
     }
 
-    fn transfer_verified(
+    fn prepare_verified(
         &mut self,
-        registry: &mut RouteEntityRegistry,
-        claims: &[ExactRegistryClaim],
+        registry: &RouteEntityRegistry,
+        claims: Vec<ExactRegistryClaim>,
+        manifests: Vec<(Entity, ComponentManifest)>,
         facts: QuarantineFacts,
-    ) -> Result<QuarantineLeaseId, QuarantineTransferError> {
-        if claims.is_empty() {
+    ) -> Result<PreparedQuarantineTransfer, QuarantineTransferError> {
+        if claims.is_empty() || manifests.len() != claims.len() {
             return Err(QuarantineTransferError::EmptyOwnedSet);
         }
-        if claims
-            .iter()
-            .any(|claim| registry.record(claim.entity()).is_none())
-        {
+        let mut records = Vec::new();
+        records
+            .try_reserve(claims.len())
+            .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
+        for claim in &claims {
+            let Some(record) = registry
+                .records
+                .iter()
+                .find(|record| record.claim() == *claim)
+            else {
+                return Err(QuarantineTransferError::UnknownOwnedEntity);
+            };
+            let mut matching_manifests = manifests
+                .iter()
+                .filter(|(entity, _)| *entity == claim.entity());
+            let Some((_, manifest)) = matching_manifests.next() else {
+                return Err(QuarantineTransferError::UnknownOwnedEntity);
+            };
+            if matching_manifests.next().is_some() {
+                return Err(QuarantineTransferError::UnknownOwnedEntity);
+            }
+            let mut record = record.clone();
+            record.lifecycle = EntityLifecycle::Quarantined;
+            record.manifest = manifest.clone();
+            records.push(record);
+        }
+        records.sort_by_key(|record| record.entity.to_bits());
+        records.dedup_by_key(|record| record.entity);
+        if records.len() != claims.len() {
             return Err(QuarantineTransferError::UnknownOwnedEntity);
         }
-        let records = registry
-            .take_exact_set(claims)
-            .ok_or(QuarantineTransferError::UnknownOwnedEntity)?;
-        self.next_sequence = self
+        let sequence = self
             .next_sequence
             .checked_add(1)
-            .expect("quarantine lease sequence exhausted");
+            .ok_or(QuarantineTransferError::CapacityExhausted)?;
+        self.leases
+            .try_reserve(1)
+            .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
         let id = QuarantineLeaseId {
             domain: self.domain,
-            sequence: self.next_sequence,
+            sequence,
         };
-        self.leases.push(QuarantineLease {
+        Ok(PreparedQuarantineTransfer {
             id,
-            generation: 1,
-            operation_sequence: 0,
+            source_claims: claims,
             records,
             facts,
+        })
+    }
+
+    fn apply_prepared(
+        &mut self,
+        registry: &mut RouteEntityRegistry,
+        prepared: PreparedQuarantineTransfer,
+    ) -> QuarantineLeaseId {
+        registry.records.retain(|record| {
+            !prepared.source_claims.iter().any(|claim| {
+                record.entity == claim.entity
+                    && record.owner == claim.owner
+                    && record.seal == claim.seal
+                    && record.lifecycle == claim.lifecycle
+            })
         });
-        Ok(id)
+        self.next_sequence = prepared.id.sequence;
+        self.leases.push(QuarantineLease {
+            id: prepared.id,
+            generation: 1,
+            operation_sequence: 0,
+            records: prepared.records,
+            facts: prepared.facts,
+        });
+        prepared.id
+    }
+
+    fn prepare_unresolved(
+        &mut self,
+        registry: &RouteEntityRegistry,
+        claims: Vec<ExactRegistryClaim>,
+        actual_manifests: Vec<(Entity, ComponentManifest)>,
+        facts: QuarantineFacts,
+    ) -> Result<PreparedUnresolvedResidualTransfer, QuarantineTransferError> {
+        if claims.is_empty() || actual_manifests.len() != claims.len() {
+            return Err(QuarantineTransferError::EmptyOwnedSet);
+        }
+        let mut records = Vec::new();
+        records
+            .try_reserve(claims.len())
+            .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
+        for claim in &claims {
+            let Some(record) = registry
+                .records
+                .iter()
+                .find(|record| record.claim() == *claim)
+            else {
+                return Err(QuarantineTransferError::UnknownOwnedEntity);
+            };
+            if actual_manifests
+                .iter()
+                .filter(|(entity, _)| *entity == claim.entity())
+                .count()
+                != 1
+            {
+                return Err(QuarantineTransferError::UnknownOwnedEntity);
+            }
+            records.push(record.clone());
+        }
+        records.sort_by_key(|record| record.entity.to_bits());
+        records.dedup_by_key(|record| record.entity);
+        if records.len() != claims.len() {
+            return Err(QuarantineTransferError::UnknownOwnedEntity);
+        }
+        let sequence = self
+            .next_residual_sequence
+            .checked_add(1)
+            .ok_or(QuarantineTransferError::CapacityExhausted)?;
+        self.unresolved
+            .try_reserve(1)
+            .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
+        Ok(PreparedUnresolvedResidualTransfer {
+            sequence,
+            source_claims: claims,
+            records,
+            actual_manifests,
+            facts,
+        })
+    }
+
+    fn apply_unresolved(
+        &mut self,
+        registry: &mut RouteEntityRegistry,
+        prepared: PreparedUnresolvedResidualTransfer,
+    ) {
+        registry.records.retain(|record| {
+            !prepared.source_claims.iter().any(|claim| {
+                record.entity == claim.entity
+                    && record.owner == claim.owner
+                    && record.seal == claim.seal
+                    && record.lifecycle == claim.lifecycle
+            })
+        });
+        self.next_residual_sequence = prepared.sequence;
+        self.unresolved.push(UnresolvedResidual {
+            sequence: prepared.sequence,
+            records: prepared.records,
+            actual_manifests: prepared.actual_manifests,
+            facts: prepared.facts,
+        });
     }
 
     pub(crate) fn lease(&self, id: QuarantineLeaseId) -> Option<&QuarantineLease> {
@@ -404,15 +678,81 @@ impl QuarantineLeaseTable {
     pub(crate) fn leases(&self) -> &[QuarantineLease] {
         &self.leases
     }
+
+    pub(crate) fn record(&self, entity: Entity) -> Option<&RouteEntityRecord> {
+        self.leases
+            .iter()
+            .flat_map(|lease| lease.records.iter())
+            .find(|record| record.entity == entity)
+    }
+
+    pub(crate) fn unresolved_record(&self, entity: Entity) -> Option<&RouteEntityRecord> {
+        self.unresolved
+            .iter()
+            .flat_map(|residual| residual.records.iter())
+            .find(|record| record.entity == entity)
+    }
+
+    pub(crate) fn inert_owned_entities(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.leases
+            .iter()
+            .flat_map(|lease| lease.records.iter())
+            .chain(
+                self.unresolved
+                    .iter()
+                    .flat_map(|residual| residual.records.iter()),
+            )
+            .map(RouteEntityRecord::entity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unresolved_residuals(&self) -> &[UnresolvedResidual] {
+        &self.unresolved
+    }
 }
 
-pub(crate) fn apply_verified_quarantine_transfer(
+pub(crate) fn prepare_verified_quarantine_transfer(
+    table: &mut QuarantineLeaseTable,
+    registry: &RouteEntityRegistry,
+    transfer: VerifiedQuarantineTransfer,
+) -> Result<PreparedQuarantineTransfer, QuarantineTransferError> {
+    let (claims, manifests, facts) = transfer.into_parts();
+    table.prepare_verified(registry, claims, manifests, facts)
+}
+
+pub(crate) fn prepare_verified_frame_quarantine_transfer(
+    table: &mut QuarantineLeaseTable,
+    registry: &RouteEntityRegistry,
+    transfer: VerifiedFrameQuarantineTransfer,
+) -> Result<PreparedQuarantineTransfer, QuarantineTransferError> {
+    let (claims, manifests, facts) = transfer.into_parts();
+    table.prepare_verified(registry, claims, manifests, facts)
+}
+
+pub(crate) fn apply_prepared_quarantine_transfer(
     table: &mut QuarantineLeaseTable,
     registry: &mut RouteEntityRegistry,
-    transfer: VerifiedQuarantineTransfer,
-) -> Result<QuarantineLeaseId, QuarantineTransferError> {
-    let (claims, facts) = transfer.into_parts();
-    table.transfer_verified(registry, &claims, facts)
+    prepared: PreparedQuarantineTransfer,
+) -> QuarantineLeaseId {
+    table.apply_prepared(registry, prepared)
+}
+
+pub(crate) fn prepare_unresolved_residual_transfer(
+    table: &mut QuarantineLeaseTable,
+    registry: &RouteEntityRegistry,
+    claims: Vec<ExactRegistryClaim>,
+    actual_manifests: Vec<(Entity, ComponentManifest)>,
+    facts: QuarantineFacts,
+) -> Result<PreparedUnresolvedResidualTransfer, QuarantineTransferError> {
+    table.prepare_unresolved(registry, claims, actual_manifests, facts)
+}
+
+pub(crate) fn apply_prepared_unresolved_residual_transfer(
+    table: &mut QuarantineLeaseTable,
+    registry: &mut RouteEntityRegistry,
+    prepared: PreparedUnresolvedResidualTransfer,
+) {
+    table.apply_unresolved(registry, prepared);
 }
 
 impl Default for QuarantineLeaseTable {
@@ -604,10 +944,15 @@ mod tests {
                 registry.record(second).unwrap().claim(),
                 registry.record(first).unwrap().claim(),
             ],
+            vec![
+                (second, ComponentManifest::new([])),
+                (first, ComponentManifest::new([])),
+            ],
             facts,
         );
-        let lease =
-            apply_verified_quarantine_transfer(&mut table, &mut registry, transfer).unwrap();
+        let transfer =
+            prepare_verified_quarantine_transfer(&mut table, &registry, transfer).unwrap();
+        let lease = apply_prepared_quarantine_transfer(&mut table, &mut registry, transfer);
         let mut expected = vec![first, second];
         expected.sort_by_key(|entity| entity.to_bits());
         assert_eq!(table.lease(lease).unwrap().owned_entities(), expected);
@@ -660,11 +1005,12 @@ mod tests {
         let mut table = QuarantineLeaseTable::new();
         let transfer = VerifiedQuarantineTransfer::fixture(
             vec![stale],
+            vec![(entity, ComponentManifest::new([]))],
             QuarantineFacts::new(None, None, vec![], vec![]),
         );
 
         assert_eq!(
-            apply_verified_quarantine_transfer(&mut table, &mut registry, transfer),
+            prepare_verified_quarantine_transfer(&mut table, &registry, transfer).map(|_| ()),
             Err(QuarantineTransferError::UnknownOwnedEntity)
         );
         assert_eq!(registry.records(), baseline);
@@ -672,14 +1018,19 @@ mod tests {
     }
 
     #[test]
-    fn quarantine_transfer_requires_the_host_gate_sealed_token() {
+    fn quarantine_transfer_requires_owner_specific_sealed_tokens() {
         let registry_source = include_str!("registry.rs");
         let host_source = include_str!("host.rs");
-        assert!(registry_source.contains("fn transfer_verified("));
+        let presentation_source = include_str!("presentation.rs");
+        assert!(registry_source.contains("fn prepare_verified("));
+        assert!(registry_source.contains("fn apply_prepared("));
         let raw_public_transfer = ["pub(crate) fn ", "transfer("].concat();
         assert!(!registry_source.contains(&raw_public_transfer));
         assert!(registry_source.contains("transfer: VerifiedQuarantineTransfer"));
+        assert!(registry_source.contains("transfer: VerifiedFrameQuarantineTransfer"));
         assert!(host_source.contains("fn after_world_validation("));
         assert!(!host_source.contains("pub(crate) fn after_world_validation("));
+        assert!(presentation_source.contains("fn after_world_validation("));
+        assert!(!presentation_source.contains("pub(crate) fn after_world_validation("));
     }
 }

@@ -20,12 +20,12 @@ use crate::components::{
     ProvisionalPostWriteProbe, ProvisionalSlotLifecycle, ProvisionalStagingProbe,
     RouteOwnershipSeal, RouterInputBarrier,
 };
+use crate::input::RouteFocusState;
 use crate::registry::{
-    ComponentManifest, EntityLifecycle, ExactRegistryClaim, ProvisionalTopSlotOwner,
+    ComponentManifest, EntityLifecycle, EntityOwner, ExactRegistryClaim, ProvisionalTopSlotOwner,
     QuarantineFacts, QuarantineLeaseTable, RegistryOwner, RouteEntityRegistry,
-    apply_verified_quarantine_transfer,
+    apply_prepared_quarantine_transfer, prepare_verified_quarantine_transfer,
 };
-use crate::state::RouteFocusState;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct HostCandidateRevision(u64);
@@ -335,21 +335,44 @@ pub(crate) enum StagingTestDrift {
 
 pub(crate) struct VerifiedQuarantineTransfer {
     claims: Vec<ExactRegistryClaim>,
+    manifests: Vec<(Entity, ComponentManifest)>,
     facts: QuarantineFacts,
 }
 
 impl VerifiedQuarantineTransfer {
-    fn after_world_validation(claims: Vec<ExactRegistryClaim>, facts: QuarantineFacts) -> Self {
-        Self { claims, facts }
+    fn after_world_validation(
+        claims: Vec<ExactRegistryClaim>,
+        manifests: Vec<(Entity, ComponentManifest)>,
+        facts: QuarantineFacts,
+    ) -> Self {
+        Self {
+            claims,
+            manifests,
+            facts,
+        }
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<ExactRegistryClaim>, QuarantineFacts) {
-        (self.claims, self.facts)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<ExactRegistryClaim>,
+        Vec<(Entity, ComponentManifest)>,
+        QuarantineFacts,
+    ) {
+        (self.claims, self.manifests, self.facts)
     }
 
     #[cfg(test)]
-    pub(crate) fn fixture(claims: Vec<ExactRegistryClaim>, facts: QuarantineFacts) -> Self {
-        Self { claims, facts }
+    pub(crate) fn fixture(
+        claims: Vec<ExactRegistryClaim>,
+        manifests: Vec<(Entity, ComponentManifest)>,
+        facts: QuarantineFacts,
+    ) -> Self {
+        Self {
+            claims,
+            manifests,
+            facts,
+        }
     }
 }
 
@@ -359,6 +382,13 @@ pub(crate) struct SealedProvisionalTopSlotSpec {
 }
 
 impl SealedProvisionalTopSlotSpec {
+    pub(crate) const fn for_candidate(candidate: ValidatedHostCandidate) -> Self {
+        Self {
+            candidate,
+            test_drift: StagingTestDrift::None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) const fn new(
         candidate: ValidatedHostCandidate,
@@ -369,6 +399,111 @@ impl SealedProvisionalTopSlotSpec {
             test_drift,
         }
     }
+}
+
+pub(crate) fn stage_granted_top_slot(
+    world: &mut World,
+    candidate: ValidatedHostCandidate,
+    grant: &bevy_ui_router_core::integration::HostGrant,
+) -> Result<StagedProvisionalTopSlot, ProvisionalStageError> {
+    let staged = stage_provisional_top_slot(
+        world,
+        SealedProvisionalTopSlotSpec::for_candidate(candidate),
+    )?;
+    let claim = world
+        .resource::<RouteEntityRegistry>()
+        .record(staged.entity())
+        .expect("validated staged slot remains registered")
+        .claim();
+    let committed = RegistryOwner::Committed(EntityOwner::HostTopSlot {
+        host: grant.version().clone(),
+        slot: grant.top_slot(),
+    });
+    if world
+        .resource_mut::<RouteEntityRegistry>()
+        .compare_exchange_owner(&claim, committed)
+        .is_none()
+    {
+        world
+            .resource_mut::<RouteEntityRegistry>()
+            .remove_exact(&claim);
+        world.despawn(staged.entity());
+        return Err(ProvisionalStageError {
+            kind: ProvisionalStageErrorKind::RegistryRejected,
+            entity: Some(staged.entity()),
+        });
+    }
+    Ok(staged)
+}
+
+pub(crate) fn activate_granted_top_slot(
+    world: &mut World,
+    candidate: &ValidatedHostCandidate,
+    grant: &bevy_ui_router_core::integration::HostGrant,
+    staged: StagedProvisionalTopSlot,
+) -> bool {
+    if !validate_granted_top_slot(world, candidate, grant, staged.entity, Visibility::Hidden) {
+        return false;
+    }
+    *world
+        .get_mut::<Visibility>(staged.entity)
+        .expect("validated granted slot retains Visibility") = Visibility::Visible;
+    validate_granted_top_slot(world, candidate, grant, staged.entity, Visibility::Visible)
+}
+
+pub(crate) fn settle_rejected_granted_top_slot(
+    world: &mut World,
+    candidate: &ValidatedHostCandidate,
+    staged: StagedProvisionalTopSlot,
+) -> bool {
+    let Some(record) = world
+        .resource::<RouteEntityRegistry>()
+        .record(staged.entity)
+    else {
+        return world.get_entity(staged.entity).is_err();
+    };
+    let claim = record.claim();
+    let manifest = record.manifest().clone();
+    settle_failed_provisional(
+        world,
+        staged.entity,
+        candidate.host,
+        &manifest,
+        claim,
+        StagingTestDrift::None,
+    )
+}
+
+fn validate_granted_top_slot(
+    world: &World,
+    candidate: &ValidatedHostCandidate,
+    grant: &bevy_ui_router_core::integration::HostGrant,
+    slot: Entity,
+    visibility: Visibility,
+) -> bool {
+    let Some(record) = world.resource::<RouteEntityRegistry>().record(slot) else {
+        return false;
+    };
+    matches!(
+        record.owner(),
+        RegistryOwner::Committed(EntityOwner::HostTopSlot { host, slot: stored_slot })
+            if host == grant.version() && *stored_slot == grant.top_slot()
+    ) && record.lifecycle() == EntityLifecycle::PreparedInert
+        && record.manifest().matches(world, slot)
+        && candidate_is_current(world, candidate)
+        && world.get::<ChildOf>(slot).map(ChildOf::parent) == Some(candidate.host)
+        && children_of(world, candidate.host)
+            .iter()
+            .filter(|child| **child == slot)
+            .count()
+            == 1
+        && world.get::<Visibility>(slot) == Some(&visibility)
+        && world.get::<Pickable>(slot) == Some(&Pickable::IGNORE)
+        && world
+            .get::<RouterInputBarrier>(slot)
+            .is_some_and(RouterInputBarrier::denies_all)
+        && world.get::<ProvisionalSlotLifecycle>(slot)
+            == Some(&ProvisionalSlotLifecycle::PreparedInert)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -513,6 +648,13 @@ fn candidate_is_current(world: &World, candidate: &ValidatedHostCandidate) -> bo
         && inspect_topology(world, candidate.host).as_ref() == Some(&candidate.fingerprint)
 }
 
+pub(crate) fn validated_host_candidate_is_current(
+    world: &World,
+    candidate: &ValidatedHostCandidate,
+) -> bool {
+    candidate_is_current(world, candidate)
+}
+
 fn provisional_top_slot_manifest(world: &mut World) -> ComponentManifest {
     let explicit = vec![
         world.register_component::<Visibility>(),
@@ -572,7 +714,8 @@ fn validate_provisional_slot(
         && !focus_is_in_subtree(world, slot);
     let mut expected_children = host_children_baseline.to_vec();
     expected_children.push(slot);
-    registry_valid && entity_valid && children_of(world, host) == expected_children
+    let children_valid = children_of(world, host) == expected_children;
+    registry_valid && entity_valid && children_valid
 }
 
 fn apply_staging_test_drift(world: &mut World, slot: Entity, drift: StagingTestDrift) {
@@ -676,24 +819,34 @@ fn settle_failed_provisional(
         || !foreign_descendants.is_empty()
         || !foreign_components.is_empty()
     {
-        let Some(quarantined_claim) = world
-            .resource_mut::<RouteEntityRegistry>()
-            .compare_exchange_lifecycle(&prepared_claim, EntityLifecycle::Quarantined)
-        else {
-            return false;
-        };
         let facts = QuarantineFacts::new(
             Some(authorized_host),
             protected_parent,
             foreign_descendants,
             foreign_components,
         );
-        let transfer =
-            VerifiedQuarantineTransfer::after_world_validation(vec![quarantined_claim], facts);
+        let transfer = VerifiedQuarantineTransfer::after_world_validation(
+            vec![prepared_claim],
+            vec![(slot, actual_manifest)],
+            facts,
+        );
         world.resource_scope(
             |world, mut registry: bevy_ecs::prelude::Mut<RouteEntityRegistry>| {
-                let mut table = world.resource_mut::<QuarantineLeaseTable>();
-                apply_verified_quarantine_transfer(&mut table, &mut registry, transfer).is_ok()
+                world.resource_scope(
+                    |_world, mut table: bevy_ecs::prelude::Mut<QuarantineLeaseTable>| {
+                        let Ok(transfer_plan) =
+                            prepare_verified_quarantine_transfer(&mut table, &registry, transfer)
+                        else {
+                            return false;
+                        };
+                        apply_prepared_quarantine_transfer(
+                            &mut table,
+                            &mut registry,
+                            transfer_plan,
+                        );
+                        true
+                    },
+                )
             },
         )
     } else {

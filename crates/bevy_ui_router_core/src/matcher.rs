@@ -36,6 +36,10 @@ impl RouteMatcher {
         select_candidate(candidates)
     }
 
+    pub(crate) fn view_binding(&self, route: RouteId) -> Option<&crate::view_key::RouteViewKey> {
+        self.tree.node(route)?.options().view_binding()
+    }
+
     fn visit(
         &self,
         route: RouteId,

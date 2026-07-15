@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::driver::EcsViewDriver;
+use bevy_app::App;
 use bevy_ecs::{
     component::Component, lifecycle::HookContext, resource::Resource, world::DeferredWorld,
 };
@@ -23,6 +24,10 @@ impl RouterConfig {
             fallback,
         }
     }
+
+    fn into_parts(self) -> (RouteTree, RouteViewRegistry, RouteViewKey) {
+        (self.routes, self.views, self.fallback)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -32,6 +37,10 @@ pub struct RouterHandle {
 }
 
 impl RouterHandle {
+    pub(crate) const fn from_parts(domain: u64, router: u64) -> Self {
+        Self { domain, router }
+    }
+
     #[cfg(test)]
     pub(crate) const fn fixture(domain: u64, router: u64) -> Self {
         Self { domain, router }
@@ -178,6 +187,10 @@ impl ViewDriverStore {
             .find_map(|(stored, driver)| (stored == key).then_some(driver.as_mut()))
     }
 
+    pub(crate) fn contains(&self, key: &ViewDriverKey) -> bool {
+        self.drivers.iter().any(|(stored, _)| stored == key)
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.drivers.len()
@@ -189,11 +202,98 @@ impl ViewDriverStore {
     }
 }
 
+pub trait AppRouterExt {
+    fn register_ui_view_driver<D: EcsViewDriver>(
+        &mut self,
+        driver: D,
+    ) -> Result<ViewDriverKey, ViewDriverRegistrationError>;
+
+    fn add_ui_router(&mut self, config: RouterConfig) -> Result<RouterHandle, RouterInstallError>;
+}
+
+impl AppRouterExt for App {
+    fn register_ui_view_driver<D: EcsViewDriver>(
+        &mut self,
+        driver: D,
+    ) -> Result<ViewDriverKey, ViewDriverRegistrationError> {
+        crate::plugin::install_foundations(self);
+        self.world_mut()
+            .resource_mut::<ViewDriverStore>()
+            .register(driver)
+    }
+
+    fn add_ui_router(&mut self, config: RouterConfig) -> Result<RouterHandle, RouterInstallError> {
+        crate::plugin::install_foundations(self);
+        let (routes, views, fallback) = config.into_parts();
+        let drivers = self.world().resource::<ViewDriverStore>();
+        let mut binding_error = None;
+        bevy_ui_router_core::integration::for_each_route_view_binding(
+            &routes,
+            |normal, boundary, error| {
+                if binding_error.is_some() {
+                    return;
+                }
+                let Some(normal) = normal else {
+                    binding_error = Some(RouterInstallErrorKind::MissingRouteView);
+                    return;
+                };
+                let Some(normal_driver) =
+                    bevy_ui_router_view::integration::driver_key(&views, normal)
+                else {
+                    binding_error = Some(RouterInstallErrorKind::UnknownRouteView);
+                    return;
+                };
+                if !drivers.contains(normal_driver) {
+                    binding_error = Some(RouterInstallErrorKind::UnknownViewDriver);
+                    return;
+                }
+                if boundary.is_some() {
+                    let Some(error) = error else {
+                        binding_error = Some(RouterInstallErrorKind::MissingErrorView);
+                        return;
+                    };
+                    let Some(error_driver) =
+                        bevy_ui_router_view::integration::driver_key(&views, error)
+                    else {
+                        binding_error = Some(RouterInstallErrorKind::UnknownRouteView);
+                        return;
+                    };
+                    if !drivers.contains(error_driver) {
+                        binding_error = Some(RouterInstallErrorKind::UnknownViewDriver);
+                    }
+                }
+            },
+        );
+        if let Some(kind) = binding_error {
+            return Err(RouterInstallError::new(kind));
+        }
+        let fallback_driver = bevy_ui_router_view::integration::driver_key(&views, &fallback)
+            .ok_or_else(|| RouterInstallError::new(RouterInstallErrorKind::MissingFallbackView))?;
+        if !drivers.contains(fallback_driver) {
+            return Err(RouterInstallError::new(
+                RouterInstallErrorKind::UnknownViewDriver,
+            ));
+        }
+        let handle = self
+            .world_mut()
+            .resource_mut::<crate::navigation::RouterNavigation>()
+            .install(routes, views)
+            .map_err(|_| RouterInstallError::new(RouterInstallErrorKind::UnknownRouteView))?;
+        self.world_mut()
+            .resource_mut::<crate::snapshots::RouterSnapshots>()
+            .ensure_router(handle);
+        Ok(handle)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bevy_ui_router_core::prelude::{RoutePattern, RouteTree, RouteViewKey};
-    use bevy_ui_router_view::{RouteViewRegistry, ViewDriverKey};
+    use bevy_ui_router_core::prelude::{
+        ErrorBoundaryKey, RouteNodeOptions, RoutePattern, RouteTree, RouteViewKey,
+    };
+    use bevy_ui_router_core::test_support::{options_with_error_boundary, options_with_error_view};
+    use bevy_ui_router_view::{RouteViewDescriptor, RouteViewRegistry, ViewDriverKey};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -318,6 +418,134 @@ mod tests {
         assert_eq!(store.keys(), vec![&key]);
         assert_eq!(first_drops.load(Ordering::SeqCst), 0);
         assert_eq!(replacement_drops.load(Ordering::SeqCst), 1);
+    }
+
+    fn app_with_driver(key: &ViewDriverKey) -> App {
+        let mut app = App::new();
+        app.register_ui_view_driver(DropDriver::new(key.clone(), Arc::new(AtomicUsize::new(0))))
+            .unwrap();
+        app
+    }
+
+    fn registry_with(view: RouteViewKey, driver: ViewDriverKey) -> RouteViewRegistry {
+        let mut views = RouteViewRegistry::new();
+        views
+            .insert(view, RouteViewDescriptor::new(driver))
+            .unwrap();
+        views
+    }
+
+    #[test]
+    fn install_validates_normal_before_error_binding_on_the_same_node() {
+        let driver = ViewDriverKey::new("install-driver").unwrap();
+        let fallback = RouteViewKey::new("fallback").unwrap();
+        let boundary = ErrorBoundaryKey::named("root-boundary").unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                options_with_error_boundary(RouteNodeOptions::new(), boundary),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let views = registry_with(fallback.clone(), driver.clone());
+        let mut app = app_with_driver(&driver);
+
+        let error = app
+            .add_ui_router(RouterConfig::new(routes, views, fallback))
+            .unwrap_err();
+
+        assert_eq!(error.kind(), RouterInstallErrorKind::MissingRouteView);
+    }
+
+    #[test]
+    fn install_rejects_a_declared_boundary_without_an_error_view() {
+        let driver = ViewDriverKey::new("install-driver").unwrap();
+        let normal = RouteViewKey::new("normal").unwrap();
+        let boundary = ErrorBoundaryKey::named("root-boundary").unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                options_with_error_boundary(
+                    RouteNodeOptions::new().with_view(normal.clone()),
+                    boundary,
+                ),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let views = registry_with(normal.clone(), driver.clone());
+        let mut app = app_with_driver(&driver);
+
+        let error = app
+            .add_ui_router(RouterConfig::new(routes, views, normal))
+            .unwrap_err();
+
+        assert_eq!(error.kind(), RouterInstallErrorKind::MissingErrorView);
+    }
+
+    #[test]
+    fn install_rejects_unknown_error_views_and_unregistered_drivers() {
+        let registered_driver = ViewDriverKey::new("registered-driver").unwrap();
+        let missing_driver = ViewDriverKey::new("missing-driver").unwrap();
+        let normal = RouteViewKey::new("normal").unwrap();
+        let error_view = RouteViewKey::new("error").unwrap();
+        let boundary = ErrorBoundaryKey::named("root-boundary").unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                options_with_error_view(
+                    RouteNodeOptions::new().with_view(normal.clone()),
+                    boundary,
+                    error_view,
+                ),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let views = registry_with(normal.clone(), registered_driver.clone());
+        let mut app = app_with_driver(&registered_driver);
+        let error = app
+            .add_ui_router(RouterConfig::new(routes, views, normal.clone()))
+            .unwrap_err();
+        assert_eq!(error.kind(), RouterInstallErrorKind::UnknownRouteView);
+
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(normal.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let views = registry_with(normal.clone(), missing_driver);
+        let error = app
+            .add_ui_router(RouterConfig::new(routes, views, normal))
+            .unwrap_err();
+        assert_eq!(error.kind(), RouterInstallErrorKind::UnknownViewDriver);
+    }
+
+    #[test]
+    fn install_validates_the_mandatory_fallback_after_route_bindings() {
+        let driver = ViewDriverKey::new("install-driver").unwrap();
+        let normal = RouteViewKey::new("normal").unwrap();
+        let fallback = RouteViewKey::new("missing-fallback").unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(normal.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let views = registry_with(normal, driver.clone());
+        let mut app = app_with_driver(&driver);
+
+        let error = app
+            .add_ui_router(RouterConfig::new(routes, views, fallback))
+            .unwrap_err();
+
+        assert_eq!(error.kind(), RouterInstallErrorKind::MissingFallbackView);
     }
 
     struct DropDriver {

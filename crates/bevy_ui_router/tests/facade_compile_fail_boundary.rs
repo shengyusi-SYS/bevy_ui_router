@@ -119,7 +119,7 @@ fn default_fake_renderer_view_root_names_missing_symbol() {
         code: "use bevy_ui_router::view::FakeViewRenderer; fn main() {}",
         default_features: true,
         features: &[],
-        expected_stderr: &["error[E0432]", "no `FakeViewRenderer` in the root"],
+        expected_stderr: &["error[E0432]", "no `FakeViewRenderer` in `view`"],
     });
 }
 
@@ -152,7 +152,7 @@ fn default_view_prelude_fake_renderer_mode_names_missing_symbol() {
         code: "use bevy_ui_router::view::prelude::FakeViewRendererMode; fn main() {}",
         default_features: true,
         features: &[],
-        expected_stderr: &["error[E0432]", "no `FakeViewRendererMode` in `prelude`"],
+        expected_stderr: &["error[E0432]", "could not find `prelude` in `view`"],
     });
 }
 

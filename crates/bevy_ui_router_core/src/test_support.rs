@@ -1,8 +1,23 @@
-use crate::transaction::FrameApplyRequest;
-use crate::{pattern::RoutePattern, route_tree::RouteTree};
+use crate::{
+    meta::ErrorBoundaryKey,
+    pattern::RoutePattern,
+    route_tree::{RouteNodeOptions, RouteTree},
+    view_key::RouteViewKey,
+};
 
-pub fn frame_apply_request_with_next_generation(request: &FrameApplyRequest) -> FrameApplyRequest {
-    request.clone_with_next_generation()
+pub fn options_with_error_boundary(
+    options: RouteNodeOptions,
+    boundary: ErrorBoundaryKey,
+) -> RouteNodeOptions {
+    options.with_error_boundary(boundary)
+}
+
+pub fn options_with_error_view(
+    options: RouteNodeOptions,
+    boundary: ErrorBoundaryKey,
+    view: RouteViewKey,
+) -> RouteNodeOptions {
+    options.with_error_view(boundary, view)
 }
 
 pub fn nested_items_route_tree() -> RouteTree {

@@ -1,24 +1,94 @@
 #![forbid(unsafe_code)]
 
-pub use bevy_ui_router_core as core;
+pub mod core {
+    pub use bevy_ui_router_core::HostVersion;
+    pub use bevy_ui_router_core::back::{BackCapabilitySnapshot, BackIntent, BackPolicy};
+    pub use bevy_ui_router_core::branch::{MatchedBranch, MatchedRoute, RouteParams};
+    pub use bevy_ui_router_core::branch_diff::{BranchDiff, BranchDiffRoute};
+    pub use bevy_ui_router_core::error::{RouteError, RouteErrorKind, RouteErrorSourceCategory};
+    pub use bevy_ui_router_core::fingerprint::RouteBranchFingerprint;
+    pub use bevy_ui_router_core::frame::{FrameOrigin, RouteFrameStatus, RouteFrameVersion};
+    pub use bevy_ui_router_core::history::{HistoryError, MemoryHistory};
+    pub use bevy_ui_router_core::ids::{
+        NavigationRequestId, RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId,
+        RouterInstanceId,
+    };
+    pub use bevy_ui_router_core::location::RouteLocation;
+    pub use bevy_ui_router_core::matcher::RouteMatcher;
+    pub use bevy_ui_router_core::meta::{ErrorBoundaryKey, RouteExplicitKey, RouteMeta};
+    pub use bevy_ui_router_core::pattern::{RoutePathSegment, RoutePattern, RoutePatternKind};
+    pub use bevy_ui_router_core::presentation::{
+        ActivePresentation, ActivePresentationKind, RouterAvailability, RouterUnavailableReason,
+    };
+    pub use bevy_ui_router_core::request::{
+        NavigationFailure, NavigationFailureKind, NavigationPhase, RequestStatus,
+    };
+    pub use bevy_ui_router_core::route_tree::{RouteNodeOptions, RouteTree, RouteTreeBuilder};
+    pub use bevy_ui_router_core::slot::RouteSlotKey;
+    pub use bevy_ui_router_core::trace::{
+        CleanupDisposition, MountRejectionKind, NavigationTraceEvent, NavigationTraceEventKind,
+    };
+    pub use bevy_ui_router_core::view_input::RouteViewInput;
+    pub use bevy_ui_router_core::view_key::{RouteViewKey, RouteViewKeyError};
+}
 
 #[cfg(feature = "view")]
-pub use bevy_ui_router_view as view;
+pub mod view {
+    pub use bevy_ui_router_view::{
+        RouteViewDescriptor, RouteViewRegistry, RouteViewRegistryError, ViewBuildEffect,
+        ViewDriverKey, ViewDriverKeyError, ViewRequestId,
+    };
+}
 
 #[cfg(feature = "ecs")]
-pub use bevy_ui_router_ecs as ecs;
+pub mod ecs {
+    pub use bevy_ui_router_ecs::{
+        AppRouterExt, BevyUiRouterPlugin, ContentColor, ContentEntity, ContentPrimitiveError,
+        ContentPrimitiveErrorKind, ContentPrimitiveKind, ContentWriteError, ContentWriteErrorKind,
+        EcsViewDriver, EcsViewReportSession, FrameContentWriter, NavigationEnqueueError,
+        NavigationEnqueueErrorKind, NavigationRequestSnapshot, RequestLookup, RouterConfig,
+        RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet, RouterInstallError,
+        RouterInstallErrorKind, RouterNavigation, RouterScheduleSet, RouterSnapshot,
+        RouterSnapshots, SolidRect, ViewBuildReport, ViewBuildReportKind,
+        ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
+    };
+
+    #[cfg(feature = "ecs-test-support")]
+    pub use bevy_ui_router_ecs::{
+        AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
+        AuthorityFrameMapping, AuthorityHostMapping, AuthoritySlotKind, AuthoritySlotMapping,
+        RouterAuthorityAuditSnapshot, RouterAuthorityAudits,
+    };
+}
 
 #[cfg(feature = "bsn")]
-pub use bevy_ui_router_bsn as bsn;
+pub mod bsn {}
 
 #[cfg(feature = "platform")]
 pub use bevy_ui_router_platform as platform;
 
 pub mod prelude {
-    #[allow(unused_imports)]
-    pub use bevy_ui_router_core::prelude::*;
+    pub use crate::core::*;
 
     #[cfg(feature = "view")]
-    #[allow(unused_imports)]
-    pub use bevy_ui_router_view::prelude::*;
+    pub use crate::view::*;
+
+    #[cfg(feature = "ecs")]
+    pub use crate::ecs::{
+        AppRouterExt, BevyUiRouterPlugin, ContentColor, ContentEntity, ContentPrimitiveError,
+        ContentPrimitiveErrorKind, ContentPrimitiveKind, ContentWriteError, ContentWriteErrorKind,
+        EcsViewDriver, EcsViewReportSession, FrameContentWriter, NavigationEnqueueError,
+        NavigationEnqueueErrorKind, NavigationRequestSnapshot, RequestLookup, RouterConfig,
+        RouterHandle, RouterHostRegistration, RouterInputGate, RouterInstallError,
+        RouterInstallErrorKind, RouterNavigation, RouterSnapshot, RouterSnapshots, SolidRect,
+        ViewBuildReport, ViewBuildReportKind, ViewDriverRegistrationError,
+        ViewDriverRegistrationErrorKind,
+    };
+
+    #[cfg(feature = "ecs-test-support")]
+    pub use crate::ecs::{
+        AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
+        AuthorityFrameMapping, AuthorityHostMapping, AuthoritySlotKind, AuthoritySlotMapping,
+        RouterAuthorityAuditSnapshot, RouterAuthorityAudits,
+    };
 }

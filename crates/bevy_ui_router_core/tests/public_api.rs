@@ -19,61 +19,6 @@ fn non_prelude_branch_planning_support_types_are_public_module_api() {
 }
 
 #[test]
-fn phase_2_frame_transaction_types_are_public_observation_api() {
-    use bevy_ui_router_core::diagnostics::FrameLifecycleDiagnostic;
-    use bevy_ui_router_core::frame::{
-        FrameCleanupPlan, FrameReconciliationPlan, RouteFrameBranch, RouteFrameIdentity,
-        RouteFrameRecord, RouteFrameScope, RouteFrameStatus,
-    };
-    use bevy_ui_router_core::transaction::{
-        FrameApplyOutcome, FrameApplyRequest, FrameApplyToken, NavigationTransactionSnapshot,
-        NavigationTransactionState, StaleApplyReason, StaleApplyResult, TransactionCommitError,
-        TransactionCommitErrorKind, TransactionFailure,
-    };
-
-    fn assert_public<T>() {}
-    assert_public::<FrameCleanupPlan>();
-    assert_public::<FrameReconciliationPlan>();
-    assert_public::<RouteFrameBranch>();
-    assert_public::<RouteFrameIdentity>();
-    assert_public::<RouteFrameRecord>();
-    assert_public::<RouteFrameScope>();
-    assert_public::<FrameLifecycleDiagnostic>();
-    assert_public::<FrameApplyOutcome>();
-    assert_public::<FrameApplyRequest>();
-    assert_public::<FrameApplyToken>();
-    assert_public::<NavigationTransactionSnapshot>();
-    assert_public::<NavigationTransactionState>();
-    assert_public::<StaleApplyReason>();
-    assert_public::<StaleApplyResult>();
-    assert_public::<TransactionCommitError>();
-    assert_public::<TransactionCommitErrorKind>();
-    assert_public::<TransactionFailure>();
-    assert_eq!(
-        RouteFrameStatus::ApplyingView,
-        RouteFrameStatus::ApplyingView
-    );
-}
-
-#[test]
-fn phase_3b_runtime_bridge_is_explicit_low_level_core_api() {
-    use bevy_ui_router_core::runtime::{
-        BeginNavigationError, FailureCleanupAckError, FrameApplyReportError, RouterRuntime,
-    };
-
-    fn assert_public<T>() {}
-    assert_public::<RouterRuntime>();
-    assert_public::<BeginNavigationError>();
-    assert_public::<FrameApplyReportError>();
-    assert_public::<FailureCleanupAckError>();
-
-    let runtime = RouterRuntime::new();
-    assert!(runtime.pending_snapshot().is_none());
-    assert!(runtime.active_branch().is_none());
-    assert_eq!(runtime.scope().router(), runtime.router());
-}
-
-#[test]
 fn route_view_key_is_public_without_raw_value_access() {
     use bevy_ui_router_core::view_key::RouteViewKey;
 

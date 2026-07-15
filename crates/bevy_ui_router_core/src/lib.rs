@@ -3,6 +3,8 @@
 mod admission;
 mod cleanup;
 mod engine;
+#[doc(hidden)]
+pub mod integration;
 pub use admission::HostVersion;
 pub mod back;
 pub mod branch;
@@ -21,12 +23,10 @@ pub mod pattern;
 pub mod presentation;
 pub mod request;
 pub mod route_tree;
-pub mod runtime;
 pub mod slot;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod trace;
-pub mod transaction;
 pub mod view_input;
 pub mod view_key;
 
@@ -63,11 +63,6 @@ pub mod prelude {
     pub use crate::slot::RouteSlotKey;
     pub use crate::trace::{
         CleanupDisposition, MountRejectionKind, NavigationTraceEvent, NavigationTraceEventKind,
-    };
-    pub use crate::transaction::{
-        FrameApplyOutcome, FrameApplyRequest, FrameApplyToken, NavigationTransactionSnapshot,
-        NavigationTransactionState, StaleApplyReason, StaleApplyResult, TransactionCommitError,
-        TransactionCommitErrorKind, TransactionFailure,
     };
     pub use crate::view_input::RouteViewInput;
     pub use crate::view_key::{RouteViewKey, RouteViewKeyError};

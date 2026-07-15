@@ -3,7 +3,7 @@
 use bevy_ui_router_core::prelude::{RouteViewInput, RouteViewKey};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ViewRequestId(u64);
+pub struct ViewRequestId(u64);
 
 impl ViewRequestId {
     pub(crate) const fn from_raw(value: u64) -> Self {
@@ -38,7 +38,7 @@ impl ViewBuildEffect {
         &self.view
     }
 
-    pub(crate) const fn request_id(&self) -> ViewRequestId {
+    pub const fn request_id(&self) -> ViewRequestId {
         self.request_id
     }
 

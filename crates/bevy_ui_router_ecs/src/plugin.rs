@@ -1,13 +1,21 @@
 use bevy_app::{App, Plugin, PreUpdate, Update};
 use bevy_ecs::prelude::{Resource, SystemSet};
 use bevy_ecs::schedule::IntoScheduleConfigs;
+use bevy_input_focus::InputFocus;
 
 use crate::app_ext::ViewDriverStore;
 use crate::host::{HostCandidateRevisionLatch, HostCandidateRevisionState};
+use crate::input::{
+    RouteFocusState, RouterInputGate, input_ready_system, refresh_input_gate_system,
+};
 use crate::navigation::RouterNavigation;
+use crate::navigation::{
+    collect_navigation_system, commit_presentation_system, drive_navigation_system,
+    observe_authority_system, publish_snapshots_system, reap_quarantines_system,
+    settle_cleanup_system,
+};
 use crate::registry::{QuarantineLeaseTable, RouteEntityRegistry};
 use crate::snapshots::RouterSnapshots;
-use crate::state::{RouteFocusState, RouterEcsState};
 
 #[derive(Default)]
 pub struct BevyUiRouterPlugin;
@@ -32,18 +40,29 @@ pub enum RouterInputSet {
 #[derive(Resource)]
 struct RouterInstallMarker;
 
-fn install_foundations(app: &mut App) {
+pub(crate) fn install_foundations(app: &mut App) {
     if app.world().contains_resource::<RouterInstallMarker>() {
         return;
     }
 
     app.insert_resource(RouterInstallMarker)
-        .init_resource::<RouterEcsState>()
+        .init_resource::<InputFocus>()
         .init_resource::<RouteFocusState>()
         .init_resource::<HostCandidateRevisionState>()
         .init_resource::<HostCandidateRevisionLatch>()
         .init_resource::<RouteEntityRegistry>()
         .init_resource::<QuarantineLeaseTable>();
+
+    if !app.world().contains_resource::<RouterInputGate>() {
+        app.insert_resource(RouterInputGate::new());
+    }
+    #[cfg(feature = "test-support")]
+    if !app
+        .world()
+        .contains_resource::<crate::audit::RouterAuthorityAudits>()
+    {
+        app.insert_resource(crate::audit::RouterAuthorityAudits::new());
+    }
 
     if !app.world().contains_resource::<ViewDriverStore>() {
         app.insert_resource(ViewDriverStore::new());
@@ -71,6 +90,25 @@ fn install_foundations(app: &mut App) {
     .configure_sets(
         PreUpdate,
         (RouterInputSet::Refresh, RouterInputSet::Ready).chain(),
+    )
+    .add_systems(
+        Update,
+        (
+            observe_authority_system.in_set(RouterScheduleSet::ObserveAuthority),
+            collect_navigation_system.in_set(RouterScheduleSet::CollectNavigation),
+            drive_navigation_system.in_set(RouterScheduleSet::DriveNavigation),
+            commit_presentation_system.in_set(RouterScheduleSet::CommitPresentation),
+            settle_cleanup_system.in_set(RouterScheduleSet::SettleCleanup),
+            reap_quarantines_system.in_set(RouterScheduleSet::ReapQuarantines),
+            publish_snapshots_system.in_set(RouterScheduleSet::PublishSnapshots),
+        ),
+    )
+    .add_systems(
+        PreUpdate,
+        (
+            refresh_input_gate_system.in_set(RouterInputSet::Refresh),
+            input_ready_system.in_set(RouterInputSet::Ready),
+        ),
     );
 }
 
@@ -95,7 +133,7 @@ mod tests {
     use std::any::TypeId;
 
     #[test]
-    fn foundation_installation_is_idempotent_and_adds_no_lifecycle_systems_or_entities() {
+    fn lifecycle_installation_is_idempotent_and_registers_the_single_system_chain() {
         fn lifecycle_system_names(schedules: &Schedules, label: impl ScheduleLabel) -> Vec<String> {
             schedules.get(label).map_or_else(Vec::new, |schedule| {
                 schedule
@@ -120,8 +158,8 @@ mod tests {
         install_foundations(&mut app);
 
         assert!(app.world().contains_resource::<RouterInstallMarker>());
-        assert!(app.world().contains_resource::<RouterEcsState>());
         assert!(app.world().contains_resource::<RouteFocusState>());
+        assert!(app.world().contains_resource::<RouterInputGate>());
         assert!(app.world().contains_resource::<ViewDriverStore>());
         assert!(app.world().contains_resource::<RouterNavigation>());
         assert!(app.world().contains_resource::<RouterSnapshots>());
@@ -137,8 +175,8 @@ mod tests {
         assert!(app.world().contains_resource::<QuarantineLeaseTable>());
 
         let resource_addresses = (
-            app.world().resource::<RouterEcsState>() as *const _,
             app.world().resource::<RouteFocusState>() as *const _,
+            app.world().resource::<RouterInputGate>() as *const _,
             app.world().resource::<ViewDriverStore>() as *const _,
             app.world().resource::<RouterNavigation>() as *const _,
             app.world().resource::<RouterSnapshots>() as *const _,
@@ -153,8 +191,8 @@ mod tests {
         assert_eq!(
             resource_addresses,
             (
-                app.world().resource::<RouterEcsState>() as *const _,
                 app.world().resource::<RouteFocusState>() as *const _,
+                app.world().resource::<RouterInputGate>() as *const _,
                 app.world().resource::<ViewDriverStore>() as *const _,
                 app.world().resource::<RouterNavigation>() as *const _,
                 app.world().resource::<RouterSnapshots>() as *const _,
@@ -179,15 +217,7 @@ mod tests {
         app.update();
 
         let schedules = app.world().resource::<Schedules>();
-        assert!(
-            lifecycle_system_names(schedules, Update).is_empty(),
-            "Update contains lifecycle systems: {:?}",
-            lifecycle_system_names(schedules, Update)
-        );
-        assert!(
-            lifecycle_system_names(schedules, PreUpdate).is_empty(),
-            "PreUpdate contains lifecycle systems: {:?}",
-            lifecycle_system_names(schedules, PreUpdate)
-        );
+        assert_eq!(lifecycle_system_names(schedules, Update).len(), 7);
+        assert_eq!(lifecycle_system_names(schedules, PreUpdate).len(), 2);
     }
 }

@@ -139,6 +139,49 @@ enum RenderContent {
     SolidRect(SolidRect),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RealizedContentKind {
+    Empty,
+    SolidRect(SolidRect),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ContentRealizationEntry {
+    local_index: usize,
+    kind: RealizedContentKind,
+}
+
+impl ContentRealizationEntry {
+    pub(crate) const fn local_index(self) -> usize {
+        self.local_index
+    }
+
+    pub(crate) const fn kind(self) -> RealizedContentKind {
+        self.kind
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct AcceptedContentPlan {
+    entries: Vec<ContentRealizationEntry>,
+    relationships: Vec<(usize, usize)>,
+    roots: Vec<usize>,
+}
+
+impl AcceptedContentPlan {
+    pub(crate) fn entries(&self) -> &[ContentRealizationEntry] {
+        &self.entries
+    }
+
+    pub(crate) fn relationships(&self) -> &[(usize, usize)] {
+        &self.relationships
+    }
+
+    pub(crate) fn roots(&self) -> &[usize] {
+        &self.roots
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ContentPlan {
     session: ContentSession,
@@ -216,6 +259,37 @@ impl ContentPlan {
             }
         }
         self.topology_order = order;
+    }
+
+    pub(crate) fn accept(self) -> AcceptedContentPlan {
+        let entries = self
+            .topology_order
+            .iter()
+            .map(|entity| ContentRealizationEntry {
+                local_index: entity.index,
+                kind: match self.content[entity.index].expect("topology contains only live content")
+                {
+                    RenderContent::Empty => RealizedContentKind::Empty,
+                    RenderContent::SolidRect(rect) => RealizedContentKind::SolidRect(rect),
+                },
+            })
+            .collect();
+        let relationships = self
+            .relationships
+            .iter()
+            .map(|(parent, child)| (parent.index, child.index))
+            .collect();
+        let roots = self
+            .topology_order
+            .iter()
+            .filter(|entity| self.parents[entity.index].is_none())
+            .map(|entity| entity.index)
+            .collect();
+        AcceptedContentPlan {
+            entries,
+            relationships,
+            roots,
+        }
     }
 }
 

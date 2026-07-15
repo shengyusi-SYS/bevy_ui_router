@@ -365,60 +365,51 @@ fn facade_prelude_exposes_branch_planning_contracts() {
 }
 
 #[test]
-fn facade_prelude_exposes_phase_2_observation_contracts() {
-    use bevy_ui_router::prelude::{
-        FrameApplyOutcome, FrameApplyRequest, FrameApplyToken, FrameCleanupPlan,
-        FrameReconciliationPlan, NavigationTransactionSnapshot, NavigationTransactionState,
-        RouteFrameBranch, RouteFrameIdentity, RouteFrameRecord, RouteFrameScope, RouteFrameStatus,
-        StaleApplyReason, StaleApplyResult, TransactionCommitError, TransactionCommitErrorKind,
-        TransactionFailure,
-    };
+fn facade_prelude_exposes_only_root_frame_observation_contracts() {
+    use bevy_ui_router::prelude::{FrameOrigin, RouteFrameStatus, RouteFrameVersion};
     fn assert_public<T>() {}
-    assert_public::<FrameApplyOutcome>();
-    assert_public::<FrameApplyRequest>();
-    assert_public::<FrameApplyToken>();
-    assert_public::<FrameCleanupPlan>();
-    assert_public::<FrameReconciliationPlan>();
-    assert_public::<NavigationTransactionSnapshot>();
-    assert_public::<NavigationTransactionState>();
-    assert_public::<RouteFrameBranch>();
-    assert_public::<RouteFrameIdentity>();
-    assert_public::<RouteFrameRecord>();
-    assert_public::<RouteFrameScope>();
-    assert_public::<StaleApplyReason>();
-    assert_public::<StaleApplyResult>();
-    assert_public::<TransactionCommitError>();
-    assert_public::<TransactionCommitErrorKind>();
-    assert_public::<TransactionFailure>();
+    assert_public::<FrameOrigin>();
+    assert_public::<RouteFrameVersion>();
     assert_eq!(RouteFrameStatus::Active, RouteFrameStatus::Active);
 }
 
-#[cfg(feature = "view")]
+#[cfg(feature = "ecs")]
 #[test]
-fn facade_default_prelude_exposes_phase_3a_view_binding_contracts() {
-    use bevy_ui_router::prelude::{RouteViewDescriptor, ViewBindingKey};
+fn facade_ecs_module_exposes_schedule_labels_without_prelude_promotion() {
+    use bevy_ui_router::ecs::{RouterInputSet, RouterScheduleSet};
     fn assert_public<T>() {}
-    assert_public::<RouteViewDescriptor>();
-    assert_public::<ViewBindingKey>();
-    let descriptor = RouteViewDescriptor::new(ViewBindingKey::new("leaf"));
-    assert_eq!(descriptor.binding().as_str(), "leaf");
+    assert_public::<RouterInputSet>();
+    assert_public::<RouterScheduleSet>();
 }
 
 #[cfg(feature = "view")]
 #[test]
-fn facade_view_module_exposes_phase_3a_protocol_observations_by_explicit_path() {
-    use bevy_ui_router::view::{
-        ViewApplyOutcome, ViewBuildOutcome, ViewBuildRequest, ViewDisposalHint, ViewFailure,
-        ViewOutputId, ViewPartialOutput, ViewRenderPlan, ViewRequestId,
+fn facade_default_prelude_exposes_final_view_registry_contracts() {
+    use bevy_ui_router::prelude::{
+        RouteViewDescriptor, RouteViewKey, RouteViewRegistry, ViewDriverKey,
     };
     fn assert_public<T>() {}
-    assert_public::<ViewApplyOutcome>();
-    assert_public::<ViewBuildOutcome>();
-    assert_public::<ViewBuildRequest>();
-    assert_public::<ViewDisposalHint>();
-    assert_public::<ViewFailure>();
-    assert_public::<ViewOutputId>();
-    assert_public::<ViewPartialOutput>();
-    assert_public::<ViewRenderPlan>();
+    assert_public::<RouteViewDescriptor>();
+    assert_public::<RouteViewRegistry>();
+    let mut registry = RouteViewRegistry::new();
+    registry
+        .insert(
+            RouteViewKey::new("leaf").unwrap(),
+            RouteViewDescriptor::new(ViewDriverKey::new("immediate").unwrap()),
+        )
+        .unwrap();
+}
+
+#[cfg(feature = "view")]
+#[test]
+fn facade_view_module_exposes_only_renderer_neutral_effect_observations() {
+    use bevy_ui_router::view::{
+        RouteViewDescriptor, RouteViewRegistry, ViewBuildEffect, ViewDriverKey, ViewRequestId,
+    };
+    fn assert_public<T>() {}
+    assert_public::<RouteViewDescriptor>();
+    assert_public::<RouteViewRegistry>();
+    assert_public::<ViewBuildEffect>();
+    assert_public::<ViewDriverKey>();
     assert_public::<ViewRequestId>();
 }

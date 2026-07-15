@@ -215,6 +215,12 @@ impl RouteTree {
     pub(crate) fn provenance(&self) -> &RouteBranchProvenance {
         &self.provenance
     }
+
+    pub(crate) fn nodes_in_declaration_order(&self) -> Vec<&RouteNode> {
+        let mut nodes = self.nodes.values().collect::<Vec<_>>();
+        nodes.sort_by_key(|node| node.declaration_index());
+        nodes
+    }
 }
 
 #[derive(Clone)]

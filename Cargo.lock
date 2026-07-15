@@ -1102,6 +1102,7 @@ version = "0.1.0"
 dependencies = [
  "bevy_app",
  "bevy_camera",
+ "bevy_color",
  "bevy_ecs",
  "bevy_input_focus",
  "bevy_internal",
