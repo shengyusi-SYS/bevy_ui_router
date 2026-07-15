@@ -9,3 +9,6 @@ test-support = []
 
 [dependencies]
 bevy_ui_router_core = { path = "../bevy_ui_router_core" }
+
+[dev-dependencies]
+bevy_ui_router_core = { path = "../bevy_ui_router_core", features = ["test-support"] }

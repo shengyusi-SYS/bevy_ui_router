@@ -189,6 +189,39 @@ fn feature_entries(manifest: &str) -> BTreeMap<String, String> {
     features
 }
 
+fn dependency_entry<'a>(
+    manifest: &'a str,
+    section_name_to_find: &str,
+    dependency: &str,
+) -> Option<&'a str> {
+    let mut current_section = None;
+
+    for raw_line in manifest.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(section) = section_name(line) {
+            current_section = Some(section);
+            continue;
+        }
+
+        if current_section != Some(section_name_to_find) {
+            continue;
+        }
+
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim() == dependency {
+            return Some(value.trim());
+        }
+    }
+
+    None
+}
+
 fn dependency_default_features_disabled(manifest: &str, dependency: &str) -> bool {
     let mut in_dependency_subtable = false;
 
@@ -222,11 +255,14 @@ fn dependency_default_features_disabled(manifest: &str, dependency: &str) -> boo
 }
 
 #[test]
-fn view_manifest_depends_only_on_core_and_keeps_test_support_dependency_free() {
+fn view_manifest_depends_only_on_core_across_normal_and_dev_sections() {
     let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let manifest = fs::read_to_string(manifest_path).expect("view manifest should be readable");
 
-    assert_eq!(dependency_entries(&manifest), vec!["bevy_ui_router_core"]);
+    assert_eq!(
+        dependency_entries(&manifest),
+        vec!["bevy_ui_router_core", "bevy_ui_router_core"]
+    );
     assert!(dependency_violations(&manifest).is_empty());
     assert_eq!(
         feature_entries(&manifest),
@@ -234,6 +270,27 @@ fn view_manifest_depends_only_on_core_and_keeps_test_support_dependency_free() {
             ("default".to_owned(), "[]".to_owned()),
             ("test-support".to_owned(), "[]".to_owned()),
         ])
+    );
+}
+
+#[test]
+fn view_manifest_enables_core_test_support_only_for_tests() {
+    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest = fs::read_to_string(manifest_path).expect("view manifest should be readable");
+
+    assert_eq!(
+        dependency_entry(&manifest, "dependencies", "bevy_ui_router_core"),
+        Some(r#"{ path = "../bevy_ui_router_core" }"#)
+    );
+    assert_eq!(
+        dependency_entry(&manifest, "dev-dependencies", "bevy_ui_router_core"),
+        Some(r#"{ path = "../bevy_ui_router_core", features = ["test-support"] }"#)
+    );
+    assert_eq!(
+        feature_entries(&manifest)
+            .get("test-support")
+            .map(String::as_str),
+        Some("[]")
     );
 }
 
