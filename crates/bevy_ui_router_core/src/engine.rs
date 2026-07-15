@@ -6,7 +6,7 @@ use crate::admission::{
     AdmissionError, HostAdmissionConfirmation, HostAdmissionIssuer, HostAdmissionToken, HostGrant,
 };
 use crate::branch::{MatchedBranch, MatchedRoute};
-use crate::cleanup::{CleanupBatchToken, CleanupCompletion};
+use crate::cleanup::{CleanupBatchToken, CleanupCompletion, CleanupManifestSeal};
 use crate::frame::{FrameOrigin, RouteFrameVersion};
 use crate::history::{HistoryIntent, MemoryHistory};
 use crate::ids::{
@@ -162,7 +162,6 @@ pub(crate) enum EngineAction {
 #[derive(Debug)]
 pub(crate) struct CommitTicket {
     identity: RootTaskIdentity,
-    cleanup: CleanupBatchToken,
 }
 
 impl CommitTicket {
@@ -170,7 +169,6 @@ impl CommitTicket {
     fn testing_duplicate(&self) -> Self {
         Self {
             identity: self.identity.clone(),
-            cleanup: self.cleanup.clone(),
         }
     }
 
@@ -186,15 +184,48 @@ impl CommitTicket {
 
     #[cfg(test)]
     fn testing_with_identity(&self, identity: RootTaskIdentity) -> Self {
-        Self {
-            identity,
-            cleanup: self.cleanup.clone(),
-        }
+        Self { identity }
     }
+}
 
+#[derive(Debug)]
+pub(crate) struct SealedCommit {
+    identity: RootTaskIdentity,
+    cleanup: CleanupBatchToken,
+    publication: PublicationPlan,
+}
+
+impl SealedCommit {
     pub(crate) const fn cleanup(&self) -> &CleanupBatchToken {
         &self.cleanup
     }
+
+    #[cfg(test)]
+    fn testing_duplicate(&self) -> Self {
+        Self {
+            identity: self.identity.clone(),
+            cleanup: self.cleanup.clone(),
+            publication: self.publication.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    fn testing_with_identity(&self, identity: RootTaskIdentity) -> Self {
+        Self {
+            identity,
+            cleanup: self.cleanup.clone(),
+            publication: self.publication.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PublicationPlan {
+    state: RouterNavigationState,
+    history: MemoryHistory,
+    active_branch: MatchedBranch,
+    records: VecDeque<NavigationRequestRecord>,
+    current: CurrentWork,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,6 +247,7 @@ pub(crate) enum ReportError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommitError {
     Stale,
+    InvalidManifest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -234,7 +266,8 @@ pub(crate) enum PrivateRequestLookup<'a> {
 enum WorkStage {
     Applying,
     ReadyToCommit,
-    PostCommitCleanup,
+    CommitSealed { token: CleanupBatchToken },
+    PostCommitCleanup { outstanding: CleanupBatchToken },
 }
 
 #[derive(Clone, Debug)]
@@ -244,7 +277,8 @@ struct CurrentWork {
     target_frame: RouteFrameVersion,
     history_intent: Option<HistoryIntent>,
     stage: WorkStage,
-    cleanup: CleanupBatchToken,
+    cleanup_batch: crate::ids::CleanupBatchId,
+    cleanup_roots: Vec<RouteFrameVersion>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -359,24 +393,78 @@ impl RouterEngine {
         })
     }
 
-    pub(crate) fn commit<F>(
+    pub(crate) fn seal_commit(
         &mut self,
         ticket: CommitTicket,
+        seal: CleanupManifestSeal,
+    ) -> Result<SealedCommit, CommitError> {
+        let Some(current) = self.current.as_ref() else {
+            return Err(CommitError::Stale);
+        };
+        if current.stage != WorkStage::ReadyToCommit || current.identity != ticket.identity {
+            return Err(CommitError::Stale);
+        }
+
+        if current.cleanup_roots != seal.logical_roots()
+            || current.cleanup_roots.is_empty() != (seal.obligation_count() == 0)
+        {
+            return Err(CommitError::InvalidManifest);
+        }
+
+        let cleanup = CleanupBatchToken::sealed(
+            current.identity.clone(),
+            current.cleanup_batch,
+            &current.cleanup_roots,
+            seal.manifest_digest(),
+            seal.obligation_count(),
+        );
+        let publication = self.precompute_publication(cleanup.clone());
+        self.current
+            .as_mut()
+            .expect("current work was validated")
+            .stage = WorkStage::CommitSealed {
+            token: cleanup.clone(),
+        };
+        Ok(SealedCommit {
+            identity: ticket.identity,
+            cleanup,
+            publication,
+        })
+    }
+
+    pub(crate) fn publish_commit<F>(
+        &mut self,
+        sealed: SealedCommit,
         mutation: F,
-    ) -> Result<CommitReceipt, CommitError>
+    ) -> Result<(), CommitError>
     where
         F: FnOnce(),
     {
         let valid = self.current.as_ref().is_some_and(|current| {
-            current.stage == WorkStage::ReadyToCommit
-                && current.identity == ticket.identity
-                && current.cleanup == ticket.cleanup
+            current.identity == sealed.identity
+                && matches!(
+                    &current.stage,
+                    WorkStage::CommitSealed { token } if token == &sealed.cleanup
+                )
         });
         if !valid {
             return Err(CommitError::Stale);
         }
+
+        let PublicationPlan {
+            state,
+            history,
+            active_branch,
+            records,
+            current,
+        } = sealed.publication;
         mutation();
-        Ok(self.publish(ticket.cleanup))
+        self.state = state;
+        self.history = history;
+        self.active_branch = Some(active_branch);
+        self.records = records;
+        self.current = Some(current);
+        Ok(())
     }
 
     pub(crate) fn complete_cleanup(
@@ -384,7 +472,11 @@ impl RouterEngine {
         completion: CleanupCompletion,
     ) -> Result<(), CleanupError> {
         let valid = self.current.as_ref().is_some_and(|current| {
-            current.stage == WorkStage::PostCommitCleanup && completion.matches(&current.cleanup)
+            matches!(
+                &current.stage,
+                WorkStage::PostCommitCleanup { outstanding }
+                    if completion.matches(outstanding)
+            )
         });
         if !valid {
             return Err(CleanupError::Stale);
@@ -399,19 +491,9 @@ impl RouterEngine {
         let record = self
             .record_mut(request)
             .expect("running record is retained");
-        if completion.receipts().is_empty() {
-            record
-                .append_trace(NavigationTraceEvent::cleanup_settled(None))
-                .expect("terminal trace is open");
-        } else {
-            for receipt in completion.receipts() {
-                record
-                    .append_trace(NavigationTraceEvent::cleanup_settled(Some(
-                        receipt.disposition(),
-                    )))
-                    .expect("terminal trace is open");
-            }
-        }
+        record
+            .append_trace(NavigationTraceEvent::cleanup_settled(None))
+            .expect("terminal trace is open");
         record
             .transition(RequestStatus::Succeeded)
             .expect("request is running");
@@ -560,16 +642,11 @@ impl RouterEngine {
             frame,
             generation,
         );
-        let cleanup_manifest = if active_frame.is_some() && !equivalent {
+        let cleanup_roots = if active_frame.is_some() && !equivalent {
             vec![active_frame.expect("checked active frame").clone()]
         } else {
             Vec::new()
         };
-        let cleanup = CleanupBatchToken::sealed(
-            identity.clone(),
-            queued.reserved.cleanup_batch(),
-            cleanup_manifest,
-        );
         let stage = if equivalent {
             WorkStage::ReadyToCommit
         } else {
@@ -581,12 +658,13 @@ impl RouterEngine {
             target_frame,
             history_intent: Some(HistoryIntent::Push(location.clone())),
             stage,
-            cleanup: cleanup.clone(),
+            cleanup_batch: queued.reserved.cleanup_batch(),
+            cleanup_roots,
         });
 
         if equivalent {
             self.transition_with_trace(request, NavigationPhase::ReadyToSwitch);
-            self.action = Some(EngineAction::Commit(CommitTicket { identity, cleanup }));
+            self.action = Some(EngineAction::Commit(CommitTicket { identity }));
         } else {
             let record = self
                 .record_mut(request)
@@ -648,33 +726,38 @@ impl RouterEngine {
         self.retain_terminal_records();
     }
 
-    fn publish(&mut self, cleanup: CleanupBatchToken) -> CommitReceipt {
-        let (request, target_frame, branch) = {
-            let current = self.current.as_ref().expect("publication was preflighted");
-            (
-                current.identity.request,
-                current.target_frame.clone(),
-                current.branch.clone(),
-            )
-        };
+    fn precompute_publication(&self, cleanup: CleanupBatchToken) -> PublicationPlan {
+        let current = self
+            .current
+            .as_ref()
+            .expect("sealing validated current work");
+        let request = current.identity.request;
         let location = self
             .request(request)
             .expect("running record is retained")
             .requested()
             .clone();
-        let active = ActivePresentation::route(location, vec![target_frame]);
-        let current = self.current.as_mut().expect("publication was preflighted");
+
+        let mut history = self.history.clone();
         current
             .history_intent
-            .take()
+            .clone()
             .expect("commit has one private history intent")
-            .publish(&mut self.history);
-        current.stage = WorkStage::PostCommitCleanup;
-        debug_assert_eq!(current.cleanup, cleanup);
-        self.active_branch = Some(branch);
-        self.state.set_active(active);
-        let record = self
-            .record_mut(request)
+            .publish(&mut history);
+
+        let mut state = self.state.clone();
+        state.set_active(ActivePresentation::route(
+            location,
+            vec![current.target_frame.clone()],
+        ));
+        state.set_request(Some(RequestStatus::Running(
+            NavigationPhase::PostCommitCleanup,
+        )));
+
+        let mut records = self.records.clone();
+        let record = records
+            .iter_mut()
+            .find(|record| record.id() == request)
             .expect("running record is retained");
         record
             .append_trace(NavigationTraceEvent::commit_published())
@@ -687,10 +770,20 @@ impl RouterEngine {
                 NavigationPhase::PostCommitCleanup,
             ))
             .expect("running trace is open");
-        self.state.set_request(Some(RequestStatus::Running(
-            NavigationPhase::PostCommitCleanup,
-        )));
-        CommitReceipt { cleanup }
+
+        let mut current = current.clone();
+        current.history_intent = None;
+        current.stage = WorkStage::PostCommitCleanup {
+            outstanding: cleanup,
+        };
+
+        PublicationPlan {
+            state,
+            history,
+            active_branch: current.branch.clone(),
+            records,
+            current,
+        }
     }
 
     fn retain_terminal_records(&mut self) {
@@ -809,25 +902,7 @@ impl ViewReportSession<'_> {
             .transition_with_trace(request, NavigationPhase::ReadyToSwitch);
         CommitTicket {
             identity: self.identity,
-            cleanup: self
-                .engine
-                .current
-                .as_ref()
-                .expect("report retains current work")
-                .cleanup
-                .clone(),
         }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct CommitReceipt {
-    cleanup: CleanupBatchToken,
-}
-
-impl CommitReceipt {
-    pub(crate) const fn cleanup(&self) -> &CleanupBatchToken {
-        &self.cleanup
     }
 }
 
@@ -867,17 +942,25 @@ struct EngineSnapshot {
 mod tests {
     use super::{
         CommitError, EngineAction, PrivateRequestLookup, ReportError, RootTaskIdentity,
-        RouterEngine,
+        RouterEngine, WorkStage,
     };
     use crate::admission::HostAdmissionIssuer;
+    use crate::cleanup::{
+        CleanupBatchToken, CleanupCompletion, CleanupCompletionDigest, CleanupManifestDigest,
+        CleanupManifestSeal,
+    };
     use crate::frame::{FrameOrigin, RouteFrameVersion};
-    use crate::ids::{ReservationCounter, RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId};
+    use crate::ids::{
+        CleanupBatchId, ReservationCounter, RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId,
+    };
     use crate::location::RouteLocation;
     use crate::pattern::RoutePattern;
     use crate::presentation::ActivePresentationKind;
     use crate::request::{NavigationPhase, RequestStatus};
     use crate::route_tree::RouteTree;
-    use crate::trace::{CleanupDisposition, NavigationTraceEventKind};
+    use crate::trace::NavigationTraceEventKind;
+
+    const NONZERO_OBLIGATION_COUNT: usize = 3;
 
     fn tree() -> RouteTree {
         let mut builder = RouteTree::builder()
@@ -918,7 +1001,34 @@ mod tests {
             }
             EngineAction::Commit(ticket) => ticket,
         };
-        engine.commit(ticket, || {}).unwrap().cleanup().clone()
+        let sealed = seal_current(engine, ticket);
+        let cleanup = sealed.cleanup().clone();
+        engine.publish_commit(sealed, || {}).unwrap();
+        cleanup
+    }
+
+    fn seal_current(engine: &mut RouterEngine, ticket: super::CommitTicket) -> super::SealedCommit {
+        let roots = engine
+            .current
+            .as_ref()
+            .expect("test requires current work")
+            .cleanup_roots
+            .clone();
+        let count = if roots.is_empty() {
+            0
+        } else {
+            NONZERO_OBLIGATION_COUNT
+        };
+        engine
+            .seal_commit(
+                ticket,
+                CleanupManifestSeal::new(roots, manifest_digest(41), count),
+            )
+            .unwrap()
+    }
+
+    fn manifest_digest(tag: u64) -> CleanupManifestDigest {
+        CleanupManifestDigest::from_opaque(0x4d41_4e49_4645_5354 ^ tag)
     }
 
     fn settle_current(engine: &mut RouterEngine) {
@@ -926,14 +1036,13 @@ mod tests {
         engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
     }
 
-    fn valid_completion(
-        cleanup: &crate::cleanup::CleanupBatchToken,
-    ) -> crate::cleanup::CleanupCompletion {
-        if cleanup.obligation_count() == 0 {
-            cleanup.zero_completion().unwrap()
+    fn valid_completion(cleanup: &CleanupBatchToken) -> CleanupCompletion {
+        let digest = if cleanup.obligation_count() == 0 {
+            CleanupCompletionDigest::canonical_empty()
         } else {
-            cleanup.testing_removed_completion().unwrap()
-        }
+            CleanupCompletionDigest::from_opaque(0x5445_524d_494e_414c)
+        };
+        CleanupCompletion::attest(cleanup.clone(), digest, cleanup.obligation_count())
     }
 
     fn distinct_identity() -> RootTaskIdentity {
@@ -1059,17 +1168,29 @@ mod tests {
         let mut stale = ticket.testing_duplicate();
         stale.testing_set_host_epoch(stale.identity().host_epoch() + 1);
         let before = engine.snapshot();
-        assert_eq!(engine.commit(stale, || {}).unwrap_err(), CommitError::Stale);
+        assert_eq!(
+            engine
+                .seal_commit(
+                    stale,
+                    CleanupManifestSeal::new(vec![], manifest_digest(1), 0),
+                )
+                .unwrap_err(),
+            CommitError::Stale
+        );
         assert_eq!(engine.snapshot(), before);
 
-        let receipt = engine.commit(ticket, || {}).unwrap();
+        let sealed = seal_current(&mut engine, ticket);
+        assert_eq!(engine.active().kind(), ActivePresentationKind::None);
+        assert!(engine.history().is_empty());
+        let cleanup = sealed.cleanup().clone();
+        engine.publish_commit(sealed, || {}).unwrap();
         assert_eq!(engine.active().kind(), ActivePresentationKind::Route);
         assert_eq!(engine.history().len(), 1);
         assert_eq!(
             engine.current_status(),
             Some(&RequestStatus::Running(NavigationPhase::PostCommitCleanup))
         );
-        assert_eq!(receipt.cleanup().obligation_count(), 0);
+        assert_eq!(cleanup.obligation_count(), 0);
     }
 
     #[test]
@@ -1085,11 +1206,21 @@ mod tests {
         for mismatch in identity_mismatches(exact.identity(), &foreign) {
             let before = engine.snapshot();
             let stale = exact.testing_with_identity(mismatch);
-            assert_eq!(engine.commit(stale, || {}).unwrap_err(), CommitError::Stale);
+            assert_eq!(
+                engine
+                    .seal_commit(
+                        stale,
+                        CleanupManifestSeal::new(vec![], manifest_digest(2), 0),
+                    )
+                    .unwrap_err(),
+                CommitError::Stale
+            );
             assert_eq!(engine.snapshot(), before);
         }
 
-        let cleanup = engine.commit(exact, || {}).unwrap().cleanup().clone();
+        let sealed = seal_current(&mut engine, exact);
+        let cleanup = sealed.cleanup().clone();
+        engine.publish_commit(sealed, || {}).unwrap();
         engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
     }
 
@@ -1119,7 +1250,10 @@ mod tests {
         assert_eq!(fragment.identity().frame(), first.frame());
         assert_eq!(fragment.identity().generation(), first.generation().next());
         let fragment_cleanup = publish_action(&mut engine, EngineAction::FrameTask(fragment));
-        assert_eq!(fragment_cleanup.obligation_count(), 1);
+        assert_eq!(
+            fragment_cleanup.obligation_count(),
+            NONZERO_OBLIGATION_COUNT
+        );
         engine
             .complete_cleanup(valid_completion(&fragment_cleanup))
             .unwrap();
@@ -1131,7 +1265,7 @@ mod tests {
         assert_ne!(changed.identity().frame(), first.frame());
         assert_eq!(changed.identity().generation(), RouteGeneration::initial());
         let changed_cleanup = publish_action(&mut engine, EngineAction::FrameTask(changed));
-        assert_eq!(changed_cleanup.obligation_count(), 1);
+        assert_eq!(changed_cleanup.obligation_count(), NONZERO_OBLIGATION_COUNT);
         engine
             .complete_cleanup(valid_completion(&changed_cleanup))
             .unwrap();
@@ -1209,7 +1343,7 @@ mod tests {
         }
 
         let mut wrong_digest = valid_completion(&cleanup);
-        wrong_digest.testing_set_digest(u64::MAX);
+        wrong_digest.testing_set_binding(u64::MAX);
         let before = engine.snapshot();
         assert!(engine.complete_cleanup(wrong_digest).is_err());
         assert_eq!(engine.snapshot(), before);
@@ -1294,31 +1428,43 @@ mod tests {
     }
 
     #[test]
-    fn commit_runs_unit_mutation_then_automatically_publishes_presealed_cleanup() {
+    fn commit_ticket_is_logical_only_and_sealed_token_is_tracked_before_publication() {
         let mut engine = ready_engine();
         engine.push(RouteLocation::new("/items/1")).unwrap();
         let EngineAction::FrameTask(task) = engine.action().unwrap() else {
             panic!("expected frame task");
         };
         let ticket = engine.begin_view_report(task.identity()).unwrap().applied();
-        let expected_cleanup = ticket.cleanup().clone();
+        assert!(!format!("{ticket:?}").contains("CleanupBatchToken"));
         let ids_after_action = engine.ids.snapshot();
-        let mut mutated = false;
+        let sealed = engine
+            .seal_commit(
+                ticket,
+                CleanupManifestSeal::new(vec![], manifest_digest(3), 0),
+            )
+            .unwrap();
+        let expected_cleanup = sealed.cleanup().clone();
+        assert!(matches!(
+            &engine.current.as_ref().unwrap().stage,
+            WorkStage::CommitSealed { token } if token == &expected_cleanup
+        ));
+        assert_eq!(engine.active().kind(), ActivePresentationKind::None);
+        assert!(engine.history().is_empty());
 
-        let receipt = engine
-            .commit(ticket, || {
+        let mut mutated = false;
+        engine
+            .publish_commit(sealed, || {
                 mutated = true;
             })
             .unwrap();
 
         assert!(mutated);
-        assert_eq!(receipt.cleanup(), &expected_cleanup);
         assert_eq!(engine.ids.snapshot(), ids_after_action);
         assert_eq!(engine.active().kind(), ActivePresentationKind::Route);
     }
 
     #[test]
-    fn fragment_and_replacement_freeze_exact_old_frame_cleanup_manifest() {
+    fn logical_cleanup_roots_are_retained_and_verified_in_exact_order() {
         let mut engine = ready_engine();
         engine.push(RouteLocation::new("/items/1")).unwrap();
         settle_current(&mut engine);
@@ -1334,55 +1480,206 @@ mod tests {
             .begin_view_report(fragment.identity())
             .unwrap()
             .applied();
-        assert_eq!(fragment_ticket.cleanup().obligations(), &[first.clone()]);
-        let fragment_cleanup = engine
-            .commit(fragment_ticket, || {})
-            .unwrap()
-            .cleanup()
-            .clone();
-        engine
-            .complete_cleanup(fragment_cleanup.testing_removed_completion().unwrap())
-            .unwrap();
-        let fragment_active = engine.active().frames()[0].clone();
-
-        engine.push(RouteLocation::new("/about")).unwrap();
-        let EngineAction::FrameTask(replacement) = engine.action().unwrap() else {
-            panic!("expected replacement task");
-        };
-        let replacement_ticket = engine
-            .begin_view_report(replacement.identity())
-            .unwrap()
-            .applied();
         assert_eq!(
-            replacement_ticket.cleanup().obligations(),
-            &[fragment_active]
+            engine.current.as_ref().unwrap().cleanup_roots,
+            vec![first.clone()]
         );
+
+        let second = RouteFrameVersion::new(
+            first.router_identity(),
+            first.host(),
+            first.slot(),
+            first.origin().clone(),
+            RouteFrameId::new(first.frame().raw() + 10_000),
+            first.generation(),
+        );
+        let foreign = RouteFrameVersion::new(
+            first.router_identity(),
+            first.host(),
+            first.slot(),
+            first.origin().clone(),
+            RouteFrameId::new(first.frame().raw() + 20_000),
+            first.generation(),
+        );
+        engine.current.as_mut().unwrap().cleanup_roots = vec![first.clone(), second.clone()];
+
+        for invalid in [
+            vec![],
+            vec![first.clone()],
+            vec![first.clone(), second.clone(), first.clone()],
+            vec![first.clone(), first.clone()],
+            vec![first.clone(), foreign],
+            vec![second.clone(), first.clone()],
+        ] {
+            let before = engine.snapshot();
+            assert_eq!(
+                engine
+                    .seal_commit(
+                        fragment_ticket.testing_duplicate(),
+                        CleanupManifestSeal::new(invalid, manifest_digest(4), 7),
+                    )
+                    .unwrap_err(),
+                CommitError::InvalidManifest
+            );
+            assert_eq!(engine.snapshot(), before);
+        }
+
+        let sealed = engine
+            .seal_commit(
+                fragment_ticket,
+                CleanupManifestSeal::new(vec![first, second], manifest_digest(4), 7),
+            )
+            .unwrap();
+        assert_eq!(sealed.cleanup().obligation_count(), 7);
     }
 
     #[test]
-    fn nonzero_cleanup_rejects_missing_duplicate_foreign_and_out_of_order_receipts() {
+    fn root_count_coherence_is_rejected_before_any_mutation() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("expected frame task");
+        };
+        let ticket = engine.begin_view_report(task.identity()).unwrap().applied();
+
+        let before = engine.snapshot();
+        assert_eq!(
+            engine
+                .seal_commit(
+                    ticket.testing_duplicate(),
+                    CleanupManifestSeal::new(vec![], manifest_digest(5), 1),
+                )
+                .unwrap_err(),
+            CommitError::InvalidManifest
+        );
+        assert_eq!(engine.snapshot(), before);
+
+        let root = engine.current.as_ref().unwrap().target_frame.clone();
+        engine.current.as_mut().unwrap().cleanup_roots = vec![root.clone()];
+        let before = engine.snapshot();
+        assert_eq!(
+            engine
+                .seal_commit(
+                    ticket,
+                    CleanupManifestSeal::new(vec![root], manifest_digest(5), 0),
+                )
+                .unwrap_err(),
+            CommitError::InvalidManifest
+        );
+        assert_eq!(engine.snapshot(), before);
+    }
+
+    #[test]
+    fn duplicate_and_foreign_sealed_commit_capabilities_are_zero_write() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("expected frame task");
+        };
+        let ticket = engine.begin_view_report(task.identity()).unwrap().applied();
+        let sealed = seal_current(&mut engine, ticket);
+        let duplicate = sealed.testing_duplicate();
+        let foreign_identity = distinct_identity();
+        let foreign = sealed.testing_with_identity(foreign_identity);
+
+        for invalid in [foreign] {
+            let before = engine.snapshot();
+            let mut mutated = false;
+            assert_eq!(
+                engine
+                    .publish_commit(invalid, || {
+                        mutated = true;
+                    })
+                    .unwrap_err(),
+                CommitError::Stale
+            );
+            assert!(!mutated);
+            assert_eq!(engine.snapshot(), before);
+        }
+
+        engine.publish_commit(sealed, || {}).unwrap();
+        let before = engine.snapshot();
+        let mut mutated = false;
+        assert_eq!(
+            engine
+                .publish_commit(duplicate, || {
+                    mutated = true;
+                })
+                .unwrap_err(),
+            CommitError::Stale
+        );
+        assert!(!mutated);
+        assert_eq!(engine.snapshot(), before);
+    }
+
+    #[test]
+    fn manifest_digest_count_and_batch_are_bound_into_the_token() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        engine.push(RouteLocation::new("/about")).unwrap();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("expected replacement task");
+        };
+        let ticket = engine.begin_view_report(task.identity()).unwrap().applied();
+        let current = engine.current.as_ref().unwrap();
+        let exact = CleanupBatchToken::sealed(
+            ticket.identity().clone(),
+            current.cleanup_batch,
+            &current.cleanup_roots,
+            manifest_digest(10),
+            NONZERO_OBLIGATION_COUNT,
+        );
+        let different_manifest = CleanupBatchToken::sealed(
+            ticket.identity().clone(),
+            current.cleanup_batch,
+            &current.cleanup_roots,
+            manifest_digest(11),
+            NONZERO_OBLIGATION_COUNT,
+        );
+        let different_count = CleanupBatchToken::sealed(
+            ticket.identity().clone(),
+            current.cleanup_batch,
+            &current.cleanup_roots,
+            manifest_digest(10),
+            NONZERO_OBLIGATION_COUNT + 1,
+        );
+        let different_batch = CleanupBatchToken::sealed(
+            ticket.identity().clone(),
+            CleanupBatchId::new(current.cleanup_batch.raw() + 1),
+            &current.cleanup_roots,
+            manifest_digest(10),
+            NONZERO_OBLIGATION_COUNT,
+        );
+
+        for different in [different_manifest, different_count, different_batch] {
+            assert_ne!(exact, different);
+            assert_ne!(exact.testing_binding(), different.testing_binding());
+        }
+
+        let sealed = engine
+            .seal_commit(
+                ticket,
+                CleanupManifestSeal::new(
+                    current.cleanup_roots.clone(),
+                    manifest_digest(10),
+                    NONZERO_OBLIGATION_COUNT,
+                ),
+            )
+            .unwrap();
+        assert_eq!(sealed.cleanup(), &exact);
+    }
+
+    #[test]
+    fn nonzero_completion_is_aggregate_attestation_without_core_receipts() {
         let mut engine = ready_engine();
         engine.push(RouteLocation::new("/items/1")).unwrap();
         settle_current(&mut engine);
         let request = engine.push(RouteLocation::new("/about")).unwrap();
         let cleanup = publish_current(&mut engine);
-        assert_eq!(cleanup.obligation_count(), 1);
+        assert_eq!(cleanup.obligation_count(), NONZERO_OBLIGATION_COUNT);
 
-        for invalid in [
-            cleanup.testing_missing_completion(),
-            cleanup.testing_duplicate_completion(CleanupDisposition::Removed),
-            cleanup.testing_foreign_completion(CleanupDisposition::Removed),
-            cleanup.testing_foreign_batch_completion(CleanupDisposition::Removed),
-            cleanup.testing_out_of_order_completion(CleanupDisposition::Removed),
-        ] {
-            let before = engine.snapshot();
-            assert!(engine.complete_cleanup(invalid).is_err());
-            assert_eq!(engine.snapshot(), before);
-        }
-
-        engine
-            .complete_cleanup(cleanup.testing_removed_completion().unwrap())
-            .unwrap();
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
         let settled = engine
             .request(request)
             .unwrap()
@@ -1391,52 +1688,40 @@ mod tests {
             .filter(|event| event.kind() == NavigationTraceEventKind::CleanupSettled)
             .collect::<Vec<_>>();
         assert_eq!(settled.len(), 1);
-        assert_eq!(
-            settled[0].cleanup_disposition(),
-            Some(CleanupDisposition::Removed)
-        );
+        assert_eq!(settled[0].cleanup_disposition(), None);
     }
 
     #[test]
-    fn cleanup_ledger_rejects_two_exact_receipts_in_reverse_manifest_order() {
+    fn completion_rejects_wrong_token_count_zero_representation_and_binding() {
         let mut engine = ready_engine();
         engine.push(RouteLocation::new("/items/1")).unwrap();
-        settle_current(&mut engine);
-        engine.push(RouteLocation::new("/about")).unwrap();
         let cleanup = publish_current(&mut engine);
-        let first = cleanup.obligations()[0].clone();
-        let second = RouteFrameVersion::new(
-            first.router_identity(),
-            first.host(),
-            first.slot(),
-            first.origin().clone(),
-            RouteFrameId::new(first.frame().raw() + 1),
-            first.generation(),
-        );
-        let two = cleanup.testing_with_manifest(vec![first, second]);
-        let reversed = cleanup
-            .testing_with_manifest(two.obligations().iter().cloned().rev().collect::<Vec<_>>());
-        assert_ne!(
-            two.testing_manifest_digest(),
-            reversed.testing_manifest_digest()
-        );
-        assert_ne!(
-            cleanup.testing_manifest_digest(),
-            cleanup.testing_with_next_batch().testing_manifest_digest()
-        );
-        let receipts = vec![
-            two.receipt(1, CleanupDisposition::Removed).unwrap(),
-            two.receipt(0, CleanupDisposition::Removed).unwrap(),
-        ];
 
-        assert_eq!(
-            two.completion_from_receipts(receipts),
-            Err(crate::cleanup::CleanupLedgerError::DuplicateOrOutOfOrderReceipt)
-        );
-        assert_eq!(
-            cleanup.zero_completion(),
-            Err(crate::cleanup::CleanupLedgerError::MissingReceipt)
-        );
+        let mut foreign_engine = ready_engine();
+        foreign_engine.push(RouteLocation::new("/items/1")).unwrap();
+        let foreign = publish_current(&mut foreign_engine);
+
+        let mut wrong_binding = valid_completion(&cleanup);
+        wrong_binding.testing_set_binding(u64::MAX);
+        let wrong_batch =
+            cleanup.testing_with_batch(CleanupBatchId::new(cleanup.testing_batch().raw() + 1));
+        for invalid in [
+            CleanupCompletion::attest(foreign, CleanupCompletionDigest::canonical_empty(), 0),
+            CleanupCompletion::attest(
+                cleanup.clone(),
+                CleanupCompletionDigest::canonical_empty(),
+                1,
+            ),
+            CleanupCompletion::attest(cleanup.clone(), CleanupCompletionDigest::from_opaque(77), 0),
+            CleanupCompletion::attest(wrong_batch, CleanupCompletionDigest::canonical_empty(), 0),
+            wrong_binding,
+        ] {
+            let before = engine.snapshot();
+            assert!(engine.complete_cleanup(invalid).is_err());
+            assert_eq!(engine.snapshot(), before);
+        }
+
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
     }
 
     #[test]
@@ -1449,9 +1734,7 @@ mod tests {
             .push(RouteLocation::new("/items/1").with_fragment("details"))
             .unwrap();
 
-        engine
-            .complete_cleanup(cleanup.zero_completion().unwrap())
-            .unwrap();
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
 
         assert_eq!(
             engine.request(first).unwrap().status(),
@@ -1491,9 +1774,7 @@ mod tests {
         let failed = engine.push(RouteLocation::new("/missing")).unwrap();
         let next = engine.push(RouteLocation::new("/about")).unwrap();
 
-        engine
-            .complete_cleanup(cleanup.zero_completion().unwrap())
-            .unwrap();
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
 
         assert!(matches!(
             engine.request(failed).unwrap().status(),
