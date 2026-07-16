@@ -5,6 +5,7 @@ mod cleanup;
 mod engine;
 #[doc(hidden)]
 pub mod integration;
+mod mount;
 pub use admission::{HostSnapshot, HostTraceEvent, HostTraceEventKind, HostVersion};
 pub use cleanup::CleanupSummary;
 pub mod back;

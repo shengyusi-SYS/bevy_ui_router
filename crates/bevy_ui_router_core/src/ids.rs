@@ -262,6 +262,7 @@ pub(crate) struct CoreIdAllocator {
     next_task: u64,
     next_transaction: u64,
     next_cleanup_batch: u64,
+    next_mount_sequence: u64,
     next_request_by_router: BTreeMap<RouterIdentity, u64>,
 }
 
@@ -279,6 +280,7 @@ impl CoreIdAllocator {
             next_task: 1,
             next_transaction: 1,
             next_cleanup_batch: 1,
+            next_mount_sequence: 1,
             next_request_by_router: BTreeMap::new(),
         })
     }
@@ -334,6 +336,11 @@ impl CoreIdAllocator {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn allocate_transaction(&mut self) -> Result<TransactionId, IdExhaustion> {
         checked_take(&mut self.next_transaction).map(TransactionId)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn allocate_mount_sequence(&mut self) -> Result<u64, IdExhaustion> {
+        checked_take(&mut self.next_mount_sequence)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -448,6 +455,7 @@ impl CoreIdAllocator {
             next_task: self.next_task,
             next_transaction: self.next_transaction,
             next_cleanup_batch: self.next_cleanup_batch,
+            next_mount_sequence: self.next_mount_sequence,
             next_request_by_router: self.next_request_by_router.clone(),
         }
     }
@@ -497,7 +505,19 @@ pub(crate) struct CoreIdAllocatorSnapshot {
     next_task: u64,
     next_transaction: u64,
     next_cleanup_batch: u64,
+    next_mount_sequence: u64,
     next_request_by_router: BTreeMap<RouterIdentity, u64>,
+}
+
+#[cfg(test)]
+impl CoreIdAllocatorSnapshot {
+    pub(crate) const fn next_slot(&self) -> u64 {
+        self.next_slot
+    }
+
+    pub(crate) const fn next_mount_sequence(&self) -> u64 {
+        self.next_mount_sequence
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

@@ -18,6 +18,11 @@ use crate::history::{HistorySnapshot, MemoryHistory};
 use crate::ids::{NavigationRequestId, RouterIdentity};
 use crate::location::RouteLocation;
 use crate::meta::ErrorBoundaryKey;
+use crate::mount::{
+    MountGrant as CoreMountGrant, MountReceiptAttestation as CoreMountReceiptAttestation,
+    MountReceiptDigest, MountRegistrationCompletion as CoreMountRegistrationCompletion,
+    MountRegistrationDigest, MountRegistrationPermit as CoreMountRegistrationPermit,
+};
 use crate::presentation::{ActivePresentation, RouterAvailability};
 use crate::request::{
     NavigationFailure, NavigationFailureKind, NavigationPhase, NavigationRequestRecord,
@@ -52,6 +57,62 @@ pub struct HostAdmissionToken {
 
 pub struct HostGrant {
     inner: CoreHostGrant,
+}
+
+pub struct MountGrant {
+    inner: CoreMountGrant,
+}
+
+impl MountGrant {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn sealed(inner: CoreMountGrant) -> Self {
+        Self { inner }
+    }
+
+    pub fn slot(&self) -> crate::ids::RouteSlotId {
+        self.inner.slot()
+    }
+
+    pub fn attest_receipt(self, digest: u64) -> MountReceiptAttestation {
+        MountReceiptAttestation {
+            inner: self
+                .inner
+                .attest_receipt(MountReceiptDigest::from_opaque(digest)),
+        }
+    }
+}
+
+pub struct MountReceiptAttestation {
+    #[cfg_attr(not(test), allow(dead_code))]
+    inner: CoreMountReceiptAttestation,
+}
+
+pub struct MountRegistrationPermit {
+    inner: CoreMountRegistrationPermit,
+}
+
+impl MountRegistrationPermit {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn sealed(inner: CoreMountRegistrationPermit) -> Self {
+        Self { inner }
+    }
+
+    pub fn slot(&self) -> crate::ids::RouteSlotId {
+        self.inner.slot()
+    }
+
+    pub fn complete(self, registration_digest: u64) -> MountRegistrationCompletion {
+        MountRegistrationCompletion {
+            inner: self
+                .inner
+                .complete(MountRegistrationDigest::from_opaque(registration_digest)),
+        }
+    }
+}
+
+pub struct MountRegistrationCompletion {
+    #[cfg_attr(not(test), allow(dead_code))]
+    inner: CoreMountRegistrationCompletion,
 }
 
 impl HostGrant {
@@ -718,6 +779,10 @@ fn map_commit_error(error: CoreCommitError) -> IntegrationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admission::HostAdmissionIssuer;
+    use crate::frame::RouteFrameVersion;
+    use crate::ids::{CoreIdAllocator, RouteGeneration};
+    use crate::mount::MountIssuer;
     use crate::prelude::{
         ActivePresentationKind, CleanupDisposition, FrameOrigin, HostTraceEventKind,
         NavigationPhase, NavigationTraceEventKind, RequestStatus, RouteLocation, RouteNodeOptions,
@@ -733,6 +798,50 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn mount_wrappers_consume_only_sealed_grant_and_registration_permit_artifacts() {
+        let mut ids = CoreIdAllocator::new().unwrap();
+        let router = ids.allocate_router_identity().unwrap();
+        let mut admission = HostAdmissionIssuer::new().unwrap();
+        let host_token = admission.issue(router).unwrap();
+        let host_grant = admission.grant(&host_token, &mut ids).unwrap();
+        let host = admission.confirm(&host_grant).unwrap();
+        let request = ids.allocate_request(router).unwrap();
+        let transaction = ids.allocate_transaction().unwrap();
+        let parent = RouteFrameVersion::new(
+            router,
+            host.version().host(),
+            host.top_slot(),
+            FrameOrigin::RouterFallback,
+            ids.allocate_frame().unwrap(),
+            RouteGeneration::initial(),
+        );
+        let mut issuer = MountIssuer::new(router);
+        let request_token = issuer
+            .issue(
+                &mut ids,
+                host.version().clone(),
+                request,
+                transaction,
+                parent,
+                crate::slot::RouteSlotKey::named("details").unwrap(),
+            )
+            .unwrap();
+        let core_grant = issuer.grant(&request_token, &mut ids).unwrap();
+
+        let grant = MountGrant::sealed(core_grant);
+        let slot = grant.slot();
+        let receipt = grant.attest_receipt(67);
+        let core_permit = issuer.accept_receipt(&receipt.inner).unwrap();
+        let permit = MountRegistrationPermit::sealed(core_permit);
+        assert_eq!(permit.slot(), slot);
+
+        let completion = permit.complete(71);
+        let confirmation = issuer.complete_registration(&completion.inner).unwrap();
+        assert_eq!(confirmation.slot(), slot);
+        assert!(confirmation.has_valid_binding());
     }
 
     fn ready_engine() -> (RouterEngine, HostGrant) {
