@@ -507,6 +507,10 @@ struct FailureCleanupRequest {
 
 The failure transition first returns `FailureCleanupRequest` carrying the exact router/host epoch/request/transaction/frame-task/sequence/stage identity, failure and logical roots but no Entity or manifest claim
 
+The outlet-aware report path accepts any stable sorted unique observation and still issues the matched `MountRequest` when its required key is absent, so ECS can consume the token as `MissingOutlet`; the legacy leaf-only `report_applied` path remains distinct and reissues the exact nested parent task with `Invalid`
+
+Failure cleanup logical roots contain only the already accepted applied-frame prefix in child-to-parent order; an issued but unapplied frame is not a cleanup root, while ECS may bind additional slot or partial-realization obligations into the manifest digest and count
+
 ECS freezes its exact physical obligations and returns the existing integration `CleanupManifest { logical_roots, manifest_digest, obligation_count }`; `prepare_failure_cleanup` verifies the exact request and logical roots, then seals the existing `CleanupBatchToken` with its reserved cleanup batch ID, digest and count
 
 Core validates the final existing `CleanupCompletion` digest/count before terminal publication; exact Entity obligations, attempts and receipts remain ECS-only and no weaker parallel cleanup authority is introduced
