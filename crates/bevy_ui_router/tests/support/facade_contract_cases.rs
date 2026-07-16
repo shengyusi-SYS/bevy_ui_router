@@ -3005,7 +3005,7 @@ fn inspect_api_risk_meta(
         }
         return;
     }
-    let safe_builtin = ["allow", "cfg", "derive", "doc", "path", "test"]
+    let safe_builtin = ["allow", "cfg", "derive", "doc", "must_use", "path", "test"]
         .iter()
         .any(|name| meta.path().is_ident(name));
     let safe_helper = meta
@@ -5161,6 +5161,20 @@ mod mutation_tests {
                 "possible attribute proc macro escaped owner public-surface inspection: {source}"
             );
         }
+    }
+
+    #[test]
+    fn owner_public_surface_must_use_builtin_is_not_reported_as_an_attribute_macro() {
+        let records = synthetic_owner_records(
+            r#"#[must_use = "RouterHandle must be used"] pub struct RouterHandle;"#,
+            "RouterHandle",
+        );
+        assert!(records.contains(&source_record(
+            "owner",
+            "RouterHandle",
+            "struct",
+            "pub struct RouterHandle",
+        )));
     }
 
     #[test]
