@@ -14,7 +14,7 @@
 
 **Architecture:** `RouterEngine` becomes the only logical navigation authority; ECS owns every Bevy `Entity`, registry record, mutation plan, receipt, and physical validation. The immediate driver produces only a session-local data plan. Root push establishes the complete host-to-snapshot vertical path and honest repeated single-root `push`; it does not implement child mount, nested common-prefix reconciliation, replace/back, or full authority recovery.
 
-**Tech Stack:** Rust 2024, Bevy 0.19 from exact revision `61f78f75684e6b0bc28a13a5933f8f55ca653fa7`, Cargo resolver 3, `syn` 2 with `full`, `cargo-nextest`.
+**Tech Stack:** Rust 2024, Bevy 0.19 from exact revision `61f78f75684e6b0bc28a13a5933f8f55ca653fa7`, Cargo resolver 3, `syn` 2 with `full` and `visit`, `cargo-nextest`.
 
 ## Global Constraints
 
