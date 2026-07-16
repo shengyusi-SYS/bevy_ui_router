@@ -282,6 +282,8 @@ git commit -m "feat(core): add sealed child mount protocol"
 - Modify: `crates/bevy_ui_router_core/src/trace.rs`
 - Modify: `crates/bevy_ui_router_view/src/lib.rs`
 - Modify: `crates/bevy_ui_router_view/src/effect.rs`
+- Modify: `crates/bevy_ui_router_ecs/src/navigation.rs` (workspace compatibility holder only)
+- Modify: `crates/bevy_ui_router_ecs/src/snapshots.rs` (depth-one test helper exhaustiveness only)
 
 **Interfaces:**
 - Consumes: sealed mount protocol from Task 2
@@ -289,6 +291,7 @@ git commit -m "feat(core): add sealed child mount protocol"
 - Produces: sealed `AppliedFrameReport` carrying the consumed task identity and stable logical outlet keys
 - Produces: `EngineAction::{FrameTask, MountRequest, Commit}`
 - Produces: full root-to-leaf `ActivePresentation::frames()` on one publication
+- Preserves: workspace compilation by retaining an unhandled sealed `MountRequest` in one private ECS holder; Task 6 remains the only slice that consumes it and implements physical mount staging
 
 - [ ] **Step 1: Write happy-path engine RED**
 
@@ -429,16 +432,17 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core -
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib ids::tests::branch_reservation_
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --test public_api
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_view
+cargo check --locked --workspace --all-targets --all-features -j 1 --config "build.rustc-wrapper = ''"
 ```
 
-Expected: full Core engine and View suites pass
+Expected: full Core engine and View suites pass and every workspace consumer remains exhaustive
 
 - [ ] **Step 7: Review and commit**
 
 Review gate: child task cannot exist before exact registered-slot completion and final mount confirmation, active publication contains one ordered branch, Root semantics stay green
 
 ```powershell
-git add -- crates/bevy_ui_router_core/src/engine.rs crates/bevy_ui_router_core/src/integration.rs crates/bevy_ui_router_core/src/cleanup.rs crates/bevy_ui_router_core/src/frame.rs crates/bevy_ui_router_core/src/ids.rs crates/bevy_ui_router_core/src/trace.rs crates/bevy_ui_router_view/src/lib.rs crates/bevy_ui_router_view/src/effect.rs
+git add -- crates/bevy_ui_router_core/src/engine.rs crates/bevy_ui_router_core/src/integration.rs crates/bevy_ui_router_core/src/cleanup.rs crates/bevy_ui_router_core/src/frame.rs crates/bevy_ui_router_core/src/ids.rs crates/bevy_ui_router_core/src/trace.rs crates/bevy_ui_router_view/src/lib.rs crates/bevy_ui_router_view/src/effect.rs crates/bevy_ui_router_ecs/src/navigation.rs crates/bevy_ui_router_ecs/src/snapshots.rs
 git diff --cached --name-only
 git diff --cached --check
 git commit -m "feat(core): schedule nested frame branches"
