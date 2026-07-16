@@ -565,6 +565,9 @@ git commit -m "feat(core): settle nested failures before terminal"
 - Modify: `crates/bevy_ui_router_ecs/src/registry.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/presentation.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/content.rs`
+- Modify: `crates/bevy_ui_router_ecs/src/host.rs` (HostTopSlot provisional-owner wrapper migration only)
+- Modify: `crates/bevy_ui_router_ecs/src/cleanup.rs` (test fixture wrapper migration only)
+- Modify: `crates/bevy_ui_router_ecs/src/navigation.rs` (test fixture wrapper migration only)
 
 **Interfaces:**
 - Consumes: `AcceptedOutlet` and Core `MountGrant`
@@ -684,7 +687,7 @@ Expected: exact staging, drift rejection and all existing Root physical tests pa
 Review gate: registry-first is physically ordered, every observer-capable write is followed by exact validation, app-owned host is untouched
 
 ```powershell
-git add -- crates/bevy_ui_router_ecs/src/mount.rs crates/bevy_ui_router_ecs/src/lib.rs crates/bevy_ui_router_ecs/src/components.rs crates/bevy_ui_router_ecs/src/registry.rs crates/bevy_ui_router_ecs/src/presentation.rs crates/bevy_ui_router_ecs/src/content.rs
+git add -- crates/bevy_ui_router_ecs/src/mount.rs crates/bevy_ui_router_ecs/src/lib.rs crates/bevy_ui_router_ecs/src/components.rs crates/bevy_ui_router_ecs/src/registry.rs crates/bevy_ui_router_ecs/src/presentation.rs crates/bevy_ui_router_ecs/src/content.rs crates/bevy_ui_router_ecs/src/host.rs crates/bevy_ui_router_ecs/src/cleanup.rs crates/bevy_ui_router_ecs/src/navigation.rs
 git diff --cached --name-only
 git diff --cached --check
 git commit -m "feat(ecs): stage exact child outlet slots"
