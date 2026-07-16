@@ -7,7 +7,8 @@ use bevy_ecs::{
     prelude::{Entity, Resource, World},
 };
 use bevy_ui_router_core::{
-    HostVersion, frame::RouteFrameVersion, ids::RouteSlotId, slot::RouteSlotKey,
+    HostVersion, frame::RouteFrameVersion, ids::RouteSlotId,
+    integration::frame_versions_share_router, slot::RouteSlotKey,
 };
 
 use crate::cleanup::VerifiedCleanupQuarantineTransfer;
@@ -61,9 +62,75 @@ impl ProvisionalTopSlotOwner {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProvisionalOwner {
+    HostTopSlot(ProvisionalTopSlotOwner),
+    ChildSlot {
+        parent: RouteFrameVersion,
+        outlet: RouteSlotKey,
+        slot: RouteSlotId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RegistryOwner {
     Committed(EntityOwner),
-    Provisional(ProvisionalTopSlotOwner),
+    Provisional(ProvisionalOwner),
+}
+
+impl RegistryOwner {
+    fn child_binding(&self) -> Option<(&RouteFrameVersion, &RouteSlotKey, RouteSlotId)> {
+        match self {
+            Self::Committed(EntityOwner::ChildSlot {
+                parent,
+                outlet,
+                slot,
+            })
+            | Self::Provisional(ProvisionalOwner::ChildSlot {
+                parent,
+                outlet,
+                slot,
+            }) => Some((parent, outlet, *slot)),
+            _ => None,
+        }
+    }
+
+    fn conflicts_with(&self, other: &Self) -> bool {
+        if self == other {
+            return true;
+        }
+        let (
+            Some((left_parent, left_outlet, left_slot)),
+            Some((right_parent, right_outlet, right_slot)),
+        ) = (self.child_binding(), other.child_binding())
+        else {
+            return false;
+        };
+        (left_parent == right_parent && left_outlet == right_outlet)
+            || (frame_versions_share_router(left_parent, right_parent) && left_slot == right_slot)
+    }
+
+    fn allows_exact_owner_transition(&self, next: &Self) -> bool {
+        match (self, next) {
+            (
+                Self::Provisional(ProvisionalOwner::ChildSlot {
+                    parent: current_parent,
+                    outlet: current_outlet,
+                    slot: current_slot,
+                }),
+                Self::Committed(EntityOwner::ChildSlot {
+                    parent: next_parent,
+                    outlet: next_outlet,
+                    slot: next_slot,
+                }),
+            ) => {
+                current_parent == next_parent
+                    && current_outlet == next_outlet
+                    && current_slot == next_slot
+            }
+            (Self::Provisional(ProvisionalOwner::ChildSlot { .. }), _) => false,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -192,6 +259,13 @@ impl ExactRegistryClaim {
     pub(crate) const fn lifecycle(&self) -> EntityLifecycle {
         self.lifecycle
     }
+
+    pub(crate) const fn opaque_digest_part(&self) -> u64 {
+        self.entity.to_bits()
+            ^ self.seal.domain.rotate_left(11)
+            ^ self.seal.sequence.rotate_left(29)
+            ^ (self.lifecycle as u64).rotate_left(47)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,6 +306,14 @@ impl RouteEntityRegistry {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn latest_issued_seal(&self) -> Option<OwnershipSeal> {
+        (self.next_seal_sequence != 0).then_some(OwnershipSeal {
+            domain: self.seal_domain,
+            sequence: self.next_seal_sequence,
+        })
+    }
+
     pub(crate) fn register(
         &mut self,
         entity: Entity,
@@ -252,7 +334,11 @@ impl RouteEntityRegistry {
         if self.records.iter().any(|record| record.entity == entity) {
             return Err(RegistryWriteError::DuplicateEntity);
         }
-        if self.records.iter().any(|record| record.owner == owner) {
+        if self
+            .records
+            .iter()
+            .any(|record| record.owner.conflicts_with(&owner))
+        {
             return Err(RegistryWriteError::DuplicateOwner);
         }
         self.consumed_seal_sequences.push(seal.sequence);
@@ -323,10 +409,11 @@ impl RouteEntityRegistry {
         claim: &ExactRegistryClaim,
         owner: RegistryOwner,
     ) -> Option<ExactRegistryClaim> {
-        if self
-            .records
-            .iter()
-            .any(|record| record.owner == owner && record.entity != claim.entity)
+        if !claim.owner.allows_exact_owner_transition(&owner)
+            || self
+                .records
+                .iter()
+                .any(|record| record.entity != claim.entity && record.owner.conflicts_with(&owner))
         {
             return None;
         }
@@ -349,6 +436,39 @@ impl RouteEntityRegistry {
             .find(|record| record.claim() == *claim)?;
         record.manifest = manifest;
         Some(record.claim())
+    }
+
+    pub(crate) fn compare_exchange_manifest_exact(
+        &mut self,
+        claim: &ExactRegistryClaim,
+        expected_old: &ComponentManifest,
+        manifest: ComponentManifest,
+    ) -> bool {
+        self.compare_exchange_manifests_exact(&[(claim.clone(), expected_old.clone(), manifest)])
+    }
+
+    pub(crate) fn compare_exchange_manifests_exact(
+        &mut self,
+        exchanges: &[(ExactRegistryClaim, ComponentManifest, ComponentManifest)],
+    ) -> bool {
+        let mut indices = Vec::with_capacity(exchanges.len());
+        for (claim, expected_old, _) in exchanges {
+            let Some(index) = self
+                .records
+                .iter()
+                .position(|record| record.claim() == *claim && record.manifest() == expected_old)
+            else {
+                return false;
+            };
+            if indices.contains(&index) {
+                return false;
+            }
+            indices.push(index);
+        }
+        for (index, (_, _, manifest)) in indices.into_iter().zip(exchanges) {
+            self.records[index].manifest = manifest.clone();
+        }
+        true
     }
 
     pub(crate) fn remove_exact(&mut self, claim: &ExactRegistryClaim) -> bool {
@@ -785,6 +905,59 @@ impl Default for QuarantineLeaseTable {
 mod tests {
     use super::*;
     use crate::host::HostCandidateRevision;
+    use bevy_ui_router_core::{
+        integration::{EngineAction, RouterEngine},
+        prelude::{RouteLocation, RoutePattern, RouteTree, RouteViewKey},
+    };
+
+    fn frame_fixture() -> RouteFrameVersion {
+        let tree = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                bevy_ui_router_core::prelude::RouteNodeOptions::new()
+                    .with_view(RouteViewKey::new("root").unwrap()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut engine =
+            RouterEngine::install(tree, RouteViewKey::new("fallback").unwrap()).unwrap();
+        let token = engine.request_host_admission().unwrap();
+        let grant = engine.grant_host_admission(&token).unwrap();
+        engine.confirm_host(grant);
+        engine.push(RouteLocation::new("/")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("frame task expected")
+        };
+        task.frame().clone()
+    }
+
+    fn child_owner_fixture() -> (RouteFrameVersion, RouteSlotId, RouteSlotId) {
+        let mut engine = RouterEngine::install(
+            bevy_ui_router_core::test_support::nested_items_view_route_tree(),
+            RouteViewKey::new("fallback").unwrap(),
+        )
+        .unwrap();
+        let token = engine.request_host_admission().unwrap();
+        let grant = engine.grant_host_admission(&token).unwrap();
+        engine.confirm_host(grant);
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("parent frame task expected")
+        };
+        let parent_frame = parent.frame().clone();
+        let top_slot = parent_frame.slot();
+        engine
+            .report_applied_with_outlets(parent, vec![RouteSlotKey::default()])
+            .unwrap();
+        let EngineAction::MountRequest(request) = engine.action().unwrap() else {
+            panic!("child mount request expected")
+        };
+        let child_slot = engine.resolve_mount(request).unwrap().slot();
+        (parent_frame, top_slot, child_slot)
+    }
 
     #[test]
     fn exhausted_registry_domains_never_wrap_or_reuse_authority() {
@@ -831,7 +1004,7 @@ mod tests {
         registry
             .register(
                 first,
-                RegistryOwner::Provisional(owner.clone()),
+                RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(owner.clone())),
                 first_seal,
                 manifest.clone(),
                 EntityLifecycle::PreparedInert,
@@ -841,7 +1014,7 @@ mod tests {
         assert_eq!(
             registry.register(
                 first,
-                RegistryOwner::Provisional(other_owner.clone()),
+                RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(other_owner.clone())),
                 second_seal,
                 manifest.clone(),
                 EntityLifecycle::PreparedInert
@@ -851,7 +1024,7 @@ mod tests {
         assert_eq!(
             registry.register(
                 second,
-                RegistryOwner::Provisional(owner),
+                RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(owner)),
                 second_seal,
                 manifest.clone(),
                 EntityLifecycle::PreparedInert
@@ -861,7 +1034,7 @@ mod tests {
         assert_eq!(
             registry.register(
                 second,
-                RegistryOwner::Provisional(other_owner),
+                RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(other_owner)),
                 first_seal,
                 manifest,
                 EntityLifecycle::PreparedInert
@@ -872,13 +1045,250 @@ mod tests {
     }
 
     #[test]
+    fn provisional_child_owner_preserves_unique_owner_seal_and_exact_cas() {
+        let mut registry = RouteEntityRegistry::new();
+        let mut world = World::new();
+        let first = world.spawn_empty().id();
+        let duplicate = world.spawn_empty().id();
+        let parent = frame_fixture();
+        let slot = parent.slot();
+        let outlet = RouteSlotKey::default();
+        let owner = ProvisionalOwner::ChildSlot {
+            parent: parent.clone(),
+            outlet: outlet.clone(),
+            slot,
+        };
+        let first_seal = registry.issue_seal();
+        let duplicate_seal = registry.issue_seal();
+
+        registry
+            .register(
+                first,
+                RegistryOwner::Provisional(owner.clone()),
+                first_seal,
+                ComponentManifest::new([]),
+                EntityLifecycle::PreparedInert,
+            )
+            .unwrap();
+        let provisional = registry.record(first).unwrap().claim();
+        let baseline = registry.records().to_vec();
+        assert_eq!(
+            registry.register(
+                duplicate,
+                RegistryOwner::Provisional(owner),
+                duplicate_seal,
+                ComponentManifest::new([]),
+                EntityLifecycle::PreparedInert,
+            ),
+            Err(RegistryWriteError::DuplicateOwner)
+        );
+        assert_eq!(registry.records(), baseline);
+
+        let committed_owner = RegistryOwner::Committed(EntityOwner::ChildSlot {
+            parent,
+            outlet,
+            slot,
+        });
+        let committed = registry
+            .compare_exchange_owner(&provisional, committed_owner.clone())
+            .expect("exact provisional child claim should commit once");
+        assert!(
+            registry
+                .compare_exchange_owner(&provisional, committed_owner)
+                .is_none()
+        );
+        assert_eq!(registry.record(first).unwrap().claim(), committed);
+    }
+
+    #[test]
+    fn child_owner_uniqueness_crosses_provisional_committed_location_and_router_slot() {
+        let (parent, other_slot, child_slot) = child_owner_fixture();
+        assert_ne!(other_slot, child_slot);
+        let outlet = RouteSlotKey::default();
+        let other_outlet = RouteSlotKey::named("other").unwrap();
+
+        let mut registry = RouteEntityRegistry::new();
+        let mut world = World::new();
+        let first = world.spawn_empty().id();
+        let same_location = world.spawn_empty().id();
+        let same_slot = world.spawn_empty().id();
+        let first_seal = registry.issue_seal();
+        let location_seal = registry.issue_seal();
+        let slot_seal = registry.issue_seal();
+        registry
+            .register(
+                first,
+                RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
+                    parent: parent.clone(),
+                    outlet: outlet.clone(),
+                    slot: child_slot,
+                }),
+                first_seal,
+                ComponentManifest::new([]),
+                EntityLifecycle::PreparedInert,
+            )
+            .unwrap();
+        let baseline = registry.records().to_vec();
+        assert_eq!(
+            registry.register(
+                same_location,
+                RegistryOwner::Committed(EntityOwner::ChildSlot {
+                    parent: parent.clone(),
+                    outlet: outlet.clone(),
+                    slot: other_slot,
+                }),
+                location_seal,
+                ComponentManifest::new([]),
+                EntityLifecycle::PreparedInert,
+            ),
+            Err(RegistryWriteError::DuplicateOwner)
+        );
+        assert_eq!(registry.records(), baseline);
+        assert_eq!(
+            registry.register(
+                same_slot,
+                RegistryOwner::Committed(EntityOwner::ChildSlot {
+                    parent,
+                    outlet: other_outlet,
+                    slot: child_slot,
+                }),
+                slot_seal,
+                ComponentManifest::new([]),
+                EntityLifecycle::PreparedInert,
+            ),
+            Err(RegistryWriteError::DuplicateOwner)
+        );
+        assert_eq!(registry.records(), baseline);
+    }
+
+    #[test]
+    fn child_owner_uniqueness_keeps_opaque_router_instances_independent() {
+        let (first_parent, _, first_child_slot) = child_owner_fixture();
+        let (second_parent, _, second_child_slot) = child_owner_fixture();
+        assert_eq!(first_parent.router(), second_parent.router());
+        assert_eq!(first_child_slot, second_child_slot);
+        assert!(!frame_versions_share_router(&first_parent, &second_parent));
+
+        let mut registry = RouteEntityRegistry::new();
+        let mut world = World::new();
+        let first = world.spawn_empty().id();
+        let second = world.spawn_empty().id();
+        let first_seal = registry.issue_seal();
+        let second_seal = registry.issue_seal();
+        let outlet = RouteSlotKey::default();
+        registry
+            .register(
+                first,
+                RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
+                    parent: first_parent,
+                    outlet: outlet.clone(),
+                    slot: first_child_slot,
+                }),
+                first_seal,
+                ComponentManifest::new([]),
+                EntityLifecycle::PreparedInert,
+            )
+            .unwrap();
+        registry
+            .register(
+                second,
+                RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
+                    parent: second_parent,
+                    outlet,
+                    slot: second_child_slot,
+                }),
+                second_seal,
+                ComponentManifest::new([]),
+                EntityLifecycle::PreparedInert,
+            )
+            .expect("separate opaque router instances may reuse raw slot projections");
+    }
+
+    #[test]
+    fn exact_manifest_cas_rejects_stale_old_manifest_without_write() {
+        let mut registry = RouteEntityRegistry::new();
+        let mut world = World::new();
+        let entity = world.spawn_empty().id();
+        let seal = registry.issue_seal();
+        registry
+            .register(
+                entity,
+                RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
+                    ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(31)),
+                )),
+                seal,
+                ComponentManifest::new([]),
+                EntityLifecycle::PreparedInert,
+            )
+            .unwrap();
+        let claim = registry.record(entity).unwrap().claim();
+        let old = registry.record(entity).unwrap().manifest().clone();
+        let component = world.register_component::<A>();
+        let next = ComponentManifest::new([component]);
+
+        assert!(!registry.compare_exchange_manifest_exact(&claim, &next, next.clone()));
+        assert_eq!(registry.record(entity).unwrap().manifest(), &old);
+        assert!(registry.compare_exchange_manifest_exact(&claim, &old, next.clone()));
+        assert_eq!(registry.record(entity).unwrap().manifest(), &next);
+        assert!(!registry.compare_exchange_manifest_exact(&claim, &old, old.clone()));
+        assert_eq!(registry.record(entity).unwrap().manifest(), &next);
+    }
+
+    #[test]
+    fn exact_manifest_batch_is_atomic_and_rejects_duplicate_claims() {
+        let mut registry = RouteEntityRegistry::new();
+        let mut world = World::new();
+        let first = world.spawn_empty().id();
+        let second = world.spawn_empty().id();
+        for (entity, revision) in [(first, 41), (second, 43)] {
+            let seal = registry.issue_seal();
+            registry
+                .register(
+                    entity,
+                    RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
+                        ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(revision)),
+                    )),
+                    seal,
+                    ComponentManifest::new([]),
+                    EntityLifecycle::PreparedInert,
+                )
+                .unwrap();
+        }
+        let first_claim = registry.record(first).unwrap().claim();
+        let second_claim = registry.record(second).unwrap().claim();
+        let empty = ComponentManifest::new([]);
+        let a = ComponentManifest::new([world.register_component::<A>()]);
+        let b = ComponentManifest::new([world.register_component::<B>()]);
+        let stale = ComponentManifest::new([
+            world.register_component::<A>(),
+            world.register_component::<B>(),
+        ]);
+        let baseline = registry.records().to_vec();
+
+        assert!(!registry.compare_exchange_manifests_exact(&[
+            (first_claim.clone(), empty.clone(), a.clone()),
+            (second_claim.clone(), stale, b.clone()),
+        ]));
+        assert_eq!(registry.records(), baseline);
+        assert!(!registry.compare_exchange_manifests_exact(&[
+            (first_claim.clone(), empty.clone(), a.clone()),
+            (first_claim, empty.clone(), b),
+        ]));
+        assert_eq!(registry.records(), baseline);
+        assert!(registry.compare_exchange_manifests_exact(&[
+            (registry.record(first).unwrap().claim(), empty.clone(), a),
+            (second_claim, empty, ComponentManifest::new([])),
+        ]));
+    }
+
+    #[test]
     fn registry_rejects_foreign_zero_and_unissued_seals_without_partial_write() {
         let mut registry = RouteEntityRegistry::new();
         let mut foreign = RouteEntityRegistry::new();
         let mut world = World::new();
         let entity = world.spawn_empty().id();
-        let owner = RegistryOwner::Provisional(ProvisionalTopSlotOwner::new(
-            HostCandidateRevision::fixture(8),
+        let owner = RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
+            ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(8)),
         ));
         let foreign_seal = foreign.issue_seal();
         for seal in [
@@ -907,8 +1317,8 @@ mod tests {
         let mut world = World::new();
         let entity = world.spawn_empty().id();
         let seal = registry.issue_seal();
-        let owner = RegistryOwner::Provisional(ProvisionalTopSlotOwner::new(
-            HostCandidateRevision::fixture(9),
+        let owner = RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
+            ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(9)),
         ));
         registry
             .register(
@@ -942,11 +1352,11 @@ mod tests {
         let second = world.spawn_empty().id();
         let foreign = world.spawn_empty().id();
         let mut registry = RouteEntityRegistry::new();
-        let first_owner = RegistryOwner::Provisional(ProvisionalTopSlotOwner::new(
-            HostCandidateRevision::fixture(1),
+        let first_owner = RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
+            ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(1)),
         ));
-        let second_owner = RegistryOwner::Provisional(ProvisionalTopSlotOwner::new(
-            HostCandidateRevision::fixture(2),
+        let second_owner = RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
+            ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(2)),
         ));
         let first_seal = registry.issue_seal();
         let second_seal = registry.issue_seal();
@@ -998,8 +1408,8 @@ mod tests {
         assert_eq!(
             registry.register(
                 replacement,
-                RegistryOwner::Provisional(ProvisionalTopSlotOwner::new(
-                    HostCandidateRevision::fixture(3),
+                RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
+                    ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(3)),
                 )),
                 first_seal,
                 ComponentManifest::new([]),
@@ -1020,8 +1430,8 @@ mod tests {
         registry
             .register(
                 entity,
-                RegistryOwner::Provisional(ProvisionalTopSlotOwner::new(
-                    HostCandidateRevision::fixture(13),
+                RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
+                    ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(13)),
                 )),
                 seal,
                 ComponentManifest::new([]),

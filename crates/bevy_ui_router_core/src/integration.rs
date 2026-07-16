@@ -224,6 +224,20 @@ pub fn host_version_matches_frame(version: &crate::HostVersion, frame: &RouteFra
     version.router_identity() == frame.router_identity() && version.host() == frame.host()
 }
 
+#[doc(hidden)]
+pub fn frame_versions_share_router(left: &RouteFrameVersion, right: &RouteFrameVersion) -> bool {
+    left.router_identity() == right.router_identity()
+}
+
+#[doc(hidden)]
+pub fn mount_grant_matches_target(
+    grant: &MountGrant,
+    parent: &RouteFrameVersion,
+    outlet: &crate::slot::RouteSlotKey,
+) -> bool {
+    grant.inner.matches_target(parent, outlet)
+}
+
 pub fn root_view(tree: &RouteTree) -> Option<&RouteViewKey> {
     tree.node(tree.root())?.options().view_binding()
 }
@@ -1586,6 +1600,7 @@ mod tests {
             ids.allocate_frame().unwrap(),
             RouteGeneration::initial(),
         );
+        let outlet = crate::slot::RouteSlotKey::named("details").unwrap();
         let mut issuer = MountIssuer::new(router);
         let request_token = issuer
             .issue(
@@ -1593,13 +1608,35 @@ mod tests {
                 host.version().clone(),
                 request,
                 transaction,
-                parent,
-                crate::slot::RouteSlotKey::named("details").unwrap(),
+                parent.clone(),
+                outlet.clone(),
             )
             .unwrap();
         let core_grant = issuer.grant(&request_token, &mut ids).unwrap();
 
         let grant = MountGrant::sealed(core_grant);
+        let mut foreign_ids = CoreIdAllocator::new().unwrap();
+        let foreign_parent = RouteFrameVersion::new(
+            foreign_ids.allocate_router_identity().unwrap(),
+            foreign_ids.allocate_host().unwrap(),
+            foreign_ids.allocate_slot().unwrap(),
+            FrameOrigin::RouterFallback,
+            foreign_ids.allocate_frame().unwrap(),
+            RouteGeneration::initial(),
+        );
+        assert_eq!(parent.router(), foreign_parent.router());
+        assert_eq!(parent.host(), foreign_parent.host());
+        assert!(mount_grant_matches_target(&grant, &parent, &outlet));
+        assert!(!mount_grant_matches_target(
+            &grant,
+            &parent,
+            &crate::slot::RouteSlotKey::named("other").unwrap()
+        ));
+        assert!(!mount_grant_matches_target(
+            &grant,
+            &foreign_parent,
+            &outlet
+        ));
         let slot = grant.slot();
         let receipt = grant.attest_receipt(67);
         let core_permit = issuer.accept_receipt(&receipt.inner).unwrap();
@@ -1610,6 +1647,44 @@ mod tests {
         let confirmation = issuer.complete_registration(&completion.inner).unwrap();
         assert_eq!(confirmation.slot(), slot);
         assert!(confirmation.has_valid_binding());
+    }
+
+    #[test]
+    fn frame_router_match_uses_opaque_identity_not_raw_projection() {
+        let mut first = CoreIdAllocator::new().unwrap();
+        let first_router = first.allocate_router_identity().unwrap();
+        let first_frame = RouteFrameVersion::new(
+            first_router,
+            first.allocate_host().unwrap(),
+            first.allocate_slot().unwrap(),
+            FrameOrigin::RouterFallback,
+            first.allocate_frame().unwrap(),
+            RouteGeneration::initial(),
+        );
+        let same_router_frame = RouteFrameVersion::new(
+            first_router,
+            first.allocate_host().unwrap(),
+            first.allocate_slot().unwrap(),
+            FrameOrigin::RouterFallback,
+            first.allocate_frame().unwrap(),
+            RouteGeneration::initial(),
+        );
+        let mut second = CoreIdAllocator::new().unwrap();
+        let foreign_frame = RouteFrameVersion::new(
+            second.allocate_router_identity().unwrap(),
+            second.allocate_host().unwrap(),
+            second.allocate_slot().unwrap(),
+            FrameOrigin::RouterFallback,
+            second.allocate_frame().unwrap(),
+            RouteGeneration::initial(),
+        );
+
+        assert_eq!(first_frame.router(), foreign_frame.router());
+        assert!(frame_versions_share_router(
+            &first_frame,
+            &same_router_frame
+        ));
+        assert!(!frame_versions_share_router(&first_frame, &foreign_frame));
     }
 
     fn ready_engine() -> (RouterEngine, HostGrant) {

@@ -22,9 +22,9 @@ use crate::components::{
 };
 use crate::input::RouteFocusState;
 use crate::registry::{
-    ComponentManifest, EntityLifecycle, EntityOwner, ExactRegistryClaim, ProvisionalTopSlotOwner,
-    QuarantineFacts, QuarantineLeaseTable, RegistryOwner, RouteEntityRegistry,
-    apply_prepared_quarantine_transfer, prepare_verified_quarantine_transfer,
+    ComponentManifest, EntityLifecycle, EntityOwner, ExactRegistryClaim, ProvisionalOwner,
+    ProvisionalTopSlotOwner, QuarantineFacts, QuarantineLeaseTable, RegistryOwner,
+    RouteEntityRegistry, apply_prepared_quarantine_transfer, prepare_verified_quarantine_transfer,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -613,7 +613,7 @@ pub(crate) fn stage_provisional_top_slot(
         if registry
             .register(
                 slot,
-                RegistryOwner::Provisional(owner.clone()),
+                RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(owner.clone())),
                 seal,
                 manifest.clone(),
                 EntityLifecycle::PreparedInert,
@@ -743,7 +743,8 @@ fn validate_provisional_slot(
         return false;
     };
     let registry_valid = record.claim() == *claim
-        && record.owner() == &RegistryOwner::Provisional(owner.clone())
+        && record.owner()
+            == &RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(owner.clone()))
         && record.seal() == seal
         && record.lifecycle() == EntityLifecycle::PreparedInert
         && record.manifest() == manifest

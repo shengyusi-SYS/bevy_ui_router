@@ -462,6 +462,12 @@ impl MountGrant {
         self.slot
     }
 
+    pub(crate) fn matches_target(&self, parent: &RouteFrameVersion, outlet: &RouteSlotKey) -> bool {
+        self.has_valid_binding()
+            && &self.identity.parent == parent
+            && &self.identity.outlet == outlet
+    }
+
     pub(crate) fn attest_receipt(self, digest: MountReceiptDigest) -> MountReceiptAttestation {
         self.attest_receipt_with_proof(digest).0
     }

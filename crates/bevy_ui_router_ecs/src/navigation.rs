@@ -904,8 +904,8 @@ pub(crate) mod tests {
         plugin::{BevyUiRouterPlugin, RouterScheduleSet},
         presentation::FrameOutput,
         registry::{
-            ComponentManifest, EntityOwner, ProvisionalTopSlotOwner, QuarantineLeaseTable,
-            RegistryOwner,
+            ComponentManifest, EntityOwner, ProvisionalOwner, ProvisionalTopSlotOwner,
+            QuarantineLeaseTable, RegistryOwner,
         },
     };
     use bevy_app::{App, PostUpdate, PreUpdate, Update};
@@ -3578,7 +3578,9 @@ pub(crate) mod tests {
             registry
                 .register(
                     blocker,
-                    RegistryOwner::Provisional(ProvisionalTopSlotOwner::new(revision)),
+                    RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
+                        ProvisionalTopSlotOwner::new(revision),
+                    )),
                     seal,
                     ComponentManifest::new(Vec::new()),
                     EntityLifecycle::PreparedInert,

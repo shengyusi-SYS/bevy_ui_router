@@ -12,13 +12,19 @@ use bevy_ecs::{
 use bevy_input_focus::InputFocus;
 use bevy_picking::{Pickable, hover::PickingInteraction};
 use bevy_ui::{BackgroundColor, ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Node, Val};
-use bevy_ui_router_core::{frame::RouteFrameVersion, integration::host_version_matches_frame};
+use bevy_ui_router_core::{
+    frame::RouteFrameVersion,
+    integration::{
+        FrameMountTarget, FrameTask, frame_versions_share_router, host_version_matches_frame,
+    },
+};
 
 use crate::{
-    components::{RouteOwnershipSeal, RouterInputBarrier},
+    components::{ChildSlotAuthority, ChildSlotLifecycle, RouteOwnershipSeal, RouterInputBarrier},
     content::{AcceptedContentPlan, RealizedContentKind},
     host::{ValidatedHostCandidate, validated_host_candidate_is_current},
     input::RouteFocusState,
+    mount::MountedChildSlot,
     registry::{
         ComponentManifest, EntityLifecycle, EntityOwner, ExactRegistryClaim, QuarantineFacts,
         QuarantineLeaseTable, RegistryOwner, RouteEntityRegistry,
@@ -27,11 +33,78 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+use crate::components::{
+    ChildSlotAuthorityProbe, ChildSlotBarrierProbe, ChildSlotNodeProbe, ChildSlotRelationshipProbe,
+};
+
+#[derive(Clone, Debug)]
+pub(crate) struct FrameMountBinding {
+    slot: Entity,
+    slot_claim: ExactRegistryClaim,
+    kind: FrameMountBindingKind,
+}
+
+#[derive(Clone, Debug)]
+enum FrameMountBindingKind {
+    HostTop,
+    ChildOutlet {
+        parent: RouteFrameVersion,
+        outlet: bevy_ui_router_core::slot::RouteSlotKey,
+        anchor: Entity,
+        anchor_claim: ExactRegistryClaim,
+        expected_anchor_children: Vec<Entity>,
+    },
+}
+
+impl FrameMountBinding {
+    fn host_top(slot: Entity, slot_claim: ExactRegistryClaim) -> Self {
+        Self {
+            slot,
+            slot_claim,
+            kind: FrameMountBindingKind::HostTop,
+        }
+    }
+
+    fn from_mounted_child_slot(mounted: &MountedChildSlot) -> Self {
+        Self {
+            slot: mounted.slot(),
+            slot_claim: mounted.slot_claim().clone(),
+            kind: FrameMountBindingKind::ChildOutlet {
+                parent: mounted.parent().clone(),
+                outlet: mounted.outlet().clone(),
+                anchor: mounted.anchor(),
+                anchor_claim: mounted.anchor_claim().clone(),
+                expected_anchor_children: mounted.expected_anchor_children().to_vec(),
+            },
+        }
+    }
+
+    pub(crate) const fn slot(&self) -> Entity {
+        self.slot
+    }
+
+    pub(crate) const fn slot_claim(&self) -> &ExactRegistryClaim {
+        &self.slot_claim
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn is_child_outlet(&self) -> bool {
+        matches!(self.kind, FrameMountBindingKind::ChildOutlet { .. })
+    }
+}
+
 #[derive(Component, Clone, Debug, Eq, PartialEq)]
 struct FrameShell(RouteFrameVersion);
 
 #[derive(Component, Clone, Debug, Eq, PartialEq)]
 struct FrameContentTarget(RouteFrameVersion);
+
+#[cfg(test)]
+#[derive(bevy_ecs::prelude::Resource)]
+struct MountChildrenManifestCasDriftProbe {
+    entity: Entity,
+}
 
 #[derive(Component, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FrameOutput {
@@ -60,14 +133,41 @@ struct RealizedEntity {
     solid_rect: Option<crate::content::SolidRect>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct RealizedOutlet {
+    parent: RouteFrameVersion,
+    key: bevy_ui_router_core::slot::RouteSlotKey,
+    anchor: Entity,
+    anchor_claim: ExactRegistryClaim,
+}
+
+impl RealizedOutlet {
+    pub(crate) const fn parent(&self) -> &RouteFrameVersion {
+        &self.parent
+    }
+
+    pub(crate) const fn key(&self) -> &bevy_ui_router_core::slot::RouteSlotKey {
+        &self.key
+    }
+
+    pub(crate) const fn anchor(&self) -> Entity {
+        self.anchor
+    }
+
+    pub(crate) const fn anchor_claim(&self) -> &ExactRegistryClaim {
+        &self.anchor_claim
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct RealizedFrame {
     frame: RouteFrameVersion,
     host_candidate: ValidatedHostCandidate,
-    top_slot: Entity,
-    top_slot_claim: ExactRegistryClaim,
+    mount: FrameMountBinding,
+    prior_mount_children: Vec<Entity>,
     shell: Entity,
     entities: Vec<RealizedEntity>,
+    outlets: Vec<RealizedOutlet>,
     prewrite_complete: bool,
 }
 
@@ -170,7 +270,22 @@ impl RealizedFrame {
     }
 
     pub(crate) const fn top_slot(&self) -> Entity {
-        self.top_slot
+        self.mount.slot
+    }
+
+    pub(crate) const fn mount_binding(&self) -> &FrameMountBinding {
+        &self.mount
+    }
+
+    pub(crate) fn outlet(
+        &self,
+        key: &bevy_ui_router_core::slot::RouteSlotKey,
+    ) -> Option<&RealizedOutlet> {
+        self.outlets.iter().find(|outlet| outlet.key() == key)
+    }
+
+    pub(crate) fn outlets(&self) -> &[RealizedOutlet] {
+        &self.outlets
     }
 
     pub(crate) fn cleanup_members(
@@ -250,6 +365,7 @@ impl RealizedFrame {
 pub(crate) enum RealizationError {
     MissingTopSlot,
     InvalidTopSlot,
+    InvalidMount,
     RegistryRejected,
     PostWriteDrift,
 }
@@ -318,15 +434,99 @@ pub(crate) fn realize_frame_deferred(
     output: u64,
     plan: AcceptedContentPlan,
 ) -> Result<RealizedFrame, DeferredRealizationFailure> {
+    realize_frame_with_binding_deferred(
+        world,
+        host_candidate,
+        FrameMountBinding::host_top(top_slot, top_slot_claim),
+        frame,
+        output,
+        plan,
+    )
+}
+
+pub(crate) fn realize_child_frame_deferred(
+    world: &mut World,
+    parent: &RealizedFrame,
+    mounted: &MountedChildSlot,
+    task: &FrameTask,
+    output: u64,
+    plan: AcceptedContentPlan,
+) -> Result<RealizedFrame, DeferredRealizationFailure> {
+    let FrameMountTarget::ChildOutlet {
+        parent: task_parent,
+        outlet: task_outlet,
+    } = task.mount_target()
+    else {
+        return Err(DeferredRealizationFailure::before_complete_frame(
+            RealizationError::InvalidMount,
+        ));
+    };
+    let parent_outlet_is_exact = parent.outlet(mounted.outlet()).is_some_and(|outlet| {
+        outlet.parent() == mounted.parent()
+            && outlet.anchor() == mounted.anchor()
+            && outlet.anchor_claim() == mounted.anchor_claim()
+    });
+    if parent.frame() != mounted.parent()
+        || task_parent != *mounted.parent()
+        || task_outlet != *mounted.outlet()
+        || task.frame().slot() != mounted.slot_id()
+        || !parent_outlet_is_exact
+    {
+        return Err(DeferredRealizationFailure::before_complete_frame(
+            RealizationError::InvalidMount,
+        ));
+    }
+    realize_frame_with_binding_deferred(
+        world,
+        parent.host_candidate.clone(),
+        FrameMountBinding::from_mounted_child_slot(mounted),
+        task.frame().clone(),
+        output,
+        plan,
+    )
+}
+
+fn realize_frame_with_binding_deferred(
+    world: &mut World,
+    host_candidate: ValidatedHostCandidate,
+    mount: FrameMountBinding,
+    frame: RouteFrameVersion,
+    output: u64,
+    plan: AcceptedContentPlan,
+) -> Result<RealizedFrame, DeferredRealizationFailure> {
+    let mount_slot = mount.slot();
     let runtime_components = runtime_ui_component_ids(world);
-    synchronize_manifest_allowing_additions(world, top_slot, &top_slot_claim, &runtime_components)
+    validate_mount_binding_allowing_additions(
+        world,
+        &host_candidate,
+        &mount,
+        &frame,
+        &runtime_components,
+    )
+    .map_err(DeferredRealizationFailure::before_complete_frame)?;
+    synchronize_manifest_allowing_additions(
+        world,
+        mount_slot,
+        mount.slot_claim(),
+        &runtime_components,
+    )
+    .map_err(DeferredRealizationFailure::before_complete_frame)?;
+    validate_mount_binding(world, &host_candidate, &mount, &frame)
         .map_err(DeferredRealizationFailure::before_complete_frame)?;
-    validate_top_slot(world, &host_candidate, top_slot, &top_slot_claim, &frame)
-        .map_err(DeferredRealizationFailure::before_complete_frame)?;
+    let mount_manifest_before_children = world
+        .resource::<RouteEntityRegistry>()
+        .record(mount_slot)
+        .expect("validated mount slot remains registered")
+        .manifest()
+        .clone();
+    let mount_children_before = world
+        .get::<Children>(mount_slot)
+        .map(|children| children.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
     let inherited_runtime_components = world
         .resource::<RouteEntityRegistry>()
-        .record(top_slot)
-        .expect("validated top slot remains registered")
+        .record(mount_slot)
+        .expect("validated mount slot remains registered")
         .manifest()
         .component_ids()
         .iter()
@@ -339,7 +539,7 @@ pub(crate) fn realize_frame_deferred(
         world,
         RegistryOwner::Committed(EntityOwner::FrameShell(frame.clone())),
         RealizedRole::Shell,
-        top_slot,
+        mount_slot,
         true,
         &inherited_runtime_components,
     )
@@ -361,8 +561,8 @@ pub(crate) fn realize_frame_deferred(
             let residual = partial_realized_frame(
                 frame,
                 host_candidate,
-                top_slot,
-                top_slot_claim,
+                mount,
+                mount_children_before,
                 shell_entity,
                 realized,
             );
@@ -411,8 +611,8 @@ pub(crate) fn realize_frame_deferred(
                 let residual = partial_realized_frame(
                     frame,
                     host_candidate,
-                    top_slot,
-                    top_slot_claim,
+                    mount,
+                    mount_children_before,
                     shell_entity,
                     realized,
                 );
@@ -440,32 +640,87 @@ pub(crate) fn realize_frame_deferred(
     }
     world.flush();
 
+    let outlets = plan
+        .outlets()
+        .iter()
+        .map(|outlet| {
+            let anchor = outputs
+                .iter()
+                .find_map(|(index, entity)| (*index == outlet.local_index()).then_some(*entity))
+                .expect("accepted outlet local index must map to a realized output");
+            let anchor_claim = realized
+                .iter()
+                .find(|entity| entity.entity == anchor)
+                .expect("realized outlet anchor must retain its exact claim")
+                .claim
+                .clone();
+            RealizedOutlet {
+                parent: frame.clone(),
+                key: outlet.key().clone(),
+                anchor,
+                anchor_claim,
+            }
+        })
+        .collect();
     let result = RealizedFrame {
         frame,
         host_candidate,
-        top_slot,
-        top_slot_claim,
+        mount,
+        prior_mount_children: mount_children_before,
         shell: realized[0].entity,
         entities: realized,
+        outlets,
         prewrite_complete: true,
     };
     clear_frame_focus(world, &result);
     let children = world.register_component::<Children>();
-    let top_slot_changes = [children];
-    let manifests_valid =
-        synchronize_manifest_allowing(world, top_slot, &result.top_slot_claim, &top_slot_changes)
-            .and_then(|()| {
-                for realized in &result.entities {
-                    if !world
-                        .resource::<RouteEntityRegistry>()
-                        .record(realized.entity)
-                        .is_some_and(|record| record.manifest().matches(world, realized.entity))
-                    {
-                        return Err(RealizationError::PostWriteDrift);
-                    }
+    let mount_slot_changes = [children];
+    #[cfg(test)]
+    apply_mount_children_manifest_cas_drift_probe(world, result.mount.slot());
+    let manifests_valid = if validate_mount_binding_allowing_additions(
+        world,
+        &result.host_candidate,
+        &result.mount,
+        result.frame(),
+        &mount_slot_changes,
+    )
+    .is_err()
+        || !mount_slot_child_order_extended_exactly(
+            world,
+            result.mount.slot(),
+            &result.prior_mount_children,
+            result.shell(),
+        )
+        || !mount_slot_children_are_exact(world, &result)
+    {
+        Err(RealizationError::PostWriteDrift)
+    } else {
+        synchronize_manifest_allowing_from_expected(
+            world,
+            result.mount.slot(),
+            result.mount.slot_claim(),
+            &mount_manifest_before_children,
+            &mount_slot_changes,
+        )
+        .and_then(|()| {
+            if validate_mount_binding(world, &result.host_candidate, &result.mount, result.frame())
+                .is_err()
+                || !mount_slot_children_are_exact(world, &result)
+            {
+                return Err(RealizationError::PostWriteDrift);
+            }
+            for realized in &result.entities {
+                if !world
+                    .resource::<RouteEntityRegistry>()
+                    .record(realized.entity)
+                    .is_some_and(|record| record.manifest().matches(world, realized.entity))
+                {
+                    return Err(RealizationError::PostWriteDrift);
                 }
-                Ok(())
-            });
+            }
+            Ok(())
+        })
+    };
     if let Err(error) = manifests_valid {
         return Err(DeferredRealizationFailure::with_residual(error, result));
     }
@@ -483,8 +738,8 @@ pub(crate) fn realize_frame_deferred(
 fn partial_realized_frame(
     frame: RouteFrameVersion,
     host_candidate: ValidatedHostCandidate,
-    top_slot: Entity,
-    top_slot_claim: ExactRegistryClaim,
+    mount: FrameMountBinding,
+    prior_mount_children: Vec<Entity>,
     shell: Entity,
     entities: Vec<RealizedEntity>,
 ) -> RealizedFrame {
@@ -492,12 +747,149 @@ fn partial_realized_frame(
     RealizedFrame {
         frame,
         host_candidate,
-        top_slot,
-        top_slot_claim,
+        mount,
+        prior_mount_children,
         shell,
         entities,
+        outlets: Vec::new(),
         prewrite_complete: false,
     }
+}
+
+fn validate_mount_binding(
+    world: &World,
+    host_candidate: &ValidatedHostCandidate,
+    mount: &FrameMountBinding,
+    frame: &RouteFrameVersion,
+) -> Result<(), RealizationError> {
+    validate_mount_binding_allowing_additions(world, host_candidate, mount, frame, &[])
+}
+
+fn validate_mount_binding_allowing_additions(
+    world: &World,
+    host_candidate: &ValidatedHostCandidate,
+    mount: &FrameMountBinding,
+    frame: &RouteFrameVersion,
+    allowed_manifest_additions: &[ComponentId],
+) -> Result<(), RealizationError> {
+    match &mount.kind {
+        FrameMountBindingKind::HostTop => validate_top_slot(
+            world,
+            host_candidate,
+            mount.slot,
+            &mount.slot_claim,
+            frame,
+            allowed_manifest_additions,
+        ),
+        FrameMountBindingKind::ChildOutlet {
+            parent,
+            outlet,
+            anchor,
+            anchor_claim,
+            expected_anchor_children,
+        } => validate_child_mount_slot(
+            world,
+            host_candidate,
+            mount.slot,
+            &mount.slot_claim,
+            parent,
+            outlet,
+            *anchor,
+            anchor_claim,
+            expected_anchor_children,
+            frame,
+            allowed_manifest_additions,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_child_mount_slot(
+    world: &World,
+    host_candidate: &ValidatedHostCandidate,
+    slot_entity: Entity,
+    slot_claim: &ExactRegistryClaim,
+    parent: &RouteFrameVersion,
+    outlet: &bevy_ui_router_core::slot::RouteSlotKey,
+    anchor: Entity,
+    anchor_claim: &ExactRegistryClaim,
+    expected_anchor_children: &[Entity],
+    frame: &RouteFrameVersion,
+    allowed_manifest_additions: &[ComponentId],
+) -> Result<(), RealizationError> {
+    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+        return Err(RealizationError::InvalidMount);
+    };
+    let Some(slot_record) = registry.record(slot_entity) else {
+        return Err(RealizationError::InvalidMount);
+    };
+    let Some(anchor_record) = registry.record(anchor) else {
+        return Err(RealizationError::InvalidMount);
+    };
+    let owner_is_exact = matches!(
+        slot_record.owner(),
+        RegistryOwner::Committed(EntityOwner::ChildSlot {
+            parent: owner_parent,
+            outlet: owner_outlet,
+            slot,
+        }) if owner_parent == parent && owner_outlet == outlet && *slot == frame.slot()
+    );
+    let anchor_owner_is_exact = matches!(
+        anchor_record.owner(),
+        RegistryOwner::Committed(EntityOwner::FrameOutput {
+            frame: owner_frame,
+            ..
+        }) if owner_frame == parent
+    );
+    let expected_node = Node {
+        width: Val::Percent(100.0),
+        height: Val::Percent(100.0),
+        ..Node::default()
+    };
+    if !frame_versions_share_router(frame, parent)
+        || frame.host() != parent.host()
+        || slot_record.claim() != *slot_claim
+        || !owner_is_exact
+        || slot_record.lifecycle() != EntityLifecycle::PreparedInert
+        || !manifest_matches_allowing_additions(
+            world,
+            slot_entity,
+            slot_record.manifest(),
+            allowed_manifest_additions,
+        )
+        || world.get::<RouteOwnershipSeal>(slot_entity)
+            != Some(&RouteOwnershipSeal::new(slot_record.seal()))
+        || world.get::<Visibility>(slot_entity) != Some(&Visibility::Hidden)
+        || world.get::<Pickable>(slot_entity) != Some(&Pickable::IGNORE)
+        || !world
+            .get::<RouterInputBarrier>(slot_entity)
+            .is_some_and(RouterInputBarrier::denies_all)
+        || world.get::<Node>(slot_entity) != Some(&expected_node)
+        || world.get::<ChildSlotLifecycle>(slot_entity)
+            != Some(&ChildSlotLifecycle::RegisteredInert)
+        || !world
+            .get::<ChildSlotAuthority>(slot_entity)
+            .is_some_and(|authority| {
+                authority.parent() == parent
+                    && authority.outlet() == outlet
+                    && authority.slot() == frame.slot()
+            })
+        || world.get::<ChildOf>(slot_entity).map(ChildOf::parent) != Some(anchor)
+        || anchor_record.claim() != *anchor_claim
+        || !anchor_owner_is_exact
+        || !anchor_record.manifest().matches(world, anchor)
+        || world.get::<RouteOwnershipSeal>(anchor)
+            != Some(&RouteOwnershipSeal::new(anchor_record.seal()))
+        || world
+            .get::<Children>(anchor)
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default()
+            != expected_anchor_children
+        || !validated_host_candidate_is_current(world, host_candidate)
+    {
+        return Err(RealizationError::InvalidMount);
+    }
+    Ok(())
 }
 
 fn validate_top_slot(
@@ -506,6 +898,7 @@ fn validate_top_slot(
     top_slot: Entity,
     top_slot_claim: &ExactRegistryClaim,
     frame: &RouteFrameVersion,
+    allowed_manifest_additions: &[ComponentId],
 ) -> Result<(), RealizationError> {
     let host_entity = host_candidate.host();
     let record = world
@@ -523,7 +916,12 @@ fn validate_top_slot(
         || *slot != frame.slot()
         || !host_version_matches_frame(host_version, frame)
         || record.lifecycle() != EntityLifecycle::PreparedInert
-        || !record.manifest().matches(world, top_slot)
+        || !manifest_matches_allowing_additions(
+            world,
+            top_slot,
+            record.manifest(),
+            allowed_manifest_additions,
+        )
         || world.get::<ChildOf>(top_slot).map(ChildOf::parent) != Some(host_entity)
         || world.get::<RouteOwnershipSeal>(top_slot)
             != Some(&RouteOwnershipSeal::new(record.seal()))
@@ -540,6 +938,25 @@ fn validate_top_slot(
         return Err(RealizationError::InvalidTopSlot);
     }
     Ok(())
+}
+
+fn manifest_matches_allowing_additions(
+    world: &World,
+    entity: Entity,
+    expected: &ComponentManifest,
+    allowed_additions: &[ComponentId],
+) -> bool {
+    let Some(actual) = ComponentManifest::from_world(world, entity) else {
+        return false;
+    };
+    expected
+        .component_ids()
+        .iter()
+        .all(|id| actual.component_ids().contains(id))
+        && actual
+            .component_ids()
+            .iter()
+            .all(|id| expected.component_ids().contains(id) || allowed_additions.contains(id))
 }
 
 fn allocate_registered(
@@ -746,21 +1163,40 @@ fn runtime_ui_component_ids(world: &mut World) -> [ComponentId; 2] {
 #[cfg(test)]
 pub(crate) fn assert_locked_component_manifest_closure(world: &mut World, frame: &RealizedFrame) {
     let runtime = runtime_ui_component_ids(world);
-    let top_slot_explicit = vec![
-        world.register_component::<Visibility>(),
-        world.register_component::<Pickable>(),
-        world.register_component::<RouterInputBarrier>(),
-        world.register_component::<RouteOwnershipSeal>(),
-        world.register_component::<crate::components::ProvisionalSlotLifecycle>(),
-        world.register_component::<crate::components::ProvisionalStagingProbe>(),
-        world.register_component::<crate::components::ProvisionalPostWriteProbe>(),
-        world.register_component::<Node>(),
-        world.register_component::<ChildOf>(),
-        world.register_component::<Children>(),
-        runtime[0],
-        runtime[1],
-    ];
-    assert_manifest_is_exact(world, frame.top_slot, top_slot_explicit);
+    let mount_slot_explicit = match &frame.mount.kind {
+        FrameMountBindingKind::HostTop => vec![
+            world.register_component::<Visibility>(),
+            world.register_component::<Pickable>(),
+            world.register_component::<RouterInputBarrier>(),
+            world.register_component::<RouteOwnershipSeal>(),
+            world.register_component::<crate::components::ProvisionalSlotLifecycle>(),
+            world.register_component::<crate::components::ProvisionalStagingProbe>(),
+            world.register_component::<crate::components::ProvisionalPostWriteProbe>(),
+            world.register_component::<Node>(),
+            world.register_component::<ChildOf>(),
+            world.register_component::<Children>(),
+            runtime[0],
+            runtime[1],
+        ],
+        FrameMountBindingKind::ChildOutlet { .. } => vec![
+            world.register_component::<Visibility>(),
+            world.register_component::<Pickable>(),
+            world.register_component::<RouterInputBarrier>(),
+            world.register_component::<ChildSlotBarrierProbe>(),
+            world.register_component::<Node>(),
+            world.register_component::<ChildSlotNodeProbe>(),
+            world.register_component::<RouteOwnershipSeal>(),
+            world.register_component::<ChildSlotLifecycle>(),
+            world.register_component::<ChildSlotAuthority>(),
+            world.register_component::<ChildSlotAuthorityProbe>(),
+            world.register_component::<ChildOf>(),
+            world.register_component::<ChildSlotRelationshipProbe>(),
+            world.register_component::<Children>(),
+            runtime[0],
+            runtime[1],
+        ],
+    };
+    assert_manifest_is_exact(world, frame.mount.slot(), mount_slot_explicit);
 
     for realized in &frame.entities {
         let mut explicit = vec![
@@ -855,11 +1291,15 @@ fn synchronize_manifest_allowing_additions(
     {
         return Err(RealizationError::PostWriteDrift);
     }
-    world
+    if !world
         .resource_mut::<RouteEntityRegistry>()
-        .compare_exchange_manifest(claim, actual)
-        .ok_or(RealizationError::InvalidTopSlot)?;
-    Ok(())
+        .compare_exchange_manifest_exact(claim, &expected, actual.clone())
+    {
+        return Err(RealizationError::InvalidMount);
+    }
+    exact_manifest_cas_is_current(world, entity, claim, &actual)
+        .then_some(())
+        .ok_or(RealizationError::PostWriteDrift)
 }
 
 fn synchronize_manifest_allowing(
@@ -874,6 +1314,16 @@ fn synchronize_manifest_allowing(
         .filter(|record| record.claim() == *claim)
         .map(|record| record.manifest().clone())
         .ok_or(RealizationError::InvalidTopSlot)?;
+    synchronize_manifest_allowing_from_expected(world, entity, claim, &expected, allowed_changes)
+}
+
+fn synchronize_manifest_allowing_from_expected(
+    world: &mut World,
+    entity: Entity,
+    claim: &ExactRegistryClaim,
+    expected: &ComponentManifest,
+    allowed_changes: &[ComponentId],
+) -> Result<(), RealizationError> {
     let actual =
         ComponentManifest::from_world(world, entity).ok_or(RealizationError::InvalidTopSlot)?;
     let unexpected_change = actual
@@ -887,23 +1337,36 @@ fn synchronize_manifest_allowing(
     if unexpected_change {
         return Err(RealizationError::PostWriteDrift);
     }
-    world
+    if !world
         .resource_mut::<RouteEntityRegistry>()
-        .compare_exchange_manifest(claim, actual)
-        .ok_or(RealizationError::InvalidTopSlot)?;
-    Ok(())
+        .compare_exchange_manifest_exact(claim, expected, actual.clone())
+    {
+        return Err(RealizationError::InvalidMount);
+    }
+    exact_manifest_cas_is_current(world, entity, claim, &actual)
+        .then_some(())
+        .ok_or(RealizationError::PostWriteDrift)
+}
+
+fn exact_manifest_cas_is_current(
+    world: &World,
+    entity: Entity,
+    claim: &ExactRegistryClaim,
+    expected: &ComponentManifest,
+) -> bool {
+    world
+        .get_resource::<RouteEntityRegistry>()
+        .and_then(|registry| registry.record(entity))
+        .is_some_and(|record| {
+            record.claim() == *claim
+                && record.manifest() == expected
+                && expected.matches(world, entity)
+        })
 }
 
 pub(crate) fn validate_realized_frame(world: &World, frame: &RealizedFrame) -> bool {
-    if validate_top_slot(
-        world,
-        &frame.host_candidate,
-        frame.top_slot,
-        &frame.top_slot_claim,
-        frame.frame(),
-    )
-    .is_err()
-        || !top_slot_children_are_exact(world, frame)
+    if validate_mount_binding(world, &frame.host_candidate, &frame.mount, frame.frame()).is_err()
+        || !mount_slot_children_are_exact(world, frame)
         || frame_focus_is_in_subtree(world, frame)
     {
         return false;
@@ -1106,15 +1569,8 @@ fn classify_committed_frame(
     frame: &RealizedFrame,
     role: CommittedFrameRole,
 ) -> CommittedFramePreflight {
-    if validate_top_slot(
-        world,
-        &frame.host_candidate,
-        frame.top_slot,
-        &frame.top_slot_claim,
-        frame.frame(),
-    )
-    .is_ok()
-        && top_slot_children_are_exact(world, frame)
+    if validate_mount_binding(world, &frame.host_candidate, &frame.mount, frame.frame()).is_ok()
+        && mount_slot_children_are_exact(world, frame)
     {
         // Continue with the role-sensitive closure checks below.
     } else {
@@ -1389,19 +1845,56 @@ fn exact_children_match(world: &World, parent: Entity, expected: Vec<Entity>) ->
     actual == expected
 }
 
-fn top_slot_children_are_exact(world: &World, frame: &RealizedFrame) -> bool {
-    let Some(RegistryOwner::Committed(EntityOwner::HostTopSlot {
-        host: host_version,
-        slot,
-    })) = world
+fn mount_slot_child_order_extended_exactly(
+    world: &World,
+    mount_slot: Entity,
+    prior: &[Entity],
+    shell: Entity,
+) -> bool {
+    let actual = world
+        .get::<Children>(mount_slot)
+        .map(|children| children.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    actual.len() == prior.len() + 1
+        && actual[..prior.len()] == *prior
+        && actual.last() == Some(&shell)
+}
+
+#[cfg(test)]
+fn apply_mount_children_manifest_cas_drift_probe(world: &mut World, mount_slot: Entity) {
+    if !world
+        .get_resource::<MountChildrenManifestCasDriftProbe>()
+        .is_some_and(|probe| probe.entity == mount_slot)
+    {
+        return;
+    }
+    let Some(actual) = ComponentManifest::from_world(world, mount_slot) else {
+        return;
+    };
+    let Some(claim) = world
         .resource::<RouteEntityRegistry>()
-        .record(frame.top_slot)
-        .map(|record| record.owner())
+        .record(mount_slot)
+        .map(|record| record.claim())
     else {
+        return;
+    };
+    let _ = world
+        .resource_mut::<RouteEntityRegistry>()
+        .compare_exchange_manifest(&claim, actual);
+}
+
+fn mount_slot_children_are_exact(world: &World, frame: &RealizedFrame) -> bool {
+    let slot_entity = frame.mount.slot();
+    let registry = world.resource::<RouteEntityRegistry>();
+    let Some(mount_record) = registry.record(slot_entity) else {
         return false;
     };
+    let mount_owner = mount_record.owner();
+    if !frame_version_matches_mount(&frame.mount, mount_owner, frame.frame()) {
+        return false;
+    }
     let children = world
-        .get::<Children>(frame.top_slot)
+        .get::<Children>(slot_entity)
         .map(|children| children.iter().copied().collect::<Vec<_>>())
         .unwrap_or_default();
     if children.is_empty() || !children.contains(&frame.shell) {
@@ -1411,13 +1904,12 @@ fn top_slot_children_are_exact(world: &World, frame: &RealizedFrame) -> bool {
     let mut prepared_shells = 0;
     let mut leaving_shells = 0;
     for child in children {
-        if let Some(record) = world.resource::<RouteEntityRegistry>().record(child) {
+        if let Some(record) = registry.record(child) {
             let RegistryOwner::Committed(EntityOwner::FrameShell(child_frame)) = record.owner()
             else {
                 return false;
             };
-            if child_frame.slot() != *slot
-                || !host_version_matches_frame(host_version, child_frame)
+            if !frame_version_matches_mount(&frame.mount, mount_owner, child_frame)
                 || (child == frame.shell && child_frame != &frame.frame)
                 || (child != frame.shell && child_frame == &frame.frame)
                 || !record.manifest().matches(world, child)
@@ -1426,7 +1918,7 @@ fn top_slot_children_are_exact(world: &World, frame: &RealizedFrame) -> bool {
                     .map(|seal| seal.seal())
                     != Some(record.seal())
                 || world.get::<FrameLifecycle>(child) != Some(&FrameLifecycle(record.lifecycle()))
-                || world.get::<ChildOf>(child).map(ChildOf::parent) != Some(frame.top_slot)
+                || world.get::<ChildOf>(child).map(ChildOf::parent) != Some(slot_entity)
                 || world.get::<Pickable>(child) != Some(&Pickable::IGNORE)
                 || !world
                     .get::<RouterInputBarrier>(child)
@@ -1464,9 +1956,8 @@ fn top_slot_children_are_exact(world: &World, frame: &RealizedFrame) -> bool {
                 matches!(
                     record.owner(),
                     RegistryOwner::Committed(EntityOwner::FrameShell(child_frame))
-                        if child_frame.slot() == *slot
-                            && child_frame != &frame.frame
-                            && host_version_matches_frame(host_version, child_frame)
+                        if child_frame != &frame.frame
+                            && frame_version_matches_mount(&frame.mount, mount_owner, child_frame)
                 ) && matches!(
                     record.lifecycle(),
                     EntityLifecycle::PreparedInert | EntityLifecycle::Leaving
@@ -1480,7 +1971,7 @@ fn top_slot_children_are_exact(world: &World, frame: &RealizedFrame) -> bool {
                     && world
                         .get::<RouterInputBarrier>(child)
                         .is_some_and(RouterInputBarrier::denies_all)
-                    && world.get::<ChildOf>(child).map(ChildOf::parent) == Some(frame.top_slot)
+                    && world.get::<ChildOf>(child).map(ChildOf::parent) == Some(slot_entity)
             })
         {
             continue;
@@ -1492,8 +1983,7 @@ fn top_slot_children_are_exact(world: &World, frame: &RealizedFrame) -> bool {
                 matches!(
                     record.owner(),
                     RegistryOwner::Committed(EntityOwner::FrameShell(child_frame))
-                        if child_frame.slot() == *slot
-                            && host_version_matches_frame(host_version, child_frame)
+                        if frame_version_matches_mount(&frame.mount, mount_owner, child_frame)
                 ) && record.lifecycle() == EntityLifecycle::Quarantined
                     && record.manifest().matches(world, child)
                     && world
@@ -1507,7 +1997,7 @@ fn top_slot_children_are_exact(world: &World, frame: &RealizedFrame) -> bool {
                     && world
                         .get::<RouterInputBarrier>(child)
                         .is_some_and(RouterInputBarrier::denies_all)
-                    && world.get::<ChildOf>(child).map(ChildOf::parent) == Some(frame.top_slot)
+                    && world.get::<ChildOf>(child).map(ChildOf::parent) == Some(slot_entity)
             })
         {
             return false;
@@ -1519,13 +2009,41 @@ fn top_slot_children_are_exact(world: &World, frame: &RealizedFrame) -> bool {
         && !(prepared_shells == 1 && leaving_shells == 1)
 }
 
+fn frame_version_matches_mount(
+    mount: &FrameMountBinding,
+    mount_owner: &RegistryOwner,
+    candidate: &RouteFrameVersion,
+) -> bool {
+    match (&mount.kind, mount_owner) {
+        (
+            FrameMountBindingKind::HostTop,
+            RegistryOwner::Committed(EntityOwner::HostTopSlot { host, slot }),
+        ) => candidate.slot() == *slot && host_version_matches_frame(host, candidate),
+        (
+            FrameMountBindingKind::ChildOutlet { parent, outlet, .. },
+            RegistryOwner::Committed(EntityOwner::ChildSlot {
+                parent: owner_parent,
+                outlet: owner_outlet,
+                slot,
+            }),
+        ) => {
+            owner_parent == parent
+                && owner_outlet == outlet
+                && candidate.slot() == *slot
+                && frame_versions_share_router(candidate, parent)
+                && candidate.host() == parent.host()
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 fn settle_failed_realization(world: &mut World, top_slot: Entity, frame: &RealizedFrame) {
     if quarantine_failed_realization(world, frame) {
         return;
     }
     let children = world.register_component::<Children>();
-    let _ = synchronize_manifest_allowing(world, top_slot, &frame.top_slot_claim, &[children]);
+    let _ = synchronize_manifest_allowing(world, top_slot, frame.mount.slot_claim(), &[children]);
 }
 
 #[cfg(test)]
@@ -1832,6 +2350,7 @@ fn frame_focus_is_in_subtree(world: &World, frame: &RealizedFrame) -> bool {
 fn entity_is_in_frame_subtree(world: &World, frame: &RealizedFrame, focused: Entity) -> bool {
     let mut current = focused;
     let mut visited = HashSet::new();
+    let mut child_below_mount = None;
     loop {
         if frame
             .entities
@@ -1840,12 +2359,19 @@ fn entity_is_in_frame_subtree(world: &World, frame: &RealizedFrame, focused: Ent
         {
             return true;
         }
+        if current == frame.mount.slot() {
+            return child_below_mount
+                .is_none_or(|child| !frame.prior_mount_children.contains(&child));
+        }
         if !visited.insert(current) {
             return false;
         }
         let Some(parent) = world.get::<ChildOf>(current).map(ChildOf::parent) else {
             return false;
         };
+        if parent == frame.mount.slot() {
+            child_below_mount = Some(current);
+        }
         current = parent;
     }
 }
@@ -1944,7 +2470,7 @@ pub(crate) mod tests {
     use bevy_ecs::{component::Component, lifecycle::HookContext, prelude::Resource};
     use bevy_ui_router_core::{
         integration::{EngineAction, RootFrameTask, RouterEngine},
-        prelude::{RouteNodeOptions, RoutePattern, RouteTree, RouteViewKey},
+        prelude::{RouteNodeOptions, RoutePattern, RouteSlotKey, RouteTree, RouteViewKey},
     };
 
     #[derive(Resource, Default)]
@@ -2036,6 +2562,37 @@ pub(crate) mod tests {
         )
         .unwrap();
         (world, host, top_slot, frame)
+    }
+
+    #[test]
+    fn equal_raw_cross_router_frame_cannot_reparent_into_child_mount() {
+        let (_first_world, _, _, first_slot, first_claim, first_task) = pending_frame_fixture();
+        let (_second_world, _, _, _, _, second_task) = pending_frame_fixture();
+        let parent = first_task.frame().clone();
+        let candidate = second_task.frame().clone();
+        assert_eq!(parent.router(), candidate.router());
+        assert_eq!(parent.host(), candidate.host());
+        assert_eq!(parent.slot(), candidate.slot());
+
+        let outlet = RouteSlotKey::default();
+        let mount = FrameMountBinding {
+            slot: first_slot,
+            slot_claim: first_claim.clone(),
+            kind: FrameMountBindingKind::ChildOutlet {
+                parent: parent.clone(),
+                outlet: outlet.clone(),
+                anchor: first_slot,
+                anchor_claim: first_claim,
+                expected_anchor_children: Vec::new(),
+            },
+        };
+        let owner = RegistryOwner::Committed(EntityOwner::ChildSlot {
+            parent,
+            outlet,
+            slot: candidate.slot(),
+        });
+
+        assert!(!frame_version_matches_mount(&mount, &owner, &candidate));
     }
 
     #[test]
@@ -2133,6 +2690,39 @@ pub(crate) mod tests {
         assert_eq!(record.claim(), new_claim);
         assert_eq!(record.manifest(), &manifest);
         assert_eq!(world.iter_entities().count(), entity_count);
+    }
+
+    #[test]
+    fn mount_slot_children_manifest_cas_rejects_registry_drift_after_relationship_write() {
+        let (mut world, _host, candidate, top_slot, top_slot_claim, task) = pending_frame_fixture();
+        world.insert_resource(MountChildrenManifestCasDriftProbe { entity: top_slot });
+
+        let failure = realize_frame_deferred(
+            &mut world,
+            candidate,
+            top_slot,
+            top_slot_claim,
+            task.frame().clone(),
+            task.view_request_sequence(),
+            ContentPlan::new().accept(),
+        )
+        .expect_err("post-relationship registry drift must defeat the frozen manifest CAS");
+        let (error, residual) = failure.into_parts();
+
+        assert_eq!(error, RealizationError::InvalidMount);
+        let residual = residual.expect("written frame entities remain a sealed cleanup residual");
+        assert_eq!(
+            world.get::<ChildOf>(residual.shell()).map(ChildOf::parent),
+            Some(top_slot)
+        );
+        assert!(
+            world
+                .resource::<RouteEntityRegistry>()
+                .record(top_slot)
+                .unwrap()
+                .manifest()
+                .matches(&world, top_slot)
+        );
     }
 
     #[test]
@@ -2256,6 +2846,47 @@ pub(crate) mod tests {
                 ))
         );
         assert!(world.get_entity(host).is_ok());
+    }
+
+    #[test]
+    fn pending_frame_focus_covers_exact_mount_slot_and_its_descendants() {
+        let (mut world, _host, top_slot, frame) = realized_empty_fixture();
+        world.insert_resource(InputFocus::from_entity(top_slot));
+        let mut route_focus = RouteFocusState::default();
+        route_focus.set_focused(Some(top_slot));
+        world.insert_resource(route_focus);
+
+        assert!(frame_focus_is_in_subtree(&world, &frame));
+        clear_frame_focus(&mut world, &frame);
+        assert_eq!(world.resource::<InputFocus>().get(), None);
+        assert_eq!(world.resource::<RouteFocusState>().focused(), None);
+
+        let descendant = world.spawn(ChildOf(top_slot)).id();
+        *world.resource_mut::<InputFocus>() = InputFocus::from_entity(descendant);
+        world
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(descendant));
+        assert!(frame_focus_is_in_subtree(&world, &frame));
+        clear_frame_focus(&mut world, &frame);
+        assert_eq!(world.resource::<InputFocus>().get(), None);
+        assert_eq!(world.resource::<RouteFocusState>().focused(), None);
+    }
+
+    #[test]
+    fn pending_frame_focus_excludes_a_preexisting_mount_child_subtree() {
+        let (mut world, _host, top_slot, mut frame) = realized_empty_fixture();
+        let preexisting = world.spawn(ChildOf(top_slot)).id();
+        let focused = world.spawn(ChildOf(preexisting)).id();
+        frame.prior_mount_children.push(preexisting);
+        world.insert_resource(InputFocus::from_entity(focused));
+        let mut route_focus = RouteFocusState::default();
+        route_focus.set_focused(Some(focused));
+        world.insert_resource(route_focus);
+
+        assert!(!frame_focus_is_in_subtree(&world, &frame));
+        clear_frame_focus(&mut world, &frame);
+        assert_eq!(world.resource::<InputFocus>().get(), Some(focused));
+        assert_eq!(world.resource::<RouteFocusState>().focused(), Some(focused));
     }
 
     #[test]

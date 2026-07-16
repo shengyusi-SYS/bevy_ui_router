@@ -1212,8 +1212,8 @@ pub(crate) mod tests {
     use crate::{
         host::HostCandidateRevision,
         registry::{
-            ComponentManifest, EntityLifecycle, ProvisionalTopSlotOwner, QuarantineLeaseTable,
-            RegistryOwner, RouteEntityRegistry,
+            ComponentManifest, EntityLifecycle, ProvisionalOwner, ProvisionalTopSlotOwner,
+            QuarantineLeaseTable, RegistryOwner, RouteEntityRegistry,
         },
     };
     use bevy_ecs::{component::Component, hierarchy::ChildOf};
@@ -1329,8 +1329,10 @@ pub(crate) mod tests {
         registry
             .register(
                 entity,
-                RegistryOwner::Provisional(ProvisionalTopSlotOwner::new(
-                    HostCandidateRevision::fixture(entity.to_bits().wrapping_add(1)),
+                RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
+                    ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(
+                        entity.to_bits().wrapping_add(1),
+                    )),
                 )),
                 seal,
                 manifest,

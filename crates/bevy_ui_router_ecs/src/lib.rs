@@ -11,6 +11,7 @@ mod content;
 mod driver;
 mod host;
 mod input;
+mod mount;
 mod navigation;
 mod plugin;
 mod presentation;

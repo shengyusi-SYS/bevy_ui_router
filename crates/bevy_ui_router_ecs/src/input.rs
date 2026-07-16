@@ -2,7 +2,11 @@ use std::collections::HashSet;
 
 use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
-    change_detection::Mut, entity::Entity, hierarchy::Children, prelude::World, resource::Resource,
+    change_detection::Mut,
+    entity::Entity,
+    hierarchy::{ChildOf, Children},
+    prelude::World,
+    resource::Resource,
 };
 use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
@@ -231,28 +235,45 @@ fn prepare_physical_isolation<'w>(
 }
 
 fn clear_inert_subtree_focus(world: &mut World, invalid_active: &HashSet<Entity>) {
-    let mut inert = world
-        .resource::<RouteEntityRegistry>()
-        .records()
-        .iter()
-        .filter(|record| record.lifecycle() != EntityLifecycle::Active)
-        .map(|record| record.entity())
-        .collect::<HashSet<_>>();
     let quarantine_roots = world
         .resource::<QuarantineLeaseTable>()
         .inert_owned_entities()
         .collect::<Vec<_>>();
-    inert.extend(observed_descendant_closure(world, quarantine_roots));
-    inert.extend(invalid_active.iter().copied());
+    let mut blocked = observed_descendant_closure(world, quarantine_roots);
+    blocked.extend(invalid_active.iter().copied());
     let input = world.get_resource::<InputFocus>().and_then(InputFocus::get);
-    if input.is_some_and(|focused| inert.contains(&focused)) {
+    let clear_input = input.is_some_and(|focused| {
+        blocked.contains(&focused) || nearest_registry_boundary_is_inert(world, focused)
+    });
+    if clear_input {
         world.resource_mut::<InputFocus>().clear();
     }
     let route = world
         .get_resource::<RouteFocusState>()
         .and_then(RouteFocusState::focused);
-    if route.is_some_and(|focused| inert.contains(&focused)) {
+    let clear_route = route.is_some_and(|focused| {
+        blocked.contains(&focused) || nearest_registry_boundary_is_inert(world, focused)
+    });
+    if clear_route {
         world.resource_mut::<RouteFocusState>().set_focused(None);
+    }
+}
+
+fn nearest_registry_boundary_is_inert(world: &World, focused: Entity) -> bool {
+    let registry = world.resource::<RouteEntityRegistry>();
+    let mut current = focused;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current) {
+            return true;
+        }
+        if let Some(record) = registry.record(current) {
+            return record.lifecycle() != EntityLifecycle::Active;
+        }
+        let Some(parent) = world.get::<ChildOf>(current).map(ChildOf::parent) else {
+            return false;
+        };
+        current = parent;
     }
 }
 
