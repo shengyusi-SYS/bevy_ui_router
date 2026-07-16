@@ -457,6 +457,7 @@ git commit -m "feat(core): schedule nested frame branches"
 - Modify: `crates/bevy_ui_router_core/src/integration.rs`
 - Modify: `crates/bevy_ui_router_core/src/cleanup.rs`
 - Modify: `crates/bevy_ui_router_core/src/trace.rs`
+- Modify: `crates/bevy_ui_router_core/src/ids.rs` (test-only mount-sequence exhaustion seam)
 - Modify: `crates/bevy_ui_router_ecs/src/navigation.rs` (failure capability holder only)
 - Modify: `crates/bevy_ui_router_ecs/src/snapshots.rs` (depth-one test helper exhaustiveness only)
 
@@ -544,7 +545,7 @@ Expected: all Core failure, trace, cleanup and Root fallback tests pass and ever
 Review gate: no terminal-before-cleanup path, no nested fallback authority, existing Root fallback remains
 
 ```powershell
-git add -- crates/bevy_ui_router_core/src/engine.rs crates/bevy_ui_router_core/src/integration.rs crates/bevy_ui_router_core/src/cleanup.rs crates/bevy_ui_router_core/src/trace.rs crates/bevy_ui_router_ecs/src/navigation.rs crates/bevy_ui_router_ecs/src/snapshots.rs
+git add -- crates/bevy_ui_router_core/src/engine.rs crates/bevy_ui_router_core/src/integration.rs crates/bevy_ui_router_core/src/cleanup.rs crates/bevy_ui_router_core/src/trace.rs crates/bevy_ui_router_core/src/ids.rs crates/bevy_ui_router_ecs/src/navigation.rs crates/bevy_ui_router_ecs/src/snapshots.rs
 git diff --cached --name-only
 git diff --cached --check
 git commit -m "feat(core): settle nested failures before terminal"
