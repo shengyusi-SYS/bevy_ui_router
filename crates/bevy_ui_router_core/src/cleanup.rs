@@ -342,7 +342,8 @@ impl StructuredDigest {
         self.push(router);
         self.push(identity.host().raw());
         self.push(identity.host_epoch());
-        self.push(identity.top_slot().raw());
+        self.push(identity.slot().raw());
+        self.push(identity.branch_index() as u64);
         let (request_domain, request_router) = identity.request().router_identity().provenance();
         self.push(request_domain);
         self.push(request_router);

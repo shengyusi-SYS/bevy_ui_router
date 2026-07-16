@@ -174,14 +174,50 @@ impl RouterIdentity {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ReservedNavigationIds {
+pub(crate) struct ReservedFrameAttempt {
+    frame_task: FrameTaskId,
+    frame: RouteFrameId,
+}
+
+impl ReservedFrameAttempt {
+    pub(crate) const fn new(frame_task: FrameTaskId, frame: RouteFrameId) -> Self {
+        Self { frame_task, frame }
+    }
+
+    pub(crate) const fn frame_task(self) -> FrameTaskId {
+        self.frame_task
+    }
+
+    pub(crate) const fn frame(self) -> RouteFrameId {
+        self.frame
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReservedBranchAttempt {
     request: NavigationRequestId,
     transaction: TransactionId,
-    frame_task: FrameTaskId,
-    candidate_frame: RouteFrameId,
     cleanup_batch: CleanupBatchId,
+    frames: Vec<ReservedFrameAttempt>,
+}
+
+impl ReservedBranchAttempt {
+    pub(crate) const fn request(&self) -> NavigationRequestId {
+        self.request
+    }
+
+    pub(crate) const fn transaction(&self) -> TransactionId {
+        self.transaction
+    }
+
+    pub(crate) const fn cleanup_batch(&self) -> CleanupBatchId {
+        self.cleanup_batch
+    }
+
+    pub(crate) fn frames(&self) -> &[ReservedFrameAttempt] {
+        &self.frames
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -193,28 +229,6 @@ pub(crate) struct ReservedAttemptIds {
 }
 
 impl ReservedAttemptIds {
-    pub(crate) const fn transaction(self) -> TransactionId {
-        self.transaction
-    }
-
-    pub(crate) const fn frame_task(self) -> FrameTaskId {
-        self.frame_task
-    }
-
-    pub(crate) const fn candidate_frame(self) -> RouteFrameId {
-        self.candidate_frame
-    }
-
-    pub(crate) const fn cleanup_batch(self) -> CleanupBatchId {
-        self.cleanup_batch
-    }
-}
-
-impl ReservedNavigationIds {
-    pub(crate) const fn request(self) -> NavigationRequestId {
-        self.request
-    }
-
     pub(crate) const fn transaction(self) -> TransactionId {
         self.transaction
     }
@@ -367,12 +381,18 @@ impl CoreIdAllocator {
         Ok(id)
     }
 
-    pub(crate) fn reserve_navigation(
+    pub(crate) fn reserve_navigation_branch(
         &mut self,
         router: RouterIdentity,
-    ) -> Result<ReservedNavigationIds, RequestAllocationError> {
+        branch_len: usize,
+    ) -> Result<ReservedBranchAttempt, RequestAllocationError> {
         if router.domain != self.domain {
             return Err(RequestAllocationError::ForeignRouter);
+        }
+        let branch_len =
+            u64::try_from(branch_len).map_err(|_| RequestAllocationError::Exhausted)?;
+        if branch_len == 0 {
+            return Err(RequestAllocationError::Exhausted);
         }
         let request = self
             .next_request_by_router
@@ -388,26 +408,31 @@ impl CoreIdAllocator {
             .ok_or(RequestAllocationError::Exhausted)?;
         let next_task = self
             .next_task
-            .checked_add(1)
+            .checked_add(branch_len)
             .ok_or(RequestAllocationError::Exhausted)?;
         let next_frame = self
             .next_frame
-            .checked_add(1)
+            .checked_add(branch_len)
             .ok_or(RequestAllocationError::Exhausted)?;
         let next_cleanup_batch = self
             .next_cleanup_batch
             .checked_add(1)
             .ok_or(RequestAllocationError::Exhausted)?;
 
-        let reserved = ReservedNavigationIds {
+        let frames = (0..branch_len)
+            .map(|offset| ReservedFrameAttempt {
+                frame_task: FrameTaskId(self.next_task + offset),
+                frame: RouteFrameId::new(self.next_frame + offset),
+            })
+            .collect();
+        let reserved = ReservedBranchAttempt {
             request: NavigationRequestId {
                 router,
                 sequence: request,
             },
             transaction: TransactionId(self.next_transaction),
-            frame_task: FrameTaskId(self.next_task),
-            candidate_frame: RouteFrameId::new(self.next_frame),
             cleanup_batch: CleanupBatchId(self.next_cleanup_batch),
+            frames,
         };
         self.next_request_by_router.insert(router, next_request);
         self.next_transaction = next_transaction;
@@ -415,6 +440,14 @@ impl CoreIdAllocator {
         self.next_frame = next_frame;
         self.next_cleanup_batch = next_cleanup_batch;
         Ok(reserved)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn reserve_navigation(
+        &mut self,
+        router: RouterIdentity,
+    ) -> Result<ReservedBranchAttempt, RequestAllocationError> {
+        self.reserve_navigation_branch(router, 1)
     }
 
     pub(crate) fn reserve_attempt(&mut self) -> Result<ReservedAttemptIds, IdExhaustion> {
@@ -476,6 +509,11 @@ impl CoreIdAllocator {
             ReservationCounter::CleanupBatch => self.next_cleanup_batch = u64::MAX,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn testing_exhaust_slot_counter(&mut self) {
+        self.next_slot = u64::MAX;
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -517,6 +555,26 @@ impl CoreIdAllocatorSnapshot {
 
     pub(crate) const fn next_mount_sequence(&self) -> u64 {
         self.next_mount_sequence
+    }
+
+    pub(crate) const fn next_frame(&self) -> u64 {
+        self.next_frame
+    }
+
+    pub(crate) const fn next_frame_task(&self) -> u64 {
+        self.next_task
+    }
+
+    pub(crate) const fn next_transaction(&self) -> u64 {
+        self.next_transaction
+    }
+
+    pub(crate) const fn next_cleanup_batch(&self) -> u64 {
+        self.next_cleanup_batch
+    }
+
+    pub(crate) fn next_request(&self, router: RouterIdentity) -> Option<u64> {
+        self.next_request_by_router.get(&router).copied()
     }
 }
 
@@ -724,5 +782,71 @@ mod tests {
             assert!(allocator.reserve_navigation(router).is_err());
             assert_eq!(allocator.snapshot(), before, "counter: {counter:?}");
         }
+    }
+
+    #[test]
+    fn branch_reservation_is_atomic_for_every_reserved_counter() {
+        for counter in [
+            ReservationCounter::Request,
+            ReservationCounter::Transaction,
+            ReservationCounter::FrameTask,
+            ReservationCounter::CandidateFrame,
+            ReservationCounter::CleanupBatch,
+        ] {
+            let mut allocator = CoreIdAllocator::new().unwrap();
+            let router = allocator.allocate_router_identity().unwrap();
+            allocator.testing_exhaust_reservation_counter(router, counter);
+            let before = allocator.snapshot();
+
+            assert!(allocator.reserve_navigation_branch(router, 2).is_err());
+            assert_eq!(allocator.snapshot(), before, "counter: {counter:?}");
+        }
+    }
+
+    #[test]
+    fn branch_reservation_length_exhaustion_is_complete_zero_change() {
+        for counter in [
+            ReservationCounter::FrameTask,
+            ReservationCounter::CandidateFrame,
+        ] {
+            let mut allocator = CoreIdAllocator::new().unwrap();
+            let router = allocator.allocate_router_identity().unwrap();
+            match counter {
+                ReservationCounter::FrameTask => allocator.next_task = u64::MAX - 1,
+                ReservationCounter::CandidateFrame => allocator.next_frame = u64::MAX - 1,
+                _ => unreachable!(),
+            }
+            let before = allocator.snapshot();
+
+            assert_eq!(
+                allocator.reserve_navigation_branch(router, 2),
+                Err(RequestAllocationError::Exhausted)
+            );
+            assert_eq!(allocator.snapshot(), before, "counter: {counter:?}");
+        }
+    }
+
+    #[test]
+    fn branch_reservation_returns_one_attempt_per_frame_and_burns_successes() {
+        let mut allocator = CoreIdAllocator::new().unwrap();
+        let router = allocator.allocate_router_identity().unwrap();
+
+        let first = allocator.reserve_navigation_branch(router, 2).unwrap();
+        let second = allocator.reserve_navigation_branch(router, 2).unwrap();
+
+        assert_eq!(first.frames().len(), 2);
+        assert_eq!(
+            first.frames()[0].frame_task().raw() + 1,
+            first.frames()[1].frame_task().raw()
+        );
+        assert_eq!(
+            first.frames()[0].frame().raw() + 1,
+            first.frames()[1].frame().raw()
+        );
+        assert!(second.request().sequence() > first.request().sequence());
+        assert!(second.transaction().raw() > first.transaction().raw());
+        assert!(second.cleanup_batch().raw() > first.cleanup_batch().raw());
+        assert!(second.frames()[0].frame_task().raw() > first.frames()[1].frame_task().raw());
+        assert!(second.frames()[0].frame().raw() > first.frames()[1].frame().raw());
     }
 }

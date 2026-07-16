@@ -54,6 +54,63 @@ pub struct NavigationTraceEvent {
 }
 
 impl NavigationTraceEvent {
+    pub(crate) fn frame_task_issued(frame: RouteFrameVersion) -> Self {
+        Self::new(NavigationTraceEventKind::FrameTaskIssued).with_frame(frame)
+    }
+
+    pub(crate) fn shell_prepared(frame: RouteFrameVersion) -> Self {
+        Self::new(NavigationTraceEventKind::ShellPrepared).with_frame(frame)
+    }
+
+    pub(crate) fn view_applied(frame: RouteFrameVersion) -> Self {
+        Self::new(NavigationTraceEventKind::ViewApplied).with_frame(frame)
+    }
+
+    pub(crate) fn outlet_registered(frame: RouteFrameVersion, outlet: RouteSlotKey) -> Self {
+        Self::new(NavigationTraceEventKind::OutletRegistered)
+            .with_frame(frame)
+            .with_outlet(outlet)
+    }
+
+    pub(crate) fn mount_requested(frame: RouteFrameVersion, outlet: RouteSlotKey) -> Self {
+        Self::new(NavigationTraceEventKind::MountRequested)
+            .with_frame(frame)
+            .with_outlet(outlet)
+    }
+
+    pub(crate) fn mount_resolved(frame: RouteFrameVersion, outlet: RouteSlotKey) -> Self {
+        Self::new(NavigationTraceEventKind::MountResolved)
+            .with_frame(frame)
+            .with_outlet(outlet)
+    }
+
+    pub(crate) fn mount_granted(
+        frame: RouteFrameVersion,
+        outlet: RouteSlotKey,
+        slot: RouteSlotId,
+    ) -> Self {
+        Self::new(NavigationTraceEventKind::MountGranted)
+            .with_frame(frame)
+            .with_outlet(outlet)
+            .with_slot(slot)
+    }
+
+    pub(crate) fn mount_rejected(
+        frame: RouteFrameVersion,
+        outlet: RouteSlotKey,
+        rejection: MountRejectionKind,
+    ) -> Self {
+        let mut event = Self::new(NavigationTraceEventKind::MountRejected)
+            .with_frame(frame)
+            .with_outlet(outlet);
+        event.mount_rejection = Some(rejection);
+        event
+    }
+
+    pub(crate) fn frame_activated(frame: RouteFrameVersion) -> Self {
+        Self::new(NavigationTraceEventKind::FrameActivated).with_frame(frame)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn request_phase_changed(phase: NavigationPhase) -> Self {
         Self::new(NavigationTraceEventKind::RequestPhaseChanged).with_phase(phase)
@@ -90,6 +147,21 @@ impl NavigationTraceEvent {
 
     pub(crate) fn with_phase(mut self, phase: NavigationPhase) -> Self {
         self.phase = Some(phase);
+        self
+    }
+
+    fn with_frame(mut self, frame: RouteFrameVersion) -> Self {
+        self.frame = Some(frame);
+        self
+    }
+
+    fn with_outlet(mut self, outlet: RouteSlotKey) -> Self {
+        self.outlet = Some(outlet);
+        self
+    }
+
+    fn with_slot(mut self, slot: RouteSlotId) -> Self {
+        self.slot = Some(slot);
         self
     }
 

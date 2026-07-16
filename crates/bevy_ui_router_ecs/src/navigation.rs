@@ -4,8 +4,8 @@ use bevy_ecs::{prelude::World, resource::Resource};
 use bevy_input_focus::InputFocus;
 use bevy_ui_router_core::{
     integration::{
-        CleanupManifest, CommitTicket, EngineAction, IntegrationError, RootFrameTask, RouterEngine,
-        ViewFailureKind,
+        CleanupManifest, CommitTicket, EngineAction, IntegrationError, MountRequest, RootFrameTask,
+        RouterEngine, ViewFailureKind,
     },
     prelude::{NavigationRequestId, RouteLocation},
 };
@@ -79,6 +79,7 @@ pub(crate) struct RouterEntry {
     pub(crate) host: Option<HostBinding>,
     host_settlement: Option<ProvisionalHostSettlement>,
     pending_commit: Option<PendingCommit>,
+    pending_mount_request: Option<MountRequest>,
     pub(crate) active: Option<RealizedFrame>,
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
     failure_cleanup: Option<PendingFailureCleanup>,
@@ -169,6 +170,7 @@ impl RouterNavigation {
             host: None,
             host_settlement: None,
             pending_commit: None,
+            pending_mount_request: None,
             active: None,
             cleanup_ledger: None,
             failure_cleanup: None,
@@ -371,6 +373,10 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                         if entry.pending_commit.is_some() || entry.failure_cleanup.is_some() {
                             continue;
                         }
+                        let pending_mount_request = match &mut entry.pending_mount_request {
+                            vacant @ None => vacant,
+                            Some(_) => continue,
+                        };
                         let Some(action) = entry.engine.action() else {
                             continue;
                         };
@@ -496,6 +502,12 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                     task: Some(task),
                                     realized: Some(realized),
                                 });
+                            }
+                            EngineAction::MountRequest(request) => {
+                                // The vacant-slot borrow is acquired before taking the sealed
+                                // action, so an existing request fails closed without either
+                                // capability being removed, overwritten, or discarded.
+                                *pending_mount_request = Some(request);
                             }
                         }
                     }

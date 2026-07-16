@@ -11,11 +11,15 @@ use crate::diagnostics::{DiagnosticEvent, ReportDisposition};
 use crate::frame::{FrameOrigin, RouteFrameVersion};
 use crate::history::{HistoryIntent, MemoryHistory};
 use crate::ids::{
-    CoreIdAllocator, FrameTaskId, NavigationRequestId, ReservedNavigationIds, RouteFrameId,
-    RouteGeneration, RouteHostId, RouteSlotId, RouterIdentity, TransactionId,
+    CoreIdAllocator, FrameTaskId, NavigationRequestId, ReservedBranchAttempt, ReservedFrameAttempt,
+    RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId, RouterIdentity, TransactionId,
 };
 use crate::location::RouteLocation;
 use crate::matcher::RouteMatcher;
+use crate::mount::{
+    MountConfirmation, MountError, MountGrant, MountIssuer, MountReceiptAttestation,
+    MountRegistrationCompletion, MountRegistrationPermit, MountRequestToken,
+};
 use crate::presentation::{ActivePresentation, ActivePresentationKind, RouterNavigationState};
 use crate::request::{
     NavigationFailure, NavigationFailureKind, NavigationPhase, NavigationRequestRecord,
@@ -25,25 +29,27 @@ use crate::route_tree::RouteTree;
 use crate::trace::{NavigationTraceEvent, NavigationTraceEventKind};
 use crate::view_input::RouteViewInput;
 use crate::view_key::RouteViewKey;
+use crate::{HostVersion, slot::RouteSlotKey};
 
 const TERMINAL_RETENTION: usize = 64;
 const ROUTER_DIAGNOSTIC_RETENTION: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RootTaskIdentity {
+pub(crate) struct FrameTaskIdentity {
     router: RouterIdentity,
     host: RouteHostId,
     host_epoch: u64,
-    top_slot: RouteSlotId,
+    slot: RouteSlotId,
     request: NavigationRequestId,
     transaction: TransactionId,
     frame_task: FrameTaskId,
     frame: RouteFrameId,
     generation: RouteGeneration,
     origin: FrameOrigin,
+    branch_index: usize,
 }
 
-impl RootTaskIdentity {
+impl FrameTaskIdentity {
     pub(crate) const fn router_identity(&self) -> RouterIdentity {
         self.router
     }
@@ -56,8 +62,8 @@ impl RootTaskIdentity {
         self.host_epoch
     }
 
-    pub(crate) const fn top_slot(&self) -> RouteSlotId {
-        self.top_slot
+    pub(crate) const fn slot(&self) -> RouteSlotId {
+        self.slot
     }
 
     pub(crate) const fn request(&self) -> NavigationRequestId {
@@ -84,6 +90,10 @@ impl RootTaskIdentity {
         &self.origin
     }
 
+    pub(crate) const fn branch_index(&self) -> usize {
+        self.branch_index
+    }
+
     #[cfg(test)]
     fn testing_set_router(&mut self, router: RouterIdentity) {
         self.router = router;
@@ -101,7 +111,7 @@ impl RootTaskIdentity {
 
     #[cfg(test)]
     fn testing_set_top_slot(&mut self, slot: RouteSlotId) {
-        self.top_slot = slot;
+        self.slot = slot;
     }
 
     #[cfg(test)]
@@ -135,17 +145,30 @@ impl RootTaskIdentity {
     }
 }
 
-pub(crate) struct RootFrameTask {
-    identity: RootTaskIdentity,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FrameMountTarget {
+    TopSlot {
+        host: HostVersion,
+        slot: RouteSlotId,
+    },
+    ChildOutlet {
+        parent: RouteFrameVersion,
+        outlet: RouteSlotKey,
+    },
+}
+
+pub(crate) struct FrameTask {
+    identity: FrameTaskIdentity,
     frame: RouteFrameVersion,
+    target: FrameMountTarget,
     location: RouteLocation,
     matched: Option<MatchedRoute>,
     view: RouteViewKey,
     input: Option<RouteViewInput>,
 }
 
-impl RootFrameTask {
-    pub(crate) const fn identity(&self) -> &RootTaskIdentity {
+impl FrameTask {
+    pub(crate) const fn identity(&self) -> &FrameTaskIdentity {
         &self.identity
     }
 
@@ -177,16 +200,65 @@ impl RootFrameTask {
             .take()
             .expect("frame task input is consumed exactly once")
     }
+
+    pub(crate) const fn mount_target(&self) -> &FrameMountTarget {
+        &self.target
+    }
+
+    pub(crate) fn into_applied_report(self, outlets: Vec<RouteSlotKey>) -> AppliedFrameReport {
+        AppliedFrameReport {
+            identity: self.identity,
+            outlets,
+        }
+    }
+}
+
+pub(crate) type RootFrameTask = FrameTask;
+pub(crate) type RootTaskIdentity = FrameTaskIdentity;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AppliedFrameReport {
+    identity: FrameTaskIdentity,
+    outlets: Vec<RouteSlotKey>,
+}
+
+impl AppliedFrameReport {
+    #[cfg(test)]
+    fn testing_duplicate(&self) -> Self {
+        self.clone()
+    }
+}
+
+pub(crate) struct FrameMountRequest {
+    token: MountRequestToken,
+    request: NavigationRequestId,
+    parent: RouteFrameVersion,
+    outlet: RouteSlotKey,
+}
+
+impl FrameMountRequest {
+    pub(crate) const fn request(&self) -> NavigationRequestId {
+        self.request
+    }
+
+    pub(crate) const fn parent(&self) -> &RouteFrameVersion {
+        &self.parent
+    }
+
+    pub(crate) const fn outlet(&self) -> &RouteSlotKey {
+        &self.outlet
+    }
 }
 
 pub(crate) enum EngineAction {
-    FrameTask(RootFrameTask),
+    FrameTask(FrameTask),
+    MountRequest(FrameMountRequest),
     Commit(CommitTicket),
 }
 
 #[derive(Debug)]
 pub(crate) struct CommitTicket {
-    identity: RootTaskIdentity,
+    identity: FrameTaskIdentity,
 }
 
 impl CommitTicket {
@@ -215,7 +287,7 @@ impl CommitTicket {
 
 #[derive(Debug)]
 pub(crate) struct SealedCommit {
-    identity: RootTaskIdentity,
+    identity: FrameTaskIdentity,
     cleanup: CleanupBatchToken,
     publication: PublicationPlan,
 }
@@ -299,6 +371,9 @@ pub(crate) enum PrivateRequestLookup<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum WorkStage {
     Applying,
+    AwaitingMount,
+    AwaitingReceipt,
+    ConfirmingMount,
     ReadyToCommit,
     CommitSealed { token: CleanupBatchToken },
     PostCommitCleanup { outstanding: CleanupBatchToken },
@@ -312,9 +387,13 @@ enum AttemptKind {
 
 #[derive(Clone, Debug)]
 struct CurrentWork {
-    identity: RootTaskIdentity,
+    identity: FrameTaskIdentity,
     branch: Option<MatchedBranch>,
-    target_frame: RouteFrameVersion,
+    location: RouteLocation,
+    reservation: Vec<ReservedFrameAttempt>,
+    target_frames: Vec<RouteFrameVersion>,
+    current_target: FrameMountTarget,
+    pending_mount: Option<PendingMount>,
     history_intent: Option<HistoryIntent>,
     stage: WorkStage,
     cleanup_batch: crate::ids::CleanupBatchId,
@@ -322,15 +401,29 @@ struct CurrentWork {
     attempt: AttemptKind,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct QueuedWork {
+#[derive(Clone, Debug)]
+struct PendingMount {
+    child_index: usize,
+    parent: RouteFrameVersion,
+    outlet: RouteSlotKey,
+}
+
+#[derive(Clone, Debug)]
+enum QueuedMatchOutcome {
+    Matched(MatchedBranch),
+    MatchFailed(NavigationFailure),
+}
+
+#[derive(Clone, Debug)]
+struct QueuedPush {
     request: NavigationRequestId,
-    reserved: ReservedNavigationIds,
+    outcome: QueuedMatchOutcome,
+    reservation: Option<ReservedBranchAttempt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReportDispositionRecord {
-    identity: RootTaskIdentity,
+    identity: FrameTaskIdentity,
     disposition: ReportDisposition,
     target: DiagnosticTarget,
 }
@@ -358,10 +451,11 @@ pub(crate) struct RouterEngine {
     records: VecDeque<NavigationRequestRecord>,
     evicted_through: Option<u64>,
     highest_issued: Option<u64>,
-    queue: VecDeque<QueuedWork>,
+    queue: VecDeque<QueuedPush>,
     current: Option<CurrentWork>,
     action: Option<EngineAction>,
-    issued_view_tasks: Vec<RootTaskIdentity>,
+    issued_view_tasks: Vec<FrameTaskIdentity>,
+    mount: MountIssuer,
     report_dispositions: Vec<ReportDispositionRecord>,
     router_diagnostics: Vec<DiagnosticEvent>,
     completed_cleanup: Vec<CompletedCleanupTombstone>,
@@ -391,6 +485,7 @@ impl RouterEngine {
             current: None,
             action: None,
             issued_view_tasks: Vec::new(),
+            mount: MountIssuer::new(router),
             report_dispositions: Vec::new(),
             router_diagnostics: Vec::new(),
             completed_cleanup: Vec::new(),
@@ -439,15 +534,42 @@ impl RouterEngine {
         if self.state.host().is_none() {
             return Err(PushError::AwaitingHost);
         }
-        let reserved = self
-            .ids
-            .reserve_navigation(self.router)
-            .map_err(|_| PushError::IdExhausted)?;
-        let request = reserved.request();
+        let matched = self.matcher.match_location(&location);
+        let (request, outcome, reservation) = match matched {
+            Ok(branch) => {
+                let reserved = self
+                    .ids
+                    .reserve_navigation_branch(self.router, branch.routes().len())
+                    .map_err(|_| PushError::IdExhausted)?;
+                (
+                    reserved.request(),
+                    QueuedMatchOutcome::Matched(branch),
+                    Some(reserved),
+                )
+            }
+            Err(error) => {
+                let request = self
+                    .ids
+                    .allocate_request(self.router)
+                    .map_err(|_| PushError::IdExhausted)?;
+                (
+                    request,
+                    QueuedMatchOutcome::MatchFailed(NavigationFailure::new(
+                        NavigationFailureKind::Match,
+                        error.redacted_message(),
+                    )),
+                    None,
+                )
+            }
+        };
         self.records
             .push_back(NavigationRequestRecord::new(request, location));
         self.highest_issued = Some(request.sequence());
-        self.queue.push_back(QueuedWork { request, reserved });
+        self.queue.push_back(QueuedPush {
+            request,
+            outcome,
+            reservation,
+        });
         Ok(request)
     }
 
@@ -459,6 +581,224 @@ impl RouterEngine {
 
     pub(crate) fn action(&mut self) -> Option<EngineAction> {
         self.action.take()
+    }
+
+    pub(crate) fn restore_action(&mut self, action: EngineAction) {
+        debug_assert!(self.action.is_none());
+        self.action = Some(action);
+    }
+
+    pub(crate) fn accept_applied_report(
+        &mut self,
+        report: AppliedFrameReport,
+    ) -> Result<(), ReportError> {
+        if let Err(error) = self.validate_view_report_identity(&report.identity) {
+            if self.action.is_none()
+                && self
+                    .current
+                    .as_ref()
+                    .is_some_and(|current| current.stage == WorkStage::Applying)
+            {
+                self.reissue_current_frame_task();
+            }
+            return Err(error);
+        }
+        let sorted_unique = report.outlets.windows(2).all(|pair| pair[0] < pair[1]);
+        let next_outlet = self.current.as_ref().and_then(|current| {
+            current
+                .branch
+                .as_ref()
+                .and_then(|branch| branch.routes().get(report.identity.branch_index + 1))
+                .map(|matched| matched.slot().clone())
+        });
+        if !sorted_unique
+            || next_outlet
+                .as_ref()
+                .is_some_and(|required| report.outlets.binary_search(required).is_err())
+        {
+            self.reissue_current_frame_task();
+            return Err(ReportError::Invalid);
+        }
+
+        let request = report.identity.request;
+        let frame = self
+            .current
+            .as_ref()
+            .and_then(|current| current.target_frames.last())
+            .expect("an issued task has one target frame")
+            .clone();
+        self.record_report_disposition(
+            &report.identity,
+            ReportDisposition::Accepted,
+            "accepted applied frame report",
+        );
+        let record = self
+            .record_mut(request)
+            .expect("running record is retained");
+        record
+            .append_trace(NavigationTraceEvent::shell_prepared(frame.clone()))
+            .expect("running trace is open");
+        record
+            .append_trace(NavigationTraceEvent::view_applied(frame.clone()))
+            .expect("running trace is open");
+        for outlet in &report.outlets {
+            record
+                .append_trace(NavigationTraceEvent::outlet_registered(
+                    frame.clone(),
+                    outlet.clone(),
+                ))
+                .expect("running trace is open");
+        }
+
+        if let Some(outlet) = next_outlet {
+            let host = self.state.host().expect("confirmed host").clone();
+            let transaction = report.identity.transaction;
+            let token = match self.mount.issue(
+                &mut self.ids,
+                host,
+                request,
+                transaction,
+                frame.clone(),
+                outlet.clone(),
+            ) {
+                Ok(token) => token,
+                Err(_) => {
+                    self.begin_fallback(
+                        request,
+                        NavigationFailure::new(
+                            NavigationFailureKind::AuthorityLost,
+                            "child mount request identity exhausted",
+                        ),
+                    );
+                    return Ok(());
+                }
+            };
+            let child_index = report.identity.branch_index + 1;
+            let current = self.current.as_mut().expect("report was preflighted");
+            current.identity = report.identity;
+            current.pending_mount = Some(PendingMount {
+                child_index,
+                parent: frame.clone(),
+                outlet: outlet.clone(),
+            });
+            current.stage = WorkStage::AwaitingMount;
+            self.record_mut(request)
+                .expect("running record is retained")
+                .append_trace(NavigationTraceEvent::mount_requested(
+                    frame.clone(),
+                    outlet.clone(),
+                ))
+                .expect("running trace is open");
+            self.action = Some(EngineAction::MountRequest(FrameMountRequest {
+                token,
+                request,
+                parent: frame,
+                outlet,
+            }));
+        } else {
+            let current = self.current.as_mut().expect("report was preflighted");
+            current.identity = report.identity.clone();
+            current.stage = WorkStage::ReadyToCommit;
+            self.transition_with_trace(request, NavigationPhase::ReadyToSwitch);
+            self.action = Some(EngineAction::Commit(CommitTicket {
+                identity: report.identity,
+            }));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resolve_mount(
+        &mut self,
+        request: FrameMountRequest,
+    ) -> Result<MountGrant, MountError> {
+        if !self.current.as_ref().is_some_and(|current| {
+            current.stage == WorkStage::AwaitingMount
+                && current.pending_mount.as_ref().is_some_and(|pending| {
+                    pending.parent == request.parent && pending.outlet == request.outlet
+                })
+        }) {
+            return Err(MountError::WrongPhase);
+        }
+        let grant = match self.mount.grant(&request.token, &mut self.ids) {
+            Ok(grant) => grant,
+            Err(MountError::Exhausted) => {
+                self.mount
+                    .cancel(&request.token)
+                    .expect("the exact unresolved mount remains cancellable");
+                self.record_mut(request.request)
+                    .expect("mount request is retained")
+                    .append_trace(NavigationTraceEvent::mount_rejected(
+                        request.parent,
+                        request.outlet,
+                        crate::trace::MountRejectionKind::ParentAuthorityLost,
+                    ))
+                    .expect("running trace is open");
+                self.begin_fallback(
+                    request.request,
+                    NavigationFailure::new(
+                        NavigationFailureKind::AuthorityLost,
+                        "child mount slot reservation exhausted",
+                    ),
+                );
+                return Err(MountError::Exhausted);
+            }
+            Err(error) => return Err(error),
+        };
+        let slot = grant.slot();
+        let current = self.current.as_mut().expect("mount was preflighted");
+        current.stage = WorkStage::AwaitingReceipt;
+        let record = self
+            .record_mut(request.request)
+            .expect("mount request is retained");
+        record
+            .append_trace(NavigationTraceEvent::mount_resolved(
+                request.parent.clone(),
+                request.outlet.clone(),
+            ))
+            .expect("running trace is open");
+        record
+            .append_trace(NavigationTraceEvent::mount_granted(
+                request.parent,
+                request.outlet,
+                slot,
+            ))
+            .expect("running trace is open");
+        Ok(grant)
+    }
+
+    pub(crate) fn accept_mount_receipt(
+        &mut self,
+        receipt: MountReceiptAttestation,
+    ) -> Result<MountRegistrationPermit, MountError> {
+        if !self
+            .current
+            .as_ref()
+            .is_some_and(|current| current.stage == WorkStage::AwaitingReceipt)
+        {
+            return Err(MountError::WrongPhase);
+        }
+        let permit = self.mount.accept_receipt(&receipt)?;
+        self.current
+            .as_mut()
+            .expect("receipt was preflighted")
+            .stage = WorkStage::ConfirmingMount;
+        Ok(permit)
+    }
+
+    pub(crate) fn complete_mount_registration(
+        &mut self,
+        completion: MountRegistrationCompletion,
+    ) -> Result<(), MountError> {
+        if !self
+            .current
+            .as_ref()
+            .is_some_and(|current| current.stage == WorkStage::ConfirmingMount)
+        {
+            return Err(MountError::WrongPhase);
+        }
+        let confirmation = self.mount.complete_registration(&completion)?;
+        self.issue_confirmed_child(confirmation);
+        Ok(())
     }
 
     pub(crate) fn begin_view_report<'a>(
@@ -612,9 +952,12 @@ impl RouterEngine {
             .as_ref()
             .and_then(|current| match &current.stage {
                 WorkStage::PostCommitCleanup { outstanding } => Some(outstanding),
-                WorkStage::Applying | WorkStage::ReadyToCommit | WorkStage::CommitSealed { .. } => {
-                    None
-                }
+                WorkStage::Applying
+                | WorkStage::AwaitingMount
+                | WorkStage::AwaitingReceipt
+                | WorkStage::ConfirmingMount
+                | WorkStage::ReadyToCommit
+                | WorkStage::CommitSealed { .. } => None,
             });
         if !outstanding.is_some_and(|expected| completion.matches(expected)) {
             if let Some(tombstone) = self
@@ -682,6 +1025,9 @@ impl RouterEngine {
                     Some(current.identity.request)
                 }
                 WorkStage::Applying
+                | WorkStage::AwaitingMount
+                | WorkStage::AwaitingReceipt
+                | WorkStage::ConfirmingMount
                 | WorkStage::ReadyToCommit
                 | WorkStage::CommitSealed { .. }
                 | WorkStage::PostCommitCleanup { .. } => None,
@@ -800,11 +1146,9 @@ impl RouterEngine {
             .expect("queued record is retained")
             .requested()
             .clone();
-        let branch = match self.matcher.match_location(&location) {
-            Ok(branch) => branch,
-            Err(error) => {
-                let failure =
-                    NavigationFailure::new(NavigationFailureKind::Match, error.redacted_message());
+        let branch = match queued.outcome {
+            QueuedMatchOutcome::Matched(branch) => branch,
+            QueuedMatchOutcome::MatchFailed(failure) => {
                 self.record_mut(request)
                     .expect("running record is retained")
                     .push_diagnostic(DiagnosticEvent::match_failed(failure.message()))
@@ -813,15 +1157,20 @@ impl RouterEngine {
                 return;
             }
         };
+        let reservation = queued
+            .reservation
+            .expect("a stored matched branch has one atomic reservation");
         self.record_mut(request)
             .expect("running record is retained")
             .set_matched(branch.branch_fingerprint().clone())
             .expect("match is written once");
         let active_location = self.state.active().location();
-        let active_frame = self.state.active().frames().first();
+        let active_frames = self.state.active().frames();
         let equivalent = self.state.active().kind() == ActivePresentationKind::Route
-            && active_location == Some(&location);
+            && active_location == Some(&location)
+            && active_frames.len() == branch.routes().len();
         let fragment_only = !equivalent
+            && branch.routes().len() == 1
             && active_location.is_some_and(|active| {
                 active.path() == location.path()
                     && active.search() == location.search()
@@ -831,11 +1180,59 @@ impl RouterEngine {
                 .current_active_branch()
                 .is_some_and(|active| active.branch_fingerprint() == branch.branch_fingerprint());
 
-        let (frame, generation) = if equivalent {
-            let active = active_frame.expect("route presentation has one active root");
-            (active.frame(), active.generation())
-        } else if fragment_only {
-            let active = active_frame.expect("fragment remount has an active root");
+        let host = self
+            .state
+            .host()
+            .expect("host was checked before push")
+            .clone();
+        let top_slot = self.state.top_slot().expect("confirmed host has top slot");
+        let reserved_frames = reservation.frames().to_vec();
+
+        if equivalent {
+            let leaf_index = branch.routes().len() - 1;
+            let active = active_frames
+                .get(leaf_index)
+                .expect("equivalent route has one active frame per match");
+            let leaf = &branch.routes()[leaf_index];
+            let identity = FrameTaskIdentity {
+                router: self.router,
+                host: host.host(),
+                host_epoch: host.epoch(),
+                slot: active.slot(),
+                request,
+                transaction: reservation.transaction(),
+                frame_task: reserved_frames[leaf_index].frame_task(),
+                frame: active.frame(),
+                generation: active.generation(),
+                origin: FrameOrigin::MatchedRoute(leaf.route()),
+                branch_index: leaf_index,
+            };
+            self.current = Some(CurrentWork {
+                identity: identity.clone(),
+                branch: Some(branch),
+                location: location.clone(),
+                reservation: reserved_frames,
+                target_frames: active_frames.to_vec(),
+                current_target: FrameMountTarget::TopSlot {
+                    host,
+                    slot: top_slot,
+                },
+                pending_mount: None,
+                history_intent: Some(HistoryIntent::Push(location)),
+                stage: WorkStage::ReadyToCommit,
+                cleanup_batch: reservation.cleanup_batch(),
+                cleanup_roots: Vec::new(),
+                attempt: AttemptKind::Normal,
+            });
+            self.transition_with_trace(request, NavigationPhase::ReadyToSwitch);
+            self.action = Some(EngineAction::Commit(CommitTicket { identity }));
+            return;
+        }
+
+        let (frame, generation) = if fragment_only {
+            let active = active_frames
+                .first()
+                .expect("fragment remount has an active root");
             (
                 active.frame(),
                 match active.generation().checked_next() {
@@ -854,42 +1251,35 @@ impl RouterEngine {
                 },
             )
         } else {
-            (
-                queued.reserved.candidate_frame(),
-                RouteGeneration::initial(),
-            )
+            (reserved_frames[0].frame(), RouteGeneration::initial())
         };
 
-        let leaf = branch
-            .leaf()
-            .expect("route tree matches a nonempty branch")
-            .clone();
-        let origin = FrameOrigin::MatchedRoute(leaf.route());
+        let matched = branch.routes()[0].clone();
+        let origin = FrameOrigin::MatchedRoute(matched.route());
         let view = self
             .matcher
-            .view_binding(leaf.route())
-            .expect("installed route tree has a root view")
+            .view_binding(matched.route())
+            .expect("each scheduled route has a view binding")
             .clone();
         let input = RouteViewInput::new(
             location.clone(),
-            Some(leaf.route()),
-            leaf.params().clone(),
+            Some(matched.route()),
+            matched.params().clone(),
             origin.clone(),
             None,
         );
-        let host = self.state.host().expect("host was checked before push");
-        let top_slot = self.state.top_slot().expect("confirmed host has top slot");
-        let identity = RootTaskIdentity {
+        let identity = FrameTaskIdentity {
             router: self.router,
             host: host.host(),
             host_epoch: host.epoch(),
-            top_slot,
+            slot: top_slot,
             request,
-            transaction: queued.reserved.transaction(),
-            frame_task: queued.reserved.frame_task(),
+            transaction: reservation.transaction(),
+            frame_task: reserved_frames[0].frame_task(),
             frame,
             generation,
             origin: origin.clone(),
+            branch_index: 0,
         };
         let target_frame = RouteFrameVersion::new(
             self.router,
@@ -899,60 +1289,54 @@ impl RouterEngine {
             frame,
             generation,
         );
-        let cleanup_roots = if active_frame.is_some() && !equivalent {
-            vec![active_frame.expect("checked active frame").clone()]
-        } else {
-            Vec::new()
-        };
-        let stage = if equivalent {
-            WorkStage::ReadyToCommit
-        } else {
-            WorkStage::Applying
+        let cleanup_roots = active_frames.iter().rev().cloned().collect();
+        let target = FrameMountTarget::TopSlot {
+            host: host.clone(),
+            slot: top_slot,
         };
         self.current = Some(CurrentWork {
             identity: identity.clone(),
             branch: Some(branch),
-            target_frame: target_frame.clone(),
+            location: location.clone(),
+            reservation: reserved_frames,
+            target_frames: vec![target_frame.clone()],
+            current_target: target.clone(),
+            pending_mount: None,
             history_intent: Some(HistoryIntent::Push(location.clone())),
-            stage,
-            cleanup_batch: queued.reserved.cleanup_batch(),
+            stage: WorkStage::Applying,
+            cleanup_batch: reservation.cleanup_batch(),
             cleanup_roots,
             attempt: AttemptKind::Normal,
         });
-
-        if equivalent {
-            self.transition_with_trace(request, NavigationPhase::ReadyToSwitch);
-            self.action = Some(EngineAction::Commit(CommitTicket { identity }));
-        } else {
-            let record = self
-                .record_mut(request)
-                .expect("running record is retained");
-            record
-                .append_trace(NavigationTraceEvent::new(
-                    NavigationTraceEventKind::FrameTaskIssued,
-                ))
-                .expect("running trace is open");
-            record
-                .transition(RequestStatus::Running(NavigationPhase::ApplyingFrame(0)))
-                .expect("request is running");
-            record
-                .append_trace(NavigationTraceEvent::request_phase_changed(
-                    NavigationPhase::ApplyingFrame(0),
-                ))
-                .expect("running trace is open");
-            self.state.set_request(Some(RequestStatus::Running(
+        let record = self
+            .record_mut(request)
+            .expect("running record is retained");
+        record
+            .append_trace(NavigationTraceEvent::frame_task_issued(
+                target_frame.clone(),
+            ))
+            .expect("running trace is open");
+        record
+            .transition(RequestStatus::Running(NavigationPhase::ApplyingFrame(0)))
+            .expect("request is running");
+        record
+            .append_trace(NavigationTraceEvent::request_phase_changed(
                 NavigationPhase::ApplyingFrame(0),
-            )));
-            self.issued_view_tasks.push(identity.clone());
-            self.action = Some(EngineAction::FrameTask(RootFrameTask {
-                identity,
-                frame: target_frame,
-                location,
-                matched: Some(leaf),
-                view,
-                input: Some(input),
-            }));
-        }
+            ))
+            .expect("running trace is open");
+        self.state.set_request(Some(RequestStatus::Running(
+            NavigationPhase::ApplyingFrame(0),
+        )));
+        self.issued_view_tasks.push(identity.clone());
+        self.action = Some(EngineAction::FrameTask(FrameTask {
+            identity,
+            frame: target_frame,
+            target,
+            location,
+            matched: Some(matched),
+            view,
+            input: Some(input),
+        }));
     }
 
     fn begin_fallback(
@@ -1003,17 +1387,18 @@ impl RouterEngine {
             .expect("confirmed host has a top slot");
         let origin = FrameOrigin::RouterFallback;
         let generation = RouteGeneration::initial();
-        let identity = RootTaskIdentity {
+        let identity = FrameTaskIdentity {
             router: self.router,
             host: host.host(),
             host_epoch: host.epoch(),
-            top_slot,
+            slot: top_slot,
             request,
             transaction: reserved.transaction(),
             frame_task: reserved.frame_task(),
             frame: reserved.candidate_frame(),
             generation,
             origin: origin.clone(),
+            branch_index: 0,
         };
         let target_frame = RouteFrameVersion::new(
             self.router,
@@ -1023,14 +1408,7 @@ impl RouterEngine {
             reserved.candidate_frame(),
             generation,
         );
-        let cleanup_roots = self
-            .state
-            .active()
-            .frames()
-            .first()
-            .cloned()
-            .into_iter()
-            .collect();
+        let cleanup_roots = self.state.active().frames().iter().rev().cloned().collect();
         let input = RouteViewInput::new(
             location.clone(),
             matched.as_ref().map(MatchedRoute::route),
@@ -1041,10 +1419,21 @@ impl RouterEngine {
             Some(original_failure.clone()),
         );
 
+        let target = FrameMountTarget::TopSlot {
+            host: host.clone(),
+            slot: top_slot,
+        };
         self.current = Some(CurrentWork {
             identity: identity.clone(),
             branch: None,
-            target_frame: target_frame.clone(),
+            location: location.clone(),
+            reservation: vec![ReservedFrameAttempt::new(
+                reserved.frame_task(),
+                reserved.candidate_frame(),
+            )],
+            target_frames: vec![target_frame.clone()],
+            current_target: target.clone(),
+            pending_mount: None,
             history_intent: None,
             stage: WorkStage::Applying,
             cleanup_batch: reserved.cleanup_batch(),
@@ -1054,18 +1443,162 @@ impl RouterEngine {
         self.action = None;
         self.record_mut(request)
             .expect("recovering request is retained")
-            .append_trace(NavigationTraceEvent::new(
-                NavigationTraceEventKind::FrameTaskIssued,
+            .append_trace(NavigationTraceEvent::frame_task_issued(
+                target_frame.clone(),
             ))
             .expect("running trace is open");
         self.transition_with_trace(request, NavigationPhase::Recovering);
         self.issued_view_tasks.push(identity.clone());
-        self.action = Some(EngineAction::FrameTask(RootFrameTask {
+        self.action = Some(EngineAction::FrameTask(FrameTask {
             identity,
             frame: target_frame,
+            target,
             location,
             matched,
             view: self.fallback.clone(),
+            input: Some(input),
+        }));
+    }
+
+    fn issue_confirmed_child(&mut self, confirmation: MountConfirmation) {
+        debug_assert!(confirmation.has_valid_binding());
+        let slot = confirmation.slot();
+        let pending = self
+            .current
+            .as_mut()
+            .expect("confirmed mount belongs to current work")
+            .pending_mount
+            .take()
+            .expect("confirming work has pending child facts");
+        let index = pending.child_index;
+        let (request, transaction, host, host_epoch, location, matched, reserved) = {
+            let current = self.current.as_ref().expect("current work exists");
+            let matched = current
+                .branch
+                .as_ref()
+                .and_then(|branch| branch.routes().get(index))
+                .expect("reserved child index belongs to matched branch")
+                .clone();
+            (
+                current.identity.request,
+                current.identity.transaction,
+                current.identity.host,
+                current.identity.host_epoch,
+                current.location.clone(),
+                matched,
+                current.reservation[index],
+            )
+        };
+        let origin = FrameOrigin::MatchedRoute(matched.route());
+        let frame = RouteFrameVersion::new(
+            self.router,
+            host,
+            slot,
+            origin.clone(),
+            reserved.frame(),
+            RouteGeneration::initial(),
+        );
+        let identity = FrameTaskIdentity {
+            router: self.router,
+            host,
+            host_epoch,
+            slot,
+            request,
+            transaction,
+            frame_task: reserved.frame_task(),
+            frame: reserved.frame(),
+            generation: RouteGeneration::initial(),
+            origin: origin.clone(),
+            branch_index: index,
+        };
+        let target = FrameMountTarget::ChildOutlet {
+            parent: pending.parent,
+            outlet: pending.outlet,
+        };
+        let view = self
+            .matcher
+            .view_binding(matched.route())
+            .expect("each scheduled route has a view binding")
+            .clone();
+        let input = RouteViewInput::new(
+            location.clone(),
+            Some(matched.route()),
+            matched.params().clone(),
+            origin,
+            None,
+        );
+        let current = self.current.as_mut().expect("current work exists");
+        current.identity = identity.clone();
+        current.target_frames.push(frame.clone());
+        current.current_target = target.clone();
+        current.stage = WorkStage::Applying;
+        self.record_mut(request)
+            .expect("running record is retained")
+            .append_trace(NavigationTraceEvent::frame_task_issued(frame.clone()))
+            .expect("running trace is open");
+        self.transition_with_trace(request, NavigationPhase::ApplyingFrame(index));
+        self.issued_view_tasks.push(identity.clone());
+        self.action = Some(EngineAction::FrameTask(FrameTask {
+            identity,
+            frame,
+            target,
+            location,
+            matched: Some(matched),
+            view,
+            input: Some(input),
+        }));
+    }
+
+    fn reissue_current_frame_task(&mut self) {
+        let Some(current) = self.current.as_ref() else {
+            return;
+        };
+        let identity = current.identity.clone();
+        let frame = current
+            .target_frames
+            .last()
+            .expect("applying work has an issued frame")
+            .clone();
+        let target = current.current_target.clone();
+        let location = current.location.clone();
+        let matched = current
+            .branch
+            .as_ref()
+            .and_then(|branch| branch.routes().get(identity.branch_index))
+            .cloned();
+        let (view, failure) = match &current.attempt {
+            AttemptKind::Normal => (
+                self.matcher
+                    .view_binding(
+                        matched
+                            .as_ref()
+                            .expect("normal frame belongs to a match")
+                            .route(),
+                    )
+                    .expect("matched route has a view")
+                    .clone(),
+                None,
+            ),
+            AttemptKind::Fallback { original_failure } => {
+                (self.fallback.clone(), Some(original_failure.clone()))
+            }
+        };
+        let input = RouteViewInput::new(
+            location.clone(),
+            matched.as_ref().map(MatchedRoute::route),
+            matched
+                .as_ref()
+                .map_or_else(RouteParams::new, |route| route.params().clone()),
+            identity.origin.clone(),
+            failure,
+        );
+        self.action = Some(EngineAction::FrameTask(FrameTask {
+            identity,
+            frame,
+            target,
+            location,
+            matched,
+            view,
             input: Some(input),
         }));
     }
@@ -1107,7 +1640,7 @@ impl RouterEngine {
         let frame = RouteFrameVersion::new(
             identity.router_identity(),
             identity.host(),
-            identity.top_slot(),
+            identity.slot(),
             identity.origin().clone(),
             identity.frame(),
             identity.generation(),
@@ -1176,7 +1709,7 @@ impl RouterEngine {
         let mut state = self.state.clone();
         let (active, active_branch) = match &current.attempt {
             AttemptKind::Normal => (
-                ActivePresentation::route(location, vec![current.target_frame.clone()]),
+                ActivePresentation::route(location, current.target_frames.clone()),
                 current.branch.clone(),
             ),
             AttemptKind::Fallback { original_failure } => (
@@ -1187,7 +1720,7 @@ impl RouterEngine {
                         .matched()
                         .cloned(),
                     original_failure.clone(),
-                    vec![current.target_frame.clone()],
+                    current.target_frames.clone(),
                 ),
                 None,
             ),
@@ -1203,6 +1736,11 @@ impl RouterEngine {
             .position(|record| record.id() == request)
             .expect("running record is retained");
         let mut published_record = self.records[record_index].clone();
+        for frame in &current.target_frames {
+            published_record
+                .append_trace(NavigationTraceEvent::frame_activated(frame.clone()))
+                .expect("running trace is open");
+        }
         published_record
             .append_trace(NavigationTraceEvent::commit_published())
             .expect("running trace is open");
@@ -1273,7 +1811,11 @@ impl RouterEngine {
             records: self.records.clone(),
             evicted_through: self.evicted_through,
             highest_issued: self.highest_issued,
-            queue: self.queue.clone(),
+            queue: self
+                .queue
+                .iter()
+                .map(|queued| format!("{queued:?}"))
+                .collect(),
             current: self.current.as_ref().map(|current| format!("{current:?}")),
             action: self.action.as_ref().map(ActionSnapshot::from),
         }
@@ -1334,32 +1876,16 @@ impl std::fmt::Debug for ViewReportSession<'_> {
 
 impl ViewReportSession<'_> {
     pub(crate) fn applied(self) -> CommitTicket {
-        let request = self.identity.request;
-        self.engine.record_report_disposition(
-            &self.identity,
-            ReportDisposition::Accepted,
-            "accepted applied view report",
-        );
-        let current = self
-            .engine
-            .current
-            .as_mut()
-            .expect("report was preflighted");
-        current.stage = WorkStage::ReadyToCommit;
-        let record = self
-            .engine
-            .record_mut(request)
-            .expect("running record is retained");
-        record
-            .append_trace(NavigationTraceEvent::new(
-                NavigationTraceEventKind::ViewApplied,
-            ))
-            .expect("running trace is open");
         self.engine
-            .transition_with_trace(request, NavigationPhase::ReadyToSwitch);
-        CommitTicket {
-            identity: self.identity,
-        }
+            .accept_applied_report(AppliedFrameReport {
+                identity: self.identity,
+                outlets: Vec::new(),
+            })
+            .expect("legacy internal report helper is only valid for a leaf frame");
+        let Some(EngineAction::Commit(ticket)) = self.engine.action.take() else {
+            panic!("a leaf report produces one commit ticket")
+        };
+        ticket
     }
 
     pub(crate) fn failed(self, failure: NavigationFailure) {
@@ -1411,6 +1937,7 @@ impl ViewReportSession<'_> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ActionSnapshot {
     FrameTask(RootTaskIdentity),
+    MountRequest(NavigationRequestId, RouteFrameVersion, RouteSlotKey),
     Commit(RootTaskIdentity),
 }
 
@@ -1419,6 +1946,11 @@ impl From<&EngineAction> for ActionSnapshot {
     fn from(action: &EngineAction) -> Self {
         match action {
             EngineAction::FrameTask(task) => Self::FrameTask(task.identity.clone()),
+            EngineAction::MountRequest(request) => Self::MountRequest(
+                request.request,
+                request.parent.clone(),
+                request.outlet.clone(),
+            ),
             EngineAction::Commit(ticket) => Self::Commit(ticket.identity.clone()),
         }
     }
@@ -1434,7 +1966,7 @@ struct EngineSnapshot {
     records: VecDeque<NavigationRequestRecord>,
     evicted_through: Option<u64>,
     highest_issued: Option<u64>,
-    queue: VecDeque<QueuedWork>,
+    queue: Vec<String>,
     current: Option<String>,
     action: Option<ActionSnapshot>,
 }
@@ -1513,16 +2045,48 @@ mod tests {
         engine: &mut RouterEngine,
         action: EngineAction,
     ) -> crate::cleanup::CleanupBatchToken {
-        let ticket = match action {
-            EngineAction::FrameTask(task) => {
-                engine.begin_view_report(task.identity()).unwrap().applied()
-            }
-            EngineAction::Commit(ticket) => ticket,
-        };
+        let ticket = drive_to_commit(engine, action);
         let sealed = seal_current(engine, ticket);
         let cleanup = sealed.cleanup().clone();
         publish_sealed(engine, sealed, || {}).unwrap();
         cleanup
+    }
+
+    fn drive_to_commit(engine: &mut RouterEngine, mut action: EngineAction) -> super::CommitTicket {
+        loop {
+            match action {
+                EngineAction::FrameTask(task) => {
+                    let next_outlet = engine.current.as_ref().and_then(|current| {
+                        current
+                            .branch
+                            .as_ref()
+                            .and_then(|branch| {
+                                branch.routes().get(task.identity().branch_index() + 1)
+                            })
+                            .map(|matched| matched.slot().clone())
+                    });
+                    engine
+                        .accept_applied_report(
+                            task.into_applied_report(next_outlet.into_iter().collect()),
+                        )
+                        .unwrap();
+                    action = engine.action().expect("accepted report produces an action");
+                }
+                EngineAction::MountRequest(request) => {
+                    let grant = engine.resolve_mount(request).unwrap();
+                    let receipt =
+                        grant.attest_receipt(crate::mount::MountReceiptDigest::from_opaque(1));
+                    let permit = engine.accept_mount_receipt(receipt).unwrap();
+                    let completion =
+                        permit.complete(crate::mount::MountRegistrationDigest::from_opaque(2));
+                    engine.complete_mount_registration(completion).unwrap();
+                    action = engine
+                        .action()
+                        .expect("mount confirmation produces child task");
+                }
+                EngineAction::Commit(ticket) => break ticket,
+            }
+        }
     }
 
     fn publish_sealed<F>(
@@ -1568,7 +2132,7 @@ mod tests {
         };
         assert_eq!(fallback.identity().request(), request);
         assert_eq!(fallback.identity().host(), normal_identity.host());
-        assert_eq!(fallback.identity().top_slot(), normal_identity.top_slot());
+        assert_eq!(fallback.identity().slot(), normal_identity.slot());
         assert_ne!(
             fallback.identity().transaction(),
             normal_identity.transaction()
@@ -1846,12 +2410,19 @@ mod tests {
         let EngineAction::FrameTask(duplicate_task) = duplicate_engine.action().unwrap() else {
             panic!("normal task expected")
         };
-        let duplicate_identity = duplicate_task.identity().clone();
-        let duplicate_frame = duplicate_task.frame.clone();
-        let _ticket = duplicate_engine
-            .begin_view_report(&duplicate_identity)
+        let ticket = drive_to_commit(
+            &mut duplicate_engine,
+            EngineAction::FrameTask(duplicate_task),
+        );
+        let duplicate_identity = ticket.identity().clone();
+        let duplicate_frame = duplicate_engine
+            .current
+            .as_ref()
             .unwrap()
-            .applied();
+            .target_frames
+            .last()
+            .unwrap()
+            .clone();
         let duplicate_lifecycle = (
             duplicate_engine.state.snapshot(),
             duplicate_engine.ids.snapshot(),
@@ -1993,9 +2564,9 @@ mod tests {
         let EngineAction::FrameTask(terminal_task) = terminal_engine.action().unwrap() else {
             panic!("normal task expected")
         };
-        let terminal_identity = terminal_task.identity().clone();
         let terminal_cleanup =
             publish_action(&mut terminal_engine, EngineAction::FrameTask(terminal_task));
+        let terminal_identity = terminal_cleanup.testing_identity().clone();
         terminal_engine
             .complete_cleanup(valid_completion(&terminal_cleanup))
             .unwrap();
@@ -2054,11 +2625,11 @@ mod tests {
             engine.router_diagnostics().len(),
             ROUTER_DIAGNOSTIC_RETENTION
         );
-        assert_eq!(engine.issued_view_tasks.len(), TERMINAL_RETENTION);
+        assert_eq!(engine.issued_view_tasks.len(), TERMINAL_RETENTION * 2);
         assert_eq!(engine.completed_cleanup.len(), TERMINAL_RETENTION);
         assert_eq!(
             engine.report_dispositions.len(),
-            TERMINAL_RETENTION + ROUTER_DIAGNOSTIC_RETENTION
+            TERMINAL_RETENTION * 2 + ROUTER_DIAGNOSTIC_RETENTION
         );
     }
 
@@ -2160,7 +2731,7 @@ mod tests {
         value.testing_set_host_epoch(exact.host_epoch() + 1);
         mismatches.push(value);
         let mut value = exact.clone();
-        value.testing_set_top_slot(RouteSlotId::new(exact.top_slot().raw() + 1));
+        value.testing_set_top_slot(RouteSlotId::new(exact.slot().raw() + 1));
         mismatches.push(value);
         let mut value = exact.clone();
         value.testing_set_request(distinct.request());
@@ -2263,7 +2834,7 @@ mod tests {
         let EngineAction::FrameTask(task) = engine.action().unwrap() else {
             panic!("expected frame task");
         };
-        let ticket = engine.begin_view_report(task.identity()).unwrap().applied();
+        let ticket = drive_to_commit(&mut engine, EngineAction::FrameTask(task));
 
         assert_eq!(engine.active().kind(), ActivePresentationKind::None);
         assert!(engine.history().is_empty());
@@ -2303,7 +2874,7 @@ mod tests {
         let EngineAction::FrameTask(task) = engine.action().unwrap() else {
             panic!("expected frame task");
         };
-        let exact = engine.begin_view_report(task.identity()).unwrap().applied();
+        let exact = drive_to_commit(&mut engine, EngineAction::FrameTask(task));
         let foreign = distinct_identity();
 
         for mismatch in identity_mismatches(exact.identity(), &foreign) {
@@ -2350,8 +2921,8 @@ mod tests {
         let EngineAction::FrameTask(fragment) = engine.action().unwrap() else {
             panic!("fragment change must issue one task");
         };
-        assert_eq!(fragment.identity().frame(), first.frame());
-        assert_eq!(fragment.identity().generation(), first.generation().next());
+        assert_ne!(fragment.identity().frame(), first.frame());
+        assert_eq!(fragment.identity().generation(), RouteGeneration::initial());
         let fragment_cleanup = publish_action(&mut engine, EngineAction::FrameTask(fragment));
         assert_eq!(
             fragment_cleanup.obligation_count(),
@@ -2540,9 +3111,10 @@ mod tests {
         let EngineAction::FrameTask(task) = engine.action().unwrap() else {
             panic!("expected frame task");
         };
-        let ticket = engine.begin_view_report(task.identity()).unwrap().applied();
+        let task_identity = task.identity().clone();
+        let ticket = drive_to_commit(&mut engine, EngineAction::FrameTask(task));
         let super::CommitTicket { identity } = &ticket;
-        assert_eq!(identity, task.identity());
+        assert_eq!(identity.request(), task_identity.request());
         let ids_after_action = engine.ids.snapshot();
         let sealed = engine
             .seal_commit(
@@ -2576,7 +3148,7 @@ mod tests {
         let EngineAction::FrameTask(task) = engine.action().unwrap() else {
             panic!("expected first frame task");
         };
-        let ticket = engine.begin_view_report(task.identity()).unwrap().applied();
+        let ticket = drive_to_commit(&mut engine, EngineAction::FrameTask(task));
         let sealed = seal_current(&mut engine, ticket);
         let cleanup = sealed.cleanup().clone();
 
@@ -2619,7 +3191,9 @@ mod tests {
         let mut engine = ready_engine();
         engine.push(RouteLocation::new("/items/1")).unwrap();
         settle_current(&mut engine);
-        let first = engine.active().frames()[0].clone();
+        let active = engine.active().frames().to_vec();
+        let first = active[0].clone();
+        let child = active[1].clone();
 
         engine
             .push(RouteLocation::new("/items/1").with_fragment("details"))
@@ -2627,13 +3201,10 @@ mod tests {
         let EngineAction::FrameTask(fragment) = engine.action().unwrap() else {
             panic!("expected fragment task");
         };
-        let fragment_ticket = engine
-            .begin_view_report(fragment.identity())
-            .unwrap()
-            .applied();
+        let fragment_ticket = drive_to_commit(&mut engine, EngineAction::FrameTask(fragment));
         assert_eq!(
             engine.current.as_ref().unwrap().cleanup_roots,
-            vec![first.clone()]
+            vec![child, first.clone()]
         );
 
         let second = RouteFrameVersion::new(
@@ -2691,7 +3262,7 @@ mod tests {
         let EngineAction::FrameTask(task) = engine.action().unwrap() else {
             panic!("expected frame task");
         };
-        let ticket = engine.begin_view_report(task.identity()).unwrap().applied();
+        let ticket = drive_to_commit(&mut engine, EngineAction::FrameTask(task));
 
         let before = engine.snapshot();
         assert_eq!(
@@ -2705,7 +3276,14 @@ mod tests {
         );
         assert_eq!(engine.snapshot(), before);
 
-        let root = engine.current.as_ref().unwrap().target_frame.clone();
+        let root = engine
+            .current
+            .as_ref()
+            .unwrap()
+            .target_frames
+            .last()
+            .unwrap()
+            .clone();
         engine.current.as_mut().unwrap().cleanup_roots = vec![root.clone()];
         let before = engine.snapshot();
         assert_eq!(
@@ -2727,7 +3305,7 @@ mod tests {
         let EngineAction::FrameTask(task) = engine.action().unwrap() else {
             panic!("expected frame task");
         };
-        let ticket = engine.begin_view_report(task.identity()).unwrap().applied();
+        let ticket = drive_to_commit(&mut engine, EngineAction::FrameTask(task));
         let sealed = seal_current(&mut engine, ticket);
         let duplicate = sealed.testing_duplicate();
         let foreign_identity = distinct_identity();
@@ -2770,7 +3348,7 @@ mod tests {
         let EngineAction::FrameTask(task) = engine.action().unwrap() else {
             panic!("expected replacement task");
         };
-        let ticket = engine.begin_view_report(task.identity()).unwrap().applied();
+        let ticket = drive_to_commit(&mut engine, EngineAction::FrameTask(task));
         let current = engine.current.as_ref().unwrap();
         let exact = CleanupBatchToken::sealed(
             ticket.identity().clone(),
@@ -2896,11 +3474,11 @@ mod tests {
     #[test]
     fn generation_overflow_settles_accepted_request_and_does_not_poison_prior_cleanup() {
         let mut engine = ready_engine();
-        let first = engine.push(RouteLocation::new("/items/1")).unwrap();
+        let first = engine.push(RouteLocation::new("/")).unwrap();
         let cleanup = publish_current(&mut engine);
         engine.testing_set_active_generation(RouteGeneration::testing_max());
         let overflow = engine
-            .push(RouteLocation::new("/items/1").with_fragment("details"))
+            .push(RouteLocation::new("/").with_fragment("details"))
             .unwrap();
 
         engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
@@ -2980,6 +3558,432 @@ mod tests {
             &RequestStatus::Running(NavigationPhase::ApplyingFrame(0))
         );
         assert!(matches!(engine.action(), Some(EngineAction::FrameTask(_))));
+    }
+
+    #[test]
+    fn nested_happy_path_schedules_root_to_leaf_branch() {
+        let mut engine = ready_engine();
+        let requested = RouteLocation::new("/items/1");
+        let request = engine.push(requested.clone()).unwrap();
+
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("nested navigation must start with its parent frame task")
+        };
+        assert_eq!(parent.view(), &RouteViewKey::new("root").unwrap());
+        assert!(matches!(
+            parent.mount_target(),
+            super::FrameMountTarget::TopSlot { .. }
+        ));
+        let parent_version = parent.frame_version().clone();
+        engine
+            .accept_applied_report(
+                parent.into_applied_report(vec![crate::slot::RouteSlotKey::default()]),
+            )
+            .unwrap();
+
+        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
+            panic!("parent report must request its default child outlet")
+        };
+        assert_eq!(mount.request(), request);
+        assert_eq!(mount.parent(), &parent_version);
+        assert!(mount.outlet().is_default());
+        let grant = engine.resolve_mount(mount).unwrap();
+        let child_slot = grant.slot();
+        let receipt = grant.attest_receipt(crate::mount::MountReceiptDigest::from_opaque(11));
+        let permit = engine.accept_mount_receipt(receipt).unwrap();
+        assert_eq!(permit.slot(), child_slot);
+        assert!(engine.action().is_none());
+        let completion = permit.complete(crate::mount::MountRegistrationDigest::from_opaque(13));
+        assert!(engine.action().is_none());
+        engine.complete_mount_registration(completion).unwrap();
+
+        let EngineAction::FrameTask(child) = engine.action().unwrap() else {
+            panic!("exact final mount confirmation must issue the child task")
+        };
+        assert_eq!(child.view(), &RouteViewKey::new("items").unwrap());
+        assert_eq!(child.frame_version().slot(), child_slot);
+        assert!(matches!(
+            child.mount_target(),
+            super::FrameMountTarget::ChildOutlet { parent, outlet }
+                if parent == &parent_version && outlet.is_default()
+        ));
+        let child_version = child.frame_version().clone();
+        engine
+            .accept_applied_report(child.into_applied_report(Vec::new()))
+            .unwrap();
+        let EngineAction::Commit(ticket) = engine.action().unwrap() else {
+            panic!("leaf report must issue one commit")
+        };
+        let sealed = seal_current(&mut engine, ticket);
+        let cleanup = sealed.cleanup().clone();
+        publish_sealed(&mut engine, sealed, || {}).unwrap();
+
+        assert_eq!(
+            engine.active().frames(),
+            &[parent_version.clone(), child_version.clone()]
+        );
+        assert_eq!(engine.history().len(), 1);
+        assert_eq!(engine.history().current(), Some(&requested));
+        let exact = engine
+            .request(request)
+            .unwrap()
+            .trace()
+            .iter()
+            .filter_map(|event| match event.kind() {
+                NavigationTraceEventKind::FrameTaskIssued
+                | NavigationTraceEventKind::ShellPrepared
+                | NavigationTraceEventKind::ViewApplied
+                | NavigationTraceEventKind::OutletRegistered
+                | NavigationTraceEventKind::MountRequested
+                | NavigationTraceEventKind::MountResolved
+                | NavigationTraceEventKind::MountGranted
+                | NavigationTraceEventKind::FrameActivated
+                | NavigationTraceEventKind::CommitPublished => Some(event.kind()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            exact,
+            vec![
+                NavigationTraceEventKind::FrameTaskIssued,
+                NavigationTraceEventKind::ShellPrepared,
+                NavigationTraceEventKind::ViewApplied,
+                NavigationTraceEventKind::OutletRegistered,
+                NavigationTraceEventKind::MountRequested,
+                NavigationTraceEventKind::MountResolved,
+                NavigationTraceEventKind::MountGranted,
+                NavigationTraceEventKind::FrameTaskIssued,
+                NavigationTraceEventKind::ShellPrepared,
+                NavigationTraceEventKind::ViewApplied,
+                NavigationTraceEventKind::FrameActivated,
+                NavigationTraceEventKind::FrameActivated,
+                NavigationTraceEventKind::CommitPublished,
+            ]
+        );
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+    }
+
+    #[test]
+    fn nested_equivalent_nested_push_is_zero_entering() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let active = engine.active().frames().to_vec();
+
+        let request = engine.push(RouteLocation::new("items//1/")).unwrap();
+        let action = engine.action().unwrap();
+        assert!(matches!(action, EngineAction::Commit(_)));
+        let cleanup = publish_action(&mut engine, action);
+        assert_eq!(cleanup.obligation_count(), 0);
+        assert_eq!(engine.active().frames(), active);
+        assert_eq!(
+            engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::FrameTaskIssued)
+                .count(),
+            0
+        );
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+    }
+
+    #[test]
+    fn nested_branch_changing_nested_push_replaces_the_whole_branch() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let old = engine.active().frames().to_vec();
+        engine.push(RouteLocation::new("/about")).unwrap();
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("changed nested branch starts with a fresh parent")
+        };
+        assert_eq!(parent.view(), &RouteViewKey::new("root").unwrap());
+        assert_ne!(parent.frame_version().frame(), old[0].frame());
+        let ticket = drive_to_commit(&mut engine, EngineAction::FrameTask(parent));
+        let current = engine.current.as_ref().unwrap();
+        assert_eq!(current.cleanup_roots, vec![old[1].clone(), old[0].clone()]);
+        assert!(
+            current
+                .target_frames
+                .iter()
+                .zip(&old)
+                .all(|(new, old)| new.frame() != old.frame())
+        );
+        let sealed = seal_current(&mut engine, ticket);
+        let cleanup = sealed.cleanup().clone();
+        publish_sealed(&mut engine, sealed, || {}).unwrap();
+        assert_eq!(engine.active().frames().len(), 2);
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+    }
+
+    #[test]
+    fn nested_fragment_push_replaces_the_whole_branch_until_reconciliation() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let old = engine.active().frames().to_vec();
+        engine
+            .push(RouteLocation::new("/items/1").with_fragment("details"))
+            .unwrap();
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("nested fragment starts with a fresh parent")
+        };
+        assert_eq!(parent.view(), &RouteViewKey::new("root").unwrap());
+        assert_ne!(parent.frame_version().frame(), old[0].frame());
+        assert_eq!(
+            parent.frame_version().generation(),
+            RouteGeneration::initial()
+        );
+        let ticket = drive_to_commit(&mut engine, EngineAction::FrameTask(parent));
+        let current = engine.current.as_ref().unwrap();
+        assert_eq!(current.cleanup_roots, vec![old[1].clone(), old[0].clone()]);
+        assert!(
+            current
+                .target_frames
+                .iter()
+                .zip(&old)
+                .all(|(new, old)| new.frame() != old.frame())
+        );
+        let sealed = seal_current(&mut engine, ticket);
+        let cleanup = sealed.cleanup().clone();
+        publish_sealed(&mut engine, sealed, || {}).unwrap();
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+    }
+
+    #[test]
+    fn nested_depth_one_fragment_push_preserves_frame_and_advances_generation() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/")).unwrap();
+        settle_current(&mut engine);
+        let first = engine.active().frames()[0].clone();
+
+        engine
+            .push(RouteLocation::new("/").with_fragment("details"))
+            .unwrap();
+        let EngineAction::FrameTask(fragment) = engine.action().unwrap() else {
+            panic!("depth-one fragment push must issue a frame task")
+        };
+
+        assert_eq!(fragment.identity().frame(), first.frame());
+        assert_eq!(fragment.identity().generation(), first.generation().next());
+    }
+
+    #[test]
+    fn nested_queued_push_matches_once_and_reuses_the_stored_branch() {
+        let mut engine = ready_engine();
+        let request = engine.enqueue_push(RouteLocation::new("/items/1")).unwrap();
+        engine.matcher = crate::matcher::RouteMatcher::new(
+            RouteTree::builder()
+                .root_with_options(
+                    RoutePattern::path("/").unwrap(),
+                    RouteNodeOptions::new().with_view(RouteViewKey::new("root").unwrap()),
+                )
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+
+        engine.collect();
+
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("stored match must still issue the original branch")
+        };
+        assert_eq!(parent.identity().request(), request);
+        assert_eq!(parent.view(), &RouteViewKey::new("root").unwrap());
+    }
+
+    #[test]
+    fn nested_match_failure_queues_without_branch_reservation_then_reserves_fallback_attempt() {
+        let mut engine = ready_engine();
+        let before = engine.ids.snapshot();
+        let request = engine.enqueue_push(RouteLocation::new("/missing")).unwrap();
+        let queued = engine.ids.snapshot();
+
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        assert!(engine.action().is_none());
+        assert_eq!(
+            queued.next_request(engine.router),
+            Some(request.sequence() + 1)
+        );
+        assert_eq!(queued.next_frame(), before.next_frame());
+        assert_eq!(queued.next_frame_task(), before.next_frame_task());
+        assert_eq!(queued.next_transaction(), before.next_transaction());
+        assert_eq!(queued.next_cleanup_batch(), before.next_cleanup_batch());
+        engine.collect();
+        let fallback_reserved = engine.ids.snapshot();
+        let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
+            panic!("match failure must reserve and issue one fallback attempt")
+        };
+        assert_eq!(fallback.identity().request(), request);
+        assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
+        assert_eq!(fallback_reserved.next_frame(), queued.next_frame() + 1);
+        assert_eq!(
+            fallback_reserved.next_frame_task(),
+            queued.next_frame_task() + 1
+        );
+        assert_eq!(
+            fallback_reserved.next_transaction(),
+            queued.next_transaction() + 1
+        );
+        assert_eq!(
+            fallback_reserved.next_cleanup_batch(),
+            queued.next_cleanup_batch() + 1
+        );
+    }
+
+    #[test]
+    fn nested_applied_reports_reject_unsorted_foreign_and_duplicate_capabilities() {
+        let mut unsorted_engine = ready_engine();
+        unsorted_engine
+            .push(RouteLocation::new("/items/1"))
+            .unwrap();
+        let EngineAction::FrameTask(task) = unsorted_engine.action().unwrap() else {
+            panic!("parent task expected")
+        };
+        let exact_identity = task.identity().clone();
+        let lifecycle = (
+            unsorted_engine.state.snapshot(),
+            unsorted_engine.ids.snapshot(),
+            unsorted_engine.history.clone(),
+            unsorted_engine.records.clone(),
+            format!("{:?}", unsorted_engine.current),
+        );
+        let report = task.into_applied_report(vec![
+            crate::slot::RouteSlotKey::named("z").unwrap(),
+            crate::slot::RouteSlotKey::default(),
+        ]);
+        assert_eq!(
+            unsorted_engine.accept_applied_report(report),
+            Err(ReportError::Invalid)
+        );
+        assert_eq!(
+            (
+                unsorted_engine.state.snapshot(),
+                unsorted_engine.ids.snapshot(),
+                unsorted_engine.history.clone(),
+                unsorted_engine.records.clone(),
+                format!("{:?}", unsorted_engine.current),
+            ),
+            lifecycle
+        );
+        let EngineAction::FrameTask(reissued) = unsorted_engine.action().unwrap() else {
+            panic!("invalid consumed report must restore its exact task")
+        };
+        assert_eq!(reissued.identity(), &exact_identity);
+
+        let mut foreign_engine = ready_engine();
+        foreign_engine.push(RouteLocation::new("/items/1")).unwrap();
+        let EngineAction::FrameTask(task) = foreign_engine.action().unwrap() else {
+            panic!("parent task expected")
+        };
+        let exact_identity = task.identity().clone();
+        let mut foreign = task.into_applied_report(vec![crate::slot::RouteSlotKey::default()]);
+        foreign
+            .identity
+            .testing_set_router(distinct_identity().router_identity());
+        let before = (
+            foreign_engine.state.snapshot(),
+            foreign_engine.ids.snapshot(),
+            foreign_engine.history.clone(),
+            format!("{:?}", foreign_engine.current),
+        );
+        assert_eq!(
+            foreign_engine.accept_applied_report(foreign),
+            Err(ReportError::Invalid)
+        );
+        assert_eq!(
+            (
+                foreign_engine.state.snapshot(),
+                foreign_engine.ids.snapshot(),
+                foreign_engine.history.clone(),
+                format!("{:?}", foreign_engine.current),
+            ),
+            before
+        );
+        let EngineAction::FrameTask(reissued) = foreign_engine.action().unwrap() else {
+            panic!("foreign consumed report must restore the current exact task")
+        };
+        assert_eq!(reissued.identity(), &exact_identity);
+
+        let mut duplicate_engine = ready_engine();
+        duplicate_engine
+            .push(RouteLocation::new("/items/1"))
+            .unwrap();
+        let EngineAction::FrameTask(task) = duplicate_engine.action().unwrap() else {
+            panic!("parent task expected")
+        };
+        let report = task.into_applied_report(vec![crate::slot::RouteSlotKey::default()]);
+        let duplicate = report.testing_duplicate();
+        duplicate_engine.accept_applied_report(report).unwrap();
+        let before = (
+            duplicate_engine.state.snapshot(),
+            duplicate_engine.ids.snapshot(),
+            duplicate_engine.history.clone(),
+            format!("{:?}", duplicate_engine.current),
+            duplicate_engine.action.as_ref().map(ActionSnapshot::from),
+        );
+        assert_eq!(
+            duplicate_engine.accept_applied_report(duplicate),
+            Err(ReportError::Duplicate)
+        );
+        assert_eq!(
+            (
+                duplicate_engine.state.snapshot(),
+                duplicate_engine.ids.snapshot(),
+                duplicate_engine.history.clone(),
+                format!("{:?}", duplicate_engine.current),
+                duplicate_engine.action.as_ref().map(ActionSnapshot::from),
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn nested_branch_reservation_exhaustion_is_complete_zero_change() {
+        let mut engine = ready_engine();
+        engine.testing_exhaust_reservation_counter(ReservationCounter::FrameTask);
+        let before = engine.snapshot();
+
+        assert_eq!(
+            engine.push(RouteLocation::new("/items/1")),
+            Err(super::PushError::IdExhausted)
+        );
+        assert_eq!(engine.snapshot(), before);
+    }
+
+    #[test]
+    fn nested_successful_branch_reservation_stays_burned_after_mount_resolution_failure() {
+        let mut engine = ready_engine();
+        let before = engine.ids.snapshot();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        let reserved = engine.ids.snapshot();
+        assert_eq!(reserved.next_frame(), before.next_frame() + 2);
+        assert_eq!(reserved.next_frame_task(), before.next_frame_task() + 2);
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("parent task expected")
+        };
+        engine
+            .accept_applied_report(
+                parent.into_applied_report(vec![crate::slot::RouteSlotKey::default()]),
+            )
+            .unwrap();
+        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
+            panic!("mount request expected")
+        };
+        engine.ids.testing_exhaust_slot_counter();
+
+        assert!(matches!(
+            engine.resolve_mount(mount),
+            Err(crate::mount::MountError::Exhausted)
+        ));
+        assert!(matches!(engine.action(), Some(EngineAction::FrameTask(_))));
+        assert!(engine.ids.snapshot().next_frame() > reserved.next_frame());
+        assert!(engine.ids.snapshot().next_frame_task() > reserved.next_frame_task());
     }
 
     #[test]

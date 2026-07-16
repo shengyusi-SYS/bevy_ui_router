@@ -260,6 +260,9 @@ mod tests {
         let ticket = match action {
             EngineAction::FrameTask(task) => engine.report_applied(task).unwrap(),
             EngineAction::Commit(ticket) => ticket,
+            EngineAction::MountRequest(_) => {
+                panic!("depth-one snapshot fixture must not produce a nested mount action")
+            }
         };
         let prepared = engine
             .prepare_commit(&ticket, CleanupManifest::empty())

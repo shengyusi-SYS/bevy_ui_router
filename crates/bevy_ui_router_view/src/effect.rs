@@ -72,4 +72,13 @@ mod tests {
 
         assert_eq!(request_id.raw(), 7);
     }
+
+    #[test]
+    fn request_id_observes_distinct_frame_task_sequences() {
+        let parent = ViewRequestId::from_raw(11);
+        let child = ViewRequestId::from_raw(12);
+
+        assert_ne!(parent, child);
+        assert_eq!((parent.raw(), child.raw()), (11, 12));
+    }
 }

@@ -316,19 +316,21 @@ impl RouteFrameBranch {
     pub(crate) fn from_matched_branch(
         scope: RouteFrameScope,
         branch: &MatchedBranch,
-        allocator: &mut FrameAllocator,
+        reserved_frames: &[RouteFrameId],
     ) -> Self {
+        assert_eq!(reserved_frames.len(), branch.routes().len());
         let frames = branch
             .routes()
             .iter()
+            .zip(reserved_frames.iter().copied())
             .enumerate()
-            .map(|(index, matched)| {
+            .map(|(index, (matched, frame))| {
                 let identity = RouteFrameIdentity::new(
                     scope.router(),
                     scope.host(),
                     scope.slot(),
                     matched.route(),
-                    allocator.allocate(),
+                    frame,
                     RouteGeneration::initial(),
                 );
                 RouteFrameRecord::new(
@@ -341,26 +343,6 @@ impl RouteFrameBranch {
             })
             .collect();
         Self::new(frames, branch.branch_fingerprint().clone())
-    }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug)]
-pub(crate) struct FrameAllocator {
-    next_frame: u64,
-}
-
-impl FrameAllocator {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) const fn new() -> Self {
-        Self { next_frame: 1 }
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn allocate(&mut self) -> RouteFrameId {
-        let frame = RouteFrameId::new(self.next_frame);
-        self.next_frame += 1;
-        frame
     }
 }
 
@@ -440,7 +422,7 @@ impl FrameReconciliationPlan {
         active: Option<&RouteFrameBranch>,
         target: &MatchedBranch,
         diff: &BranchDiff,
-        allocator: &mut FrameAllocator,
+        reserved_frames: &[RouteFrameId],
     ) -> Self {
         let in_scope_active = active.filter(|branch| branch.belongs_to_scope(scope));
         let baseline_branch = in_scope_active.map(ActiveBranchBaseline::from_branch);
@@ -467,7 +449,7 @@ impl FrameReconciliationPlan {
                     target,
                     common,
                     RouteFrameStatus::Building,
-                    allocator,
+                    reserved_frames,
                 );
                 (preserved, leaving, entering)
             } else {
@@ -479,14 +461,26 @@ impl FrameReconciliationPlan {
                         .rev()
                         .map(|record| record.with_status(RouteFrameStatus::Leaving))
                         .collect(),
-                    build_entering_records(scope, target, 0, RouteFrameStatus::Building, allocator),
+                    build_entering_records(
+                        scope,
+                        target,
+                        0,
+                        RouteFrameStatus::Building,
+                        reserved_frames,
+                    ),
                 )
             }
         } else {
             (
                 Vec::new(),
                 Vec::new(),
-                build_entering_records(scope, target, 0, RouteFrameStatus::Building, allocator),
+                build_entering_records(
+                    scope,
+                    target,
+                    0,
+                    RouteFrameStatus::Building,
+                    reserved_frames,
+                ),
             )
         };
 
@@ -504,10 +498,15 @@ impl FrameReconciliationPlan {
     pub(crate) fn from_first_navigation(
         scope: RouteFrameScope,
         target: &MatchedBranch,
-        allocator: &mut FrameAllocator,
+        reserved_frames: &[RouteFrameId],
     ) -> Self {
-        let entering =
-            build_entering_records(scope, target, 0, RouteFrameStatus::Building, allocator);
+        let entering = build_entering_records(
+            scope,
+            target,
+            0,
+            RouteFrameStatus::Building,
+            reserved_frames,
+        );
         Self {
             preserved: Vec::new(),
             leaving: Vec::new(),
@@ -571,8 +570,9 @@ fn build_entering_records(
     target: &MatchedBranch,
     start_index: usize,
     status: RouteFrameStatus,
-    allocator: &mut FrameAllocator,
+    reserved_frames: &[RouteFrameId],
 ) -> Vec<RouteFrameRecord> {
+    assert_eq!(reserved_frames.len(), target.routes().len());
     target.routes()[start_index..]
         .iter()
         .enumerate()
@@ -583,7 +583,7 @@ fn build_entering_records(
                 scope.host(),
                 scope.slot(),
                 matched.route(),
-                allocator.allocate(),
+                reserved_frames[branch_index],
                 RouteGeneration::initial(),
             );
             RouteFrameRecord::new(
@@ -707,6 +707,12 @@ mod tests {
             .route(items, RoutePattern::path(":id").unwrap())
             .unwrap();
         RouteMatcher::new(builder.build().unwrap())
+    }
+
+    fn reserve_frame_ids(allocator: &mut CoreIdAllocator, count: usize) -> Vec<RouteFrameId> {
+        (0..count)
+            .map(|_| allocator.allocate_frame().unwrap())
+            .collect()
     }
 
     fn segment(route: RouteId) -> RouteSegmentReuseKey {
@@ -851,14 +857,15 @@ mod tests {
         let target = matcher
             .match_location(&RouteLocation::new("/items/1"))
             .unwrap();
-        let mut allocator = FrameAllocator::new();
+        let mut allocator = CoreIdAllocator::new().unwrap();
         let scope = RouteFrameScope::new(
             RouterInstanceId::new(1),
             RouteHostId::new(2),
             RouteSlotId::new(3),
         );
 
-        let plan = FrameReconciliationPlan::from_first_navigation(scope, &target, &mut allocator);
+        let reserved = reserve_frame_ids(&mut allocator, target.routes().len());
+        let plan = FrameReconciliationPlan::from_first_navigation(scope, &target, &reserved);
 
         assert!(plan.baseline_fingerprint().is_none());
         assert!(plan.preserved().is_empty());
@@ -881,20 +888,22 @@ mod tests {
             .match_location(&RouteLocation::new("/items/2"))
             .unwrap();
         let diff = BranchDiff::compare(&old_branch, &new_branch);
-        let mut allocator = FrameAllocator::new();
+        let mut allocator = CoreIdAllocator::new().unwrap();
         let scope = RouteFrameScope::new(
             RouterInstanceId::new(1),
             RouteHostId::new(2),
             RouteSlotId::new(3),
         );
-        let active = RouteFrameBranch::from_matched_branch(scope, &old_branch, &mut allocator);
+        let old_reserved = reserve_frame_ids(&mut allocator, old_branch.routes().len());
+        let active = RouteFrameBranch::from_matched_branch(scope, &old_branch, &old_reserved);
+        let new_reserved = reserve_frame_ids(&mut allocator, new_branch.routes().len());
 
         let plan = FrameReconciliationPlan::from_diff(
             scope,
             Some(&active),
             &new_branch,
             &diff,
-            &mut allocator,
+            &new_reserved,
         );
 
         assert_eq!(plan.preserved().len(), 2);
@@ -924,20 +933,22 @@ mod tests {
             .match_location(&RouteLocation::new("/items/3"))
             .unwrap();
         let diff = BranchDiff::compare(&old_branch, &new_branch);
-        let mut allocator = FrameAllocator::new();
+        let mut allocator = CoreIdAllocator::new().unwrap();
         let scope = RouteFrameScope::new(
             RouterInstanceId::new(1),
             RouteHostId::new(2),
             RouteSlotId::new(3),
         );
-        let active = RouteFrameBranch::from_matched_branch(scope, &stale_branch, &mut allocator);
+        let stale_reserved = reserve_frame_ids(&mut allocator, stale_branch.routes().len());
+        let active = RouteFrameBranch::from_matched_branch(scope, &stale_branch, &stale_reserved);
+        let new_reserved = reserve_frame_ids(&mut allocator, new_branch.routes().len());
 
         let plan = FrameReconciliationPlan::from_diff(
             scope,
             Some(&active),
             &new_branch,
             &diff,
-            &mut allocator,
+            &new_reserved,
         );
 
         assert_eq!(
@@ -960,7 +971,7 @@ mod tests {
             .match_location(&RouteLocation::new("/items/2"))
             .unwrap();
         let diff = BranchDiff::compare(&old_branch, &new_branch);
-        let mut allocator = FrameAllocator::new();
+        let mut allocator = CoreIdAllocator::new().unwrap();
         let active_scope = RouteFrameScope::new(
             RouterInstanceId::new(9),
             RouteHostId::new(9),
@@ -971,15 +982,17 @@ mod tests {
             RouteHostId::new(2),
             RouteSlotId::new(3),
         );
+        let old_reserved = reserve_frame_ids(&mut allocator, old_branch.routes().len());
         let active =
-            RouteFrameBranch::from_matched_branch(active_scope, &old_branch, &mut allocator);
+            RouteFrameBranch::from_matched_branch(active_scope, &old_branch, &old_reserved);
+        let new_reserved = reserve_frame_ids(&mut allocator, new_branch.routes().len());
 
         let plan = FrameReconciliationPlan::from_diff(
             requested_scope,
             Some(&active),
             &new_branch,
             &diff,
-            &mut allocator,
+            &new_reserved,
         );
 
         assert!(plan.baseline_fingerprint().is_none());
@@ -1028,20 +1041,22 @@ mod tests {
             .match_location(&RouteLocation::new("/items/1"))
             .unwrap();
         let diff = BranchDiff::compare(&old_branch, &new_branch);
-        let mut allocator = FrameAllocator::new();
+        let mut allocator = CoreIdAllocator::new().unwrap();
         let scope = RouteFrameScope::new(
             RouterInstanceId::new(1),
             RouteHostId::new(2),
             RouteSlotId::new(3),
         );
-        let active = RouteFrameBranch::from_matched_branch(scope, &old_branch, &mut allocator);
+        let old_reserved = reserve_frame_ids(&mut allocator, old_branch.routes().len());
+        let active = RouteFrameBranch::from_matched_branch(scope, &old_branch, &old_reserved);
+        let new_reserved = reserve_frame_ids(&mut allocator, new_branch.routes().len());
 
         let plan = FrameReconciliationPlan::from_diff(
             scope,
             Some(&active),
             &new_branch,
             &diff,
-            &mut allocator,
+            &new_reserved,
         );
 
         assert!(diff.provenance_changed());
@@ -1060,20 +1075,22 @@ mod tests {
             .match_location(&RouteLocation::new("/section/items/2"))
             .unwrap();
         let diff = BranchDiff::compare(&old_branch, &new_branch);
-        let mut allocator = FrameAllocator::new();
+        let mut allocator = CoreIdAllocator::new().unwrap();
         let scope = RouteFrameScope::new(
             RouterInstanceId::new(1),
             RouteHostId::new(2),
             RouteSlotId::new(3),
         );
-        let active = RouteFrameBranch::from_matched_branch(scope, &old_branch, &mut allocator);
+        let old_reserved = reserve_frame_ids(&mut allocator, old_branch.routes().len());
+        let active = RouteFrameBranch::from_matched_branch(scope, &old_branch, &old_reserved);
+        let new_reserved = reserve_frame_ids(&mut allocator, new_branch.routes().len());
 
         let plan = FrameReconciliationPlan::from_diff(
             scope,
             Some(&active),
             &new_branch,
             &diff,
-            &mut allocator,
+            &new_reserved,
         );
 
         let leaf = new_branch.leaf().unwrap().route();
@@ -1095,14 +1112,15 @@ mod tests {
             .match_location(&RouteLocation::new("/items/1"))
             .unwrap();
         let leaf = target.leaf().unwrap().route();
-        let mut allocator = FrameAllocator::new();
+        let mut allocator = CoreIdAllocator::new().unwrap();
         let scope = RouteFrameScope::new(
             RouterInstanceId::new(1),
             RouteHostId::new(2),
             RouteSlotId::new(3),
         );
 
-        let plan = FrameReconciliationPlan::from_first_navigation(scope, &target, &mut allocator);
+        let reserved = reserve_frame_ids(&mut allocator, target.routes().len());
+        let plan = FrameReconciliationPlan::from_first_navigation(scope, &target, &reserved);
 
         assert_eq!(plan.nearest_error_boundary_for(leaf), None);
     }

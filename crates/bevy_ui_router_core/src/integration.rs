@@ -9,13 +9,13 @@ use crate::cleanup::{
 use crate::engine::{
     CommitError as CoreCommitError, CommitTicket as CoreCommitTicket,
     EngineAction as CoreEngineAction, EngineInstallError as CoreEngineInstallError,
-    PreparedPublication, PrivateRequestLookup, PushError as CorePushError,
-    ReportError as CoreReportError, RootFrameTask as CoreRootFrameTask,
-    RouterEngine as CoreRouterEngine,
+    FrameMountRequest as CoreFrameMountRequest, FrameMountTarget as CoreFrameMountTarget,
+    FrameTask as CoreFrameTask, PreparedPublication, PrivateRequestLookup,
+    PushError as CorePushError, ReportError as CoreReportError, RouterEngine as CoreRouterEngine,
 };
 use crate::frame::RouteFrameVersion;
 use crate::history::{HistorySnapshot, MemoryHistory};
-use crate::ids::{NavigationRequestId, RouterIdentity};
+use crate::ids::{NavigationRequestId, RouteSlotId, RouterIdentity};
 use crate::location::RouteLocation;
 use crate::meta::ErrorBoundaryKey;
 use crate::mount::{
@@ -29,6 +29,7 @@ use crate::request::{
     RequestStatus,
 };
 use crate::route_tree::RouteTree;
+use crate::slot::RouteSlotKey;
 use crate::trace::{CleanupDisposition, NavigationTraceEvent};
 use crate::view_input::RouteViewInput;
 use crate::view_key::RouteViewKey;
@@ -147,8 +148,22 @@ pub fn for_each_route_view_binding(
     }
 }
 
-pub struct RootFrameTask {
-    inner: CoreRootFrameTask,
+pub struct FrameTask {
+    inner: CoreFrameTask,
+}
+
+pub type RootFrameTask = FrameTask;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FrameMountTarget {
+    TopSlot {
+        host: crate::HostVersion,
+        slot: RouteSlotId,
+    },
+    ChildOutlet {
+        parent: RouteFrameVersion,
+        outlet: RouteSlotKey,
+    },
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -156,7 +171,7 @@ pub struct ViewReportIdentity {
     inner: crate::engine::RootTaskIdentity,
 }
 
-impl RootFrameTask {
+impl FrameTask {
     pub fn report_identity(&self) -> ViewReportIdentity {
         ViewReportIdentity {
             inner: self.inner.identity().clone(),
@@ -168,7 +183,7 @@ impl RootFrameTask {
     }
 
     pub fn view_request_sequence(&self) -> u64 {
-        self.inner.identity().request().sequence()
+        self.inner.identity().frame_task().raw()
     }
 
     pub fn frame(&self) -> &RouteFrameVersion {
@@ -189,10 +204,42 @@ impl RootFrameTask {
     pub fn take_input(&mut self) -> RouteViewInput {
         self.inner.take_input()
     }
+
+    pub fn mount_target(&self) -> FrameMountTarget {
+        match self.inner.mount_target() {
+            CoreFrameMountTarget::TopSlot { host, slot } => FrameMountTarget::TopSlot {
+                host: host.clone(),
+                slot: *slot,
+            },
+            CoreFrameMountTarget::ChildOutlet { parent, outlet } => FrameMountTarget::ChildOutlet {
+                parent: parent.clone(),
+                outlet: outlet.clone(),
+            },
+        }
+    }
+}
+
+pub struct MountRequest {
+    inner: CoreFrameMountRequest,
+}
+
+impl MountRequest {
+    pub fn request(&self) -> NavigationRequestId {
+        self.inner.request()
+    }
+
+    pub fn parent(&self) -> &RouteFrameVersion {
+        self.inner.parent()
+    }
+
+    pub fn outlet(&self) -> &RouteSlotKey {
+        self.inner.outlet()
+    }
 }
 
 pub enum EngineAction {
-    FrameTask(RootFrameTask),
+    FrameTask(FrameTask),
+    MountRequest(MountRequest),
     Commit(CommitTicket),
 }
 
@@ -579,9 +626,22 @@ impl RouterEngine {
 
     pub fn action(&mut self) -> Option<EngineAction> {
         self.inner.action().map(|action| match action {
-            CoreEngineAction::FrameTask(inner) => EngineAction::FrameTask(RootFrameTask { inner }),
+            CoreEngineAction::FrameTask(inner) => EngineAction::FrameTask(FrameTask { inner }),
+            CoreEngineAction::MountRequest(inner) => {
+                EngineAction::MountRequest(MountRequest { inner })
+            }
             CoreEngineAction::Commit(inner) => EngineAction::Commit(CommitTicket { inner }),
         })
+    }
+
+    pub fn report_applied_with_outlets(
+        &mut self,
+        task: FrameTask,
+        outlets: Vec<RouteSlotKey>,
+    ) -> Result<(), IntegrationError> {
+        self.inner
+            .accept_applied_report(task.inner.into_applied_report(outlets))
+            .map_err(map_report_error)
     }
 
     pub fn report_applied(
@@ -589,11 +649,42 @@ impl RouterEngine {
         task: RootFrameTask,
     ) -> Result<CommitTicket, IntegrationError> {
         self.inner
-            .begin_view_report(task.inner.identity())
-            .map(|session| CommitTicket {
-                inner: session.applied(),
-            })
-            .map_err(map_report_error)
+            .accept_applied_report(task.inner.into_applied_report(Vec::new()))
+            .map_err(map_report_error)?;
+        match self.inner.action() {
+            Some(CoreEngineAction::Commit(inner)) => Ok(CommitTicket { inner }),
+            Some(other) => {
+                self.inner.restore_action(other);
+                Err(IntegrationError::Invalid)
+            }
+            None => Err(IntegrationError::Invalid),
+        }
+    }
+
+    pub fn resolve_mount(&mut self, request: MountRequest) -> Result<MountGrant, IntegrationError> {
+        self.inner
+            .resolve_mount(request.inner)
+            .map(MountGrant::sealed)
+            .map_err(map_mount_error)
+    }
+
+    pub fn accept_mount_receipt(
+        &mut self,
+        receipt: MountReceiptAttestation,
+    ) -> Result<MountRegistrationPermit, IntegrationError> {
+        self.inner
+            .accept_mount_receipt(receipt.inner)
+            .map(MountRegistrationPermit::sealed)
+            .map_err(map_mount_error)
+    }
+
+    pub fn complete_mount_registration(
+        &mut self,
+        completion: MountRegistrationCompletion,
+    ) -> Result<(), IntegrationError> {
+        self.inner
+            .complete_mount_registration(completion.inner)
+            .map_err(map_mount_error)
     }
 
     pub fn validate_report_identity(
@@ -763,9 +854,18 @@ fn map_push_error(error: CorePushError) -> IntegrationError {
 
 fn map_report_error(error: CoreReportError) -> IntegrationError {
     match error {
-        CoreReportError::Duplicate | CoreReportError::Stale | CoreReportError::Invalid => {
-            IntegrationError::Stale
-        }
+        CoreReportError::Duplicate => IntegrationError::Duplicate,
+        CoreReportError::Stale => IntegrationError::Stale,
+        CoreReportError::Invalid => IntegrationError::Invalid,
+    }
+}
+
+fn map_mount_error(error: crate::mount::MountError) -> IntegrationError {
+    match error {
+        crate::mount::MountError::Exhausted => IntegrationError::Exhausted,
+        crate::mount::MountError::Foreign => IntegrationError::ForeignRouter,
+        crate::mount::MountError::Stale => IntegrationError::Stale,
+        crate::mount::MountError::WrongPhase => IntegrationError::Invalid,
     }
 }
 
@@ -798,6 +898,98 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
+    }
+
+    fn nested_tree() -> RouteTree {
+        let mut builder = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("layout").unwrap()),
+            )
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        builder
+            .route_with_options(
+                root,
+                RoutePattern::path("items/:id").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("item").unwrap()),
+            )
+            .unwrap();
+        builder.build().unwrap()
+    }
+
+    fn confirmed_nested_engine() -> RouterEngine {
+        let mut engine =
+            RouterEngine::install(nested_tree(), RouteViewKey::new("fallback").unwrap()).unwrap();
+        let token = engine.request_host_admission().unwrap();
+        let grant = engine.grant_host_admission(&token).unwrap();
+        engine.record_top_slot_registered(&grant).unwrap();
+        engine.confirm_host(grant);
+        engine
+    }
+
+    #[test]
+    fn nested_integration_requires_outlet_report_and_registration_completion() {
+        let mut engine = confirmed_nested_engine();
+        let request = engine.push(RouteLocation::new("/items/1")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("parent frame task expected")
+        };
+        let parent_sequence = parent.view_request_sequence();
+        let parent_frame = parent.frame().clone();
+        engine
+            .report_applied_with_outlets(parent, vec![RouteSlotKey::default()])
+            .unwrap();
+
+        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
+            panic!("parent report must yield a mount request")
+        };
+        assert_eq!(mount.request(), request);
+        assert_eq!(mount.parent(), &parent_frame);
+        assert!(mount.outlet().is_default());
+        let grant = engine.resolve_mount(mount).unwrap();
+        let receipt = grant.attest_receipt(101);
+        let permit = engine.accept_mount_receipt(receipt).unwrap();
+        assert!(engine.action().is_none());
+        let completion = permit.complete(103);
+        assert!(engine.action().is_none());
+        engine.complete_mount_registration(completion).unwrap();
+
+        let EngineAction::FrameTask(child) = engine.action().unwrap() else {
+            panic!("registration completion must yield the child frame task")
+        };
+        assert_ne!(child.view_request_sequence(), parent_sequence);
+        assert!(matches!(
+            child.mount_target(),
+            FrameMountTarget::ChildOutlet { .. }
+        ));
+        engine
+            .report_applied_with_outlets(child, Vec::new())
+            .unwrap();
+        assert!(matches!(engine.action(), Some(EngineAction::Commit(_))));
+    }
+
+    #[test]
+    fn legacy_report_applied_reissues_nested_parent_without_lifecycle_change() {
+        let mut engine = confirmed_nested_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("parent frame task expected")
+        };
+        let exact = parent.report_identity();
+        let before = engine.snapshot();
+
+        assert!(matches!(
+            engine.report_applied(parent),
+            Err(IntegrationError::Invalid)
+        ));
+        assert_eq!(engine.snapshot(), before);
+        let EngineAction::FrameTask(reissued) = engine.action().unwrap() else {
+            panic!("legacy misuse must restore exactly one parent task")
+        };
+        assert!(reissued.report_identity() == exact);
     }
 
     #[test]
@@ -865,6 +1057,7 @@ mod tests {
         engine.collect();
         let ticket = match engine.action().unwrap() {
             EngineAction::FrameTask(task) => engine.report_applied(task).unwrap(),
+            EngineAction::MountRequest(_) => panic!("helper expects a depth-one route"),
             EngineAction::Commit(ticket) => ticket,
         };
         let prepared = engine

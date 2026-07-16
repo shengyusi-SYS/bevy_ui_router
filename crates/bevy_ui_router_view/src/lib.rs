@@ -27,12 +27,12 @@ pub mod integration {
     pub fn build_effect(
         view: RouteViewKey,
         input: RouteViewInput,
-        request_sequence: u64,
+        frame_task_sequence: u64,
     ) -> ViewBuildEffect {
         ViewBuildEffect::new(
             view,
             input,
-            super::effect::ViewRequestId::from_raw(request_sequence),
+            super::effect::ViewRequestId::from_raw(frame_task_sequence),
         )
     }
 }
