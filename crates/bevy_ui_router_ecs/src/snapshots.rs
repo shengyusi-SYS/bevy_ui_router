@@ -263,6 +263,9 @@ mod tests {
             EngineAction::MountRequest(_) => {
                 panic!("depth-one snapshot fixture must not produce a nested mount action")
             }
+            EngineAction::FailureCleanup(_) => {
+                panic!("depth-one snapshot fixture must not produce nested failure cleanup")
+            }
         };
         let prepared = engine
             .prepare_commit(&ticket, CleanupManifest::empty())

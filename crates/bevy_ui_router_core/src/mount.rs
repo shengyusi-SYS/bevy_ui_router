@@ -175,10 +175,7 @@ impl MountIssuer {
         token: &MountRequestToken,
         ids: &mut CoreIdAllocator,
     ) -> Result<MountGrant, MountError> {
-        if !token.has_valid_binding() || !identity_is_coherent(&token.identity) {
-            return Err(MountError::Foreign);
-        }
-        self.validate_requested(&token.identity)?;
+        self.validate_request_token(token)?;
         if !ids.owns_router_identity(token.identity.router) {
             return Err(MountError::Foreign);
         }
@@ -211,10 +208,7 @@ impl MountIssuer {
     }
 
     fn finish_requested(&mut self, token: &MountRequestToken) -> Result<(), MountError> {
-        if !token.has_valid_binding() || !identity_is_coherent(&token.identity) {
-            return Err(MountError::Foreign);
-        }
-        self.validate_requested(&token.identity)?;
+        self.validate_request_token(token)?;
         self.outstanding = None;
         Ok(())
     }
@@ -223,10 +217,7 @@ impl MountIssuer {
         &mut self,
         receipt: &MountReceiptAttestation,
     ) -> Result<MountRegistrationPermit, MountError> {
-        if !receipt.has_valid_binding() || !identity_is_coherent(&receipt.identity) {
-            return Err(MountError::Foreign);
-        }
-        self.validate_granted(&receipt.identity, receipt.slot)?;
+        self.validate_receipt(receipt)?;
 
         let permit = MountRegistrationPermit {
             identity: receipt.identity.clone(),
@@ -252,14 +243,7 @@ impl MountIssuer {
         &mut self,
         completion: &MountRegistrationCompletion,
     ) -> Result<MountConfirmation, MountError> {
-        if !completion.has_valid_binding() || !identity_is_coherent(&completion.identity) {
-            return Err(MountError::Foreign);
-        }
-        self.validate_confirming(
-            &completion.identity,
-            completion.slot,
-            completion.receipt_digest,
-        )?;
+        self.validate_completion(completion)?;
 
         let confirmation = MountConfirmation {
             identity: completion.identity.clone(),
@@ -282,6 +266,49 @@ impl MountIssuer {
         &mut self,
         artifact: &A,
     ) -> Result<(), MountError> {
+        self.validate_mutation_artifact(artifact)?;
+        self.outstanding = None;
+        Ok(())
+    }
+
+    pub(crate) fn validate_request_token(
+        &self,
+        token: &MountRequestToken,
+    ) -> Result<(), MountError> {
+        if !token.has_valid_binding() || !identity_is_coherent(&token.identity) {
+            return Err(MountError::Foreign);
+        }
+        self.validate_requested(&token.identity)
+    }
+
+    pub(crate) fn validate_receipt(
+        &self,
+        receipt: &MountReceiptAttestation,
+    ) -> Result<(), MountError> {
+        if !receipt.has_valid_binding() || !identity_is_coherent(&receipt.identity) {
+            return Err(MountError::Foreign);
+        }
+        self.validate_granted(&receipt.identity, receipt.slot)
+    }
+
+    pub(crate) fn validate_completion(
+        &self,
+        completion: &MountRegistrationCompletion,
+    ) -> Result<(), MountError> {
+        if !completion.has_valid_binding() || !identity_is_coherent(&completion.identity) {
+            return Err(MountError::Foreign);
+        }
+        self.validate_confirming(
+            &completion.identity,
+            completion.slot,
+            completion.receipt_digest,
+        )
+    }
+
+    pub(crate) fn validate_mutation_artifact<A: MountMutationArtifact + ?Sized>(
+        &self,
+        artifact: &A,
+    ) -> Result<(), MountError> {
         if !artifact.has_valid_binding() || !identity_is_coherent(artifact.identity()) {
             return Err(MountError::Foreign);
         }
@@ -293,8 +320,25 @@ impl MountIssuer {
                 self.validate_confirming(artifact.identity(), artifact.slot(), receipt_digest)?;
             }
         }
-        self.outstanding = None;
         Ok(())
+    }
+
+    pub(crate) fn matches_outstanding_context(
+        &self,
+        host: &HostVersion,
+        request: NavigationRequestId,
+        transaction: TransactionId,
+        parent: &RouteFrameVersion,
+        outlet: &RouteSlotKey,
+    ) -> bool {
+        self.outstanding.as_ref().is_some_and(|outstanding| {
+            let identity = outstanding.identity();
+            identity.host == *host
+                && identity.request == request
+                && identity.transaction == transaction
+                && identity.parent == *parent
+                && identity.outlet == *outlet
+        })
     }
 
     fn validate_requested(&self, identity: &MountIdentity) -> Result<(), MountError> {
@@ -353,7 +397,7 @@ impl MountIssuer {
     }
 
     #[cfg(test)]
-    fn snapshot(&self) -> MountIssuerSnapshot {
+    pub(crate) fn snapshot(&self) -> MountIssuerSnapshot {
         MountIssuerSnapshot {
             router: self.router,
             outstanding: self.outstanding.clone(),
@@ -647,7 +691,7 @@ impl StructuredDigest {
 
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct MountIssuerSnapshot {
+pub(crate) struct MountIssuerSnapshot {
     router: RouterIdentity,
     outstanding: Option<OutstandingMount>,
 }
@@ -787,6 +831,54 @@ mod tests {
         let granted = fixture.ids.snapshot();
         assert_eq!(granted.next_slot(), requested.next_slot() + 1);
         assert_eq!(grant.slot().raw(), requested.next_slot());
+    }
+
+    #[test]
+    fn read_only_artifact_validation_preserves_every_issuer_stage() {
+        let mut fixture = Fixture::new();
+        let request = fixture.issue();
+        let requested = fixture.issuer.snapshot();
+        fixture.issuer.validate_request_token(&request).unwrap();
+        assert!(fixture.issuer.matches_outstanding_context(
+            &fixture.host,
+            fixture.request,
+            fixture.transaction,
+            &fixture.parent,
+            &fixture.outlet,
+        ));
+        assert_eq!(fixture.issuer.snapshot(), requested);
+
+        let grant = fixture.issuer.grant(&request, &mut fixture.ids).unwrap();
+        let granted = fixture.issuer.snapshot();
+        fixture.issuer.validate_mutation_artifact(&grant).unwrap();
+        let receipt = grant.attest_receipt(MountReceiptDigest::from_opaque(5));
+        fixture.issuer.validate_receipt(&receipt).unwrap();
+        assert_eq!(fixture.issuer.snapshot(), granted);
+
+        let permit = fixture.issuer.accept_receipt(&receipt).unwrap();
+        let confirming = fixture.issuer.snapshot();
+        fixture.issuer.validate_mutation_artifact(&permit).unwrap();
+        let completion = permit.complete(MountRegistrationDigest::from_opaque(7));
+        fixture.issuer.validate_completion(&completion).unwrap();
+        assert_eq!(fixture.issuer.snapshot(), confirming);
+
+        let replay = completion.clone();
+        fixture.issuer.complete_registration(&completion).unwrap();
+        let completed = fixture.issuer.snapshot();
+        assert_eq!(
+            fixture.issuer.validate_completion(&replay),
+            Err(MountError::Stale)
+        );
+        assert_eq!(fixture.issuer.snapshot(), completed);
+
+        let mut foreign = Fixture::new();
+        let foreign_grant = foreign.grant();
+        let foreign_receipt = foreign_grant.attest_receipt(MountReceiptDigest::from_opaque(11));
+        assert_eq!(
+            fixture.issuer.validate_receipt(&foreign_receipt),
+            Err(MountError::Foreign)
+        );
+        assert_eq!(fixture.issuer.snapshot(), completed);
     }
 
     #[test]

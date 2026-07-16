@@ -9,8 +9,10 @@ use crate::cleanup::{
 use crate::engine::{
     CommitError as CoreCommitError, CommitTicket as CoreCommitTicket,
     EngineAction as CoreEngineAction, EngineInstallError as CoreEngineInstallError,
-    FrameMountRequest as CoreFrameMountRequest, FrameMountTarget as CoreFrameMountTarget,
-    FrameTask as CoreFrameTask, PreparedPublication, PrivateRequestLookup,
+    FailureCleanupError as CoreFailureCleanupError,
+    FailureCleanupRequest as CoreFailureCleanupRequest, FrameMountRequest as CoreFrameMountRequest,
+    FrameMountTarget as CoreFrameMountTarget, FrameTask as CoreFrameTask,
+    MountMutationArtifact as CoreMountMutationArtifact, PreparedPublication, PrivateRequestLookup,
     PushError as CorePushError, ReportError as CoreReportError, RouterEngine as CoreRouterEngine,
 };
 use crate::frame::RouteFrameVersion;
@@ -30,7 +32,7 @@ use crate::request::{
 };
 use crate::route_tree::RouteTree;
 use crate::slot::RouteSlotKey;
-use crate::trace::{CleanupDisposition, NavigationTraceEvent};
+use crate::trace::{CleanupDisposition, MountRejectionKind, NavigationTraceEvent};
 use crate::view_input::RouteViewInput;
 use crate::view_key::RouteViewKey;
 use crate::{
@@ -237,9 +239,36 @@ impl MountRequest {
     }
 }
 
+#[doc(hidden)]
+pub enum MountMutationArtifact {
+    Grant(MountGrant),
+    RegistrationPermit(MountRegistrationPermit),
+}
+
+#[doc(hidden)]
+pub struct FailureCleanupRequest {
+    inner: CoreFailureCleanupRequest,
+}
+
+impl FailureCleanupRequest {
+    pub fn request(&self) -> NavigationRequestId {
+        self.inner.request()
+    }
+
+    pub fn logical_roots(&self) -> &[RouteFrameVersion] {
+        self.inner.logical_roots()
+    }
+
+    pub fn failure(&self) -> &NavigationFailure {
+        self.inner.failure()
+    }
+}
+
 pub enum EngineAction {
     FrameTask(FrameTask),
     MountRequest(MountRequest),
+    #[doc(hidden)]
+    FailureCleanup(FailureCleanupRequest),
     Commit(CommitTicket),
 }
 
@@ -630,6 +659,9 @@ impl RouterEngine {
             CoreEngineAction::MountRequest(inner) => {
                 EngineAction::MountRequest(MountRequest { inner })
             }
+            CoreEngineAction::FailureCleanup(inner) => {
+                EngineAction::FailureCleanup(FailureCleanupRequest { inner })
+            }
             CoreEngineAction::Commit(inner) => EngineAction::Commit(CommitTicket { inner }),
         })
     }
@@ -649,7 +681,7 @@ impl RouterEngine {
         task: RootFrameTask,
     ) -> Result<CommitTicket, IntegrationError> {
         self.inner
-            .accept_applied_report(task.inner.into_applied_report(Vec::new()))
+            .accept_applied_report(task.inner.into_legacy_applied_report())
             .map_err(map_report_error)?;
         match self.inner.action() {
             Some(CoreEngineAction::Commit(inner)) => Ok(CommitTicket { inner }),
@@ -665,6 +697,35 @@ impl RouterEngine {
         self.inner
             .resolve_mount(request.inner)
             .map(MountGrant::sealed)
+            .map_err(map_mount_error)
+    }
+
+    #[doc(hidden)]
+    pub fn reject_mount(
+        &mut self,
+        request: MountRequest,
+        rejection: MountRejectionKind,
+    ) -> Result<FailureCleanupRequest, IntegrationError> {
+        self.inner
+            .reject_mount(request.inner, rejection)
+            .map(|inner| FailureCleanupRequest { inner })
+            .map_err(map_mount_error)
+    }
+
+    #[doc(hidden)]
+    pub fn reject_mount_after_mutation(
+        &mut self,
+        artifact: MountMutationArtifact,
+    ) -> Result<FailureCleanupRequest, IntegrationError> {
+        let artifact = match artifact {
+            MountMutationArtifact::Grant(grant) => CoreMountMutationArtifact::Grant(grant.inner),
+            MountMutationArtifact::RegistrationPermit(permit) => {
+                CoreMountMutationArtifact::RegistrationPermit(permit.inner)
+            }
+        };
+        self.inner
+            .reject_mount_after_mutation(artifact)
+            .map(|inner| FailureCleanupRequest { inner })
             .map_err(map_mount_error)
     }
 
@@ -701,15 +762,45 @@ impl RouterEngine {
         task: RootFrameTask,
         kind: ViewFailureKind,
         message: &'static str,
-    ) -> Result<(), IntegrationError> {
+    ) -> Result<Option<FailureCleanupRequest>, IntegrationError> {
         let kind = match kind {
             ViewFailureKind::Build => NavigationFailureKind::Build,
             ViewFailureKind::Apply => NavigationFailureKind::Apply,
         };
         self.inner
             .begin_view_report(task.inner.identity())
-            .map(|session| session.failed(NavigationFailure::new(kind, message)))
+            .map(|session| {
+                session
+                    .failed(NavigationFailure::new(kind, message))
+                    .map(|inner| FailureCleanupRequest { inner })
+            })
             .map_err(map_report_error)
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_failure_cleanup(
+        &mut self,
+        request: FailureCleanupRequest,
+        manifest: CleanupManifest,
+    ) -> Result<CleanupBatch, IntegrationError> {
+        let manifest_digest = manifest.manifest_digest;
+        let obligation_count = manifest.obligation_count;
+        let inner = self
+            .inner
+            .prepare_failure_cleanup(
+                request.inner,
+                CleanupManifestSeal::new(
+                    manifest.logical_roots,
+                    CleanupManifestDigest::from_opaque(manifest_digest),
+                    obligation_count,
+                ),
+            )
+            .map_err(map_failure_cleanup_error)?;
+        Ok(CleanupBatch {
+            inner,
+            manifest_digest,
+            obligation_count,
+        })
     }
 
     pub fn prepare_commit(
@@ -876,6 +967,14 @@ fn map_commit_error(error: CoreCommitError) -> IntegrationError {
     }
 }
 
+fn map_failure_cleanup_error(error: CoreFailureCleanupError) -> IntegrationError {
+    match error {
+        CoreFailureCleanupError::Foreign => IntegrationError::ForeignRouter,
+        CoreFailureCleanupError::Stale => IntegrationError::Stale,
+        CoreFailureCleanupError::InvalidManifest => IntegrationError::InvalidManifest,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -928,6 +1027,33 @@ mod tests {
         engine
     }
 
+    fn pending_nested_receipt(engine: &mut RouterEngine, digest: u64) -> MountReceiptAttestation {
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("parent frame task expected")
+        };
+        engine
+            .report_applied_with_outlets(parent, vec![RouteSlotKey::default()])
+            .unwrap();
+        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
+            panic!("mount request expected")
+        };
+        engine.resolve_mount(mount).unwrap().attest_receipt(digest)
+    }
+
+    fn pending_nested_completion(
+        engine: &mut RouterEngine,
+        receipt_digest: u64,
+        registration_digest: u64,
+    ) -> MountRegistrationCompletion {
+        let receipt = pending_nested_receipt(engine, receipt_digest);
+        engine
+            .accept_mount_receipt(receipt)
+            .unwrap()
+            .complete(registration_digest)
+    }
+
     #[test]
     fn nested_integration_requires_outlet_report_and_registration_completion() {
         let mut engine = confirmed_nested_engine();
@@ -971,6 +1097,76 @@ mod tests {
     }
 
     #[test]
+    fn foreign_mount_receipt_and_completion_are_stable_in_idle_and_terminal_receivers() {
+        let mut idle_receipt_receiver = confirmed_nested_engine();
+        let mut receipt_source = confirmed_nested_engine();
+        let foreign_receipt = pending_nested_receipt(&mut receipt_source, 251);
+        assert!(matches!(
+            idle_receipt_receiver.accept_mount_receipt(foreign_receipt),
+            Err(IntegrationError::ForeignRouter)
+        ));
+
+        let mut terminal_receipt_receiver = confirmed_nested_engine();
+        settle_push(&mut terminal_receipt_receiver, RouteLocation::new("/"));
+        let mut terminal_receipt_source = confirmed_nested_engine();
+        let foreign_receipt = pending_nested_receipt(&mut terminal_receipt_source, 257);
+        assert!(matches!(
+            terminal_receipt_receiver.accept_mount_receipt(foreign_receipt),
+            Err(IntegrationError::ForeignRouter)
+        ));
+
+        let mut idle_completion_receiver = confirmed_nested_engine();
+        let mut completion_source = confirmed_nested_engine();
+        let foreign_completion = pending_nested_completion(&mut completion_source, 263, 269);
+        assert_eq!(
+            idle_completion_receiver.complete_mount_registration(foreign_completion),
+            Err(IntegrationError::ForeignRouter)
+        );
+
+        let mut terminal_completion_receiver = confirmed_nested_engine();
+        settle_push(&mut terminal_completion_receiver, RouteLocation::new("/"));
+        let mut terminal_completion_source = confirmed_nested_engine();
+        let foreign_completion =
+            pending_nested_completion(&mut terminal_completion_source, 271, 277);
+        assert_eq!(
+            terminal_completion_receiver.complete_mount_registration(foreign_completion),
+            Err(IntegrationError::ForeignRouter)
+        );
+    }
+
+    #[test]
+    fn consumed_mount_receipt_and_completion_replays_are_stale_without_fallback() {
+        let mut engine = confirmed_nested_engine();
+        let receipt = pending_nested_receipt(&mut engine, 281);
+        let receipt_replay = MountReceiptAttestation {
+            inner: receipt.inner.clone(),
+        };
+        let permit = engine.accept_mount_receipt(receipt).unwrap();
+        let after_receipt = engine.snapshot();
+        assert!(matches!(
+            engine.accept_mount_receipt(receipt_replay),
+            Err(IntegrationError::Stale)
+        ));
+        assert_eq!(engine.snapshot(), after_receipt);
+
+        let completion = permit.complete(283);
+        let completion_replay = MountRegistrationCompletion {
+            inner: completion.inner.clone(),
+        };
+        engine.complete_mount_registration(completion).unwrap();
+        let after_completion = engine.snapshot();
+        assert_eq!(
+            engine.complete_mount_registration(completion_replay),
+            Err(IntegrationError::Stale)
+        );
+        assert_eq!(engine.snapshot(), after_completion);
+        let EngineAction::FrameTask(child) = engine.action().unwrap() else {
+            panic!("normal completion must keep the child frame path")
+        };
+        assert_ne!(child.frame().origin(), &FrameOrigin::RouterFallback);
+    }
+
+    #[test]
     fn legacy_report_applied_reissues_nested_parent_without_lifecycle_change() {
         let mut engine = confirmed_nested_engine();
         engine.push(RouteLocation::new("/items/1")).unwrap();
@@ -990,6 +1186,119 @@ mod tests {
             panic!("legacy misuse must restore exactly one parent task")
         };
         assert!(reissued.report_identity() == exact);
+    }
+
+    #[test]
+    fn outlet_aware_missing_required_key_yields_mount_request_and_failure_cleanup() {
+        let mut engine = confirmed_nested_engine();
+        let request = engine.push(RouteLocation::new("/items/1")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("parent frame task expected")
+        };
+        let parent_frame = parent.frame().clone();
+
+        engine
+            .report_applied_with_outlets(parent, Vec::new())
+            .unwrap();
+
+        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
+            panic!("outlet-aware report still yields the matched mount request")
+        };
+        let failure = engine
+            .reject_mount(mount, MountRejectionKind::MissingOutlet)
+            .unwrap();
+        assert_eq!(failure.request(), request);
+        assert_eq!(failure.logical_roots(), &[parent_frame.clone()]);
+        assert_eq!(failure.failure().kind(), NavigationFailureKind::Mount);
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::CleanupPending)
+        );
+
+        let cleanup = engine
+            .prepare_failure_cleanup(failure, CleanupManifest::new(vec![parent_frame], 181, 1))
+            .unwrap();
+        assert_eq!(cleanup.manifest_digest(), 181);
+        assert_eq!(cleanup.obligation_count(), 1);
+        assert!(
+            engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .all(|event| { event.kind() != NavigationTraceEventKind::RequestTerminal })
+        );
+        engine.complete_cleanup(cleanup.complete(191, 1)).unwrap();
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::Mount
+        ));
+    }
+
+    #[test]
+    fn registration_permit_is_the_only_post_receipt_rejection_capability() {
+        let mut engine = confirmed_nested_engine();
+        let request = engine.push(RouteLocation::new("/items/1")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("parent frame task expected")
+        };
+        let parent_frame = parent.frame().clone();
+        engine
+            .report_applied_with_outlets(parent, vec![RouteSlotKey::default()])
+            .unwrap();
+        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
+            panic!("mount request expected")
+        };
+        let grant = engine.resolve_mount(mount).unwrap();
+        let receipt = grant.attest_receipt(193);
+        let permit = engine.accept_mount_receipt(receipt).unwrap();
+
+        let failure = engine
+            .reject_mount_after_mutation(MountMutationArtifact::RegistrationPermit(permit))
+            .unwrap();
+
+        assert_eq!(failure.request(), request);
+        assert_eq!(failure.logical_roots(), &[parent_frame.clone()]);
+        let cleanup = engine
+            .prepare_failure_cleanup(failure, CleanupManifest::new(vec![parent_frame], 197, 2))
+            .unwrap();
+        engine.complete_cleanup(cleanup.complete(199, 2)).unwrap();
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::Mount
+        ));
+    }
+
+    #[test]
+    fn foreign_failure_cleanup_request_is_rejected_before_receiver_mutation() {
+        let mut source = confirmed_nested_engine();
+        source.push(RouteLocation::new("/items/1")).unwrap();
+        source.collect();
+        let EngineAction::FrameTask(parent) = source.action().unwrap() else {
+            panic!("parent task expected")
+        };
+        source
+            .report_applied_with_outlets(parent, Vec::new())
+            .unwrap();
+        let EngineAction::MountRequest(mount) = source.action().unwrap() else {
+            panic!("mount request expected")
+        };
+        let failure = source
+            .reject_mount(mount, MountRejectionKind::MissingOutlet)
+            .unwrap();
+        let roots = failure.logical_roots().to_vec();
+
+        let mut receiver = confirmed_nested_engine();
+        let before = receiver.snapshot();
+        assert!(matches!(
+            receiver.prepare_failure_cleanup(failure, CleanupManifest::new(roots, 229, 1)),
+            Err(IntegrationError::ForeignRouter)
+        ));
+        assert_eq!(receiver.snapshot(), before);
     }
 
     #[test]
@@ -1058,6 +1367,9 @@ mod tests {
         let ticket = match engine.action().unwrap() {
             EngineAction::FrameTask(task) => engine.report_applied(task).unwrap(),
             EngineAction::MountRequest(_) => panic!("helper expects a depth-one route"),
+            EngineAction::FailureCleanup(_) => {
+                panic!("depth-one helper cannot hold nested failure cleanup")
+            }
             EngineAction::Commit(ticket) => ticket,
         };
         let prepared = engine

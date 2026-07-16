@@ -4,8 +4,8 @@ use bevy_ecs::{prelude::World, resource::Resource};
 use bevy_input_focus::InputFocus;
 use bevy_ui_router_core::{
     integration::{
-        CleanupManifest, CommitTicket, EngineAction, IntegrationError, MountRequest, RootFrameTask,
-        RouterEngine, ViewFailureKind,
+        CleanupManifest, CommitTicket, EngineAction, FailureCleanupRequest, IntegrationError,
+        MountRequest, RootFrameTask, RouterEngine, ViewFailureKind,
     },
     prelude::{NavigationRequestId, RouteLocation},
 };
@@ -80,6 +80,7 @@ pub(crate) struct RouterEntry {
     host_settlement: Option<ProvisionalHostSettlement>,
     pending_commit: Option<PendingCommit>,
     pending_mount_request: Option<MountRequest>,
+    pending_failure_cleanup_request: Option<FailureCleanupRequest>,
     pub(crate) active: Option<RealizedFrame>,
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
     failure_cleanup: Option<PendingFailureCleanup>,
@@ -92,6 +93,7 @@ impl RouterEntry {
         self.cleanup_observation.summary(
             self.cleanup_ledger.is_some()
                 || self.failure_cleanup.is_some()
+                || self.pending_failure_cleanup_request.is_some()
                 || self.host_settlement.is_some(),
         )
     }
@@ -171,6 +173,7 @@ impl RouterNavigation {
             host_settlement: None,
             pending_commit: None,
             pending_mount_request: None,
+            pending_failure_cleanup_request: None,
             active: None,
             cleanup_ledger: None,
             failure_cleanup: None,
@@ -370,9 +373,17 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
             world.resource_scope(
                 |world, mut drivers: bevy_ecs::change_detection::Mut<ViewDriverStore>| {
                     for entry in &mut navigation.entries {
-                        if entry.pending_commit.is_some() || entry.failure_cleanup.is_some() {
+                        if entry.pending_commit.is_some()
+                            || entry.failure_cleanup.is_some()
+                            || entry.pending_failure_cleanup_request.is_some()
+                        {
                             continue;
                         }
+                        let pending_failure_cleanup_request =
+                            match &mut entry.pending_failure_cleanup_request {
+                                vacant @ None => vacant,
+                                Some(_) => continue,
+                            };
                         let pending_mount_request = match &mut entry.pending_mount_request {
                             vacant @ None => vacant,
                             Some(_) => continue,
@@ -508,6 +519,12 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                 // action, so an existing request fails closed without either
                                 // capability being removed, overwritten, or discarded.
                                 *pending_mount_request = Some(request);
+                            }
+                            EngineAction::FailureCleanup(request) => {
+                                // Task 6 consumes this unique by-value capability together with
+                                // the failed prepared branch; until then the holder is inert and
+                                // its vacancy is checked before taking another engine action.
+                                *pending_failure_cleanup_request = Some(request);
                             }
                         }
                     }

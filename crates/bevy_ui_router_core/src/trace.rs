@@ -107,6 +107,19 @@ impl NavigationTraceEvent {
         event
     }
 
+    pub(crate) fn mount_rejected_after_mutation(
+        frame: RouteFrameVersion,
+        outlet: RouteSlotKey,
+        slot: RouteSlotId,
+    ) -> Self {
+        let mut event = Self::new(NavigationTraceEventKind::MountRejectedAfterMutation)
+            .with_frame(frame)
+            .with_outlet(outlet)
+            .with_slot(slot);
+        event.mount_rejection = Some(MountRejectionKind::RejectedAfterMutation);
+        event
+    }
+
     pub(crate) fn frame_activated(frame: RouteFrameVersion) -> Self {
         Self::new(NavigationTraceEventKind::FrameActivated).with_frame(frame)
     }

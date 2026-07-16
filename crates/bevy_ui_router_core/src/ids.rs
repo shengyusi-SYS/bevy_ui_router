@@ -514,6 +514,11 @@ impl CoreIdAllocator {
     pub(crate) fn testing_exhaust_slot_counter(&mut self) {
         self.next_slot = u64::MAX;
     }
+
+    #[cfg(test)]
+    pub(crate) fn testing_exhaust_mount_sequence_counter(&mut self) {
+        self.next_mount_sequence = u64::MAX;
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
