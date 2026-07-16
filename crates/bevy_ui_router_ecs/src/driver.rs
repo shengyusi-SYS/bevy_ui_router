@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::content::FrameContentWriter;
+use bevy_ui_router_core::integration::ViewReportIdentity;
 use bevy_ui_router_view::{ViewBuildEffect, ViewDriverKey};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10,10 +11,20 @@ pub enum ViewBuildReportKind {
     ApplyFailed,
 }
 
-#[derive(Debug)]
 pub struct ViewBuildReport {
     kind: ViewBuildReportKind,
     message: Option<String>,
+    identity: ViewReportIdentity,
+}
+
+impl std::fmt::Debug for ViewBuildReport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ViewBuildReport")
+            .field("kind", &self.kind)
+            .field("message", &self.message)
+            .finish()
+    }
 }
 
 impl ViewBuildReport {
@@ -23,6 +34,10 @@ impl ViewBuildReport {
 
     pub fn message(&self) -> Option<&str> {
         self.message.as_deref()
+    }
+
+    pub(crate) fn identity(&self) -> &ViewReportIdentity {
+        &self.identity
     }
 }
 
@@ -36,17 +51,22 @@ impl ReportSeal {
 
 pub struct EcsViewReportSession<'a> {
     _seal: &'a mut ReportSeal,
+    identity: ViewReportIdentity,
 }
 
 impl<'a> EcsViewReportSession<'a> {
-    pub(crate) fn new(seal: &'a mut ReportSeal) -> Self {
-        Self { _seal: seal }
+    pub(crate) fn new(seal: &'a mut ReportSeal, identity: ViewReportIdentity) -> Self {
+        Self {
+            _seal: seal,
+            identity,
+        }
     }
 
     pub fn applied(self) -> ViewBuildReport {
         ViewBuildReport {
             kind: ViewBuildReportKind::Applied,
             message: None,
+            identity: self.identity,
         }
     }
 
@@ -54,6 +74,7 @@ impl<'a> EcsViewReportSession<'a> {
         ViewBuildReport {
             kind: ViewBuildReportKind::BuildFailed,
             message: Some(message.into()),
+            identity: self.identity,
         }
     }
 
@@ -61,6 +82,7 @@ impl<'a> EcsViewReportSession<'a> {
         ViewBuildReport {
             kind: ViewBuildReportKind::ApplyFailed,
             message: Some(message.into()),
+            identity: self.identity,
         }
     }
 }
@@ -79,6 +101,10 @@ pub trait EcsViewDriver: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy_ui_router_core::{
+        integration::{EngineAction, RouterEngine},
+        prelude::{RouteLocation, RouteNodeOptions, RoutePattern, RouteTree, RouteViewKey},
+    };
 
     #[derive(bevy_ecs::component::Component)]
     struct SentinelComponent(u32);
@@ -123,20 +149,51 @@ mod tests {
         report.applied()
     }
 
+    fn test_report_identity() -> ViewReportIdentity {
+        let view = RouteViewKey::new("driver-report").unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(view.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut engine = RouterEngine::install(routes, view).unwrap();
+        let token = engine.request_host_admission().unwrap();
+        let grant = engine.grant_host_admission(&token).unwrap();
+        engine.record_top_slot_registered(&grant).unwrap();
+        engine.confirm_host(grant);
+        engine.push(RouteLocation::new("/")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("collected root push must issue a frame task")
+        };
+        task.report_identity()
+    }
+
+    fn test_report_session(seal: &mut ReportSeal) -> EcsViewReportSession<'_> {
+        EcsViewReportSession::new(seal, test_report_identity())
+    }
+
     #[test]
     fn report_session_is_terminal_and_report_is_data_only() {
         let mut seal = ReportSeal::new();
-        let report = EcsViewReportSession::new(&mut seal).applied();
+        let report = test_report_session(&mut seal).applied();
         assert_eq!(report.kind(), ViewBuildReportKind::Applied);
         assert_eq!(report.message(), None);
+        assert_eq!(
+            format!("{report:?}"),
+            "ViewBuildReport { kind: Applied, message: None }"
+        );
 
         let mut seal = ReportSeal::new();
-        let report = EcsViewReportSession::new(&mut seal).build_failed("redacted");
+        let report = test_report_session(&mut seal).build_failed("redacted");
         assert_eq!(report.kind(), ViewBuildReportKind::BuildFailed);
         assert_eq!(report.message(), Some("redacted"));
 
         let mut seal = ReportSeal::new();
-        let report = EcsViewReportSession::new(&mut seal).apply_failed("rejected");
+        let report = test_report_session(&mut seal).apply_failed("rejected");
         assert_eq!(report.kind(), ViewBuildReportKind::ApplyFailed);
         assert_eq!(report.message(), Some("rejected"));
     }
@@ -187,7 +244,7 @@ mod tests {
         let mut plan = crate::content::ContentPlan::new();
         let mut writer = crate::content::FrameContentWriter::new(&mut plan);
         let mut seal = ReportSeal::new();
-        let report = execute_data_only(&mut writer, EcsViewReportSession::new(&mut seal));
+        let report = execute_data_only(&mut writer, test_report_session(&mut seal));
 
         assert_eq!(report.kind(), ViewBuildReportKind::Applied);
         assert_eq!(report.message(), None);

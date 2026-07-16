@@ -15,19 +15,22 @@ use crate::{
     app_ext::{RouterHandle, ViewDriverStore},
     cleanup::{CleanupLedger, FrozenCleanupManifest, RouterCleanupObservation},
     content::{ContentPlan, FrameContentWriter},
-    driver::{EcsViewReportSession, ReportSeal, ViewBuildReportKind},
+    driver::{EcsViewReportSession, ReportSeal, ViewBuildReport, ViewBuildReportKind},
     host::{
         HostCandidateClassification, HostCandidateRevisionLatch, HostCandidateRevisionState,
-        ValidatedHostCandidate, activate_granted_top_slot, classify_host_candidate,
+        ProvisionalHostSettlement, ValidatedHostCandidate, activate_granted_top_slot,
+        classify_host_candidate, retry_provisional_host_settlement,
         settle_rejected_granted_top_slot, stage_granted_top_slot,
         validated_host_candidate_is_current,
     },
     input::{
-        RouteFocusState, RouterInputGate, prepare_focus_mutation, prepare_input_gate_mutation,
+        RouteFocusState, RouterInputGate, observed_descendant_closure, prepare_focus_mutation,
+        prepare_input_gate_mutation,
     },
     presentation::{
-        RealizedFrame, prepare_presentation_mutation, realize_frame_deferred, settle_frame,
-        validate_active_frame, validate_realized_frame,
+        DeferredRealizationFailure, RealizedFrame, isolate_frame_for_settlement,
+        prepare_presentation_mutation, realize_frame_deferred, validate_active_frame,
+        validate_leaving_frame, validate_realized_frame,
     },
     registry::{EntityLifecycle, RouteEntityRegistry},
     snapshots::RouterSnapshots,
@@ -52,6 +55,7 @@ pub(crate) struct HostBinding {
 
 struct PendingCommit {
     ticket: Option<CommitTicket>,
+    task: Option<RootFrameTask>,
     realized: Option<RealizedFrame>,
 }
 
@@ -63,6 +67,7 @@ struct PendingFailureCleanup {
 }
 
 enum FailureCleanupState {
+    Unisolated(RealizedFrame),
     Unprepared(RealizedFrame),
     Prepared(CleanupLedger),
 }
@@ -72,6 +77,7 @@ pub(crate) struct RouterEntry {
     pub(crate) engine: RouterEngine,
     views: RouteViewRegistry,
     pub(crate) host: Option<HostBinding>,
+    host_settlement: Option<ProvisionalHostSettlement>,
     pending_commit: Option<PendingCommit>,
     pub(crate) active: Option<RealizedFrame>,
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
@@ -82,8 +88,11 @@ pub(crate) struct RouterEntry {
 
 impl RouterEntry {
     pub(crate) fn cleanup_summary(&self) -> bevy_ui_router_core::CleanupSummary {
-        self.cleanup_observation
-            .summary(self.cleanup_ledger.is_some() || self.failure_cleanup.is_some())
+        self.cleanup_observation.summary(
+            self.cleanup_ledger.is_some()
+                || self.failure_cleanup.is_some()
+                || self.host_settlement.is_some(),
+        )
     }
 
     fn observe_cleanup_receipts(&mut self, ledger: &mut CleanupLedger) -> bool {
@@ -158,6 +167,7 @@ impl RouterNavigation {
             engine,
             views,
             host: None,
+            host_settlement: None,
             pending_commit: None,
             active: None,
             cleanup_ledger: None,
@@ -232,6 +242,12 @@ pub(crate) fn observe_authority_system(world: &mut World) {
         world.resource_scope(|world, mut latch: bevy_ecs::change_detection::Mut<HostCandidateRevisionLatch>| {
             world.resource_scope(|world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 for entry in &mut navigation.entries {
+                    if let Some(settlement) = entry.host_settlement.take()
+                        && !retry_provisional_host_settlement(world, &settlement)
+                    {
+                        entry.host_settlement = Some(settlement);
+                        continue;
+                    }
                     if entry.host.is_some() {
                         continue;
                     }
@@ -292,9 +308,11 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                                 latch.reject(revision);
                             }
                         }
-                        Err(_) => {
+                        Err(failure) => {
+                            let settlement = failure.into_settlement();
                             let _ = entry.engine.reject_host_after_mutation(grant);
                             latch.reject(revision);
+                            entry.host_settlement = settlement;
                         }
                     }
                 }
@@ -308,6 +326,40 @@ pub(crate) fn collect_navigation_system(world: &mut World) {
     for entry in &mut world.resource_mut::<RouterNavigation>().entries {
         entry.engine.collect();
     }
+}
+
+enum DriverReportApplicationError {
+    Stale,
+    Realization(DeferredRealizationFailure),
+}
+
+fn apply_applied_driver_report(
+    world: &mut World,
+    engine: &mut RouterEngine,
+    host_candidate: ValidatedHostCandidate,
+    top_slot: bevy_ecs::entity::Entity,
+    top_slot_claim: crate::registry::ExactRegistryClaim,
+    task: &RootFrameTask,
+    report: &ViewBuildReport,
+    plan: ContentPlan,
+) -> Result<RealizedFrame, DriverReportApplicationError> {
+    if report.kind() != ViewBuildReportKind::Applied
+        || report.identity() != &task.report_identity()
+        || engine.validate_report_identity(task).is_err()
+    {
+        return Err(DriverReportApplicationError::Stale);
+    }
+
+    realize_frame_deferred(
+        world,
+        host_candidate,
+        top_slot,
+        top_slot_claim,
+        task.frame().clone(),
+        task.view_request_sequence(),
+        plan.accept(),
+    )
+    .map_err(DriverReportApplicationError::Realization)
 }
 
 pub(crate) fn drive_navigation_system(world: &mut World) {
@@ -326,6 +378,7 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                             EngineAction::Commit(ticket) => {
                                 entry.pending_commit = Some(PendingCommit {
                                     ticket: Some(ticket),
+                                    task: None,
                                     realized: None,
                                 });
                             }
@@ -373,12 +426,19 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                 let mut plan = ContentPlan::new();
                                 let mut writer = FrameContentWriter::new(&mut plan);
                                 let mut seal = ReportSeal::new();
+                                let report_identity = task.report_identity();
                                 let report = driver.apply(
                                     &effect,
                                     &mut writer,
-                                    EcsViewReportSession::new(&mut seal),
+                                    EcsViewReportSession::new(&mut seal, report_identity),
                                 );
+                                if report.identity() != &task.report_identity() {
+                                    continue;
+                                }
                                 if report.kind() != ViewBuildReportKind::Applied {
+                                    if entry.engine.validate_report_identity(&task).is_err() {
+                                        continue;
+                                    }
                                     let failure = match report.kind() {
                                         ViewBuildReportKind::BuildFailed => ViewFailureKind::Build,
                                         ViewBuildReportKind::ApplyFailed => ViewFailureKind::Apply,
@@ -391,18 +451,20 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                     );
                                     continue;
                                 }
-                                let realized = realize_frame_deferred(
+                                let realized = apply_applied_driver_report(
                                     world,
+                                    &mut entry.engine,
                                     host.candidate.clone(),
                                     host.top_slot,
                                     host.top_slot_claim.clone(),
-                                    task.frame().clone(),
-                                    task.view_request_sequence(),
-                                    plan.accept(),
+                                    &task,
+                                    &report,
+                                    plan,
                                 );
                                 let realized = match realized {
                                     Ok(realized) => realized,
-                                    Err(failure) => {
+                                    Err(DriverReportApplicationError::Stale) => continue,
+                                    Err(DriverReportApplicationError::Realization(failure)) => {
                                         let (_error, residual) = failure.into_parts();
                                         if let Some(residual) = residual {
                                             let state = match CleanupLedger::for_failed_realization(
@@ -429,12 +491,9 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                         continue;
                                     }
                                 };
-                                let Ok(ticket) = entry.engine.report_applied(task) else {
-                                    let _ = settle_frame(world, realized);
-                                    continue;
-                                };
                                 entry.pending_commit = Some(PendingCommit {
-                                    ticket: Some(ticket),
+                                    ticket: None,
+                                    task: Some(task),
                                     realized: Some(realized),
                                 });
                             }
@@ -460,15 +519,47 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                 };
                 if world.get_entity(host.host).is_err()
                     || !validated_host_candidate_is_current(world, &host.candidate)
-                    || pending
-                        .realized
-                        .as_ref()
-                        .is_some_and(|frame| !validate_realized_frame(world, frame))
-                    || entry
-                        .active
-                        .as_ref()
-                        .is_some_and(|frame| !validate_active_frame(world, frame))
                 {
+                    entry.pending_commit = Some(pending);
+                    continue;
+                }
+                if pending
+                    .realized
+                    .as_ref()
+                    .is_some_and(|frame| !validate_realized_frame(world, frame))
+                {
+                    let frame = pending
+                        .realized
+                        .take()
+                        .expect("the invalid pending preflight identified its realized frame");
+                    let Some(task) = pending.task.take() else {
+                        entry.pending_commit = Some(pending);
+                        continue;
+                    };
+                    let state = if isolate_frame_for_settlement(world, &frame) {
+                        match CleanupLedger::for_failed_realization(world, frame) {
+                            Ok(ledger) => FailureCleanupState::Prepared(ledger),
+                            Err(frame) => FailureCleanupState::Unprepared(frame),
+                        }
+                    } else {
+                        FailureCleanupState::Unisolated(frame)
+                    };
+                    entry.failure_cleanup = Some(PendingFailureCleanup {
+                        task,
+                        failure: ViewFailureKind::Apply,
+                        message: "frame final preflight rejected",
+                        state,
+                    });
+                    continue;
+                }
+                let active_is_valid_for_role = entry.active.as_ref().is_none_or(|frame| {
+                    if pending.realized.is_some() {
+                        validate_leaving_frame(world, frame)
+                    } else {
+                        validate_active_frame(world, frame)
+                    }
+                });
+                if !active_is_valid_for_role {
                     entry.pending_commit = Some(pending);
                     continue;
                 }
@@ -496,10 +587,14 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                 let focus_leaving = leaving
                     .as_ref()
                     .map(|frame| {
-                        frame
-                            .claims()
-                            .map(|claim| claim.entity())
-                            .collect::<Vec<_>>()
+                        let mut closure = observed_descendant_closure(
+                            world,
+                            frame.claims().map(|claim| claim.entity()),
+                        )
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                        closure.sort_by_key(|entity| entity.to_bits());
+                        closure
                     })
                     .unwrap_or_default();
                 let mut targets = Vec::new();
@@ -574,6 +669,11 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                                                 );
                                                 let presentation_plan =
                                                     prepare_presentation_mutation(world, &targets)?;
+                                                if pending.ticket.is_none() {
+                                                    let task = pending.task.take()?;
+                                                    pending.ticket =
+                                                        entry.engine.report_applied(task).ok();
+                                                }
                                                 let ticket = pending.ticket.as_ref()?;
                                                 let prepared = match entry
                                                     .engine
@@ -587,10 +687,12 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                                                     reserved_ledger.bind_batch(cleanup);
                                                 pending.ticket.take();
                                                 entry.engine.publish(prepared, || {
-                                                    presentation_plan.apply();
+                                                    presentation_plan
+                                                        .apply_with_split(leaving_count, || {
+                                                            focus_plan.apply()
+                                                        });
                                                     registry_plan.apply(&mut registry);
                                                     gate_plan.apply();
-                                                    focus_plan.apply();
                                                 });
                                                 Some((cleanup_ledger, resulting_claims))
                                             },
@@ -606,7 +708,7 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                         entry.active = Some(frame);
                     }
                     pending.realized = entering;
-                    if pending.ticket.is_some() {
+                    if pending.ticket.is_some() || pending.task.is_some() {
                         entry.pending_commit = Some(pending);
                     }
                     continue;
@@ -634,6 +736,21 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                 if let Some(mut failure) = entry.failure_cleanup.take() {
                     let mut ledger = match failure.state {
                         FailureCleanupState::Prepared(ledger) => ledger,
+                        FailureCleanupState::Unisolated(frame) => {
+                            if !isolate_frame_for_settlement(world, &frame) {
+                                failure.state = FailureCleanupState::Unisolated(frame);
+                                entry.failure_cleanup = Some(failure);
+                                continue;
+                            }
+                            match CleanupLedger::for_failed_realization(world, frame) {
+                                Ok(ledger) => ledger,
+                                Err(frame) => {
+                                    failure.state = FailureCleanupState::Unprepared(frame);
+                                    entry.failure_cleanup = Some(failure);
+                                    continue;
+                                }
+                            }
+                        }
                         FailureCleanupState::Unprepared(residual) => {
                             match CleanupLedger::for_failed_realization(world, residual) {
                                 Ok(ledger) => ledger,
@@ -747,23 +864,27 @@ pub(crate) mod tests {
     use super::*;
     use crate::{
         app_ext::{AppRouterExt, RouterConfig, RouterHostRegistration},
-        components::{ProvisionalPostWriteProbe, RouteOwnershipSeal, RouterInputBarrier},
+        components::{
+            ProvisionalPostWriteProbe, ProvisionalSlotLifecycle, RouteOwnershipSeal,
+            RouterInputBarrier,
+        },
         content::{ContentColor, SolidRect},
         driver::{EcsViewDriver, ViewBuildReport},
         host::HostCandidateRevision,
         input::{RouteFocusState, RouterInputGate},
-        plugin::BevyUiRouterPlugin,
+        plugin::{BevyUiRouterPlugin, RouterScheduleSet},
         presentation::FrameOutput,
         registry::{
             ComponentManifest, EntityOwner, ProvisionalTopSlotOwner, QuarantineLeaseTable,
             RegistryOwner,
         },
     };
-    use bevy_app::{App, PostUpdate, PreUpdate};
+    use bevy_app::{App, PostUpdate, PreUpdate, Update};
     use bevy_camera::visibility::{InheritedVisibility, Visibility};
     use bevy_ecs::{
-        component::Component, entity::Entity, lifecycle::HookContext, prelude::Resource,
-        query::With,
+        component::Component, entity::Entity, event::EntityEvent, hierarchy::ChildOf,
+        lifecycle::HookContext, observer::On, prelude::Resource, query::With,
+        schedule::IntoScheduleConfigs,
     };
     use bevy_input_focus::InputFocus;
     use bevy_internal::{
@@ -777,7 +898,9 @@ pub(crate) mod tests {
         window::{PrimaryWindow, Window, WindowRef},
     };
     use bevy_picking::Pickable;
+    use bevy_picking::events::{Over, Pointer};
     use bevy_ui::{ComputedNode, Node, UiGlobalTransform, Val};
+    use bevy_ui_router_core::integration::ViewReportIdentity;
     use bevy_ui_router_core::prelude::{
         NavigationFailureKind, RequestStatus, RouteNodeOptions, RoutePattern, RouteTree,
         RouteViewKey,
@@ -857,8 +980,57 @@ pub(crate) mod tests {
         observed_slots: Vec<Entity>,
     }
 
+    #[derive(Resource, Default)]
+    struct PendingPreflightDrift {
+        armed: bool,
+        drifted: Vec<Entity>,
+    }
+
+    #[derive(Resource, Default)]
+    struct NativeTargetDeliveries(std::collections::BTreeMap<Entity, usize>);
+
+    fn install_native_pointer_observer(app: &mut App) {
+        app.world_mut().add_observer(
+            |event: On<Pointer<Over>>,
+             mut deliveries: bevy_ecs::prelude::ResMut<NativeTargetDeliveries>| {
+                *deliveries.0.entry(event.event_target()).or_default() += 1;
+            },
+        );
+    }
+
+    #[derive(Resource, Default)]
+    struct ProvisionalDetachReentry {
+        enabled: bool,
+        host: Option<Entity>,
+        removals: usize,
+    }
+
     #[derive(Component)]
     struct CleanupDriftMarker;
+
+    #[derive(Component)]
+    struct FinalPreflightForeignComponent;
+
+    #[derive(Resource, Default)]
+    struct ForeignComponentHooks {
+        removed: usize,
+        despawned: usize,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct CommitWindowSample {
+        old_gate_denied: bool,
+        new_gate_allowed: bool,
+        input_focus: Option<Entity>,
+        route_focus: Option<Entity>,
+    }
+
+    #[derive(Resource, Default)]
+    struct CommitWindowObservation {
+        armed: bool,
+        leaving_output: Option<Entity>,
+        samples: Vec<CommitWindowSample>,
+    }
 
     impl EcsViewDriver for FailOnceDriver {
         fn key(&self) -> ViewDriverKey {
@@ -911,6 +1083,195 @@ pub(crate) mod tests {
         router
     }
 
+    fn authority_world_fingerprint(
+        world: &World,
+    ) -> Vec<(Entity, Vec<bevy_ecs::component::ComponentId>)> {
+        let mut fingerprint = world
+            .iter_entities()
+            .map(|entity| (entity.id(), entity.archetype().components().to_vec()))
+            .collect::<Vec<_>>();
+        fingerprint.sort_by_key(|(entity, _)| entity.to_bits());
+        fingerprint
+    }
+
+    fn applied_report_with_identity(
+        identity: ViewReportIdentity,
+    ) -> (ContentPlan, ViewBuildReport) {
+        let mut plan = ContentPlan::new();
+        let mut writer = FrameContentWriter::new(&mut plan);
+        writer
+            .spawn_solid_rect(SolidRect::new(24, 16, ContentColor::srgba8(1, 2, 3, 255)).unwrap())
+            .unwrap();
+        let mut seal = ReportSeal::new();
+        let report = EcsViewReportSession::new(&mut seal, identity).applied();
+        (plan, report)
+    }
+
+    #[test]
+    pub(crate) fn production_report_application_rejects_opaque_or_foreign_identity_before_world_write()
+     {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let first = install_atomic_router(&mut app, "stale-sealed-first");
+        let second = install_atomic_router(&mut app, "stale-sealed-second");
+        observe_authority_system(app.world_mut());
+        let first_request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(first, RouteLocation::new("/"))
+            .unwrap();
+        let second_request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(second, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        let (foreign_task, current_task) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let first_entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == first)
+                .unwrap();
+            let EngineAction::FrameTask(task) = first_entry.engine.action().unwrap() else {
+                panic!("first router must issue a frame task")
+            };
+            let second_entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == second)
+                .unwrap();
+            let EngineAction::FrameTask(current_task) = second_entry.engine.action().unwrap()
+            else {
+                panic!("second router must issue its own frame task")
+            };
+            (task, current_task)
+        };
+        let world_before = authority_world_fingerprint(app.world());
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .iter()
+            .map(|record| record.claim())
+            .collect::<Vec<_>>();
+        let (active_before, history_before, status_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == second)
+                .unwrap();
+            (
+                entry.engine.active().clone(),
+                entry.engine.history().clone(),
+                entry
+                    .engine
+                    .request(second_request)
+                    .unwrap()
+                    .status()
+                    .clone(),
+            )
+        };
+
+        let (plan, report) = applied_report_with_identity(foreign_task.report_identity());
+        let opaque_mismatch = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == second)
+                    .unwrap();
+                let host = entry.host.as_ref().unwrap();
+                apply_applied_driver_report(
+                    world,
+                    &mut entry.engine,
+                    host.candidate.clone(),
+                    host.top_slot,
+                    host.top_slot_claim.clone(),
+                    &current_task,
+                    &report,
+                    plan,
+                )
+            },
+        );
+        assert!(matches!(
+            opaque_mismatch,
+            Err(DriverReportApplicationError::Stale)
+        ));
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .records()
+                .iter()
+                .map(|record| record.claim())
+                .collect::<Vec<_>>(),
+            registry_before
+        );
+
+        let (plan, report) = applied_report_with_identity(foreign_task.report_identity());
+
+        let result = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == second)
+                    .unwrap();
+                let host = entry.host.as_ref().unwrap();
+                apply_applied_driver_report(
+                    world,
+                    &mut entry.engine,
+                    host.candidate.clone(),
+                    host.top_slot,
+                    host.top_slot_claim.clone(),
+                    &foreign_task,
+                    &report,
+                    plan,
+                )
+            },
+        );
+
+        assert!(matches!(result, Err(DriverReportApplicationError::Stale)));
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .records()
+                .iter()
+                .map(|record| record.claim())
+                .collect::<Vec<_>>(),
+            registry_before
+        );
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == second)
+            .unwrap();
+        assert_eq!(entry.engine.active(), &active_before);
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(
+            entry.engine.request(second_request).unwrap().status(),
+            &status_before
+        );
+        assert_eq!(
+            navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == first)
+                .unwrap()
+                .engine
+                .request(first_request)
+                .unwrap()
+                .status(),
+            &RequestStatus::Running(
+                bevy_ui_router_core::prelude::NavigationPhase::ApplyingFrame(0)
+            )
+        );
+    }
+
     fn install_host_grant_observer_drift(app: &mut App) {
         app.world_mut().insert_resource(HostGrantObserverDrift {
             enabled: true,
@@ -931,6 +1292,657 @@ pub(crate) mod tests {
                         .remove::<RouterInputBarrier>();
                 }
             });
+    }
+
+    fn install_provisional_detach_reentry(app: &mut App) {
+        app.init_resource::<ProvisionalDetachReentry>();
+        app.world_mut()
+            .register_component_hooks::<ChildOf>()
+            .on_remove(|mut world, HookContext { entity, .. }| {
+                if world.get::<ProvisionalSlotLifecycle>(entity).is_none() {
+                    return;
+                }
+                let host = {
+                    let mut reentry = world.resource_mut::<ProvisionalDetachReentry>();
+                    reentry.removals += 1;
+                    reentry.enabled.then_some(reentry.host).flatten()
+                };
+                if let Some(host) = host {
+                    world.commands().entity(entity).insert(ChildOf(host));
+                }
+            });
+    }
+
+    fn drift_pending_output_before_commit(world: &mut World) {
+        if !world.resource::<PendingPreflightDrift>().armed {
+            return;
+        }
+        let output = {
+            let navigation = world.resource::<RouterNavigation>();
+            navigation.entries[0]
+                .pending_commit
+                .as_ref()
+                .and_then(|pending| pending.realized.as_ref())
+                .and_then(|frame| frame.interactive_entities().first().copied())
+        };
+        let Some(output) = output else { return };
+        *world.get_mut::<Visibility>(output).unwrap() = Visibility::Visible;
+        *world.get_mut::<Pickable>(output).unwrap() = Pickable::default();
+        *world.get_mut::<RouterInputBarrier>(output).unwrap() = RouterInputBarrier::allow_all();
+        let mut drift = world.resource_mut::<PendingPreflightDrift>();
+        drift.armed = false;
+        drift.drifted.push(output);
+    }
+
+    fn observe_commit_before_cleanup(world: &mut World) {
+        let (armed, leaving_output) = {
+            let observation = world.resource::<CommitWindowObservation>();
+            (observation.armed, observation.leaving_output)
+        };
+        if !armed {
+            return;
+        }
+        let leaving_output = leaving_output.expect("armed observation has a leaving output");
+        let new_output = world.resource::<RouterNavigation>().entries[0]
+            .active
+            .as_ref()
+            .expect("commit published the entering frame")
+            .interactive_entities()[0];
+        let gate = world.resource::<RouterInputGate>();
+        let sample = CommitWindowSample {
+            old_gate_denied: !gate.allows_pointer(leaving_output)
+                && !gate.allows_keyboard(leaving_output)
+                && !gate.allows_gamepad(leaving_output),
+            new_gate_allowed: gate.allows_pointer(new_output)
+                && gate.allows_keyboard(new_output)
+                && gate.allows_gamepad(new_output),
+            input_focus: world.resource::<InputFocus>().get(),
+            route_focus: world.resource::<RouteFocusState>().focused(),
+        };
+        let mut observation = world.resource_mut::<CommitWindowObservation>();
+        observation.armed = false;
+        observation.samples.push(sample);
+    }
+
+    #[test]
+    fn pending_preflight_drift_settles_and_terminates_without_replacing_active() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        app.init_resource::<PendingPreflightDrift>().add_systems(
+            Update,
+            drift_pending_output_before_commit
+                .after(RouterScheduleSet::DriveNavigation)
+                .before(RouterScheduleSet::CommitPresentation),
+        );
+        let router = install_atomic_router(&mut app, "pending-preflight-drift");
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+
+        let (active_before, history_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            (
+                (
+                    entry.active.as_ref().unwrap().frame().clone(),
+                    entry.active.as_ref().unwrap().shell(),
+                ),
+                entry.engine.history().clone(),
+            )
+        };
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/").with_fragment("drifted-pending"),
+            )
+            .unwrap();
+        app.world_mut()
+            .resource_mut::<PendingPreflightDrift>()
+            .armed = true;
+
+        app.update();
+
+        let drifted = app
+            .world()
+            .resource::<PendingPreflightDrift>()
+            .drifted
+            .clone();
+        assert!(!drifted.is_empty());
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert!(
+            entry.pending_commit.is_none(),
+            "invalid pending work must not be requeued"
+        );
+        assert_eq!(
+            (
+                entry.active.as_ref().unwrap().frame().clone(),
+                entry.active.as_ref().unwrap().shell()
+            ),
+            active_before
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert!(drifted.iter().all(|entity| {
+            app.world().get_entity(*entity).is_err()
+                || app
+                    .world()
+                    .resource::<QuarantineLeaseTable>()
+                    .record(*entity)
+                    .is_some()
+        }));
+
+        for _ in 0..4 {
+            app.update();
+        }
+        assert!(matches!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .unwrap()
+                .status(),
+            RequestStatus::Succeeded | RequestStatus::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn leaving_foreign_descendant_does_not_block_root_commit_and_is_quarantined() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "leaving-foreign-descendant");
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+        let (leaving, leaving_output) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let frame = navigation.entries[0].active.as_ref().unwrap();
+            (frame.shell(), frame.interactive_entities()[0])
+        };
+        let foreign = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .entity_mut(leaving_output)
+            .add_child(foreign);
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/").with_fragment("replacement"))
+            .unwrap();
+
+        app.update();
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert!(
+            entry.pending_commit.is_none(),
+            "leaving quarantine must not poll forever"
+        );
+        assert_ne!(entry.active.as_ref().unwrap().shell(), leaving);
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Succeeded
+        ));
+        assert!(app.world().get_entity(foreign).is_ok());
+        assert_eq!(
+            app.world().get::<ChildOf>(foreign).map(ChildOf::parent),
+            Some(leaving_output)
+        );
+        assert!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .record(leaving_output)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn leaving_foreign_component_is_terminal_and_quarantined_without_hooks() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        app.init_resource::<ForeignComponentHooks>();
+        app.world_mut()
+            .register_component_hooks::<FinalPreflightForeignComponent>()
+            .on_remove(|mut world, HookContext { .. }| {
+                world.resource_mut::<ForeignComponentHooks>().removed += 1;
+            })
+            .on_despawn(|mut world, HookContext { .. }| {
+                world.resource_mut::<ForeignComponentHooks>().despawned += 1;
+            });
+        let router = install_atomic_router(&mut app, "leaving-foreign-component");
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+
+        let (leaving_shell, leaving_output) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let frame = navigation.entries[0].active.as_ref().unwrap();
+            (frame.shell(), frame.interactive_entities()[0])
+        };
+        app.world_mut()
+            .entity_mut(leaving_output)
+            .insert(FinalPreflightForeignComponent);
+        assert!(
+            validate_active_frame(
+                app.world(),
+                app.world().resource::<RouterNavigation>().entries[0]
+                    .active
+                    .as_ref()
+                    .unwrap()
+            ),
+            "a protected foreign component must not invalidate a preserved active frame"
+        );
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/").with_fragment("foreign-component-replacement"),
+            )
+            .unwrap();
+
+        app.update();
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert!(
+            entry.pending_commit.is_none(),
+            "request must not poll forever"
+        );
+        assert_ne!(entry.active.as_ref().unwrap().shell(), leaving_shell);
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Succeeded
+        ));
+        assert!(
+            app.world()
+                .get::<FinalPreflightForeignComponent>(leaving_output)
+                .is_some()
+        );
+        assert_eq!(app.world().resource::<ForeignComponentHooks>().removed, 0);
+        assert_eq!(app.world().resource::<ForeignComponentHooks>().despawned, 0);
+        assert!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .record(leaving_output)
+                .is_some()
+        );
+        let gate = app.world().resource::<RouterInputGate>();
+        assert!(!gate.allows_pointer(leaving_output));
+        assert!(gate.allows_pointer(entry.active.as_ref().unwrap().interactive_entities()[0]));
+    }
+
+    #[test]
+    fn atomic_switch_clears_foreign_descendant_focus_before_cleanup() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        app.init_resource::<CommitWindowObservation>().add_systems(
+            Update,
+            observe_commit_before_cleanup
+                .after(RouterScheduleSet::CommitPresentation)
+                .before(RouterScheduleSet::SettleCleanup),
+        );
+        let router = install_atomic_router(&mut app, "atomic-foreign-focus");
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+
+        let leaving_output = app.world().resource::<RouterNavigation>().entries[0]
+            .active
+            .as_ref()
+            .unwrap()
+            .interactive_entities()[0];
+        let foreign = app.world_mut().spawn(CleanupDriftMarker).id();
+        app.world_mut()
+            .entity_mut(leaving_output)
+            .add_child(foreign);
+        let foreign_components_before = app
+            .world()
+            .entity(foreign)
+            .archetype()
+            .components()
+            .to_vec();
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(foreign);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(foreign));
+        {
+            let mut observation = app.world_mut().resource_mut::<CommitWindowObservation>();
+            observation.armed = true;
+            observation.leaving_output = Some(leaving_output);
+        }
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/").with_fragment("foreign-focus-replacement"),
+            )
+            .unwrap();
+
+        app.update();
+
+        let samples = &app.world().resource::<CommitWindowObservation>().samples;
+        assert_eq!(samples.len(), 1);
+        let sample = samples[0];
+        assert!(sample.old_gate_denied, "old gate must be closed at commit");
+        assert!(sample.new_gate_allowed, "new gate must be open at commit");
+        assert_eq!(sample.input_focus, None);
+        assert_eq!(sample.route_focus, None);
+        assert!(matches!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .unwrap()
+                .status(),
+            RequestStatus::Succeeded
+        ));
+        assert!(app.world().get_entity(foreign).is_ok());
+        assert_eq!(
+            app.world().get::<ChildOf>(foreign).map(ChildOf::parent),
+            Some(leaving_output)
+        );
+        assert_eq!(
+            app.world()
+                .entity(foreign)
+                .archetype()
+                .components()
+                .to_vec(),
+            foreign_components_before,
+            "commit and cleanup must not write foreign components"
+        );
+    }
+
+    #[test]
+    fn production_admission_retains_and_retries_detach_blocked_provisional_settlement() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        install_host_grant_observer_drift(&mut app);
+        install_provisional_detach_reentry(&mut app);
+        let router = install_atomic_router(&mut app, "detach-blocked-admission");
+        let host = registered_host(&mut app, router);
+        let host_node_before = app.world().get::<Node>(host).unwrap().clone();
+        let foreign_host_child = app.world_mut().spawn(CleanupDriftMarker).id();
+        app.world_mut()
+            .entity_mut(host)
+            .add_child(foreign_host_child);
+        {
+            let mut reentry = app.world_mut().resource_mut::<ProvisionalDetachReentry>();
+            reentry.enabled = true;
+            reentry.host = Some(host);
+        }
+
+        app.update();
+
+        let revision = current_candidate_revision(&mut app, router);
+        let residual = app
+            .world()
+            .resource::<HostGrantObserverDrift>()
+            .observed_slots[0];
+        let trace_before = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .snapshot()
+            .host()
+            .trace()
+            .to_vec();
+        let rejected = trace_before
+            .iter()
+            .find(|event| {
+                event.kind()
+                    == bevy_ui_router_core::HostTraceEventKind::AdmissionRejectedAfterMutation
+            })
+            .unwrap()
+            .clone();
+        assert_eq!(
+            app.world().get::<ChildOf>(residual).map(ChildOf::parent),
+            Some(host)
+        );
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(residual)
+                .is_some()
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(residual),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(
+            app.world().get::<Pickable>(residual),
+            Some(&Pickable::IGNORE)
+        );
+        assert!(
+            app.world()
+                .get::<RouterInputBarrier>(residual)
+                .is_some_and(RouterInputBarrier::denies_all)
+        );
+        assert_eq!(
+            app.world().get::<ProvisionalSlotLifecycle>(residual),
+            Some(&ProvisionalSlotLifecycle::PreparedInert)
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(residual)
+                .unwrap()
+                .lifecycle(),
+            EntityLifecycle::PreparedInert
+        );
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .host_settlement
+                .is_some(),
+            "the exact residual must retain an explicit settlement owner"
+        );
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_summary()
+                .foreground_pending()
+        );
+        assert!(
+            !app.world()
+                .resource::<HostCandidateRevisionLatch>()
+                .allows(revision)
+        );
+        app.world_mut()
+            .resource_mut::<ProvisionalDetachReentry>()
+            .enabled = false;
+        app.world_mut()
+            .resource_mut::<HostGrantObserverDrift>()
+            .enabled = false;
+        app.update();
+
+        assert!(
+            app.world().get_entity(residual).is_err()
+                || app
+                    .world()
+                    .resource::<QuarantineLeaseTable>()
+                    .record(residual)
+                    .is_some(),
+            "the retained exact settlement must finish after detach reentry stops"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<HostGrantObserverDrift>()
+                .observed_slots
+                .len(),
+            1,
+            "the latched candidate must not be admitted again"
+        );
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .snapshot()
+                .host()
+                .trace(),
+            trace_before
+        );
+        assert!(
+            !app.world()
+                .resource::<HostCandidateRevisionLatch>()
+                .allows(revision)
+        );
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .host_settlement
+                .is_none()
+        );
+        assert!(
+            !app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_summary()
+                .foreground_pending()
+        );
+        assert!(app.world().get::<Node>(host).is_some());
+        assert_eq!(app.world().get::<Node>(host), Some(&host_node_before));
+        assert!(app.world().get::<RouterHostRegistration>(host).is_some());
+        assert!(app.world().get_entity(foreign_host_child).is_ok());
+        assert!(
+            app.world()
+                .get::<CleanupDriftMarker>(foreign_host_child)
+                .is_some()
+        );
+        assert_eq!(
+            app.world()
+                .get::<ChildOf>(foreign_host_child)
+                .map(ChildOf::parent),
+            Some(host)
+        );
+
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .unwrap();
+        app.world_mut().entity_mut(host).insert(registration);
+        app.update();
+        let snapshot = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .snapshot()
+            .host()
+            .clone();
+        assert_ne!(snapshot.version(), rejected.version());
+        assert_ne!(snapshot.top_slot(), rejected.slot());
+    }
+
+    #[test]
+    fn refresh_clears_focus_from_foreign_descendant_of_invalid_active_frame() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "invalid-active-foreign-focus");
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+        let output = app.world().resource::<RouterNavigation>().entries[0]
+            .active
+            .as_ref()
+            .unwrap()
+            .interactive_entities()[0];
+        let foreign = app.world_mut().spawn_empty().id();
+        app.world_mut().entity_mut(output).add_child(foreign);
+        *app.world_mut().get_mut::<Visibility>(output).unwrap() = Visibility::Hidden;
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(foreign);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(foreign));
+        let foreign_components = app
+            .world()
+            .entity(foreign)
+            .archetype()
+            .components()
+            .to_vec();
+
+        app.update();
+
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        assert!(app.world().get_entity(foreign).is_ok());
+        assert_eq!(
+            app.world().get::<ChildOf>(foreign).map(ChildOf::parent),
+            Some(output)
+        );
+        assert_eq!(
+            app.world()
+                .entity(foreign)
+                .archetype()
+                .components()
+                .to_vec(),
+            foreign_components
+        );
+    }
+
+    #[test]
+    fn refresh_clears_focus_from_foreign_descendant_of_quarantined_frame() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "quarantine-foreign-focus");
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+        let quarantined_output = app.world().resource::<RouterNavigation>().entries[0]
+            .active
+            .as_ref()
+            .unwrap()
+            .interactive_entities()[0];
+        let foreign = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .entity_mut(quarantined_output)
+            .add_child(foreign);
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/").with_fragment("replacement"))
+            .unwrap();
+        app.update();
+        assert!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .record(quarantined_output)
+                .is_some()
+        );
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(foreign);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(foreign));
+        let foreign_components = app
+            .world()
+            .entity(foreign)
+            .archetype()
+            .components()
+            .to_vec();
+
+        app.update();
+
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        assert!(app.world().get_entity(foreign).is_ok());
+        assert_eq!(
+            app.world().get::<ChildOf>(foreign).map(ChildOf::parent),
+            Some(quarantined_output)
+        );
+        assert_eq!(
+            app.world()
+                .entity(foreign)
+                .archetype()
+                .components()
+                .to_vec(),
+            foreign_components
+        );
     }
 
     fn registered_host(app: &mut App, router: RouterHandle) -> Entity {
@@ -1045,7 +2057,8 @@ pub(crate) mod tests {
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
         assert_eq!(entry.engine.snapshot(), before_projection);
         assert!(entry.pending_commit.is_some());
-        assert!(entry.pending_commit.as_ref().unwrap().ticket.is_some());
+        assert!(entry.pending_commit.as_ref().unwrap().ticket.is_none());
+        assert!(entry.pending_commit.as_ref().unwrap().task.is_some());
         assert!(entry.pending_commit.as_ref().unwrap().realized.is_some());
         assert_eq!(
             app.world().resource::<RouteEntityRegistry>().records(),
@@ -1861,6 +2874,9 @@ pub(crate) mod tests {
         let mut app = App::new();
         app.add_plugins(DefaultPlugins);
         app.add_plugins(BevyUiRouterPlugin::default());
+        app.world_mut()
+            .insert_resource(NativeTargetDeliveries::default());
+        install_native_pointer_observer(&mut app);
 
         let primary_windows = app
             .world_mut()
@@ -2046,6 +3062,14 @@ pub(crate) mod tests {
                 .get(&PointerId::Mouse)
                 .is_some_and(|hits| hits.contains_key(&output))
         );
+        assert_eq!(
+            app.world()
+                .resource::<NativeTargetDeliveries>()
+                .0
+                .get(&output),
+            Some(&1),
+            "active primitive must receive the native target event"
+        );
 
         let replacement_request = app
             .world_mut()
@@ -2073,6 +3097,14 @@ pub(crate) mod tests {
             .unwrap_or_default();
         assert!(pending_hover.contains_key(&output));
         assert!(!pending_hover.contains_key(&pending));
+        assert_eq!(
+            app.world()
+                .resource::<NativeTargetDeliveries>()
+                .0
+                .get(&pending),
+            None,
+            "pending primitive must not receive a native target event"
+        );
 
         commit_presentation_system(app.world_mut());
         let leaving_hover = {
@@ -2085,6 +3117,22 @@ pub(crate) mod tests {
         };
         assert!(!leaving_hover.contains_key(&output));
         assert!(!leaving_hover.contains_key(&pending));
+        assert_eq!(
+            app.world()
+                .resource::<NativeTargetDeliveries>()
+                .0
+                .get(&output),
+            Some(&1),
+            "leaving primitive must not receive another native target event"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<NativeTargetDeliveries>()
+                .0
+                .get(&pending),
+            None,
+            "entering primitive remains event-isolated until it is active"
+        );
         settle_cleanup_system(app.world_mut());
         app.world_mut().run_schedule(PostUpdate);
         app.world_mut().run_schedule(PreUpdate);
@@ -2175,6 +3223,14 @@ pub(crate) mod tests {
             .unwrap_or_default();
         assert!(!hover.contains_key(&output));
         assert!(hover.contains_key(&replacement));
+        assert_eq!(
+            app.world()
+                .resource::<NativeTargetDeliveries>()
+                .0
+                .get(&replacement),
+            Some(&1),
+            "the committed replacement must receive the native target event"
+        );
         app.world_mut().resource_scope(
             |world, navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 crate::presentation::assert_locked_component_manifest_closure(

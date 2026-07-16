@@ -7,7 +7,6 @@ use bevy_ecs::{
 };
 use bevy_picking::Pickable;
 use bevy_ui::Node;
-use bevy_ui_router_core::integration::{EngineAction, IntegrationError};
 use bevy_ui_router_core::prelude::{
     NavigationPhase, NavigationRequestId, RequestStatus, RouteLocation, RouteNodeOptions,
     RoutePattern, RouteTree, RouteViewKey,
@@ -398,87 +397,7 @@ fn solid_rect_runs_real_layout_and_picking_pipeline() {
 
 #[test]
 fn stale_report_identity_is_zero_write() {
-    let mut app = App::new();
-    app.add_plugins(BevyUiRouterPlugin::default());
-    let first = install_driver_router(
-        &mut app,
-        "stale-report-first",
-        AuthorityDriver {
-            key: ViewDriverKey::new("stale-report-first-driver").unwrap(),
-        },
-    );
-    let second = install_driver_router(
-        &mut app,
-        "stale-report-second",
-        AuthorityDriver {
-            key: ViewDriverKey::new("stale-report-second-driver").unwrap(),
-        },
-    );
-    observe_authority_system(app.world_mut());
-    app.world_mut()
-        .resource_mut::<RouterNavigation>()
-        .push(first, RouteLocation::new("/"))
-        .unwrap();
-    collect_navigation_system(app.world_mut());
-    let stale = {
-        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
-        let entry = navigation
-            .entries
-            .iter_mut()
-            .find(|entry| entry.handle == first)
-            .unwrap();
-        let EngineAction::FrameTask(task) = entry.engine.action().unwrap() else {
-            panic!("first router must issue a frame task")
-        };
-        task
-    };
-
-    let world_before = world_entity_snapshot(&app);
-    let registry_before = app
-        .world()
-        .resource::<RouteEntityRegistry>()
-        .records()
-        .iter()
-        .map(|record| record.claim())
-        .collect::<Vec<_>>();
-    let histories_before = app
-        .world()
-        .resource::<RouterNavigation>()
-        .entries
-        .iter()
-        .map(|entry| entry.engine.history().clone())
-        .collect::<Vec<_>>();
-
-    let result = {
-        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
-        let entry = navigation
-            .entries
-            .iter_mut()
-            .find(|entry| entry.handle == second)
-            .unwrap();
-        entry.engine.report_applied(stale)
-    };
-
-    assert!(matches!(result, Err(IntegrationError::Stale)));
-    assert_eq!(world_entity_snapshot(&app), world_before);
-    assert_eq!(
-        app.world()
-            .resource::<RouteEntityRegistry>()
-            .records()
-            .iter()
-            .map(|record| record.claim())
-            .collect::<Vec<_>>(),
-        registry_before
-    );
-    assert_eq!(
-        app.world()
-            .resource::<RouterNavigation>()
-            .entries
-            .iter()
-            .map(|entry| entry.engine.history().clone())
-            .collect::<Vec<_>>(),
-        histories_before
-    );
+    crate::navigation::tests::production_report_application_rejects_opaque_or_foreign_identity_before_world_write();
 }
 
 #[test]

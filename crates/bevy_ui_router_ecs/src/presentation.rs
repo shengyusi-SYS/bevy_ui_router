@@ -121,12 +121,25 @@ struct PreparedEntityMutation<'w> {
 }
 
 pub(crate) struct PreparedPresentationMutation<'w> {
-    entities: Vec<PreparedEntityMutation<'w>>,
+    entities: Vec<(usize, PreparedEntityMutation<'w>)>,
 }
 
 impl PreparedPresentationMutation<'_> {
     pub(crate) fn apply(self) {
-        for mut entity in self.entities {
+        let entity_count = self.entities.len();
+        self.apply_with_split(entity_count, || {});
+    }
+
+    pub(crate) fn apply_with_split(self, split_at: usize, between: impl FnOnce()) {
+        let mut entities = self.entities;
+        let entering = entities.split_off(split_at);
+        Self::apply_entities(entities);
+        between();
+        Self::apply_entities(entering);
+    }
+
+    fn apply_entities(entities: Vec<(usize, PreparedEntityMutation<'_>)>) {
+        for (_, mut entity) in entities {
             *entity.visibility = if entity.active_after {
                 Visibility::Visible
             } else {
@@ -974,16 +987,20 @@ pub(crate) fn prepare_presentation_mutation<'w>(
             return None;
         }
         found[index] = true;
-        entities.push(PreparedEntityMutation {
-            visibility,
-            pickable: pickable.expect("validated Pickable remains borrowed"),
-            barrier,
-            lifecycle,
-            next: target.next,
-            active_after: target.active_after,
-            interactive: target.interactive,
-        });
+        entities.push((
+            index,
+            PreparedEntityMutation {
+                visibility,
+                pickable: pickable.expect("validated Pickable remains borrowed"),
+                barrier,
+                lifecycle,
+                next: target.next,
+                active_after: target.active_after,
+                interactive: target.interactive,
+            },
+        ));
     }
+    entities.sort_by_key(|(index, _)| *index);
     found
         .into_iter()
         .all(|present| present)
@@ -1058,7 +1075,38 @@ pub(crate) fn repair_missing_pickable_for_cleanup_quarantine(
 }
 
 pub(crate) fn validate_active_frame(world: &World, frame: &RealizedFrame) -> bool {
-    validate_top_slot(
+    matches!(
+        classify_committed_frame(world, frame, CommittedFrameRole::Preserved),
+        CommittedFramePreflight::Ready
+    )
+}
+
+pub(crate) fn validate_leaving_frame(world: &World, frame: &RealizedFrame) -> bool {
+    matches!(
+        classify_committed_frame(world, frame, CommittedFrameRole::Leaving),
+        CommittedFramePreflight::Ready | CommittedFramePreflight::ReadyWithQuarantine
+    )
+}
+
+#[derive(Clone, Copy)]
+enum CommittedFrameRole {
+    Preserved,
+    Leaving,
+}
+
+#[derive(Clone, Copy)]
+enum CommittedFramePreflight {
+    Invalid,
+    Ready,
+    ReadyWithQuarantine,
+}
+
+fn classify_committed_frame(
+    world: &World,
+    frame: &RealizedFrame,
+    role: CommittedFrameRole,
+) -> CommittedFramePreflight {
+    if validate_top_slot(
         world,
         &frame.host_candidate,
         frame.top_slot,
@@ -1067,45 +1115,186 @@ pub(crate) fn validate_active_frame(world: &World, frame: &RealizedFrame) -> boo
     )
     .is_ok()
         && top_slot_children_are_exact(world, frame)
-        && frame.entities.iter().all(|realized| {
-            let interactive = realized.role == RealizedRole::SolidRect;
-            world
-                .resource::<RouteEntityRegistry>()
-                .record(realized.entity)
-                .is_some_and(|record| {
-                    record.claim() == realized.claim
-                        && record.lifecycle() == EntityLifecycle::Active
-                        && record.manifest().matches(world, realized.entity)
+    {
+        // Continue with the role-sensitive closure checks below.
+    } else {
+        return CommittedFramePreflight::Invalid;
+    }
+
+    let mut quarantine_on_leave = false;
+    for realized in &frame.entities {
+        let interactive = realized.role == RealizedRole::SolidRect;
+        let Some(record) = world
+            .resource::<RouteEntityRegistry>()
+            .record(realized.entity)
+        else {
+            return CommittedFramePreflight::Invalid;
+        };
+        if record.claim() != realized.claim
+            || record.lifecycle() != EntityLifecycle::Active
+            || world.get::<RouteOwnershipSeal>(realized.entity)
+                != Some(&RouteOwnershipSeal::new(realized.claim.seal()))
+            || world.get::<Visibility>(realized.entity) != Some(&Visibility::Visible)
+            || world.get::<Pickable>(realized.entity)
+                != Some(if interactive {
+                    &ACTIVE_PICKABLE
+                } else {
+                    &Pickable::IGNORE
                 })
-                && world.get::<RouteOwnershipSeal>(realized.entity)
-                    == Some(&RouteOwnershipSeal::new(realized.claim.seal()))
-                && world.get::<Visibility>(realized.entity) == Some(&Visibility::Visible)
-                && world.get::<Pickable>(realized.entity)
-                    == Some(if interactive {
-                        &ACTIVE_PICKABLE
+            || !world
+                .get::<RouterInputBarrier>(realized.entity)
+                .is_some_and(|barrier| {
+                    if interactive {
+                        barrier.allows_all()
                     } else {
-                        &Pickable::IGNORE
-                    })
-                && world
-                    .get::<RouterInputBarrier>(realized.entity)
-                    .is_some_and(|barrier| {
-                        if interactive {
-                            barrier.allows_all()
-                        } else {
-                            barrier.denies_all()
-                        }
-                    })
-                && world.get::<FrameLifecycle>(realized.entity)
-                    == Some(&FrameLifecycle(EntityLifecycle::Active))
-                && world.get::<ChildOf>(realized.entity).map(ChildOf::parent)
-                    == Some(realized.parent)
-                && exact_children_match(
-                    world,
-                    realized.entity,
-                    expected_children(frame, realized.entity),
-                )
-                && realized_values_match(world, realized, frame.frame())
+                        barrier.denies_all()
+                    }
+                })
+            || world.get::<FrameLifecycle>(realized.entity)
+                != Some(&FrameLifecycle(EntityLifecycle::Active))
+            || world.get::<ChildOf>(realized.entity).map(ChildOf::parent) != Some(realized.parent)
+            || !realized_values_match(world, realized, frame.frame())
+        {
+            return CommittedFramePreflight::Invalid;
+        }
+        let Some(has_foreign_components) =
+            manifest_foreign_additions(world, realized.entity, record.manifest())
+        else {
+            return CommittedFramePreflight::Invalid;
+        };
+        let Some(has_foreign_descendants) =
+            owned_children_with_foreign_descendants(world, frame, realized.entity)
+        else {
+            return CommittedFramePreflight::Invalid;
+        };
+        quarantine_on_leave |= has_foreign_components || has_foreign_descendants;
+    }
+
+    match (role, quarantine_on_leave) {
+        (CommittedFrameRole::Leaving, true) => CommittedFramePreflight::ReadyWithQuarantine,
+        // Protected additions are observed but untouched while this frame is preserved.
+        (CommittedFrameRole::Preserved, _) | (CommittedFrameRole::Leaving, false) => {
+            CommittedFramePreflight::Ready
+        }
+    }
+}
+
+fn manifest_foreign_additions(
+    world: &World,
+    entity: Entity,
+    expected: &ComponentManifest,
+) -> Option<bool> {
+    let Some(actual) = ComponentManifest::from_world(world, entity) else {
+        return None;
+    };
+    if expected
+        .component_ids()
+        .iter()
+        .any(|component| !actual.component_ids().contains(component))
+    {
+        return None;
+    }
+    let children = world.components().component_id::<Children>();
+    Some(actual.component_ids().iter().any(|component| {
+        !expected.component_ids().contains(component) && Some(*component) != children
+    }))
+}
+
+fn owned_children_with_foreign_descendants(
+    world: &World,
+    frame: &RealizedFrame,
+    parent: Entity,
+) -> Option<bool> {
+    let expected = expected_children(frame, parent);
+    let actual = world
+        .get::<Children>(parent)
+        .map(|children| children.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let owned_actual = actual
+        .iter()
+        .copied()
+        .filter(|child| expected.contains(child))
+        .collect::<Vec<_>>();
+    if owned_actual != expected
+        || actual.iter().any(|child| {
+            !expected.contains(child)
+                && (world
+                    .resource::<RouteEntityRegistry>()
+                    .record(*child)
+                    .is_some()
+                    || world
+                        .resource::<QuarantineLeaseTable>()
+                        .record(*child)
+                        .is_some()
+                    || world
+                        .resource::<QuarantineLeaseTable>()
+                        .unresolved_record(*child)
+                        .is_some())
         })
+    {
+        return None;
+    }
+    Some(actual.iter().any(|child| !expected.contains(child)))
+}
+
+pub(crate) fn isolate_frame_for_settlement(world: &mut World, frame: &RealizedFrame) -> bool {
+    if !frame
+        .entities
+        .iter()
+        .all(|realized| frame_claim_is_current(world, realized))
+    {
+        return false;
+    }
+    for realized in &frame.entities {
+        if world.get::<Visibility>(realized.entity).is_none() {
+            world.entity_mut(realized.entity).insert(Visibility::Hidden);
+            world.flush();
+            if !frame_claim_is_current(world, realized) {
+                return false;
+            }
+        }
+        if world.get::<Pickable>(realized.entity).is_none() {
+            world.entity_mut(realized.entity).insert(Pickable::IGNORE);
+            world.flush();
+            if !frame_claim_is_current(world, realized) {
+                return false;
+            }
+        }
+        if world.get::<RouterInputBarrier>(realized.entity).is_none() {
+            world
+                .entity_mut(realized.entity)
+                .insert(RouterInputBarrier::deny_all());
+            world.flush();
+            if !frame_claim_is_current(world, realized) {
+                return false;
+            }
+        }
+        *world.get_mut::<Visibility>(realized.entity).unwrap() = Visibility::Hidden;
+        *world.get_mut::<Pickable>(realized.entity).unwrap() = Pickable::IGNORE;
+        *world
+            .get_mut::<RouterInputBarrier>(realized.entity)
+            .unwrap() = RouterInputBarrier::deny_all();
+    }
+    clear_frame_focus(world, frame);
+    frame.entities.iter().all(|realized| {
+        frame_claim_is_current(world, realized)
+            && world.get::<Visibility>(realized.entity) == Some(&Visibility::Hidden)
+            && world.get::<Pickable>(realized.entity) == Some(&Pickable::IGNORE)
+            && world
+                .get::<RouterInputBarrier>(realized.entity)
+                .is_some_and(RouterInputBarrier::denies_all)
+    })
+}
+
+fn frame_claim_is_current(world: &World, realized: &RealizedEntity) -> bool {
+    world
+        .resource::<RouteEntityRegistry>()
+        .record(realized.entity)
+        .is_some_and(|record| record.claim() == realized.claim)
+        && world.get::<RouteOwnershipSeal>(realized.entity)
+            == Some(&RouteOwnershipSeal::new(realized.claim.seal()))
+        && world.get::<FrameLifecycle>(realized.entity)
+            == Some(&FrameLifecycle(realized.claim.lifecycle()))
 }
 
 pub(crate) fn settle_frame(world: &mut World, frame: RealizedFrame) -> Result<(), RealizedFrame> {

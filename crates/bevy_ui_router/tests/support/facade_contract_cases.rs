@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output},
 };
+use syn::visit::Visit;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct TableRow(pub Vec<String>);
@@ -843,18 +844,29 @@ pub fn assert_owner_source_matches_golden(_symbols: &[SymbolRow], golden: &[Gold
     let mut actual = BTreeSet::new();
     let mut all_public_names = BTreeSet::new();
     for (owner, source_dir) in owners {
-        let mut files = Vec::new();
-        rust_files(&workspace_dir().join(source_dir), &mut files);
-        files.sort();
-        for file in files {
-            let source = fs::read_to_string(&file)
-                .unwrap_or_else(|error| panic!("failed to read '{}': {error}", file.display()));
-            let parsed = syn::parse_file(&source)
-                .unwrap_or_else(|error| panic!("failed to parse '{}': {error}", file.display()));
-            collect_owner_items(
+        let source_root = workspace_dir().join(source_dir);
+        let parsed_sources = production_source_modules(&source_root)
+            .into_iter()
+            .map(|(file, module)| {
+                let source = fs::read_to_string(file).unwrap();
+                let parsed = syn::parse_file(&source).unwrap();
+                (module, parsed)
+            })
+            .collect::<Vec<_>>();
+        let mut aliases = BTreeSet::new();
+        let mut index = ProductionScopeIndex::default();
+        for (module, parsed) in &parsed_sources {
+            collect_type_alias_names(&parsed.items, &mut aliases);
+            collect_production_module_scopes(module, &parsed.items, &mut index);
+        }
+        for (module, parsed) in &parsed_sources {
+            collect_owner_items_with_index(
                 owner,
                 &parsed.items,
+                module,
+                &index,
                 &canonical_by_owner_symbol,
+                &aliases,
                 &mut actual,
                 &mut all_public_names,
             );
@@ -999,12 +1011,29 @@ fn assert_source_declaration_order(golden: &[GoldenRow]) {
     ]);
     let mut actual = BTreeMap::<(String, String, String), Vec<String>>::new();
     for (owner, source_dir) in owners {
-        let mut files = Vec::new();
-        rust_files(&workspace_dir().join(source_dir), &mut files);
-        files.sort();
-        for file in files {
-            let parsed = syn::parse_file(&fs::read_to_string(file).unwrap()).unwrap();
-            collect_ordered_source_api(owner, &parsed.items, &canonical, &mut actual);
+        let source_root = workspace_dir().join(source_dir);
+        let parsed_sources = production_source_modules(&source_root)
+            .into_iter()
+            .map(|(file, module)| {
+                (
+                    module,
+                    syn::parse_file(&fs::read_to_string(&file).unwrap()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut index = ProductionScopeIndex::default();
+        for (module, parsed) in &parsed_sources {
+            collect_production_module_scopes(module, &parsed.items, &mut index);
+        }
+        for (module, parsed) in &parsed_sources {
+            collect_ordered_source_api_with_index(
+                owner,
+                &parsed.items,
+                module,
+                &index,
+                &canonical,
+                &mut actual,
+            );
         }
     }
     let mut checked = BTreeSet::new();
@@ -1045,67 +1074,71 @@ fn collect_ordered_source_api(
     canonical: &BTreeSet<(String, String)>,
     records: &mut BTreeMap<(String, String, String), Vec<String>>,
 ) {
+    let index = production_scope_index("", items);
+    collect_ordered_source_api_with_index(owner, items, "", &index, canonical, records);
+}
+
+fn collect_ordered_source_api_with_index(
+    owner: &str,
+    items: &[syn::Item],
+    module: &str,
+    index: &ProductionScopeIndex,
+    canonical: &BTreeSet<(String, String)>,
+    records: &mut BTreeMap<(String, String, String), Vec<String>>,
+) {
     use syn::__private::ToTokens;
-    for item in items {
-        if item_is_test(item) {
-            continue;
+    walk_production_items(items, module, index, &mut |item, scope| match item {
+        syn::Item::Enum(item) if is_public(&item.vis) => {
+            let symbol = item.ident.to_string();
+            if canonical.contains(&(owner.to_owned(), symbol.clone())) {
+                let key = (owner.to_owned(), symbol, "variant".to_owned());
+                records.entry(key).or_default().extend(
+                    item.variants
+                        .iter()
+                        .map(|variant| compact(&render_variant(variant))),
+                );
+            }
         }
-        match item {
-            syn::Item::Enum(item) if is_public(&item.vis) => {
-                let symbol = item.ident.to_string();
-                if canonical.contains(&(owner.to_owned(), symbol.clone())) {
-                    let key = (owner.to_owned(), symbol, "variant".to_owned());
-                    records.entry(key).or_default().extend(
-                        item.variants
-                            .iter()
-                            .map(|variant| compact(&render_variant(variant))),
-                    );
-                }
+        syn::Item::Trait(item) if is_public(&item.vis) => {
+            reject_trait_item_macros(item);
+            let symbol = item.ident.to_string();
+            if canonical.contains(&(owner.to_owned(), symbol.clone())) {
+                let key = (owner.to_owned(), symbol, "trait-method".to_owned());
+                records
+                    .entry(key)
+                    .or_default()
+                    .extend(item.items.iter().filter_map(|item| match item {
+                        syn::TraitItem::Fn(method) => {
+                            Some(compact(&method.sig.to_token_stream().to_string()))
+                        }
+                        _ => None,
+                    }));
             }
-            syn::Item::Trait(item) if is_public(&item.vis) => {
-                let symbol = item.ident.to_string();
-                if canonical.contains(&(owner.to_owned(), symbol.clone())) {
-                    let key = (owner.to_owned(), symbol, "trait-method".to_owned());
-                    records
-                        .entry(key)
-                        .or_default()
-                        .extend(item.items.iter().filter_map(|item| match item {
-                            syn::TraitItem::Fn(method) => {
-                                Some(compact(&method.sig.to_token_stream().to_string()))
-                            }
-                            _ => None,
-                        }));
-                }
-            }
-            syn::Item::Impl(item) if item.trait_.is_none() => {
-                let Some(symbol) = type_last_ident(&item.self_ty) else {
-                    continue;
-                };
-                if canonical.contains(&(owner.to_owned(), symbol.clone())) {
-                    let key = (owner.to_owned(), symbol, "method".to_owned());
-                    records
-                        .entry(key)
-                        .or_default()
-                        .extend(item.items.iter().filter_map(|item| match item {
-                            syn::ImplItem::Fn(method) if is_public(&method.vis) => {
-                                Some(compact(&format!(
-                                    "{}{}",
-                                    method.vis.to_token_stream(),
-                                    method.sig.to_token_stream()
-                                )))
-                            }
-                            _ => None,
-                        }));
-                }
-            }
-            syn::Item::Mod(module) => {
-                if let Some((_, nested)) = &module.content {
-                    collect_ordered_source_api(owner, nested, canonical, records);
-                }
-            }
-            _ => {}
         }
-    }
+        syn::Item::Impl(item) if item.trait_.is_none() => {
+            reject_impl_aliases(item, &BTreeSet::new(), scope, index);
+            let Some(symbol) = type_last_ident(&item.self_ty) else {
+                return;
+            };
+            if canonical.contains(&(owner.to_owned(), symbol.clone())) {
+                let key = (owner.to_owned(), symbol, "method".to_owned());
+                records
+                    .entry(key)
+                    .or_default()
+                    .extend(item.items.iter().filter_map(|item| match item {
+                        syn::ImplItem::Fn(method) if is_public(&method.vis) => {
+                            Some(compact(&format!(
+                                "{}{}",
+                                method.vis.to_token_stream(),
+                                method.sig.to_token_stream()
+                            )))
+                        }
+                        _ => None,
+                    }));
+            }
+        }
+        _ => {}
+    });
 }
 
 fn render_variant(variant: &syn::Variant) -> String {
@@ -1187,10 +1220,7 @@ fn project_type_catalogue() -> BTreeMap<String, BTreeSet<(String, String, bool)>
     ]);
     let mut catalogue = BTreeMap::<String, BTreeSet<(String, String, bool)>>::new();
     for (owner, source_dir) in owners {
-        let mut files = Vec::new();
-        rust_files(&workspace_dir().join(source_dir), &mut files);
-        for file in files {
-            let module = source_module(&workspace_dir().join(source_dir), &file);
+        for (file, module) in production_source_modules(&workspace_dir().join(source_dir)) {
             let parsed = syn::parse_file(&fs::read_to_string(file).unwrap()).unwrap();
             collect_project_types(owner, &module, &parsed.items, &mut catalogue);
         }
@@ -1262,22 +1292,26 @@ fn project_source_scopes() -> ProjectSourceScopes {
     let mut sources = Vec::new();
     for (owner, source_dir) in owners {
         let source_root = workspace_dir().join(source_dir);
-        let mut files = Vec::new();
-        rust_files(&source_root, &mut files);
-        files.sort();
-        for file in files {
-            let module = source_module(&source_root, &file);
+        for (file, module) in production_source_modules(&source_root) {
             sources.push((owner, module, file));
         }
     }
     let mut scopes = ProjectSourceScopes::default();
+    let mut indexes = BTreeMap::<&str, ProductionScopeIndex>::new();
     for (owner, module, file) in &sources {
         let parsed = syn::parse_file(&fs::read_to_string(file).unwrap()).unwrap();
+        collect_production_module_scopes(module, &parsed.items, indexes.entry(owner).or_default());
         collect_source_declarations(owner, module, &parsed.items, &mut scopes);
     }
     for (owner, module, file) in &sources {
         let parsed = syn::parse_file(&fs::read_to_string(file).unwrap()).unwrap();
-        collect_source_item_scopes(owner, module, &parsed.items, &mut scopes);
+        collect_source_item_scopes_with_index(
+            owner,
+            module,
+            &parsed.items,
+            indexes.get(owner).unwrap(),
+            &mut scopes,
+        );
     }
     scopes
 }
@@ -1346,15 +1380,23 @@ fn collect_source_item_scopes(
     items: &[syn::Item],
     scopes: &mut ProjectSourceScopes,
 ) {
+    let index = production_scope_index(module, items);
+    collect_source_item_scopes_with_index(owner, module, items, &index, scopes);
+}
+
+fn collect_source_item_scopes_with_index(
+    owner: &str,
+    module: &str,
+    items: &[syn::Item],
+    index: &ProductionScopeIndex,
+    scopes: &mut ProjectSourceScopes,
+) {
     use syn::__private::ToTokens;
-    let scope = SourceScope {
-        module: module.to_owned(),
-        imports: module_imports(items),
-    };
-    for item in items {
-        if item_is_test(item) {
-            continue;
-        }
+    walk_production_items(items, module, index, &mut |item, lexical_scope| {
+        let scope = SourceScope {
+            module: lexical_scope.module.clone(),
+            imports: lexical_scope.imports.clone(),
+        };
         match item {
             syn::Item::Struct(item) if is_public(&item.vis) => {
                 let symbol = item.ident.to_string();
@@ -1406,6 +1448,7 @@ fn collect_source_item_scopes(
                 }
             }
             syn::Item::Trait(item) if is_public(&item.vis) => {
+                reject_trait_item_macros(item);
                 let symbol = item.ident.to_string();
                 let bounds = if item.supertraits.is_empty() {
                     String::new()
@@ -1449,20 +1492,13 @@ fn collect_source_item_scopes(
                     }
                 }
             }
-            syn::Item::Impl(item) => collect_impl_source_scopes(owner, item, &scope, scopes),
-            syn::Item::Mod(child) => {
-                if let Some((_, nested)) = &child.content {
-                    collect_source_item_scopes(
-                        owner,
-                        &module_ident(module, &child.ident.to_string()),
-                        nested,
-                        scopes,
-                    );
-                }
+            syn::Item::Impl(item) => {
+                reject_impl_aliases(item, &BTreeSet::new(), lexical_scope, index);
+                collect_impl_source_scopes(owner, item, &scope, scopes);
             }
             _ => {}
         }
-    }
+    });
 }
 
 fn collect_impl_source_scopes(
@@ -1473,43 +1509,21 @@ fn collect_impl_source_scopes(
 ) {
     use syn::__private::ToTokens;
     let self_symbol = type_last_ident(&item.self_ty);
-    if let Some((_, trait_path, _)) = &item.trait_ {
-        let trait_symbol = trait_path
-            .segments
-            .last()
-            .map(|segment| segment.ident.to_string());
-        let record_symbol = self_symbol
-            .as_ref()
-            .filter(|symbol| {
-                scopes
-                    .declarations
-                    .contains_key(&(owner.to_owned(), (*symbol).clone()))
-            })
-            .cloned()
-            .or_else(|| {
-                trait_symbol
-                    .as_ref()
-                    .filter(|symbol| {
-                        scopes
-                            .declarations
-                            .contains_key(&(owner.to_owned(), (*symbol).clone()))
-                    })
-                    .cloned()
-            });
-        if let Some(symbol) = record_symbol {
-            let trait_name = normalized_trait_name(trait_path);
-            let self_name = if self_symbol.as_deref() == Some(&symbol) {
-                "Self".to_owned()
-            } else {
-                normalize_self_type(&item.self_ty.to_token_stream().to_string())
-            };
+    if item.trait_.is_some() {
+        let candidates = scopes
+            .declarations
+            .keys()
+            .filter(|(candidate_owner, _)| candidate_owner == owner)
+            .map(|(_, symbol)| symbol.clone())
+            .collect::<BTreeSet<_>>();
+        for symbol in trait_impl_related_symbols(item, &candidates) {
             insert_source_item_scope(
                 scopes,
                 source_record(
                     owner,
                     &symbol,
                     "trait-impl",
-                    &format!("impl{trait_name}for{self_name}"),
+                    &normalized_trait_impl(item, &symbol),
                 ),
                 scope,
             );
@@ -1855,6 +1869,15 @@ fn collect_public_struct_shapes(
 }
 
 fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) {
+    files.extend(
+        production_source_modules(directory)
+            .into_iter()
+            .map(|(file, _)| file)
+            .collect::<BTreeSet<_>>(),
+    );
+}
+
+fn collect_rust_files(directory: &Path, files: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(directory)
         .unwrap_or_else(|error| panic!("failed to read '{}': {error}", directory.display()))
     {
@@ -1862,15 +1885,559 @@ fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) {
             .expect("source directory entry must be readable")
             .path();
         if path.is_dir() {
-            rust_files(&path, files);
-        } else if path.extension().is_some_and(|extension| extension == "rs")
-            && !path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with("_tests.rs"))
-        {
+            collect_rust_files(&path, files);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
             files.push(path);
         }
+    }
+}
+
+fn production_source_modules(source_root: &Path) -> Vec<(PathBuf, String)> {
+    let mut discovered = Vec::new();
+    collect_rust_files(source_root, &mut discovered);
+    let reachability = module_file_reachability(source_root);
+    let registered_files = reachability
+        .keys()
+        .map(|(file, _)| file.clone())
+        .collect::<BTreeSet<_>>();
+    let mut sources = reachability
+        .into_iter()
+        .filter_map(|((file, module), reachable)| reachable.then_some((file, module)))
+        .collect::<BTreeSet<_>>();
+    for file in discovered {
+        if !registered_files.contains(&file) {
+            sources.insert((file.clone(), source_module(source_root, &file)));
+        }
+    }
+    sources.into_iter().collect()
+}
+
+fn module_file_reachability(source_root: &Path) -> BTreeMap<(PathBuf, String), bool> {
+    let root = source_root.join("lib.rs");
+    if !root.is_file() {
+        return BTreeMap::new();
+    }
+    let mut reachability = BTreeMap::new();
+    let mut visited = BTreeSet::new();
+    visit_module_file(&root, "", true, &mut reachability, &mut visited);
+    reachability
+}
+
+fn visit_module_file(
+    file: &Path,
+    logical_module: &str,
+    production_reachable: bool,
+    reachability: &mut BTreeMap<(PathBuf, String), bool>,
+    visited: &mut BTreeSet<(PathBuf, String, bool)>,
+) {
+    let file = file.to_path_buf();
+    let key = (file.clone(), logical_module.to_owned());
+    reachability
+        .entry(key.clone())
+        .and_modify(|reachable| *reachable |= production_reachable)
+        .or_insert(production_reachable);
+    if !visited.insert((
+        file.clone(),
+        logical_module.to_owned(),
+        production_reachable,
+    )) {
+        return;
+    }
+    let source = fs::read_to_string(&file)
+        .unwrap_or_else(|error| panic!("failed to read '{}': {error}", file.display()));
+    let parsed = syn::parse_file(&source)
+        .unwrap_or_else(|error| panic!("failed to parse '{}': {error}", file.display()));
+    let module_dir = module_directory(&file);
+    let path_attribute_base = file.parent().expect("Rust source file has a parent");
+    visit_external_modules(
+        &parsed.items,
+        &module_dir,
+        path_attribute_base,
+        logical_module,
+        production_reachable,
+        reachability,
+        visited,
+    );
+}
+
+fn visit_external_modules(
+    items: &[syn::Item],
+    module_dir: &Path,
+    path_attribute_base: &Path,
+    logical_module: &str,
+    production_reachable: bool,
+    reachability: &mut BTreeMap<(PathBuf, String), bool>,
+    visited: &mut BTreeSet<(PathBuf, String, bool)>,
+) {
+    for item in items {
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+        let child_reachable = production_reachable && !item_is_test(item);
+        let child_module = module_ident(logical_module, &module.ident.to_string());
+        if let Some((_, nested)) = &module.content {
+            visit_external_modules(
+                nested,
+                &module_dir.join(module.ident.to_string()),
+                &path_attribute_base.join(module.ident.to_string()),
+                &child_module,
+                child_reachable,
+                reachability,
+                visited,
+            );
+            continue;
+        }
+        let path_override = module.attrs.iter().find_map(|attribute| {
+            if !attribute.path().is_ident("path") {
+                return None;
+            }
+            let syn::Meta::NameValue(path) = &attribute.meta else {
+                return None;
+            };
+            let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(path),
+                ..
+            }) = &path.value
+            else {
+                return None;
+            };
+            Some(path.value())
+        });
+        let resolved = if let Some(path) = path_override {
+            path_attribute_base.join(path)
+        } else {
+            let direct = module_dir.join(format!("{}.rs", module.ident));
+            let nested = module_dir.join(module.ident.to_string()).join("mod.rs");
+            match (direct.is_file(), nested.is_file()) {
+                (true, false) => direct,
+                (false, true) => nested,
+                (false, false) => continue,
+                (true, true) => panic!(
+                    "ambiguous module source for `{}`: '{}' and '{}'",
+                    module.ident,
+                    direct.display(),
+                    nested.display()
+                ),
+            }
+        };
+        if resolved.is_file() {
+            visit_module_file(
+                &resolved,
+                &child_module,
+                child_reachable,
+                reachability,
+                visited,
+            );
+        }
+    }
+}
+
+fn module_directory(file: &Path) -> PathBuf {
+    let parent = file.parent().expect("Rust source file has a parent");
+    match file.file_stem().and_then(|stem| stem.to_str()) {
+        Some("lib" | "mod") => parent.to_path_buf(),
+        Some(stem) => parent.join(stem),
+        None => parent.to_path_buf(),
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProductionBindings {
+    aliases: BTreeSet<String>,
+    binding_risks: BTreeSet<String>,
+    declarations: BTreeSet<String>,
+    imports: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProductionScopeIndex {
+    modules: BTreeMap<String, ProductionBindings>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProductionScope {
+    module: String,
+    aliases: BTreeSet<String>,
+    declarations: BTreeSet<String>,
+    imports: BTreeMap<String, String>,
+    ancestors: Vec<(String, ProductionBindings)>,
+    binding_risks: BTreeSet<String>,
+    safe_macros: BTreeSet<String>,
+    block_depth: usize,
+}
+
+fn production_scope_index(module: &str, items: &[syn::Item]) -> ProductionScopeIndex {
+    let mut index = ProductionScopeIndex::default();
+    collect_production_module_scopes(module, items, &mut index);
+    index
+}
+
+fn collect_production_module_scopes(
+    module: &str,
+    items: &[syn::Item],
+    index: &mut ProductionScopeIndex,
+) {
+    let bindings = production_bindings(items.iter());
+    assert!(
+        index.modules.insert(module.to_owned(), bindings).is_none(),
+        "duplicate production module scope `{module}`"
+    );
+    for item in items {
+        if item_is_test(item) {
+            continue;
+        }
+        if let syn::Item::Mod(child) = item
+            && let Some((_, nested)) = &child.content
+        {
+            collect_production_module_scopes(
+                &module_ident(module, &child.ident.to_string()),
+                nested,
+                index,
+            );
+        }
+    }
+}
+
+fn production_bindings<'a>(items: impl IntoIterator<Item = &'a syn::Item>) -> ProductionBindings {
+    let mut bindings = ProductionBindings::default();
+    for item in items {
+        if item_is_test(item) {
+            continue;
+        }
+        if let Some(identifier) = item_identifier(item) {
+            bindings.declarations.insert(identifier);
+        }
+        if let syn::Item::Use(item) = item {
+            if use_tree_contains_glob(&item.tree) {
+                bindings
+                    .binding_risks
+                    .insert("glob import leaves lexical authority unresolved".to_owned());
+            }
+            collect_explicit_use_aliases(&item.tree, &mut bindings.aliases);
+            let mut leaves = Vec::new();
+            collect_internal_use_leaves(&item.tree, &mut Vec::new(), &mut leaves);
+            for (source, name) in leaves {
+                bindings.imports.insert(name, source);
+            }
+        }
+        if let syn::Item::ExternCrate(item) = item
+            && item.rename.is_some()
+        {
+            bindings
+                .binding_risks
+                .insert("extern-crate rename leaves lexical authority unresolved".to_owned());
+        }
+    }
+    bindings
+}
+
+fn use_tree_contains_glob(tree: &syn::UseTree) -> bool {
+    match tree {
+        syn::UseTree::Glob(_) => true,
+        syn::UseTree::Group(group) => group.items.iter().any(use_tree_contains_glob),
+        syn::UseTree::Path(path) => use_tree_contains_glob(&path.tree),
+        syn::UseTree::Name(_) | syn::UseTree::Rename(_) => false,
+    }
+}
+
+fn item_identifier(item: &syn::Item) -> Option<String> {
+    match item {
+        syn::Item::Enum(item) => Some(item.ident.to_string()),
+        syn::Item::ExternCrate(item) => Some(item.ident.to_string()),
+        syn::Item::Fn(item) => Some(item.sig.ident.to_string()),
+        syn::Item::Mod(item) => Some(item.ident.to_string()),
+        syn::Item::Static(item) => Some(item.ident.to_string()),
+        syn::Item::Struct(item) => Some(item.ident.to_string()),
+        syn::Item::Trait(item) => Some(item.ident.to_string()),
+        syn::Item::TraitAlias(item) => Some(item.ident.to_string()),
+        syn::Item::Type(item) => Some(item.ident.to_string()),
+        syn::Item::Union(item) => Some(item.ident.to_string()),
+        _ => None,
+    }
+}
+
+fn module_production_scope(module: &str, index: &ProductionScopeIndex) -> ProductionScope {
+    let bindings = index.modules.get(module).cloned().unwrap_or_default();
+    ProductionScope {
+        module: module.to_owned(),
+        aliases: bindings.aliases,
+        declarations: bindings.declarations,
+        imports: bindings.imports,
+        ancestors: Vec::new(),
+        binding_risks: bindings.binding_risks,
+        safe_macros: BTreeSet::new(),
+        block_depth: 0,
+    }
+}
+
+fn block_production_scope(block: &syn::Block, parent: &ProductionScope) -> ProductionScope {
+    let bindings =
+        production_bindings(block.stmts.iter().filter_map(|statement| match statement {
+            syn::Stmt::Item(item) => Some(item),
+            _ => None,
+        }));
+    let mut scope = parent.clone();
+    scope.block_depth += 1;
+    scope.binding_risks = bindings.binding_risks;
+    for declaration in &bindings.declarations {
+        scope.aliases.remove(declaration);
+        scope.imports.remove(declaration);
+    }
+    scope.declarations.extend(bindings.declarations);
+    for (name, source) in bindings.imports {
+        scope.imports.insert(name, source);
+    }
+    scope.aliases.extend(bindings.aliases);
+    scope
+}
+
+fn walk_production_items<'a>(
+    items: &'a [syn::Item],
+    module: &str,
+    index: &ProductionScopeIndex,
+    visitor: &mut impl FnMut(&'a syn::Item, &ProductionScope),
+) {
+    walk_production_items_with_risks(items, module, index, visitor, &mut |risk, scope| {
+        panic!(
+            "production source contains opaque macro risk in `{}`: {risk}",
+            scope.module
+        )
+    });
+}
+
+fn walk_production_items_with_risks<'a>(
+    items: &'a [syn::Item],
+    module: &str,
+    index: &ProductionScopeIndex,
+    visitor: &mut impl FnMut(&'a syn::Item, &ProductionScope),
+    risk_visitor: &mut impl FnMut(String, &ProductionScope),
+) {
+    let scope = module_production_scope(module, index);
+    let mut walker = ProductionWalker {
+        index,
+        scopes: vec![scope],
+        visitor,
+        risk_visitor,
+    };
+    walker.report_scope_binding_risks();
+    for item in items {
+        walker.visit_item(item);
+    }
+}
+
+struct ProductionWalker<'a, ItemVisitor, RiskVisitor> {
+    index: &'a ProductionScopeIndex,
+    scopes: Vec<ProductionScope>,
+    visitor: &'a mut ItemVisitor,
+    risk_visitor: &'a mut RiskVisitor,
+}
+
+impl<ItemVisitor, RiskVisitor> ProductionWalker<'_, ItemVisitor, RiskVisitor> {
+    fn report_macro_risk(&mut self, risk: String)
+    where
+        RiskVisitor: FnMut(String, &ProductionScope),
+    {
+        let scope = self.scopes.last().expect("production scope exists").clone();
+        (self.risk_visitor)(risk, &scope);
+    }
+
+    fn report_scope_binding_risks(&mut self)
+    where
+        RiskVisitor: FnMut(String, &ProductionScope),
+    {
+        let risks = self
+            .scopes
+            .last()
+            .expect("production scope exists")
+            .binding_risks
+            .clone();
+        for risk in risks {
+            self.report_macro_risk(risk);
+        }
+    }
+
+    fn visit_source_macro(&mut self, item: &syn::ItemMacro)
+    where
+        RiskVisitor: FnMut(String, &ProductionScope),
+    {
+        if item.ident.is_some() && item.mac.path.is_ident("macro_rules") {
+            let name = item.ident.as_ref().unwrap().to_string();
+            if !item.attrs.is_empty() || !local_macro_is_expression_only(item) {
+                self.report_macro_risk(format!(
+                    "local macro `{name}` is not structurally expression-only"
+                ));
+                return;
+            }
+            self.scopes
+                .last_mut()
+                .expect("production scope exists")
+                .safe_macros
+                .insert(name);
+            return;
+        }
+        self.check_macro_invocation(&item.mac.path);
+    }
+
+    fn check_macro_invocation(&mut self, path: &syn::Path)
+    where
+        RiskVisitor: FnMut(String, &ProductionScope),
+    {
+        let scope = self.scopes.last().expect("production scope exists");
+        if macro_invocation_is_trusted(path, scope) {
+            return;
+        }
+        use syn::__private::ToTokens;
+        self.report_macro_risk(format!(
+            "unknown or shadowed macro invocation `{}`",
+            path.to_token_stream()
+        ));
+    }
+}
+
+impl<'ast, ItemVisitor, RiskVisitor> Visit<'ast> for ProductionWalker<'_, ItemVisitor, RiskVisitor>
+where
+    ItemVisitor: FnMut(&'ast syn::Item, &ProductionScope),
+    RiskVisitor: FnMut(String, &ProductionScope),
+{
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if item_is_test(item) {
+            return;
+        }
+        if let syn::Item::Macro(item) = item {
+            self.visit_source_macro(item);
+            return;
+        }
+        let scope = self.scopes.last().expect("production scope exists").clone();
+        (self.visitor)(item, &scope);
+        syn::visit::visit_item(self, item);
+    }
+
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        let Some((_, nested)) = &item.content else {
+            syn::visit::visit_item_mod(self, item);
+            return;
+        };
+        let parent = self.scopes.last().expect("production scope exists");
+        let child_module = module_ident(&parent.module, &item.ident.to_string());
+        let mut bindings = if parent.block_depth > 0 {
+            production_bindings(nested.iter())
+        } else {
+            self.index
+                .modules
+                .get(&child_module)
+                .cloned()
+                .unwrap_or_else(|| production_bindings(nested.iter()))
+        };
+        let mut ancestors = parent.ancestors.clone();
+        ancestors.push((
+            parent.module.clone(),
+            ProductionBindings {
+                aliases: parent.aliases.clone(),
+                binding_risks: parent.binding_risks.clone(),
+                declarations: parent.declarations.clone(),
+                imports: parent.imports.clone(),
+            },
+        ));
+        let child_scope = ProductionScope {
+            module: child_module,
+            aliases: std::mem::take(&mut bindings.aliases),
+            declarations: std::mem::take(&mut bindings.declarations),
+            imports: std::mem::take(&mut bindings.imports),
+            ancestors,
+            binding_risks: std::mem::take(&mut bindings.binding_risks),
+            safe_macros: BTreeSet::new(),
+            block_depth: parent.block_depth,
+        };
+        self.scopes.push(child_scope);
+        self.report_scope_binding_risks();
+        syn::visit::visit_item_mod(self, item);
+        self.scopes.pop();
+    }
+
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        let parent = self.scopes.last().expect("production scope exists").clone();
+        self.scopes.push(block_production_scope(block, &parent));
+        self.report_scope_binding_risks();
+        syn::visit::visit_block(self, block);
+        self.scopes.pop();
+    }
+
+    fn visit_macro(&mut self, invocation: &'ast syn::Macro) {
+        self.check_macro_invocation(&invocation.path);
+    }
+}
+
+fn local_macro_is_expression_only(item: &syn::ItemMacro) -> bool {
+    let rendered = item.mac.tokens.to_string();
+    if rendered.matches("=>").count() != 1 || rendered.contains(['$', '!']) {
+        return false;
+    }
+    let forbidden = [
+        "const", "enum", "extern", "fn", "impl", "item", "macro", "mod", "pub", "static", "struct",
+        "trait", "type", "union", "use",
+    ];
+    if rendered
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .any(|token| forbidden.contains(&token))
+    {
+        return false;
+    }
+    let Some((_, expression)) = rendered.split_once("=>") else {
+        return false;
+    };
+    syn::parse_str::<syn::Expr>(expression.trim().trim_end_matches(';').trim()).is_ok()
+}
+
+fn macro_invocation_is_trusted(path: &syn::Path, scope: &ProductionScope) -> bool {
+    let segments = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>();
+    let builtin = [
+        "assert",
+        "assert_eq",
+        "assert_ne",
+        "cfg",
+        "column",
+        "compile_error",
+        "concat",
+        "dbg",
+        "debug_assert",
+        "debug_assert_eq",
+        "debug_assert_ne",
+        "env",
+        "file",
+        "format",
+        "format_args",
+        "include_bytes",
+        "include_str",
+        "line",
+        "matches",
+        "module_path",
+        "option_env",
+        "panic",
+        "stringify",
+        "todo",
+        "unimplemented",
+        "unreachable",
+        "vec",
+        "write",
+        "writeln",
+    ];
+    match segments.as_slice() {
+        [name] if scope.safe_macros.contains(name) => true,
+        [name] => {
+            builtin.contains(&name.as_str())
+                && !scope.imports.contains_key(name)
+                && !scope.declarations.contains(name)
+        }
+        [root, name] if matches!(root.as_str(), "core" | "std") => {
+            builtin.contains(&name.as_str())
+                && !scope.imports.contains_key(root)
+                && !scope.declarations.contains(root)
+        }
+        _ => false,
     }
 }
 
@@ -1878,14 +2445,36 @@ fn collect_owner_items(
     owner: &str,
     items: &[syn::Item],
     canonical: &BTreeMap<(String, String), String>,
+    type_aliases: &BTreeSet<String>,
+    records: &mut BTreeSet<SourceRecord>,
+    public_names: &mut BTreeSet<String>,
+) {
+    let index = production_scope_index("", items);
+    collect_owner_items_with_index(
+        owner,
+        items,
+        "",
+        &index,
+        canonical,
+        type_aliases,
+        records,
+        public_names,
+    );
+}
+
+fn collect_owner_items_with_index(
+    owner: &str,
+    items: &[syn::Item],
+    module: &str,
+    index: &ProductionScopeIndex,
+    canonical: &BTreeMap<(String, String), String>,
+    type_aliases: &BTreeSet<String>,
     records: &mut BTreeSet<SourceRecord>,
     public_names: &mut BTreeSet<String>,
 ) {
     use syn::__private::ToTokens;
-    for item in items {
-        if item_is_test(item) {
-            continue;
-        }
+    walk_production_items(items, module, index, &mut |item, scope| {
+        reject_unexpanded_public_api_risks(item, scope);
         match item {
             syn::Item::Struct(item) if is_public(&item.vis) => {
                 let symbol = item.ident.to_string();
@@ -1963,6 +2552,7 @@ fn collect_owner_items(
                 }
             }
             syn::Item::Trait(item) if is_public(&item.vis) => {
+                reject_trait_item_macros(item);
                 let symbol = item.ident.to_string();
                 public_names.insert(symbol.clone());
                 if canonical.contains_key(&(owner.to_owned(), symbol.clone())) {
@@ -2008,15 +2598,24 @@ fn collect_owner_items(
                     }
                 }
             }
-            syn::Item::Impl(item) => collect_impl(owner, item, canonical, records),
-            syn::Item::Mod(module) => {
-                if let Some((_, nested)) = &module.content {
-                    collect_owner_items(owner, nested, canonical, records, public_names);
-                }
+            syn::Item::Impl(item) => {
+                reject_impl_aliases(item, type_aliases, scope, index);
+                collect_impl(owner, item, canonical, records);
             }
+            syn::Item::Macro(item)
+                if scope.block_depth > 0
+                    && item.ident.is_some()
+                    && !item
+                        .attrs
+                        .iter()
+                        .any(|attribute| attribute.path().is_ident("macro_export")) => {}
+            syn::Item::Macro(item) => panic!(
+                "owner source macro `{}` can generate unenumerated public API",
+                item.mac.path.to_token_stream()
+            ),
             _ => {}
         }
-    }
+    });
 }
 
 fn collect_impl(
@@ -2027,33 +2626,18 @@ fn collect_impl(
 ) {
     use syn::__private::ToTokens;
     let self_symbol = type_last_ident(&item.self_ty);
-    if let Some((_, trait_path, _)) = &item.trait_ {
-        let trait_symbol = trait_path
-            .segments
-            .last()
-            .map(|segment| segment.ident.to_string());
-        let record_symbol = self_symbol
-            .as_ref()
-            .filter(|symbol| canonical.contains_key(&(owner.to_owned(), (*symbol).clone())))
-            .cloned()
-            .or_else(|| {
-                trait_symbol
-                    .as_ref()
-                    .filter(|symbol| canonical.contains_key(&(owner.to_owned(), (*symbol).clone())))
-                    .cloned()
-            });
-        if let Some(symbol) = record_symbol {
-            let trait_name = normalized_trait_name(trait_path);
-            let self_name = if self_symbol.as_deref() == Some(&symbol) {
-                "Self".to_owned()
-            } else {
-                normalize_self_type(&item.self_ty.to_token_stream().to_string())
-            };
+    if item.trait_.is_some() {
+        let candidates = canonical
+            .keys()
+            .filter(|(candidate_owner, _)| candidate_owner == owner)
+            .map(|(_, symbol)| symbol.clone())
+            .collect::<BTreeSet<_>>();
+        for symbol in trait_impl_related_symbols(item, &candidates) {
             records.insert(source_record(
                 owner,
                 &symbol,
                 "trait-impl",
-                &format!("impl{trait_name}for{self_name}"),
+                &normalized_trait_impl(item, &symbol),
             ));
         }
         return;
@@ -2090,9 +2674,353 @@ fn collect_impl(
                     &value.to_token_stream().to_string(),
                 ));
             }
+            syn::ImplItem::Macro(value) => panic!(
+                "macro `{}` inside impl for `{symbol}` can generate unenumerated associated API",
+                value.mac.path.to_token_stream()
+            ),
             _ => {}
         }
     }
+}
+
+fn collect_type_alias_names(items: &[syn::Item], aliases: &mut BTreeSet<String>) {
+    for item in items {
+        if item_is_test(item) {
+            continue;
+        }
+        match item {
+            syn::Item::Type(item) => {
+                aliases.insert(item.ident.to_string());
+            }
+            syn::Item::Mod(module) => {
+                if let Some((_, nested)) = &module.content {
+                    collect_type_alias_names(nested, aliases);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn explicit_use_aliases(items: &[syn::Item]) -> BTreeSet<String> {
+    let mut aliases = BTreeSet::new();
+    for item in items {
+        if item_is_test(item) {
+            continue;
+        }
+        if let syn::Item::Use(item) = item {
+            collect_explicit_use_aliases(&item.tree, &mut aliases);
+        }
+    }
+    aliases
+}
+
+fn collect_explicit_use_aliases(tree: &syn::UseTree, aliases: &mut BTreeSet<String>) {
+    match tree {
+        syn::UseTree::Rename(rename) if rename.rename != "_" => {
+            aliases.insert(rename.rename.to_string());
+        }
+        syn::UseTree::Path(path) => collect_explicit_use_aliases(&path.tree, aliases),
+        syn::UseTree::Group(group) => {
+            for tree in &group.items {
+                collect_explicit_use_aliases(tree, aliases);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn reject_impl_aliases(
+    item: &syn::ItemImpl,
+    type_aliases: &BTreeSet<String>,
+    scope: &ProductionScope,
+    index: &ProductionScopeIndex,
+) {
+    use syn::__private::ToTokens;
+    let mut signature = item.self_ty.to_token_stream().to_string();
+    if let Some((_, trait_path, _)) = &item.trait_ {
+        signature.push_str(&trait_path.to_token_stream().to_string());
+    }
+    signature.push_str(&item.generics.to_token_stream().to_string());
+    let signature = compact(&signature);
+    if let Some(alias) = type_aliases
+        .iter()
+        .find(|alias| replace_identifier(&signature, alias, "__facade_alias__") != signature)
+    {
+        panic!(
+            "impl signature uses type alias `{alias}`; alias-based impls are rejected fail closed"
+        );
+    }
+    if let Some(alias) = scope
+        .aliases
+        .iter()
+        .find(|alias| replace_identifier(&signature, alias, "__facade_alias__") != signature)
+    {
+        panic!(
+            "impl signature uses explicit import alias `{alias}`; alias-based impls are rejected fail closed"
+        );
+    }
+    let current = scope
+        .module
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let reject_ancestor_aliases = |module: &str, bindings: &ProductionBindings| {
+        let ancestor = module
+            .split("::")
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        if ancestor.len() >= current.len() || current[..ancestor.len()] != ancestor {
+            return;
+        }
+        let distance = current.len() - ancestor.len();
+        for alias in &bindings.aliases {
+            let relative = format!("{}{}", "super::".repeat(distance), alias);
+            let absolute = if module.is_empty() {
+                format!("crate::{alias}")
+            } else {
+                format!("crate::{module}::{alias}")
+            };
+            if [relative, absolute]
+                .iter()
+                .any(|path| signature.contains(&compact(path)))
+            {
+                panic!(
+                    "impl signature uses ancestor import alias `{module}::{alias}`; alias-based impls are rejected fail closed"
+                );
+            }
+        }
+    };
+    for (module, bindings) in &scope.ancestors {
+        reject_ancestor_aliases(module, bindings);
+    }
+    for (module, bindings) in &index.modules {
+        reject_ancestor_aliases(module, bindings);
+    }
+}
+
+fn reject_trait_item_macros(item: &syn::ItemTrait) {
+    use syn::__private::ToTokens;
+    if let Some(item) = item.items.iter().find_map(|item| match item {
+        syn::TraitItem::Macro(item) => Some(item),
+        _ => None,
+    }) {
+        panic!(
+            "macro `{}` inside public trait can generate unenumerated associated API",
+            item.mac.path.to_token_stream()
+        );
+    }
+}
+
+fn reject_unexpanded_public_api_risks(item: &syn::Item, scope: &ProductionScope) {
+    let risks = unexpanded_public_api_risks_in_scope(item, scope);
+    assert!(
+        risks.is_empty(),
+        "owner source contains unexpanded public API risk: {}",
+        risks.join("; ")
+    );
+}
+
+fn unexpanded_public_api_risks(item: &syn::Item) -> Vec<String> {
+    unexpanded_public_api_risks_in_scope(item, &ProductionScope::default())
+}
+
+fn unexpanded_public_api_risks_in_scope(item: &syn::Item, scope: &ProductionScope) -> Vec<String> {
+    use syn::__private::ToTokens;
+    let mut risks = BTreeSet::new();
+    let helpers = item_derive_helpers(item, scope, &mut risks);
+    for attribute in item_attributes(item) {
+        inspect_api_risk_meta(&attribute.meta, &helpers, scope, &mut risks);
+    }
+    match item {
+        syn::Item::Enum(item) => {
+            for variant in &item.variants {
+                for attribute in &variant.attrs {
+                    inspect_api_risk_meta(&attribute.meta, &helpers, scope, &mut risks);
+                }
+                for field in &variant.fields {
+                    for attribute in &field.attrs {
+                        inspect_api_risk_meta(&attribute.meta, &helpers, scope, &mut risks);
+                    }
+                }
+            }
+        }
+        syn::Item::Struct(item) => {
+            for field in &item.fields {
+                for attribute in &field.attrs {
+                    inspect_api_risk_meta(&attribute.meta, &helpers, scope, &mut risks);
+                }
+            }
+        }
+        syn::Item::Trait(item) => {
+            for trait_item in &item.items {
+                let attributes = match trait_item {
+                    syn::TraitItem::Const(item) => &item.attrs,
+                    syn::TraitItem::Fn(item) => &item.attrs,
+                    syn::TraitItem::Macro(item) => &item.attrs,
+                    syn::TraitItem::Type(item) => &item.attrs,
+                    _ => continue,
+                };
+                for attribute in attributes {
+                    inspect_api_risk_meta(&attribute.meta, &BTreeSet::new(), scope, &mut risks);
+                }
+            }
+        }
+        syn::Item::Impl(item) => {
+            for impl_item in &item.items {
+                let attributes = match impl_item {
+                    syn::ImplItem::Const(item) => &item.attrs,
+                    syn::ImplItem::Fn(item) => &item.attrs,
+                    syn::ImplItem::Macro(item) => &item.attrs,
+                    syn::ImplItem::Type(item) => &item.attrs,
+                    _ => continue,
+                };
+                for attribute in attributes {
+                    inspect_api_risk_meta(&attribute.meta, &BTreeSet::new(), scope, &mut risks);
+                }
+            }
+        }
+        _ => {}
+    }
+    if compact(&item.to_token_stream().to_string()).contains("#[macro_export]") {
+        risks.insert("#[macro_export] can create root public API".to_owned());
+    }
+    risks.into_iter().collect()
+}
+
+fn item_derive_helpers(
+    item: &syn::Item,
+    scope: &ProductionScope,
+    risks: &mut BTreeSet<String>,
+) -> BTreeSet<String> {
+    use syn::punctuated::Punctuated;
+    use syn::token::Comma;
+    let mut helpers = BTreeSet::new();
+    for attribute in item_attributes(item) {
+        if !attribute.path().is_ident("derive") {
+            continue;
+        }
+        let derives =
+            match attribute.parse_args_with(Punctuated::<syn::Path, Comma>::parse_terminated) {
+                Ok(derives) => derives,
+                Err(_) => {
+                    risks.insert("unparseable derive may generate public API".to_owned());
+                    continue;
+                }
+            };
+        for derive in derives {
+            let resolved = resolved_macro_path(&derive, scope);
+            if matches!(
+                resolved.as_str(),
+                "Clone"
+                    | "Copy"
+                    | "Debug"
+                    | "Default"
+                    | "Eq"
+                    | "Hash"
+                    | "Ord"
+                    | "PartialEq"
+                    | "PartialOrd"
+            ) {
+                continue;
+            }
+            match resolved.as_str() {
+                "bevy_ecs::component::Component" | "bevy_ecs::prelude::Component" => {
+                    helpers.extend([
+                        "component",
+                        "entities",
+                        "relationship",
+                        "relationship_target",
+                        "require",
+                    ]);
+                }
+                "bevy_ecs::prelude::Resource" | "bevy_ecs::resource::Resource" => {
+                    helpers.extend(["component", "require"]);
+                }
+                "bevy_ecs::prelude::SystemSet" | "bevy_ecs::schedule::SystemSet" => {}
+                _ => {
+                    risks.insert(format!(
+                        "possible derive macro `#[derive({resolved})]` can generate public API"
+                    ));
+                }
+            }
+        }
+    }
+    helpers.into_iter().map(str::to_owned).collect()
+}
+
+fn resolved_macro_path(path: &syn::Path, scope: &ProductionScope) -> String {
+    use syn::__private::ToTokens;
+    let segments = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>();
+    let Some(first) = segments.first() else {
+        return compact(&path.to_token_stream().to_string());
+    };
+    if let Some(import) = scope.imports.get(first) {
+        return std::iter::once(import.clone())
+            .chain(segments.into_iter().skip(1))
+            .collect::<Vec<_>>()
+            .join("::");
+    }
+    if scope.declarations.contains(first) {
+        return std::iter::once("local".to_owned())
+            .chain(segments)
+            .collect::<Vec<_>>()
+            .join("::");
+    }
+    compact(&path.to_token_stream().to_string())
+}
+
+fn inspect_api_risk_meta(
+    meta: &syn::Meta,
+    derive_helpers: &BTreeSet<String>,
+    scope: &ProductionScope,
+    risks: &mut BTreeSet<String>,
+) {
+    use syn::parse::Parser;
+    use syn::punctuated::Punctuated;
+    use syn::token::Comma;
+
+    if meta.path().is_ident("macro_export") {
+        risks.insert("#[macro_export] can create root public API".to_owned());
+        return;
+    }
+    if meta.path().is_ident("cfg_attr") {
+        let syn::Meta::List(list) = meta else {
+            risks.insert("unparseable cfg_attr may contain an attribute macro".to_owned());
+            return;
+        };
+        match Punctuated::<syn::Meta, Comma>::parse_terminated.parse2(list.tokens.clone()) {
+            Ok(arguments) => {
+                for attribute in arguments.iter().skip(1) {
+                    inspect_api_risk_meta(attribute, derive_helpers, scope, risks);
+                }
+            }
+            Err(_) => {
+                risks.insert("unparseable cfg_attr may contain an attribute macro".to_owned());
+            }
+        }
+        return;
+    }
+    let safe_builtin = ["allow", "cfg", "derive", "doc", "path", "test"]
+        .iter()
+        .any(|name| meta.path().is_ident(name));
+    let safe_helper = meta
+        .path()
+        .get_ident()
+        .is_some_and(|name| derive_helpers.contains(&name.to_string()));
+    let safe = safe_builtin || safe_helper;
+    if !safe {
+        use syn::__private::ToTokens;
+        risks.insert(format!(
+            "possible attribute macro `#[{}]`",
+            meta.path().to_token_stream()
+        ));
+    }
+    let _ = scope;
 }
 
 fn collect_derives(
@@ -2136,36 +3064,145 @@ fn collect_derives(
     }
 }
 
-fn normalized_trait_name(path: &syn::Path) -> String {
-    let last = path.segments.last().unwrap().ident.to_string();
-    match last.as_str() {
-        "Error" => "std::error::Error".to_owned(),
-        "Plugin" => "bevy_app::Plugin".to_owned(),
-        "Resource" => "bevy_ecs::resource::Resource".to_owned(),
-        "Component" => "bevy_ecs::component::Component".to_owned(),
-        "SystemSet" => "bevy_ecs::schedule::SystemSet".to_owned(),
-        _ => last,
-    }
+fn trait_impl_related_symbols(item: &syn::ItemImpl, candidates: &BTreeSet<String>) -> Vec<String> {
+    use syn::__private::ToTokens;
+    let (_, trait_path, _) = item
+        .trait_
+        .as_ref()
+        .expect("trait impl record requires an explicit trait");
+    let signature = compact(&format!(
+        "{}|{}|{}",
+        trait_path.to_token_stream(),
+        item.self_ty.to_token_stream(),
+        item.generics.to_token_stream()
+    ));
+    candidates
+        .iter()
+        .filter(|symbol| replace_identifier(&signature, symbol, "__facade_type__") != signature)
+        .cloned()
+        .collect()
 }
 
-fn normalize_self_type(source: &str) -> String {
-    let compact = compact(source);
-    if compact == "App" {
+fn normalized_trait_impl(item: &syn::ItemImpl, record_symbol: &str) -> String {
+    use syn::__private::ToTokens;
+    let (_, trait_path, _) = item
+        .trait_
+        .as_ref()
+        .expect("trait impl normalization requires an explicit trait");
+    let parameters = generic_parameters(&item.generics);
+    let trait_path = normalized_trait_path(trait_path);
+    let self_type = normalized_impl_self_type(&item.self_ty, record_symbol);
+    let where_clause = item
+        .generics
+        .where_clause
+        .as_ref()
+        .map(|clause| {
+            format!(
+                "where{}",
+                clause
+                    .predicates
+                    .iter()
+                    .map(|predicate| compact(&predicate.to_token_stream().to_string()))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .unwrap_or_default();
+    replace_identifier(
+        &compact(&format!(
+            "impl{parameters}{trait_path}for{self_type}{where_clause}"
+        )),
+        record_symbol,
+        "Self",
+    )
+}
+
+fn normalized_trait_path(path: &syn::Path) -> String {
+    use syn::__private::ToTokens;
+    let last = path.segments.last().unwrap();
+    let leaf = last.ident.to_string();
+    let mut base_path = path.clone();
+    base_path.segments.last_mut().unwrap().arguments = syn::PathArguments::None;
+    let base_path = compact(&base_path.to_token_stream().to_string());
+    let base = match leaf.as_str() {
+        "Error" if matches!(base_path.as_str(), "Error" | "std::error::Error") => {
+            "std::error::Error"
+        }
+        "Plugin" if matches!(base_path.as_str(), "Plugin" | "bevy_app::Plugin") => {
+            "bevy_app::Plugin"
+        }
+        "Resource"
+            if matches!(
+                base_path.as_str(),
+                "Resource" | "bevy_ecs::resource::Resource"
+            ) =>
+        {
+            "bevy_ecs::resource::Resource"
+        }
+        "Component"
+            if matches!(
+                base_path.as_str(),
+                "Component" | "bevy_ecs::component::Component"
+            ) =>
+        {
+            "bevy_ecs::component::Component"
+        }
+        "SystemSet"
+            if matches!(
+                base_path.as_str(),
+                "SystemSet" | "bevy_ecs::schedule::SystemSet"
+            ) =>
+        {
+            "bevy_ecs::schedule::SystemSet"
+        }
+        "Debug"
+            if matches!(
+                base_path.as_str(),
+                "Debug" | "fmt::Debug" | "std::fmt::Debug"
+            ) =>
+        {
+            "Debug"
+        }
+        "Display"
+            if matches!(
+                base_path.as_str(),
+                "Display" | "fmt::Display" | "std::fmt::Display"
+            ) =>
+        {
+            "Display"
+        }
+        _ => &base_path,
+    };
+    format!(
+        "{base}{}",
+        compact(&last.arguments.to_token_stream().to_string())
+    )
+}
+
+fn normalized_impl_self_type(ty: &syn::Type, record_symbol: &str) -> String {
+    use syn::__private::ToTokens;
+    if let syn::Type::Path(path) = ty
+        && path.qself.is_none()
+        && path.path.segments.last().is_some_and(|segment| {
+            segment.ident == record_symbol && matches!(segment.arguments, syn::PathArguments::None)
+        })
+    {
+        return "Self".to_owned();
+    }
+    let normalized = compact(&ty.to_token_stream().to_string());
+    if normalized == "App" {
         "bevy_app::App".to_owned()
     } else {
-        compact
+        normalized
     }
 }
 
 fn item_is_test(item: &syn::Item) -> bool {
-    use syn::__private::ToTokens;
     item_attributes(item).iter().any(|attribute| {
         attribute.path().is_ident("cfg")
-            && attribute
-                .meta
-                .to_token_stream()
-                .to_string()
-                .contains("test")
+            && attribute.parse_args::<syn::Meta>().is_ok_and(
+                |predicate| matches!(predicate, syn::Meta::Path(path) if path.is_ident("test")),
+            )
     })
 }
 
@@ -3237,35 +4274,65 @@ fn assert_lock_is_pinned(path: &Path) {
 pub fn public_facade_source_violations(source: &str) -> Vec<String> {
     let file = syn::parse_file(source).expect("facade source must parse");
     let mut violations = Vec::new();
+    let mut macro_violations = Vec::new();
     let mut modules = BTreeSet::new();
-    for item in &file.items {
-        match item {
-            syn::Item::Mod(module) if matches!(module.vis, syn::Visibility::Public(_)) => {
-                let path = module.ident.to_string();
-                modules.insert(path.clone());
-                inspect_module(module, &path, &mut modules, &mut violations);
+    let index = production_scope_index("", &file.items);
+    walk_production_items_with_risks(
+        &file.items,
+        "",
+        &index,
+        &mut |item, scope| {
+            violations.extend(unexpanded_public_api_risks_in_scope(item, scope));
+            match item {
+                syn::Item::Mod(module) => {
+                    let path = module_ident(&scope.module, &module.ident.to_string());
+                    if scope.block_depth == 0 && is_public(&module.vis) {
+                        modules.insert(path.clone());
+                    }
+                    if scope.block_depth == 0 && is_public(&module.vis) && module.content.is_none()
+                    {
+                        violations.push(format!("public module `{}` is not inline", module.ident));
+                    }
+                }
+                syn::Item::Use(item)
+                    if scope.block_depth == 0 && matches!(item.vis, syn::Visibility::Public(_)) =>
+                {
+                    if scope.module.is_empty() {
+                        violations.push(
+                            "facade root contains a public use instead of a curated module".into(),
+                        );
+                    }
+                    inspect_use_tree(&item.tree, &mut violations);
+                }
+                syn::Item::ExternCrate(item)
+                    if scope.block_depth == 0 && matches!(item.vis, syn::Visibility::Public(_)) =>
+                {
+                    violations.push("facade contains pub extern crate".into());
+                }
+                syn::Item::Impl(_) => {
+                    violations.push(format!(
+                        "facade module `{}` contains an impl that can create public API",
+                        scope.module
+                    ));
+                }
+                item if scope.block_depth == 0 && public_definition_kind(item).is_some() => {
+                    violations.push(format!(
+                        "facade module `{}` contains public {} definition",
+                        scope.module,
+                        public_definition_kind(item).unwrap()
+                    ));
+                }
+                _ => {}
             }
-            syn::Item::Use(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
-                violations
-                    .push("facade root contains a public use instead of a curated module".into());
-                inspect_use_tree(&item.tree, &mut violations);
-            }
-            syn::Item::ExternCrate(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
-                violations.push("facade contains pub extern crate".into());
-            }
-            syn::Item::Macro(_) => {
-                violations.push("facade contains a source macro that can create public API".into());
-            }
-            syn::Item::Impl(_) => {
-                violations.push("facade root contains an impl that can create public API".into());
-            }
-            item if public_definition_kind(item).is_some() => violations.push(format!(
-                "facade root contains public {} definition",
-                public_definition_kind(item).unwrap()
-            )),
-            _ => {}
-        }
-    }
+        },
+        &mut |risk, scope| {
+            macro_violations.push(format!(
+                "facade module `{}` contains a source macro risk: {risk}",
+                scope.module
+            ));
+        },
+    );
+    violations.extend(macro_violations);
     let expected = BTreeSet::from([
         "bsn".to_owned(),
         "core".to_owned(),
@@ -3279,48 +4346,6 @@ pub fn public_facade_source_violations(source: &str) -> Vec<String> {
         violations.push(format!("public module set mismatch: {modules:?}"));
     }
     violations
-}
-
-fn inspect_module(
-    module: &syn::ItemMod,
-    module_path: &str,
-    modules: &mut BTreeSet<String>,
-    violations: &mut Vec<String>,
-) {
-    let Some((_, items)) = &module.content else {
-        violations.push(format!("public module `{}` is not inline", module.ident));
-        return;
-    };
-    for item in items {
-        match item {
-            syn::Item::Use(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
-                inspect_use_tree(&item.tree, violations);
-            }
-            syn::Item::Mod(child) if matches!(child.vis, syn::Visibility::Public(_)) => {
-                let child_path = format!("{module_path}::{}", child.ident);
-                modules.insert(child_path.clone());
-                inspect_module(child, &child_path, modules, violations);
-            }
-            syn::Item::ExternCrate(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
-                violations.push(format!(
-                    "module `{}` contains pub extern crate",
-                    module.ident
-                ));
-            }
-            syn::Item::Macro(_) => violations.push(format!(
-                "module `{}` contains a source macro that can create public API",
-                module_path
-            )),
-            syn::Item::Impl(_) => violations.push(format!(
-                "module `{module_path}` contains an impl that can create public API"
-            )),
-            item if public_definition_kind(item).is_some() => violations.push(format!(
-                "module `{module_path}` contains public {} definition",
-                public_definition_kind(item).unwrap()
-            )),
-            _ => {}
-        }
-    }
 }
 
 fn public_definition_kind(item: &syn::Item) -> Option<&'static str> {
@@ -3359,6 +4384,179 @@ fn inspect_use_tree(tree: &syn::UseTree, violations: &mut Vec<String>) {
 #[cfg(test)]
 mod mutation_tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static RUSTC_FIXTURE_RUN: AtomicU64 = AtomicU64::new(1);
+
+    fn rustc_fixture_output_root() -> PathBuf {
+        let run = RUSTC_FIXTURE_RUN.fetch_add(1, Ordering::Relaxed);
+        let root = workspace_dir()
+            .join("target/facade-contract-cases/rustc-fixtures")
+            .join(format!("{}-{run}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn synthetic_canonical(symbol: &str) -> BTreeMap<(String, String), String> {
+        BTreeMap::from([(
+            ("owner".to_owned(), symbol.to_owned()),
+            format!("bevy_ui_router::ecs::{symbol}"),
+        )])
+    }
+
+    fn synthetic_owner_records(source: &str, symbol: &str) -> BTreeSet<SourceRecord> {
+        synthetic_owner_records_for(source, &[symbol])
+    }
+
+    fn synthetic_owner_records_for(source: &str, symbols: &[&str]) -> BTreeSet<SourceRecord> {
+        let parsed = syn::parse_file(source).unwrap();
+        let canonical = symbols
+            .iter()
+            .map(|symbol| {
+                (
+                    ("owner".to_owned(), (*symbol).to_owned()),
+                    format!("bevy_ui_router::ecs::{symbol}"),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut aliases = BTreeSet::new();
+        collect_type_alias_names(&parsed.items, &mut aliases);
+        let mut records = BTreeSet::new();
+        let mut public_names = BTreeSet::new();
+        collect_owner_items(
+            "owner",
+            &parsed.items,
+            &canonical,
+            &aliases,
+            &mut records,
+            &mut public_names,
+        );
+        records
+    }
+
+    fn compiled_hostile_fixture(name: &str) -> String {
+        let fixture = facade_dir()
+            .join("tests/support/fixtures/hostile_source")
+            .join(name);
+        let output_root = rustc_fixture_output_root();
+        let metadata = output_root.join(format!("{}.rmeta", name.trim_end_matches(".rs")));
+        let output = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+            .arg("--edition=2024")
+            .arg("--crate-type=lib")
+            .arg("--emit=metadata")
+            .arg("-o")
+            .arg(metadata)
+            .arg(&fixture)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to invoke rustc for '{}': {error}",
+                    fixture.display()
+                )
+            });
+        assert!(
+            output.status.success(),
+            "hostile Rust fixture '{}' must remain legal:\n{}",
+            fixture.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::read_to_string(&fixture).unwrap()
+    }
+
+    fn compiled_module_fixture(name: &str) -> PathBuf {
+        let root = facade_dir().join("tests/support/fixtures").join(name);
+        let source = root.join("lib.rs");
+        let output_root = rustc_fixture_output_root();
+        let metadata = output_root.join(format!("{name}.rmeta"));
+        let output = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+            .arg("--edition=2024")
+            .arg("--crate-type=lib")
+            .arg("--emit=metadata")
+            .arg("-o")
+            .arg(metadata)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "module fixture '{}' must remain legal:\n{}",
+            source.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        root
+    }
+
+    fn compiled_derive_binding_spoofs() -> [String; 2] {
+        let root = facade_dir().join("tests/support/fixtures/derive_binding_spoof");
+        let output_root = rustc_fixture_output_root();
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+        let proc_macro = output_root.join(format!(
+            "{}evil_component{}",
+            std::env::consts::DLL_PREFIX,
+            std::env::consts::DLL_SUFFIX
+        ));
+        let wrapper = output_root.join("libevil_bevy_ecs.rlib");
+        let compile = |mut command: Command, label: &str| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "derive binding fixture {label} must remain legal:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        let mut proc_macro_command = Command::new(&rustc);
+        proc_macro_command
+            .arg("--edition=2024")
+            .arg("--crate-type=proc-macro")
+            .arg("--crate-name=evil_component")
+            .arg("-o")
+            .arg(&proc_macro)
+            .arg(root.join("evil_component.rs"));
+        compile(proc_macro_command, "proc macro");
+
+        let mut wrapper_command = Command::new(&rustc);
+        wrapper_command
+            .arg("--edition=2024")
+            .arg("--crate-type=rlib")
+            .arg("--crate-name=evil_bevy_ecs")
+            .arg("--extern")
+            .arg(format!("evil_component={}", proc_macro.display()))
+            .arg("-o")
+            .arg(&wrapper)
+            .arg(root.join("evil_bevy_ecs.rs"));
+        compile(wrapper_command, "extern rename wrapper");
+
+        for (name, extern_wrapper) in [
+            ("glob_consumer.rs", false),
+            ("extern_rename_consumer.rs", true),
+        ] {
+            let mut consumer = Command::new(&rustc);
+            consumer
+                .arg("--edition=2024")
+                .arg("--crate-type=lib")
+                .arg("--emit=metadata")
+                .arg("--extern")
+                .arg(format!("evil_component={}", proc_macro.display()));
+            if extern_wrapper {
+                consumer
+                    .arg("-L")
+                    .arg(format!("dependency={}", output_root.display()))
+                    .arg("--extern")
+                    .arg(format!("evil_bevy_ecs={}", wrapper.display()));
+            }
+            consumer
+                .arg("-o")
+                .arg(output_root.join(format!("{}.rmeta", name.trim_end_matches(".rs"))))
+                .arg(root.join(name));
+            compile(consumer, name);
+        }
+
+        [
+            fs::read_to_string(root.join("glob_consumer.rs")).unwrap(),
+            fs::read_to_string(root.join("extern_rename_consumer.rs")).unwrap(),
+        ]
+    }
 
     fn contract_rows() -> (Vec<SymbolRow>, Vec<TableRow>) {
         let allowlist = read_workspace("docs/facade-export-allowlist.md");
@@ -3395,6 +4593,586 @@ mod mutation_tests {
         assert!(
             std::panic::catch_unwind(|| assert_facade_exports(&source, &symbols)).is_err(),
             "intermediate owner module mutation escaped the export gate"
+        );
+    }
+
+    #[test]
+    fn owner_impl_through_type_alias_cannot_escape_associated_api_closure() {
+        let source = r#"
+            pub struct RouterNavigation;
+            type NavigationAlias = RouterNavigation;
+
+            impl NavigationAlias {
+                pub fn force_private_authority(&mut self) {}
+            }
+        "#;
+        let canonical = synthetic_canonical("RouterNavigation");
+        let parsed = syn::parse_file(source).unwrap();
+        let mut aliases = BTreeSet::new();
+        collect_type_alias_names(&parsed.items, &mut aliases);
+        let mut records = BTreeSet::new();
+        let mut public_names = BTreeSet::new();
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            collect_owner_items(
+                "owner",
+                &parsed.items,
+                &canonical,
+                &aliases,
+                &mut records,
+                &mut public_names,
+            );
+        }))
+        .is_err();
+        let enumerated = records.contains(&source_record(
+            "owner",
+            "RouterNavigation",
+            "method",
+            "pub fn force_private_authority(&mut self)",
+        ));
+        assert!(
+            rejected || enumerated,
+            "type-alias inherent impl escaped without enumeration or fail-closed rejection"
+        );
+    }
+
+    #[test]
+    fn owner_item_and_impl_macros_fail_closed() {
+        for (shape, source) in [
+            (
+                "top-level invocation",
+                r#"
+                    pub struct RouterNavigation;
+                    leaked_owner_impl!(RouterNavigation);
+                "#,
+            ),
+            (
+                "canonical owner impl invocation",
+                r#"
+                    pub struct RouterNavigation;
+                    impl RouterNavigation {
+                        leaked_method!();
+                    }
+                "#,
+            ),
+            (
+                "private-module macro_export",
+                r#"
+                    pub struct RouterNavigation;
+                    mod hidden {
+                        #[macro_export]
+                        macro_rules! leaked_facade_api {
+                            () => { pub struct LeakedAuthority; };
+                        }
+                    }
+                "#,
+            ),
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| {
+                    synthetic_owner_records(source, "RouterNavigation")
+                })
+                .is_err(),
+                "owner {shape} was silently ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn private_facade_module_macro_export_is_inspected() {
+        let original = fs::read_to_string(facade_dir().join("src/lib.rs")).unwrap();
+        let source = format!(
+            r#"{original}
+                mod hidden {{
+                    #[macro_export]
+                    macro_rules! leaked_facade_api {{
+                        () => {{ pub struct LeakedAuthority; }};
+                    }}
+                }}
+            "#
+        );
+        assert!(
+            public_facade_source_violations(&source)
+                .iter()
+                .any(|violation| violation.contains("source macro")),
+            "private-module macro_export escaped facade source inspection"
+        );
+    }
+
+    #[test]
+    fn source_enumeration_does_not_trust_tests_filename_suffix() {
+        let root = facade_dir().join("tests/support/fixtures/source_enumeration");
+        let mut files = Vec::new();
+        rust_files(&root, &mut files);
+        let names = files
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            names.contains("capability_tests.rs"),
+            "production-reachable `_tests.rs` file was omitted"
+        );
+        assert!(
+            !names.contains("pure_tests.rs"),
+            "a provably cfg(test)-only file should remain excluded"
+        );
+    }
+
+    #[test]
+    fn only_exact_cfg_test_items_are_omitted_from_production_scan() {
+        let parsed = syn::parse_file(
+            r#"
+                #[cfg(test)]
+                impl RouterNavigation { pub fn test_helper(&self) {} }
+
+                #[cfg(not(test))]
+                impl RouterNavigation { pub fn production_authority(&self) {} }
+
+                #[cfg(any(test, feature = "ecs"))]
+                impl RouterNavigation { pub fn production_alternative(&self) {} }
+            "#,
+        )
+        .unwrap();
+        assert!(item_is_test(&parsed.items[0]));
+        assert!(!item_is_test(&parsed.items[1]));
+        assert!(!item_is_test(&parsed.items[2]));
+    }
+
+    #[test]
+    fn reverse_conversion_trait_impl_records_the_complete_type_graph() {
+        let records = synthetic_owner_records(
+            r#"
+                pub struct RouterHandle;
+                impl From<RouterHandle> for bevy_ecs::entity::Entity {
+                    fn from(_: RouterHandle) -> Self { unreachable!() }
+                }
+            "#,
+            "RouterHandle",
+        );
+        assert!(
+            records.contains(&source_record(
+                "owner",
+                "RouterHandle",
+                "trait-impl",
+                "impl From<Self> for bevy_ecs::entity::Entity",
+            )),
+            "reverse conversion through a trait generic was not attributed to RouterHandle: {records:#?}"
+        );
+    }
+
+    #[test]
+    fn trait_impl_keeps_generics_bindings_where_clause_and_full_self_type() {
+        let records = synthetic_owner_records(
+            r#"
+                pub struct RouterHandle;
+                impl<T> private::Capability<T, Item = PrivateAuthority>
+                    for foreign::Wrapper<RouterHandle>
+                where
+                    T: Into<PrivateAuthority>,
+                {}
+            "#,
+            "RouterHandle",
+        );
+        assert!(
+            records.contains(&source_record(
+                "owner",
+                "RouterHandle",
+                "trait-impl",
+                "impl<T> private::Capability<T, Item = PrivateAuthority> for foreign::Wrapper<Self> where T: Into<PrivateAuthority>",
+            )),
+            "trait impl signature graph was lossy: {records:#?}"
+        );
+    }
+
+    #[test]
+    fn nested_use_rename_inherent_impl_is_rejected_fail_closed() {
+        let source = compiled_hostile_fixture("use_alias_inherent.rs");
+        assert!(
+            std::panic::catch_unwind(|| synthetic_owner_records(&source, "RouterNavigation"))
+                .is_err(),
+            "nested `use ... as ...` inherent impl escaped owner selection"
+        );
+    }
+
+    #[test]
+    fn use_rename_reverse_conversion_is_rejected_fail_closed() {
+        let source = compiled_hostile_fixture("use_alias_reverse.rs");
+        assert!(
+            std::panic::catch_unwind(|| synthetic_owner_records(&source, "RouterHandle")).is_err(),
+            "`impl From<import alias> for Entity` escaped the trait type graph"
+        );
+    }
+
+    #[test]
+    fn self_as_use_rename_impl_is_rejected_fail_closed() {
+        let source = compiled_hostile_fixture("use_alias_self_as.rs");
+        assert!(
+            std::panic::catch_unwind(|| synthetic_owner_records(&source, "RouterNavigation"))
+                .is_err(),
+            "`use module::{{self as alias}}` impl escaped fail-closed selection"
+        );
+    }
+
+    #[test]
+    fn use_rename_scope_does_not_leak_into_shadowing_nested_module() {
+        let records = synthetic_owner_records(
+            r#"
+                pub struct RouterNavigation;
+                mod outer {
+                    use crate::RouterNavigation as H;
+
+                    mod inner {
+                        pub struct H;
+                        impl H {
+                            pub fn local_method(&self) {}
+                        }
+                    }
+                }
+            "#,
+            "H",
+        );
+        assert!(records.contains(&source_record(
+            "owner",
+            "H",
+            "method",
+            "pub fn local_method(&self)",
+        )));
+    }
+
+    #[test]
+    fn ancestor_qualified_import_aliases_fail_closed() {
+        let source = compiled_hostile_fixture("ancestor_qualified_aliases.rs");
+        assert!(
+            std::panic::catch_unwind(|| {
+                synthetic_owner_records_for(&source, &["RouterNavigation", "RouterHandle"])
+            })
+            .is_err(),
+            "ancestor-qualified inherent/reverse impl aliases escaped owner selection"
+        );
+    }
+
+    #[test]
+    fn path_override_keeps_semantic_module_identity() {
+        let root = facade_dir().join("tests/support/fixtures/path_semantic_module");
+        let sources = production_source_modules(&root);
+        let physical = root.join("facade_path_override_physical.rs");
+        assert!(
+            sources
+                .iter()
+                .any(|(file, module)| file == &physical && module == "outer"),
+            "#[path] source was not assigned its declared logical module"
+        );
+        assert!(
+            !sources.iter().any(|(file, module)| {
+                file == &physical && module == "facade_path_override_physical"
+            }),
+            "#[path] physical filename leaked into semantic module identity"
+        );
+        let canonical = synthetic_canonical("RouterNavigation");
+        let mut aliases = BTreeSet::new();
+        let mut index = ProductionScopeIndex::default();
+        let parsed = sources
+            .into_iter()
+            .map(|(file, module)| {
+                let parsed = syn::parse_file(&fs::read_to_string(file).unwrap()).unwrap();
+                collect_type_alias_names(&parsed.items, &mut aliases);
+                collect_production_module_scopes(&module, &parsed.items, &mut index);
+                (module, parsed)
+            })
+            .collect::<Vec<_>>();
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut records = BTreeSet::new();
+            let mut names = BTreeSet::new();
+            for (module, source) in &parsed {
+                collect_owner_items_with_index(
+                    "owner",
+                    &source.items,
+                    module,
+                    &index,
+                    &canonical,
+                    &aliases,
+                    &mut records,
+                    &mut names,
+                );
+            }
+        }))
+        .is_err();
+        assert!(
+            rejected,
+            "#[path] physical filename replaced semantic module identity"
+        );
+    }
+
+    #[test]
+    fn inline_path_override_uses_inline_module_directory() {
+        let root = compiled_module_fixture("inline_path_semantic_module");
+        let sources = production_source_modules(&root);
+        let physical = root.join("wrapper/physical.rs");
+        assert!(
+            sources
+                .iter()
+                .any(|(file, module)| file == &physical && module == "wrapper::outer"),
+            "inline #[path] did not retain its declared logical module: {sources:#?}"
+        );
+        assert!(
+            !sources
+                .iter()
+                .any(|(file, module)| file == &physical && module == "wrapper::physical"),
+            "inline #[path] fell back to its physical filename"
+        );
+    }
+
+    #[test]
+    fn path_attribute_base_resets_for_external_source_files() {
+        let root = compiled_module_fixture("inline_path_semantic_module");
+        let sources = production_source_modules(&root);
+        let external_physical = root.join("physical.rs");
+        assert!(
+            sources.iter().any(|(file, module)| {
+                file == &external_physical && module == "outer::semantic"
+            }),
+            "external source #[path] did not use its source-file parent: {sources:#?}"
+        );
+        let inline_physical = root.join("wrapper/physical.rs");
+        assert!(
+            sources
+                .iter()
+                .any(|(file, module)| file == &inline_physical && module == "wrapper::outer"),
+            "external source reset regressed inline-module path accumulation"
+        );
+    }
+
+    #[test]
+    fn block_local_inline_module_uses_live_ancestor_bindings() {
+        let source = compiled_hostile_fixture("block_local_inline_module.rs");
+        assert!(
+            std::panic::catch_unwind(|| { synthetic_owner_records(&source, "RouterNavigation") })
+                .is_err(),
+            "block-local module ancestor alias escaped live lexical scope checks"
+        );
+    }
+
+    #[test]
+    fn include_macro_cannot_inject_owner_items() {
+        let source = compiled_hostile_fixture("include_owner_impl.rs");
+        assert!(
+            std::panic::catch_unwind(|| { synthetic_owner_records(&source, "RouterNavigation") })
+                .is_err(),
+            "trusted include! injected an unenumerated owner impl"
+        );
+    }
+
+    #[test]
+    fn thread_local_macro_cannot_inject_public_static() {
+        let original = fs::read_to_string(facade_dir().join("src/lib.rs")).unwrap();
+        let injected = compiled_hostile_fixture("thread_local_public_static.rs");
+        let source = format!("{original}\n{injected}");
+        assert!(
+            public_facade_source_violations(&source)
+                .iter()
+                .any(|violation| violation.contains("thread_local")),
+            "trusted thread_local! injected an unenumerated public facade static"
+        );
+    }
+
+    #[test]
+    fn opaque_scope_bindings_cannot_spoof_derive_authority() {
+        for source in compiled_derive_binding_spoofs() {
+            assert!(
+                std::panic::catch_unwind(|| synthetic_owner_records(&source, "RouterHandle"))
+                    .is_err(),
+                "glob or extern-crate rename spoofed the trusted derive authority"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_expression_items_are_visited_and_stmt_macro_impl_fails_closed() {
+        let source = compiled_hostile_fixture("nested_expr_items.rs");
+        let records = synthetic_owner_records(&source, "RouterNavigation");
+        for method in ["call_authority", "tuple_authority", "return_authority"] {
+            assert!(records.contains(&source_record(
+                "owner",
+                "RouterNavigation",
+                "method",
+                &format!("pub fn {method}(&self)"),
+            )));
+        }
+
+        let source = compiled_hostile_fixture("stmt_macro_impl.rs");
+        assert!(
+            std::panic::catch_unwind(|| synthetic_owner_records(&source, "RouterNavigation"))
+                .is_err(),
+            "block statement macro emitted an unenumerated inherent impl"
+        );
+    }
+
+    #[test]
+    fn derive_prefix_alias_cannot_spoof_bevy_authority() {
+        assert!(
+            std::panic::catch_unwind(|| {
+                synthetic_owner_records(
+                    r#"
+                        mod evil { pub mod component { pub struct Component; } }
+                        use crate::evil as bevy_ecs;
+                        #[derive(bevy_ecs::component::Component)]
+                        #[component]
+                        pub struct RouterHandle;
+                    "#,
+                    "RouterHandle",
+                )
+            })
+            .is_err(),
+            "first-segment import alias spoofed the trusted Bevy derive path"
+        );
+    }
+
+    #[test]
+    fn block_local_nonlocal_impls_are_enumerated() {
+        let source = compiled_hostile_fixture("block_local_nonlocal_impls.rs");
+        let records = synthetic_owner_records_for(&source, &["RouterNavigation", "RouterHandle"]);
+        assert!(records.contains(&source_record(
+            "owner",
+            "RouterNavigation",
+            "method",
+            "pub fn force_private_authority(&mut self)",
+        )));
+        assert!(records.contains(&source_record(
+            "owner",
+            "RouterHandle",
+            "trait-impl",
+            "impl From<Self> for bevy_ecs::entity::Entity",
+        )));
+    }
+
+    #[test]
+    fn block_local_attribute_expansion_fails_closed() {
+        for attribute in [
+            "#[leaked_api]",
+            "#[cfg_attr(not(test), leaked_api)]",
+            "#[component]",
+        ] {
+            let source =
+                format!("fn hidden() {{ {attribute} struct Local; }} pub struct RouterHandle;");
+            assert!(
+                std::panic::catch_unwind(|| synthetic_owner_records(&source, "RouterHandle"))
+                    .is_err(),
+                "block-local attribute escaped fail-closed inspection: {attribute}"
+            );
+        }
+    }
+
+    #[test]
+    fn bevy_component_derive_helpers_are_structurally_allowed() {
+        for helper in [
+            "#[component(on_insert)]",
+            "#[relationship(relationship_target = Target)]",
+        ] {
+            let source = format!(
+                r#"
+                    use bevy_ecs::component::Component;
+                    #[derive(Component)]
+                    {helper}
+                    pub struct RouterHandle;
+                "#
+            );
+            assert!(
+                std::panic::catch_unwind(|| synthetic_owner_records(&source, "RouterHandle"))
+                    .is_ok(),
+                "registered Component derive helper was rejected: {helper}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_exported_macro_and_public_trait_item_macro_fail_closed() {
+        let source = compiled_hostile_fixture("deep_exported_trait_macro.rs");
+        assert!(
+            std::panic::catch_unwind(|| synthetic_owner_records(&source, "AppRouterExt")).is_err(),
+            "block-nested macro_export plus public TraitItem::Macro escaped owner inspection"
+        );
+    }
+
+    #[test]
+    fn public_trait_item_macro_fails_closed_independently() {
+        assert!(
+            std::panic::catch_unwind(|| {
+                synthetic_owner_records(
+                    "pub trait AppRouterExt { leaked_trait_items!(); }",
+                    "AppRouterExt",
+                )
+            })
+            .is_err(),
+            "public TraitItem::Macro escaped owner inspection"
+        );
+    }
+
+    #[test]
+    fn private_facade_function_cannot_hide_macro_export() {
+        let original = fs::read_to_string(facade_dir().join("src/lib.rs")).unwrap();
+        let source = format!(
+            r#"{original}
+                mod hidden {{
+                    fn container() {{
+                        #[macro_export]
+                        macro_rules! leaked_from_block {{
+                            () => {{ pub struct LeakedAuthority; }};
+                        }}
+                    }}
+                }}
+            "#
+        );
+        assert!(
+            public_facade_source_violations(&source)
+                .iter()
+                .any(|violation| violation.contains("macro_export")),
+            "private function block hid a root-exported macro from facade inspection"
+        );
+    }
+
+    #[test]
+    fn ordinary_nonexported_function_local_macro_is_not_public_api_risk() {
+        let records = synthetic_owner_records(
+            r#"
+                fn private_container() {
+                    macro_rules! local_value { () => { 7_u8 }; }
+                    let _ = local_value!();
+                }
+                pub struct RouterHandle;
+            "#,
+            "RouterHandle",
+        );
+        assert!(records.contains(&source_record(
+            "owner",
+            "RouterHandle",
+            "struct",
+            "pub struct RouterHandle",
+        )));
+    }
+
+    #[test]
+    fn owner_public_surface_attribute_macro_fails_closed() {
+        for source in [
+            "#[leaked_api] pub struct RouterHandle;",
+            "#[cfg_attr(not(test), leaked_api)] pub struct RouterHandle;",
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| synthetic_owner_records(source, "RouterHandle"))
+                    .is_err(),
+                "possible attribute proc macro escaped owner public-surface inspection: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn facade_public_surface_attribute_macro_fails_closed() {
+        let original = fs::read_to_string(facade_dir().join("src/lib.rs")).unwrap();
+        let source = original.replacen("pub mod core {", "#[leaked_api]\npub mod core {", 1);
+        assert_ne!(source, original);
+        assert!(
+            public_facade_source_violations(&source)
+                .iter()
+                .any(|violation| violation.contains("attribute macro")),
+            "possible facade attribute proc macro escaped source inspection"
         );
     }
 

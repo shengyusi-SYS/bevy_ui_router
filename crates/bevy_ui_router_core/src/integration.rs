@@ -90,7 +90,18 @@ pub struct RootFrameTask {
     inner: CoreRootFrameTask,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct ViewReportIdentity {
+    inner: crate::engine::RootTaskIdentity,
+}
+
 impl RootFrameTask {
+    pub fn report_identity(&self) -> ViewReportIdentity {
+        ViewReportIdentity {
+            inner: self.inner.identity().clone(),
+        }
+    }
+
     pub fn request(&self) -> NavigationRequestId {
         self.inner.identity().request()
     }
@@ -521,6 +532,15 @@ impl RouterEngine {
             .map(|session| CommitTicket {
                 inner: session.applied(),
             })
+            .map_err(map_report_error)
+    }
+
+    pub fn validate_report_identity(
+        &mut self,
+        task: &RootFrameTask,
+    ) -> Result<(), IntegrationError> {
+        self.inner
+            .validate_view_report_identity(task.inner.identity())
             .map_err(map_report_error)
     }
 

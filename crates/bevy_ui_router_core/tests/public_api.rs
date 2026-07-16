@@ -220,3 +220,29 @@ fn task_3_private_router_allocation_keeps_world_provenance() {
 
     assert!(!ids.contains("pub(crate) fn allocate_router(&mut self)"));
 }
+
+#[test]
+fn sealed_report_identity_does_not_expose_raw_axes() {
+    use bevy_ui_router_core::integration::ViewReportIdentity;
+
+    fn assert_opaque_traits<T: Clone + Eq + PartialEq>() {}
+    assert_opaque_traits::<ViewReportIdentity>();
+
+    let source = include_str!("../src/integration.rs");
+    assert!(source.contains("#[derive(Clone, Eq, PartialEq)]\npub struct ViewReportIdentity"));
+    assert!(source.contains("pub struct ViewReportIdentity {\n    inner:"));
+    for forbidden in [
+        "pub fn report_router_provenance(",
+        "pub fn report_host_epoch(",
+        "pub fn report_transaction_sequence(",
+        "pub fn report_frame_task_sequence(",
+        "pub struct ViewReportIdentity(pub ",
+        "pub inner:",
+        "impl ViewReportIdentity {",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "sealed report identity must not expose `{forbidden}`"
+        );
+    }
+}

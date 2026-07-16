@@ -6,7 +6,12 @@ use std::{
 };
 
 use bevy_app::App;
-use bevy_ecs::{entity::Entity, hierarchy::ChildOf, prelude::Component};
+use bevy_ecs::{
+    component::ComponentId,
+    entity::Entity,
+    hierarchy::{ChildOf, Children},
+    prelude::Component,
+};
 use bevy_ui::{BackgroundColor, Node, Val};
 use bevy_ui_router::prelude::*;
 
@@ -18,7 +23,22 @@ const PARTIAL_RECT_WIDTH: u16 = 199;
 struct HostSentinel(u32);
 
 #[derive(Component, Debug, Eq, PartialEq)]
+struct HostMetadata(u64);
+
+#[derive(Component, Debug, Eq, PartialEq)]
 struct ExistingChild(u32);
+
+#[derive(Component, Debug, Eq, PartialEq)]
+struct ExistingSibling(u32);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HostBoundaryFingerprint {
+    host: Entity,
+    host_non_children_components: Vec<ComponentId>,
+    existing_children: Vec<Entity>,
+    existing_child_components: Vec<(Entity, Vec<ComponentId>)>,
+    top_slot: Option<Entity>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FixtureMode {
@@ -140,8 +160,8 @@ struct RootFixture {
     control: FixtureControl,
     normal: RouteViewKey,
     fallback: RouteViewKey,
-    host: Entity,
-    existing_child: Entity,
+    existing_children: Vec<Entity>,
+    host_fingerprint: HostBoundaryFingerprint,
     admission_entities: HashSet<Entity>,
 }
 
@@ -198,6 +218,7 @@ fn root_fixture(pattern: &str) -> RootFixture {
                 ..Node::default()
             },
             HostSentinel(7),
+            HostMetadata(73),
             RouterHostRegistration::new(router),
         ))
         .id();
@@ -213,7 +234,30 @@ fn root_fixture(pattern: &str) -> RootFixture {
             ChildOf(host),
         ))
         .id();
+    let existing_sibling = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(19.0),
+                height: Val::Px(29.0),
+                ..Node::default()
+            },
+            ExistingSibling(17),
+            ChildOf(host),
+        ))
+        .id();
+    let existing_children = vec![existing_child, existing_sibling];
+    let mut host_fingerprint = capture_host_boundary(&app, host, &existing_children);
     app.update();
+    let top_slot = app
+        .world()
+        .get::<Children>(host)
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|child| !existing_children.contains(child))
+        .expect("admission adds one exact router top slot");
+    host_fingerprint.top_slot = Some(top_slot);
     let admission_entities = entity_set(&app);
 
     RootFixture {
@@ -222,9 +266,52 @@ fn root_fixture(pattern: &str) -> RootFixture {
         control,
         normal,
         fallback,
-        host,
-        existing_child,
+        existing_children,
+        host_fingerprint,
         admission_entities,
+    }
+}
+
+fn component_manifest(app: &App, entity: Entity) -> Vec<ComponentId> {
+    app.world()
+        .get_entity(entity)
+        .expect("fingerprinted app-owned Entity must exist")
+        .archetype()
+        .components()
+        .to_vec()
+}
+
+fn capture_host_boundary(
+    app: &App,
+    host: Entity,
+    expected_children: &[Entity],
+) -> HostBoundaryFingerprint {
+    let children_component = app
+        .world()
+        .component_id::<Children>()
+        .expect("the app-owned host has a Children relationship component");
+    let host_non_children_components = component_manifest(app, host)
+        .into_iter()
+        .filter(|component| *component != children_component)
+        .collect::<Vec<_>>();
+    let existing_children = app
+        .world()
+        .get::<Children>(host)
+        .expect("the app-owned host has its pre-existing children")
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(existing_children, expected_children);
+
+    HostBoundaryFingerprint {
+        host,
+        host_non_children_components,
+        existing_children: existing_children.clone(),
+        existing_child_components: existing_children
+            .into_iter()
+            .map(|child| (child, component_manifest(app, child)))
+            .collect(),
+        top_slot: None,
     }
 }
 
@@ -395,20 +482,84 @@ fn assert_cleanup_trace_is_ordered(snapshot: &NavigationRequestSnapshot, expect_
     assert_eq!(terminal + 1, trace.len());
 }
 
-fn assert_host_intact(app: &App, host: Entity, existing_child: Entity) {
+fn assert_host_intact(app: &App, fingerprint: &HostBoundaryFingerprint) {
+    let host = fingerprint.host;
+    let existing_child = fingerprint.existing_children[0];
+    let existing_sibling = fingerprint.existing_children[1];
+    assert!(app.world().get_entity(host).is_ok());
     assert_eq!(
         app.world().get::<HostSentinel>(host),
         Some(&HostSentinel(7))
+    );
+    assert_eq!(
+        app.world().get::<HostMetadata>(host),
+        Some(&HostMetadata(73))
     );
     assert_eq!(
         app.world().get::<ExistingChild>(existing_child),
         Some(&ExistingChild(11))
     );
     assert_eq!(
+        app.world().get::<ExistingSibling>(existing_sibling),
+        Some(&ExistingSibling(17))
+    );
+    assert_eq!(
         app.world()
             .get::<ChildOf>(existing_child)
             .map(ChildOf::parent),
         Some(host)
+    );
+    assert_eq!(
+        app.world()
+            .get::<ChildOf>(existing_sibling)
+            .map(ChildOf::parent),
+        Some(host)
+    );
+    let children_component = app.world().component_id::<Children>().unwrap();
+    let current_host_components = component_manifest(app, host)
+        .into_iter()
+        .filter(|component| *component != children_component)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        current_host_components, fingerprint.host_non_children_components,
+        "production navigation must preserve every non-Children host component"
+    );
+    for (child, expected_components) in &fingerprint.existing_child_components {
+        assert_eq!(
+            component_manifest(app, *child),
+            *expected_components,
+            "production navigation must preserve each existing app child component set"
+        );
+    }
+    let current_children = app
+        .world()
+        .get::<Children>(host)
+        .unwrap()
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let expected_children = fingerprint
+        .existing_children
+        .iter()
+        .copied()
+        .chain(fingerprint.top_slot)
+        .collect::<Vec<_>>();
+    assert_eq!(current_children, expected_children);
+    let existing_set = fingerprint
+        .existing_children
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let current_existing_order = current_children
+        .iter()
+        .copied()
+        .filter(|child| existing_set.contains(child))
+        .collect::<Vec<_>>();
+    assert_eq!(current_existing_order, fingerprint.existing_children);
+    assert_eq!(
+        current_children.len(),
+        fingerprint.existing_children.len() + 1,
+        "the exact router top-slot membership is the only allowed host child delta"
     );
     let host_node = app
         .world()
@@ -422,6 +573,12 @@ fn assert_host_intact(app: &App, host: Entity, existing_child: Entity) {
         .expect("existing child Node must remain");
     assert_eq!(child_node.width, Val::Px(13.0));
     assert_eq!(child_node.height, Val::Px(17.0));
+    let sibling_node = app
+        .world()
+        .get::<Node>(existing_sibling)
+        .expect("existing sibling Node must remain");
+    assert_eq!(sibling_node.width, Val::Px(19.0));
+    assert_eq!(sibling_node.height, Val::Px(29.0));
 }
 
 fn entity_set(app: &App) -> HashSet<Entity> {
@@ -458,6 +615,7 @@ fn assert_real_solid_rect(app: &mut App, width: u16) {
 #[test]
 fn root_push_first_equivalent_fragment_and_changed_root_settle_with_physical_cleanup() {
     let mut fixture = root_fixture("*page");
+    assert_eq!(fixture.existing_children.len(), 2);
 
     let first_request_id = push_and_settle(
         &mut fixture.app,
@@ -493,7 +651,7 @@ fn root_push_first_equivalent_fragment_and_changed_root_settle_with_physical_cle
         .collect::<HashSet<_>>();
     assert!(!first_entities.is_empty());
     assert_real_solid_rect(&mut fixture.app, NORMAL_RECT_WIDTH);
-    assert_host_intact(&fixture.app, fixture.host, fixture.existing_child);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
 
     let effects_before_equivalent = fixture.control.effects().len();
     let entities_before_equivalent = entity_set(&fixture.app);
@@ -586,7 +744,7 @@ fn root_push_first_equivalent_fragment_and_changed_root_settle_with_physical_cle
     assert_eq!(effects[0].location, RouteLocation::new("/alpha"));
     assert_eq!(effects[1].fragment.as_deref(), Some("details"));
     assert_eq!(effects[2].location, RouteLocation::new("/beta"));
-    assert_host_intact(&fixture.app, fixture.host, fixture.existing_child);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
 }
 
 #[test]
@@ -639,7 +797,7 @@ fn root_push_match_failure_commits_router_fallback_without_history() {
     assert_eq!(effects[0].view, fixture.fallback);
     assert_eq!(effects[0].origin, FrameOrigin::RouterFallback);
     assert_eq!(effects[0].failure, Some(NavigationFailureKind::Match));
-    assert_host_intact(&fixture.app, fixture.host, fixture.existing_child);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
 }
 
 #[test]
@@ -708,7 +866,7 @@ fn root_push_build_and_apply_failures_preserve_match_and_commit_error_presentati
         assert_eq!(recovery.view, fixture.fallback);
         assert_eq!(recovery.origin, FrameOrigin::RouterFallback);
         assert_eq!(recovery.failure, Some(expected));
-        assert_host_intact(&fixture.app, fixture.host, fixture.existing_child);
+        assert_host_intact(&fixture.app, &fixture.host_fingerprint);
     }
 }
 
@@ -751,7 +909,7 @@ fn root_push_fallback_failure_preserves_old_state_and_does_not_poison_the_queue(
     assert_eq!(entity_set(&fixture.app), old_entities);
     assert!(node_entities_with_width(&mut fixture.app, PARTIAL_RECT_WIDTH).is_empty());
     assert_real_solid_rect(&mut fixture.app, NORMAL_RECT_WIDTH);
-    assert_host_intact(&fixture.app, fixture.host, fixture.existing_child);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
 
     fixture.control.set_mode(
         &fixture.normal,
@@ -785,5 +943,5 @@ fn root_push_fallback_failure_preserves_old_state_and_does_not_poison_the_queue(
         Some(&RouteLocation::new("/known/two"))
     );
     assert_eq!(recovered_router.history().len(), 2);
-    assert_host_intact(&fixture.app, fixture.host, fixture.existing_child);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
 }

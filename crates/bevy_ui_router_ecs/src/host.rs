@@ -431,6 +431,7 @@ pub(crate) fn stage_granted_top_slot(
         return Err(ProvisionalStageError {
             kind: ProvisionalStageErrorKind::RegistryRejected,
             entity: Some(staged.entity()),
+            settlement: None,
         });
     }
     Ok(staged)
@@ -530,12 +531,54 @@ pub(crate) enum ProvisionalStageErrorKind {
 pub(crate) struct ProvisionalStageError {
     kind: ProvisionalStageErrorKind,
     entity: Option<Entity>,
+    settlement: Option<ProvisionalHostSettlement>,
 }
 
 impl ProvisionalStageError {
     pub(crate) const fn entity(&self) -> Option<Entity> {
         self.entity
     }
+
+    pub(crate) fn into_settlement(self) -> Option<ProvisionalHostSettlement> {
+        self.settlement
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ProvisionalHostSettlement {
+    slot: Entity,
+    authorized_host: Entity,
+    manifest: ComponentManifest,
+    claim: ExactRegistryClaim,
+}
+
+pub(crate) fn retry_provisional_host_settlement(
+    world: &mut World,
+    settlement: &ProvisionalHostSettlement,
+) -> bool {
+    if world.get_entity(settlement.slot).is_err() {
+        world
+            .resource_mut::<RouteEntityRegistry>()
+            .remove_exact(&settlement.claim);
+        return true;
+    }
+    let still_exact = world
+        .resource::<RouteEntityRegistry>()
+        .record(settlement.slot)
+        .is_some_and(|record| {
+            record.claim() == settlement.claim && record.manifest() == &settlement.manifest
+        });
+    if !still_exact {
+        return true;
+    }
+    settle_failed_provisional(
+        world,
+        settlement.slot,
+        settlement.authorized_host,
+        &settlement.manifest,
+        settlement.claim.clone(),
+        StagingTestDrift::None,
+    )
 }
 
 pub(crate) fn stage_provisional_top_slot(
@@ -548,12 +591,14 @@ pub(crate) fn stage_provisional_top_slot(
         return Err(ProvisionalStageError {
             kind: ProvisionalStageErrorKind::MissingFoundation,
             entity: None,
+            settlement: None,
         });
     }
     if !candidate_is_current(world, &spec.candidate) {
         return Err(ProvisionalStageError {
             kind: ProvisionalStageErrorKind::StaleCandidate,
             entity: None,
+            settlement: None,
         });
     }
 
@@ -579,6 +624,7 @@ pub(crate) fn stage_provisional_top_slot(
             return Err(ProvisionalStageError {
                 kind: ProvisionalStageErrorKind::RegistryRejected,
                 entity: Some(slot),
+                settlement: None,
             });
         }
         let claim = registry
@@ -628,6 +674,12 @@ pub(crate) fn stage_provisional_top_slot(
         return Ok(StagedProvisionalTopSlot { entity: slot });
     }
 
+    let settlement = ProvisionalHostSettlement {
+        slot,
+        authorized_host: host,
+        manifest: manifest.clone(),
+        claim: claim.clone(),
+    };
     let settled = settle_failed_provisional(world, slot, host, &manifest, claim, spec.test_drift);
     Err(ProvisionalStageError {
         kind: if settled {
@@ -636,6 +688,7 @@ pub(crate) fn stage_provisional_top_slot(
             ProvisionalStageErrorKind::QuarantineDetachBlocked
         },
         entity: Some(slot),
+        settlement: (!settled).then_some(settlement),
     })
 }
 
@@ -764,6 +817,14 @@ fn settle_failed_provisional(
         world
             .resource_mut::<RouteEntityRegistry>()
             .remove_exact(&prepared_claim);
+        return true;
+    }
+
+    let still_exact = world
+        .resource::<RouteEntityRegistry>()
+        .record(slot)
+        .is_some_and(|record| record.claim() == prepared_claim && record.manifest() == manifest);
+    if !still_exact {
         return true;
     }
 

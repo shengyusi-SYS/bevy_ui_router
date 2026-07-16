@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 
 use bevy_camera::visibility::Visibility;
-use bevy_ecs::{change_detection::Mut, entity::Entity, prelude::World, resource::Resource};
+use bevy_ecs::{
+    change_detection::Mut, entity::Entity, hierarchy::Children, prelude::World, resource::Resource,
+};
 use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
 
@@ -203,8 +205,9 @@ fn fail_closed_invalid_active_frames(world: &mut World) -> HashSet<Entity> {
         .flatten()
         .map(ExactRegistryClaim::entity)
         .collect::<HashSet<_>>();
+    let focus_closure = observed_descendant_closure(world, entities.iter().copied());
     prepare_physical_isolation(world, &entities).apply();
-    entities
+    focus_closure
 }
 
 fn prepare_physical_isolation<'w>(
@@ -235,11 +238,11 @@ fn clear_inert_subtree_focus(world: &mut World, invalid_active: &HashSet<Entity>
         .filter(|record| record.lifecycle() != EntityLifecycle::Active)
         .map(|record| record.entity())
         .collect::<HashSet<_>>();
-    inert.extend(
-        world
-            .resource::<QuarantineLeaseTable>()
-            .inert_owned_entities(),
-    );
+    let quarantine_roots = world
+        .resource::<QuarantineLeaseTable>()
+        .inert_owned_entities()
+        .collect::<Vec<_>>();
+    inert.extend(observed_descendant_closure(world, quarantine_roots));
     inert.extend(invalid_active.iter().copied());
     let input = world.get_resource::<InputFocus>().and_then(InputFocus::get);
     if input.is_some_and(|focused| inert.contains(&focused)) {
@@ -251,6 +254,28 @@ fn clear_inert_subtree_focus(world: &mut World, invalid_active: &HashSet<Entity>
     if route.is_some_and(|focused| inert.contains(&focused)) {
         world.resource_mut::<RouteFocusState>().set_focused(None);
     }
+}
+
+pub(crate) fn observed_descendant_closure(
+    world: &World,
+    roots: impl IntoIterator<Item = Entity>,
+) -> HashSet<Entity> {
+    let mut stack = roots.into_iter().collect::<Vec<_>>();
+    stack.sort_by_key(|entity| entity.to_bits());
+    stack.reverse();
+    let mut visited = HashSet::new();
+    while let Some(entity) = stack.pop() {
+        if !visited.insert(entity) {
+            continue;
+        }
+        let mut children = world
+            .get::<Children>(entity)
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        children.sort_by_key(|child| child.to_bits());
+        stack.extend(children.into_iter().rev());
+    }
+    visited
 }
 
 pub(crate) fn input_ready_system(_world: &mut World) {}

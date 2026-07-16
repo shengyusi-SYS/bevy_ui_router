@@ -465,14 +465,22 @@ impl RouterEngine {
         &'a mut self,
         identity: &RootTaskIdentity,
     ) -> Result<ViewReportSession<'a>, ReportError> {
+        self.validate_view_report_identity(identity)?;
+        Ok(ViewReportSession {
+            engine: self,
+            identity: identity.clone(),
+        })
+    }
+
+    pub(crate) fn validate_view_report_identity(
+        &mut self,
+        identity: &RootTaskIdentity,
+    ) -> Result<(), ReportError> {
         let accepted = self.current.as_ref().is_some_and(|current| {
             current.stage == WorkStage::Applying && current.identity == *identity
         });
         if accepted {
-            return Ok(ViewReportSession {
-                engine: self,
-                identity: identity.clone(),
-            });
+            return Ok(());
         }
 
         let known = self
