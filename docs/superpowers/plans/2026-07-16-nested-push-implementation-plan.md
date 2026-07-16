@@ -559,6 +559,10 @@ git commit -m "feat(core): settle nested failures before terminal"
 ### Task 5: ECS exact outlet realization and child-slot staging
 
 **Files:**
+- Modify: `crates/bevy_ui_router_core/src/mount.rs` (sealed registration-session prerequisite only)
+- Modify: `crates/bevy_ui_router_core/src/engine.rs` (read-only permit preflight only)
+- Modify: `crates/bevy_ui_router_core/src/integration.rs` (opaque proof and borrowed session only)
+- Modify: `crates/bevy_ui_router_core/tests/compile_fail_boundary.rs` (direct-completion boundary only)
 - Create: `crates/bevy_ui_router_ecs/src/mount.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/lib.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/components.rs`
@@ -571,10 +575,34 @@ git commit -m "feat(core): settle nested failures before terminal"
 
 **Interfaces:**
 - Consumes: `AcceptedOutlet` and Core `MountGrant`
+- Consumes: opaque Core `MountReceiptProof` and a borrowed `MountRegistrationSession`; raw permit slot and direct completion are not ECS authority
 - Produces: private `RealizedOutlet` and `FrameMountBinding`
 - Produces: private `MountedChildSlot` with exact claim and sealed parent/outlet identity
 - Produces: ECS-only `MountReceipt` attesting the exact staged slot and anchor; Core receives only its opaque digest plus logical grant identity
-- Produces: registry-first `stage_child_slot`、`confirm_child_slot` and sealed-ledger-only `settle_rejected_child_slot`
+- Produces: registry-first `stage_child_slot` and `confirm_child_slot`, plus a non-Clone tracked residual for Task 6 sealed-ledger settlement
+
+- [ ] **Step 0: Close the Core registration-session prerequisite**
+
+Write RED tests proving that two routers with the same raw slot and receipt digest cannot cross a permit/proof pair, an old same-router proof is stale, failed begin is lifecycle zero-write, no child action exists before session completion, and session rejection yields the exact `FailureCleanupRequest`
+
+Implement an opaque non-Clone `MountReceiptProof` returned together with `MountReceiptAttestation`; it binds the complete mount identity, slot, receipt digest and sealed artifact binding without exposing raw axes
+
+`RouterEngine::begin_mount_registration(permit, &proof)` performs read-only proof classification, issuer validation and exact engine-context validation before returning a non-Clone session that exclusively borrows the engine and owns the permit
+
+The session exposes only the validated slot plus consuming `complete(registration_digest)` and `reject()` terminals; completion is infallible after exclusive preflight, while rejection consumes the original permit through `reject_mount_after_mutation` and returns the failure cleanup capability
+
+Remove or narrow the integration-level direct permit slot/completion path so no caller can issue a child task without the physical registration session
+
+```powershell
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib mount::tests::
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib engine::tests::mount_registration_
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib integration::tests::mount_registration_
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --test compile_fail_boundary
+git add -- crates/bevy_ui_router_core/src/mount.rs crates/bevy_ui_router_core/src/engine.rs crates/bevy_ui_router_core/src/integration.rs crates/bevy_ui_router_core/tests/compile_fail_boundary.rs
+git diff --cached --name-only
+git diff --cached --check
+git commit -m "feat(core): seal mount registration sessions"
+```
 
 - [ ] **Step 1: Write realization and registry RED**
 
@@ -622,6 +650,8 @@ enum RegistryOwner {
 
 Keep owner uniqueness, seal consumption and compare-and-swap claims unchanged
 
+Child-slot uniqueness is logical rather than enum equality: the same `(parent, outlet)` conflicts across provisional and committed owners even when the slot differs, and the same router-scoped slot cannot bind another child location
+
 - [ ] **Step 4: Implement mount binding and child-slot staging**
 
 ```rust
@@ -656,21 +686,21 @@ struct MountReceipt {
 
 The child slot carries `Visibility::Hidden`, deny-all `RouterInputBarrier`, `Pickable::IGNORE` and a transparent 100% `Node` before relationship insertion; it cannot acquire focus before branch publication
 
-Staging order is exact and individually testable
+Staging order is exact and individually testable; the registry starts with the actual empty-entity manifest and every later batch advances from the previously frozen stage manifest through an exact expected-manifest CAS
 
 1. empty Entity allocation
 2. provisional registry record with owner/seal/lifecycle/initial manifest validation
 3. inert barrier batch → flush → exact Entity/owner/seal/manifest/lifecycle/anchor validation
 4. transparent 100% Node required-closure batch → flush → the same exact validation
 5. private authority batch → flush → the same exact validation
-6. `ChildOf(anchor)` relationship write → flush → exact validation including the unique anchor edge
+6. `ChildOf(anchor)` relationship write → flush → exact validation including the unique anchor edge; update the anchor `Children` manifest only through an old-manifest-bound allowed-addition CAS, then revalidate its exact claim, manifest, prior child order and one new slot edge
 7. produce `MountReceipt` while the owner remains provisional and inert
-8. pass only its digest through the exact Core grant to obtain `MountRegistrationPermit`; Core stays `Confirming` and emits no child action
-9. `confirm_child_slot` validates the unchanged receipt/claims, uses the permit for the provisional→registered CAS, flushes and exact-revalidates the registered inert `ChildSlot`
-10. return permit-bound `MountRegistrationCompletion` with the final registration digest
-11. Core validates completion, emits `MountConfirmation` and only then may issue the child frame task
+8. pass only its digest through the exact Core grant to obtain the attestation and opaque proof, accept the attestation to obtain a permit, then begin the borrowed registration session before any owner CAS; Core stays `Confirming` and emits no child action
+9. `confirm_child_slot` validates the unchanged receipt/claims and session-bound slot, performs the provisional→registered CAS, flushes and exact-revalidates the registered inert `ChildSlot`
+10. success consumes the session with the final registration digest; any pre/post-CAS drift consumes it through `reject()` and returns the exact failure capability together with the tracked residual
+11. only successful session completion may emit `MountConfirmation` and the child frame task
 
-Drift before the CAS keeps the slot provisional/inert; drift or stale completion after the CAS keeps it registered but inert and transfers the residual into Task 6 `FailedPreparedBranch`; `settle_rejected_child_slot` executes only as a Core-sealed exact ledger obligation, never directly from the staging error branch, and no child task exists
+Drift before the CAS keeps the slot provisional/inert; drift after the CAS keeps it registered but inert; despawn drift remains a tracked absent residual. All three non-Clone states transfer into Task 6 `FailedPreparedBranch`, and no Task 5 staging error branch may detach, despawn or settle them directly
 
 - [ ] **Step 5: Verify GREEN and locked Node contract**
 
@@ -730,7 +760,7 @@ Cover foreign/duplicate parent report, stale mount request, missing outlet, inva
 
 Every case snapshots World and registry before the first unauthorized operation and requires zero change or sealed residual cleanup according to its phase
 
-For missing/invalid outlet, rejected-after-mutation and child build/apply failure, assert the partial prepared branch moves to one `FailedPreparedBranch`, its exact manifest orders partial child frame → child slot → parent frames, the old active branch/history remain unchanged, and no terminal status appears before every receipt plus Core completion
+For missing/invalid outlet, rejected-after-mutation and child build/apply failure, assert the partial prepared branch and any provisional, registered or absent child-slot residual move to one `FailedPreparedBranch`, its exact manifest orders partial child frame → child slot residual → parent frames, the old active branch/history remain unchanged, and no terminal status appears before every receipt plus Core completion
 
 - [ ] **Step 3: Verify RED**
 
@@ -771,6 +801,7 @@ struct PendingCommit {
 
 struct FailedPreparedBranch {
     realized: RealizedBranch,
+    mount_residuals: Vec<ChildSlotResidual>,
 }
 
 struct PendingFailureCleanup {
@@ -799,7 +830,7 @@ struct RouterEntry {
 }
 ```
 
-`active` is the only ECS active branch, `pending_commit.branch` is the only entering branch, `failure_cleanup.branch` is the only failed-entering owner and the cleanup ledger is the only post-publication leaving owner; each transition moves the whole `RealizedBranch` without cloning authority state and no second resource mirrors it
+`active` is the only ECS active branch, `pending_commit.branch` is the only entering branch, `failure_cleanup.branch` is the only failed-entering owner and the cleanup ledger is the only post-publication leaving owner; each transition moves the whole `RealizedBranch` and every tracked mount residual without cloning authority state, and no second resource mirrors them
 
 Drive one action at a time
 
@@ -808,12 +839,12 @@ Drive one action at a time
 3. record realized outlets
 4. report applied to Core
 5. resolve the next `MountRequest` against the exact parent frame
-6. stage the provisional child slot, accept its receipt, consume the registration permit, validate exact registered completion and only then obtain the child action
+6. stage the provisional child slot, accept its receipt, begin the exact borrowed registration session, validate the registered inert slot, then consume the session through completion or failure rejection; only completion obtains the child action
 7. continue until Core emits one commit ticket
 
 On any precommit failure
 
-1. consume the partial `PreparedBranch` into `FailedPreparedBranch`
+1. consume the partial `PreparedBranch` and any child-slot residual into `FailedPreparedBranch`
 2. freeze exact Entity obligations from stored frame/output/child-slot claims in leaf-to-root order
 3. pass the manifest digest/count and matching logical roots to Core `prepare_failure_cleanup`
 4. execute only the sealed exact ledger while the failed branch stays inert
