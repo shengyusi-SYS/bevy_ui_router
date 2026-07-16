@@ -373,6 +373,18 @@ fn facade_prelude_exposes_only_root_frame_observation_contracts() {
     assert_eq!(RouteFrameStatus::Active, RouteFrameStatus::Active);
 }
 
+#[test]
+fn facade_core_exposes_non_prelude_fingerprint_and_route_node_types() {
+    use bevy_ui_router::core::{
+        RouteNode, RouteParamsFingerprint, RouteSearchFingerprint, RouteSegmentReuseKey,
+    };
+    fn assert_public<T>() {}
+    assert_public::<RouteNode>();
+    assert_public::<RouteParamsFingerprint>();
+    assert_public::<RouteSearchFingerprint>();
+    assert_public::<RouteSegmentReuseKey>();
+}
+
 #[cfg(feature = "ecs")]
 #[test]
 fn facade_ecs_module_exposes_schedule_labels_without_prelude_promotion() {

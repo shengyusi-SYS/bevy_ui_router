@@ -277,11 +277,20 @@ impl AppRouterExt for App {
         let handle = self
             .world_mut()
             .resource_mut::<crate::navigation::RouterNavigation>()
-            .install(routes, views)
+            .install(routes, views, fallback)
             .map_err(|_| RouterInstallError::new(RouterInstallErrorKind::UnknownRouteView))?;
+        let projection = self
+            .world()
+            .resource::<crate::navigation::RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == handle)
+            .expect("the installed router entry is retained")
+            .engine
+            .snapshot();
         self.world_mut()
             .resource_mut::<crate::snapshots::RouterSnapshots>()
-            .ensure_router(handle);
+            .install_router(handle, projection);
         Ok(handle)
     }
 }

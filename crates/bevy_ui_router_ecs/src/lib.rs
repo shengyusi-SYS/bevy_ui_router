@@ -3,6 +3,8 @@
 mod app_ext;
 #[cfg(feature = "test-support")]
 mod audit;
+#[cfg(test)]
+mod authority_regression_tests;
 mod cleanup;
 mod components;
 mod content;

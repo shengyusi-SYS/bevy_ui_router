@@ -5,7 +5,8 @@ mod cleanup;
 mod engine;
 #[doc(hidden)]
 pub mod integration;
-pub use admission::HostVersion;
+pub use admission::{HostSnapshot, HostTraceEvent, HostTraceEventKind, HostVersion};
+pub use cleanup::CleanupSummary;
 pub mod back;
 pub mod branch;
 pub mod branch_diff;
@@ -31,19 +32,19 @@ pub mod view_input;
 pub mod view_key;
 
 pub mod prelude {
-    pub use crate::HostVersion;
     pub use crate::back::{BackCapabilitySnapshot, BackIntent, BackPolicy};
     pub use crate::branch::{MatchedBranch, MatchedRoute, RouteParams};
     pub use crate::branch_diff::BranchDiff;
     pub use crate::diagnostics::{
-        DiagnosticEvent, DiagnosticEventKind, DiagnosticIdentity, DiagnosticSnapshot,
+        DiagnosticEvent, DiagnosticEventKind, DiagnosticIdentity, DiagnosticSeverity,
+        DiagnosticSnapshot, ReportDisposition,
     };
     pub use crate::error::{RouteError, RouteErrorKind, RouteErrorSourceCategory};
     pub use crate::frame::{
         FrameCleanupPlan, FrameOrigin, FrameReconciliationPlan, RouteFrameBranch,
         RouteFrameIdentity, RouteFrameRecord, RouteFrameScope, RouteFrameStatus, RouteFrameVersion,
     };
-    pub use crate::history::{HistoryError, MemoryHistory};
+    pub use crate::history::{HistoryError, HistorySnapshot, MemoryHistory};
     pub use crate::ids::{
         NavigationRequestId, RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId,
         RouterInstanceId,
@@ -66,6 +67,9 @@ pub mod prelude {
     };
     pub use crate::view_input::RouteViewInput;
     pub use crate::view_key::{RouteViewKey, RouteViewKeyError};
+    pub use crate::{
+        CleanupSummary, HostSnapshot, HostTraceEvent, HostTraceEventKind, HostVersion,
+    };
 }
 
 #[cfg(test)]

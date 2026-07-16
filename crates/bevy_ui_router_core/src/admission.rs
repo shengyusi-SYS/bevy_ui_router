@@ -1,3 +1,10 @@
+//! ```compile_fail
+//! use bevy_ui_router_core::prelude::{HostSnapshot, HostTraceEvent, HostTraceEventKind};
+//!
+//! let _ = HostTraceEvent::project(HostTraceEventKind::AdmissionRequested, None, None);
+//! let _ = HostSnapshot::project(None, None, Vec::new());
+//! ```
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ids::{
@@ -29,6 +36,86 @@ impl HostVersion {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn epoch(&self) -> u64 {
         self.epoch
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostTraceEventKind {
+    AdmissionRequested,
+    AdmissionRejected,
+    AdmissionRejectedAfterMutation,
+    HostGranted,
+    TopSlotRegistered,
+    HostReady,
+    SettlementStarted,
+    SettlementCompleted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostTraceEvent {
+    kind: HostTraceEventKind,
+    version: Option<HostVersion>,
+    slot: Option<RouteSlotId>,
+}
+
+impl HostTraceEvent {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn project(
+        kind: HostTraceEventKind,
+        version: Option<HostVersion>,
+        slot: Option<RouteSlotId>,
+    ) -> Self {
+        Self {
+            kind,
+            version,
+            slot,
+        }
+    }
+
+    pub fn kind(&self) -> HostTraceEventKind {
+        self.kind
+    }
+
+    pub fn version(&self) -> Option<&HostVersion> {
+        self.version.as_ref()
+    }
+
+    pub fn slot(&self) -> Option<RouteSlotId> {
+        self.slot
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostSnapshot {
+    version: Option<HostVersion>,
+    top_slot: Option<RouteSlotId>,
+    trace: Vec<HostTraceEvent>,
+}
+
+impl HostSnapshot {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn project(
+        version: Option<HostVersion>,
+        top_slot: Option<RouteSlotId>,
+        trace: Vec<HostTraceEvent>,
+    ) -> Self {
+        Self {
+            version,
+            top_slot,
+            trace,
+        }
+    }
+
+    pub fn version(&self) -> Option<&HostVersion> {
+        self.version.as_ref()
+    }
+
+    pub fn top_slot(&self) -> Option<RouteSlotId> {
+        self.top_slot
+    }
+
+    pub fn trace(&self) -> &[HostTraceEvent] {
+        &self.trace
     }
 }
 
@@ -244,6 +331,12 @@ impl HostAdmissionIssuer {
         self.current.as_ref() == Some(&GrantIdentity::from_confirmation(confirmation))
     }
 
+    pub(crate) fn is_outstanding_grant(&self, grant: &HostGrant) -> bool {
+        self.outstanding.as_ref().is_some_and(|outstanding| {
+            outstanding == &OutstandingAdmission::Granted(GrantIdentity::from_grant(grant))
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn has_outstanding(&self) -> bool {
         self.outstanding.is_some()
@@ -315,6 +408,53 @@ struct HostAdmissionIssuerSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_snapshot_preserves_version_slot_and_ordered_trace() {
+        fn assert_traits<T: Clone + std::fmt::Debug + Eq + PartialEq>() {}
+        assert_traits::<HostSnapshot>();
+        assert_traits::<HostTraceEvent>();
+
+        let (mut ids, router, mut issuer) = setup();
+        let token = issuer.issue(router).unwrap();
+        let grant = issuer.grant(&token, &mut ids).unwrap();
+        let confirmation = issuer.confirm(&grant).unwrap();
+        let version = confirmation.version().clone();
+        let slot = confirmation.top_slot();
+        let trace = vec![
+            HostTraceEvent::project(HostTraceEventKind::AdmissionRequested, None, None),
+            HostTraceEvent::project(
+                HostTraceEventKind::HostGranted,
+                Some(version.clone()),
+                Some(slot),
+            ),
+            HostTraceEvent::project(
+                HostTraceEventKind::HostReady,
+                Some(version.clone()),
+                Some(slot),
+            ),
+        ];
+        let snapshot = HostSnapshot::project(Some(version.clone()), Some(slot), trace);
+
+        assert_eq!(snapshot.version(), Some(&version));
+        assert_eq!(snapshot.top_slot(), Some(slot));
+        assert_eq!(
+            snapshot
+                .trace()
+                .iter()
+                .map(HostTraceEvent::kind)
+                .collect::<Vec<_>>(),
+            vec![
+                HostTraceEventKind::AdmissionRequested,
+                HostTraceEventKind::HostGranted,
+                HostTraceEventKind::HostReady,
+            ]
+        );
+        assert_eq!(snapshot.trace()[0].version(), None);
+        assert_eq!(snapshot.trace()[0].slot(), None);
+        assert_eq!(snapshot.trace()[1].version(), Some(&version));
+        assert_eq!(snapshot.trace()[1].slot(), Some(slot));
+    }
 
     fn setup() -> (CoreIdAllocator, RouterIdentity, HostAdmissionIssuer) {
         let mut ids = CoreIdAllocator::new().unwrap();

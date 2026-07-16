@@ -5,8 +5,9 @@ use std::collections::VecDeque;
 use crate::admission::{
     AdmissionError, HostAdmissionConfirmation, HostAdmissionIssuer, HostAdmissionToken, HostGrant,
 };
-use crate::branch::{MatchedBranch, MatchedRoute};
+use crate::branch::{MatchedBranch, MatchedRoute, RouteParams};
 use crate::cleanup::{CleanupBatchToken, CleanupCompletion, CleanupManifestSeal};
+use crate::diagnostics::{DiagnosticEvent, ReportDisposition};
 use crate::frame::{FrameOrigin, RouteFrameVersion};
 use crate::history::{HistoryIntent, MemoryHistory};
 use crate::ids::{
@@ -15,7 +16,7 @@ use crate::ids::{
 };
 use crate::location::RouteLocation;
 use crate::matcher::RouteMatcher;
-use crate::presentation::{ActivePresentation, RouterNavigationState};
+use crate::presentation::{ActivePresentation, ActivePresentationKind, RouterNavigationState};
 use crate::request::{
     NavigationFailure, NavigationFailureKind, NavigationPhase, NavigationRequestRecord,
     RequestStatus,
@@ -26,6 +27,7 @@ use crate::view_input::RouteViewInput;
 use crate::view_key::RouteViewKey;
 
 const TERMINAL_RETENTION: usize = 64;
+const ROUTER_DIAGNOSTIC_RETENTION: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RootTaskIdentity {
@@ -137,7 +139,7 @@ pub(crate) struct RootFrameTask {
     identity: RootTaskIdentity,
     frame: RouteFrameVersion,
     location: RouteLocation,
-    matched: MatchedRoute,
+    matched: Option<MatchedRoute>,
     view: RouteViewKey,
     input: Option<RouteViewInput>,
 }
@@ -156,8 +158,8 @@ impl RootFrameTask {
     }
 
     #[allow(dead_code)]
-    pub(crate) const fn matched(&self) -> &MatchedRoute {
-        &self.matched
+    pub(crate) const fn matched(&self) -> Option<&MatchedRoute> {
+        self.matched.as_ref()
     }
 
     pub(crate) const fn view(&self) -> &RouteViewKey {
@@ -246,7 +248,7 @@ impl SealedCommit {
 struct PublicationPlan {
     state: RouterNavigationState,
     history: MemoryHistory,
-    active_branch: MatchedBranch,
+    active_branch: Option<MatchedBranch>,
     record_index: usize,
     published_record: NavigationRequestRecord,
     current: CurrentWork,
@@ -269,7 +271,9 @@ pub(crate) enum PushError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReportError {
+    Duplicate,
     Stale,
+    Invalid,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -280,7 +284,9 @@ pub(crate) enum CommitError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CleanupError {
+    Duplicate,
     Stale,
+    Invalid,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -299,14 +305,21 @@ enum WorkStage {
 }
 
 #[derive(Clone, Debug)]
+enum AttemptKind {
+    Normal,
+    Fallback { original_failure: NavigationFailure },
+}
+
+#[derive(Clone, Debug)]
 struct CurrentWork {
     identity: RootTaskIdentity,
-    branch: MatchedBranch,
+    branch: Option<MatchedBranch>,
     target_frame: RouteFrameVersion,
     history_intent: Option<HistoryIntent>,
     stage: WorkStage,
     cleanup_batch: crate::ids::CleanupBatchId,
     cleanup_roots: Vec<RouteFrameVersion>,
+    attempt: AttemptKind,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -315,10 +328,30 @@ struct QueuedWork {
     reserved: ReservedNavigationIds,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReportDispositionRecord {
+    identity: RootTaskIdentity,
+    disposition: ReportDisposition,
+    target: DiagnosticTarget,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiagnosticTarget {
+    Request(NavigationRequestId),
+    Router,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompletedCleanupTombstone {
+    request: NavigationRequestId,
+    token: CleanupBatchToken,
+}
+
 pub(crate) struct RouterEngine {
     matcher: RouteMatcher,
     ids: CoreIdAllocator,
     router: RouterIdentity,
+    fallback: RouteViewKey,
     state: RouterNavigationState,
     history: MemoryHistory,
     active_branch: Option<MatchedBranch>,
@@ -328,10 +361,17 @@ pub(crate) struct RouterEngine {
     queue: VecDeque<QueuedWork>,
     current: Option<CurrentWork>,
     action: Option<EngineAction>,
+    issued_view_tasks: Vec<RootTaskIdentity>,
+    report_dispositions: Vec<ReportDispositionRecord>,
+    router_diagnostics: Vec<DiagnosticEvent>,
+    completed_cleanup: Vec<CompletedCleanupTombstone>,
 }
 
 impl RouterEngine {
-    pub(crate) fn install(tree: RouteTree) -> Result<Self, EngineInstallError> {
+    pub(crate) fn install(
+        tree: RouteTree,
+        fallback: RouteViewKey,
+    ) -> Result<Self, EngineInstallError> {
         let mut ids = CoreIdAllocator::new().map_err(|_| EngineInstallError::IdExhausted)?;
         let router = ids
             .allocate_router_identity()
@@ -340,6 +380,7 @@ impl RouterEngine {
             matcher: RouteMatcher::new(tree),
             ids,
             router,
+            fallback,
             state: RouterNavigationState::new(router),
             history: MemoryHistory::new(),
             active_branch: None,
@@ -349,6 +390,10 @@ impl RouterEngine {
             queue: VecDeque::new(),
             current: None,
             action: None,
+            issued_view_tasks: Vec::new(),
+            report_dispositions: Vec::new(),
+            router_diagnostics: Vec::new(),
+            completed_cleanup: Vec::new(),
         })
     }
 
@@ -420,16 +465,47 @@ impl RouterEngine {
         &'a mut self,
         identity: &RootTaskIdentity,
     ) -> Result<ViewReportSession<'a>, ReportError> {
-        let valid = self.current.as_ref().is_some_and(|current| {
+        let accepted = self.current.as_ref().is_some_and(|current| {
             current.stage == WorkStage::Applying && current.identity == *identity
         });
-        if !valid {
-            return Err(ReportError::Stale);
+        if accepted {
+            return Ok(ViewReportSession {
+                engine: self,
+                identity: identity.clone(),
+            });
         }
-        Ok(ViewReportSession {
-            engine: self,
-            identity: identity.clone(),
-        })
+
+        let known = self
+            .issued_view_tasks
+            .iter()
+            .any(|issued| issued == identity);
+        let latest_for_request = self
+            .issued_view_tasks
+            .iter()
+            .rev()
+            .find(|issued| issued.request == identity.request);
+        let (disposition, error, message) =
+            if known && latest_for_request.is_some_and(|latest| latest == identity) {
+                (
+                    ReportDisposition::DuplicateRejected,
+                    ReportError::Duplicate,
+                    "duplicate view report rejected",
+                )
+            } else if known {
+                (
+                    ReportDisposition::StaleDiscarded,
+                    ReportError::Stale,
+                    "stale view report discarded",
+                )
+            } else {
+                (
+                    ReportDisposition::InvalidRejected,
+                    ReportError::Invalid,
+                    "invalid view report rejected",
+                )
+            };
+        self.record_report_disposition(identity, disposition, message);
+        Err(error)
     }
 
     pub(crate) fn seal_commit(
@@ -515,7 +591,7 @@ impl RouterEngine {
         self.records[record_index] = published_record;
         self.state = state;
         self.history = history;
-        self.active_branch = Some(active_branch);
+        self.active_branch = active_branch;
         self.current = Some(current);
     }
 
@@ -523,23 +599,45 @@ impl RouterEngine {
         &mut self,
         completion: CleanupCompletion,
     ) -> Result<(), CleanupError> {
-        let valid = self.current.as_ref().is_some_and(|current| {
-            matches!(
-                &current.stage,
-                WorkStage::PostCommitCleanup { outstanding }
-                    if completion.matches(outstanding)
-            )
-        });
-        if !valid {
-            return Err(CleanupError::Stale);
-        }
-
-        let request = self
+        let outstanding = self
             .current
             .as_ref()
-            .expect("validated current work")
-            .identity
-            .request;
+            .and_then(|current| match &current.stage {
+                WorkStage::PostCommitCleanup { outstanding } => Some(outstanding),
+                WorkStage::Applying | WorkStage::ReadyToCommit | WorkStage::CommitSealed { .. } => {
+                    None
+                }
+            });
+        if !outstanding.is_some_and(|expected| completion.matches(expected)) {
+            if let Some(tombstone) = self
+                .completed_cleanup
+                .iter()
+                .find(|tombstone| completion.token() == &tombstone.token)
+            {
+                return if completion.matches(&tombstone.token) {
+                    Err(CleanupError::Duplicate)
+                } else {
+                    Err(CleanupError::Invalid)
+                };
+            }
+            return if completion.is_well_formed() {
+                Err(CleanupError::Stale)
+            } else {
+                Err(CleanupError::Invalid)
+            };
+        }
+
+        let current = self.current.as_ref().expect("validated current work");
+        let request = current.identity.request;
+        let completed_token = outstanding
+            .expect("validated cleanup has an outstanding token")
+            .clone();
+        let terminal_status = match &current.attempt {
+            AttemptKind::Normal => RequestStatus::Succeeded,
+            AttemptKind::Fallback { original_failure } => {
+                RequestStatus::Failed(original_failure.clone())
+            }
+        };
         let record = self
             .record_mut(request)
             .expect("running record is retained");
@@ -547,11 +645,15 @@ impl RouterEngine {
             .append_trace(NavigationTraceEvent::cleanup_settled(None))
             .expect("terminal trace is open");
         record
-            .transition(RequestStatus::Succeeded)
+            .transition(terminal_status)
             .expect("request is running");
         record
             .append_trace(NavigationTraceEvent::request_terminal())
             .expect("terminal status precedes terminal event");
+        self.completed_cleanup.push(CompletedCleanupTombstone {
+            request,
+            token: completed_token,
+        });
         self.current = None;
         self.state.set_request(None);
         self.retain_terminal_records();
@@ -559,12 +661,101 @@ impl RouterEngine {
         Ok(())
     }
 
+    pub(crate) fn observe_cleanup_receipt(
+        &mut self,
+        batch: &CleanupBatchToken,
+        disposition: crate::trace::CleanupDisposition,
+    ) -> Result<(), CleanupError> {
+        let request = self
+            .current
+            .as_ref()
+            .and_then(|current| match &current.stage {
+                WorkStage::PostCommitCleanup { outstanding } if outstanding == batch => {
+                    Some(current.identity.request)
+                }
+                WorkStage::Applying
+                | WorkStage::ReadyToCommit
+                | WorkStage::CommitSealed { .. }
+                | WorkStage::PostCommitCleanup { .. } => None,
+            })
+            .ok_or(CleanupError::Stale)?;
+        self.record_mut(request)
+            .expect("current cleanup request is retained")
+            .append_trace(NavigationTraceEvent::cleanup_settled(Some(disposition)))
+            .expect("current cleanup trace is open");
+        Ok(())
+    }
+
     pub(crate) const fn active(&self) -> &ActivePresentation {
         self.state.active()
     }
 
+    pub(crate) const fn availability(&self) -> &crate::presentation::RouterAvailability {
+        self.state.availability()
+    }
+
+    pub(crate) fn running_request(&self) -> Option<NavigationRequestId> {
+        self.current
+            .as_ref()
+            .map(|current| current.identity.request)
+    }
+
+    pub(crate) fn requested(&self) -> Option<&RouteLocation> {
+        self.running_request()
+            .and_then(|request| self.request(request))
+            .map(NavigationRequestRecord::requested)
+    }
+
+    pub(crate) fn matched(&self) -> Option<&crate::fingerprint::RouteBranchFingerprint> {
+        self.running_request()
+            .and_then(|request| self.request(request))
+            .and_then(NavigationRequestRecord::matched)
+    }
+
+    pub(crate) fn pending_phase(&self) -> Option<&NavigationPhase> {
+        match self.state.current_request() {
+            Some(RequestStatus::Running(phase)) => Some(phase),
+            Some(RequestStatus::Queued | RequestStatus::Succeeded | RequestStatus::Failed(_))
+            | None => None,
+        }
+    }
+
     pub(crate) const fn history(&self) -> &MemoryHistory {
         &self.history
+    }
+
+    pub(crate) fn history_snapshot(&self) -> crate::history::HistorySnapshot {
+        crate::history::HistorySnapshot::project(&self.history)
+    }
+
+    pub(crate) fn earliest_retained_sequence(&self) -> Option<u64> {
+        self.records
+            .iter()
+            .filter(|record| is_terminal(record.status()))
+            .map(|record| record.id().sequence())
+            .min()
+    }
+
+    pub(crate) const fn request_retention_facts(
+        &self,
+    ) -> (RouterIdentity, Option<u64>, Option<u64>) {
+        (self.router, self.evicted_through, self.highest_issued)
+    }
+
+    pub(crate) fn router_diagnostics(&self) -> &[DiagnosticEvent] {
+        &self.router_diagnostics
+    }
+
+    pub(crate) fn diagnostic_snapshot(&self) -> crate::diagnostics::DiagnosticSnapshot {
+        crate::diagnostics::DiagnosticSnapshot::project(self.router_diagnostics.clone())
+    }
+
+    pub(crate) fn host(&self) -> Option<&crate::HostVersion> {
+        self.state.host()
+    }
+
+    pub(crate) fn top_slot(&self) -> Option<RouteSlotId> {
+        self.state.top_slot()
     }
 
     pub(crate) fn request(&self, id: NavigationRequestId) -> Option<&NavigationRequestRecord> {
@@ -606,18 +797,11 @@ impl RouterEngine {
             Err(error) => {
                 let failure =
                     NavigationFailure::new(NavigationFailureKind::Match, error.redacted_message());
-                let record = self
-                    .record_mut(request)
-                    .expect("running record is retained");
-                record
-                    .transition(RequestStatus::Failed(failure))
-                    .expect("request is running");
-                record
-                    .append_trace(NavigationTraceEvent::request_terminal())
-                    .expect("terminal status precedes terminal event");
-                self.state.set_request(None);
-                self.retain_terminal_records();
-                self.start_next();
+                self.record_mut(request)
+                    .expect("running record is retained")
+                    .push_diagnostic(DiagnosticEvent::match_failed(failure.message()))
+                    .expect("running diagnostics are open");
+                self.begin_fallback(request, failure);
                 return;
             }
         };
@@ -627,7 +811,8 @@ impl RouterEngine {
             .expect("match is written once");
         let active_location = self.state.active().location();
         let active_frame = self.state.active().frames().first();
-        let equivalent = active_location == Some(&location);
+        let equivalent = self.state.active().kind() == ActivePresentationKind::Route
+            && active_location == Some(&location);
         let fragment_only = !equivalent
             && active_location.is_some_and(|active| {
                 active.path() == location.path()
@@ -718,12 +903,13 @@ impl RouterEngine {
         };
         self.current = Some(CurrentWork {
             identity: identity.clone(),
-            branch,
+            branch: Some(branch),
             target_frame: target_frame.clone(),
             history_intent: Some(HistoryIntent::Push(location.clone())),
             stage,
             cleanup_batch: queued.reserved.cleanup_batch(),
             cleanup_roots,
+            attempt: AttemptKind::Normal,
         });
 
         if equivalent {
@@ -749,14 +935,183 @@ impl RouterEngine {
             self.state.set_request(Some(RequestStatus::Running(
                 NavigationPhase::ApplyingFrame(0),
             )));
+            self.issued_view_tasks.push(identity.clone());
             self.action = Some(EngineAction::FrameTask(RootFrameTask {
                 identity,
                 frame: target_frame,
                 location,
-                matched: leaf,
+                matched: Some(leaf),
                 view,
                 input: Some(input),
             }));
+        }
+    }
+
+    fn begin_fallback(
+        &mut self,
+        request: NavigationRequestId,
+        original_failure: NavigationFailure,
+    ) {
+        let matched = self
+            .current
+            .as_ref()
+            .and_then(|current| current.branch.as_ref())
+            .and_then(MatchedBranch::leaf)
+            .cloned();
+        self.record_mut(request)
+            .expect("recovering request is retained")
+            .append_trace(NavigationTraceEvent::new(
+                NavigationTraceEventKind::HistoryIntentRejected,
+            ))
+            .expect("running trace is open");
+        let reserved = match self.ids.reserve_attempt() {
+            Ok(reserved) => reserved,
+            Err(_) => {
+                self.current = None;
+                self.action = None;
+                self.fail_reserved_request(
+                    request,
+                    NavigationFailure::new(
+                        NavigationFailureKind::RecoveryFailed,
+                        "router fallback identity reservation exhausted",
+                    ),
+                );
+                self.start_next();
+                return;
+            }
+        };
+        let location = self
+            .request(request)
+            .expect("recovering request is retained")
+            .requested()
+            .clone();
+        let host = self
+            .state
+            .host()
+            .expect("accepted push has a confirmed host");
+        let top_slot = self
+            .state
+            .top_slot()
+            .expect("confirmed host has a top slot");
+        let origin = FrameOrigin::RouterFallback;
+        let generation = RouteGeneration::initial();
+        let identity = RootTaskIdentity {
+            router: self.router,
+            host: host.host(),
+            host_epoch: host.epoch(),
+            top_slot,
+            request,
+            transaction: reserved.transaction(),
+            frame_task: reserved.frame_task(),
+            frame: reserved.candidate_frame(),
+            generation,
+            origin: origin.clone(),
+        };
+        let target_frame = RouteFrameVersion::new(
+            self.router,
+            host.host(),
+            top_slot,
+            origin.clone(),
+            reserved.candidate_frame(),
+            generation,
+        );
+        let cleanup_roots = self
+            .state
+            .active()
+            .frames()
+            .first()
+            .cloned()
+            .into_iter()
+            .collect();
+        let input = RouteViewInput::new(
+            location.clone(),
+            matched.as_ref().map(MatchedRoute::route),
+            matched
+                .as_ref()
+                .map_or_else(RouteParams::new, |leaf| leaf.params().clone()),
+            origin,
+            Some(original_failure.clone()),
+        );
+
+        self.current = Some(CurrentWork {
+            identity: identity.clone(),
+            branch: None,
+            target_frame: target_frame.clone(),
+            history_intent: None,
+            stage: WorkStage::Applying,
+            cleanup_batch: reserved.cleanup_batch(),
+            cleanup_roots,
+            attempt: AttemptKind::Fallback { original_failure },
+        });
+        self.action = None;
+        self.record_mut(request)
+            .expect("recovering request is retained")
+            .append_trace(NavigationTraceEvent::new(
+                NavigationTraceEventKind::FrameTaskIssued,
+            ))
+            .expect("running trace is open");
+        self.transition_with_trace(request, NavigationPhase::Recovering);
+        self.issued_view_tasks.push(identity.clone());
+        self.action = Some(EngineAction::FrameTask(RootFrameTask {
+            identity,
+            frame: target_frame,
+            location,
+            matched,
+            view: self.fallback.clone(),
+            input: Some(input),
+        }));
+    }
+
+    fn record_report_disposition(
+        &mut self,
+        identity: &RootTaskIdentity,
+        disposition: ReportDisposition,
+        message: impl Into<String>,
+    ) {
+        let target = if self.request(identity.request).is_some() {
+            DiagnosticTarget::Request(identity.request)
+        } else {
+            DiagnosticTarget::Router
+        };
+        if self.report_dispositions.iter().any(|record| {
+            record.identity == *identity
+                && record.disposition == disposition
+                && record.target == target
+        }) {
+            return;
+        }
+        if target == DiagnosticTarget::Router
+            && self.router_diagnostics.len() == ROUTER_DIAGNOSTIC_RETENTION
+        {
+            self.router_diagnostics.remove(0);
+            let oldest = self
+                .report_dispositions
+                .iter()
+                .position(|record| record.target == DiagnosticTarget::Router)
+                .expect("router diagnostic and dedup records stay aligned");
+            self.report_dispositions.remove(oldest);
+        }
+        self.report_dispositions.push(ReportDispositionRecord {
+            identity: identity.clone(),
+            disposition,
+            target,
+        });
+        let frame = RouteFrameVersion::new(
+            identity.router_identity(),
+            identity.host(),
+            identity.top_slot(),
+            identity.origin().clone(),
+            identity.frame(),
+            identity.generation(),
+        );
+        let event = DiagnosticEvent::reported(identity.request(), frame, disposition, message);
+        match target {
+            DiagnosticTarget::Request(request) => self
+                .record_mut(request)
+                .expect("diagnostic target request is retained")
+                .push_diagnostic(event)
+                .expect("report disposition diagnostics are open"),
+            DiagnosticTarget::Router => self.router_diagnostics.push(event),
         }
     }
 
@@ -806,17 +1161,30 @@ impl RouterEngine {
             .clone();
 
         let mut history = self.history.clone();
-        current
-            .history_intent
-            .clone()
-            .expect("commit has one private history intent")
-            .publish(&mut history);
+        if let Some(intent) = current.history_intent.clone() {
+            intent.publish(&mut history);
+        }
 
         let mut state = self.state.clone();
-        state.set_active(ActivePresentation::route(
-            location,
-            vec![current.target_frame.clone()],
-        ));
+        let (active, active_branch) = match &current.attempt {
+            AttemptKind::Normal => (
+                ActivePresentation::route(location, vec![current.target_frame.clone()]),
+                current.branch.clone(),
+            ),
+            AttemptKind::Fallback { original_failure } => (
+                ActivePresentation::error(
+                    location,
+                    self.request(request)
+                        .expect("running record is retained")
+                        .matched()
+                        .cloned(),
+                    original_failure.clone(),
+                    vec![current.target_frame.clone()],
+                ),
+                None,
+            ),
+        };
+        state.set_active(active);
         state.set_request(Some(RequestStatus::Running(
             NavigationPhase::PostCommitCleanup,
         )));
@@ -848,7 +1216,7 @@ impl RouterEngine {
         PublicationPlan {
             state,
             history,
-            active_branch: current.branch.clone(),
+            active_branch,
             record_index,
             published_record,
             current,
@@ -869,6 +1237,13 @@ impl RouterEngine {
                 .position(|record| is_terminal(record.status()))
                 .expect("terminal count was nonzero");
             let evicted = self.records.remove(index).expect("index came from records");
+            let evicted_request = evicted.id();
+            self.issued_view_tasks
+                .retain(|identity| identity.request != evicted_request);
+            self.report_dispositions
+                .retain(|record| record.target != DiagnosticTarget::Request(evicted_request));
+            self.completed_cleanup
+                .retain(|tombstone| tombstone.request != evicted_request);
             let sequence = evicted.id().sequence();
             self.evicted_through = Some(
                 self.evicted_through
@@ -952,6 +1327,11 @@ impl std::fmt::Debug for ViewReportSession<'_> {
 impl ViewReportSession<'_> {
     pub(crate) fn applied(self) -> CommitTicket {
         let request = self.identity.request;
+        self.engine.record_report_disposition(
+            &self.identity,
+            ReportDisposition::Accepted,
+            "accepted applied view report",
+        );
         let current = self
             .engine
             .current
@@ -976,10 +1356,46 @@ impl ViewReportSession<'_> {
 
     pub(crate) fn failed(self, failure: NavigationFailure) {
         let request = self.identity.request;
-        self.engine.current = None;
-        self.engine.action = None;
-        self.engine.fail_reserved_request(request, failure);
-        self.engine.start_next();
+        let attempt = self
+            .engine
+            .current
+            .as_ref()
+            .expect("report was preflighted")
+            .attempt
+            .clone();
+        let diagnostic_message = match &attempt {
+            AttemptKind::Normal => format!(
+                "accepted normal {:?} failure: {}",
+                failure.kind(),
+                failure.message()
+            ),
+            AttemptKind::Fallback { .. } => format!(
+                "accepted fallback {:?} failure: {}",
+                failure.kind(),
+                failure.message()
+            ),
+        };
+        self.engine.record_report_disposition(
+            &self.identity,
+            ReportDisposition::Accepted,
+            diagnostic_message,
+        );
+
+        match attempt {
+            AttemptKind::Normal => self.engine.begin_fallback(request, failure),
+            AttemptKind::Fallback { .. } => {
+                self.engine.current = None;
+                self.engine.action = None;
+                self.engine.fail_reserved_request(
+                    request,
+                    NavigationFailure::new(
+                        NavigationFailureKind::RecoveryFailed,
+                        "router fallback failed",
+                    ),
+                );
+                self.engine.start_next();
+            }
+        }
     }
 }
 
@@ -1018,14 +1434,16 @@ struct EngineSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitError, EngineAction, PrivateRequestLookup, ReportError, RootTaskIdentity,
-        RouterEngine, WorkStage,
+        ActionSnapshot, CleanupError, CommitError, EngineAction, PrivateRequestLookup,
+        ROUTER_DIAGNOSTIC_RETENTION, ReportError, RootTaskIdentity, RouterEngine,
+        TERMINAL_RETENTION, WorkStage,
     };
     use crate::admission::HostAdmissionIssuer;
     use crate::cleanup::{
         CleanupBatchToken, CleanupCompletion, CleanupCompletionDigest, CleanupManifestDigest,
         CleanupManifestSeal,
     };
+    use crate::diagnostics::ReportDisposition;
     use crate::frame::{FrameOrigin, RouteFrameVersion};
     use crate::ids::{
         CleanupBatchId, ReservationCounter, RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId,
@@ -1068,7 +1486,8 @@ mod tests {
     }
 
     fn ready_engine() -> RouterEngine {
-        let mut engine = RouterEngine::install(tree()).unwrap();
+        let mut engine =
+            RouterEngine::install(tree(), RouteViewKey::new("fallback").unwrap()).unwrap();
         let mut issuer = HostAdmissionIssuer::new().unwrap();
         let token = engine.request_host_admission(&mut issuer).unwrap();
         let grant = engine.grant_host_admission(&mut issuer, &token).unwrap();
@@ -1112,13 +1531,15 @@ mod tests {
     }
 
     #[test]
-    fn failed_view_report_terminates_without_publishing_history_or_presentation() {
+    fn failed_normal_view_report_issues_fresh_router_fallback_without_publishing() {
         let mut engine = ready_engine();
         let request = engine.enqueue_push(RouteLocation::new("/")).unwrap();
         engine.collect();
         let EngineAction::FrameTask(task) = engine.action().unwrap() else {
             panic!("root frame task expected")
         };
+        let normal_identity = task.identity().clone();
+        let normal_cleanup_batch = engine.current.as_ref().unwrap().cleanup_batch;
 
         engine
             .begin_view_report(task.identity())
@@ -1128,14 +1549,543 @@ mod tests {
                 "view build rejected",
             ));
 
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::Recovering)
+        );
+        assert_eq!(engine.history().len(), 0);
+        assert_eq!(engine.state.active().kind(), ActivePresentationKind::None);
+        let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
+            panic!("normal failure must issue a router fallback task")
+        };
+        assert_eq!(fallback.identity().request(), request);
+        assert_eq!(fallback.identity().host(), normal_identity.host());
+        assert_eq!(fallback.identity().top_slot(), normal_identity.top_slot());
+        assert_ne!(
+            fallback.identity().transaction(),
+            normal_identity.transaction()
+        );
+        assert_ne!(
+            fallback.identity().frame_task(),
+            normal_identity.frame_task()
+        );
+        assert_ne!(fallback.identity().frame(), normal_identity.frame());
+        assert_ne!(
+            engine.current.as_ref().unwrap().cleanup_batch,
+            normal_cleanup_batch
+        );
+        assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
+        assert_eq!(fallback.view(), &RouteViewKey::new("fallback").unwrap());
+        assert_eq!(
+            fallback.input().failure().map(NavigationFailure::kind),
+            Some(NavigationFailureKind::Build)
+        );
+
+        let before_stale = engine.snapshot();
+        assert_eq!(
+            engine.begin_view_report(&normal_identity).unwrap_err(),
+            ReportError::Stale
+        );
+        assert_eq!(engine.state.snapshot(), before_stale.state);
+        assert_eq!(engine.ids.snapshot(), before_stale.ids);
+        assert_eq!(engine.history(), &before_stale.history);
+        assert_eq!(
+            engine
+                .current
+                .as_ref()
+                .map(|current| format!("{current:?}")),
+            before_stale.current
+        );
+        assert_eq!(
+            engine.action.as_ref().map(ActionSnapshot::from),
+            before_stale.action
+        );
+        assert_eq!(
+            report_disposition_count(&engine, request, ReportDisposition::StaleDiscarded),
+            1
+        );
+    }
+
+    #[test]
+    fn match_failure_recovery_keeps_matched_none_and_commits_error_without_history() {
+        let mut engine = ready_engine();
+        let request = engine.push(RouteLocation::new("/missing")).unwrap();
+        let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
+            panic!("match failure must issue a router fallback task")
+        };
+
+        assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
+        assert!(fallback.input().route().is_none());
+        assert!(engine.request(request).unwrap().matched().is_none());
+        assert_eq!(
+            engine.request(request).unwrap().trace()[0].kind(),
+            NavigationTraceEventKind::HistoryIntentRejected
+        );
+        assert_eq!(
+            engine.request(request).unwrap().trace()[1].kind(),
+            NavigationTraceEventKind::FrameTaskIssued
+        );
+        assert_eq!(
+            engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::HistoryIntentRejected)
+                .count(),
+            1
+        );
+        assert_eq!(engine.active().kind(), ActivePresentationKind::None);
+
+        let cleanup = publish_action(&mut engine, EngineAction::FrameTask(fallback));
+        assert_eq!(engine.active().kind(), ActivePresentationKind::Error);
+        assert!(engine.active().matched().is_none());
+        assert_eq!(
+            engine.active().failure().map(NavigationFailure::kind),
+            Some(NavigationFailureKind::Match)
+        );
+        assert!(engine.history().is_empty());
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+        );
+
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
         assert!(matches!(
             engine.request(request).unwrap().status(),
-            RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::Build
+            RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::Match
         ));
-        assert_eq!(engine.history().len(), 0);
-        assert!(engine.state.active().location().is_none());
+    }
+
+    #[test]
+    fn fallback_failure_preserves_old_presentation_and_history_then_reports_recovery_failed() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let old_active = engine.active().clone();
+        let old_history = engine.history().clone();
+
+        let request = engine.push(RouteLocation::new("/about")).unwrap();
+        let EngineAction::FrameTask(normal) = engine.action().unwrap() else {
+            panic!("normal task expected")
+        };
+        let original_matched = engine.request(request).unwrap().matched().cloned();
+        engine
+            .begin_view_report(normal.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "normal apply rejected",
+            ));
+        let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
+            panic!("fallback task expected")
+        };
+        assert_eq!(
+            engine.request(request).unwrap().matched(),
+            original_matched.as_ref()
+        );
+
+        engine
+            .begin_view_report(fallback.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Build,
+                "fallback build rejected",
+            ));
+
+        assert_eq!(engine.active(), &old_active);
+        assert_eq!(engine.history(), &old_history);
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::RecoveryFailed
+        ));
         assert!(engine.current.is_none());
         assert!(engine.action.is_none());
+        let accepted_reports = engine
+            .request(request)
+            .unwrap()
+            .diagnostics()
+            .iter()
+            .filter(|event| event.report_disposition() == Some(ReportDisposition::Accepted))
+            .map(|event| event.redacted_message())
+            .collect::<Vec<_>>();
+        assert_eq!(accepted_reports.len(), 2);
+        assert!(accepted_reports[0].contains("normal Apply"));
+        assert!(accepted_reports[1].contains("fallback Build"));
+    }
+
+    #[test]
+    fn post_match_fallback_commit_keeps_original_fingerprint_and_failure() {
+        let mut engine = ready_engine();
+        let request = engine.push(RouteLocation::new("/items/7")).unwrap();
+        let original_matched = engine.request(request).unwrap().matched().cloned().unwrap();
+        let EngineAction::FrameTask(normal) = engine.action().unwrap() else {
+            panic!("normal task expected")
+        };
+        engine
+            .begin_view_report(normal.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "normal apply failed",
+            ));
+        let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
+            panic!("post-match failure must issue fallback")
+        };
+        let original_leaf = engine
+            .matcher
+            .match_location(&RouteLocation::new("/items/7"))
+            .unwrap()
+            .leaf()
+            .unwrap()
+            .clone();
+        assert_eq!(fallback.input().route(), Some(original_leaf.route()));
+        assert_eq!(fallback.input().params(), original_leaf.params());
+        let trace = engine.request(request).unwrap().trace();
+        let history_rejected = trace
+            .iter()
+            .position(|event| event.kind() == NavigationTraceEventKind::HistoryIntentRejected)
+            .expect("normal failure must reject history intent");
+        let fallback_issued = trace
+            .iter()
+            .rposition(|event| event.kind() == NavigationTraceEventKind::FrameTaskIssued)
+            .expect("fallback task must be traced");
+        assert!(history_rejected < fallback_issued);
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::HistoryIntentRejected)
+                .count(),
+            1
+        );
+
+        let cleanup = publish_action(&mut engine, EngineAction::FrameTask(fallback));
+
+        assert_eq!(engine.active().matched(), Some(&original_matched));
+        assert_eq!(
+            engine.active().failure().map(NavigationFailure::kind),
+            Some(NavigationFailureKind::Apply)
+        );
+        assert!(engine.history().is_empty());
+
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::Apply
+        ));
+    }
+
+    #[test]
+    fn an_error_presentation_never_takes_the_equivalent_zero_effect_path() {
+        let mut engine = ready_engine();
+        let failed = engine.push(RouteLocation::new("/items/7")).unwrap();
+        let EngineAction::FrameTask(normal) = engine.action().unwrap() else {
+            panic!("normal task expected")
+        };
+        engine
+            .begin_view_report(normal.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Build,
+                "normal build failed",
+            ));
+        let fallback_cleanup = publish_current(&mut engine);
+        engine
+            .complete_cleanup(valid_completion(&fallback_cleanup))
+            .unwrap();
+        assert!(matches!(
+            engine.request(failed).unwrap().status(),
+            RequestStatus::Failed(_)
+        ));
+        let error_frame = engine.active().frames()[0].clone();
+
+        engine.push(RouteLocation::new("/items/7")).unwrap();
+        let EngineAction::FrameTask(normal) = engine.action().unwrap() else {
+            panic!("same-location push after error must build a fresh normal frame")
+        };
+        assert!(matches!(
+            normal.identity().origin(),
+            FrameOrigin::MatchedRoute(_)
+        ));
+        assert_ne!(normal.identity().frame(), error_frame.frame());
+        assert_eq!(
+            engine.current.as_ref().unwrap().cleanup_roots,
+            vec![error_frame]
+        );
+    }
+
+    fn report_disposition_count(
+        engine: &RouterEngine,
+        request: crate::ids::NavigationRequestId,
+        disposition: ReportDisposition,
+    ) -> usize {
+        engine
+            .request(request)
+            .unwrap()
+            .diagnostics()
+            .iter()
+            .filter(|event| event.report_disposition() == Some(disposition))
+            .count()
+    }
+
+    #[test]
+    fn rejected_view_reports_are_classified_deduplicated_and_lifecycle_zero_write() {
+        let mut duplicate_engine = ready_engine();
+        let duplicate_request = duplicate_engine
+            .push(RouteLocation::new("/items/7"))
+            .unwrap();
+        let EngineAction::FrameTask(duplicate_task) = duplicate_engine.action().unwrap() else {
+            panic!("normal task expected")
+        };
+        let duplicate_identity = duplicate_task.identity().clone();
+        let duplicate_frame = duplicate_task.frame.clone();
+        let _ticket = duplicate_engine
+            .begin_view_report(&duplicate_identity)
+            .unwrap()
+            .applied();
+        let duplicate_lifecycle = (
+            duplicate_engine.state.snapshot(),
+            duplicate_engine.ids.snapshot(),
+            duplicate_engine.history.clone(),
+            format!("{:?}", duplicate_engine.current),
+            duplicate_engine.action.as_ref().map(ActionSnapshot::from),
+        );
+        assert!(
+            duplicate_engine
+                .begin_view_report(&duplicate_identity)
+                .is_err()
+        );
+        assert!(
+            duplicate_engine
+                .begin_view_report(&duplicate_identity)
+                .is_err()
+        );
+        assert_eq!(
+            report_disposition_count(
+                &duplicate_engine,
+                duplicate_request,
+                ReportDisposition::DuplicateRejected,
+            ),
+            1
+        );
+        let duplicate_diagnostic = duplicate_engine
+            .request(duplicate_request)
+            .unwrap()
+            .diagnostics()
+            .iter()
+            .find(|event| event.report_disposition() == Some(ReportDisposition::DuplicateRejected))
+            .unwrap();
+        assert_eq!(duplicate_diagnostic.request(), Some(duplicate_request));
+        assert_eq!(duplicate_diagnostic.frame(), Some(&duplicate_frame));
+        assert_eq!(
+            (
+                duplicate_engine.state.snapshot(),
+                duplicate_engine.ids.snapshot(),
+                duplicate_engine.history.clone(),
+                format!("{:?}", duplicate_engine.current),
+                duplicate_engine.action.as_ref().map(ActionSnapshot::from),
+            ),
+            duplicate_lifecycle
+        );
+
+        let mut stale_engine = ready_engine();
+        let stale_request = stale_engine.push(RouteLocation::new("/items/7")).unwrap();
+        let EngineAction::FrameTask(stale_task) = stale_engine.action().unwrap() else {
+            panic!("normal task expected")
+        };
+        let stale_identity = stale_task.identity().clone();
+        stale_engine
+            .begin_view_report(&stale_identity)
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Build,
+                "normal build failed",
+            ));
+        let stale_lifecycle = (
+            stale_engine.state.snapshot(),
+            stale_engine.ids.snapshot(),
+            stale_engine.history.clone(),
+            format!("{:?}", stale_engine.current),
+            stale_engine.action.as_ref().map(ActionSnapshot::from),
+        );
+        assert!(stale_engine.begin_view_report(&stale_identity).is_err());
+        assert!(stale_engine.begin_view_report(&stale_identity).is_err());
+        assert_eq!(
+            report_disposition_count(
+                &stale_engine,
+                stale_request,
+                ReportDisposition::StaleDiscarded,
+            ),
+            1
+        );
+        assert_eq!(
+            (
+                stale_engine.state.snapshot(),
+                stale_engine.ids.snapshot(),
+                stale_engine.history.clone(),
+                format!("{:?}", stale_engine.current),
+                stale_engine.action.as_ref().map(ActionSnapshot::from),
+            ),
+            stale_lifecycle
+        );
+
+        let mut invalid_engine = ready_engine();
+        let invalid_request = invalid_engine.push(RouteLocation::new("/items/7")).unwrap();
+        let EngineAction::FrameTask(invalid_task) = invalid_engine.action().unwrap() else {
+            panic!("normal task expected")
+        };
+        let mut invalid_identity = invalid_task.identity().clone();
+        invalid_identity.testing_set_host_epoch(invalid_identity.host_epoch() + 1);
+        let invalid_lifecycle = (
+            invalid_engine.state.snapshot(),
+            invalid_engine.ids.snapshot(),
+            invalid_engine.history.clone(),
+            format!("{:?}", invalid_engine.current),
+            invalid_engine.action.as_ref().map(ActionSnapshot::from),
+        );
+        assert!(invalid_engine.begin_view_report(&invalid_identity).is_err());
+        assert!(invalid_engine.begin_view_report(&invalid_identity).is_err());
+        let foreign_identity = distinct_identity();
+        assert!(invalid_engine.begin_view_report(&foreign_identity).is_err());
+        assert!(invalid_engine.begin_view_report(&foreign_identity).is_err());
+        assert_eq!(
+            report_disposition_count(
+                &invalid_engine,
+                invalid_request,
+                ReportDisposition::InvalidRejected,
+            ),
+            1
+        );
+        assert_eq!(
+            invalid_engine
+                .router_diagnostics()
+                .iter()
+                .filter(|event| {
+                    event.report_disposition() == Some(ReportDisposition::InvalidRejected)
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            (
+                invalid_engine.state.snapshot(),
+                invalid_engine.ids.snapshot(),
+                invalid_engine.history.clone(),
+                format!("{:?}", invalid_engine.current),
+                invalid_engine.action.as_ref().map(ActionSnapshot::from),
+            ),
+            invalid_lifecycle
+        );
+
+        let mut terminal_engine = ready_engine();
+        let terminal_request = terminal_engine
+            .push(RouteLocation::new("/items/7"))
+            .unwrap();
+        let EngineAction::FrameTask(terminal_task) = terminal_engine.action().unwrap() else {
+            panic!("normal task expected")
+        };
+        let terminal_identity = terminal_task.identity().clone();
+        let terminal_cleanup =
+            publish_action(&mut terminal_engine, EngineAction::FrameTask(terminal_task));
+        terminal_engine
+            .complete_cleanup(valid_completion(&terminal_cleanup))
+            .unwrap();
+        assert!(
+            terminal_engine
+                .begin_view_report(&terminal_identity)
+                .is_err()
+        );
+        assert_eq!(
+            report_disposition_count(
+                &terminal_engine,
+                terminal_request,
+                ReportDisposition::DuplicateRejected,
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn evicted_report_replays_are_router_scoped_and_private_indexes_stay_bounded() {
+        let mut engine = ready_engine();
+        let total = TERMINAL_RETENTION + ROUTER_DIAGNOSTIC_RETENTION + 2;
+        let mut requests = Vec::new();
+        let mut identities = Vec::new();
+        for index in 0..total {
+            let request = engine
+                .push(RouteLocation::new(format!("/items/{index}")))
+                .unwrap();
+            requests.push(request);
+            let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+                panic!("changed root must issue one task")
+            };
+            identities.push(task.identity().clone());
+            let cleanup = publish_action(&mut engine, EngineAction::FrameTask(task));
+            engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+        }
+        let newest = *requests.last().unwrap();
+        let newest_diagnostics = engine.request(newest).unwrap().diagnostics().to_vec();
+
+        for identity in identities.iter().take(total - TERMINAL_RETENTION) {
+            assert_eq!(
+                engine.begin_view_report(identity).unwrap_err(),
+                ReportError::Invalid
+            );
+            assert_eq!(
+                engine.begin_view_report(identity).unwrap_err(),
+                ReportError::Invalid
+            );
+        }
+
+        assert_eq!(
+            engine.request(newest).unwrap().diagnostics(),
+            newest_diagnostics
+        );
+        assert_eq!(
+            engine.router_diagnostics().len(),
+            ROUTER_DIAGNOSTIC_RETENTION
+        );
+        assert_eq!(engine.issued_view_tasks.len(), TERMINAL_RETENTION);
+        assert_eq!(engine.completed_cleanup.len(), TERMINAL_RETENTION);
+        assert_eq!(
+            engine.report_dispositions.len(),
+            TERMINAL_RETENTION + ROUTER_DIAGNOSTIC_RETENTION
+        );
+    }
+
+    #[test]
+    fn fallback_reservation_exhaustion_is_atomic_and_settles_recovery_failed() {
+        for counter in [
+            ReservationCounter::Transaction,
+            ReservationCounter::FrameTask,
+            ReservationCounter::CandidateFrame,
+            ReservationCounter::CleanupBatch,
+        ] {
+            let mut engine = ready_engine();
+            let request = engine.push(RouteLocation::new("/items/7")).unwrap();
+            let EngineAction::FrameTask(normal) = engine.action().unwrap() else {
+                panic!("normal task expected")
+            };
+            engine.testing_exhaust_reservation_counter(counter);
+            let ids_before = engine.ids.snapshot();
+
+            engine
+                .begin_view_report(normal.identity())
+                .unwrap()
+                .failed(NavigationFailure::new(
+                    NavigationFailureKind::Build,
+                    "normal build failed",
+                ));
+
+            assert_eq!(engine.ids.snapshot(), ids_before, "counter: {counter:?}");
+            assert!(matches!(
+                engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::RecoveryFailed
+            ));
+            assert!(engine.action().is_none());
+        }
     }
 
     fn seal_current(engine: &mut RouterEngine, ticket: super::CommitTicket) -> super::SealedCommit {
@@ -1227,7 +2177,8 @@ mod tests {
 
     #[test]
     fn no_host_push_rejects_without_allocating_or_changing_state() {
-        let mut engine = RouterEngine::install(tree()).unwrap();
+        let mut engine =
+            RouterEngine::install(tree(), RouteViewKey::new("fallback").unwrap()).unwrap();
         let before = engine.snapshot();
 
         assert!(engine.push(RouteLocation::new("/items/1")).is_err());
@@ -1278,9 +2229,22 @@ mod tests {
             let before = engine.snapshot();
             assert_eq!(
                 engine.begin_view_report(&mismatch).unwrap_err(),
-                ReportError::Stale
+                ReportError::Invalid
             );
-            assert_eq!(engine.snapshot(), before);
+            assert_eq!(engine.state.snapshot(), before.state);
+            assert_eq!(engine.ids.snapshot(), before.ids);
+            assert_eq!(engine.history(), &before.history);
+            assert_eq!(
+                engine
+                    .current
+                    .as_ref()
+                    .map(|current| format!("{current:?}")),
+                before.current
+            );
+            assert_eq!(
+                engine.action.as_ref().map(ActionSnapshot::from),
+                before.action
+            );
         }
     }
 
@@ -1455,7 +2419,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0].cleanup_disposition(), None);
-        assert!(engine.complete_cleanup(replay).is_err());
+        assert_eq!(
+            engine.complete_cleanup(replay),
+            Err(CleanupError::Duplicate)
+        );
         assert_eq!(engine.snapshot(), terminal);
     }
 
@@ -1879,15 +2846,39 @@ mod tests {
         wrong_binding.testing_set_binding(u64::MAX);
         let wrong_batch =
             cleanup.testing_with_batch(CleanupBatchId::new(cleanup.testing_batch().raw() + 1));
-        for invalid in [
-            CleanupCompletion::attest(foreign, CleanupCompletionDigest::canonical_empty(), 0),
-            CleanupCompletion::attest(cleanup.clone(), CleanupCompletionDigest::from_opaque(76), 1),
-            CleanupCompletion::attest(cleanup.clone(), CleanupCompletionDigest::from_opaque(77), 0),
-            CleanupCompletion::attest(wrong_batch, CleanupCompletionDigest::canonical_empty(), 0),
-            wrong_binding,
+        for (invalid, expected) in [
+            (
+                CleanupCompletion::attest(foreign, CleanupCompletionDigest::canonical_empty(), 0),
+                CleanupError::Stale,
+            ),
+            (
+                CleanupCompletion::attest(
+                    cleanup.clone(),
+                    CleanupCompletionDigest::from_opaque(76),
+                    1,
+                ),
+                CleanupError::Invalid,
+            ),
+            (
+                CleanupCompletion::attest(
+                    cleanup.clone(),
+                    CleanupCompletionDigest::from_opaque(77),
+                    0,
+                ),
+                CleanupError::Invalid,
+            ),
+            (
+                CleanupCompletion::attest(
+                    wrong_batch,
+                    CleanupCompletionDigest::canonical_empty(),
+                    0,
+                ),
+                CleanupError::Stale,
+            ),
+            (wrong_binding, CleanupError::Invalid),
         ] {
             let before = engine.snapshot();
-            assert!(engine.complete_cleanup(invalid).is_err());
+            assert_eq!(engine.complete_cleanup(invalid), Err(expected));
             assert_eq!(engine.snapshot(), before);
         }
 
@@ -1919,13 +2910,24 @@ mod tests {
     }
 
     #[test]
-    fn match_failure_clears_running_summary_and_advances_queue_consistently() {
+    fn match_failure_stays_recovering_until_fallback_settles() {
         let mut engine = ready_engine();
         let failed = engine.push(RouteLocation::new("/missing")).unwrap();
 
+        assert_eq!(
+            engine.request(failed).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::Recovering)
+        );
+        let fallback = engine.action().unwrap();
+        let cleanup = publish_action(&mut engine, fallback);
+        assert_eq!(
+            engine.current_status(),
+            Some(&RequestStatus::Running(NavigationPhase::PostCommitCleanup))
+        );
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
         assert!(matches!(
             engine.request(failed).unwrap().status(),
-            RequestStatus::Failed(_)
+            RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::Match
         ));
         assert_eq!(engine.current_status(), None);
 
@@ -1937,7 +2939,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_match_failure_is_settled_before_next_reserved_request_starts() {
+    fn queued_match_failure_fallback_settles_before_next_reserved_request_starts() {
         let mut engine = ready_engine();
         engine.push(RouteLocation::new("/items/1")).unwrap();
         let cleanup = publish_current(&mut engine);
@@ -1946,9 +2948,24 @@ mod tests {
 
         engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
 
+        assert_eq!(
+            engine.request(failed).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::Recovering)
+        );
+        let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
+            panic!("failed request must issue fallback before advancing the queue")
+        };
+        engine
+            .begin_view_report(fallback.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Build,
+                "fallback build failed",
+            ));
         assert!(matches!(
             engine.request(failed).unwrap().status(),
-            RequestStatus::Failed(_)
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::RecoveryFailed
         ));
         assert_eq!(
             engine.request(next).unwrap().status(),

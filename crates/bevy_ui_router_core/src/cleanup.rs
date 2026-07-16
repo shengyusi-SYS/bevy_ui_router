@@ -1,13 +1,53 @@
 #![allow(dead_code)]
 
+//! ```compile_fail
+//! use bevy_ui_router_core::prelude::{CleanupDisposition, CleanupSummary};
+//!
+//! let _ = CleanupSummary::project(false, 0, Some(CleanupDisposition::AlreadyAbsent));
+//! ```
+
 use crate::engine::RootTaskIdentity;
 use crate::frame::{FrameOrigin, RouteFrameVersion};
 use crate::ids::CleanupBatchId;
+use crate::trace::CleanupDisposition;
 
 const LOGICAL_ROOT_DOMAIN: u64 = 0x4c4f_4749_4341_4c52;
 const TOKEN_DOMAIN: u64 = 0x434c_4541_4e54_4f4b;
 const COMPLETION_DOMAIN: u64 = 0x434c_4541_4e44_4f4e;
 const CANONICAL_EMPTY_COMPLETION: u64 = 0x454d_5054_594c_4544;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupSummary {
+    foreground_pending: bool,
+    quarantine_count: usize,
+    last_disposition: Option<CleanupDisposition>,
+}
+
+impl CleanupSummary {
+    pub(crate) const fn project(
+        foreground_pending: bool,
+        quarantine_count: usize,
+        last_disposition: Option<CleanupDisposition>,
+    ) -> Self {
+        Self {
+            foreground_pending,
+            quarantine_count,
+            last_disposition,
+        }
+    }
+
+    pub fn foreground_pending(&self) -> bool {
+        self.foreground_pending
+    }
+
+    pub fn quarantine_count(&self) -> usize {
+        self.quarantine_count
+    }
+
+    pub fn last_disposition(&self) -> Option<CleanupDisposition> {
+        self.last_disposition
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CleanupManifestDigest(u64);
@@ -199,9 +239,16 @@ impl CleanupCompletion {
     }
 
     pub(crate) fn matches(&self, expected: &CleanupBatchToken) -> bool {
-        self.token == *expected
-            && expected.has_valid_binding()
-            && self.settled_count == expected.obligation_count
+        self.token == *expected && self.is_well_formed()
+    }
+
+    pub(crate) const fn token(&self) -> &CleanupBatchToken {
+        &self.token
+    }
+
+    pub(crate) fn is_well_formed(&self) -> bool {
+        self.token.has_valid_binding()
+            && self.settled_count == self.token.obligation_count
             && (self.settled_count == 0) == self.completion_digest.is_canonical_empty()
             && self.binding
                 == completion_binding(&self.token, self.completion_digest, self.settled_count)
@@ -210,6 +257,31 @@ impl CleanupCompletion {
     #[cfg(test)]
     pub(crate) fn testing_set_binding(&mut self, binding: u64) {
         self.binding = binding;
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::trace::CleanupDisposition;
+
+    #[test]
+    fn cleanup_summary_is_a_frozen_read_only_projection() {
+        fn assert_traits<T: Clone + std::fmt::Debug + Eq + PartialEq>() {}
+        assert_traits::<CleanupSummary>();
+
+        let summary = CleanupSummary::project(
+            true,
+            2,
+            Some(CleanupDisposition::QuarantinedForeignComponent),
+        );
+
+        assert!(summary.foreground_pending());
+        assert_eq!(summary.quarantine_count(), 2);
+        assert_eq!(
+            summary.last_disposition(),
+            Some(CleanupDisposition::QuarantinedForeignComponent)
+        );
     }
 }
 

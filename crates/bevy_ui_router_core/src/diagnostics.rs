@@ -47,9 +47,10 @@
 //! }
 //! ```
 
-use crate::frame::{RouteFrameIdentity, RouteFrameStatus};
+use crate::frame::{RouteFrameIdentity, RouteFrameStatus, RouteFrameVersion};
 use crate::ids::{
-    RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId, RouterInstanceId,
+    NavigationRequestId, RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId,
+    RouterInstanceId,
 };
 use crate::location::RouteLocation;
 
@@ -116,6 +117,27 @@ pub enum DiagnosticEventKind {
     MatchConflict,
     BranchPlanned,
     FrameLifecycle,
+    ReportDisposition,
+    CleanupDisposition,
+    HostLifecycle,
+    AuthorityInvariantViolation,
+    PostCommitCleanupAnomaly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticSeverity {
+    Info,
+    Warning,
+    Error,
+    Severe,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReportDisposition {
+    Accepted,
+    StaleDiscarded,
+    DuplicateRejected,
+    InvalidRejected,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -196,9 +218,13 @@ impl BranchPlanningDiagnostic {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiagnosticEvent {
     kind: DiagnosticEventKind,
+    severity: DiagnosticSeverity,
+    request: Option<NavigationRequestId>,
+    frame: Option<RouteFrameVersion>,
     identity: Option<DiagnosticIdentity>,
     branch_planning: Option<BranchPlanningDiagnostic>,
     frame_lifecycle: Option<FrameLifecycleDiagnostic>,
+    report_disposition: Option<ReportDisposition>,
     redacted_message: String,
 }
 
@@ -210,9 +236,13 @@ impl DiagnosticEvent {
     ) -> Self {
         Self {
             kind: DiagnosticEventKind::PendingOverwrite,
+            severity: DiagnosticSeverity::Warning,
+            request: None,
+            frame: None,
             identity: Some(identity),
             branch_planning: None,
             frame_lifecycle: None,
+            report_disposition: None,
             redacted_message: redacted_message.into(),
         }
     }
@@ -221,9 +251,13 @@ impl DiagnosticEvent {
     pub(crate) fn host_or_slot_unavailable(redacted_message: impl Into<String>) -> Self {
         Self {
             kind: DiagnosticEventKind::HostOrSlotUnavailable,
+            severity: DiagnosticSeverity::Warning,
+            request: None,
+            frame: None,
             identity: None,
             branch_planning: None,
             frame_lifecycle: None,
+            report_disposition: None,
             redacted_message: redacted_message.into(),
         }
     }
@@ -232,9 +266,13 @@ impl DiagnosticEvent {
     pub(crate) fn match_failed(redacted_message: impl Into<String>) -> Self {
         Self {
             kind: DiagnosticEventKind::MatchFailed,
+            severity: DiagnosticSeverity::Error,
+            request: None,
+            frame: None,
             identity: None,
             branch_planning: None,
             frame_lifecycle: None,
+            report_disposition: None,
             redacted_message: redacted_message.into(),
         }
     }
@@ -243,9 +281,13 @@ impl DiagnosticEvent {
     pub(crate) fn match_conflict(redacted_message: impl Into<String>) -> Self {
         Self {
             kind: DiagnosticEventKind::MatchConflict,
+            severity: DiagnosticSeverity::Error,
+            request: None,
+            frame: None,
             identity: None,
             branch_planning: None,
             frame_lifecycle: None,
+            report_disposition: None,
             redacted_message: redacted_message.into(),
         }
     }
@@ -254,9 +296,13 @@ impl DiagnosticEvent {
     pub(crate) fn branch_planned(branch_planning: BranchPlanningDiagnostic) -> Self {
         Self {
             kind: DiagnosticEventKind::BranchPlanned,
+            severity: DiagnosticSeverity::Info,
+            request: None,
+            frame: None,
             identity: None,
             branch_planning: Some(branch_planning),
             frame_lifecycle: None,
+            report_disposition: None,
             redacted_message: "branch planned".to_owned(),
         }
     }
@@ -266,6 +312,9 @@ impl DiagnosticEvent {
         let identity = frame_lifecycle.identity();
         Self {
             kind: DiagnosticEventKind::FrameLifecycle,
+            severity: DiagnosticSeverity::Info,
+            request: None,
+            frame: None,
             identity: Some(DiagnosticIdentity::new(
                 identity.router(),
                 identity.host(),
@@ -276,24 +325,63 @@ impl DiagnosticEvent {
             )),
             branch_planning: None,
             frame_lifecycle: Some(frame_lifecycle),
+            report_disposition: None,
             redacted_message: "frame lifecycle changed".to_owned(),
         }
     }
 
-    pub const fn kind(&self) -> DiagnosticEventKind {
+    pub(crate) fn reported(
+        request: NavigationRequestId,
+        frame: RouteFrameVersion,
+        disposition: ReportDisposition,
+        redacted_message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: DiagnosticEventKind::ReportDisposition,
+            severity: DiagnosticSeverity::Warning,
+            request: Some(request),
+            frame: Some(frame),
+            identity: None,
+            branch_planning: None,
+            frame_lifecycle: None,
+            report_disposition: Some(disposition),
+            redacted_message: redacted_message.into(),
+        }
+    }
+
+    pub fn kind(&self) -> DiagnosticEventKind {
         self.kind
     }
 
-    pub const fn identity(&self) -> Option<DiagnosticIdentity> {
+    pub fn severity(&self) -> DiagnosticSeverity {
+        self.severity
+    }
+
+    pub fn request(&self) -> Option<NavigationRequestId> {
+        self.request
+    }
+
+    pub fn frame(&self) -> Option<&RouteFrameVersion> {
+        self.frame.as_ref()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn identity(&self) -> Option<DiagnosticIdentity> {
         self.identity
     }
 
-    pub fn branch_planning(&self) -> Option<&BranchPlanningDiagnostic> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn branch_planning(&self) -> Option<&BranchPlanningDiagnostic> {
         self.branch_planning.as_ref()
     }
 
-    pub fn frame_lifecycle(&self) -> Option<&FrameLifecycleDiagnostic> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn frame_lifecycle(&self) -> Option<&FrameLifecycleDiagnostic> {
         self.frame_lifecycle.as_ref()
+    }
+
+    pub fn report_disposition(&self) -> Option<ReportDisposition> {
+        self.report_disposition
     }
 
     pub fn redacted_message(&self) -> &str {
@@ -301,7 +389,7 @@ impl DiagnosticEvent {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiagnosticSnapshot {
     requested: Option<RouteLocation>,
     active: Option<DiagnosticIdentity>,
@@ -309,11 +397,17 @@ pub struct DiagnosticSnapshot {
 }
 
 impl DiagnosticSnapshot {
-    pub fn new() -> Self {
-        Self::default()
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn new() -> Self {
+        Self {
+            requested: None,
+            active: None,
+            events: Vec::new(),
+        }
     }
 
-    pub fn with_requested(mut self, requested: RouteLocation) -> Self {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_requested(mut self, requested: RouteLocation) -> Self {
         self.requested = Some(requested);
         self
     }
@@ -330,11 +424,22 @@ impl DiagnosticSnapshot {
         self
     }
 
-    pub fn requested(&self) -> Option<&RouteLocation> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn project(events: Vec<DiagnosticEvent>) -> Self {
+        Self {
+            requested: None,
+            active: None,
+            events,
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn requested(&self) -> Option<&RouteLocation> {
         self.requested.as_ref()
     }
 
-    pub const fn active(&self) -> Option<DiagnosticIdentity> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn active(&self) -> Option<DiagnosticIdentity> {
         self.active
     }
 
@@ -347,6 +452,21 @@ impl DiagnosticSnapshot {
 mod tests {
     use super::*;
     use crate::frame::{RouteFrameIdentity, RouteFrameStatus};
+
+    #[test]
+    fn diagnostic_snapshot_projects_only_ordered_read_only_events() {
+        fn assert_traits<T: Clone + std::fmt::Debug + Eq + PartialEq>() {}
+        assert_traits::<DiagnosticSeverity>();
+        assert_traits::<DiagnosticSnapshot>();
+
+        let event = DiagnosticEvent::match_failed("no route matched");
+        assert_eq!(event.severity(), DiagnosticSeverity::Error);
+        assert_eq!(event.request(), None);
+        assert_eq!(event.frame(), None);
+
+        let snapshot = DiagnosticSnapshot::project(vec![event.clone()]);
+        assert_eq!(snapshot.events(), &[event]);
+    }
 
     #[test]
     fn identity_chain_records_router_host_slot_frame_generation_and_route() {

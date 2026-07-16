@@ -10,12 +10,21 @@ use bevy_ui_router_core::{
     HostVersion, frame::RouteFrameVersion, ids::RouteSlotId, slot::RouteSlotKey,
 };
 
+use crate::cleanup::VerifiedCleanupQuarantineTransfer;
 use crate::host::HostCandidateRevision;
 use crate::host::VerifiedQuarantineTransfer;
 use crate::presentation::VerifiedFrameQuarantineTransfer;
 
 static NEXT_SEAL_DOMAIN: AtomicU64 = AtomicU64::new(1);
 static NEXT_QUARANTINE_DOMAIN: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_registry_domain(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1).filter(|_| current != 0)
+        })
+        .ok()
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum EntityOwner {
@@ -204,7 +213,8 @@ pub(crate) struct RouteEntityRegistry {
 impl RouteEntityRegistry {
     pub(crate) fn new() -> Self {
         Self {
-            seal_domain: NEXT_SEAL_DOMAIN.fetch_add(1, Ordering::Relaxed),
+            seal_domain: allocate_registry_domain(&NEXT_SEAL_DOMAIN)
+                .expect("ownership seal domain exhausted"),
             next_seal_sequence: 0,
             consumed_seal_sequences: Vec::new(),
             records: Vec::new(),
@@ -505,7 +515,8 @@ pub(crate) struct QuarantineLeaseTable {
 impl QuarantineLeaseTable {
     pub(crate) fn new() -> Self {
         Self {
-            domain: NEXT_QUARANTINE_DOMAIN.fetch_add(1, Ordering::Relaxed),
+            domain: allocate_registry_domain(&NEXT_QUARANTINE_DOMAIN)
+                .expect("quarantine lease domain exhausted"),
             next_sequence: 0,
             next_residual_sequence: 0,
             leases: Vec::new(),
@@ -729,6 +740,15 @@ pub(crate) fn prepare_verified_frame_quarantine_transfer(
     table.prepare_verified(registry, claims, manifests, facts)
 }
 
+pub(crate) fn prepare_verified_cleanup_quarantine_transfer(
+    table: &mut QuarantineLeaseTable,
+    registry: &RouteEntityRegistry,
+    transfer: VerifiedCleanupQuarantineTransfer,
+) -> Result<PreparedQuarantineTransfer, QuarantineTransferError> {
+    let (claims, manifests, facts) = transfer.into_parts();
+    table.prepare_verified(registry, claims, manifests, facts)
+}
+
 pub(crate) fn apply_prepared_quarantine_transfer(
     table: &mut QuarantineLeaseTable,
     registry: &mut RouteEntityRegistry,
@@ -765,6 +785,17 @@ impl Default for QuarantineLeaseTable {
 mod tests {
     use super::*;
     use crate::host::HostCandidateRevision;
+
+    #[test]
+    fn exhausted_registry_domains_never_wrap_or_reuse_authority() {
+        for counter in [AtomicU64::new(u64::MAX - 1), AtomicU64::new(u64::MAX - 1)] {
+            assert_eq!(allocate_registry_domain(&counter), Some(u64::MAX - 1));
+            assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+            assert_eq!(allocate_registry_domain(&counter), None);
+            assert_eq!(allocate_registry_domain(&counter), None);
+            assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        }
+    }
     use bevy_ecs::{component::Component, prelude::World};
 
     #[derive(Component)]

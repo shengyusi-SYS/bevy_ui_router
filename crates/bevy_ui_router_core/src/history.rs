@@ -1,4 +1,46 @@
+//! ```compile_fail
+//! use bevy_ui_router_core::prelude::{HistorySnapshot, MemoryHistory};
+//!
+//! let _ = HistorySnapshot::project(&MemoryHistory::new());
+//! ```
+
 use crate::location::RouteLocation;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistorySnapshot {
+    entries: Vec<RouteLocation>,
+    cursor: Option<usize>,
+}
+
+impl HistorySnapshot {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn project(history: &MemoryHistory) -> Self {
+        Self {
+            entries: history.entries.clone(),
+            cursor: history.cursor,
+        }
+    }
+
+    pub fn current(&self) -> Option<&RouteLocation> {
+        self.cursor.and_then(|cursor| self.entries.get(cursor))
+    }
+
+    pub fn entries(&self) -> &[RouteLocation] {
+        &self.entries
+    }
+
+    pub fn cursor(&self) -> Option<usize> {
+        self.cursor
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn can_back(&self) -> bool {
+        self.cursor.is_some_and(|cursor| cursor > 0)
+    }
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +122,35 @@ impl MemoryHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_is_a_frozen_projection_of_history_state() {
+        fn assert_traits<T: Clone + std::fmt::Debug + Eq + PartialEq>() {}
+        assert_traits::<HistorySnapshot>();
+
+        let mut history = MemoryHistory::new();
+        history.push(RouteLocation::new("/"));
+        history.push(RouteLocation::new("/settings"));
+        let snapshot = HistorySnapshot::project(&history);
+
+        history.back().unwrap();
+
+        assert_eq!(
+            snapshot.current().map(RouteLocation::path),
+            Some("/settings")
+        );
+        assert_eq!(
+            snapshot
+                .entries()
+                .iter()
+                .map(RouteLocation::path)
+                .collect::<Vec<_>>(),
+            vec!["/", "/settings"]
+        );
+        assert_eq!(snapshot.cursor(), Some(1));
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot.can_back());
+    }
 
     #[test]
     fn push_replace_and_back_track_memory_locations() {

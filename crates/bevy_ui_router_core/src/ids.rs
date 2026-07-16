@@ -138,6 +138,32 @@ pub(crate) struct ReservedNavigationIds {
     cleanup_batch: CleanupBatchId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReservedAttemptIds {
+    transaction: TransactionId,
+    frame_task: FrameTaskId,
+    candidate_frame: RouteFrameId,
+    cleanup_batch: CleanupBatchId,
+}
+
+impl ReservedAttemptIds {
+    pub(crate) const fn transaction(self) -> TransactionId {
+        self.transaction
+    }
+
+    pub(crate) const fn frame_task(self) -> FrameTaskId {
+        self.frame_task
+    }
+
+    pub(crate) const fn candidate_frame(self) -> RouteFrameId {
+        self.candidate_frame
+    }
+
+    pub(crate) const fn cleanup_batch(self) -> CleanupBatchId {
+        self.cleanup_batch
+    }
+}
+
 impl ReservedNavigationIds {
     pub(crate) const fn request(self) -> NavigationRequestId {
         self.request
@@ -331,6 +357,25 @@ impl CoreIdAllocator {
             cleanup_batch: CleanupBatchId(self.next_cleanup_batch),
         };
         self.next_request_by_router.insert(router, next_request);
+        self.next_transaction = next_transaction;
+        self.next_task = next_task;
+        self.next_frame = next_frame;
+        self.next_cleanup_batch = next_cleanup_batch;
+        Ok(reserved)
+    }
+
+    pub(crate) fn reserve_attempt(&mut self) -> Result<ReservedAttemptIds, IdExhaustion> {
+        let next_transaction = self.next_transaction.checked_add(1).ok_or(IdExhaustion)?;
+        let next_task = self.next_task.checked_add(1).ok_or(IdExhaustion)?;
+        let next_frame = self.next_frame.checked_add(1).ok_or(IdExhaustion)?;
+        let next_cleanup_batch = self.next_cleanup_batch.checked_add(1).ok_or(IdExhaustion)?;
+
+        let reserved = ReservedAttemptIds {
+            transaction: TransactionId(self.next_transaction),
+            frame_task: FrameTaskId(self.next_task),
+            candidate_frame: RouteFrameId::new(self.next_frame),
+            cleanup_batch: CleanupBatchId(self.next_cleanup_batch),
+        };
         self.next_transaction = next_transaction;
         self.next_task = next_task;
         self.next_frame = next_frame;

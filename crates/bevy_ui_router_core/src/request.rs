@@ -161,9 +161,6 @@ impl NavigationRequestRecord {
         &mut self,
         event: DiagnosticEvent,
     ) -> Result<(), RequestRecordError> {
-        if self.trace.is_closed() {
-            return Err(RequestRecordError::TraceClosed);
-        }
         self.diagnostics.push(event);
         Ok(())
     }

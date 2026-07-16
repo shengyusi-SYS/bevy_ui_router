@@ -117,12 +117,20 @@ impl std::error::Error for ContentPrimitiveError {}
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ContentSession(u64);
 
+fn allocate_content_session(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1).filter(|_| current != 0)
+        })
+        .ok()
+}
+
 impl ContentSession {
     fn new() -> Self {
         static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
-        let session = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(session, 0, "content session identity space exhausted");
+        let session = allocate_content_session(&NEXT_SESSION)
+            .expect("content session identity space exhausted");
         Self(session)
     }
 }
@@ -482,6 +490,17 @@ impl std::error::Error for ContentWriteError {}
 mod tests {
     use super::*;
     use bevy_ui_router_core::prelude::RouteSlotKey;
+
+    #[test]
+    fn exhausted_content_session_domain_never_wraps_or_reuses_authority() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+
+        assert_eq!(allocate_content_session(&counter), Some(u64::MAX - 1));
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(allocate_content_session(&counter), None);
+        assert_eq!(allocate_content_session(&counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
 
     fn color() -> ContentColor {
         ContentColor::srgba8(1, 2, 3, 4)

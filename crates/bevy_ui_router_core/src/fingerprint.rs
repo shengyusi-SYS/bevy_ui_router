@@ -166,11 +166,20 @@ impl RouteBranchFingerprint {
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct RouteBranchProvenance(String);
 
+fn allocate_tree_source(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1).filter(|_| current != 0)
+        })
+        .ok()
+}
+
 impl RouteBranchProvenance {
     #[allow(dead_code)]
     pub(crate) fn next_tree_source() -> Self {
         static NEXT_TREE_SOURCE: AtomicU64 = AtomicU64::new(1);
-        let raw = NEXT_TREE_SOURCE.fetch_add(1, Ordering::Relaxed);
+        let raw = allocate_tree_source(&NEXT_TREE_SOURCE)
+            .expect("route branch provenance domain exhausted");
         Self(format!("tree:{raw}"))
     }
 }
@@ -183,6 +192,17 @@ mod tests {
     use crate::location::RouteLocation;
     use crate::meta::RouteExplicitKey;
     use crate::slot::RouteSlotKey;
+
+    #[test]
+    fn exhausted_tree_source_domain_never_wraps_or_reuses_authority() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+
+        assert_eq!(allocate_tree_source(&counter), Some(u64::MAX - 1));
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(allocate_tree_source(&counter), None);
+        assert_eq!(allocate_tree_source(&counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
 
     #[test]
     fn params_fingerprint_uses_route_id_and_sorted_local_params() {

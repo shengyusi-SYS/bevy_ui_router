@@ -129,3 +129,17 @@ fn cutover_rejects_ecs_registry_authority_and_keeps_schedule_labels_out_of_prelu
         &["no `RouterScheduleSet` in `prelude`"],
     );
 }
+
+#[test]
+fn curated_prelude_rejects_core_only_diagnostic_vocabulary() {
+    assert_rejected(
+        "diagnostic-event-prelude",
+        "use bevy_ui_router::prelude::DiagnosticEvent; fn main() {}",
+        &["no `DiagnosticEvent` in `prelude`"],
+    );
+    assert_rejected(
+        "diagnostic-kind-prelude",
+        "use bevy_ui_router::prelude::DiagnosticEventKind; fn main() {}",
+        &["no `DiagnosticEventKind` in `prelude`"],
+    );
+}

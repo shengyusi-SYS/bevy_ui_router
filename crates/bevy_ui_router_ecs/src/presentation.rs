@@ -34,7 +34,7 @@ struct FrameShell(RouteFrameVersion);
 struct FrameContentTarget(RouteFrameVersion);
 
 #[derive(Component, Clone, Debug, Eq, PartialEq)]
-struct FrameOutput {
+pub(crate) struct FrameOutput {
     frame: RouteFrameVersion,
     local_index: usize,
     primitive: Option<crate::content::ContentPrimitiveKind>,
@@ -68,6 +68,7 @@ pub(crate) struct RealizedFrame {
     top_slot_claim: ExactRegistryClaim,
     shell: Entity,
     entities: Vec<RealizedEntity>,
+    prewrite_complete: bool,
 }
 
 pub(crate) struct VerifiedFrameQuarantineTransfer {
@@ -155,6 +156,22 @@ impl RealizedFrame {
         self.shell
     }
 
+    pub(crate) const fn top_slot(&self) -> Entity {
+        self.top_slot
+    }
+
+    pub(crate) fn cleanup_members(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&ExactRegistryClaim, Entity)> {
+        self.entities
+            .iter()
+            .map(|entity| (&entity.claim, entity.parent))
+    }
+
+    pub(crate) const fn prewrite_complete(&self) -> bool {
+        self.prewrite_complete
+    }
+
     pub(crate) fn claims(&self) -> impl ExactSizeIterator<Item = &ExactRegistryClaim> {
         self.entities.iter().map(|entity| &entity.claim)
     }
@@ -224,6 +241,32 @@ pub(crate) enum RealizationError {
     PostWriteDrift,
 }
 
+pub(crate) struct DeferredRealizationFailure {
+    error: RealizationError,
+    residual: Option<RealizedFrame>,
+}
+
+impl DeferredRealizationFailure {
+    fn before_complete_frame(error: RealizationError) -> Self {
+        Self {
+            error,
+            residual: None,
+        }
+    }
+
+    fn with_residual(error: RealizationError, residual: RealizedFrame) -> Self {
+        Self {
+            error,
+            residual: Some(residual),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (RealizationError, Option<RealizedFrame>) {
+        (self.error, self.residual)
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn realize_frame(
     world: &mut World,
     host_candidate: ValidatedHostCandidate,
@@ -233,9 +276,40 @@ pub(crate) fn realize_frame(
     output: u64,
     plan: AcceptedContentPlan,
 ) -> Result<RealizedFrame, RealizationError> {
+    match realize_frame_deferred(
+        world,
+        host_candidate,
+        top_slot,
+        top_slot_claim,
+        frame,
+        output,
+        plan,
+    ) {
+        Ok(frame) => Ok(frame),
+        Err(failure) => {
+            let (error, residual) = failure.into_parts();
+            if let Some(residual) = residual {
+                settle_failed_realization(world, top_slot, &residual);
+            }
+            Err(error)
+        }
+    }
+}
+
+pub(crate) fn realize_frame_deferred(
+    world: &mut World,
+    host_candidate: ValidatedHostCandidate,
+    top_slot: Entity,
+    top_slot_claim: ExactRegistryClaim,
+    frame: RouteFrameVersion,
+    output: u64,
+    plan: AcceptedContentPlan,
+) -> Result<RealizedFrame, DeferredRealizationFailure> {
     let runtime_components = runtime_ui_component_ids(world);
-    synchronize_manifest_allowing_additions(world, top_slot, &top_slot_claim, &runtime_components)?;
-    validate_top_slot(world, &host_candidate, top_slot, &top_slot_claim, &frame)?;
+    synchronize_manifest_allowing_additions(world, top_slot, &top_slot_claim, &runtime_components)
+        .map_err(DeferredRealizationFailure::before_complete_frame)?;
+    validate_top_slot(world, &host_candidate, top_slot, &top_slot_claim, &frame)
+        .map_err(DeferredRealizationFailure::before_complete_frame)?;
     let inherited_runtime_components = world
         .resource::<RouteEntityRegistry>()
         .record(top_slot)
@@ -255,7 +329,8 @@ pub(crate) fn realize_frame(
         top_slot,
         true,
         &inherited_runtime_components,
-    )?;
+    )
+    .map_err(DeferredRealizationFailure::before_complete_frame)?;
     let shell_entity = shell.entity;
     realized.push(shell);
     let content_target_entity = world.spawn_empty().id();
@@ -270,8 +345,15 @@ pub(crate) fn realize_frame(
     ) {
         Ok(content_target) => content_target,
         Err(error) => {
-            settle_registered_allocations(world, &realized);
-            return Err(error);
+            let residual = partial_realized_frame(
+                frame,
+                host_candidate,
+                top_slot,
+                top_slot_claim,
+                shell_entity,
+                realized,
+            );
+            return Err(DeferredRealizationFailure::with_residual(error, residual));
         }
     };
     realized.push(content_target);
@@ -313,8 +395,15 @@ pub(crate) fn realize_frame(
         ) {
             Ok(registered) => registered,
             Err(error) => {
-                settle_registered_allocations(world, &realized);
-                return Err(error);
+                let residual = partial_realized_frame(
+                    frame,
+                    host_candidate,
+                    top_slot,
+                    top_slot_claim,
+                    shell_entity,
+                    realized,
+                );
+                return Err(DeferredRealizationFailure::with_residual(error, residual));
             }
         };
         registered.solid_rect = match entry.kind() {
@@ -345,6 +434,7 @@ pub(crate) fn realize_frame(
         top_slot_claim,
         shell: realized[0].entity,
         entities: realized,
+        prewrite_complete: true,
     };
     clear_frame_focus(world, &result);
     let children = world.register_component::<Children>();
@@ -364,21 +454,36 @@ pub(crate) fn realize_frame(
                 Ok(())
             });
     if let Err(error) = manifests_valid {
-        settle_failed_realization(world, top_slot, &result);
-        let _ = synchronize_manifest_allowing(
-            world,
-            top_slot,
-            &result.top_slot_claim,
-            &top_slot_changes,
-        );
-        return Err(error);
+        return Err(DeferredRealizationFailure::with_residual(error, result));
     }
 
     if validate_realized_frame(world, &result) {
         Ok(result)
     } else {
-        settle_failed_realization(world, top_slot, &result);
-        Err(RealizationError::PostWriteDrift)
+        Err(DeferredRealizationFailure::with_residual(
+            RealizationError::PostWriteDrift,
+            result,
+        ))
+    }
+}
+
+fn partial_realized_frame(
+    frame: RouteFrameVersion,
+    host_candidate: ValidatedHostCandidate,
+    top_slot: Entity,
+    top_slot_claim: ExactRegistryClaim,
+    shell: Entity,
+    entities: Vec<RealizedEntity>,
+) -> RealizedFrame {
+    debug_assert!(!entities.is_empty());
+    RealizedFrame {
+        frame,
+        host_candidate,
+        top_slot,
+        top_slot_claim,
+        shell,
+        entities,
+        prewrite_complete: false,
     }
 }
 
@@ -885,6 +990,73 @@ pub(crate) fn prepare_presentation_mutation<'w>(
         .then_some(PreparedPresentationMutation { entities })
 }
 
+pub(crate) fn prepare_cleanup_quarantine_mutation<'w>(
+    world: &'w mut World,
+    claims: &[ExactRegistryClaim],
+) -> Option<PreparedPresentationMutation<'w>> {
+    let targets = claims
+        .iter()
+        .map(|claim| FrameMutationTarget {
+            entity: claim.entity(),
+            current: claim.lifecycle(),
+            next: EntityLifecycle::Quarantined,
+            active_after: false,
+            interactive: false,
+        })
+        .collect::<Vec<_>>();
+    prepare_presentation_mutation(world, &targets)
+}
+
+pub(crate) fn repair_missing_pickable_for_cleanup_quarantine(
+    world: &mut World,
+    claims: &[ExactRegistryClaim],
+) -> bool {
+    if claims.iter().any(|claim| {
+        !matches!(
+            claim.lifecycle(),
+            EntityLifecycle::PreparedInert | EntityLifecycle::Leaving
+        )
+    }) {
+        return false;
+    }
+    let missing = claims
+        .iter()
+        .filter_map(|claim| {
+            world
+                .get::<Pickable>(claim.entity())
+                .is_none()
+                .then_some(claim.entity())
+        })
+        .collect::<Vec<_>>();
+    let claims_are_inert_and_exact = |world: &World| {
+        claims.iter().all(|claim| {
+            world
+                .resource::<RouteEntityRegistry>()
+                .record(claim.entity())
+                .is_some_and(|record| record.claim() == *claim)
+                && world.get::<RouteOwnershipSeal>(claim.entity())
+                    == Some(&RouteOwnershipSeal::new(claim.seal()))
+                && world.get::<Visibility>(claim.entity()) == Some(&Visibility::Hidden)
+                && world
+                    .get::<RouterInputBarrier>(claim.entity())
+                    .is_some_and(RouterInputBarrier::denies_all)
+                && world.get::<FrameLifecycle>(claim.entity())
+                    == Some(&FrameLifecycle(claim.lifecycle()))
+        })
+    };
+    if !claims_are_inert_and_exact(world) {
+        return false;
+    }
+    for entity in missing {
+        world.entity_mut(entity).insert(Pickable::IGNORE);
+    }
+    world.flush();
+    claims_are_inert_and_exact(world)
+        && claims
+            .iter()
+            .all(|claim| world.get::<Pickable>(claim.entity()) == Some(&Pickable::IGNORE))
+}
+
 pub(crate) fn validate_active_frame(world: &World, frame: &RealizedFrame) -> bool {
     validate_top_slot(
         world,
@@ -1158,15 +1330,7 @@ fn top_slot_children_are_exact(world: &World, frame: &RealizedFrame) -> bool {
         && !(prepared_shells == 1 && leaving_shells == 1)
 }
 
-fn settle_registered_allocations(world: &mut World, entities: &[RealizedEntity]) {
-    for realized in entities.iter().rev() {
-        world
-            .resource_mut::<RouteEntityRegistry>()
-            .remove_exact(&realized.claim);
-        world.despawn(realized.entity);
-    }
-}
-
+#[cfg(test)]
 fn settle_failed_realization(world: &mut World, top_slot: Entity, frame: &RealizedFrame) {
     if quarantine_failed_realization(world, frame) {
         return;
@@ -1175,6 +1339,7 @@ fn settle_failed_realization(world: &mut World, top_slot: Entity, frame: &Realiz
     let _ = synchronize_manifest_allowing(world, top_slot, &frame.top_slot_claim, &[children]);
 }
 
+#[cfg(test)]
 fn quarantine_failed_realization(world: &mut World, frame: &RealizedFrame) -> bool {
     quarantine_frame(world, frame)
 }
@@ -1560,6 +1725,7 @@ fn repair_missing_pickable_for_quarantine(
     for entity in missing {
         world.entity_mut(entity).insert(Pickable::IGNORE);
     }
+    world.flush();
     frame.entities.iter().all(|realized| {
         world
             .resource::<RouteEntityRegistry>()
@@ -1642,7 +1808,8 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        let mut engine = RouterEngine::install(tree).unwrap();
+        let fallback = RouteViewKey::new("fallback").unwrap();
+        let mut engine = RouterEngine::install(tree, fallback).unwrap();
         let token = engine.request_host_admission().unwrap();
         let grant = engine.grant_host_admission(&token).unwrap();
         let staged =
@@ -1756,7 +1923,7 @@ mod tests {
             .insert(RouteOwnershipSeal::new(new_claim.seal()));
         let entity_count = world.iter_entities().count();
 
-        let error = realize_frame(
+        let failure = realize_frame_deferred(
             &mut world,
             candidate,
             top_slot,
@@ -1766,8 +1933,10 @@ mod tests {
             ContentPlan::new().accept(),
         )
         .unwrap_err();
+        let (error, residual) = failure.into_parts();
 
         assert_eq!(error, RealizationError::InvalidTopSlot);
+        assert!(residual.is_none());
         let record = world
             .resource::<RouteEntityRegistry>()
             .record(top_slot)
@@ -2039,7 +2208,8 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        let mut engine = RouterEngine::install(tree).unwrap();
+        let fallback = RouteViewKey::new("fallback").unwrap();
+        let mut engine = RouterEngine::install(tree, fallback).unwrap();
         let token = engine.request_host_admission().unwrap();
         let grant = engine.grant_host_admission(&token).unwrap();
         let staged =
@@ -2119,7 +2289,8 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        let mut engine = RouterEngine::install(tree).unwrap();
+        let fallback = RouteViewKey::new("fallback").unwrap();
+        let mut engine = RouterEngine::install(tree, fallback).unwrap();
         let token = engine.request_host_admission().unwrap();
         let grant = engine.grant_host_admission(&token).unwrap();
         let staged =
@@ -2159,7 +2330,7 @@ mod tests {
         let entity_count_before = world.iter_entities().count();
         let registry_count_before = world.resource::<RouteEntityRegistry>().records().len();
 
-        let error = realize_frame(
+        let failure = realize_frame_deferred(
             &mut world,
             candidate,
             top_slot,
@@ -2169,8 +2340,22 @@ mod tests {
             ContentPlan::new().accept(),
         )
         .unwrap_err();
+        let (error, residual) = failure.into_parts();
 
         assert_eq!(error, RealizationError::RegistryRejected);
+        let residual = residual.expect("prior registered allocations remain a cleanup residual");
+        assert_eq!(residual.obligation_count(), 1);
+        assert_eq!(world.iter_entities().count(), entity_count_before + 1);
+        assert_eq!(
+            world.resource::<RouteEntityRegistry>().records().len(),
+            registry_count_before + 1
+        );
+
+        let mut ledger = crate::cleanup::CleanupLedger::for_failed_realization(&world, residual)
+            .expect("partial realization has an exact foreground ledger");
+        let attempt = ledger.attempt(&world).unwrap();
+        assert!(ledger.settle(&mut world, attempt));
+        assert_eq!(ledger.receipt_count(), 1);
         assert_eq!(world.iter_entities().count(), entity_count_before);
         assert_eq!(
             world.resource::<RouteEntityRegistry>().records().len(),
@@ -2216,7 +2401,8 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        let mut engine = RouterEngine::install(tree).unwrap();
+        let fallback = RouteViewKey::new("fallback").unwrap();
+        let mut engine = RouterEngine::install(tree, fallback).unwrap();
         let token = engine.request_host_admission().unwrap();
         let grant = engine.grant_host_admission(&token).unwrap();
         let staged =
