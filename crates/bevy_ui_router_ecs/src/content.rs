@@ -169,11 +169,28 @@ impl ContentRealizationEntry {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AcceptedOutlet {
+    local_index: usize,
+    key: RouteSlotKey,
+}
+
+impl AcceptedOutlet {
+    pub(crate) const fn local_index(&self) -> usize {
+        self.local_index
+    }
+
+    pub(crate) const fn key(&self) -> &RouteSlotKey {
+        &self.key
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct AcceptedContentPlan {
     entries: Vec<ContentRealizationEntry>,
     relationships: Vec<(usize, usize)>,
     roots: Vec<usize>,
+    outlets: Vec<AcceptedOutlet>,
 }
 
 impl AcceptedContentPlan {
@@ -187,6 +204,10 @@ impl AcceptedContentPlan {
 
     pub(crate) fn roots(&self) -> &[usize] {
         &self.roots
+    }
+
+    pub(crate) fn outlets(&self) -> &[AcceptedOutlet] {
+        &self.outlets
     }
 }
 
@@ -293,10 +314,24 @@ impl ContentPlan {
             .filter(|entity| self.parents[entity.index].is_none())
             .map(|entity| entity.index)
             .collect();
+        let mut outlets = self
+            .outlets
+            .into_iter()
+            .map(|(entity, key)| AcceptedOutlet {
+                local_index: entity.index,
+                key,
+            })
+            .collect::<Vec<_>>();
+        outlets.sort_by(|left, right| {
+            left.local_index
+                .cmp(&right.local_index)
+                .then_with(|| left.key.cmp(&right.key))
+        });
         AcceptedContentPlan {
             entries,
             relationships,
             roots,
+            outlets,
         }
     }
 }
@@ -703,6 +738,35 @@ pub(crate) mod tests {
         assert_eq!(plan.relationships(), &[(root, child), (child, leaf)]);
         assert_eq!(plan.outlets()[0].0, root);
         assert_eq!(plan.outlets()[1].0, child);
+    }
+
+    #[test]
+    fn accepted_plan_retains_outlets_in_stable_local_index_and_key_order() {
+        let mut plan = ContentPlan::new();
+        let (root, child) = {
+            let mut writer = writer(&mut plan);
+            (writer.spawn_empty().unwrap(), writer.spawn_empty().unwrap())
+        };
+        writer(&mut plan).add_child(root, child).unwrap();
+        let first = RouteSlotKey::named("first").unwrap();
+        let second = RouteSlotKey::named("second").unwrap();
+        writer(&mut plan)
+            .declare_outlet(child, second.clone())
+            .unwrap();
+        writer(&mut plan)
+            .declare_outlet(root, first.clone())
+            .unwrap();
+
+        let accepted = plan.accept();
+
+        assert_eq!(
+            accepted
+                .outlets()
+                .iter()
+                .map(|outlet| (outlet.local_index(), outlet.key().clone()))
+                .collect::<Vec<_>>(),
+            vec![(root.index, first), (child.index, second)],
+        );
     }
 
     #[test]
