@@ -457,10 +457,13 @@ git commit -m "feat(core): schedule nested frame branches"
 - Modify: `crates/bevy_ui_router_core/src/integration.rs`
 - Modify: `crates/bevy_ui_router_core/src/cleanup.rs`
 - Modify: `crates/bevy_ui_router_core/src/trace.rs`
+- Modify: `crates/bevy_ui_router_ecs/src/navigation.rs` (failure capability holder only)
+- Modify: `crates/bevy_ui_router_ecs/src/snapshots.rs` (depth-one test helper exhaustiveness only)
 
 **Interfaces:**
 - Produces: unsealed logical `FailureCleanupRequest` followed by the existing digest/count-bound `CleanupBatchToken`
 - Produces: `reject_mount`、`reject_mount_after_mutation` and child frame failure transitions
+- Produces: `EngineAction::FailureCleanup` only when an accepted frame cannot issue its next mount capability; ECS retains it without starting physical cleanup until Task 6
 - Produces: `Running(CleanupPending|Recovering) -> CleanupSettled -> Failed -> RequestTerminal`
 - Preserves: Root mandatory RouterFallback for match/root build/root apply failure
 
@@ -530,16 +533,18 @@ Only `complete_cleanup` may append `CleanupSettled`, transition terminal and app
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib engine::tests::
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib integration::tests::
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib -j 1
+cargo check --locked --workspace --all-targets --all-features -j 1 --config "build.rustc-wrapper = ''"
 ```
 
-Expected: all Core failure, trace, cleanup and Root fallback tests pass
+Expected: all Core failure, trace, cleanup and Root fallback tests pass and every workspace consumer retains the new failure capability exhaustively
 
 - [ ] **Step 5: Review and commit**
 
 Review gate: no terminal-before-cleanup path, no nested fallback authority, existing Root fallback remains
 
 ```powershell
-git add -- crates/bevy_ui_router_core/src/engine.rs crates/bevy_ui_router_core/src/integration.rs crates/bevy_ui_router_core/src/cleanup.rs crates/bevy_ui_router_core/src/trace.rs
+git add -- crates/bevy_ui_router_core/src/engine.rs crates/bevy_ui_router_core/src/integration.rs crates/bevy_ui_router_core/src/cleanup.rs crates/bevy_ui_router_core/src/trace.rs crates/bevy_ui_router_ecs/src/navigation.rs crates/bevy_ui_router_ecs/src/snapshots.rs
 git diff --cached --name-only
 git diff --cached --check
 git commit -m "feat(core): settle nested failures before terminal"
