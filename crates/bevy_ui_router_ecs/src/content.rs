@@ -316,9 +316,9 @@ impl<'a> FrameContentWriter<'a> {
 
     pub fn spawn_solid_rect(
         &mut self,
-        solid_rect: SolidRect,
+        rect: SolidRect,
     ) -> Result<ContentEntity, ContentWriteError> {
-        Ok(self.spawn(RenderContent::SolidRect(solid_rect)))
+        Ok(self.spawn(RenderContent::SolidRect(rect)))
     }
 
     pub fn add_child(
@@ -487,7 +487,7 @@ impl fmt::Display for ContentWriteError {
 impl std::error::Error for ContentWriteError {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bevy_ui_router_core::prelude::RouteSlotKey;
 
@@ -583,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn relationship_rejections_are_zero_write_with_fixed_priority() {
+    pub(crate) fn relationship_rejections_are_zero_write_with_fixed_priority() {
         let mut first = ContentPlan::new();
         let mut second = ContentPlan::new();
         let (a, b, c) = {

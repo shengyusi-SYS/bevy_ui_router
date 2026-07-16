@@ -2,18 +2,32 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bevy_camera::visibility::Visibility;
 use bevy_ecs::{entity::Entity, hierarchy::ChildOf, prelude::World, resource::Resource};
+use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
-use bevy_ui_router_core::{HostVersion, frame::RouteFrameVersion, ids::RouteSlotId};
+use bevy_ui_router_core::{
+    HostVersion,
+    frame::RouteFrameVersion,
+    ids::{NavigationRequestId, RouteSlotId},
+    slot::RouteSlotKey,
+};
 
 use crate::{
     app_ext::RouterHandle,
     components::{ProvisionalSlotLifecycle, RouteOwnershipSeal, RouterInputBarrier},
     content::{ContentColor, ContentPrimitiveKind},
     host::validated_host_candidate_is_current,
+    input::{RouteFocusState, RouterInputGate},
     navigation::RouterEntry,
     presentation::{FrameLifecycle, RealizedFrame, validate_active_frame, validate_realized_frame},
-    registry::{EntityLifecycle, EntityOwner, RegistryOwner, RouteEntityRegistry},
+    registry::{
+        EntityLifecycle, EntityOwner, QuarantineLeaseTable, RegistryOwner, RouteEntityRegistry,
+    },
 };
+
+const OWNED_ID_FLAG: u64 = 1 << 32;
+const AUDIT_NAMESPACE_SHIFT: u32 = 33;
+const ID_SEQUENCE_MASK: u64 = (1 << 32) - 1;
+const REMOVED_RETENTION: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct AuditEntityId(u64);
@@ -65,6 +79,8 @@ pub struct AuthoritySlotMapping {
     entity: AuditEntityId,
     host: HostVersion,
     kind: AuthoritySlotKind,
+    parent_frame: Option<RouteFrameVersion>,
+    outlet: Option<RouteSlotKey>,
 }
 
 impl AuthoritySlotMapping {
@@ -82,6 +98,14 @@ impl AuthoritySlotMapping {
 
     pub fn kind(&self) -> AuthoritySlotKind {
         self.kind
+    }
+
+    pub fn parent_frame(&self) -> Option<&RouteFrameVersion> {
+        self.parent_frame.as_ref()
+    }
+
+    pub fn outlet(&self) -> Option<&RouteSlotKey> {
+        self.outlet.as_ref()
     }
 }
 
@@ -164,16 +188,92 @@ impl AuthorityContentMapping {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouterLifecycleAuditEventKind {
+    ShellPrepared,
+    FrameIsolated,
+    FrameActivated,
+    RegistryPublished,
+    QuarantineOpened,
+    QuarantineReaped,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouterLifecycleAuditEvent {
+    kind: RouterLifecycleAuditEventKind,
+    frame: Option<RouteFrameVersion>,
+    entity: Option<AuditEntityId>,
+    visibility_hidden: bool,
+    accepts_pointer: bool,
+    accepts_keyboard: bool,
+    accepts_gamepad: bool,
+    focused: bool,
+}
+
+impl RouterLifecycleAuditEvent {
+    pub fn kind(&self) -> RouterLifecycleAuditEventKind {
+        self.kind
+    }
+
+    pub fn frame(&self) -> Option<&RouteFrameVersion> {
+        self.frame.as_ref()
+    }
+
+    pub fn entity(&self) -> Option<AuditEntityId> {
+        self.entity
+    }
+
+    pub fn visibility_hidden(&self) -> bool {
+        self.visibility_hidden
+    }
+
+    pub fn accepts_pointer(&self) -> bool {
+        self.accepts_pointer
+    }
+
+    pub fn accepts_keyboard(&self) -> bool {
+        self.accepts_keyboard
+    }
+
+    pub fn accepts_gamepad(&self) -> bool {
+        self.accepts_gamepad
+    }
+
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouterAuthorityAuditSnapshot {
     host: Option<AuthorityHostMapping>,
     slots: Vec<AuthoritySlotMapping>,
     frames: Vec<AuthorityFrameMapping>,
     content: Vec<AuthorityContentMapping>,
-    owned: Vec<AuditEntityId>,
+    orphan_slots: Vec<RouteSlotId>,
+    orphan_slot_mappings: Vec<AuthoritySlotMapping>,
+    events: Vec<RouterLifecycleAuditEvent>,
+    owned_states: Vec<(AuditEntityId, AuditEntityState)>,
+    namespace: u32,
+    evicted_owned_through: u32,
 }
 
 impl RouterAuthorityAuditSnapshot {
+    fn empty() -> Self {
+        Self {
+            host: None,
+            slots: Vec::new(),
+            frames: Vec::new(),
+            content: Vec::new(),
+            orphan_slots: Vec::new(),
+            orphan_slot_mappings: Vec::new(),
+            events: Vec::new(),
+            owned_states: Vec::new(),
+            namespace: 0,
+            evicted_owned_through: 0,
+        }
+    }
+
     pub fn host(&self) -> Option<&AuthorityHostMapping> {
         self.host.as_ref()
     }
@@ -190,25 +290,146 @@ impl RouterAuthorityAuditSnapshot {
         &self.content
     }
 
+    pub fn orphan_slots(&self) -> &[RouteSlotId] {
+        &self.orphan_slots
+    }
+
+    pub fn events(&self) -> &[RouterLifecycleAuditEvent] {
+        &self.events
+    }
+
     pub fn owned_entity_state(&self, entity: AuditEntityId) -> AuditEntityState {
-        if self.owned.contains(&entity) {
-            AuditEntityState::PresentOwned
-        } else {
-            AuditEntityState::Unknown
-        }
+        self.owned_states
+            .iter()
+            .find_map(|(stored, state)| (*stored == entity).then_some(*state))
+            .unwrap_or_else(|| {
+                let namespace = (entity.0 >> AUDIT_NAMESPACE_SHIFT) as u32;
+                let sequence = (entity.0 & ID_SEQUENCE_MASK) as u32;
+                if namespace == self.namespace
+                    && entity.0 & OWNED_ID_FLAG != 0
+                    && sequence <= self.evicted_owned_through
+                {
+                    AuditEntityState::NotRetained
+                } else {
+                    AuditEntityState::Unknown
+                }
+            })
+    }
+}
+
+fn observed_owned_state(world: &World, entity: Entity) -> AuditEntityState {
+    if world
+        .get_resource::<QuarantineLeaseTable>()
+        .is_some_and(|table| {
+            table.record(entity).is_some() || table.unresolved_record(entity).is_some()
+        })
+    {
+        return AuditEntityState::Quarantined;
+    }
+    let record = world
+        .get_resource::<RouteEntityRegistry>()
+        .and_then(|registry| registry.record(entity));
+    match record.map(|record| record.lifecycle()) {
+        Some(EntityLifecycle::Quarantined) => AuditEntityState::Quarantined,
+        Some(_) => AuditEntityState::PresentOwned,
+        None if world.get_entity(entity).is_err() => AuditEntityState::Removed,
+        None => AuditEntityState::Unknown,
+    }
+}
+
+#[derive(Clone)]
+struct AuditIdentityRecord {
+    router: RouterHandle,
+    entity: Entity,
+    id: AuditEntityId,
+    frame: Option<RouteFrameVersion>,
+    request: Option<NavigationRequestId>,
+    interactive: bool,
+    frame_root: bool,
+    removed_at: Option<u64>,
+}
+
+struct RouterAuditNamespace {
+    router: RouterHandle,
+    namespace: u32,
+    next_owned: u32,
+    next_observed: u32,
+    next_removed: u64,
+    evicted_owned_through: u32,
+}
+
+struct FrameAuditSample {
+    frame: RouteFrameVersion,
+    root: AuditEntityId,
+    entities: Vec<Entity>,
+    interactive: Vec<Entity>,
+}
+
+#[derive(Clone, Copy)]
+struct EventStateSample {
+    visibility_hidden: bool,
+    accepts_pointer: bool,
+    accepts_keyboard: bool,
+    accepts_gamepad: bool,
+    focused: bool,
+}
+
+fn sample_event_state(
+    world: &World,
+    entities: &[Entity],
+    interactive: &[Entity],
+) -> EventStateSample {
+    let visibility_hidden = !entities.is_empty()
+        && entities
+            .iter()
+            .all(|entity| world.get::<Visibility>(*entity) == Some(&Visibility::Hidden));
+    let gate = world.get_resource::<RouterInputGate>();
+    let accepts_pointer = !interactive.is_empty()
+        && gate.is_some_and(|gate| {
+            interactive
+                .iter()
+                .any(|entity| gate.allows_pointer(*entity))
+        });
+    let accepts_keyboard = !interactive.is_empty()
+        && gate.is_some_and(|gate| {
+            interactive
+                .iter()
+                .any(|entity| gate.allows_keyboard(*entity))
+        });
+    let accepts_gamepad = !interactive.is_empty()
+        && gate.is_some_and(|gate| {
+            interactive
+                .iter()
+                .any(|entity| gate.allows_gamepad(*entity))
+        });
+    let input_focus = world.get_resource::<InputFocus>().and_then(InputFocus::get);
+    let route_focus = world
+        .get_resource::<RouteFocusState>()
+        .and_then(RouteFocusState::focused);
+    let focused = entities
+        .iter()
+        .any(|entity| Some(*entity) == input_focus || Some(*entity) == route_focus);
+    EventStateSample {
+        visibility_hidden,
+        accepts_pointer,
+        accepts_keyboard,
+        accepts_gamepad,
+        focused,
     }
 }
 
 #[derive(Resource)]
 pub struct RouterAuthorityAudits {
-    entity_ids: Vec<(Entity, AuditEntityId)>,
+    identities: Vec<AuditIdentityRecord>,
+    namespaces: Vec<RouterAuditNamespace>,
     snapshots: Vec<(RouterHandle, RouterAuthorityAuditSnapshot)>,
 }
 
 impl RouterAuthorityAudits {
     pub(crate) const fn new() -> Self {
         Self {
-            entity_ids: Vec::new(),
+            identities: Vec::new(),
+            namespaces: Vec::new(),
             snapshots: Vec::new(),
         }
     }
@@ -222,17 +443,50 @@ impl RouterAuthorityAudits {
     pub(crate) fn refresh(&mut self, world: &World, entries: &[RouterEntry]) {
         let mut snapshots = Vec::with_capacity(entries.len());
         for entry in entries {
+            let namespace = self.ensure_namespace(entry.handle);
+            let request = entry.engine.snapshot().running_request();
+            let known_frames = [
+                entry.pending_frame(),
+                entry.active.as_ref(),
+                entry.leaving_frame(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|frame| frame.frame().clone())
+            .collect::<Vec<_>>();
+            let previous = self.snapshots.iter().find_map(|(handle, snapshot)| {
+                (*handle == entry.handle).then_some(snapshot.clone())
+            });
             let Some(host) = entry.host.as_ref() else {
-                snapshots.push((
+                let mut current = RouterAuthorityAuditSnapshot::empty();
+                current.namespace = namespace;
+                current.orphan_slot_mappings = self.collect_orphan_slots(
+                    world,
                     entry.handle,
-                    RouterAuthorityAuditSnapshot {
-                        host: None,
-                        slots: Vec::new(),
-                        frames: Vec::new(),
-                        content: Vec::new(),
-                        owned: Vec::new(),
-                    },
-                ));
+                    request,
+                    &known_frames,
+                    previous.as_ref(),
+                    &current.slots,
+                    None,
+                );
+                current.orphan_slots = current
+                    .orphan_slot_mappings
+                    .iter()
+                    .map(AuthoritySlotMapping::id)
+                    .collect();
+                current
+                    .owned_states
+                    .extend(current.orphan_slot_mappings.iter().map(|slot| {
+                        (
+                            slot.entity,
+                            self.entity_for(slot.entity)
+                                .map(|entity| observed_owned_state(world, entity))
+                                .unwrap_or(AuditEntityState::NotRetained),
+                        )
+                    }));
+                let snapshot =
+                    self.finalize_snapshot(world, entry, previous.as_ref(), current, &[]);
+                snapshots.push((entry.handle, snapshot));
                 continue;
             };
             let host_is_current = validated_host_candidate_is_current(world, &host.candidate)
@@ -262,23 +516,51 @@ impl RouterAuthorityAudits {
                 && world.get::<ProvisionalSlotLifecycle>(host.top_slot)
                     == Some(&ProvisionalSlotLifecycle::PreparedInert);
             if !host_is_current {
-                snapshots.push((
+                let mut current = RouterAuthorityAuditSnapshot::empty();
+                current.namespace = namespace;
+                current.orphan_slot_mappings = self.collect_orphan_slots(
+                    world,
                     entry.handle,
-                    RouterAuthorityAuditSnapshot {
-                        host: None,
-                        slots: Vec::new(),
-                        frames: Vec::new(),
-                        content: Vec::new(),
-                        owned: Vec::new(),
-                    },
-                ));
+                    request,
+                    &known_frames,
+                    previous.as_ref(),
+                    &current.slots,
+                    Some(&host.version),
+                );
+                current.orphan_slots = current
+                    .orphan_slot_mappings
+                    .iter()
+                    .map(AuthoritySlotMapping::id)
+                    .collect();
+                current
+                    .owned_states
+                    .extend(current.orphan_slot_mappings.iter().map(|slot| {
+                        (
+                            slot.entity,
+                            self.entity_for(slot.entity)
+                                .map(|entity| observed_owned_state(world, entity))
+                                .unwrap_or(AuditEntityState::NotRetained),
+                        )
+                    }));
+                let snapshot =
+                    self.finalize_snapshot(world, entry, previous.as_ref(), current, &[]);
+                snapshots.push((entry.handle, snapshot));
                 continue;
             }
-            let host_id = self.id_for(host.host);
-            let top_slot_id = self.id_for(host.top_slot);
-            let mut owned = vec![top_slot_id];
+            let host_id = self.id_for(entry.handle, host.host, false, None, None, false, false);
+            let top_slot_id = self.id_for(
+                entry.handle,
+                host.top_slot,
+                true,
+                None,
+                request,
+                false,
+                false,
+            );
+            let mut owned_states = vec![(top_slot_id, AuditEntityState::PresentOwned)];
             let mut frames = Vec::new();
             let mut content = Vec::new();
+            let mut samples = Vec::new();
             for (frame, lifecycle) in [
                 (
                     entry.pending_frame(),
@@ -299,8 +581,31 @@ impl RouterAuthorityAudits {
                 if !frame_is_current {
                     continue;
                 }
-                let root = self.id_for(frame.shell());
-                owned.push(root);
+                let interactive = frame.interactive_entities();
+                let entities = frame
+                    .claims()
+                    .map(|claim| claim.entity())
+                    .collect::<Vec<_>>();
+                let mut root = None;
+                for entity in &entities {
+                    let is_root = *entity == frame.shell();
+                    let id = self.id_for(
+                        entry.handle,
+                        *entity,
+                        true,
+                        Some(frame.frame()),
+                        request,
+                        interactive.contains(entity),
+                        is_root,
+                    );
+                    if !owned_states.iter().any(|(stored, _)| *stored == id) {
+                        owned_states.push((id, AuditEntityState::PresentOwned));
+                    }
+                    if is_root {
+                        root = Some(id);
+                    }
+                }
+                let root = root.expect("validated frame must include its shell");
                 frames.push(AuthorityFrameMapping {
                     frame: frame.frame().clone(),
                     root,
@@ -308,8 +613,15 @@ impl RouterAuthorityAudits {
                     lifecycle,
                 });
                 for (entity, rect) in frame.audit_content() {
-                    let id = self.id_for(entity);
-                    owned.push(id);
+                    let id = self.id_for(
+                        entry.handle,
+                        entity,
+                        true,
+                        Some(frame.frame()),
+                        request,
+                        true,
+                        false,
+                    );
                     content.push(AuthorityContentMapping {
                         frame: frame.frame().clone(),
                         entity: id,
@@ -323,9 +635,79 @@ impl RouterAuthorityAudits {
                         }),
                     });
                 }
+                samples.push(FrameAuditSample {
+                    frame: frame.frame().clone(),
+                    root,
+                    entities,
+                    interactive,
+                });
             }
-            snapshots.push((
+            let mut slots = vec![AuthoritySlotMapping {
+                id: host.slot_id,
+                entity: top_slot_id,
+                host: host.version.clone(),
+                kind: AuthoritySlotKind::HostTop,
+                parent_frame: None,
+                outlet: None,
+            }];
+            if let Some(registry) = world.get_resource::<RouteEntityRegistry>() {
+                for record in registry.records() {
+                    let RegistryOwner::Committed(EntityOwner::ChildSlot {
+                        parent,
+                        outlet,
+                        slot,
+                    }) = record.owner()
+                    else {
+                        continue;
+                    };
+                    if !frames.iter().any(|frame| frame.frame == *parent)
+                        || slots.iter().any(|item| item.id == *slot)
+                    {
+                        continue;
+                    }
+                    let Some(entity) = self.identities.iter().find_map(|item| {
+                        (item.router == entry.handle && item.entity == record.entity())
+                            .then_some(item.id)
+                    }) else {
+                        continue;
+                    };
+                    slots.push(AuthoritySlotMapping {
+                        id: *slot,
+                        entity,
+                        host: host.version.clone(),
+                        kind: AuthoritySlotKind::ChildOutlet,
+                        parent_frame: Some(parent.clone()),
+                        outlet: Some(outlet.clone()),
+                    });
+                }
+            }
+            let orphan_slot_mappings = self.collect_orphan_slots(
+                world,
                 entry.handle,
+                request,
+                &known_frames,
+                previous.as_ref(),
+                &slots,
+                Some(&host.version),
+            );
+            let orphan_slots = orphan_slot_mappings
+                .iter()
+                .map(AuthoritySlotMapping::id)
+                .collect();
+            for slot in &orphan_slot_mappings {
+                if !owned_states.iter().any(|(id, _)| *id == slot.entity) {
+                    owned_states.push((
+                        slot.entity,
+                        self.entity_for(slot.entity)
+                            .map(|entity| observed_owned_state(world, entity))
+                            .unwrap_or(AuditEntityState::NotRetained),
+                    ));
+                }
+            }
+            let snapshot = self.finalize_snapshot(
+                world,
+                entry,
+                previous.as_ref(),
                 RouterAuthorityAuditSnapshot {
                     host: Some(AuthorityHostMapping {
                         version: host.version.clone(),
@@ -333,34 +715,553 @@ impl RouterAuthorityAudits {
                         top_slot: top_slot_id,
                         app_entity: host.host,
                     }),
-                    slots: vec![AuthoritySlotMapping {
-                        id: host.slot_id,
-                        entity: top_slot_id,
-                        host: host.version.clone(),
-                        kind: AuthoritySlotKind::HostTop,
-                    }],
+                    slots,
                     frames,
                     content,
-                    owned,
+                    orphan_slots,
+                    orphan_slot_mappings,
+                    events: Vec::new(),
+                    owned_states,
+                    namespace,
+                    evicted_owned_through: 0,
                 },
-            ));
+                &samples,
+            );
+            snapshots.push((entry.handle, snapshot));
         }
         self.snapshots = snapshots;
     }
 
-    fn id_for(&mut self, entity: Entity) -> AuditEntityId {
-        if let Some((_, id)) = self.entity_ids.iter().find(|(stored, _)| *stored == entity) {
-            return *id;
+    fn finalize_snapshot(
+        &mut self,
+        world: &World,
+        entry: &RouterEntry,
+        previous: Option<&RouterAuthorityAuditSnapshot>,
+        mut current: RouterAuthorityAuditSnapshot,
+        samples: &[FrameAuditSample],
+    ) -> RouterAuthorityAuditSnapshot {
+        if let Some(previous) = previous {
+            for (id, _) in &previous.owned_states {
+                if current
+                    .owned_states
+                    .iter()
+                    .any(|(current, _)| current == id)
+                {
+                    continue;
+                }
+                let state = self
+                    .entity_for(*id)
+                    .map(|entity| observed_owned_state(world, entity))
+                    .unwrap_or(AuditEntityState::NotRetained);
+                current.owned_states.push((*id, state));
+            }
         }
-        static NEXT_AUDIT_ID: AtomicU64 = AtomicU64::new(1);
-        let raw = NEXT_AUDIT_ID
+
+        let mut events = previous
+            .map(|snapshot| snapshot.events.clone())
+            .unwrap_or_default();
+        self.append_lifecycle_events(world, previous, &current, samples, &mut events);
+        const EVENT_RETENTION: usize = 128;
+        if events.len() > EVENT_RETENTION {
+            events.drain(..events.len() - EVENT_RETENTION);
+        }
+        current.events = events;
+
+        for (id, state) in &current.owned_states {
+            if *state != AuditEntityState::Removed {
+                continue;
+            }
+            let Some(identity_index) = self.identities.iter().position(|item| item.id == *id)
+            else {
+                continue;
+            };
+            if self.identities[identity_index].removed_at.is_none() {
+                let namespace = self
+                    .namespaces
+                    .iter_mut()
+                    .find(|item| item.router == entry.handle)
+                    .expect("router audit namespace exists");
+                namespace.next_removed = namespace
+                    .next_removed
+                    .checked_add(1)
+                    .expect("audit removal sequence exhausted");
+                self.identities[identity_index].removed_at = Some(namespace.next_removed);
+            }
+        }
+
+        let mut unpinned_removed = self
+            .identities
+            .iter()
+            .filter(|item| item.router == entry.handle && item.removed_at.is_some())
+            .filter(|item| {
+                !item
+                    .request
+                    .is_some_and(|request| entry.engine.request(request).is_some())
+            })
+            .map(|item| (item.id, item.removed_at.unwrap()))
+            .collect::<Vec<_>>();
+        unpinned_removed.sort_by_key(|(_, removed_at)| std::cmp::Reverse(*removed_at));
+        let mut evicted = unpinned_removed
+            .into_iter()
+            .skip(REMOVED_RETENTION)
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        evicted.extend(
+            current
+                .owned_states
+                .iter()
+                .filter(|(_, state)| *state == AuditEntityState::Unknown)
+                .filter_map(|(id, _)| {
+                    self.identities
+                        .iter()
+                        .find(|item| item.id == *id)
+                        .filter(|item| {
+                            !item
+                                .request
+                                .is_some_and(|request| entry.engine.request(request).is_some())
+                        })
+                        .map(|_| *id)
+                }),
+        );
+        evicted.sort_by_key(|id| id.0);
+        evicted.dedup();
+        if !evicted.is_empty() {
+            let namespace = self
+                .namespaces
+                .iter_mut()
+                .find(|item| item.router == entry.handle)
+                .expect("router audit namespace exists");
+            for id in &evicted {
+                namespace.evicted_owned_through = namespace
+                    .evicted_owned_through
+                    .max((id.0 & ID_SEQUENCE_MASK) as u32);
+            }
+            current.owned_states.retain(|(id, _)| !evicted.contains(id));
+            self.identities.retain(|item| !evicted.contains(&item.id));
+        }
+        let namespace = self
+            .namespaces
+            .iter()
+            .find(|item| item.router == entry.handle)
+            .expect("router audit namespace exists");
+        current.namespace = namespace.namespace;
+        current.evicted_owned_through = namespace.evicted_owned_through;
+        let current_host = current.host.as_ref().map(AuthorityHostMapping::entity);
+        self.identities.retain(|item| {
+            item.router != entry.handle
+                || item.id.0 & OWNED_ID_FLAG != 0
+                || Some(item.id) == current_host
+        });
+        current
+    }
+
+    fn append_lifecycle_events(
+        &self,
+        world: &World,
+        previous: Option<&RouterAuthorityAuditSnapshot>,
+        current: &RouterAuthorityAuditSnapshot,
+        samples: &[FrameAuditSample],
+        events: &mut Vec<RouterLifecycleAuditEvent>,
+    ) {
+        let previous_slots = previous.map_or(&[][..], |snapshot| snapshot.slots.as_slice());
+        for slot in &current.slots {
+            if !previous_slots.iter().any(|old| old.entity == slot.entity) {
+                events.push(self.event_for_entity(
+                    world,
+                    RouterLifecycleAuditEventKind::RegistryPublished,
+                    None,
+                    slot.entity,
+                ));
+            }
+        }
+
+        let previous_frames = previous.map_or(&[][..], |snapshot| snapshot.frames.as_slice());
+
+        // Isolation must be observable before activation during replacement commit.
+        for frame in &current.frames {
+            if frame.lifecycle == AuthorityFrameLifecycle::LeavingInert
+                && previous_frames.iter().any(|old| {
+                    old.root == frame.root && old.lifecycle == AuthorityFrameLifecycle::Active
+                })
+            {
+                events.push(self.event_for_frame(
+                    world,
+                    RouterLifecycleAuditEventKind::FrameIsolated,
+                    samples.iter().find(|sample| sample.root == frame.root),
+                ));
+            }
+        }
+
+        for frame in &current.frames {
+            let previous_frame = previous_frames.iter().find(|old| old.root == frame.root);
+            if previous_frame.is_none() {
+                events.push(self.event_for_frame(
+                    world,
+                    RouterLifecycleAuditEventKind::RegistryPublished,
+                    samples.iter().find(|sample| sample.root == frame.root),
+                ));
+                if frame.lifecycle == AuthorityFrameLifecycle::PreparedInert {
+                    events.push(self.event_for_frame(
+                        world,
+                        RouterLifecycleAuditEventKind::ShellPrepared,
+                        samples.iter().find(|sample| sample.root == frame.root),
+                    ));
+                }
+            }
+        }
+
+        for frame in &current.frames {
+            let activated = previous_frames
+                .iter()
+                .find(|old| old.root == frame.root)
+                .is_some_and(|old| {
+                    old.lifecycle == AuthorityFrameLifecycle::PreparedInert
+                        && frame.lifecycle == AuthorityFrameLifecycle::Active
+                });
+            if activated {
+                events.push(self.event_for_frame(
+                    world,
+                    RouterLifecycleAuditEventKind::FrameActivated,
+                    samples.iter().find(|sample| sample.root == frame.root),
+                ));
+            }
+        }
+
+        if let Some(previous) = previous {
+            let mut emitted_frames = Vec::new();
+            for (id, state) in &current.owned_states {
+                let old = previous.owned_entity_state(*id);
+                let kind = match (old, state) {
+                    (AuditEntityState::Quarantined, AuditEntityState::Removed) => {
+                        Some(RouterLifecycleAuditEventKind::QuarantineReaped)
+                    }
+                    (old, AuditEntityState::Quarantined)
+                        if old != AuditEntityState::Quarantined =>
+                    {
+                        Some(RouterLifecycleAuditEventKind::QuarantineOpened)
+                    }
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    let identity = self.identities.iter().find(|item| item.id == *id);
+                    if let Some(frame) = identity.and_then(|item| item.frame.as_ref()) {
+                        if emitted_frames.contains(frame) {
+                            continue;
+                        }
+                        emitted_frames.push(frame.clone());
+                        let root = self
+                            .identities
+                            .iter()
+                            .find(|item| item.frame.as_ref() == Some(frame) && item.frame_root);
+                        let entities = self
+                            .identities
+                            .iter()
+                            .filter(|item| item.frame.as_ref() == Some(frame))
+                            .map(|item| item.entity)
+                            .collect::<Vec<_>>();
+                        let interactive = self
+                            .identities
+                            .iter()
+                            .filter(|item| item.frame.as_ref() == Some(frame) && item.interactive)
+                            .map(|item| item.entity)
+                            .collect::<Vec<_>>();
+                        let sample = sample_event_state(world, &entities, &interactive);
+                        events.push(Self::build_event(
+                            kind,
+                            Some(frame.clone()),
+                            root.map(|item| item.id).or(Some(*id)),
+                            sample,
+                        ));
+                    } else {
+                        events.push(self.event_for_entity(world, kind, None, *id));
+                    }
+                }
+            }
+        }
+    }
+
+    fn event_for_frame(
+        &self,
+        world: &World,
+        kind: RouterLifecycleAuditEventKind,
+        sample: Option<&FrameAuditSample>,
+    ) -> RouterLifecycleAuditEvent {
+        let sample = sample.expect("current frame transition must have an exact-owned sample");
+        Self::build_event(
+            kind,
+            Some(sample.frame.clone()),
+            Some(sample.root),
+            sample_event_state(world, &sample.entities, &sample.interactive),
+        )
+    }
+
+    fn event_for_entity(
+        &self,
+        world: &World,
+        kind: RouterLifecycleAuditEventKind,
+        frame: Option<RouteFrameVersion>,
+        entity: AuditEntityId,
+    ) -> RouterLifecycleAuditEvent {
+        let entities = self.entity_for(entity).into_iter().collect::<Vec<_>>();
+        Self::build_event(
+            kind,
+            frame,
+            Some(entity),
+            sample_event_state(world, &entities, &[]),
+        )
+    }
+
+    fn build_event(
+        kind: RouterLifecycleAuditEventKind,
+        frame: Option<RouteFrameVersion>,
+        entity: Option<AuditEntityId>,
+        sample: EventStateSample,
+    ) -> RouterLifecycleAuditEvent {
+        RouterLifecycleAuditEvent {
+            kind,
+            frame,
+            entity,
+            visibility_hidden: sample.visibility_hidden,
+            accepts_pointer: sample.accepts_pointer,
+            accepts_keyboard: sample.accepts_keyboard,
+            accepts_gamepad: sample.accepts_gamepad,
+            focused: sample.focused,
+        }
+    }
+
+    fn entity_for(&self, id: AuditEntityId) -> Option<Entity> {
+        self.identities
+            .iter()
+            .find_map(|item| (item.id == id).then_some(item.entity))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn id_for(
+        &mut self,
+        router: RouterHandle,
+        entity: Entity,
+        owned: bool,
+        frame: Option<&RouteFrameVersion>,
+        request: Option<NavigationRequestId>,
+        interactive: bool,
+        frame_root: bool,
+    ) -> AuditEntityId {
+        if let Some(item) = self
+            .identities
+            .iter_mut()
+            .find(|item| item.router == router && item.entity == entity)
+        {
+            if frame.is_some() {
+                item.frame = frame.cloned();
+            }
+            if request.is_some() {
+                item.request = request;
+            }
+            item.interactive |= interactive;
+            item.frame_root |= frame_root;
+            return item.id;
+        }
+        let namespace = self
+            .namespaces
+            .iter_mut()
+            .find(|item| item.router == router)
+            .expect("router audit namespace exists");
+        let sequence = if owned {
+            namespace.next_owned = namespace
+                .next_owned
+                .checked_add(1)
+                .expect("owned audit id exhausted");
+            namespace.next_owned
+        } else {
+            namespace.next_observed = namespace
+                .next_observed
+                .checked_add(1)
+                .expect("observed audit id exhausted");
+            namespace.next_observed
+        };
+        let raw = ((namespace.namespace as u64) << AUDIT_NAMESPACE_SHIFT)
+            | u64::from(owned) * OWNED_ID_FLAG
+            | u64::from(sequence);
+        let id = AuditEntityId(raw);
+        self.identities.push(AuditIdentityRecord {
+            router,
+            entity,
+            id,
+            frame: frame.cloned(),
+            request,
+            interactive,
+            frame_root,
+            removed_at: None,
+        });
+        id
+    }
+
+    fn ensure_namespace(&mut self, router: RouterHandle) -> u32 {
+        if let Some(item) = self.namespaces.iter().find(|item| item.router == router) {
+            return item.namespace;
+        }
+        static NEXT_AUDIT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
+        let raw = NEXT_AUDIT_NAMESPACE
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
-            .expect("audit id exhausted");
-        let id = AuditEntityId(raw);
-        self.entity_ids.push((entity, id));
-        id
+            .expect("audit namespace exhausted");
+        let namespace = u32::try_from(raw)
+            .ok()
+            .filter(|namespace| *namespace < (1 << 31))
+            .expect("audit namespace exhausted");
+        self.namespaces.push(RouterAuditNamespace {
+            router,
+            namespace,
+            next_owned: 0,
+            next_observed: 0,
+            next_removed: 0,
+            evicted_owned_through: 0,
+        });
+        namespace
+    }
+
+    fn collect_orphan_slots(
+        &mut self,
+        world: &World,
+        router: RouterHandle,
+        request: Option<NavigationRequestId>,
+        known_frames: &[RouteFrameVersion],
+        previous: Option<&RouterAuthorityAuditSnapshot>,
+        current: &[AuthoritySlotMapping],
+        known_host: Option<&HostVersion>,
+    ) -> Vec<AuthoritySlotMapping> {
+        let mut orphans: Vec<AuthoritySlotMapping> = Vec::new();
+        if let Some(previous) = previous {
+            for slot in previous
+                .slots
+                .iter()
+                .chain(previous.orphan_slot_mappings.iter())
+            {
+                if current.iter().any(|item| item.id == slot.id) {
+                    continue;
+                }
+                let still_exact_owned = self.entity_for(slot.entity).is_some_and(|entity| {
+                    matches!(
+                        observed_owned_state(world, entity),
+                        AuditEntityState::PresentOwned | AuditEntityState::Quarantined
+                    )
+                });
+                if still_exact_owned && !orphans.iter().any(|item| item.id == slot.id) {
+                    orphans.push(slot.clone());
+                }
+            }
+        }
+
+        let mut host_versions = previous
+            .into_iter()
+            .flat_map(|snapshot| {
+                snapshot
+                    .slots
+                    .iter()
+                    .chain(snapshot.orphan_slot_mappings.iter())
+                    .map(|slot| slot.host.clone())
+            })
+            .collect::<Vec<_>>();
+        if let Some(host) = known_host
+            && !host_versions.contains(host)
+        {
+            host_versions.push(host.clone());
+        }
+        let mut frame_versions = known_frames.to_vec();
+        if let Some(previous) = previous {
+            frame_versions.extend(previous.frames.iter().map(|frame| frame.frame.clone()));
+            frame_versions.extend(
+                previous
+                    .slots
+                    .iter()
+                    .chain(previous.orphan_slot_mappings.iter())
+                    .filter_map(|slot| slot.parent_frame.clone()),
+            );
+        }
+        frame_versions.sort_by_key(|frame| (frame.frame().raw(), frame.slot().raw()));
+        frame_versions.dedup();
+
+        let mut facts = Vec::new();
+        if let Some(registry) = world.get_resource::<RouteEntityRegistry>() {
+            for record in registry.records() {
+                if let RegistryOwner::Committed(owner) = record.owner() {
+                    facts.push((record.entity(), owner.clone()));
+                }
+            }
+        }
+        if let Some(table) = world.get_resource::<QuarantineLeaseTable>() {
+            for entity in table.inert_owned_entities() {
+                let record = table
+                    .record(entity)
+                    .or_else(|| table.unresolved_record(entity));
+                if let Some(record) = record
+                    && let RegistryOwner::Committed(owner) = record.owner()
+                {
+                    facts.push((entity, owner.clone()));
+                }
+            }
+        }
+        facts.sort_by_key(|(entity, owner)| {
+            let slot_priority = match owner {
+                EntityOwner::ChildSlot { .. } => 0,
+                EntityOwner::HostTopSlot { .. } => 1,
+                _ => 2,
+            };
+            (slot_priority, entity.to_bits())
+        });
+        facts.dedup_by_key(|(entity, _)| *entity);
+
+        for (entity, owner) in facts {
+            let mapping = match owner {
+                EntityOwner::HostTopSlot { host, slot }
+                    if host_versions.contains(&host)
+                        && !current.iter().any(|item| item.id == slot) =>
+                {
+                    let entity = self.id_for(router, entity, true, None, request, false, false);
+                    Some(AuthoritySlotMapping {
+                        id: slot,
+                        entity,
+                        host,
+                        kind: AuthoritySlotKind::HostTop,
+                        parent_frame: None,
+                        outlet: None,
+                    })
+                }
+                EntityOwner::ChildSlot {
+                    parent,
+                    outlet,
+                    slot,
+                } if frame_versions.contains(&parent)
+                    && !current.iter().any(|item| item.id == slot) =>
+                {
+                    let Some(host) = known_host
+                        .cloned()
+                        .or_else(|| host_versions.first().cloned())
+                    else {
+                        continue;
+                    };
+                    let entity =
+                        self.id_for(router, entity, true, Some(&parent), request, false, false);
+                    Some(AuthoritySlotMapping {
+                        id: slot,
+                        entity,
+                        host,
+                        kind: AuthoritySlotKind::ChildOutlet,
+                        parent_frame: Some(parent),
+                        outlet: Some(outlet),
+                    })
+                }
+                _ => None,
+            };
+            if let Some(mapping) = mapping
+                && !orphans.iter().any(|item| item.id == mapping.id)
+            {
+                orphans.push(mapping);
+            }
+        }
+        orphans.sort_by_key(|slot| slot.id.raw());
+        orphans
     }
 }
 
@@ -399,11 +1300,12 @@ mod tests {
         driver::{EcsViewDriver, EcsViewReportSession, ViewBuildReport},
         navigation::{
             RouterNavigation, collect_navigation_system, commit_presentation_system,
-            drive_navigation_system, observe_authority_system,
+            drive_navigation_system, observe_authority_system, settle_cleanup_system,
         },
         plugin::BevyUiRouterPlugin,
     };
     use bevy_app::App;
+    use bevy_ecs::prelude::Component;
     use bevy_ui::Node;
     use bevy_ui_router_core::prelude::{
         RouteLocation, RouteNodeOptions, RoutePattern, RouteTree, RouteViewKey,
@@ -413,6 +1315,9 @@ mod tests {
     };
 
     struct AuditDriver(ViewDriverKey);
+
+    #[derive(Component)]
+    struct AuditCleanupDrift;
 
     impl EcsViewDriver for AuditDriver {
         fn key(&self) -> ViewDriverKey {
@@ -431,6 +1336,35 @@ mod tests {
             content
                 .spawn_solid_rect(SolidRect::new(8, 6, ContentColor::srgba8(1, 2, 3, 255)).unwrap())
                 .unwrap();
+            report.applied()
+        }
+    }
+
+    struct BurstAuditDriver {
+        key: ViewDriverKey,
+        calls: usize,
+    }
+
+    impl EcsViewDriver for BurstAuditDriver {
+        fn key(&self) -> ViewDriverKey {
+            self.key.clone()
+        }
+
+        fn apply(
+            &mut self,
+            _effect: &ViewBuildEffect,
+            content: &mut FrameContentWriter<'_>,
+            report: EcsViewReportSession<'_>,
+        ) -> ViewBuildReport {
+            let count = if self.calls == 0 { 300 } else { 1 };
+            self.calls += 1;
+            for _ in 0..count {
+                content
+                    .spawn_solid_rect(
+                        SolidRect::new(1, 1, ContentColor::srgba8(1, 1, 1, 255)).unwrap(),
+                    )
+                    .unwrap();
+            }
             report.applied()
         }
     }
@@ -471,6 +1405,9 @@ mod tests {
             .unwrap();
         assert!(host_snapshot.host().unwrap().matches_app_entity(host));
         assert_eq!(host_snapshot.slots().len(), 1);
+        assert_eq!(host_snapshot.slots()[0].parent_frame(), None);
+        assert_eq!(host_snapshot.slots()[0].outlet(), None);
+        assert!(host_snapshot.orphan_slots().is_empty());
         assert!(host_snapshot.frames().is_empty());
 
         app.world_mut()
@@ -492,53 +1429,600 @@ mod tests {
         assert_eq!(pending.content().len(), 1);
         assert!(pending.content()[0].visibility_hidden());
         assert!(!pending.content()[0].pickable_active());
+        assert!(pending.events().iter().any(|event| {
+            event.kind() == RouterLifecycleAuditEventKind::ShellPrepared
+                && event.frame() == Some(pending.frames()[0].frame())
+                && event.entity() == Some(pending.frames()[0].root())
+                && event.visibility_hidden()
+                && !event.accepts_pointer()
+                && !event.accepts_keyboard()
+                && !event.accepts_gamepad()
+                && !event.focused()
+        }));
 
         commit_presentation_system(app.world_mut());
-        let active = app
-            .world()
-            .resource::<RouterAuthorityAudits>()
-            .get(router)
-            .unwrap();
-        assert_eq!(
-            active.frames()[0].lifecycle(),
-            AuthorityFrameLifecycle::Active
-        );
-        assert!(!active.content()[0].visibility_hidden());
-        assert!(active.content()[0].pickable_active());
-        assert_eq!(active.frames()[0].slot_entity(), active.slots()[0].entity());
-        assert_eq!(
-            active.owned_entity_state(active.frames()[0].root()),
-            AuditEntityState::PresentOwned
-        );
-        assert_ne!(active.frames()[0].root(), active.content()[0].entity());
+        settle_cleanup_system(app.world_mut());
 
-        let stale_root = active.frames()[0].root();
-        let shell = app.world().resource::<RouterNavigation>().entries[0]
+        let stale_output = {
+            let active = app
+                .world()
+                .resource::<RouterAuthorityAudits>()
+                .get(router)
+                .unwrap();
+            assert_eq!(
+                active.frames()[0].lifecycle(),
+                AuthorityFrameLifecycle::Active
+            );
+            assert!(!active.content()[0].visibility_hidden());
+            assert!(active.content()[0].pickable_active());
+            assert_eq!(active.frames()[0].slot_entity(), active.slots()[0].entity());
+            assert_eq!(
+                active.owned_entity_state(active.frames()[0].root()),
+                AuditEntityState::PresentOwned
+            );
+            assert!(active.events().iter().any(|event| {
+                event.kind() == RouterLifecycleAuditEventKind::FrameActivated
+                    && event.frame() == Some(active.frames()[0].frame())
+                    && event.entity() == Some(active.frames()[0].root())
+                    && !event.visibility_hidden()
+                    && event.accepts_pointer()
+                    && event.accepts_keyboard()
+                    && event.accepts_gamepad()
+            }));
+            assert_ne!(active.frames()[0].root(), active.content()[0].entity());
+            active.content()[0].entity()
+        };
+
+        let (active_entities, active_interactive) = {
+            let frame = app.world().resource::<RouterNavigation>().entries[0]
+                .active
+                .as_ref()
+                .unwrap();
+            (
+                frame
+                    .claims()
+                    .map(|claim| claim.entity())
+                    .collect::<Vec<_>>(),
+                frame.interactive_entities(),
+            )
+        };
+        let focused_output = active_interactive[0];
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(focused_output);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(focused_output));
+        assert!(sample_event_state(app.world(), &active_entities, &active_interactive).focused);
+
+        let output = app.world().resource::<RouterNavigation>().entries[0]
             .active
             .as_ref()
             .unwrap()
-            .shell();
-        let claim = app
+            .interactive_entities()[0];
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/").with_fragment("quarantine"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+        app.world_mut().entity_mut(output).insert(AuditCleanupDrift);
+        settle_cleanup_system(app.world_mut());
+        if app
             .world()
             .resource::<crate::registry::RouteEntityRegistry>()
-            .record(shell)
-            .unwrap()
-            .claim();
-        app.world_mut()
-            .resource_mut::<crate::registry::RouteEntityRegistry>()
-            .compare_exchange_lifecycle(&claim, crate::registry::EntityLifecycle::Quarantined)
-            .unwrap();
-        drive_navigation_system(app.world_mut());
+            .record(output)
+            .is_some()
+        {
+            settle_cleanup_system(app.world_mut());
+        }
 
         let drifted = app
             .world()
             .resource::<RouterAuthorityAudits>()
             .get(router)
             .unwrap();
-        assert!(drifted.frames().is_empty());
-        assert!(drifted.content().is_empty());
+        assert!(app.world().get_entity(output).is_ok());
+        assert!(
+            app.world()
+                .resource::<crate::registry::RouteEntityRegistry>()
+                .record(output)
+                .is_none()
+        );
+        assert!(
+            app.world()
+                .resource::<crate::registry::QuarantineLeaseTable>()
+                .record(output)
+                .is_some()
+        );
         assert_eq!(
-            drifted.owned_entity_state(stale_root),
+            drifted.owned_entity_state(stale_output),
+            AuditEntityState::Quarantined
+        );
+        assert!(drifted.events().iter().any(|event| {
+            event.kind() == RouterLifecycleAuditEventKind::QuarantineOpened
+                && event.frame().is_some()
+        }));
+
+        assert!(app.world_mut().despawn(output));
+        app.world_mut().remove_resource::<QuarantineLeaseTable>();
+        app.world_mut().insert_resource(QuarantineLeaseTable::new());
+        let mut audits = app
+            .world_mut()
+            .remove_resource::<RouterAuthorityAudits>()
+            .unwrap();
+        let navigation = app
+            .world_mut()
+            .remove_resource::<RouterNavigation>()
+            .unwrap();
+        audits.refresh(app.world(), &navigation.entries);
+        app.world_mut().insert_resource(navigation);
+        app.world_mut().insert_resource(audits);
+        let reaped = app
+            .world()
+            .resource::<RouterAuthorityAudits>()
+            .get(router)
+            .unwrap();
+        assert_eq!(
+            reaped.owned_entity_state(stale_output),
+            AuditEntityState::Removed
+        );
+        assert!(reaped.events().iter().any(|event| {
+            event.kind() == RouterLifecycleAuditEventKind::QuarantineReaped
+                && event.frame().is_some()
+        }));
+    }
+
+    #[test]
+    fn event_hidden_fact_requires_explicit_hidden_on_every_owned_entity() {
+        let mut world = World::new();
+        world.insert_resource(InputFocus::default());
+        world.insert_resource(RouteFocusState::default());
+        world.insert_resource(crate::input::RouterInputGate::new());
+        let shell = world.spawn(Visibility::Hidden).id();
+        let missing_visibility = world.spawn_empty().id();
+        let denied = world.spawn(Visibility::Hidden).id();
+        world.resource_scope(|_world, gate: bevy_ecs::prelude::Mut<RouterInputGate>| {
+            crate::input::prepare_input_gate_mutation(gate, &[], vec![missing_visibility])
+                .unwrap()
+                .apply();
+        });
+        *world.resource_mut::<InputFocus>() = InputFocus::from_entity(missing_visibility);
+
+        let sample = sample_event_state(
+            &world,
+            &[shell, missing_visibility, denied],
+            &[missing_visibility, denied],
+        );
+
+        assert!(!sample.visibility_hidden);
+        assert!(sample.accepts_pointer);
+        assert!(sample.accepts_keyboard);
+        assert!(sample.accepts_gamepad);
+        let event = RouterAuthorityAudits::build_event(
+            RouterLifecycleAuditEventKind::FrameActivated,
+            None,
+            Some(AuditEntityId(1)),
+            sample,
+        );
+        assert!(event.focused());
+    }
+
+    #[test]
+    fn authority_loss_keeps_exact_owned_top_slot_observable_as_orphan() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let driver = ViewDriverKey::new("audit-orphan-driver").unwrap();
+        app.register_ui_view_driver(AuditDriver(driver.clone()))
+            .unwrap();
+        let view = RouteViewKey::new("root").unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(view.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut views = RouteViewRegistry::new();
+        views
+            .insert(view.clone(), RouteViewDescriptor::new(driver))
+            .unwrap();
+        let router = app
+            .add_ui_router(RouterConfig::new(routes, views, view))
+            .unwrap();
+        let app_host = app
+            .world_mut()
+            .spawn((Node::default(), RouterHostRegistration::new(router)))
+            .id();
+        observe_authority_system(app.world_mut());
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+
+        let before = app
+            .world()
+            .resource::<RouterAuthorityAudits>()
+            .get(router)
+            .unwrap();
+        let slot = before.slots()[0].id();
+        let slot_entity = before.slots()[0].entity();
+        let app_host_id = before.host().unwrap().entity();
+        let raw_slot = app.world().resource::<RouterNavigation>().entries[0]
+            .host
+            .as_ref()
+            .unwrap()
+            .top_slot;
+        let frame = app.world().resource::<RouterNavigation>().entries[0]
+            .active
+            .as_ref()
+            .unwrap()
+            .frame()
+            .clone();
+        let slot_claim = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(raw_slot)
+            .unwrap()
+            .claim();
+        app.world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .compare_exchange_owner(
+                &slot_claim,
+                RegistryOwner::Committed(EntityOwner::FrameOutput {
+                    frame,
+                    output: u64::MAX,
+                    local_index: usize::MAX,
+                }),
+            )
+            .unwrap();
+        drive_navigation_system(app.world_mut());
+
+        let after = app
+            .world()
+            .resource::<RouterAuthorityAudits>()
+            .get(router)
+            .unwrap();
+        assert!(after.host().is_none());
+        assert!(after.slots().is_empty());
+        assert_eq!(after.orphan_slots(), &[slot]);
+        assert_eq!(
+            after.owned_entity_state(slot_entity),
+            AuditEntityState::PresentOwned
+        );
+        assert_eq!(
+            after.owned_entity_state(app_host_id),
+            AuditEntityState::Unknown
+        );
+        assert!(app.world().get_entity(app_host).is_ok());
+
+        drive_navigation_system(app.world_mut());
+        let repeated = app
+            .world()
+            .resource::<RouterAuthorityAudits>()
+            .get(router)
+            .unwrap();
+        assert_eq!(repeated.orphan_slots(), &[slot]);
+        assert_eq!(
+            repeated.owned_entity_state(slot_entity),
+            AuditEntityState::PresentOwned
+        );
+    }
+
+    #[test]
+    fn child_slot_parent_drift_is_observable_as_a_persistent_orphan() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let driver = ViewDriverKey::new("audit-child-slot-driver").unwrap();
+        app.register_ui_view_driver(AuditDriver(driver.clone()))
+            .unwrap();
+        let view = RouteViewKey::new("root").unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(view.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut views = RouteViewRegistry::new();
+        views
+            .insert(view.clone(), RouteViewDescriptor::new(driver))
+            .unwrap();
+        let router = app
+            .add_ui_router(RouterConfig::new(routes, views, view))
+            .unwrap();
+        let app_host = app
+            .world_mut()
+            .spawn((Node::default(), RouterHostRegistration::new(router)))
+            .id();
+        observe_authority_system(app.world_mut());
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+
+        let (host, slot, frame, child) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let host = entry.host.as_ref().unwrap();
+            let frame = entry.active.as_ref().unwrap();
+            (
+                host.version.clone(),
+                host.slot_id,
+                frame.frame().clone(),
+                frame.interactive_entities()[0],
+            )
+        };
+        let child_claim = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(child)
+            .unwrap()
+            .claim();
+        app.world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .compare_exchange_owner(
+                &child_claim,
+                RegistryOwner::Committed(EntityOwner::ChildSlot {
+                    parent: frame.clone(),
+                    outlet: RouteSlotKey::named("drifted-child").unwrap(),
+                    slot,
+                }),
+            )
+            .unwrap();
+        app.world_mut().entity_mut(child).insert(ChildOf(app_host));
+
+        let mut fresh = RouterAuthorityAudits::new();
+        fresh.ensure_namespace(router);
+        let orphans = fresh.collect_orphan_slots(
+            app.world(),
+            router,
+            None,
+            std::slice::from_ref(&frame),
+            None,
+            &[],
+            Some(&host),
+        );
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].id(), slot);
+        assert_eq!(orphans[0].kind(), AuthoritySlotKind::ChildOutlet);
+        assert_eq!(orphans[0].parent_frame(), Some(&frame));
+        assert!(orphans[0].outlet().is_some());
+        assert_eq!(
+            observed_owned_state(app.world(), child),
+            AuditEntityState::PresentOwned
+        );
+        assert_eq!(fresh.entity_for(orphans[0].entity()), Some(child));
+        assert!(app.world().get_entity(app_host).is_ok());
+    }
+
+    #[test]
+    fn audit_retains_removed_state_after_real_root_cleanup() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let driver = ViewDriverKey::new("audit-cleanup-driver").unwrap();
+        app.register_ui_view_driver(AuditDriver(driver.clone()))
+            .unwrap();
+        let view = RouteViewKey::new("root").unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(view.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut views = RouteViewRegistry::new();
+        views
+            .insert(view.clone(), RouteViewDescriptor::new(driver))
+            .unwrap();
+        let router = app
+            .add_ui_router(RouterConfig::new(routes, views, view))
+            .unwrap();
+        app.world_mut()
+            .spawn((Node::default(), RouterHostRegistration::new(router)));
+        observe_authority_system(app.world_mut());
+
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+        let removed_root = app
+            .world()
+            .resource::<RouterAuthorityAudits>()
+            .get(router)
+            .unwrap()
+            .frames()[0]
+            .root();
+        let removed_entity = app.world().resource::<RouterNavigation>().entries[0]
+            .active
+            .as_ref()
+            .unwrap()
+            .shell();
+
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/").with_fragment("replacement"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+
+        assert!(app.world().get_entity(removed_entity).is_err());
+        assert!(
+            app.world()
+                .resource::<crate::registry::RouteEntityRegistry>()
+                .record(removed_entity)
+                .is_none()
+        );
+        let settled = app
+            .world()
+            .resource::<RouterAuthorityAudits>()
+            .get(router)
+            .unwrap();
+        assert_eq!(
+            settled.owned_entity_state(removed_root),
+            AuditEntityState::Removed
+        );
+        assert!(settled.orphan_slots().is_empty());
+        let kinds = settled
+            .events()
+            .iter()
+            .map(RouterLifecycleAuditEvent::kind)
+            .collect::<Vec<_>>();
+        let isolated = kinds
+            .iter()
+            .position(|kind| *kind == RouterLifecycleAuditEventKind::FrameIsolated)
+            .unwrap();
+        let activated = kinds
+            .iter()
+            .rposition(|kind| *kind == RouterLifecycleAuditEventKind::FrameActivated)
+            .unwrap();
+        assert!(isolated < activated);
+    }
+
+    #[test]
+    fn audit_bounds_unpinned_removed_tombstones_and_reports_eviction() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let driver = ViewDriverKey::new("audit-retention-driver").unwrap();
+        app.register_ui_view_driver(BurstAuditDriver {
+            key: driver.clone(),
+            calls: 0,
+        })
+        .unwrap();
+        let view = RouteViewKey::new("root").unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(view.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut views = RouteViewRegistry::new();
+        views
+            .insert(view.clone(), RouteViewDescriptor::new(driver))
+            .unwrap();
+        let router = app
+            .add_ui_router(RouterConfig::new(routes, views, view))
+            .unwrap();
+        app.world_mut()
+            .spawn((Node::default(), RouterHostRegistration::new(router)));
+        observe_authority_system(app.world_mut());
+
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+        let first_contents = app
+            .world()
+            .resource::<RouterAuthorityAudits>()
+            .get(router)
+            .unwrap()
+            .content()
+            .iter()
+            .map(AuthorityContentMapping::entity)
+            .collect::<Vec<_>>();
+        let first_content = first_contents[0];
+
+        for replacement in 0..70 {
+            app.world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(
+                    router,
+                    RouteLocation::new("/").with_fragment(format!("replacement-{replacement}")),
+                )
+                .unwrap();
+            collect_navigation_system(app.world_mut());
+            drive_navigation_system(app.world_mut());
+            commit_presentation_system(app.world_mut());
+            settle_cleanup_system(app.world_mut());
+            if replacement == 0 {
+                let pinned = app
+                    .world()
+                    .resource::<RouterAuthorityAudits>()
+                    .get(router)
+                    .unwrap();
+                assert_eq!(
+                    pinned.owned_entity_state(first_content),
+                    AuditEntityState::Removed
+                );
+                assert!(
+                    pinned
+                        .owned_states
+                        .iter()
+                        .filter(|(_, state)| *state == AuditEntityState::Removed)
+                        .count()
+                        > REMOVED_RETENTION
+                );
+            }
+        }
+
+        let audit = app.world().resource::<RouterAuthorityAudits>();
+        let snapshot = audit.get(router).unwrap();
+        assert_eq!(
+            snapshot.owned_entity_state(first_content),
+            AuditEntityState::NotRetained
+        );
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let unpinned_removed = snapshot
+            .owned_states
+            .iter()
+            .filter(|(_, state)| *state == AuditEntityState::Removed)
+            .filter(|(id, _)| {
+                audit
+                    .identities
+                    .iter()
+                    .find(|item| item.id == *id)
+                    .and_then(|item| item.request)
+                    .is_none_or(|request| entry.engine.request(request).is_none())
+            })
+            .count();
+        assert_eq!(unpinned_removed, REMOVED_RETENTION);
+        let first_retained = first_contents
+            .iter()
+            .position(|id| snapshot.owned_entity_state(*id) == AuditEntityState::Removed)
+            .expect("the newest burst tombstones must reach the 256-entry boundary");
+        assert!(first_retained > 0);
+        assert!(
+            first_contents[..first_retained]
+                .iter()
+                .all(|id| snapshot.owned_entity_state(*id) == AuditEntityState::NotRetained)
+        );
+        assert!(
+            first_contents[first_retained..]
+                .iter()
+                .all(|id| snapshot.owned_entity_state(*id) == AuditEntityState::Removed)
+        );
+        let request_pinned = audit
+            .identities
+            .iter()
+            .filter(|item| {
+                item.request
+                    .is_some_and(|request| entry.engine.request(request).is_some())
+            })
+            .count();
+        assert!(audit.identities.len() <= REMOVED_RETENTION + request_pinned + 1);
+        assert_eq!(
+            snapshot.owned_entity_state(snapshot.host().unwrap().entity()),
             AuditEntityState::Unknown
         );
     }
@@ -552,7 +2036,24 @@ mod tests {
         assert_eq!(first_entity.to_bits(), second_entity.to_bits());
         let mut first = RouterAuthorityAudits::new();
         let mut second = RouterAuthorityAudits::new();
+        let router = RouterHandle::fixture(1, 1);
+        let first_namespace = first.ensure_namespace(router);
+        second.ensure_namespace(router);
 
-        assert_ne!(first.id_for(first_entity), second.id_for(second_entity));
+        let first_id = first.id_for(router, first_entity, true, None, None, false, false);
+        let second_id = second.id_for(router, second_entity, true, None, None, false, false);
+        assert_ne!(first_id, second_id);
+
+        let mut snapshot = RouterAuthorityAuditSnapshot::empty();
+        snapshot.namespace = first_namespace;
+        snapshot.evicted_owned_through = (first_id.0 & ID_SEQUENCE_MASK) as u32;
+        assert_eq!(
+            snapshot.owned_entity_state(first_id),
+            AuditEntityState::NotRetained
+        );
+        assert_eq!(
+            snapshot.owned_entity_state(second_id),
+            AuditEntityState::Unknown
+        );
     }
 }

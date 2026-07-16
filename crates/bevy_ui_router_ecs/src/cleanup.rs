@@ -1207,7 +1207,7 @@ pub(crate) fn cleanup_batch_matches(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         host::HostCandidateRevision,
@@ -1443,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_and_replayed_receipts_are_ledger_zero() {
+    pub(crate) fn foreign_and_replayed_receipts_are_ledger_zero() {
         let mut world = World::new();
         world.insert_resource(RouteEntityRegistry::new());
         world.insert_resource(QuarantineLeaseTable::new());
@@ -1465,8 +1465,26 @@ mod tests {
 
         assert!(ledger.settle(&mut world, attempt.clone()));
         let replay = ledger.receipts[0].clone().unwrap();
+        let receipts_before = ledger.receipts.clone();
+        let registry_before = world.resource::<RouteEntityRegistry>().records().to_vec();
+        let world_before = world
+            .iter_entities()
+            .map(|entity| (entity.id(), entity.archetype().components().to_vec()))
+            .collect::<Vec<_>>();
         assert!(!ledger.accept_receipt(&attempt, replay));
+        assert_eq!(ledger.receipts, receipts_before);
         assert_eq!(ledger.receipt_count(), 1);
+        assert_eq!(
+            world.resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(
+            world
+                .iter_entities()
+                .map(|entity| (entity.id(), entity.archetype().components().to_vec()))
+                .collect::<Vec<_>>(),
+            world_before
+        );
     }
 
     #[test]

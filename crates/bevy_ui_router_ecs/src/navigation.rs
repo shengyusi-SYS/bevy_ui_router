@@ -743,13 +743,14 @@ fn refresh_authority_audits(world: &mut World) {
 fn refresh_authority_audits(_world: &mut World) {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         app_ext::{AppRouterExt, RouterConfig, RouterHostRegistration},
-        components::{RouteOwnershipSeal, RouterInputBarrier},
+        components::{ProvisionalPostWriteProbe, RouteOwnershipSeal, RouterInputBarrier},
         content::{ContentColor, SolidRect},
         driver::{EcsViewDriver, ViewBuildReport},
+        host::HostCandidateRevision,
         input::{RouteFocusState, RouterInputGate},
         plugin::BevyUiRouterPlugin,
         presentation::FrameOutput,
@@ -850,6 +851,12 @@ mod tests {
         target: Option<Entity>,
     }
 
+    #[derive(Resource)]
+    struct HostGrantObserverDrift {
+        enabled: bool,
+        observed_slots: Vec<Entity>,
+    }
+
     #[derive(Component)]
     struct CleanupDriftMarker;
 
@@ -902,6 +909,49 @@ mod tests {
         app.world_mut()
             .spawn((Node::default(), RouterHostRegistration::new(router)));
         router
+    }
+
+    fn install_host_grant_observer_drift(app: &mut App) {
+        app.world_mut().insert_resource(HostGrantObserverDrift {
+            enabled: true,
+            observed_slots: Vec::new(),
+        });
+        app.world_mut()
+            .register_component_hooks::<ProvisionalPostWriteProbe>()
+            .on_add(|mut world, HookContext { entity, .. }| {
+                let enabled = {
+                    let mut drift = world.resource_mut::<HostGrantObserverDrift>();
+                    drift.observed_slots.push(entity);
+                    drift.enabled
+                };
+                if enabled {
+                    world
+                        .commands()
+                        .entity(entity)
+                        .remove::<RouterInputBarrier>();
+                }
+            });
+    }
+
+    fn registered_host(app: &mut App, router: RouterHandle) -> Entity {
+        app.world_mut()
+            .query::<(Entity, &RouterHostRegistration)>()
+            .iter(app.world())
+            .find_map(|(entity, registration)| (registration.router() == router).then_some(entity))
+            .expect("router fixture must have one registered host")
+    }
+
+    fn current_candidate_revision(app: &mut App, router: RouterHandle) -> HostCandidateRevision {
+        app.world_mut().resource_scope(
+            |world, mut revisions: bevy_ecs::change_detection::Mut<HostCandidateRevisionState>| {
+                let HostCandidateClassification::Unique(candidate) =
+                    classify_host_candidate(world, router, &mut revisions)
+                else {
+                    panic!("router fixture must classify one valid host")
+                };
+                candidate.revision()
+            },
+        )
     }
 
     #[test]
@@ -1116,32 +1166,10 @@ mod tests {
     }
 
     #[test]
-    fn commit_switches_registry_pickable_gate_and_core_history_in_one_system() {
+    pub(crate) fn commit_switches_registry_pickable_gate_and_core_history_in_one_system() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
-        let driver = ViewDriverKey::new("atomic-driver").unwrap();
-        app.register_ui_view_driver(AtomicDriver {
-            key: driver.clone(),
-        })
-        .unwrap();
-        let view = RouteViewKey::new("root").unwrap();
-        let routes = RouteTree::builder()
-            .root_with_options(
-                RoutePattern::path("/").unwrap(),
-                RouteNodeOptions::new().with_view(view.clone()),
-            )
-            .unwrap()
-            .build()
-            .unwrap();
-        let mut views = RouteViewRegistry::new();
-        views
-            .insert(view.clone(), RouteViewDescriptor::new(driver))
-            .unwrap();
-        let router = app
-            .add_ui_router(RouterConfig::new(routes, views, view))
-            .unwrap();
-        app.world_mut()
-            .spawn((Node::default(), RouterHostRegistration::new(router)));
+        let router = install_atomic_router(&mut app, "atomic-replacement");
         observe_authority_system(app.world_mut());
         app.world_mut()
             .resource_mut::<RouterNavigation>()
@@ -1149,62 +1177,142 @@ mod tests {
             .unwrap();
         collect_navigation_system(app.world_mut());
         drive_navigation_system(app.world_mut());
-
-        let outputs = app
-            .world()
-            .resource::<RouteEntityRegistry>()
-            .records()
-            .iter()
-            .filter_map(|record| {
-                matches!(
-                    record.owner(),
-                    RegistryOwner::Committed(EntityOwner::FrameOutput { .. })
-                )
-                .then_some(record.entity())
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(outputs.len(), 1);
-        let output = outputs[0];
-        assert_eq!(app.world().get::<Pickable>(output), Some(&Pickable::IGNORE));
-        assert!(
-            !app.world()
-                .resource::<RouterInputGate>()
-                .allows_pointer(output)
-        );
-        assert_eq!(
-            app.world().resource::<RouterNavigation>().entries[0]
-                .engine
-                .history()
-                .len(),
-            0
-        );
-
         commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
 
-        let record = app
-            .world()
-            .resource::<RouteEntityRegistry>()
-            .record(output)
+        let (old_claims, old_interactive) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let active = navigation.entries[0].active.as_ref().unwrap();
+            (
+                active.claims().cloned().collect::<Vec<_>>(),
+                active.interactive_entities(),
+            )
+        };
+        let old_entities = old_claims
+            .iter()
+            .map(|claim| claim.entity())
+            .collect::<Vec<_>>();
+        let old_focus = old_interactive[0];
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(old_focus);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(old_focus));
+
+        let replacement = RouteLocation::new("/").with_fragment("replacement");
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, replacement.clone())
             .unwrap();
-        assert_eq!(record.lifecycle(), EntityLifecycle::Active);
-        assert_eq!(
-            app.world().get::<Pickable>(output),
-            Some(&Pickable {
-                should_block_lower: true,
-                is_hoverable: true,
-            })
-        );
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+
+        let (new_claims, new_interactive) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let pending = navigation.entries[0]
+                .pending_commit
+                .as_ref()
+                .and_then(|pending| pending.realized.as_ref())
+                .unwrap();
+            (
+                pending.claims().cloned().collect::<Vec<_>>(),
+                pending.interactive_entities(),
+            )
+        };
+        let new_entities = new_claims
+            .iter()
+            .map(|claim| claim.entity())
+            .collect::<Vec<_>>();
         assert!(
-            app.world()
-                .resource::<RouterInputGate>()
-                .allows_pointer(output)
+            old_entities
+                .iter()
+                .all(|entity| !new_entities.contains(entity))
         );
+        assert!(old_claims.iter().all(|claim| {
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(claim.entity())
+                .is_some_and(|record| record.lifecycle() == EntityLifecycle::Active)
+        }));
+        assert!(new_claims.iter().all(|claim| {
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(claim.entity())
+                .is_some_and(|record| record.lifecycle() == EntityLifecycle::PreparedInert)
+        }));
         assert_eq!(
             app.world().resource::<RouterNavigation>().entries[0]
                 .engine
                 .history()
                 .len(),
             1
+        );
+
+        commit_presentation_system(app.world_mut());
+
+        let registry = app.world().resource::<RouteEntityRegistry>();
+        assert!(old_claims.iter().all(|claim| {
+            registry
+                .record(claim.entity())
+                .is_some_and(|record| record.lifecycle() == EntityLifecycle::Leaving)
+                && app.world().get::<Visibility>(claim.entity()) == Some(&Visibility::Hidden)
+                && app.world().get::<Pickable>(claim.entity()) == Some(&Pickable::IGNORE)
+                && app
+                    .world()
+                    .get::<RouterInputBarrier>(claim.entity())
+                    .is_some_and(RouterInputBarrier::denies_all)
+        }));
+        assert!(new_claims.iter().all(|claim| {
+            let interactive = new_interactive.contains(&claim.entity());
+            registry
+                .record(claim.entity())
+                .is_some_and(|record| record.lifecycle() == EntityLifecycle::Active)
+                && app.world().get::<Visibility>(claim.entity()) == Some(&Visibility::Visible)
+                && app.world().get::<Pickable>(claim.entity())
+                    == Some(if interactive {
+                        &Pickable {
+                            should_block_lower: true,
+                            is_hoverable: true,
+                        }
+                    } else {
+                        &Pickable::IGNORE
+                    })
+                && app
+                    .world()
+                    .get::<RouterInputBarrier>(claim.entity())
+                    .is_some_and(|barrier| {
+                        if interactive {
+                            barrier.allows_all()
+                        } else {
+                            barrier.denies_all()
+                        }
+                    })
+        }));
+        let gate = app.world().resource::<RouterInputGate>();
+        assert!(old_interactive.iter().all(|entity| {
+            !gate.allows_pointer(*entity)
+                && !gate.allows_keyboard(*entity)
+                && !gate.allows_gamepad(*entity)
+        }));
+        assert!(new_interactive.iter().all(|entity| {
+            gate.allows_pointer(*entity)
+                && gate.allows_keyboard(*entity)
+                && gate.allows_gamepad(*entity)
+        }));
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        let navigation = app.world().resource::<RouterNavigation>();
+        assert_eq!(navigation.entries[0].engine.history().len(), 2);
+        assert_eq!(
+            navigation.entries[0].engine.history().current(),
+            Some(&replacement)
+        );
+        assert_eq!(
+            navigation.entries[0]
+                .active
+                .as_ref()
+                .unwrap()
+                .interactive_entities(),
+            new_interactive
         );
     }
 
@@ -1749,7 +1857,7 @@ mod tests {
     }
 
     #[test]
-    fn locked_bevy_plugins_produce_visible_layout_and_native_picking() {
+    pub(crate) fn locked_bevy_plugins_produce_visible_layout_and_native_picking() {
         let mut app = App::new();
         app.add_plugins(DefaultPlugins);
         app.add_plugins(BevyUiRouterPlugin::default());
@@ -2094,6 +2202,250 @@ mod tests {
                 .iter(app.world())
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    pub(crate) fn host_grant_observer_drift_is_rejected_by_the_real_authority_system() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        install_host_grant_observer_drift(&mut app);
+        let router = install_atomic_router(&mut app, "host-grant-observer");
+        let host = registered_host(&mut app, router);
+        let children_before = app
+            .world()
+            .get::<bevy_ecs::hierarchy::Children>(host)
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        observe_authority_system(app.world_mut());
+
+        let first_trace = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .snapshot()
+            .host()
+            .trace()
+            .to_vec();
+        assert_eq!(
+            first_trace
+                .iter()
+                .map(bevy_ui_router_core::HostTraceEvent::kind)
+                .collect::<Vec<_>>(),
+            vec![
+                bevy_ui_router_core::HostTraceEventKind::AdmissionRequested,
+                bevy_ui_router_core::HostTraceEventKind::HostGranted,
+                bevy_ui_router_core::HostTraceEventKind::AdmissionRejectedAfterMutation,
+            ]
+        );
+        let rejected = first_trace
+            .iter()
+            .find(|event| {
+                event.kind()
+                    == bevy_ui_router_core::HostTraceEventKind::AdmissionRejectedAfterMutation
+            })
+            .unwrap()
+            .clone();
+        assert!(rejected.version().is_some());
+        assert!(rejected.slot().is_some());
+        assert_eq!(
+            app.world()
+                .resource::<HostGrantObserverDrift>()
+                .observed_slots
+                .len(),
+            1
+        );
+        let rejected_slot_entity = app
+            .world()
+            .resource::<HostGrantObserverDrift>()
+            .observed_slots[0];
+        assert!(app.world().get_entity(rejected_slot_entity).is_err());
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .host
+                .is_none()
+        );
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .records()
+                .is_empty()
+        );
+        assert_eq!(
+            app.world()
+                .get::<bevy_ecs::hierarchy::Children>(host)
+                .map(|children| children.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            children_before
+        );
+        let rejected_revision = current_candidate_revision(&mut app, router);
+        assert!(
+            !app.world()
+                .resource::<HostCandidateRevisionLatch>()
+                .allows(rejected_revision)
+        );
+
+        observe_authority_system(app.world_mut());
+        assert_eq!(
+            app.world()
+                .resource::<HostGrantObserverDrift>()
+                .observed_slots
+                .len(),
+            1,
+            "the rejected revision must not allocate or write a second provisional slot"
+        );
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .snapshot()
+                .host()
+                .trace(),
+            first_trace
+        );
+
+        app.world_mut()
+            .resource_mut::<HostGrantObserverDrift>()
+            .enabled = false;
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .unwrap();
+        app.world_mut().entity_mut(host).insert(registration);
+        let fresh_revision = current_candidate_revision(&mut app, router);
+        assert_ne!(fresh_revision, rejected_revision);
+        observe_authority_system(app.world_mut());
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        let host_snapshot = entry.engine.snapshot().host().clone();
+        assert!(entry.host.is_some());
+        assert_eq!(
+            host_snapshot
+                .trace()
+                .iter()
+                .filter(|event| {
+                    event.kind() == bevy_ui_router_core::HostTraceEventKind::HostReady
+                })
+                .count(),
+            1
+        );
+        assert_ne!(host_snapshot.version(), rejected.version());
+        assert_ne!(host_snapshot.top_slot(), rejected.slot());
+        assert!(host_snapshot.trace().iter().all(|event| {
+            event.kind() != bevy_ui_router_core::HostTraceEventKind::HostReady
+                || event.version() != rejected.version()
+                || event.slot() != rejected.slot()
+        }));
+    }
+
+    #[test]
+    pub(crate) fn persistent_host_observer_latches_each_revision_to_one_attempt() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        install_host_grant_observer_drift(&mut app);
+        let router = install_atomic_router(&mut app, "persistent-host-observer");
+        let host = registered_host(&mut app, router);
+        let children_before = app
+            .world()
+            .get::<bevy_ecs::hierarchy::Children>(host)
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        observe_authority_system(app.world_mut());
+        let first_revision = current_candidate_revision(&mut app, router);
+        let live_entities_after_first = app.world().iter_entities().count();
+        for _ in 0..3 {
+            observe_authority_system(app.world_mut());
+        }
+        assert_eq!(
+            app.world()
+                .resource::<HostGrantObserverDrift>()
+                .observed_slots
+                .len(),
+            1
+        );
+        assert_eq!(
+            app.world().iter_entities().count(),
+            live_entities_after_first
+        );
+        assert!(
+            !app.world()
+                .resource::<HostCandidateRevisionLatch>()
+                .allows(first_revision)
+        );
+
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .unwrap();
+        app.world_mut().entity_mut(host).insert(registration);
+        let second_revision = current_candidate_revision(&mut app, router);
+        assert_ne!(second_revision, first_revision);
+        observe_authority_system(app.world_mut());
+        let live_entities_after_second = app.world().iter_entities().count();
+        for _ in 0..3 {
+            observe_authority_system(app.world_mut());
+        }
+
+        let observed_slots = &app
+            .world()
+            .resource::<HostGrantObserverDrift>()
+            .observed_slots;
+        assert_eq!(observed_slots.len(), 2);
+        assert_ne!(observed_slots[0], observed_slots[1]);
+        assert_eq!(
+            app.world().iter_entities().count(),
+            live_entities_after_second
+        );
+        assert!(
+            !app.world()
+                .resource::<HostCandidateRevisionLatch>()
+                .allows(second_revision)
+        );
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .host
+                .is_none()
+        );
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .records()
+                .is_empty()
+        );
+        assert_eq!(
+            app.world()
+                .get::<bevy_ecs::hierarchy::Children>(host)
+                .map(|children| children.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            children_before
+        );
+
+        let trace = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .snapshot()
+            .host()
+            .trace()
+            .to_vec();
+        let rejected = trace
+            .iter()
+            .filter(|event| {
+                event.kind()
+                    == bevy_ui_router_core::HostTraceEventKind::AdmissionRejectedAfterMutation
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rejected.len(), 2);
+        assert_ne!(rejected[0].version(), rejected[1].version());
+        assert_ne!(rejected[0].slot(), rejected[1].slot());
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|event| {
+                    event.kind() == bevy_ui_router_core::HostTraceEventKind::HostReady
+                })
+                .count(),
+            0
         );
     }
 

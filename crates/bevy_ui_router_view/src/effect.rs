@@ -38,7 +38,7 @@ impl ViewBuildEffect {
         &self.view
     }
 
-    pub const fn request_id(&self) -> ViewRequestId {
+    pub fn request_id(&self) -> ViewRequestId {
         self.request_id
     }
 

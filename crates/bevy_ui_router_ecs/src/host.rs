@@ -924,7 +924,7 @@ fn is_descendant_or_self(world: &World, root: Entity, mut current: Entity) -> bo
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::app_ext::{RouterHandle, RouterHostRegistration};
     use crate::{
@@ -998,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_node_host_and_cycles_and_revisions_are_monotonic() {
+    pub(crate) fn rejects_non_node_host_and_cycles_and_revisions_are_monotonic() {
         let mut world = World::new();
         let host = world.spawn((RouterHostRegistration::new(router()),)).id();
         let mut revisions = HostCandidateRevisionState::default();
@@ -1017,9 +1017,30 @@ mod tests {
         };
         assert!(valid.revision().raw() > first.revision().raw());
 
-        let parent = world.spawn((Node::default(),)).id();
-        world.entity_mut(host).insert(ChildOf(parent));
-        world.entity_mut(parent).insert(ChildOf(host));
+        let grandparent = world.spawn((Node::default(),)).id();
+        let intermediate = world.spawn((ChildOf(grandparent),)).id();
+        world.entity_mut(host).insert(ChildOf(intermediate));
+        let HostCandidateClassification::InvalidTopology(missing_intermediate_node) =
+            classify_host_candidate(&world, router(), &mut revisions)
+        else {
+            panic!("expected invalid intermediate ancestry")
+        };
+        assert_eq!(
+            missing_intermediate_node.reason(),
+            InvalidHostTopologyReason::MissingNode
+        );
+        assert!(missing_intermediate_node.revision().raw() > valid.revision().raw());
+
+        world.entity_mut(intermediate).insert(Node::default());
+        let HostCandidateClassification::Unique(deep_valid) =
+            classify_host_candidate(&world, router(), &mut revisions)
+        else {
+            panic!("expected valid all-Node ancestry")
+        };
+        assert_eq!(deep_valid.ancestry(), &[host, intermediate, grandparent]);
+        assert!(deep_valid.revision().raw() > missing_intermediate_node.revision().raw());
+
+        world.entity_mut(grandparent).insert(ChildOf(host));
         let HostCandidateClassification::InvalidTopology(cyclic) =
             classify_host_candidate(&world, router(), &mut revisions)
         else {
@@ -1029,7 +1050,7 @@ mod tests {
             cyclic.reason(),
             InvalidHostTopologyReason::RelationshipCycle
         );
-        assert!(cyclic.revision().raw() > valid.revision().raw());
+        assert!(cyclic.revision().raw() > deep_valid.revision().raw());
     }
 
     #[test]
@@ -1131,7 +1152,8 @@ mod tests {
     }
 
     #[test]
-    fn staging_registers_and_blocks_input_before_probe_then_attaches_only_the_exact_host_edge() {
+    pub(crate) fn staging_registers_and_blocks_input_before_probe_then_attaches_only_the_exact_host_edge()
+     {
         let mut world = World::new();
         world.insert_resource(RouteEntityRegistry::new());
         world.insert_resource(QuarantineLeaseTable::new());
@@ -1170,12 +1192,15 @@ mod tests {
             .iter()
             .copied()
             .collect::<Vec<_>>();
+        let host_manifest = ComponentManifest::from_world(&world, host).unwrap();
+        let host_node = world.get::<Node>(host).unwrap().clone();
+        let host_router = world.get::<RouterHostRegistration>(host).unwrap().router();
         let mut revisions = HostCandidateRevisionState::default();
         let candidate = unique_candidate(&world, &mut revisions);
 
         let staged = stage_provisional_top_slot(
             &mut world,
-            SealedProvisionalTopSlotSpec::new(candidate, StagingTestDrift::FocusSlot),
+            SealedProvisionalTopSlotSpec::new(candidate.clone(), StagingTestDrift::FocusSlot),
         )
         .unwrap();
 
@@ -1220,6 +1245,34 @@ mod tests {
             .record(staged.entity())
             .unwrap();
         assert!(record.manifest().matches(&world, staged.entity()));
+
+        let slot = staged.entity();
+        assert!(settle_rejected_granted_top_slot(
+            &mut world, &candidate, staged
+        ));
+        assert!(world.get_entity(slot).is_err());
+        assert!(
+            world
+                .resource::<RouteEntityRegistry>()
+                .record(slot)
+                .is_none()
+        );
+        assert!(world.resource::<QuarantineLeaseTable>().leases().is_empty());
+        assert_eq!(children_of(&world, host), before);
+        assert!(world.get_entity(existing_a).is_ok());
+        assert!(world.get_entity(existing_b).is_ok());
+        assert_eq!(
+            ComponentManifest::from_world(&world, host),
+            Some(host_manifest)
+        );
+        assert_eq!(world.get::<Node>(host), Some(&host_node));
+        assert_eq!(
+            world
+                .get::<RouterHostRegistration>(host)
+                .map(|value| value.router()),
+            Some(host_router)
+        );
+        assert!(world.get::<AppSentinel>(host).is_some());
     }
 
     #[test]

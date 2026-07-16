@@ -28,29 +28,75 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-macro_rules! id_type {
-    ($name:ident) => {
-        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        pub struct $name(u64);
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RouterInstanceId(u64);
 
-        impl $name {
-            #[cfg_attr(not(test), allow(dead_code))]
-            pub(crate) const fn new(raw: u64) -> Self {
-                Self(raw)
-            }
+impl RouterInstanceId {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
 
-            pub const fn raw(self) -> u64 {
-                self.0
-            }
-        }
-    };
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
 }
 
-id_type!(RouterInstanceId);
-id_type!(RouteHostId);
-id_type!(RouteSlotId);
-id_type!(RouteId);
-id_type!(RouteFrameId);
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RouteHostId(u64);
+
+impl RouteHostId {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RouteSlotId(u64);
+
+impl RouteSlotId {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RouteId(u64);
+
+impl RouteId {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RouteFrameId(u64);
+
+impl RouteFrameId {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct NavigationRequestId {

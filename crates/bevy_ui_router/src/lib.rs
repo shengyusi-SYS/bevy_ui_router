@@ -68,7 +68,8 @@ pub mod ecs {
     pub use bevy_ui_router_ecs::{
         AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
         AuthorityFrameMapping, AuthorityHostMapping, AuthoritySlotKind, AuthoritySlotMapping,
-        RouterAuthorityAuditSnapshot, RouterAuthorityAudits,
+        RouterAuthorityAuditSnapshot, RouterAuthorityAudits, RouterLifecycleAuditEvent,
+        RouterLifecycleAuditEventKind,
     };
 }
 
@@ -76,7 +77,11 @@ pub mod ecs {
 pub mod bsn {}
 
 #[cfg(feature = "platform")]
-pub use bevy_ui_router_platform as platform;
+pub mod platform {
+    pub mod prelude {
+        pub use crate::core::{BackCapabilitySnapshot, BackIntent, BackPolicy};
+    }
+}
 
 pub mod prelude {
     pub use crate::core::{
@@ -95,7 +100,10 @@ pub mod prelude {
     };
 
     #[cfg(feature = "view")]
-    pub use crate::view::*;
+    pub use crate::view::{
+        RouteViewDescriptor, RouteViewRegistry, RouteViewRegistryError, ViewBuildEffect,
+        ViewDriverKey, ViewDriverKeyError, ViewRequestId,
+    };
 
     #[cfg(feature = "ecs")]
     pub use crate::ecs::{
@@ -113,6 +121,7 @@ pub mod prelude {
     pub use crate::ecs::{
         AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
         AuthorityFrameMapping, AuthorityHostMapping, AuthoritySlotKind, AuthoritySlotMapping,
-        RouterAuthorityAuditSnapshot, RouterAuthorityAudits,
+        RouterAuthorityAuditSnapshot, RouterAuthorityAudits, RouterLifecycleAuditEvent,
+        RouterLifecycleAuditEventKind,
     };
 }

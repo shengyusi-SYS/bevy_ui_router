@@ -98,6 +98,14 @@ impl RouteError {
     }
 }
 
+impl std::fmt::Display for RouteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.redacted_message)
+    }
+}
+
+impl std::error::Error for RouteError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +131,13 @@ mod tests {
             format!("{:?}", RouteErrorKind::FinalizeFailed),
             "FinalizeFailed"
         );
+    }
+
+    #[test]
+    fn display_uses_the_redacted_message() {
+        let error = RouteError::not_found("route not found");
+
+        assert_eq!(error.to_string(), "route not found");
     }
 
     #[test]

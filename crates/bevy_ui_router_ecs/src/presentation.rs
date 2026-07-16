@@ -1744,7 +1744,7 @@ fn repair_missing_pickable_for_quarantine(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         app_ext::RouterHandle,
@@ -1987,7 +1987,7 @@ mod tests {
     }
 
     #[test]
-    fn post_write_required_component_removal_is_rejected_by_the_frozen_manifest() {
+    pub(crate) fn post_write_required_component_removal_is_rejected_by_the_frozen_manifest() {
         let (mut world, host, candidate, top_slot, top_slot_claim, task) = pending_frame_fixture();
         world.register_component_hooks::<FrameOutput>().on_add(
             |mut world, HookContext { entity, .. }| {
@@ -2183,7 +2183,7 @@ mod tests {
     }
 
     #[test]
-    fn realization_is_stable_registered_and_inert() {
+    pub(crate) fn realization_is_stable_registered_and_inert() {
         let mut world = World::new();
         world.insert_resource(RouteEntityRegistry::new());
         world.insert_resource(QuarantineLeaseTable::new());
@@ -2255,10 +2255,85 @@ mod tests {
         assert_eq!(request, task.request());
         assert_eq!(frame.obligation_count(), 4);
         assert!(validate_realized_frame(&world, &frame));
+        for realized in &frame.entities {
+            let mut explicit = vec![
+                world.register_component::<Node>(),
+                world.register_component::<Visibility>(),
+                world.register_component::<Pickable>(),
+                world.register_component::<RouterInputBarrier>(),
+                world.register_component::<RouteOwnershipSeal>(),
+                world.register_component::<FrameLifecycle>(),
+                world.register_component::<ChildOf>(),
+            ];
+            explicit.push(match realized.role {
+                RealizedRole::Shell => world.register_component::<FrameShell>(),
+                RealizedRole::ContentTarget => world.register_component::<FrameContentTarget>(),
+                RealizedRole::Empty | RealizedRole::SolidRect => {
+                    world.register_component::<FrameOutput>()
+                }
+            });
+            if realized.role == RealizedRole::SolidRect {
+                explicit.push(world.register_component::<BackgroundColor>());
+                explicit.push(world.register_component::<PickingInteraction>());
+            }
+            if frame
+                .entities
+                .iter()
+                .any(|child| child.parent == realized.entity)
+            {
+                explicit.push(world.register_component::<Children>());
+            }
+            assert_manifest_is_exact(&world, realized.entity, explicit);
+        }
         assert_eq!(
             world.get::<ChildOf>(frame.shell()).map(ChildOf::parent),
             Some(top_slot)
         );
+        assert_eq!(
+            world
+                .get::<Children>(top_slot)
+                .map(|children| children.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            vec![frame.shell()]
+        );
+        let expected_container = Node {
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            ..Node::default()
+        };
+        for realized in &frame.entities {
+            assert_eq!(
+                world.get::<ChildOf>(realized.entity).map(ChildOf::parent),
+                Some(realized.parent)
+            );
+            assert!(exact_children_match(
+                &world,
+                realized.entity,
+                expected_children(&frame, realized.entity)
+            ));
+            if matches!(
+                realized.role,
+                RealizedRole::Shell | RealizedRole::ContentTarget | RealizedRole::Empty
+            ) {
+                assert_eq!(
+                    world.get::<Node>(realized.entity),
+                    Some(&expected_container)
+                );
+                assert_eq!(
+                    world.get::<BackgroundColor>(realized.entity),
+                    Some(&BackgroundColor::default())
+                );
+                assert_eq!(
+                    world.get::<Pickable>(realized.entity),
+                    Some(&Pickable::IGNORE)
+                );
+                assert!(
+                    world
+                        .get::<RouterInputBarrier>(realized.entity)
+                        .is_some_and(RouterInputBarrier::denies_all)
+                );
+            }
+        }
         assert!(world.get_entity(host).is_ok());
     }
 

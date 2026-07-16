@@ -16,6 +16,8 @@ mod plugin;
 mod presentation;
 mod registry;
 mod snapshots;
+#[cfg(test)]
+mod task10_regression_tests;
 
 pub use app_ext::{
     AppRouterExt, RouterConfig, RouterHandle, RouterHostRegistration, RouterInstallError,
@@ -25,7 +27,8 @@ pub use app_ext::{
 pub use audit::{
     AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
     AuthorityFrameMapping, AuthorityHostMapping, AuthoritySlotKind, AuthoritySlotMapping,
-    RouterAuthorityAuditSnapshot, RouterAuthorityAudits,
+    RouterAuthorityAuditSnapshot, RouterAuthorityAudits, RouterLifecycleAuditEvent,
+    RouterLifecycleAuditEventKind,
 };
 pub use content::{
     ContentColor, ContentEntity, ContentPrimitiveError, ContentPrimitiveErrorKind,
@@ -53,6 +56,7 @@ pub mod prelude {
     pub use crate::{
         AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
         AuthorityFrameMapping, AuthorityHostMapping, AuthoritySlotKind, AuthoritySlotMapping,
-        RouterAuthorityAuditSnapshot, RouterAuthorityAudits,
+        RouterAuthorityAuditSnapshot, RouterAuthorityAudits, RouterLifecycleAuditEvent,
+        RouterLifecycleAuditEventKind,
     };
 }

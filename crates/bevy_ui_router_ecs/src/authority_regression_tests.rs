@@ -7,6 +7,7 @@ use bevy_ecs::{
 };
 use bevy_picking::Pickable;
 use bevy_ui::Node;
+use bevy_ui_router_core::integration::{EngineAction, IntegrationError};
 use bevy_ui_router_core::prelude::{
     NavigationPhase, NavigationRequestId, RequestStatus, RouteLocation, RouteNodeOptions,
     RoutePattern, RouteTree, RouteViewKey,
@@ -14,10 +15,11 @@ use bevy_ui_router_core::prelude::{
 use bevy_ui_router_view::{RouteViewDescriptor, RouteViewRegistry, ViewBuildEffect, ViewDriverKey};
 
 use crate::{
-    AppRouterExt, BevyUiRouterPlugin, ContentColor, EcsViewDriver, EcsViewReportSession,
-    FrameContentWriter, RouterConfig, RouterHandle, RouterHostRegistration, SolidRect,
-    ViewBuildReport,
+    AppRouterExt, BevyUiRouterPlugin, ContentColor, ContentWriteErrorKind, EcsViewDriver,
+    EcsViewReportSession, FrameContentWriter, RouterConfig, RouterHandle, RouterHostRegistration,
+    SolidRect, ViewBuildReport,
     cleanup::CleanupAttempt,
+    components::RouterInputBarrier,
     navigation::{
         RouterNavigation, collect_navigation_system, commit_presentation_system,
         drive_navigation_system, observe_authority_system, settle_cleanup_system,
@@ -46,6 +48,43 @@ struct RepairReparent {
 
 struct AuthorityDriver {
     key: ViewDriverKey,
+}
+
+struct PendingCycleDriver {
+    key: ViewDriverKey,
+    calls: usize,
+}
+
+impl EcsViewDriver for PendingCycleDriver {
+    fn key(&self) -> ViewDriverKey {
+        self.key.clone()
+    }
+
+    fn apply(
+        &mut self,
+        _effect: &ViewBuildEffect,
+        content: &mut FrameContentWriter<'_>,
+        report: EcsViewReportSession<'_>,
+    ) -> ViewBuildReport {
+        self.calls += 1;
+        if self.calls == 1 {
+            content
+                .spawn_solid_rect(
+                    SolidRect::new(20, 12, ContentColor::srgba8(7, 8, 9, 255)).unwrap(),
+                )
+                .unwrap();
+            return report.applied();
+        }
+
+        let parent = content.spawn_empty().unwrap();
+        let child = content.spawn_empty().unwrap();
+        content.add_child(parent, child).unwrap();
+        assert_eq!(
+            content.add_child(child, parent).unwrap_err().kind(),
+            ContentWriteErrorKind::RelationshipCycle
+        );
+        report.apply_failed("pending relationship cycle rejected")
+    }
 }
 
 impl EcsViewDriver for AuthorityDriver {
@@ -198,6 +237,255 @@ fn receipt_count(harness: &Harness) -> usize {
         .receipt_count()
 }
 
+fn install_driver_router(app: &mut App, label: &str, driver: impl EcsViewDriver) -> RouterHandle {
+    let driver_key = driver.key();
+    app.register_ui_view_driver(driver).unwrap();
+    let view = RouteViewKey::new(format!("{label}-view")).unwrap();
+    let routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("/").unwrap(),
+            RouteNodeOptions::new().with_view(view.clone()),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut views = RouteViewRegistry::new();
+    views
+        .insert(view.clone(), RouteViewDescriptor::new(driver_key))
+        .unwrap();
+    let router = app
+        .add_ui_router(RouterConfig::new(routes, views, view))
+        .unwrap();
+    app.world_mut()
+        .spawn((Node::default(), RouterHostRegistration::new(router)));
+    router
+}
+
+fn world_entity_snapshot(app: &App) -> Vec<(Entity, Vec<bevy_ecs::component::ComponentId>)> {
+    let mut snapshot = app
+        .world()
+        .iter_entities()
+        .map(|entity| (entity.id(), entity.archetype().components().to_vec()))
+        .collect::<Vec<_>>();
+    snapshot.sort_by_key(|(entity, _)| entity.to_bits());
+    snapshot
+}
+
+#[test]
+fn commit_gate_switch_is_same_frame_atomic() {
+    crate::navigation::tests::commit_switches_registry_pickable_gate_and_core_history_in_one_system(
+    );
+}
+
+#[test]
+fn host_children_change_only_top_slot_membership() {
+    crate::host::tests::staging_registers_and_blocks_input_before_probe_then_attaches_only_the_exact_host_edge();
+}
+
+#[test]
+fn host_grant_observer_drift_rejects_after_mutation() {
+    crate::navigation::tests::host_grant_observer_drift_is_rejected_by_the_real_authority_system();
+}
+
+#[test]
+fn host_ui_topology_requires_all_node_ancestry() {
+    crate::host::tests::rejects_non_node_host_and_cycles_and_revisions_are_monotonic();
+}
+
+#[test]
+fn pending_cycle_rejects_without_touching_active() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let key = ViewDriverKey::new("pending-cycle-driver").unwrap();
+    let router = install_driver_router(
+        &mut app,
+        "pending-cycle",
+        PendingCycleDriver { key, calls: 0 },
+    );
+    observe_authority_system(app.world_mut());
+    app.world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/"))
+        .unwrap();
+    collect_navigation_system(app.world_mut());
+    drive_navigation_system(app.world_mut());
+    commit_presentation_system(app.world_mut());
+    settle_cleanup_system(app.world_mut());
+
+    let active_before = {
+        let navigation = app.world().resource::<RouterNavigation>();
+        let active = navigation.entries[0].active.as_ref().unwrap();
+        (
+            active.frame().clone(),
+            active.shell(),
+            active.interactive_entities(),
+            active.claims().cloned().collect::<Vec<_>>(),
+        )
+    };
+    let history_before = app.world().resource::<RouterNavigation>().entries[0]
+        .engine
+        .history()
+        .clone();
+    let registry_before = app
+        .world()
+        .resource::<RouteEntityRegistry>()
+        .records()
+        .iter()
+        .map(|record| record.claim())
+        .collect::<Vec<_>>();
+    let world_before = world_entity_snapshot(&app);
+
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(
+            router,
+            RouteLocation::new("/").with_fragment("cycle-attempt"),
+        )
+        .unwrap();
+    collect_navigation_system(app.world_mut());
+    drive_navigation_system(app.world_mut());
+
+    let navigation = app.world().resource::<RouterNavigation>();
+    let entry = &navigation.entries[0];
+    let active = entry.active.as_ref().unwrap();
+    assert_eq!(
+        (
+            active.frame().clone(),
+            active.shell(),
+            active.interactive_entities(),
+            active.claims().cloned().collect::<Vec<_>>(),
+        ),
+        active_before
+    );
+    assert_eq!(entry.engine.history(), &history_before);
+    assert!(matches!(
+        entry.engine.request(request).unwrap().status(),
+        RequestStatus::Running(NavigationPhase::Recovering)
+    ));
+    assert_eq!(
+        app.world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .iter()
+            .map(|record| record.claim())
+            .collect::<Vec<_>>(),
+        registry_before
+    );
+    assert_eq!(world_entity_snapshot(&app), world_before);
+}
+
+#[test]
+fn persistent_admission_observer_latches_retry() {
+    crate::navigation::tests::persistent_host_observer_latches_each_revision_to_one_attempt();
+}
+
+#[test]
+fn plan_relationship_errors_are_world_zero() {
+    crate::content::tests::relationship_rejections_are_zero_write_with_fixed_priority();
+}
+
+#[test]
+fn solid_rect_required_components_match_locked_bevy() {
+    crate::presentation::tests::post_write_required_component_removal_is_rejected_by_the_frozen_manifest();
+    crate::navigation::tests::locked_bevy_plugins_produce_visible_layout_and_native_picking();
+}
+
+#[test]
+fn solid_rect_runs_real_layout_and_picking_pipeline() {
+    crate::navigation::tests::locked_bevy_plugins_produce_visible_layout_and_native_picking();
+}
+
+#[test]
+fn stale_report_identity_is_zero_write() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let first = install_driver_router(
+        &mut app,
+        "stale-report-first",
+        AuthorityDriver {
+            key: ViewDriverKey::new("stale-report-first-driver").unwrap(),
+        },
+    );
+    let second = install_driver_router(
+        &mut app,
+        "stale-report-second",
+        AuthorityDriver {
+            key: ViewDriverKey::new("stale-report-second-driver").unwrap(),
+        },
+    );
+    observe_authority_system(app.world_mut());
+    app.world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(first, RouteLocation::new("/"))
+        .unwrap();
+    collect_navigation_system(app.world_mut());
+    let stale = {
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handle == first)
+            .unwrap();
+        let EngineAction::FrameTask(task) = entry.engine.action().unwrap() else {
+            panic!("first router must issue a frame task")
+        };
+        task
+    };
+
+    let world_before = world_entity_snapshot(&app);
+    let registry_before = app
+        .world()
+        .resource::<RouteEntityRegistry>()
+        .records()
+        .iter()
+        .map(|record| record.claim())
+        .collect::<Vec<_>>();
+    let histories_before = app
+        .world()
+        .resource::<RouterNavigation>()
+        .entries
+        .iter()
+        .map(|entry| entry.engine.history().clone())
+        .collect::<Vec<_>>();
+
+    let result = {
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handle == second)
+            .unwrap();
+        entry.engine.report_applied(stale)
+    };
+
+    assert!(matches!(result, Err(IntegrationError::Stale)));
+    assert_eq!(world_entity_snapshot(&app), world_before);
+    assert_eq!(
+        app.world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .iter()
+            .map(|record| record.claim())
+            .collect::<Vec<_>>(),
+        registry_before
+    );
+    assert_eq!(
+        app.world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .map(|entry| entry.engine.history().clone())
+            .collect::<Vec<_>>(),
+        histories_before
+    );
+}
+
+#[test]
+fn structural_outputs_have_locked_manifest_and_topology() {
+    crate::presentation::tests::realization_is_stable_registered_and_inert();
+}
+
 #[test]
 fn post_commit_cleanup_waits_for_receipt() {
     let mut harness = harness("wait");
@@ -228,29 +516,7 @@ fn post_commit_cleanup_waits_for_receipt() {
 
 #[test]
 fn cleanup_receipt_replay_is_rejected() {
-    let mut harness = harness("receipt-replay");
-    first_push(&mut harness);
-    let (_leaving, _request) = begin_replacement(&mut harness);
-    let attempt = issue_attempt(&mut harness);
-    let replay = attempt.clone();
-
-    assert!(settle_attempt(&mut harness, attempt));
-    let records = harness
-        .app
-        .world()
-        .resource::<RouteEntityRegistry>()
-        .records()
-        .len();
-    assert!(!settle_attempt(&mut harness, replay));
-    assert_eq!(
-        harness
-            .app
-            .world()
-            .resource::<RouteEntityRegistry>()
-            .records()
-            .len(),
-        records
-    );
+    crate::cleanup::tests::foreign_and_replayed_receipts_are_ledger_zero();
 }
 
 #[test]
@@ -360,6 +626,23 @@ fn protected_parent_quarantine_preserves_relationship() {
         .world_mut()
         .entity_mut(leaving.output)
         .insert(ChildOf(protected));
+    let leaving_claim = harness
+        .app
+        .world()
+        .resource::<RouteEntityRegistry>()
+        .record(leaving.output)
+        .unwrap()
+        .claim();
+    assert_eq!(
+        leaving_claim.lifecycle(),
+        crate::registry::EntityLifecycle::Leaving
+    );
+    let leases_before = harness
+        .app
+        .world()
+        .resource::<QuarantineLeaseTable>()
+        .leases()
+        .len();
 
     settle_cleanup_system(harness.app.world_mut());
 
@@ -373,6 +656,49 @@ fn protected_parent_quarantine_preserves_relationship() {
     );
     assert!(harness.app.world().get_entity(protected).is_ok());
     assert!(harness.app.world().get_entity(leaving.output).is_ok());
+    assert!(
+        harness
+            .app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(leaving.output)
+            .is_none()
+    );
+    let quarantine = harness.app.world().resource::<QuarantineLeaseTable>();
+    assert_eq!(quarantine.leases().len(), leases_before + 1);
+    assert!(
+        quarantine
+            .leases()
+            .last()
+            .unwrap()
+            .owned_entities()
+            .contains(&leaving.output)
+    );
+    let quarantined = quarantine.record(leaving.output).unwrap();
+    assert_eq!(quarantined.owner(), leaving_claim.owner());
+    assert_eq!(quarantined.seal(), leaving_claim.seal());
+    assert_eq!(
+        quarantined.lifecycle(),
+        crate::registry::EntityLifecycle::Quarantined
+    );
+    assert_eq!(
+        harness
+            .app
+            .world()
+            .get::<bevy_camera::visibility::Visibility>(leaving.output),
+        Some(&bevy_camera::visibility::Visibility::Hidden)
+    );
+    assert_eq!(
+        harness.app.world().get::<Pickable>(leaving.output),
+        Some(&Pickable::IGNORE)
+    );
+    assert!(
+        harness
+            .app
+            .world()
+            .get::<RouterInputBarrier>(leaving.output)
+            .is_some_and(RouterInputBarrier::denies_all)
+    );
 }
 
 #[test]
@@ -460,8 +786,7 @@ fn cleanup_observer_reentry_supersedes_attempt() {
     );
 }
 
-#[test]
-fn partial_receipt_then_missing_pickable_still_quarantines_and_terminals() {
+pub(crate) fn partial_receipt_then_missing_pickable_still_quarantines_and_terminals() {
     let mut harness = harness("partial-persistent-drift");
     first_push(&mut harness);
     let (leaving, request) = begin_replacement(&mut harness);
@@ -517,8 +842,7 @@ fn partial_receipt_then_missing_pickable_still_quarantines_and_terminals() {
     );
 }
 
-#[test]
-fn pickable_repair_observer_drift_supersedes_attempt_before_quarantine_transfer() {
+pub(crate) fn pickable_repair_observer_drift_supersedes_attempt_before_quarantine_transfer() {
     let mut harness = harness_with_setup("repair-observer-drift", |app| {
         app.world_mut().insert_resource(RepairReparent::default());
         app.world_mut()

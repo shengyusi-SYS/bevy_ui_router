@@ -2,6 +2,7 @@
 name = "bevy_ui_router"
 version.workspace = true
 edition.workspace = true
+autotests = false
 
 [features]
 default = ["view"]
@@ -26,3 +27,45 @@ bevy_ecs = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f756
 bevy_ui = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
 syn = { version = "2", features = ["full"] }
 toml = "1.1.2"
+
+[[test]]
+name = "default_facade_features"
+path = "tests/default_facade_features.rs"
+
+[[test]]
+name = "public_navigation_journeys"
+path = "tests/public_navigation_journeys.rs"
+required-features = ["ecs"]
+
+[[test]]
+name = "public_navigation_authority_audit"
+path = "tests/public_navigation_authority_audit.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "public_navigation_input_isolation"
+path = "tests/public_navigation_input_isolation.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "ecs_facade_features"
+path = "tests/ecs_facade_features.rs"
+required-features = ["ecs"]
+
+[[test]]
+name = "bsn_facade_features"
+path = "tests/bsn_facade_features.rs"
+required-features = ["bsn"]
+
+[[test]]
+name = "test_support_features"
+path = "tests/test_support_features.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "facade_export_allowlist"
+path = "tests/facade_export_allowlist.rs"
+
+[[test]]
+name = "facade_authority_compile_fail"
+path = "tests/facade_authority_compile_fail.rs"
