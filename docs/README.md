@@ -33,6 +33,7 @@
 | [Roadmap](roadmap.md) | 记录 Now、Next 和暂停项，不重复架构正文 |
 | [整体实施目标规划](implementation-goals.md) | 概括 MVP 实施目标、阶段主线、质量门槛与范围控制 |
 | [Root Push 阶段合同 Profile](root-push-contract-profile.md) | 从最终 facade 合同中选择 Root push 已兑现能力、延后项与回归 catalogue |
+| [Nested Push 阶段合同 Profile](nested-push-contract-profile.md) | 收窄首次嵌套 push、sealed child mount、逐层 apply 与阶段 exclusions |
 | [Root Push 实施计划](superpowers/plans/2026-07-11-root-push-implementation-plan.md) | Root push 的任务顺序、TDD 门禁、文件范围与提交边界 |
 | [Root Push 计划审查记录](superpowers/plans/2026-07-11-root-push-plan-review-log.md) | 记录多角度审查的共同根因、修订、复审与无需重写结论 |
 | [Phase 3B.1 Review Log](phase-3b1-architecture-review-log.md) | 记录审查共同根因、负责人处置和复审结论 |
