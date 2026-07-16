@@ -312,3 +312,58 @@ fn consumer_cannot_name_core_private_task_or_transaction_identities() {
         assert_compile_fails(fixture);
     }
 }
+
+#[test]
+fn consumer_cannot_bypass_mount_registration_session() {
+    for fixture in [
+        Fixture {
+            name: "mount_registration_permit_slot_private",
+            code: "use bevy_ui_router_core::integration::MountRegistrationPermit; fn inspect(permit: &MountRegistrationPermit) { let _ = permit.slot(); } fn main() {}",
+            features: &[],
+            expected_stderr: &["error[E0599]", "no method named `slot`"],
+        },
+        Fixture {
+            name: "mount_registration_permit_complete_private",
+            code: "use bevy_ui_router_core::integration::MountRegistrationPermit; fn complete(permit: MountRegistrationPermit) { let _ = permit.complete(1); } fn main() {}",
+            features: &[],
+            expected_stderr: &["error[E0599]", "no method named `complete`"],
+        },
+        Fixture {
+            name: "mount_registration_engine_complete_private",
+            code: "use bevy_ui_router_core::integration::RouterEngine; fn complete(engine: &mut RouterEngine) { let _ = engine.complete_mount_registration(todo!()); } fn main() {}",
+            features: &[],
+            expected_stderr: &[
+                "error[E0599]",
+                "no method named `complete_mount_registration`",
+            ],
+        },
+    ] {
+        assert_compile_fails(fixture);
+    }
+}
+
+#[test]
+fn mount_receipt_proof_and_registration_session_are_not_clone() {
+    for fixture in [
+        Fixture {
+            name: "mount_receipt_proof_not_clone",
+            code: "use bevy_ui_router_core::integration::MountReceiptProof; fn require_clone<T: Clone>() {} fn main() { require_clone::<MountReceiptProof>(); }",
+            features: &[],
+            expected_stderr: &["error[E0277]", "trait `Clone` is not implemented"],
+        },
+        Fixture {
+            name: "mount_registration_session_not_clone",
+            code: "use bevy_ui_router_core::integration::MountRegistrationSession; fn require_clone<T: Clone>() {} fn check<'a>() { require_clone::<MountRegistrationSession<'a>>(); } fn main() {}",
+            features: &[],
+            expected_stderr: &["error[E0277]", "trait `Clone` is not implemented"],
+        },
+        Fixture {
+            name: "mount_registration_begin_error_not_clone",
+            code: "use bevy_ui_router_core::integration::MountRegistrationBeginError; fn require_clone<T: Clone>() {} fn main() { require_clone::<MountRegistrationBeginError>(); }",
+            features: &[],
+            expected_stderr: &["error[E0277]", "trait `Clone` is not implemented"],
+        },
+    ] {
+        assert_compile_fails(fixture);
+    }
+}

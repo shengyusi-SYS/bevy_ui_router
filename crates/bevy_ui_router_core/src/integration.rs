@@ -20,10 +20,12 @@ use crate::history::{HistorySnapshot, MemoryHistory};
 use crate::ids::{NavigationRequestId, RouteSlotId, RouterIdentity};
 use crate::location::RouteLocation;
 use crate::meta::ErrorBoundaryKey;
+#[cfg(test)]
+use crate::mount::MountRegistrationCompletion as CoreMountRegistrationCompletion;
 use crate::mount::{
     MountGrant as CoreMountGrant, MountReceiptAttestation as CoreMountReceiptAttestation,
-    MountReceiptDigest, MountRegistrationCompletion as CoreMountRegistrationCompletion,
-    MountRegistrationDigest, MountRegistrationPermit as CoreMountRegistrationPermit,
+    MountReceiptDigest, MountReceiptProof as CoreMountReceiptProof, MountRegistrationDigest,
+    MountRegistrationPermit as CoreMountRegistrationPermit,
 };
 use crate::presentation::{ActivePresentation, RouterAvailability};
 use crate::request::{
@@ -76,18 +78,36 @@ impl MountGrant {
         self.inner.slot()
     }
 
-    pub fn attest_receipt(self, digest: u64) -> MountReceiptAttestation {
+    #[cfg(test)]
+    fn attest_receipt(self, digest: u64) -> MountReceiptAttestation {
         MountReceiptAttestation {
             inner: self
                 .inner
                 .attest_receipt(MountReceiptDigest::from_opaque(digest)),
         }
     }
+
+    pub fn attest_receipt_with_proof(
+        self,
+        digest: u64,
+    ) -> (MountReceiptAttestation, MountReceiptProof) {
+        let (attestation, proof) = self
+            .inner
+            .attest_receipt_with_proof(MountReceiptDigest::from_opaque(digest));
+        (
+            MountReceiptAttestation { inner: attestation },
+            MountReceiptProof { inner: proof },
+        )
+    }
 }
 
 pub struct MountReceiptAttestation {
     #[cfg_attr(not(test), allow(dead_code))]
     inner: CoreMountReceiptAttestation,
+}
+
+pub struct MountReceiptProof {
+    inner: CoreMountReceiptProof,
 }
 
 pub struct MountRegistrationPermit {
@@ -100,11 +120,13 @@ impl MountRegistrationPermit {
         Self { inner }
     }
 
-    pub fn slot(&self) -> crate::ids::RouteSlotId {
+    #[cfg(test)]
+    fn slot(&self) -> crate::ids::RouteSlotId {
         self.inner.slot()
     }
 
-    pub fn complete(self, registration_digest: u64) -> MountRegistrationCompletion {
+    #[cfg(test)]
+    fn complete(self, registration_digest: u64) -> MountRegistrationCompletion {
         MountRegistrationCompletion {
             inner: self
                 .inner
@@ -113,9 +135,79 @@ impl MountRegistrationPermit {
     }
 }
 
+#[cfg(test)]
 pub struct MountRegistrationCompletion {
     #[cfg_attr(not(test), allow(dead_code))]
     inner: CoreMountRegistrationCompletion,
+}
+
+#[must_use = "a mount registration session must complete or reject"]
+pub struct MountRegistrationSession<'engine> {
+    engine: &'engine mut CoreRouterEngine,
+    permit: CoreMountRegistrationPermit,
+    slot: RouteSlotId,
+}
+
+impl MountRegistrationSession<'_> {
+    pub const fn slot(&self) -> RouteSlotId {
+        self.slot
+    }
+
+    pub fn complete(self, registration_digest: u64) {
+        self.engine.complete_preflighted_mount_registration(
+            self.permit,
+            MountRegistrationDigest::from_opaque(registration_digest),
+        )
+    }
+
+    pub fn reject(self) -> FailureCleanupRequest {
+        FailureCleanupRequest {
+            inner: self
+                .engine
+                .reject_preflighted_mount_registration(self.permit),
+        }
+    }
+}
+
+#[must_use = "a failed mount registration begin retains the rejection capability"]
+pub struct MountRegistrationBeginError {
+    kind: IntegrationError,
+    permit: CoreMountRegistrationPermit,
+}
+
+impl MountRegistrationBeginError {
+    pub const fn kind(&self) -> IntegrationError {
+        self.kind
+    }
+
+    pub fn reject(
+        self,
+        engine: &mut RouterEngine,
+    ) -> Result<FailureCleanupRequest, MountRegistrationBeginError> {
+        if let Err(error) = engine
+            .inner
+            .validate_mount_registration_rejection(&self.permit)
+        {
+            return Err(Self {
+                kind: map_mount_error(error),
+                permit: self.permit,
+            });
+        }
+        Ok(FailureCleanupRequest {
+            inner: engine
+                .inner
+                .reject_preflighted_mount_registration(self.permit),
+        })
+    }
+}
+
+impl std::fmt::Debug for MountRegistrationBeginError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MountRegistrationBeginError")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HostGrant {
@@ -739,7 +831,32 @@ impl RouterEngine {
             .map_err(map_mount_error)
     }
 
-    pub fn complete_mount_registration(
+    pub fn begin_mount_registration<'engine>(
+        &'engine mut self,
+        permit: MountRegistrationPermit,
+        proof: &MountReceiptProof,
+    ) -> Result<MountRegistrationSession<'engine>, MountRegistrationBeginError> {
+        let slot = match self
+            .inner
+            .validate_mount_registration(&permit.inner, &proof.inner)
+        {
+            Ok(slot) => slot,
+            Err(error) => {
+                return Err(MountRegistrationBeginError {
+                    kind: map_mount_error(error),
+                    permit: permit.inner,
+                });
+            }
+        };
+        Ok(MountRegistrationSession {
+            engine: &mut self.inner,
+            permit: permit.inner,
+            slot,
+        })
+    }
+
+    #[cfg(test)]
+    fn complete_mount_registration(
         &mut self,
         completion: MountRegistrationCompletion,
     ) -> Result<(), IntegrationError> {
@@ -1040,6 +1157,156 @@ mod tests {
             panic!("mount request expected")
         };
         engine.resolve_mount(mount).unwrap().attest_receipt(digest)
+    }
+
+    fn pending_mount_registration(
+        engine: &mut RouterEngine,
+        location: &str,
+        digest: u64,
+    ) -> (
+        NavigationRequestId,
+        RouteFrameVersion,
+        RouteSlotId,
+        MountRegistrationPermit,
+        MountReceiptProof,
+    ) {
+        let request = engine.push(RouteLocation::new(location)).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("parent frame task expected")
+        };
+        let parent_frame = parent.frame().clone();
+        engine
+            .report_applied_with_outlets(parent, vec![RouteSlotKey::default()])
+            .unwrap();
+        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
+            panic!("mount request expected")
+        };
+        let grant = engine.resolve_mount(mount).unwrap();
+        let slot = grant.slot();
+        let (receipt, proof) = grant.attest_receipt_with_proof(digest);
+        let permit = engine.accept_mount_receipt(receipt).unwrap();
+        (request, parent_frame, slot, permit, proof)
+    }
+
+    #[test]
+    fn mount_registration_cross_router_proof_is_foreign_and_zero_write() {
+        let mut receiver = confirmed_nested_engine();
+        let (request, parent, receiver_slot, receiver_permit, _) =
+            pending_mount_registration(&mut receiver, "/items/1", 311);
+        let mut source = confirmed_nested_engine();
+        let (_, _, source_slot, _, source_proof) =
+            pending_mount_registration(&mut source, "/items/1", 311);
+        assert_eq!(receiver_slot, source_slot);
+        let before = receiver.inner.testing_snapshot();
+
+        let error = match receiver.begin_mount_registration(receiver_permit, &source_proof) {
+            Ok(_) => panic!("cross-router proof must not open a registration session"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), IntegrationError::ForeignRouter);
+        assert_eq!(receiver.inner.testing_snapshot(), before);
+        let failure = error.reject(&mut receiver).unwrap();
+        assert_eq!(failure.request(), request);
+        assert_eq!(failure.logical_roots(), &[parent]);
+    }
+
+    #[test]
+    fn mount_registration_old_same_router_proof_is_stale_and_zero_write() {
+        let mut engine = confirmed_nested_engine();
+        let (_, _, _, permit, old_proof) = pending_mount_registration(&mut engine, "/items/1", 313);
+        engine
+            .begin_mount_registration(permit, &old_proof)
+            .unwrap()
+            .complete(317);
+        let EngineAction::FrameTask(child) = engine.action().unwrap() else {
+            panic!("completed registration must issue the child task")
+        };
+        engine
+            .report_applied_with_outlets(child, Vec::new())
+            .unwrap();
+        let EngineAction::Commit(ticket) = engine.action().unwrap() else {
+            panic!("completed child must yield one commit")
+        };
+        let prepared = engine
+            .prepare_commit(&ticket, CleanupManifest::empty())
+            .unwrap();
+        let cleanup = prepared.cleanup().clone();
+        engine.publish(prepared, || {});
+        engine.complete_cleanup(cleanup.complete_empty()).unwrap();
+
+        let (request, parent, _, permit, _) =
+            pending_mount_registration(&mut engine, "/items/2", 313);
+        let before = engine.inner.testing_snapshot();
+        let error = match engine.begin_mount_registration(permit, &old_proof) {
+            Ok(_) => panic!("an old same-router proof must not open a registration session"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), IntegrationError::Stale);
+        assert_eq!(engine.inner.testing_snapshot(), before);
+        let failure = error.reject(&mut engine).unwrap();
+        assert_eq!(failure.request(), request);
+        assert_eq!(failure.logical_roots(), &[parent]);
+    }
+
+    #[test]
+    fn mount_registration_session_withholds_child_until_completion() {
+        let mut engine = confirmed_nested_engine();
+        let (_, _, slot, permit, proof) = pending_mount_registration(&mut engine, "/items/1", 319);
+        assert!(engine.action().is_none());
+        let session = engine.begin_mount_registration(permit, &proof).unwrap();
+
+        assert_eq!(session.slot(), slot);
+        session.complete(321);
+
+        let EngineAction::FrameTask(child) = engine.action().unwrap() else {
+            panic!("only completed registration may issue the child task")
+        };
+        assert!(matches!(
+            child.mount_target(),
+            FrameMountTarget::ChildOutlet { .. }
+        ));
+    }
+
+    #[test]
+    fn mount_registration_context_drift_returns_linear_rejection_capability() {
+        let mut engine = confirmed_nested_engine();
+        let (request, parent, _, permit, proof) =
+            pending_mount_registration(&mut engine, "/items/1", 327);
+        engine
+            .inner
+            .testing_set_mount_registration_context_live(false);
+        let before = engine.inner.testing_snapshot();
+
+        let error = match engine.begin_mount_registration(permit, &proof) {
+            Ok(_) => panic!("drifted engine context must not open a registration session"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), IntegrationError::Invalid);
+        assert_eq!(engine.inner.testing_snapshot(), before);
+        engine
+            .inner
+            .testing_set_mount_registration_context_live(true);
+        let failure = error.reject(&mut engine).unwrap();
+        assert_eq!(failure.request(), request);
+        assert_eq!(failure.logical_roots(), &[parent]);
+    }
+
+    #[test]
+    fn mount_registration_session_rejects_with_exact_failure_cleanup() {
+        let mut engine = confirmed_nested_engine();
+        let (request, parent, slot, permit, proof) =
+            pending_mount_registration(&mut engine, "/items/1", 323);
+        let session = engine.begin_mount_registration(permit, &proof).unwrap();
+        assert_eq!(session.slot(), slot);
+
+        let failure = session.reject();
+
+        assert_eq!(failure.request(), request);
+        assert_eq!(failure.logical_roots(), &[parent]);
     }
 
     fn pending_nested_completion(

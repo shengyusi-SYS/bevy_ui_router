@@ -46,6 +46,15 @@ pub(crate) struct MountReceiptAttestation {
     binding: u64,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct MountReceiptProof {
+    identity: MountIdentity,
+    slot: RouteSlotId,
+    digest: MountReceiptDigest,
+    receipt_binding: u64,
+    binding: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MountRegistrationPermit {
     identity: MountIdentity,
@@ -305,6 +314,36 @@ impl MountIssuer {
         )
     }
 
+    pub(crate) fn validate_registration_permit(
+        &self,
+        permit: &MountRegistrationPermit,
+        proof: &MountReceiptProof,
+    ) -> Result<(), MountError> {
+        if !proof.has_valid_binding()
+            || !identity_is_coherent(&proof.identity)
+            || !permit.has_valid_binding()
+            || !identity_is_coherent(&permit.identity)
+        {
+            return Err(MountError::Foreign);
+        }
+        if proof.identity.router != permit.identity.router {
+            return Err(MountError::Foreign);
+        }
+        if proof.identity != permit.identity
+            || proof.slot != permit.slot
+            || proof.digest != permit.receipt_digest
+        {
+            return Err(MountError::Stale);
+        }
+        if permit.identity.router != self.router {
+            return Err(MountError::Foreign);
+        }
+        match self.validate_confirming(&permit.identity, permit.slot, permit.receipt_digest) {
+            Err(MountError::Foreign) => Err(MountError::Stale),
+            result => result,
+        }
+    }
+
     pub(crate) fn validate_mutation_artifact<A: MountMutationArtifact + ?Sized>(
         &self,
         artifact: &A,
@@ -424,18 +463,34 @@ impl MountGrant {
     }
 
     pub(crate) fn attest_receipt(self, digest: MountReceiptDigest) -> MountReceiptAttestation {
-        MountReceiptAttestation {
-            binding: artifact_binding(
-                MountArtifactStage::Receipt,
-                &self.identity,
-                Some(self.slot),
-                Some(digest),
-                None,
-            ),
+        self.attest_receipt_with_proof(digest).0
+    }
+
+    pub(crate) fn attest_receipt_with_proof(
+        self,
+        digest: MountReceiptDigest,
+    ) -> (MountReceiptAttestation, MountReceiptProof) {
+        let receipt_binding = artifact_binding(
+            MountArtifactStage::Receipt,
+            &self.identity,
+            Some(self.slot),
+            Some(digest),
+            None,
+        );
+        let proof = MountReceiptProof {
+            binding: receipt_proof_binding(&self.identity, self.slot, digest, receipt_binding),
+            identity: self.identity.clone(),
+            slot: self.slot,
+            digest,
+            receipt_binding,
+        };
+        let receipt = MountReceiptAttestation {
+            binding: receipt_binding,
             identity: self.identity,
             slot: self.slot,
             digest,
-        }
+        };
+        (receipt, proof)
     }
 
     fn has_valid_binding(&self) -> bool {
@@ -460,6 +515,26 @@ impl MountReceiptAttestation {
                 Some(self.digest),
                 None,
             )
+    }
+}
+
+impl MountReceiptProof {
+    fn has_valid_binding(&self) -> bool {
+        self.receipt_binding
+            == artifact_binding(
+                MountArtifactStage::Receipt,
+                &self.identity,
+                Some(self.slot),
+                Some(self.digest),
+                None,
+            )
+            && self.binding
+                == receipt_proof_binding(
+                    &self.identity,
+                    self.slot,
+                    self.digest,
+                    self.receipt_binding,
+                )
     }
 }
 
@@ -608,6 +683,20 @@ fn artifact_binding(
     digest.optional(slot.map(RouteSlotId::raw));
     digest.optional(receipt_digest.map(|value| value.0));
     digest.optional(registration_digest.map(|value| value.0));
+    digest.finish()
+}
+
+fn receipt_proof_binding(
+    identity: &MountIdentity,
+    slot: RouteSlotId,
+    receipt_digest: MountReceiptDigest,
+    receipt_binding: u64,
+) -> u64 {
+    let mut digest = StructuredDigest::new(0x6d6f_756e_745f_7072);
+    digest.mount_identity(identity);
+    digest.push(slot.raw());
+    digest.push(receipt_digest.0);
+    digest.push(receipt_binding);
     digest.finish()
 }
 
@@ -879,6 +968,69 @@ mod tests {
             Err(MountError::Foreign)
         );
         assert_eq!(fixture.issuer.snapshot(), completed);
+    }
+
+    #[test]
+    fn registration_proof_classifies_cross_router_before_raw_slot_and_digest() {
+        let mut receiver = Fixture::new();
+        let receiver_grant = receiver.grant();
+        let receiver_slot = receiver_grant.slot();
+        let (receiver_receipt, _) =
+            receiver_grant.attest_receipt_with_proof(MountReceiptDigest::from_opaque(79));
+        let receiver_permit = receiver.issuer.accept_receipt(&receiver_receipt).unwrap();
+
+        let mut foreign = Fixture::new();
+        let foreign_grant = foreign.grant();
+        let foreign_slot = foreign_grant.slot();
+        let (foreign_receipt, foreign_proof) =
+            foreign_grant.attest_receipt_with_proof(MountReceiptDigest::from_opaque(79));
+        foreign.issuer.accept_receipt(&foreign_receipt).unwrap();
+        assert_eq!(receiver_slot, foreign_slot);
+        let issuer_before = receiver.issuer.snapshot();
+        let ids_before = receiver.ids.snapshot();
+
+        assert_eq!(
+            receiver
+                .issuer
+                .validate_registration_permit(&receiver_permit, &foreign_proof),
+            Err(MountError::Foreign)
+        );
+        assert_eq!(receiver.issuer.snapshot(), issuer_before);
+        assert_eq!(receiver.ids.snapshot(), ids_before);
+    }
+
+    #[test]
+    fn registration_proof_from_old_same_router_mount_is_stale() {
+        let mut fixture = Fixture::new();
+        let first_grant = fixture.grant();
+        let (first_receipt, old_proof) =
+            first_grant.attest_receipt_with_proof(MountReceiptDigest::from_opaque(83));
+        let first_permit = fixture.issuer.accept_receipt(&first_receipt).unwrap();
+        let old_permit = first_permit.clone();
+        let completion = first_permit.complete(MountRegistrationDigest::from_opaque(89));
+        fixture.issuer.complete_registration(&completion).unwrap();
+
+        let current_grant = fixture.grant();
+        let (current_receipt, _) =
+            current_grant.attest_receipt_with_proof(MountReceiptDigest::from_opaque(83));
+        let current_permit = fixture.issuer.accept_receipt(&current_receipt).unwrap();
+        let issuer_before = fixture.issuer.snapshot();
+        let ids_before = fixture.ids.snapshot();
+
+        assert_eq!(
+            fixture
+                .issuer
+                .validate_registration_permit(&current_permit, &old_proof),
+            Err(MountError::Stale)
+        );
+        assert_eq!(
+            fixture
+                .issuer
+                .validate_registration_permit(&old_permit, &old_proof),
+            Err(MountError::Stale)
+        );
+        assert_eq!(fixture.issuer.snapshot(), issuer_before);
+        assert_eq!(fixture.ids.snapshot(), ids_before);
     }
 
     #[test]

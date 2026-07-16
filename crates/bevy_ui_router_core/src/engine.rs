@@ -18,7 +18,8 @@ use crate::location::RouteLocation;
 use crate::matcher::RouteMatcher;
 use crate::mount::{
     MountConfirmation, MountError, MountGrant, MountIssuer, MountReceiptAttestation,
-    MountRegistrationCompletion, MountRegistrationPermit, MountRequestToken,
+    MountReceiptProof, MountRegistrationCompletion, MountRegistrationDigest,
+    MountRegistrationPermit, MountRequestToken,
 };
 use crate::presentation::{ActivePresentation, ActivePresentationKind, RouterNavigationState};
 use crate::request::{
@@ -868,6 +869,47 @@ impl RouterEngine {
         let confirmation = self.mount.complete_registration(&completion)?;
         self.issue_confirmed_child(confirmation);
         Ok(())
+    }
+
+    pub(crate) fn validate_mount_registration(
+        &self,
+        permit: &MountRegistrationPermit,
+        proof: &MountReceiptProof,
+    ) -> Result<RouteSlotId, MountError> {
+        self.mount.validate_registration_permit(permit, proof)?;
+        if !self.has_live_mount_context(&WorkStage::ConfirmingMount, None) {
+            return Err(MountError::WrongPhase);
+        }
+        Ok(permit.slot())
+    }
+
+    pub(crate) fn validate_mount_registration_rejection(
+        &self,
+        permit: &MountRegistrationPermit,
+    ) -> Result<(), MountError> {
+        self.mount.validate_mutation_artifact(permit)?;
+        if !self.has_live_mount_context(&WorkStage::ConfirmingMount, None) {
+            return Err(MountError::WrongPhase);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_preflighted_mount_registration(
+        &mut self,
+        permit: MountRegistrationPermit,
+        registration_digest: MountRegistrationDigest,
+    ) {
+        let completion = permit.complete(registration_digest);
+        self.complete_mount_registration(completion)
+            .expect("an exclusively borrowed preflighted registration remains valid")
+    }
+
+    pub(crate) fn reject_preflighted_mount_registration(
+        &mut self,
+        permit: MountRegistrationPermit,
+    ) -> FailureCleanupRequest {
+        self.reject_mount_after_mutation(MountMutationArtifact::RegistrationPermit(permit))
+            .expect("an exclusively borrowed preflighted registration remains valid")
     }
 
     pub(crate) fn reject_mount(
@@ -2177,6 +2219,23 @@ impl RouterEngine {
     }
 
     #[cfg(test)]
+    pub(crate) fn testing_snapshot(&self) -> EngineSnapshot {
+        self.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_set_mount_registration_context_live(&mut self, live: bool) {
+        self.current
+            .as_mut()
+            .expect("mount registration fixture retains current work")
+            .stage = if live {
+            WorkStage::ConfirmingMount
+        } else {
+            WorkStage::AwaitingReceipt
+        };
+    }
+
+    #[cfg(test)]
     fn testing_exhaust_reservation_counter(&mut self, counter: crate::ids::ReservationCounter) {
         self.ids
             .testing_exhaust_reservation_counter(self.router, counter);
@@ -2367,7 +2426,7 @@ impl From<&EngineAction> for ActionSnapshot {
 
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
-struct EngineSnapshot {
+pub(crate) struct EngineSnapshot {
     state: RouterNavigationState,
     ids: crate::ids::CoreIdAllocatorSnapshot,
     history: MemoryHistory,
@@ -4566,6 +4625,25 @@ mod tests {
 
         assert_eq!(
             engine.complete_mount_registration(completion),
+            Err(crate::mount::MountError::WrongPhase)
+        );
+        assert_eq!(engine.snapshot(), before);
+    }
+
+    #[test]
+    fn mount_registration_begin_context_drift_is_zero_write() {
+        let mut engine = ready_engine();
+        let (_, _, mount) =
+            begin_nested_mount(&mut engine, vec![crate::slot::RouteSlotKey::default()]);
+        let grant = engine.resolve_mount(mount).unwrap();
+        let (receipt, proof) =
+            grant.attest_receipt_with_proof(crate::mount::MountReceiptDigest::from_opaque(257));
+        let permit = engine.accept_mount_receipt(receipt).unwrap();
+        engine.current.as_mut().unwrap().stage = WorkStage::AwaitingReceipt;
+        let before = engine.snapshot();
+
+        assert_eq!(
+            engine.validate_mount_registration(&permit, &proof),
             Err(crate::mount::MountError::WrongPhase)
         );
         assert_eq!(engine.snapshot(), before);
