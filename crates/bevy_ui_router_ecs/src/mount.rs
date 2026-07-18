@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use bevy_app::Inherited;
 use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
     component::ComponentId,
@@ -8,7 +9,7 @@ use bevy_ecs::{
 };
 use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
-use bevy_ui::{Node, Val};
+use bevy_ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Node, Val};
 use bevy_ui_router_core::{
     frame::RouteFrameVersion,
     ids::RouteSlotId,
@@ -163,6 +164,70 @@ impl MountedChildSlot {
 
     pub(crate) fn expected_anchor_children(&self) -> &[Entity] {
         &self.expected_anchor_children
+    }
+
+    #[cfg(test)]
+    fn clone_for_test(&self) -> Self {
+        Self {
+            slot: self.slot,
+            slot_claim: self.slot_claim.clone(),
+            parent: self.parent.clone(),
+            outlet: self.outlet.clone(),
+            anchor: self.anchor,
+            anchor_claim: self.anchor_claim.clone(),
+            expected_anchor_children: self.expected_anchor_children.clone(),
+            slot_id: self.slot_id,
+        }
+    }
+
+    pub(crate) fn internal_claims_can_rebind(
+        &self,
+        claims: &[ExactRegistryClaim],
+        expected_current: EntityLifecycle,
+        expected_next: EntityLifecycle,
+    ) -> bool {
+        self.claim_alias_can_rebind(&self.slot_claim, claims, expected_current, expected_next)
+            && self.claim_alias_can_rebind(
+                &self.anchor_claim,
+                claims,
+                expected_current,
+                expected_next,
+            )
+    }
+
+    pub(crate) fn apply_internal_claim_rebind(&mut self, claims: &[ExactRegistryClaim]) {
+        if let Some(next) = claims
+            .iter()
+            .find(|claim| claim.entity() == self.slot_claim.entity())
+        {
+            self.slot_claim = next.clone();
+        }
+        if let Some(next) = claims
+            .iter()
+            .find(|claim| claim.entity() == self.anchor_claim.entity())
+        {
+            self.anchor_claim = next.clone();
+        }
+    }
+
+    fn claim_alias_can_rebind(
+        &self,
+        current: &ExactRegistryClaim,
+        claims: &[ExactRegistryClaim],
+        expected_current: EntityLifecycle,
+        expected_next: EntityLifecycle,
+    ) -> bool {
+        claims
+            .iter()
+            .find(|claim| claim.entity() == current.entity())
+            .is_some_and(|next| {
+                crate::presentation::claim_rebind_is_exact(
+                    current,
+                    next,
+                    expected_current,
+                    expected_next,
+                )
+            })
     }
 }
 
@@ -729,27 +794,68 @@ fn validate_registered_slot(
 }
 
 pub(crate) fn mounted_child_slot_is_isolated(world: &World, slot: &MountedChildSlot) -> bool {
-    world
-        .get_resource::<RouteEntityRegistry>()
-        .and_then(|registry| registry.record(slot.slot))
-        .is_some_and(|record| {
-            record.claim() == slot.slot_claim
-                && record.manifest().matches(world, slot.slot)
-                && record.owner()
-                    == &RegistryOwner::Committed(crate::registry::EntityOwner::ChildSlot {
-                        parent: slot.parent.clone(),
-                        outlet: slot.outlet.clone(),
-                        slot: slot.slot_id,
-                    })
-        })
-        && world.get::<Visibility>(slot.slot) == Some(&Visibility::Hidden)
+    validate_mounted_child_slot(world, slot, EntityLifecycle::PreparedInert)
+}
+
+pub(crate) fn validate_mounted_child_slot(
+    world: &World,
+    slot: &MountedChildSlot,
+    lifecycle: EntityLifecycle,
+) -> bool {
+    validate_mounted_child_slot_with_policy(world, slot, lifecycle, false)
+}
+
+pub(crate) fn validate_leaving_mounted_child_slot(world: &World, slot: &MountedChildSlot) -> bool {
+    validate_mounted_child_slot_with_policy(world, slot, EntityLifecycle::Active, true)
+}
+
+fn validate_mounted_child_slot_with_policy(
+    world: &World,
+    slot: &MountedChildSlot,
+    lifecycle: EntityLifecycle,
+    allow_foreign_additions: bool,
+) -> bool {
+    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+        return false;
+    };
+    let Some(record) = registry.record(slot.slot) else {
+        return false;
+    };
+    let Some(anchor_record) = registry.record(slot.anchor) else {
+        return false;
+    };
+    let (component_lifecycle, visibility) = match lifecycle {
+        EntityLifecycle::PreparedInert => (ChildSlotLifecycle::RegisteredInert, Visibility::Hidden),
+        EntityLifecycle::Active => (ChildSlotLifecycle::Active, Visibility::Visible),
+        EntityLifecycle::Leaving => (ChildSlotLifecycle::Leaving, Visibility::Hidden),
+        EntityLifecycle::Quarantined => (ChildSlotLifecycle::Quarantined, Visibility::Hidden),
+    };
+    record.claim() == slot.slot_claim
+        && record.lifecycle() == lifecycle
+        && manifest_matches_policy(world, slot.slot, record.manifest(), allow_foreign_additions)
+        && record.owner()
+            == &RegistryOwner::Committed(crate::registry::EntityOwner::ChildSlot {
+                parent: slot.parent.clone(),
+                outlet: slot.outlet.clone(),
+                slot: slot.slot_id,
+            })
+        && anchor_record.claim() == slot.anchor_claim
+        && manifest_matches_policy(
+            world,
+            slot.anchor,
+            anchor_record.manifest(),
+            allow_foreign_additions,
+        )
+        && world.get::<RouteOwnershipSeal>(slot.anchor)
+            == Some(&RouteOwnershipSeal::new(anchor_record.seal()))
+        && world.get::<Visibility>(slot.slot) == Some(&visibility)
         && world.get::<Pickable>(slot.slot) == Some(&Pickable::IGNORE)
         && world
             .get::<RouterInputBarrier>(slot.slot)
             .is_some_and(RouterInputBarrier::denies_all)
         && world.get::<RouteOwnershipSeal>(slot.slot)
             == Some(&RouteOwnershipSeal::new(slot.slot_claim.seal()))
-        && world.get::<ChildSlotLifecycle>(slot.slot) == Some(&ChildSlotLifecycle::RegisteredInert)
+        && world.get::<ChildSlotLifecycle>(slot.slot) == Some(&component_lifecycle)
         && world
             .get::<ChildSlotAuthority>(slot.slot)
             .is_some_and(|authority| {
@@ -759,6 +865,24 @@ pub(crate) fn mounted_child_slot_is_isolated(world: &World, slot: &MountedChildS
             })
         && world.get::<ChildOf>(slot.slot).map(ChildOf::parent) == Some(slot.anchor)
         && children_of(world, slot.anchor) == slot.expected_anchor_children
+        && (lifecycle == EntityLifecycle::Active || !focus_is_in_slot(world, slot.slot))
+}
+
+fn manifest_matches_policy(
+    world: &World,
+    entity: Entity,
+    expected: &ComponentManifest,
+    allow_foreign_additions: bool,
+) -> bool {
+    if !allow_foreign_additions {
+        return expected.matches(world, entity);
+    }
+    ComponentManifest::from_world(world, entity).is_some_and(|actual| {
+        expected
+            .component_ids()
+            .iter()
+            .all(|component| actual.component_ids().contains(component))
+    })
 }
 
 pub(crate) fn residual_child_slot_is_isolated(world: &World, residual: &ChildSlotResidual) -> bool {
@@ -943,8 +1067,19 @@ fn advance_relationship_batch(
     let child_of = world.register_component::<ChildOf>();
     let relationship_probe = world.register_component::<ChildSlotRelationshipProbe>();
     let children = world.register_component::<Children>();
-    let expected_slot =
+    let runtime_ui_components = child_slot_relationship_runtime_ui_component_ids(world);
+    let required_slot =
         manifest_with_required(world, &old_slot, vec![child_of, relationship_probe]);
+    let authorized_slot = manifest_with_required(
+        world,
+        &old_slot,
+        vec![
+            child_of,
+            relationship_probe,
+            runtime_ui_components[0],
+            runtime_ui_components[1],
+        ],
+    );
     let expected_anchor = manifest_with_required(world, &old_anchor, vec![children]);
     world
         .entity_mut(slot.slot)
@@ -956,8 +1091,19 @@ fn advance_relationship_batch(
     expected_children.push(slot.slot);
     let actual_slot = ComponentManifest::from_world(world, slot.slot);
     let actual_anchor = ComponentManifest::from_world(world, slot.anchor);
-    if actual_slot.as_ref() != Some(&expected_slot)
-        || actual_anchor.as_ref() != Some(&expected_anchor)
+    let Some(expected_slot) = actual_slot.filter(|actual| {
+        required_slot
+            .component_ids()
+            .iter()
+            .all(|id| actual.component_ids().contains(id))
+            && actual
+                .component_ids()
+                .iter()
+                .all(|id| authorized_slot.component_ids().contains(id))
+    }) else {
+        return false;
+    };
+    if actual_anchor.as_ref() != Some(&expected_anchor)
         || children_of(world, slot.anchor) != expected_children
         || world.get::<ChildOf>(slot.slot).map(ChildOf::parent) != Some(slot.anchor)
         || !validate_stage_registry(world, slot, &old_slot)
@@ -996,6 +1142,13 @@ fn advance_relationship_batch(
             })
         && children_of(world, slot.anchor) == expected_children
         && world.get::<ChildOf>(slot.slot).map(ChildOf::parent) == Some(slot.anchor)
+}
+
+fn child_slot_relationship_runtime_ui_component_ids(world: &mut World) -> [ComponentId; 2] {
+    [
+        world.register_component::<Inherited<ComputedUiTargetCamera>>(),
+        world.register_component::<Inherited<ComputedUiRenderTargetInfo>>(),
+    ]
 }
 
 fn current_exact_manifest(world: &World, slot: &ProvisionalChildSlot) -> Option<ComponentManifest> {
@@ -2003,6 +2156,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn child_slot_relationship_runtime_ui_closure_is_registered_exactly() {
+        let (mut world, _candidate, _top_slot, _engine, frame, _local_index, grant) =
+            realized_parent_with_outlet();
+        world
+            .register_component_hooks::<ChildSlotRelationshipProbe>()
+            .on_insert(|mut world, HookContext { entity, .. }| {
+                world.commands().entity(entity).insert((
+                    Inherited(ComputedUiTargetCamera::default()),
+                    Inherited(ComputedUiRenderTargetInfo::default()),
+                ));
+            });
+
+        let staged = stage_child_slot(&mut world, &frame, &RouteSlotKey::default(), &grant)
+            .expect("known UI propagation components must be included in the locked manifest");
+        let record = world
+            .resource::<RouteEntityRegistry>()
+            .record(staged.slot())
+            .expect("staged slot remains registered");
+        assert!(record.manifest().matches(&world, staged.slot()));
+        assert!(
+            record.manifest().component_ids().contains(
+                &world
+                    .components()
+                    .component_id::<Inherited<ComputedUiTargetCamera>>()
+                    .unwrap()
+            )
+        );
+        assert!(
+            record.manifest().component_ids().contains(
+                &world
+                    .components()
+                    .component_id::<Inherited<ComputedUiRenderTargetInfo>>()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
     fn child_slot_despawn_drift_is_tracked_absent_without_cleanup() {
         let (mut world, _candidate, _top_slot, _engine, frame, _local_index, grant) =
             realized_parent_with_outlet();
@@ -2195,6 +2386,226 @@ pub(crate) mod tests {
                 .record(mounted.slot())
                 .is_some_and(|record| record.manifest().matches(&world, mounted.slot()))
         );
+    }
+
+    fn realized_nested_branch() -> (World, crate::branch_transaction::RealizedBranch) {
+        let (mut world, _candidate, _top_slot, mut engine, parent, _local_index, grant) =
+            realized_parent_with_outlet();
+        let staged =
+            stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant).unwrap();
+        let (attestation, proof) = grant.attest_receipt_with_proof(staged.receipt().digest());
+        let permit = engine.accept_mount_receipt(attestation).unwrap();
+        let mounted = confirm_child_slot(&mut world, &mut engine, staged, permit, &proof).unwrap();
+        let EngineAction::FrameTask(child_task) = engine.action().unwrap() else {
+            panic!("confirmed child slot must issue one child frame task")
+        };
+        let child = realize_child_frame_deferred(
+            &mut world,
+            &parent,
+            &mounted,
+            &child_task,
+            child_task.view_request_sequence(),
+            ContentPlan::new().accept(),
+        )
+        .unwrap_or_else(|_| panic!("exact child task must realize"));
+        let mut branch = crate::branch_transaction::RealizedBranch::empty();
+        branch.push_frame(parent).unwrap();
+        assert!(branch.push_child_slot(mounted).is_ok());
+        branch.push_frame(child).unwrap();
+        (world, branch)
+    }
+
+    #[test]
+    fn publication_rebinds_frame_mount_outlet_and_child_slot_aliases() {
+        let (world, mut branch) = realized_nested_branch();
+        let transitions = branch.lifecycle_transitions(EntityLifecycle::Active, false);
+        let resulting = world
+            .resource::<RouteEntityRegistry>()
+            .prepare_lifecycle_mutation(&transitions)
+            .unwrap()
+            .resulting_claims()
+            .to_vec();
+
+        let prepared = branch
+            .prepare_claim_rebind(
+                &resulting,
+                EntityLifecycle::PreparedInert,
+                EntityLifecycle::Active,
+            )
+            .unwrap();
+        branch.apply_claim_rebind(prepared);
+        assert!(
+            branch
+                .claims()
+                .all(|claim| claim.lifecycle() == EntityLifecycle::Active)
+        );
+        let parent = &branch.frames()[0];
+        let outlet = parent.outlet(&RouteSlotKey::default()).unwrap();
+        assert_eq!(outlet.anchor_claim().lifecycle(), EntityLifecycle::Active);
+        let mounted = &branch.child_slots()[0];
+        assert_eq!(mounted.slot_claim().lifecycle(), EntityLifecycle::Active);
+        assert_eq!(mounted.anchor_claim().lifecycle(), EntityLifecycle::Active);
+        let child_mount = branch.frames()[1].mount_binding();
+        assert_eq!(
+            child_mount.slot_claim().lifecycle(),
+            EntityLifecycle::Active
+        );
+        assert_eq!(
+            child_mount.physical_parent().1.unwrap().lifecycle(),
+            EntityLifecycle::Active
+        );
+    }
+
+    #[test]
+    fn publication_rebind_rejects_wrong_from_or_to_lifecycle_for_all_aliases() {
+        let (world, branch) = realized_nested_branch();
+        let transitions = branch.lifecycle_transitions(EntityLifecycle::Active, false);
+        let correct = world
+            .resource::<RouteEntityRegistry>()
+            .prepare_lifecycle_mutation(&transitions)
+            .unwrap()
+            .resulting_claims()
+            .to_vec();
+        let before = branch.claims().cloned().collect::<Vec<_>>();
+        let parent = &branch.frames()[0];
+        let checked_alias_entities = [
+            parent.shell(),
+            parent.outlet(&RouteSlotKey::default()).unwrap().anchor(),
+            branch.child_slots()[0].slot(),
+        ];
+
+        for entity in checked_alias_entities {
+            let current = branch
+                .claims()
+                .find(|claim| claim.entity() == entity)
+                .unwrap()
+                .clone();
+            let wrong_next = world
+                .resource::<RouteEntityRegistry>()
+                .prepare_lifecycle_mutation(&[(current, EntityLifecycle::Leaving)])
+                .unwrap()
+                .resulting_claims()[0]
+                .clone();
+            let mut claims = correct.clone();
+            *claims
+                .iter_mut()
+                .find(|claim| claim.entity() == entity)
+                .unwrap() = wrong_next;
+            assert!(
+                branch
+                    .prepare_claim_rebind(
+                        &claims,
+                        EntityLifecycle::PreparedInert,
+                        EntityLifecycle::Active,
+                    )
+                    .is_none()
+            );
+            assert_eq!(branch.claims().cloned().collect::<Vec<_>>(), before);
+        }
+
+        assert!(
+            branch
+                .prepare_claim_rebind(&correct, EntityLifecycle::Active, EntityLifecycle::Leaving,)
+                .is_none()
+        );
+        assert_eq!(branch.claims().cloned().collect::<Vec<_>>(), before);
+    }
+
+    #[test]
+    fn mounted_child_slot_alias_rebind_is_atomic() {
+        let (world, branch) = realized_nested_branch();
+        let mounted = branch
+            .child_slots()
+            .into_iter()
+            .next()
+            .unwrap()
+            .clone_for_test();
+        let transitions = branch.lifecycle_transitions(EntityLifecycle::Active, false);
+        let mut resulting = world
+            .resource::<RouteEntityRegistry>()
+            .prepare_lifecycle_mutation(&transitions)
+            .unwrap()
+            .resulting_claims()
+            .to_vec();
+        let anchor_index = resulting
+            .iter()
+            .position(|claim| claim.entity() == mounted.anchor_claim().entity())
+            .unwrap();
+        let anchor_manifest = world
+            .resource::<RouteEntityRegistry>()
+            .record(mounted.anchor())
+            .unwrap()
+            .manifest()
+            .clone();
+        let mut foreign_registry = RouteEntityRegistry::new();
+        let foreign_seal = foreign_registry.issue_seal();
+        foreign_registry
+            .register(
+                mounted.anchor(),
+                mounted.anchor_claim().owner().clone(),
+                foreign_seal,
+                anchor_manifest,
+                EntityLifecycle::Active,
+            )
+            .unwrap();
+        resulting[anchor_index] = foreign_registry.record(mounted.anchor()).unwrap().claim();
+        let slot_before = mounted.slot_claim().clone();
+        let anchor_before = mounted.anchor_claim().clone();
+
+        assert!(!mounted.internal_claims_can_rebind(
+            &resulting,
+            EntityLifecycle::PreparedInert,
+            EntityLifecycle::Active,
+        ));
+        assert_eq!(mounted.slot_claim(), &slot_before);
+        assert_eq!(mounted.anchor_claim(), &anchor_before);
+    }
+
+    #[test]
+    fn missing_mounted_child_slot_alias_is_zero_partial_write() {
+        let (mut world, branch) = realized_nested_branch();
+        let mut mounted = branch
+            .child_slots()
+            .into_iter()
+            .next()
+            .unwrap()
+            .clone_for_test();
+        let transitions = branch.lifecycle_transitions(EntityLifecycle::Active, false);
+        let resulting = world
+            .resource::<RouteEntityRegistry>()
+            .prepare_lifecycle_mutation(&transitions)
+            .unwrap()
+            .resulting_claims()
+            .to_vec();
+        let foreign_entity = world.spawn_empty().id();
+        let anchor_manifest = world
+            .resource::<RouteEntityRegistry>()
+            .record(mounted.anchor())
+            .unwrap()
+            .manifest()
+            .clone();
+        let mut foreign_registry = RouteEntityRegistry::new();
+        let foreign_seal = foreign_registry.issue_seal();
+        foreign_registry
+            .register(
+                foreign_entity,
+                mounted.anchor_claim().owner().clone(),
+                foreign_seal,
+                anchor_manifest,
+                EntityLifecycle::PreparedInert,
+            )
+            .unwrap();
+        mounted.anchor_claim = foreign_registry.record(foreign_entity).unwrap().claim();
+        let slot_before = mounted.slot_claim().clone();
+        let anchor_before = mounted.anchor_claim().clone();
+
+        assert!(!mounted.internal_claims_can_rebind(
+            &resulting,
+            EntityLifecycle::PreparedInert,
+            EntityLifecycle::Active,
+        ));
+        assert_eq!(mounted.slot_claim(), &slot_before);
+        assert_eq!(mounted.anchor_claim(), &anchor_before);
     }
 
     #[test]

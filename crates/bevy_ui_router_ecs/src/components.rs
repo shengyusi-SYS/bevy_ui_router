@@ -94,6 +94,8 @@ impl ChildSlotAuthority {
 pub(crate) enum ChildSlotLifecycle {
     ProvisionalInert,
     RegisteredInert,
+    Active,
+    Leaving,
     Quarantined,
 }
 

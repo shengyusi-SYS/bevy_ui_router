@@ -19,7 +19,7 @@ use crate::{
     },
     input::{RouteFocusState, prepare_focus_mutation},
     mount::{ChildSlotResidual, MountedChildSlot, residual_child_slot_is_isolated},
-    presentation::{FrameContentTarget, FrameLifecycle, FrameOutput, RealizedFrame, settle_frame},
+    presentation::{FrameContentTarget, FrameLifecycle, FrameOutput, RealizedFrame},
     registry::{
         ComponentManifest, EntityLifecycle, EntityOwner, ExactRegistryClaim, ProvisionalOwner,
         QuarantineFacts, QuarantineLeaseTable, RegistryOwner, RouteEntityRegistry,
@@ -62,7 +62,6 @@ const fn reservation_fault_injected() -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CleanupPostcheckPhase {
     VerifiedTransfer,
-    Fallback,
 }
 
 #[cfg(test)]
@@ -81,15 +80,6 @@ impl CleanupPostcheckDrift {
             phase,
             external_parent: Some(parent),
             focus: None,
-            fired: false,
-        }
-    }
-
-    pub(crate) const fn focus(phase: CleanupPostcheckPhase, focus: Entity) -> Self {
-        Self {
-            phase,
-            external_parent: None,
-            focus: Some(focus),
             fired: false,
         }
     }
@@ -308,6 +298,122 @@ impl FrozenCleanupManifest {
     ) -> Option<Self> {
         let claims = frame.claims().cloned().collect::<Vec<_>>();
         Self::from_frame(world, registry, frame, &claims, None)
+    }
+
+    pub(crate) fn from_leaving_branch(
+        world: &World,
+        registry: &RouteEntityRegistry,
+        branch: &RealizedBranch,
+        projected_claims: &[ExactRegistryClaim],
+        successor: Option<&RealizedBranch>,
+    ) -> Option<Self> {
+        if successor.is_some_and(|branch| {
+            branch.frames().is_empty()
+                || branch.child_slots().len().checked_add(1) != Some(branch.frames().len())
+        }) {
+            return None;
+        }
+        Self::from_leaving_branch_parts(
+            world,
+            registry,
+            branch.frames(),
+            branch.child_slots(),
+            projected_claims,
+            successor.and_then(RealizedBranch::first_frame),
+        )
+    }
+
+    fn from_leaving_branch_parts(
+        world: &World,
+        registry: &RouteEntityRegistry,
+        frames: &[RealizedFrame],
+        child_slots: &[MountedChildSlot],
+        projected_claims: &[ExactRegistryClaim],
+        successor_root: Option<&RealizedFrame>,
+    ) -> Option<Self> {
+        if frames.is_empty() {
+            return (child_slots.is_empty() && projected_claims.is_empty()).then(Self::empty);
+        }
+        if child_slots.len().checked_add(1) != Some(frames.len()) {
+            return None;
+        }
+        let obligation_count = frames.iter().try_fold(child_slots.len(), |count, frame| {
+            count.checked_add(frame.obligation_count())
+        })?;
+        let unique = projected_claims
+            .iter()
+            .map(ExactRegistryClaim::entity)
+            .collect::<HashSet<_>>();
+        if projected_claims.len() != obligation_count
+            || unique.len() != projected_claims.len()
+            || projected_claims
+                .iter()
+                .any(|claim| claim.lifecycle() != EntityLifecycle::Leaving)
+        {
+            return None;
+        }
+
+        let mut obligations = Vec::with_capacity(obligation_count);
+        for frame_index in (0..frames.len()).rev() {
+            let frame_projected = frames[frame_index]
+                .claims()
+                .map(|current| {
+                    projected_claims
+                        .iter()
+                        .find(|claim| claim.entity() == current.entity())
+                        .cloned()
+                })
+                .collect::<Option<Vec<_>>>()?;
+            obligations.extend(frame_obligations(
+                registry,
+                &frames[frame_index],
+                &frame_projected,
+            )?);
+            if frame_index > 0 {
+                let slot = &child_slots[frame_index - 1];
+                let projected = projected_claims
+                    .iter()
+                    .find(|claim| claim.entity() == slot.slot())?;
+                obligations.push(mounted_slot_obligation_with_claim(
+                    registry, slot, projected,
+                )?);
+            }
+        }
+        if obligations.len() != obligation_count
+            || obligations
+                .iter()
+                .map(|obligation| obligation.claim.entity())
+                .collect::<HashSet<_>>()
+                .len()
+                != obligation_count
+        {
+            return None;
+        }
+
+        let mut parent_candidates = frames
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                frame_mount_parent_candidate(
+                    frame,
+                    (index == 0).then_some(successor_root).flatten(),
+                )
+            })
+            .collect::<Option<Vec<_>>>()?;
+        parent_candidates.extend(
+            child_slots
+                .iter()
+                .map(mounted_anchor_parent_candidate)
+                .collect::<Option<Vec<_>>>()?,
+        );
+        let mount_parents =
+            freeze_external_mount_parents(world, registry, &obligations, parent_candidates)?;
+        let digest = frozen_manifest_digest(&obligations, &mount_parents);
+        Some(Self {
+            obligations,
+            mount_parents,
+            digest,
+        })
     }
 
     pub(crate) fn from_failed_prepared_branch(
@@ -772,9 +878,15 @@ fn mount_parent_physical_matches(
             outlet,
             slot,
         }) => {
-            record.lifecycle() == EntityLifecycle::PreparedInert
-                && world.get::<ChildSlotLifecycle>(parent.claim.entity())
-                    == Some(&ChildSlotLifecycle::RegisteredInert)
+            let (expected_lifecycle, visibility) = match record.lifecycle() {
+                EntityLifecycle::PreparedInert => {
+                    (ChildSlotLifecycle::RegisteredInert, Visibility::Hidden)
+                }
+                EntityLifecycle::Active => (ChildSlotLifecycle::Active, Visibility::Visible),
+                EntityLifecycle::Leaving => (ChildSlotLifecycle::Leaving, Visibility::Hidden),
+                EntityLifecycle::Quarantined => return false,
+            };
+            world.get::<ChildSlotLifecycle>(parent.claim.entity()) == Some(&expected_lifecycle)
                 && world
                     .get::<ChildSlotAuthority>(parent.claim.entity())
                     .is_some_and(|authority| {
@@ -782,7 +894,7 @@ fn mount_parent_physical_matches(
                             && authority.outlet() == outlet
                             && authority.slot() == *slot
                     })
-                && mount_slot_values_match(world, parent.claim.entity(), Visibility::Hidden)
+                && mount_slot_values_match(world, parent.claim.entity(), visibility)
         }
         RegistryOwner::Committed(EntityOwner::FrameOutput {
             frame, local_index, ..
@@ -889,10 +1001,21 @@ fn mounted_slot_obligation(
     registry: &RouteEntityRegistry,
     slot: &MountedChildSlot,
 ) -> Option<CleanupObligation> {
+    mounted_slot_obligation_with_claim(registry, slot, slot.slot_claim())
+}
+
+fn mounted_slot_obligation_with_claim(
+    registry: &RouteEntityRegistry,
+    slot: &MountedChildSlot,
+    projected: &ExactRegistryClaim,
+) -> Option<CleanupObligation> {
     let record = registry.record(slot.slot())?;
     let anchor_record = registry.record(slot.anchor())?;
     if record.claim() != *slot.slot_claim()
         || anchor_record.claim() != *slot.anchor_claim()
+        || projected.entity() != slot.slot()
+        || projected.owner() != slot.slot_claim().owner()
+        || projected.seal() != slot.slot_claim().seal()
         || !matches!(
             slot.slot_claim().owner(),
             RegistryOwner::Committed(EntityOwner::ChildSlot { parent, outlet, slot: slot_id })
@@ -904,7 +1027,7 @@ fn mounted_slot_obligation(
         return None;
     }
     Some(CleanupObligation {
-        claim: slot.slot_claim().clone(),
+        claim: projected.clone(),
         manifest: record.manifest().clone(),
         expected_parent: slot.anchor(),
         unit_root: slot.slot(),
@@ -1128,19 +1251,6 @@ pub(crate) struct CleanupLedger {
 pub(crate) enum CleanupOwner {
     Leaving(RealizedBranch),
     FailedPrepared(FailedPreparedBranch),
-}
-
-impl CleanupOwner {
-    fn into_single_leaving_frame(self) -> Result<RealizedFrame, Self> {
-        let Self::Leaving(branch) = self else {
-            return Err(self);
-        };
-        match branch.into_single_frame() {
-            Ok(Some(frame)) => Ok(frame),
-            Ok(None) => Err(Self::Leaving(RealizedBranch::empty())),
-            Err(branch) => Err(Self::Leaving(branch)),
-        }
-    }
 }
 
 impl CleanupLedger {
@@ -1694,44 +1804,6 @@ impl CleanupLedger {
                 focus_closure.clone(),
             );
         if !transferred {
-            if self.receipts.iter().all(Option::is_none)
-                && transfer_indices.len() == self.obligations.len()
-            {
-                let Some(owner) = self.owner.take() else {
-                    return false;
-                };
-                let frame = match owner.into_single_leaving_frame() {
-                    Ok(frame) => frame,
-                    Err(owner) => {
-                        self.owner = Some(owner);
-                        return false;
-                    }
-                };
-                match settle_frame(world, frame) {
-                    Ok(()) => {
-                        let Some(focus_roots) = self.terminal_focus_roots(world, &transfer_indices)
-                        else {
-                            return false;
-                        };
-                        self.commit_receipt_batch(quarantine_receipts);
-                        self.remember_post_settlement_focus(focus_roots);
-                        release_cleanup_focus(world, &focus_closure);
-                        #[cfg(test)]
-                        apply_cleanup_postcheck_drift(world, CleanupPostcheckPhase::Fallback);
-                        if !focus_is_released(world, &focus_closure)
-                            || !self.mount_parents_physical_match(world)
-                        {
-                            return false;
-                        }
-                        return true;
-                    }
-                    Err(frame) => {
-                        self.owner = Some(CleanupOwner::Leaving(
-                            RealizedBranch::from_single_frame(frame),
-                        ));
-                    }
-                }
-            }
             return false;
         }
         let Some(focus_roots) = self.terminal_focus_roots(world, &transfer_indices) else {
@@ -2404,6 +2476,12 @@ fn child_slot_components_match_claim(
             RegistryOwner::Committed(EntityOwner::ChildSlot { .. }),
             EntityLifecycle::PreparedInert,
         ) => ChildSlotLifecycle::RegisteredInert,
+        (RegistryOwner::Committed(EntityOwner::ChildSlot { .. }), EntityLifecycle::Active) => {
+            ChildSlotLifecycle::Active
+        }
+        (RegistryOwner::Committed(EntityOwner::ChildSlot { .. }), EntityLifecycle::Leaving) => {
+            ChildSlotLifecycle::Leaving
+        }
         (
             RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { .. })
             | RegistryOwner::Committed(EntityOwner::ChildSlot { .. }),
@@ -2450,6 +2528,20 @@ fn child_slot_components_are_compatible(
             slot,
         }) if claim.lifecycle() == EntityLifecycle::PreparedInert => {
             (ChildSlotLifecycle::RegisteredInert, parent, outlet, *slot)
+        }
+        RegistryOwner::Committed(EntityOwner::ChildSlot {
+            parent,
+            outlet,
+            slot,
+        }) if claim.lifecycle() == EntityLifecycle::Active => {
+            (ChildSlotLifecycle::Active, parent, outlet, *slot)
+        }
+        RegistryOwner::Committed(EntityOwner::ChildSlot {
+            parent,
+            outlet,
+            slot,
+        }) if claim.lifecycle() == EntityLifecycle::Leaving => {
+            (ChildSlotLifecycle::Leaving, parent, outlet, *slot)
         }
         RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
             parent,
@@ -2951,6 +3043,7 @@ impl StructuredDigest {
         self.push(obligation.claim.entity().to_bits());
         self.bytes(format!("{:?}", obligation.claim.owner()).as_bytes());
         self.bytes(format!("{:?}", obligation.claim.seal()).as_bytes());
+        self.bytes(format!("{:?}", obligation.claim.lifecycle()).as_bytes());
         self.push(obligation.manifest.component_ids().len() as u64);
         for component in obligation.manifest.component_ids() {
             self.push(component.index() as u64);
@@ -3025,6 +3118,9 @@ pub(crate) mod tests {
     #[derive(Component)]
     struct ExternalParentDriftMarker;
 
+    #[derive(Component)]
+    struct ForeignBoundaryMarker;
+
     fn published_empty_batch() -> (RouterEngine, CleanupBatch) {
         let view = RouteViewKey::new("root").unwrap();
         let tree = RouteTree::builder()
@@ -3060,6 +3156,8 @@ pub(crate) mod tests {
         assert!(source.contains("next_attempt"));
         assert!(!source.contains("\npub struct CleanupAttempt"));
         assert!(!source.contains("\npub fn complete("));
+        assert!(!source.contains(concat!("fn into_single_", "leaving_frame")));
+        assert!(!source.contains(concat!("match settle_", "frame(world")));
     }
 
     #[test]
@@ -3123,6 +3221,344 @@ pub(crate) mod tests {
         );
     }
 
+    fn projected_leaving_claims(
+        registry: &RouteEntityRegistry,
+        frames: &[RealizedFrame],
+        child_slots: &[MountedChildSlot],
+    ) -> Vec<ExactRegistryClaim> {
+        let mut transitions = Vec::new();
+        for frame_index in (0..frames.len()).rev() {
+            transitions.extend(frames[frame_index].lifecycle_transitions(EntityLifecycle::Leaving));
+            if frame_index > 0 {
+                transitions.push((
+                    child_slots[frame_index - 1].slot_claim().clone(),
+                    EntityLifecycle::Leaving,
+                ));
+            }
+        }
+        registry
+            .prepare_lifecycle_mutation(&transitions)
+            .unwrap()
+            .resulting_claims()
+            .to_vec()
+    }
+
+    #[test]
+    fn nested_leaving_manifest_orders_child_frame_before_slot_and_parent_frame() {
+        let (app, branch, child_entities, child_slot, parent_entities) =
+            crate::navigation::tests::failed_nested_branch_fixture();
+        let registry = app.world().resource::<RouteEntityRegistry>();
+        let projected = projected_leaving_claims(registry, branch.frames(), branch.child_slots());
+
+        let manifest = FrozenCleanupManifest::from_leaving_branch_parts(
+            app.world(),
+            registry,
+            branch.frames(),
+            branch.child_slots(),
+            &projected,
+            None,
+        )
+        .expect("an exact leaving branch must freeze one cleanup manifest");
+        let entities = manifest.entities();
+        let child_end = child_entities
+            .iter()
+            .map(|entity| {
+                entities
+                    .iter()
+                    .position(|candidate| candidate == entity)
+                    .unwrap()
+            })
+            .max()
+            .unwrap();
+        let slot_index = entities
+            .iter()
+            .position(|entity| *entity == child_slot)
+            .unwrap();
+        let parent_start = parent_entities
+            .iter()
+            .map(|entity| {
+                entities
+                    .iter()
+                    .position(|candidate| candidate == entity)
+                    .unwrap()
+            })
+            .min()
+            .unwrap();
+
+        assert!(child_end < slot_index);
+        assert!(slot_index < parent_start);
+        assert_eq!(
+            manifest.len(),
+            branch
+                .frames()
+                .iter()
+                .map(RealizedFrame::obligation_count)
+                .sum::<usize>()
+                + branch.child_slots().len()
+        );
+    }
+
+    #[test]
+    fn nested_leaving_manifest_rejects_non_leaving_or_incomplete_projection() {
+        let (app, branch, _child_entities, _child_slot, _parent_entities) =
+            crate::navigation::tests::failed_nested_branch_fixture();
+        let registry = app.world().resource::<RouteEntityRegistry>();
+        let mut projected =
+            projected_leaving_claims(registry, branch.frames(), branch.child_slots());
+        projected.pop();
+
+        assert!(
+            FrozenCleanupManifest::from_leaving_branch_parts(
+                app.world(),
+                registry,
+                branch.frames(),
+                branch.child_slots(),
+                &projected,
+                None,
+            )
+            .is_none()
+        );
+
+        let active = registry
+            .prepare_lifecycle_mutation(&[(
+                branch.child_slots()[0].slot_claim().clone(),
+                EntityLifecycle::Active,
+            )])
+            .unwrap()
+            .resulting_claims()[0]
+            .clone();
+        let mut projected =
+            projected_leaving_claims(registry, branch.frames(), branch.child_slots());
+        let child_slot = branch.child_slots()[0].slot();
+        *projected
+            .iter_mut()
+            .find(|claim| claim.entity() == child_slot)
+            .unwrap() = active;
+
+        assert!(
+            FrozenCleanupManifest::from_leaving_branch_parts(
+                app.world(),
+                registry,
+                branch.frames(),
+                branch.child_slots(),
+                &projected,
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn nested_leaving_cleanup_settles_exact_slot_and_preserves_external_host() {
+        let (mut app, branch, _child_entities, child_slot, _parent_entities) =
+            crate::navigation::tests::failed_nested_branch_fixture();
+        let top_slot = branch.frames()[0].top_slot();
+        let app_host = app.world().get::<ChildOf>(top_slot).unwrap().parent();
+        let projected = projected_leaving_claims(
+            app.world().resource::<RouteEntityRegistry>(),
+            branch.frames(),
+            branch.child_slots(),
+        );
+        let manifest = FrozenCleanupManifest::from_leaving_branch_parts(
+            app.world(),
+            app.world().resource::<RouteEntityRegistry>(),
+            branch.frames(),
+            branch.child_slots(),
+            &projected,
+            None,
+        )
+        .unwrap();
+        let obligation_count = manifest.len();
+        let transitions = branch
+            .frames()
+            .iter()
+            .flat_map(|frame| frame.lifecycle_transitions(EntityLifecycle::Leaving))
+            .chain(
+                branch
+                    .child_slots()
+                    .iter()
+                    .map(|slot| (slot.slot_claim().clone(), EntityLifecycle::Leaving)),
+            )
+            .collect::<Vec<_>>();
+        let registry_plan = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .prepare_lifecycle_mutation(&transitions)
+            .unwrap();
+        for frame in branch.frames() {
+            for claim in frame.claims() {
+                app.world_mut()
+                    .entity_mut(claim.entity())
+                    .insert(FrameLifecycle(EntityLifecycle::Leaving));
+            }
+        }
+        app.world_mut()
+            .entity_mut(child_slot)
+            .insert(ChildSlotLifecycle::Leaving);
+        registry_plan.apply(
+            app.world_mut()
+                .resource_mut::<RouteEntityRegistry>()
+                .into_inner(),
+        );
+        app.world_mut().flush();
+        let prepared = CleanupLedger::reserve(manifest).unwrap();
+        let mut ledger = CleanupLedger::activate(prepared, None);
+        let attempt = ledger.attempt(app.world()).unwrap();
+
+        assert!(ledger.settle(app.world_mut(), attempt));
+        assert_eq!(ledger.receipt_count(), obligation_count);
+        assert!(app.world().get_entity(top_slot).is_ok());
+        assert!(app.world().get_entity(app_host).is_ok());
+    }
+
+    #[test]
+    fn nested_failed_cleanup_only_crosses_the_frozen_exact_owner_boundary() {
+        let (mut app, branch, _child_entities, _child_slot, _parent_entities) =
+            crate::navigation::tests::failed_nested_branch_fixture();
+        let top_slot = branch.frames()[0].top_slot();
+        let app_host = app.world().get::<ChildOf>(top_slot).unwrap().parent();
+        let foreign = app
+            .world_mut()
+            .spawn((ForeignBoundaryMarker, ChildOf(app_host)))
+            .id();
+        let sibling_router = registered_entity(app.world_mut(), app_host);
+        app.world_mut().flush();
+        let sibling_claim = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(sibling_router)
+            .unwrap()
+            .claim();
+        let owned = branch
+            .frames()
+            .iter()
+            .flat_map(|frame| frame.claims().map(ExactRegistryClaim::entity))
+            .chain(branch.child_slots().iter().map(MountedChildSlot::slot))
+            .collect::<Vec<_>>();
+        let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+            app.world(),
+            app.world().resource::<RouteEntityRegistry>(),
+            &branch,
+        )
+        .unwrap();
+        let prepared = CleanupLedger::reserve(manifest).unwrap();
+        let mut ledger = CleanupLedger::activate_failed(prepared, branch);
+        let attempt = ledger.attempt(app.world()).unwrap();
+
+        assert!(ledger.settle(app.world_mut(), attempt));
+        assert!(
+            owned
+                .iter()
+                .all(|entity| app.world().get_entity(*entity).is_err())
+        );
+        assert!(app.world().get_entity(app_host).is_ok());
+        assert!(app.world().get_entity(top_slot).is_ok());
+        assert!(app.world().get::<ForeignBoundaryMarker>(foreign).is_some());
+        assert_eq!(
+            app.world().get::<ChildOf>(foreign).map(ChildOf::parent),
+            Some(app_host)
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(sibling_router)
+                .map(|record| record.claim()),
+            Some(sibling_claim)
+        );
+        assert_eq!(
+            app.world()
+                .get::<ChildOf>(sibling_router)
+                .map(ChildOf::parent),
+            Some(app_host)
+        );
+    }
+
+    #[test]
+    fn nested_cleanup_exact_claim_drift_in_each_unit_is_world_zero() {
+        for unit in 0..3 {
+            let (mut app, branch, _child_entities, child_slot, _parent_entities) =
+                crate::navigation::tests::failed_nested_branch_fixture();
+            let target = match unit {
+                0 => branch.frames()[1].shell(),
+                1 => child_slot,
+                2 => branch.frames()[0].shell(),
+                _ => unreachable!(),
+            };
+            let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                app.world(),
+                app.world().resource::<RouteEntityRegistry>(),
+                &branch,
+            )
+            .unwrap();
+            let prepared = CleanupLedger::reserve(manifest).unwrap();
+            let mut ledger = CleanupLedger::activate_failed(prepared, branch);
+            let frozen_claim = ledger
+                .obligations
+                .iter()
+                .find(|obligation| obligation.claim.entity() == target)
+                .unwrap()
+                .claim
+                .clone();
+            let drifted_claim = app
+                .world_mut()
+                .resource_mut::<RouteEntityRegistry>()
+                .compare_exchange_lifecycle(&frozen_claim, EntityLifecycle::Quarantined)
+                .unwrap();
+            *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(target);
+            app.world_mut()
+                .resource_mut::<RouteFocusState>()
+                .set_focused(Some(target));
+            let registry_before = app
+                .world()
+                .resource::<RouteEntityRegistry>()
+                .records()
+                .to_vec();
+            let world_before = app
+                .world()
+                .iter_entities()
+                .map(|entity| (entity.id(), entity.archetype().components().to_vec()))
+                .collect::<Vec<_>>();
+            let attempt = ledger.attempt(app.world()).unwrap();
+            let obligation = ledger
+                .obligations
+                .iter()
+                .position(|obligation| obligation.claim.entity() == target)
+                .unwrap();
+
+            assert!(
+                attempt
+                    .evidence
+                    .contains(&(obligation, CleanupEvidence::StaleClaim))
+            );
+            assert!(!ledger.settle(app.world_mut(), attempt));
+            assert_eq!(ledger.receipt_count(), 0);
+            assert_eq!(ledger.failed_prepared_frames().len(), 2);
+            assert_eq!(app.world().resource::<InputFocus>().get(), Some(target));
+            assert_eq!(
+                app.world().resource::<RouteFocusState>().focused(),
+                Some(target)
+            );
+            assert_eq!(
+                app.world().resource::<RouteEntityRegistry>().records(),
+                registry_before
+            );
+            assert_eq!(
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(target)
+                    .map(|record| record.claim()),
+                Some(drifted_claim)
+            );
+            assert_eq!(
+                app.world()
+                    .iter_entities()
+                    .map(|entity| (entity.id(), entity.archetype().components().to_vec()))
+                    .collect::<Vec<_>>(),
+                world_before
+            );
+        }
+    }
+
     #[test]
     fn failed_prepared_branch_manifest_survives_child_slot_relationship_drift() {
         let (mut app, branch, _child_entities, child_slot, _parent_entities) =
@@ -3180,6 +3616,48 @@ pub(crate) mod tests {
                 .claim(),
             exact_claim
         );
+    }
+
+    #[test]
+    fn nested_cleanup_accepts_exact_active_and_leaving_child_slot_claims() {
+        let (app, _branch, _child_entities, child_slot, _parent_entities) =
+            crate::navigation::tests::failed_nested_branch_fixture();
+        let registry = app.world().resource::<RouteEntityRegistry>();
+        let current = registry.record(child_slot).unwrap().claim();
+        let active = registry
+            .prepare_lifecycle_mutation(&[(current.clone(), EntityLifecycle::Active)])
+            .unwrap()
+            .resulting_claims()[0]
+            .clone();
+        let leaving = registry
+            .prepare_lifecycle_mutation(&[(current, EntityLifecycle::Leaving)])
+            .unwrap()
+            .resulting_claims()[0]
+            .clone();
+        let authority = app.world().get::<ChildSlotAuthority>(child_slot);
+
+        assert!(child_slot_components_match_claim(
+            Some(&ChildSlotLifecycle::Active),
+            authority,
+            &active,
+        ));
+        assert!(child_slot_components_match_claim(
+            Some(&ChildSlotLifecycle::Leaving),
+            authority,
+            &leaving,
+        ));
+        assert!(child_slot_components_are_compatible(
+            Some(&ChildSlotLifecycle::Active),
+            authority,
+            &active,
+            false,
+        ));
+        assert!(child_slot_components_are_compatible(
+            Some(&ChildSlotLifecycle::Leaving),
+            authority,
+            &leaving,
+            false,
+        ));
     }
 
     fn single_frame_cleanup_ledger(world: &World, frame: &RealizedFrame) -> CleanupLedger {
@@ -3808,6 +4286,30 @@ pub(crate) mod tests {
         for (index, value) in values.iter().enumerate() {
             assert!(!values[index + 1..].contains(value));
         }
+    }
+
+    #[test]
+    fn nested_cleanup_obligation_digest_binds_exact_claim_lifecycle() {
+        let mut world = World::new();
+        world.insert_resource(RouteEntityRegistry::new());
+        world.insert_resource(QuarantineLeaseTable::new());
+        let parent = world.spawn_empty().id();
+        let entity = registered_entity(&mut world, parent);
+        let ledger = one_entity_failure_ledger(&mut world, entity, parent);
+        let prepared = ledger.obligations[0].clone();
+        let quarantined_claim = world
+            .resource::<RouteEntityRegistry>()
+            .prepare_lifecycle_mutation(&[(prepared.claim.clone(), EntityLifecycle::Quarantined)])
+            .unwrap()
+            .resulting_claims()[0]
+            .clone();
+        let mut quarantined = prepared.clone();
+        quarantined.claim = quarantined_claim;
+
+        assert_ne!(
+            manifest_digest(&[prepared]),
+            manifest_digest(&[quarantined])
+        );
     }
 
     #[test]

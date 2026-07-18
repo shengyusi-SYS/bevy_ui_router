@@ -28,9 +28,13 @@ use crate::{
     registry::{
         ComponentManifest, EntityLifecycle, EntityOwner, ExactRegistryClaim, QuarantineFacts,
         QuarantineLeaseTable, RegistryOwner, RouteEntityRegistry,
-        apply_prepared_quarantine_transfer, apply_prepared_unresolved_residual_transfer,
-        prepare_unresolved_residual_transfer, prepare_verified_frame_quarantine_transfer,
     },
+};
+
+#[cfg(test)]
+use crate::registry::{
+    apply_prepared_quarantine_transfer, apply_prepared_unresolved_residual_transfer,
+    prepare_unresolved_residual_transfer, prepare_verified_frame_quarantine_transfer,
 };
 
 #[cfg(test)]
@@ -118,6 +122,42 @@ impl FrameMountBinding {
                     && anchor_claim == mounted.anchor_claim()
                     && expected_anchor_children == mounted.expected_anchor_children()
             )
+    }
+
+    fn internal_claims_can_rebind(
+        &self,
+        claims: &[ExactRegistryClaim],
+        expected_current: EntityLifecycle,
+        expected_next: EntityLifecycle,
+    ) -> bool {
+        match &self.kind {
+            FrameMountBindingKind::HostTop { .. } => optional_claim_alias_can_rebind(
+                &self.slot_claim,
+                claims,
+                expected_current,
+                expected_next,
+            ),
+            FrameMountBindingKind::ChildOutlet { anchor_claim, .. } => {
+                required_claim_alias_can_rebind(
+                    &self.slot_claim,
+                    claims,
+                    expected_current,
+                    expected_next,
+                ) && required_claim_alias_can_rebind(
+                    anchor_claim,
+                    claims,
+                    expected_current,
+                    expected_next,
+                )
+            }
+        }
+    }
+
+    fn apply_internal_claim_rebind(&mut self, claims: &[ExactRegistryClaim]) {
+        apply_claim_alias_rebind(&mut self.slot_claim, claims);
+        if let FrameMountBindingKind::ChildOutlet { anchor_claim, .. } = &mut self.kind {
+            apply_claim_alias_rebind(anchor_claim, claims);
+        }
     }
 
     #[cfg(test)]
@@ -264,6 +304,19 @@ impl RealizedOutlet {
     pub(crate) const fn anchor_claim(&self) -> &ExactRegistryClaim {
         &self.anchor_claim
     }
+
+    fn claim_can_rebind(
+        &self,
+        claims: &[ExactRegistryClaim],
+        expected_current: EntityLifecycle,
+        expected_next: EntityLifecycle,
+    ) -> bool {
+        required_claim_alias_can_rebind(&self.anchor_claim, claims, expected_current, expected_next)
+    }
+
+    fn apply_claim_rebind(&mut self, claims: &[ExactRegistryClaim]) {
+        apply_claim_alias_rebind(&mut self.anchor_claim, claims);
+    }
 }
 
 #[derive(Debug)]
@@ -279,6 +332,10 @@ pub(crate) struct RealizedFrame {
     prewrite_complete: bool,
 }
 
+pub(crate) struct PreparedFrameMountRebase {
+    prior_mount_children: Vec<Entity>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FrameMountStage {
     ShellAllocated,
@@ -292,6 +349,7 @@ pub(crate) struct VerifiedFrameQuarantineTransfer {
 }
 
 impl VerifiedFrameQuarantineTransfer {
+    #[cfg(test)]
     fn after_world_validation(
         claims: Vec<ExactRegistryClaim>,
         manifests: Vec<(Entity, ComponentManifest)>,
@@ -322,13 +380,28 @@ pub(crate) struct FrameMutationTarget {
     next: EntityLifecycle,
     active_after: bool,
     interactive: bool,
+    kind: PresentationTargetKind,
+}
+
+#[derive(Clone, Copy)]
+enum PresentationTargetKind {
+    Frame,
+    ChildSlot,
+}
+
+enum PreparedLifecycleMutation<'w> {
+    Frame(Mut<'w, FrameLifecycle>),
+    ChildSlot(Mut<'w, ChildSlotLifecycle>),
 }
 
 struct PreparedEntityMutation<'w> {
+    #[cfg(test)]
+    entity: Entity,
     visibility: Mut<'w, Visibility>,
     pickable: Mut<'w, Pickable>,
     barrier: Mut<'w, RouterInputBarrier>,
-    lifecycle: Mut<'w, FrameLifecycle>,
+    lifecycle: PreparedLifecycleMutation<'w>,
+    current: EntityLifecycle,
     next: EntityLifecycle,
     active_after: bool,
     interactive: bool,
@@ -338,39 +411,258 @@ pub(crate) struct PreparedPresentationMutation<'w> {
     entities: Vec<(usize, PreparedEntityMutation<'w>)>,
 }
 
-impl PreparedPresentationMutation<'_> {
-    pub(crate) fn apply(self) {
-        let entity_count = self.entities.len();
-        self.apply_with_split(entity_count, || {});
+pub(crate) struct PreparedCommitPresentationMutation<'w> {
+    entities: Vec<(usize, PreparedEntityMutation<'w>)>,
+    split_at: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TestCommitMutation {
+    Leaving(Entity),
+    Entering(Entity),
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_COMMIT_MUTATIONS: std::cell::RefCell<Option<Vec<TestCommitMutation>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn arm_test_commit_mutation_trace() {
+    TEST_COMMIT_MUTATIONS.with(|trace| *trace.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_commit_mutation_trace() -> Vec<TestCommitMutation> {
+    TEST_COMMIT_MUTATIONS.with(|trace| trace.borrow_mut().take().unwrap_or_default())
+}
+
+#[cfg(test)]
+fn record_test_commit_mutation(entity: Entity, next: EntityLifecycle) {
+    TEST_COMMIT_MUTATIONS.with(|trace| {
+        let mut trace = trace.borrow_mut();
+        let Some(trace) = trace.as_mut() else {
+            return;
+        };
+        match next {
+            EntityLifecycle::Leaving => trace.push(TestCommitMutation::Leaving(entity)),
+            EntityLifecycle::Active => trace.push(TestCommitMutation::Entering(entity)),
+            EntityLifecycle::PreparedInert | EntityLifecycle::Quarantined => {}
+        }
+    });
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct CommitPresentationState<'a, 'w> {
+    leaving: &'a [(usize, PreparedEntityMutation<'w>)],
+    entering: &'a [(usize, PreparedEntityMutation<'w>)],
+}
+
+impl PreparedLifecycleMutation<'_> {
+    fn apply(&mut self, next: EntityLifecycle) {
+        match self {
+            Self::Frame(lifecycle) => **lifecycle = FrameLifecycle(next),
+            Self::ChildSlot(lifecycle) => **lifecycle = child_slot_lifecycle(next),
+        }
     }
 
-    pub(crate) fn apply_with_split(self, split_at: usize, between: impl FnOnce()) {
-        let mut entities = self.entities;
-        let entering = entities.split_off(split_at);
-        Self::apply_entities(entities);
-        between();
-        Self::apply_entities(entering);
+    #[cfg(test)]
+    fn matches(&self, expected: EntityLifecycle) -> bool {
+        match self {
+            Self::Frame(lifecycle) => lifecycle.0 == expected,
+            Self::ChildSlot(lifecycle) => **lifecycle == child_slot_lifecycle(expected),
+        }
+    }
+}
+
+impl PreparedEntityMutation<'_> {
+    fn apply_final(&mut self) {
+        *self.visibility = if self.active_after {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+        self.apply_capabilities();
+        self.lifecycle.apply(self.next);
     }
 
-    fn apply_entities(entities: Vec<(usize, PreparedEntityMutation<'_>)>) {
-        for (_, mut entity) in entities {
-            *entity.visibility = if entity.active_after {
+    fn apply_base_activation(&mut self) {
+        *self.visibility = if self.active_after {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+        self.lifecycle.apply(self.next);
+    }
+
+    fn apply_capabilities(&mut self) {
+        *self.pickable = if self.active_after && self.interactive {
+            ACTIVE_PICKABLE
+        } else {
+            Pickable::IGNORE
+        };
+        *self.barrier = if self.active_after && self.interactive {
+            RouterInputBarrier::allow_all()
+        } else {
+            RouterInputBarrier::deny_all()
+        };
+    }
+
+    #[cfg(test)]
+    fn is_prepared_inert(&self) -> bool {
+        *self.visibility == Visibility::Hidden
+            && *self.pickable == Pickable::IGNORE
+            && self.barrier.denies_all()
+            && self.lifecycle.matches(self.current)
+    }
+
+    #[cfg(test)]
+    fn is_base_active(&self) -> bool {
+        *self.visibility
+            == if self.active_after {
                 Visibility::Visible
             } else {
                 Visibility::Hidden
-            };
-            *entity.pickable = if entity.active_after && entity.interactive {
-                ACTIVE_PICKABLE
+            }
+            && self.lifecycle.matches(self.next)
+    }
+
+    #[cfg(test)]
+    fn is_final(&self) -> bool {
+        *self.visibility
+            == if self.active_after {
+                Visibility::Visible
             } else {
-                Pickable::IGNORE
-            };
-            *entity.barrier = if entity.active_after && entity.interactive {
-                RouterInputBarrier::allow_all()
+                Visibility::Hidden
+            }
+            && *self.pickable
+                == if self.active_after && self.interactive {
+                    ACTIVE_PICKABLE
+                } else {
+                    Pickable::IGNORE
+                }
+            && if self.active_after && self.interactive {
+                self.barrier.allows_all()
             } else {
-                RouterInputBarrier::deny_all()
-            };
-            *entity.lifecycle = FrameLifecycle(entity.next);
+                self.barrier.denies_all()
+            }
+            && self.lifecycle.matches(self.next)
+    }
+}
+
+impl<'w> PreparedPresentationMutation<'w> {
+    pub(crate) fn apply(self) {
+        for (_, mut entity) in self.entities {
+            entity.apply_final();
         }
+    }
+
+    pub(crate) fn seal_commit(
+        self,
+        split_at: usize,
+    ) -> Option<PreparedCommitPresentationMutation<'w>> {
+        let valid = split_at <= self.entities.len()
+            && self
+                .entities
+                .iter()
+                .enumerate()
+                .all(|(position, (index, entity))| {
+                    *index == position
+                        && if position < split_at {
+                            entity.current == EntityLifecycle::Active
+                                && entity.next == EntityLifecycle::Leaving
+                                && !entity.active_after
+                        } else {
+                            entity.current == EntityLifecycle::PreparedInert
+                                && entity.next == EntityLifecycle::Active
+                                && entity.active_after
+                        }
+                });
+        valid.then_some(PreparedCommitPresentationMutation {
+            entities: self.entities,
+            split_at,
+        })
+    }
+}
+
+impl<'w> PreparedCommitPresentationMutation<'w> {
+    fn state(&self) -> CommitPresentationState<'_, 'w> {
+        let (leaving, entering) = self.entities.split_at(self.split_at);
+        CommitPresentationState { leaving, entering }
+    }
+
+    pub(crate) fn apply_staged(
+        mut self,
+        focus: impl FnOnce(CommitPresentationState<'_, 'w>),
+        registry: impl FnOnce(CommitPresentationState<'_, 'w>),
+        gate: impl FnOnce(CommitPresentationState<'_, 'w>),
+    ) {
+        for (_, entity) in &mut self.entities[..self.split_at] {
+            #[cfg(test)]
+            record_test_commit_mutation(entity.entity, entity.next);
+            entity.apply_final();
+        }
+        focus(self.state());
+        for (_, entity) in &mut self.entities[self.split_at..] {
+            #[cfg(test)]
+            record_test_commit_mutation(entity.entity, entity.next);
+            entity.apply_base_activation();
+        }
+        registry(self.state());
+        for (_, entity) in &mut self.entities[self.split_at..] {
+            entity.apply_capabilities();
+        }
+        gate(self.state());
+    }
+}
+
+#[cfg(test)]
+impl CommitPresentationState<'_, '_> {
+    pub(crate) fn leaving_is_isolated(&self) -> bool {
+        self.leaving.iter().all(|(_, entity)| entity.is_final())
+    }
+
+    pub(crate) fn entering_is_prepared_inert(&self) -> bool {
+        self.entering
+            .iter()
+            .all(|(_, entity)| entity.is_prepared_inert())
+    }
+
+    pub(crate) fn entering_base_is_active(&self) -> bool {
+        self.entering
+            .iter()
+            .all(|(_, entity)| entity.is_base_active())
+    }
+
+    pub(crate) fn entering_capabilities_are_active(&self) -> bool {
+        self.entering.iter().all(|(_, entity)| entity.is_final())
+    }
+}
+
+const fn child_slot_lifecycle(lifecycle: EntityLifecycle) -> ChildSlotLifecycle {
+    match lifecycle {
+        EntityLifecycle::PreparedInert => ChildSlotLifecycle::RegisteredInert,
+        EntityLifecycle::Active => ChildSlotLifecycle::Active,
+        EntityLifecycle::Leaving => ChildSlotLifecycle::Leaving,
+        EntityLifecycle::Quarantined => ChildSlotLifecycle::Quarantined,
+    }
+}
+
+pub(crate) fn child_slot_mutation_target(
+    slot: &MountedChildSlot,
+    current: EntityLifecycle,
+    next: EntityLifecycle,
+    active_after: bool,
+) -> FrameMutationTarget {
+    FrameMutationTarget {
+        entity: slot.slot(),
+        current,
+        next,
+        active_after,
+        interactive: false,
+        kind: PresentationTargetKind::ChildSlot,
     }
 }
 
@@ -399,7 +691,7 @@ impl RealizedFrame {
         matches!(self.mount_stage, FrameMountStage::ShellAttached)
     }
 
-    pub(crate) fn rebase_mount_after_replacing(&mut self, leaving: &Self) -> bool {
+    pub(crate) fn prepare_mount_rebase(&self, leaving: &Self) -> Option<PreparedFrameMountRebase> {
         let mut expected_prior = leaving.prior_mount_children.clone();
         expected_prior.push(leaving.shell);
         if !self.shell_is_attached()
@@ -407,10 +699,15 @@ impl RealizedFrame {
             || self.mount != leaving.mount
             || self.prior_mount_children != expected_prior
         {
-            return false;
+            return None;
         }
-        self.prior_mount_children = leaving.prior_mount_children.clone();
-        true
+        Some(PreparedFrameMountRebase {
+            prior_mount_children: leaving.prior_mount_children.clone(),
+        })
+    }
+
+    pub(crate) fn apply_mount_rebase(&mut self, prepared: PreparedFrameMountRebase) {
+        self.prior_mount_children = prepared.prior_mount_children;
     }
 
     pub(crate) fn expected_owned_children(&self, parent: Entity) -> Vec<Entity> {
@@ -471,6 +768,7 @@ impl RealizedFrame {
                 next,
                 active_after,
                 interactive: entity.role == RealizedRole::SolidRect,
+                kind: PresentationTargetKind::Frame,
             })
             .collect()
     }
@@ -485,9 +783,45 @@ impl RealizedFrame {
             .collect()
     }
 
-    pub(crate) fn replace_claims(&mut self, claims: &[ExactRegistryClaim]) {
+    fn apply_primary_claim_rebind(&mut self, claims: &[ExactRegistryClaim]) {
         for (entity, claim) in self.entities.iter_mut().zip(claims) {
             entity.claim = claim.clone();
+        }
+    }
+
+    pub(crate) fn claims_can_rebind(
+        &self,
+        primary_claims: &[ExactRegistryClaim],
+        all_claims: &[ExactRegistryClaim],
+        expected_current: EntityLifecycle,
+        expected_next: EntityLifecycle,
+    ) -> bool {
+        primary_claims.len() == self.entities.len()
+            && self
+                .entities
+                .iter()
+                .zip(primary_claims)
+                .all(|(entity, claim)| {
+                    claim_rebind_is_exact(&entity.claim, claim, expected_current, expected_next)
+                })
+            && self
+                .mount
+                .internal_claims_can_rebind(all_claims, expected_current, expected_next)
+            && self
+                .outlets
+                .iter()
+                .all(|outlet| outlet.claim_can_rebind(all_claims, expected_current, expected_next))
+    }
+
+    pub(crate) fn apply_claim_rebind(
+        &mut self,
+        primary_claims: &[ExactRegistryClaim],
+        all_claims: &[ExactRegistryClaim],
+    ) {
+        self.apply_primary_claim_rebind(primary_claims);
+        self.mount.apply_internal_claim_rebind(all_claims);
+        for outlet in &mut self.outlets {
+            outlet.apply_claim_rebind(all_claims);
         }
     }
 
@@ -498,6 +832,52 @@ impl RealizedFrame {
         self.entities
             .iter()
             .filter_map(|entity| entity.solid_rect.map(|rect| (entity.entity, rect)))
+    }
+}
+
+pub(crate) fn claim_rebind_is_exact(
+    current: &ExactRegistryClaim,
+    next: &ExactRegistryClaim,
+    expected_current: EntityLifecycle,
+    expected_next: EntityLifecycle,
+) -> bool {
+    current.entity() == next.entity()
+        && current.owner() == next.owner()
+        && current.seal() == next.seal()
+        && current.lifecycle() == expected_current
+        && next.lifecycle() == expected_next
+}
+
+fn required_claim_alias_can_rebind(
+    current: &ExactRegistryClaim,
+    claims: &[ExactRegistryClaim],
+    expected_current: EntityLifecycle,
+    expected_next: EntityLifecycle,
+) -> bool {
+    claims
+        .iter()
+        .find(|claim| claim.entity() == current.entity())
+        .is_some_and(|next| claim_rebind_is_exact(current, next, expected_current, expected_next))
+}
+
+fn optional_claim_alias_can_rebind(
+    current: &ExactRegistryClaim,
+    claims: &[ExactRegistryClaim],
+    expected_current: EntityLifecycle,
+    expected_next: EntityLifecycle,
+) -> bool {
+    claims
+        .iter()
+        .find(|claim| claim.entity() == current.entity())
+        .is_none_or(|next| claim_rebind_is_exact(current, next, expected_current, expected_next))
+}
+
+fn apply_claim_alias_rebind(current: &mut ExactRegistryClaim, claims: &[ExactRegistryClaim]) {
+    if let Some(next) = claims
+        .iter()
+        .find(|claim| claim.entity() == current.entity())
+    {
+        *current = next.clone();
     }
 }
 
@@ -942,6 +1322,52 @@ fn validate_mount_binding_allowing_additions(
             expected_anchor_children,
             frame,
             allowed_manifest_additions,
+            false,
+            EntityLifecycle::PreparedInert,
+            ChildSlotLifecycle::RegisteredInert,
+            Visibility::Hidden,
+        ),
+    }
+}
+
+fn validate_committed_mount_binding(
+    world: &World,
+    host_candidate: &ValidatedHostCandidate,
+    mount: &FrameMountBinding,
+    frame: &RouteFrameVersion,
+    allow_leaving_child_boundary_drift: bool,
+) -> Result<(), RealizationError> {
+    match &mount.kind {
+        FrameMountBindingKind::HostTop { .. } => validate_top_slot(
+            world,
+            host_candidate,
+            mount.slot,
+            &mount.slot_claim,
+            frame,
+            &[],
+        ),
+        FrameMountBindingKind::ChildOutlet {
+            parent,
+            outlet,
+            anchor,
+            anchor_claim,
+            expected_anchor_children,
+        } => validate_child_mount_slot(
+            world,
+            host_candidate,
+            mount.slot,
+            &mount.slot_claim,
+            parent,
+            outlet,
+            *anchor,
+            anchor_claim,
+            expected_anchor_children,
+            frame,
+            &[],
+            allow_leaving_child_boundary_drift,
+            EntityLifecycle::Active,
+            ChildSlotLifecycle::Active,
+            Visibility::Visible,
         ),
     }
 }
@@ -959,6 +1385,10 @@ fn validate_child_mount_slot(
     expected_anchor_children: &[Entity],
     frame: &RouteFrameVersion,
     allowed_manifest_additions: &[ComponentId],
+    allow_arbitrary_manifest_additions: bool,
+    expected_registry_lifecycle: EntityLifecycle,
+    expected_component_lifecycle: ChildSlotLifecycle,
+    expected_visibility: Visibility,
 ) -> Result<(), RealizationError> {
     let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
         return Err(RealizationError::InvalidMount);
@@ -993,23 +1423,26 @@ fn validate_child_mount_slot(
         || frame.host() != parent.host()
         || slot_record.claim() != *slot_claim
         || !owner_is_exact
-        || slot_record.lifecycle() != EntityLifecycle::PreparedInert
-        || !manifest_matches_allowing_additions(
-            world,
-            slot_entity,
-            slot_record.manifest(),
-            allowed_manifest_additions,
-        )
+        || slot_record.lifecycle() != expected_registry_lifecycle
+        || !(if allow_arbitrary_manifest_additions {
+            manifest_contains_expected(world, slot_entity, slot_record.manifest())
+        } else {
+            manifest_matches_allowing_additions(
+                world,
+                slot_entity,
+                slot_record.manifest(),
+                allowed_manifest_additions,
+            )
+        })
         || world.get::<RouteOwnershipSeal>(slot_entity)
             != Some(&RouteOwnershipSeal::new(slot_record.seal()))
-        || world.get::<Visibility>(slot_entity) != Some(&Visibility::Hidden)
+        || world.get::<Visibility>(slot_entity) != Some(&expected_visibility)
         || world.get::<Pickable>(slot_entity) != Some(&Pickable::IGNORE)
         || !world
             .get::<RouterInputBarrier>(slot_entity)
             .is_some_and(RouterInputBarrier::denies_all)
         || world.get::<Node>(slot_entity) != Some(&expected_node)
-        || world.get::<ChildSlotLifecycle>(slot_entity)
-            != Some(&ChildSlotLifecycle::RegisteredInert)
+        || world.get::<ChildSlotLifecycle>(slot_entity) != Some(&expected_component_lifecycle)
         || !world
             .get::<ChildSlotAuthority>(slot_entity)
             .is_some_and(|authority| {
@@ -1020,7 +1453,11 @@ fn validate_child_mount_slot(
         || world.get::<ChildOf>(slot_entity).map(ChildOf::parent) != Some(anchor)
         || anchor_record.claim() != *anchor_claim
         || !anchor_owner_is_exact
-        || !anchor_record.manifest().matches(world, anchor)
+        || !(if allow_arbitrary_manifest_additions {
+            manifest_contains_expected(world, anchor, anchor_record.manifest())
+        } else {
+            anchor_record.manifest().matches(world, anchor)
+        })
         || world.get::<RouteOwnershipSeal>(anchor)
             != Some(&RouteOwnershipSeal::new(anchor_record.seal()))
         || world
@@ -1033,6 +1470,15 @@ fn validate_child_mount_slot(
         return Err(RealizationError::InvalidMount);
     }
     Ok(())
+}
+
+fn manifest_contains_expected(world: &World, entity: Entity, expected: &ComponentManifest) -> bool {
+    ComponentManifest::from_world(world, entity).is_some_and(|actual| {
+        expected
+            .component_ids()
+            .iter()
+            .all(|component| actual.component_ids().contains(component))
+    })
 }
 
 fn validate_top_slot(
@@ -1512,7 +1958,6 @@ pub(crate) fn validate_realized_frame(world: &World, frame: &RealizedFrame) -> b
     validate_realized_frame_allowing_child_slots(world, frame, &[])
 }
 
-#[cfg(feature = "test-support")]
 pub(crate) fn validate_realized_frame_with_child_slots(
     world: &World,
     frame: &RealizedFrame,
@@ -1581,11 +2026,14 @@ pub(crate) fn prepare_presentation_mutation<'w>(
         &mut Visibility,
         Option<&mut Pickable>,
         &mut RouterInputBarrier,
-        &mut FrameLifecycle,
+        Option<&mut FrameLifecycle>,
+        Option<&mut ChildSlotLifecycle>,
     )>();
     let mut found = vec![false; targets.len()];
     let mut entities = Vec::with_capacity(targets.len());
-    for (entity, visibility, pickable, barrier, lifecycle) in query.iter_mut(world) {
+    for (entity, visibility, pickable, barrier, frame_lifecycle, slot_lifecycle) in
+        query.iter_mut(world)
+    {
         let Some((index, target)) = targets
             .iter()
             .enumerate()
@@ -1598,11 +2046,25 @@ pub(crate) fn prepare_presentation_mutation<'w>(
         } else {
             Pickable::IGNORE
         };
-        let pickable_valid = pickable
-            .as_deref()
-            .is_some_and(|pickable| *pickable == expected_pickable);
+        let Some(pickable) = pickable else {
+            return None;
+        };
+        let pickable_valid = *pickable == expected_pickable;
+        let lifecycle = match target.kind {
+            PresentationTargetKind::Frame => match (frame_lifecycle, slot_lifecycle) {
+                (Some(lifecycle), None) if lifecycle.0 == target.current => {
+                    PreparedLifecycleMutation::Frame(lifecycle)
+                }
+                _ => return None,
+            },
+            PresentationTargetKind::ChildSlot => match (frame_lifecycle, slot_lifecycle) {
+                (None, Some(lifecycle)) if child_slot_lifecycle(target.current) == *lifecycle => {
+                    PreparedLifecycleMutation::ChildSlot(lifecycle)
+                }
+                _ => return None,
+            },
+        };
         if found[index]
-            || lifecycle.0 != target.current
             || !pickable_valid
             || (matches!(
                 target.current,
@@ -1622,10 +2084,13 @@ pub(crate) fn prepare_presentation_mutation<'w>(
         entities.push((
             index,
             PreparedEntityMutation {
+                #[cfg(test)]
+                entity,
                 visibility,
-                pickable: pickable.expect("validated Pickable remains borrowed"),
+                pickable,
                 barrier,
                 lifecycle,
+                current: target.current,
                 next: target.next,
                 active_after: target.active_after,
                 interactive: target.interactive,
@@ -1643,16 +2108,28 @@ pub(crate) fn prepare_cleanup_quarantine_mutation<'w>(
     world: &'w mut World,
     claims: &[ExactRegistryClaim],
 ) -> Option<PreparedPresentationMutation<'w>> {
-    let targets = claims
-        .iter()
-        .map(|claim| FrameMutationTarget {
+    let mut targets = Vec::with_capacity(claims.len());
+    for claim in claims {
+        let kind = match claim.owner() {
+            RegistryOwner::Committed(
+                EntityOwner::FrameShell(_)
+                | EntityOwner::FrameContentTarget(_)
+                | EntityOwner::FrameOutput { .. },
+            ) => PresentationTargetKind::Frame,
+            RegistryOwner::Committed(EntityOwner::ChildSlot { .. }) => {
+                PresentationTargetKind::ChildSlot
+            }
+            _ => return None,
+        };
+        targets.push(FrameMutationTarget {
             entity: claim.entity(),
             current: claim.lifecycle(),
             next: EntityLifecycle::Quarantined,
             active_after: false,
             interactive: false,
-        })
-        .collect::<Vec<_>>();
+            kind,
+        });
+    }
     prepare_presentation_mutation(world, &targets)
 }
 
@@ -1707,15 +2184,31 @@ pub(crate) fn repair_missing_pickable_for_cleanup_quarantine(
 }
 
 pub(crate) fn validate_active_frame(world: &World, frame: &RealizedFrame) -> bool {
+    validate_active_frame_with_child_slots(world, frame, &[])
+}
+
+pub(crate) fn validate_active_frame_with_child_slots(
+    world: &World,
+    frame: &RealizedFrame,
+    child_slots: &[(Entity, Vec<Entity>)],
+) -> bool {
     matches!(
-        classify_committed_frame(world, frame, CommittedFrameRole::Preserved),
+        classify_committed_frame(world, frame, CommittedFrameRole::Preserved, child_slots,),
         CommittedFramePreflight::Ready
     )
 }
 
 pub(crate) fn validate_leaving_frame(world: &World, frame: &RealizedFrame) -> bool {
+    validate_leaving_frame_with_child_slots(world, frame, &[])
+}
+
+pub(crate) fn validate_leaving_frame_with_child_slots(
+    world: &World,
+    frame: &RealizedFrame,
+    child_slots: &[(Entity, Vec<Entity>)],
+) -> bool {
     matches!(
-        classify_committed_frame(world, frame, CommittedFrameRole::Leaving),
+        classify_committed_frame(world, frame, CommittedFrameRole::Leaving, child_slots),
         CommittedFramePreflight::Ready | CommittedFramePreflight::ReadyWithQuarantine
     )
 }
@@ -1737,9 +2230,19 @@ fn classify_committed_frame(
     world: &World,
     frame: &RealizedFrame,
     role: CommittedFrameRole,
+    child_slots: &[(Entity, Vec<Entity>)],
 ) -> CommittedFramePreflight {
-    if validate_mount_binding(world, &frame.host_candidate, &frame.mount, frame.frame()).is_ok()
-        && mount_slot_children_are_exact(world, frame)
+    let leaving_child_boundary = matches!(role, CommittedFrameRole::Leaving)
+        && matches!(frame.mount.kind, FrameMountBindingKind::ChildOutlet { .. });
+    if validate_committed_mount_binding(
+        world,
+        &frame.host_candidate,
+        &frame.mount,
+        frame.frame(),
+        leaving_child_boundary,
+    )
+    .is_ok()
+        && mount_slot_children_are_acceptable(world, frame, leaving_child_boundary)
     {
         // Continue with the role-sensitive closure checks below.
     } else {
@@ -1788,7 +2291,7 @@ fn classify_committed_frame(
             return CommittedFramePreflight::Invalid;
         };
         let Some(has_foreign_descendants) =
-            owned_children_with_foreign_descendants(world, frame, realized.entity)
+            owned_children_with_foreign_descendants(world, frame, realized.entity, child_slots)
         else {
             return CommittedFramePreflight::Invalid;
         };
@@ -1829,8 +2332,12 @@ fn owned_children_with_foreign_descendants(
     world: &World,
     frame: &RealizedFrame,
     parent: Entity,
+    child_slots: &[(Entity, Vec<Entity>)],
 ) -> Option<bool> {
-    let expected = expected_children(frame, parent);
+    let expected = child_slots
+        .iter()
+        .find_map(|(anchor, expected)| (*anchor == parent).then(|| expected.clone()))
+        .unwrap_or_else(|| expected_children(frame, parent));
     let actual = world
         .get::<Children>(parent)
         .map(|children| children.iter().copied().collect::<Vec<_>>())
@@ -1941,6 +2448,7 @@ fn frame_claim_is_current(world: &World, realized: &RealizedEntity) -> bool {
             == Some(&FrameLifecycle(realized.claim.lifecycle()))
 }
 
+#[cfg(test)]
 pub(crate) fn settle_frame(world: &mut World, frame: RealizedFrame) -> Result<(), RealizedFrame> {
     if quarantine_frame(world, &frame) {
         Ok(())
@@ -2071,6 +2579,14 @@ fn apply_mount_children_manifest_cas_drift_probe(world: &mut World, mount_slot: 
 }
 
 fn mount_slot_children_are_exact(world: &World, frame: &RealizedFrame) -> bool {
+    mount_slot_children_are_acceptable(world, frame, false)
+}
+
+fn mount_slot_children_are_acceptable(
+    world: &World,
+    frame: &RealizedFrame,
+    allow_foreign_children: bool,
+) -> bool {
     let slot_entity = frame.mount.slot();
     let registry = world.resource::<RouteEntityRegistry>();
     let Some(mount_record) = registry.record(slot_entity) else {
@@ -2163,6 +2679,9 @@ fn mount_slot_children_are_exact(world: &World, frame: &RealizedFrame) -> bool {
         {
             continue;
         }
+        if allow_foreign_children && registry.record(child).is_none() {
+            continue;
+        }
         if !world
             .resource::<QuarantineLeaseTable>()
             .record(child)
@@ -2238,6 +2757,7 @@ fn quarantine_failed_realization(world: &mut World, frame: &RealizedFrame) -> bo
     quarantine_frame(world, frame)
 }
 
+#[cfg(test)]
 fn quarantine_frame(world: &mut World, frame: &RealizedFrame) -> bool {
     let claims_are_current = frame.entities.iter().all(|realized| {
         world
@@ -2371,6 +2891,7 @@ fn quarantine_frame(world: &mut World, frame: &RealizedFrame) -> bool {
     )
 }
 
+#[cfg(test)]
 fn transfer_unresolved_residual(
     world: &mut World,
     frame: &RealizedFrame,
@@ -2576,6 +3097,7 @@ fn clear_frame_focus(world: &mut World, frame: &RealizedFrame) {
     }
 }
 
+#[cfg(test)]
 fn repair_missing_pickable_for_quarantine(
     world: &mut World,
     frame: &RealizedFrame,
@@ -2649,15 +3171,44 @@ fn repair_missing_pickable_for_quarantine(
 pub(crate) mod tests {
     use super::*;
     use crate::{
-        app_ext::RouterHandle,
+        app_ext::{AppRouterExt, RouterConfig, RouterHandle, RouterHostRegistration},
         content::{ContentColor, ContentPlan, FrameContentWriter, SolidRect},
+        driver::{EcsViewDriver, EcsViewReportSession, ViewBuildReport},
         host::{HostCandidateClassification, HostCandidateRevisionState, classify_host_candidate},
+        navigation::{
+            RouterNavigation, collect_navigation_system, commit_presentation_system,
+            drive_navigation_system, observe_authority_system, settle_cleanup_system,
+        },
+        plugin::BevyUiRouterPlugin,
         registry::QuarantineLeaseTable,
     };
-    use bevy_ecs::{component::Component, lifecycle::HookContext, prelude::Resource};
+    use bevy_app::{App, PostUpdate, PreUpdate};
+    use bevy_camera::visibility::InheritedVisibility;
+    use bevy_ecs::{
+        component::Component, event::EntityEvent, lifecycle::HookContext, observer::On,
+        prelude::Resource, query::With,
+    };
+    use bevy_internal::{
+        DefaultPlugins,
+        camera::{Camera2d, NormalizedRenderTarget},
+        math::Vec2,
+        picking::{
+            backend::PointerHits,
+            hover::HoverMap,
+            pointer::{Location, PointerId, PointerLocation},
+        },
+        window::{PrimaryWindow, Window, WindowRef},
+    };
+    use bevy_picking::events::{Over, Pointer};
+    use bevy_ui::{ComputedNode, UiGlobalTransform};
     use bevy_ui_router_core::{
         integration::{EngineAction, RootFrameTask, RouterEngine},
-        prelude::{RouteNodeOptions, RoutePattern, RouteSlotKey, RouteTree, RouteViewKey},
+        prelude::{
+            RouteLocation, RouteNodeOptions, RoutePattern, RouteSlotKey, RouteTree, RouteViewKey,
+        },
+    };
+    use bevy_ui_router_view::{
+        RouteViewDescriptor, RouteViewRegistry, ViewBuildEffect, ViewDriverKey,
     };
 
     #[derive(Resource, Default)]
@@ -2668,6 +3219,250 @@ pub(crate) mod tests {
 
     #[derive(Component)]
     struct ForeignRealizationComponent;
+
+    struct NestedPickingDriver {
+        key: ViewDriverKey,
+    }
+
+    impl EcsViewDriver for NestedPickingDriver {
+        fn key(&self) -> ViewDriverKey {
+            self.key.clone()
+        }
+
+        fn apply(
+            &mut self,
+            effect: &ViewBuildEffect,
+            content: &mut FrameContentWriter<'_>,
+            report: EcsViewReportSession<'_>,
+        ) -> ViewBuildReport {
+            content
+                .spawn_solid_rect(
+                    SolidRect::new(24, 16, ContentColor::srgba8(1, 2, 3, 255)).unwrap(),
+                )
+                .unwrap();
+            if effect.view() == &RouteViewKey::new("layout").unwrap() {
+                let anchor = content.spawn_empty().unwrap();
+                content
+                    .declare_outlet(anchor, RouteSlotKey::default())
+                    .unwrap();
+            }
+            report.applied()
+        }
+    }
+
+    #[derive(Resource, Default)]
+    struct NestedTargetDeliveries(std::collections::BTreeMap<Entity, usize>);
+
+    fn install_nested_pointer_observer(app: &mut App) {
+        app.world_mut().add_observer(
+            |event: On<Pointer<Over>>,
+             mut deliveries: bevy_ecs::prelude::ResMut<NestedTargetDeliveries>| {
+                *deliveries.0.entry(event.event_target()).or_default() += 1;
+            },
+        );
+    }
+
+    struct ActiveNestedTopology {
+        nodes: Vec<Entity>,
+        parent_primitive: Entity,
+        child_primitive: Entity,
+    }
+
+    fn active_nested_topology(world: &World, host: Entity) -> ActiveNestedTopology {
+        let registry = world.resource::<RouteEntityRegistry>();
+        let top_slot = registry
+            .records()
+            .iter()
+            .find_map(|record| {
+                matches!(
+                    record.owner(),
+                    RegistryOwner::Committed(EntityOwner::HostTopSlot { .. })
+                )
+                .then_some(record.entity())
+            })
+            .expect("active router must retain its top slot");
+        let child_slot = registry
+            .records()
+            .iter()
+            .find_map(|record| {
+                (record.lifecycle() == EntityLifecycle::Active
+                    && matches!(
+                        record.owner(),
+                        RegistryOwner::Committed(EntityOwner::ChildSlot { .. })
+                    ))
+                .then_some(record.entity())
+            })
+            .expect("active nested branch must retain its child slot");
+
+        let parent_shell = world
+            .iter_entities()
+            .find_map(|entity| {
+                (entity.get::<FrameLifecycle>() == Some(&FrameLifecycle(EntityLifecycle::Active))
+                    && entity.get::<FrameShell>().is_some()
+                    && entity.get::<ChildOf>().map(ChildOf::parent) == Some(top_slot))
+                .then_some(entity.id())
+            })
+            .expect("active parent shell must be mounted under the top slot");
+        let parent_frame = world.get::<FrameShell>(parent_shell).unwrap().0.clone();
+        let parent_content = world
+            .iter_entities()
+            .find_map(|entity| {
+                entity
+                    .get::<FrameContentTarget>()
+                    .is_some_and(|target| target.matches_frame(&parent_frame))
+                    .then_some(entity.id())
+            })
+            .expect("active parent content target must exist");
+        let outlet_anchor = world
+            .get::<ChildOf>(child_slot)
+            .map(ChildOf::parent)
+            .expect("active child slot must retain its outlet anchor");
+        let child_shell = world
+            .iter_entities()
+            .find_map(|entity| {
+                (entity.get::<FrameLifecycle>() == Some(&FrameLifecycle(EntityLifecycle::Active))
+                    && entity.get::<FrameShell>().is_some()
+                    && entity.get::<ChildOf>().map(ChildOf::parent) == Some(child_slot))
+                .then_some(entity.id())
+            })
+            .expect("active child shell must be mounted under the child slot");
+        let child_frame = world.get::<FrameShell>(child_shell).unwrap().0.clone();
+        let child_content = world
+            .iter_entities()
+            .find_map(|entity| {
+                entity
+                    .get::<FrameContentTarget>()
+                    .is_some_and(|target| target.matches_frame(&child_frame))
+                    .then_some(entity.id())
+            })
+            .expect("active child content target must exist");
+        let primitive_for = |frame: &RouteFrameVersion| {
+            world
+                .iter_entities()
+                .find_map(|entity| {
+                    entity
+                        .get::<FrameOutput>()
+                        .is_some_and(|output| output.frame == *frame && output.solid_rect.is_some())
+                        .then_some(entity.id())
+                })
+                .expect("each active nested frame must publish one primitive")
+        };
+
+        assert_eq!(
+            world.get::<ChildOf>(top_slot).map(ChildOf::parent),
+            Some(host)
+        );
+        assert_eq!(
+            world.get::<ChildOf>(parent_content).map(ChildOf::parent),
+            Some(parent_shell)
+        );
+        assert_eq!(
+            world.get::<ChildOf>(outlet_anchor).map(ChildOf::parent),
+            Some(parent_content)
+        );
+        assert_eq!(
+            world.get::<ChildOf>(child_content).map(ChildOf::parent),
+            Some(child_shell)
+        );
+
+        ActiveNestedTopology {
+            nodes: vec![
+                host,
+                top_slot,
+                parent_shell,
+                parent_content,
+                outlet_anchor,
+                child_slot,
+                child_shell,
+                child_content,
+            ],
+            parent_primitive: primitive_for(&parent_frame),
+            child_primitive: primitive_for(&child_frame),
+        }
+    }
+
+    fn interactive_outputs(world: &World, lifecycle: EntityLifecycle) -> Vec<Entity> {
+        let mut outputs = world
+            .iter_entities()
+            .filter_map(|entity| {
+                (entity
+                    .get::<FrameOutput>()
+                    .is_some_and(|output| output.solid_rect.is_some())
+                    && entity.get::<FrameLifecycle>() == Some(&FrameLifecycle(lifecycle)))
+                .then_some(entity.id())
+            })
+            .collect::<Vec<_>>();
+        outputs.sort_by_key(|entity| entity.to_bits());
+        outputs
+    }
+
+    #[derive(Debug)]
+    struct NestedDriveSample {
+        prepared_outputs: usize,
+        committed_slots: usize,
+        provisional_slots: usize,
+    }
+
+    fn drive_nested_until_prepared(app: &mut App) {
+        let mut trace = Vec::new();
+        for _ in 0..8 {
+            drive_navigation_system(app.world_mut());
+            let registry = app.world().resource::<RouteEntityRegistry>();
+            let sample = NestedDriveSample {
+                prepared_outputs: interactive_outputs(app.world(), EntityLifecycle::PreparedInert)
+                    .len(),
+                committed_slots: registry
+                    .records()
+                    .iter()
+                    .filter(|record| {
+                        record.lifecycle() == EntityLifecycle::PreparedInert
+                            && matches!(
+                                record.owner(),
+                                RegistryOwner::Committed(EntityOwner::ChildSlot { .. })
+                            )
+                    })
+                    .count(),
+                provisional_slots: registry
+                    .records()
+                    .iter()
+                    .filter(|record| {
+                        matches!(
+                            record.owner(),
+                            RegistryOwner::Provisional(
+                                crate::registry::ProvisionalOwner::ChildSlot { .. }
+                            )
+                        )
+                    })
+                    .count(),
+            };
+            let ready = sample.prepared_outputs == 2
+                && sample.committed_slots == 1
+                && sample.provisional_slots == 0;
+            trace.push(sample);
+            if ready {
+                return;
+            }
+        }
+        panic!("Nested branch did not reach the prepared commit gate: {trace:?}");
+    }
+
+    fn move_mouse_to(app: &mut App, primary_window: Entity, target: Entity) {
+        let center = *app.world().get::<UiGlobalTransform>(target).unwrap() * Vec2::ZERO;
+        let pointer = app
+            .world_mut()
+            .query::<(Entity, &PointerId)>()
+            .iter(app.world())
+            .find_map(|(entity, id)| (*id == PointerId::Mouse).then_some(entity))
+            .expect("DefaultPlugins must install a mouse pointer");
+        *app.world_mut().get_mut::<PointerLocation>(pointer).unwrap() =
+            PointerLocation::new(Location {
+                target: NormalizedRenderTarget::Window(
+                    WindowRef::Primary.normalize(Some(primary_window)).unwrap(),
+                ),
+                position: center,
+            });
+        app.world_mut().run_schedule(PreUpdate);
+    }
 
     fn pending_frame_fixture() -> (
         World,
@@ -2751,6 +3546,436 @@ pub(crate) mod tests {
         (world, host, top_slot, frame)
     }
 
+    fn presentation_commit_fixture(
+        world: &mut World,
+    ) -> (Entity, Entity, Entity, Vec<FrameMutationTarget>) {
+        let leaving = world
+            .spawn((
+                Visibility::Visible,
+                ACTIVE_PICKABLE,
+                RouterInputBarrier::allow_all(),
+                FrameLifecycle(EntityLifecycle::Active),
+            ))
+            .id();
+        let entering = world
+            .spawn((
+                Visibility::Hidden,
+                Pickable::IGNORE,
+                RouterInputBarrier::deny_all(),
+                FrameLifecycle(EntityLifecycle::PreparedInert),
+            ))
+            .id();
+        let child_slot = world
+            .spawn((
+                Visibility::Hidden,
+                Pickable::IGNORE,
+                RouterInputBarrier::deny_all(),
+                ChildSlotLifecycle::RegisteredInert,
+            ))
+            .id();
+        let targets = vec![
+            FrameMutationTarget {
+                entity: leaving,
+                current: EntityLifecycle::Active,
+                next: EntityLifecycle::Leaving,
+                active_after: false,
+                interactive: true,
+                kind: PresentationTargetKind::Frame,
+            },
+            FrameMutationTarget {
+                entity: entering,
+                current: EntityLifecycle::PreparedInert,
+                next: EntityLifecycle::Active,
+                active_after: true,
+                interactive: true,
+                kind: PresentationTargetKind::Frame,
+            },
+            FrameMutationTarget {
+                entity: child_slot,
+                current: EntityLifecycle::PreparedInert,
+                next: EntityLifecycle::Active,
+                active_after: true,
+                interactive: false,
+                kind: PresentationTargetKind::ChildSlot,
+            },
+        ];
+        (leaving, entering, child_slot, targets)
+    }
+
+    #[test]
+    fn staged_commit_exposes_each_infallible_closure_boundary() {
+        #[derive(Debug, Eq, PartialEq)]
+        enum ClosureBoundary {
+            Focus,
+            Registry,
+            Gate,
+        }
+
+        let mut world = World::new();
+        let (leaving, entering, child_slot, targets) = presentation_commit_fixture(&mut world);
+        let prepared = prepare_presentation_mutation(&mut world, &targets).unwrap();
+        let commit = prepared.seal_commit(1).unwrap();
+        let trace = std::cell::RefCell::new(Vec::new());
+
+        commit.apply_staged(
+            |state| {
+                trace.borrow_mut().push((
+                    ClosureBoundary::Focus,
+                    state.leaving_is_isolated(),
+                    state.entering_is_prepared_inert(),
+                    state.entering_base_is_active(),
+                    state.entering_capabilities_are_active(),
+                ));
+            },
+            |state| {
+                trace.borrow_mut().push((
+                    ClosureBoundary::Registry,
+                    state.leaving_is_isolated(),
+                    state.entering_is_prepared_inert(),
+                    state.entering_base_is_active(),
+                    state.entering_capabilities_are_active(),
+                ));
+            },
+            |state| {
+                trace.borrow_mut().push((
+                    ClosureBoundary::Gate,
+                    state.leaving_is_isolated(),
+                    state.entering_is_prepared_inert(),
+                    state.entering_base_is_active(),
+                    state.entering_capabilities_are_active(),
+                ));
+            },
+        );
+
+        assert_eq!(
+            trace.into_inner(),
+            vec![
+                (ClosureBoundary::Focus, true, true, false, false),
+                (ClosureBoundary::Registry, true, false, true, false),
+                (ClosureBoundary::Gate, true, false, true, true),
+            ]
+        );
+        assert_eq!(world.get::<Visibility>(leaving), Some(&Visibility::Hidden));
+        assert_eq!(world.get::<Pickable>(leaving), Some(&Pickable::IGNORE));
+        assert!(
+            world
+                .get::<RouterInputBarrier>(leaving)
+                .is_some_and(RouterInputBarrier::denies_all)
+        );
+        assert_eq!(
+            world.get::<FrameLifecycle>(leaving),
+            Some(&FrameLifecycle(EntityLifecycle::Leaving))
+        );
+        assert_eq!(
+            world.get::<Visibility>(entering),
+            Some(&Visibility::Visible)
+        );
+        assert_eq!(world.get::<Pickable>(entering), Some(&ACTIVE_PICKABLE));
+        assert!(
+            world
+                .get::<RouterInputBarrier>(entering)
+                .is_some_and(RouterInputBarrier::allows_all)
+        );
+        assert_eq!(
+            world.get::<FrameLifecycle>(entering),
+            Some(&FrameLifecycle(EntityLifecycle::Active))
+        );
+        assert_eq!(
+            world.get::<ChildSlotLifecycle>(child_slot),
+            Some(&ChildSlotLifecycle::Active)
+        );
+        assert_eq!(
+            world.get::<Visibility>(child_slot),
+            Some(&Visibility::Visible)
+        );
+        assert_eq!(world.get::<Pickable>(child_slot), Some(&Pickable::IGNORE));
+        assert!(
+            world
+                .get::<RouterInputBarrier>(child_slot)
+                .is_some_and(RouterInputBarrier::denies_all)
+        );
+    }
+
+    #[test]
+    fn commit_split_is_rejected_before_any_mutation() {
+        let mut world = World::new();
+        let (leaving, entering, child_slot, targets) = presentation_commit_fixture(&mut world);
+        let prepared = prepare_presentation_mutation(&mut world, &targets).unwrap();
+
+        assert!(prepared.seal_commit(0).is_none());
+        assert_eq!(world.get::<Visibility>(leaving), Some(&Visibility::Visible));
+        assert_eq!(world.get::<Visibility>(entering), Some(&Visibility::Hidden));
+        assert_eq!(
+            world.get::<Visibility>(child_slot),
+            Some(&Visibility::Hidden)
+        );
+    }
+
+    #[test]
+    fn nested_node_ancestry_runs_real_layout_and_picking_pipeline() {
+        let mut app = App::new();
+        app.add_plugins(DefaultPlugins);
+        app.add_plugins(BevyUiRouterPlugin::default());
+        app.world_mut()
+            .insert_resource(NestedTargetDeliveries::default());
+        install_nested_pointer_observer(&mut app);
+
+        let primary_windows = app
+            .world_mut()
+            .query_filtered::<Entity, With<PrimaryWindow>>()
+            .iter(app.world())
+            .collect::<Vec<_>>();
+        assert_eq!(primary_windows.len(), 1);
+        let primary_window = primary_windows[0];
+        app.world_mut()
+            .get_mut::<Window>(primary_window)
+            .unwrap()
+            .resolution
+            .set(320.0, 180.0);
+        app.world_mut().spawn(Camera2d);
+
+        let driver = ViewDriverKey::new("nested-picking-driver").unwrap();
+        app.register_ui_view_driver(NestedPickingDriver {
+            key: driver.clone(),
+        })
+        .unwrap();
+        let layout = RouteViewKey::new("layout").unwrap();
+        let item = RouteViewKey::new("item").unwrap();
+        let fallback = RouteViewKey::new("fallback").unwrap();
+        let mut views = RouteViewRegistry::new();
+        for view in [&layout, &item, &fallback] {
+            views
+                .insert(view.clone(), RouteViewDescriptor::new(driver.clone()))
+                .unwrap();
+        }
+        let router = app
+            .add_ui_router(RouterConfig::new(
+                bevy_ui_router_core::test_support::nested_items_view_route_tree(),
+                views,
+                fallback,
+            ))
+            .unwrap();
+        let host = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    ..Node::default()
+                },
+                RouterHostRegistration::new(router),
+            ))
+            .id();
+
+        app.update();
+        observe_authority_system(app.world_mut());
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_nested_until_prepared(&mut app);
+        assert_eq!(
+            interactive_outputs(app.world(), EntityLifecycle::PreparedInert).len(),
+            2
+        );
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+        app.world_mut().run_schedule(PostUpdate);
+
+        let topology = active_nested_topology(app.world(), host);
+        assert_eq!(
+            app.world()
+                .get::<ChildOf>(topology.parent_primitive)
+                .map(ChildOf::parent),
+            Some(topology.nodes[3])
+        );
+        assert_eq!(
+            app.world()
+                .get::<ChildOf>(topology.child_primitive)
+                .map(ChildOf::parent),
+            Some(topology.nodes[7])
+        );
+        for entity in topology
+            .nodes
+            .iter()
+            .copied()
+            .chain([topology.parent_primitive, topology.child_primitive])
+        {
+            assert!(app.world().get::<Node>(entity).is_some());
+            assert!(
+                app.world().get::<ComputedNode>(entity).is_some(),
+                "nested Node {entity:?} is absent from the real layout pipeline"
+            );
+            assert!(
+                app.world()
+                    .get::<InheritedVisibility>(entity)
+                    .is_some_and(|visibility| visibility.get()),
+                "nested Node {entity:?} is not effectively visible"
+            );
+        }
+        for primitive in [topology.parent_primitive, topology.child_primitive] {
+            assert!(
+                app.world()
+                    .get::<ComputedNode>(primitive)
+                    .is_some_and(|computed| computed.size().cmpgt(Vec2::ZERO).all()),
+                "nested primitive {primitive:?} retained zero layout"
+            );
+        }
+
+        move_mouse_to(&mut app, primary_window, topology.child_primitive);
+        let active_before = interactive_outputs(app.world(), EntityLifecycle::Active);
+        assert_eq!(active_before.len(), 2);
+        let hovered_before = app
+            .world()
+            .resource::<HoverMap>()
+            .get(&PointerId::Mouse)
+            .cloned()
+            .unwrap_or_default();
+        assert!(hovered_before.contains_key(&topology.child_primitive));
+        assert!(hovered_before.keys().all(|entity| {
+            app.world().get::<FrameOutput>(*entity).is_none() || active_before.contains(entity)
+        }));
+        assert!(
+            app.world()
+                .resource::<bevy_ecs::message::Messages<PointerHits>>()
+                .iter_current_update_messages()
+                .flat_map(|hits| hits.picks.iter().map(|(entity, _)| entity))
+                .any(|entity| active_before.contains(entity)),
+            "locked UI backend did not produce a router-owned PointerHits candidate"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<NestedTargetDeliveries>()
+                .0
+                .get(&topology.child_primitive),
+            Some(&1)
+        );
+
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/items/2").with_fragment("pending"),
+            )
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_nested_until_prepared(&mut app);
+        let pending = interactive_outputs(app.world(), EntityLifecycle::PreparedInert);
+        assert_eq!(pending.len(), 2);
+        app.world_mut().run_schedule(PostUpdate);
+        move_mouse_to(&mut app, primary_window, topology.child_primitive);
+        let pending_hover = app
+            .world()
+            .resource::<HoverMap>()
+            .get(&PointerId::Mouse)
+            .cloned()
+            .unwrap_or_default();
+        assert!(pending_hover.keys().all(|entity| !pending.contains(entity)));
+        assert!(pending.iter().all(|entity| {
+            app.world()
+                .resource::<NestedTargetDeliveries>()
+                .0
+                .get(entity)
+                .is_none()
+        }));
+
+        let old_deliveries = active_before
+            .iter()
+            .map(|entity| {
+                (
+                    *entity,
+                    app.world()
+                        .resource::<NestedTargetDeliveries>()
+                        .0
+                        .get(entity)
+                        .copied()
+                        .unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        commit_presentation_system(app.world_mut());
+        assert_eq!(
+            interactive_outputs(app.world(), EntityLifecycle::Leaving),
+            active_before
+        );
+        assert_eq!(
+            interactive_outputs(app.world(), EntityLifecycle::Active),
+            pending
+        );
+        app.world_mut().run_schedule(PostUpdate);
+        app.world_mut().run_schedule(PreUpdate);
+        let committed_hover = app
+            .world()
+            .resource::<HoverMap>()
+            .get(&PointerId::Mouse)
+            .cloned()
+            .unwrap_or_default();
+        assert!(committed_hover.keys().all(|entity| {
+            app.world().get::<FrameOutput>(*entity).is_none() || pending.contains(entity)
+        }));
+        for (entity, deliveries) in &old_deliveries {
+            assert_eq!(
+                app.world()
+                    .resource::<NestedTargetDeliveries>()
+                    .0
+                    .get(entity)
+                    .copied()
+                    .unwrap_or_default(),
+                *deliveries,
+                "leaving content received a final target event"
+            );
+        }
+
+        settle_cleanup_system(app.world_mut());
+        app.world_mut().run_schedule(PostUpdate);
+        let replacement = active_nested_topology(app.world(), host);
+        move_mouse_to(&mut app, primary_window, replacement.child_primitive);
+        let final_hover = app
+            .world()
+            .resource::<HoverMap>()
+            .get(&PointerId::Mouse)
+            .cloned()
+            .unwrap_or_default();
+        assert!(final_hover.contains_key(&replacement.child_primitive));
+        assert!(final_hover.keys().all(|entity| {
+            app.world().get::<FrameOutput>(*entity).is_none() || pending.contains(entity)
+        }));
+        assert_eq!(
+            app.world()
+                .resource::<NestedTargetDeliveries>()
+                .0
+                .get(&replacement.child_primitive),
+            Some(&1)
+        );
+        for (entity, deliveries) in old_deliveries {
+            assert_eq!(
+                app.world()
+                    .resource::<NestedTargetDeliveries>()
+                    .0
+                    .get(&entity)
+                    .copied()
+                    .unwrap_or_default(),
+                deliveries
+            );
+            assert!(app.world().get_entity(entity).is_err());
+        }
+        assert_eq!(
+            app.world_mut()
+                .query_filtered::<Entity, With<PrimaryWindow>>()
+                .iter(app.world())
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.world_mut()
+                .query_filtered::<Entity, With<Camera2d>>()
+                .iter(app.world())
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn equal_raw_cross_router_frame_cannot_reparent_into_child_mount() {
         let (_first_world, _, _, first_slot, first_claim, first_task) = pending_frame_fixture();
@@ -2780,6 +4005,130 @@ pub(crate) mod tests {
         });
 
         assert!(!frame_version_matches_mount(&mount, &owner, &candidate));
+    }
+
+    #[test]
+    fn invalid_outlet_alias_rebind_is_atomic() {
+        let (mut world, _host, candidate, top_slot, top_slot_claim, task) = pending_frame_fixture();
+        let mut content = ContentPlan::new();
+        let anchor = FrameContentWriter::new(&mut content).spawn_empty().unwrap();
+        FrameContentWriter::new(&mut content)
+            .declare_outlet(anchor, RouteSlotKey::default())
+            .unwrap();
+        let mut frame = realize_frame(
+            &mut world,
+            candidate,
+            top_slot,
+            top_slot_claim,
+            task.frame().clone(),
+            task.view_request_sequence(),
+            content.accept(),
+        )
+        .unwrap();
+        let current_anchor = frame.outlets[0].anchor_claim.clone();
+        let anchor_manifest = world
+            .resource::<RouteEntityRegistry>()
+            .record(current_anchor.entity())
+            .unwrap()
+            .manifest()
+            .clone();
+        let mut foreign_registry = RouteEntityRegistry::new();
+        let foreign_seal = foreign_registry.issue_seal();
+        foreign_registry
+            .register(
+                current_anchor.entity(),
+                current_anchor.owner().clone(),
+                foreign_seal,
+                anchor_manifest,
+                current_anchor.lifecycle(),
+            )
+            .unwrap();
+        frame.outlets[0].anchor_claim = foreign_registry
+            .record(current_anchor.entity())
+            .unwrap()
+            .claim();
+
+        let transitions = frame.lifecycle_transitions(EntityLifecycle::Active);
+        let resulting = world
+            .resource::<RouteEntityRegistry>()
+            .prepare_lifecycle_mutation(&transitions)
+            .unwrap()
+            .resulting_claims()
+            .to_vec();
+        let before = frame.claims().cloned().collect::<Vec<_>>();
+        let branch = crate::branch_transaction::RealizedBranch::from_single_frame(frame);
+
+        assert!(
+            branch
+                .prepare_claim_rebind(
+                    &resulting,
+                    EntityLifecycle::PreparedInert,
+                    EntityLifecycle::Active,
+                )
+                .is_none()
+        );
+        assert_eq!(branch.claims().cloned().collect::<Vec<_>>(), before);
+    }
+
+    #[test]
+    fn missing_outlet_alias_rebind_is_atomic() {
+        let (mut world, _host, candidate, top_slot, top_slot_claim, task) = pending_frame_fixture();
+        let mut content = ContentPlan::new();
+        let anchor = FrameContentWriter::new(&mut content).spawn_empty().unwrap();
+        FrameContentWriter::new(&mut content)
+            .declare_outlet(anchor, RouteSlotKey::default())
+            .unwrap();
+        let mut frame = realize_frame(
+            &mut world,
+            candidate,
+            top_slot,
+            top_slot_claim,
+            task.frame().clone(),
+            task.view_request_sequence(),
+            content.accept(),
+        )
+        .unwrap();
+        let current_anchor = frame.outlets[0].anchor_claim.clone();
+        let foreign_entity = world.spawn_empty().id();
+        let anchor_manifest = world
+            .resource::<RouteEntityRegistry>()
+            .record(current_anchor.entity())
+            .unwrap()
+            .manifest()
+            .clone();
+        let mut foreign_registry = RouteEntityRegistry::new();
+        let foreign_seal = foreign_registry.issue_seal();
+        foreign_registry
+            .register(
+                foreign_entity,
+                current_anchor.owner().clone(),
+                foreign_seal,
+                anchor_manifest,
+                current_anchor.lifecycle(),
+            )
+            .unwrap();
+        frame.outlets[0].anchor_claim = foreign_registry.record(foreign_entity).unwrap().claim();
+
+        let transitions = frame.lifecycle_transitions(EntityLifecycle::Active);
+        let resulting = world
+            .resource::<RouteEntityRegistry>()
+            .prepare_lifecycle_mutation(&transitions)
+            .unwrap()
+            .resulting_claims()
+            .to_vec();
+        let before = frame.claims().cloned().collect::<Vec<_>>();
+        let branch = crate::branch_transaction::RealizedBranch::from_single_frame(frame);
+
+        assert!(
+            branch
+                .prepare_claim_rebind(
+                    &resulting,
+                    EntityLifecycle::PreparedInert,
+                    EntityLifecycle::Active,
+                )
+                .is_none()
+        );
+        assert_eq!(branch.claims().cloned().collect::<Vec<_>>(), before);
     }
 
     #[test]

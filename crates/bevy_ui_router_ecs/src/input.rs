@@ -13,7 +13,8 @@ use bevy_picking::Pickable;
 
 use crate::{
     components::{ChildSlotAuthority, ChildSlotLifecycle, RouteOwnershipSeal, RouterInputBarrier},
-    presentation::{FrameLifecycle, validate_active_frame},
+    frame_local::validate_committed_branch,
+    presentation::FrameLifecycle,
     registry::{
         EntityLifecycle, EntityOwner, ExactRegistryClaim, ProvisionalOwner, QuarantineLeaseTable,
         RegistryOwner, RouteEntityRegistry,
@@ -140,20 +141,29 @@ pub(crate) fn prepare_input_gate_mutation<'w>(
 }
 
 pub(crate) fn refresh_input_gate_system(world: &mut World) {
-    let invalid_active = fail_closed_invalid_active_frames(world);
-    clear_inert_subtree_focus(world, &invalid_active);
-    let allowed = {
+    let (allowed, invalid_claims) = {
         let navigation = world.resource::<crate::navigation::RouterNavigation>();
-        navigation
+        let mut allowed = HashSet::new();
+        let mut invalid_claims = Vec::new();
+        for branch in navigation
             .entries
             .iter()
             .filter_map(|entry| entry.active.as_ref())
-            .flat_map(|branch| branch.frames())
-            .filter(|frame| validate_active_frame(world, frame))
-            .flat_map(|frame| frame.interactive_entities())
-            .collect()
+        {
+            if validate_committed_branch(world, branch, false).is_ok() {
+                allowed.extend(branch.interactive_entities());
+            } else {
+                invalid_claims.push(branch.claims().cloned().collect::<Vec<_>>());
+            }
+        }
+        (allowed, invalid_claims)
     };
-    world.resource_mut::<RouterInputGate>().allowed = allowed;
+    let invalid_active = fail_closed_invalid_active_frames(world, invalid_claims);
+    clear_inert_subtree_focus(world, &invalid_active);
+    world
+        .resource_mut::<RouterInputGate>()
+        .allowed
+        .retain(|entity| allowed.contains(entity));
 }
 
 struct PreparedPhysicalIsolation<'w> {
@@ -180,21 +190,13 @@ impl PreparedPhysicalIsolation<'_> {
     }
 }
 
-fn fail_closed_invalid_active_frames(world: &mut World) -> HashSet<Entity> {
-    let frames = {
-        let navigation = world.resource::<crate::navigation::RouterNavigation>();
-        navigation
-            .entries
-            .iter()
-            .filter_map(|entry| entry.active.as_ref())
-            .flat_map(|branch| branch.frames())
-            .filter(|frame| !validate_active_frame(world, frame))
-            .map(|frame| frame.claims().cloned().collect::<Vec<_>>())
-            .collect::<Vec<_>>()
-    };
-    let exact_frames = {
+fn fail_closed_invalid_active_frames(
+    world: &mut World,
+    invalid_claims: Vec<Vec<ExactRegistryClaim>>,
+) -> HashSet<Entity> {
+    let exact_branches = {
         let registry = world.resource::<RouteEntityRegistry>();
-        frames
+        invalid_claims
             .into_iter()
             .filter_map(|claims| {
                 let current = claims
@@ -209,7 +211,7 @@ fn fail_closed_invalid_active_frames(world: &mut World) -> HashSet<Entity> {
             })
             .collect::<Vec<_>>()
     };
-    let entities = exact_frames
+    let entities = exact_branches
         .iter()
         .flatten()
         .map(ExactRegistryClaim::entity)
@@ -391,7 +393,145 @@ pub(crate) fn input_ready_system(_world: &mut World) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        app_ext::{AppRouterExt, RouterConfig, RouterHostRegistration},
+        content::{ContentColor, FrameContentWriter, SolidRect},
+        driver::{EcsViewDriver, EcsViewReportSession, ViewBuildReport},
+        navigation::RouterNavigation,
+        plugin::BevyUiRouterPlugin,
+    };
+    use bevy_app::App;
     use bevy_input_focus::InputFocus;
+    use bevy_ui::Node;
+    use bevy_ui_router_core::prelude::{
+        RouteLocation, RouteNodeOptions, RoutePattern, RouteTree, RouteViewKey,
+    };
+    use bevy_ui_router_view::{
+        RouteViewDescriptor, RouteViewRegistry, ViewBuildEffect, ViewDriverKey,
+    };
+
+    struct InputTestDriver {
+        key: ViewDriverKey,
+        nested: bool,
+    }
+
+    impl EcsViewDriver for InputTestDriver {
+        fn key(&self) -> ViewDriverKey {
+            self.key.clone()
+        }
+
+        fn apply(
+            &mut self,
+            effect: &ViewBuildEffect,
+            content: &mut FrameContentWriter<'_>,
+            report: EcsViewReportSession<'_>,
+        ) -> ViewBuildReport {
+            if self.nested && effect.view() == &RouteViewKey::new("layout").unwrap() {
+                let anchor = content.spawn_empty().unwrap();
+                content
+                    .declare_outlet(anchor, bevy_ui_router_core::slot::RouteSlotKey::default())
+                    .unwrap();
+            } else {
+                content
+                    .spawn_solid_rect(
+                        SolidRect::new(24, 16, ContentColor::srgba8(1, 2, 3, 255)).unwrap(),
+                    )
+                    .unwrap();
+            }
+            report.applied()
+        }
+    }
+
+    fn active_atomic_app(label: &str) -> (App, Entity) {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let driver = ViewDriverKey::new(format!("{label}-driver")).unwrap();
+        app.register_ui_view_driver(InputTestDriver {
+            key: driver.clone(),
+            nested: false,
+        })
+        .unwrap();
+        let view = RouteViewKey::new(format!("{label}-view")).unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(view.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut views = RouteViewRegistry::new();
+        views
+            .insert(view.clone(), RouteViewDescriptor::new(driver))
+            .unwrap();
+        let router = app
+            .add_ui_router(RouterConfig::new(routes, views, view))
+            .unwrap();
+        app.world_mut()
+            .spawn((Node::default(), RouterHostRegistration::new(router)));
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+        let output = app.world().resource::<RouterNavigation>().entries[0]
+            .active
+            .as_ref()
+            .unwrap()
+            .interactive_entities()[0];
+        (app, output)
+    }
+
+    fn active_nested_app() -> (App, Entity, Entity) {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let driver = ViewDriverKey::new("input-nested-driver").unwrap();
+        app.register_ui_view_driver(InputTestDriver {
+            key: driver.clone(),
+            nested: true,
+        })
+        .unwrap();
+        let layout = RouteViewKey::new("layout").unwrap();
+        let item = RouteViewKey::new("item").unwrap();
+        let fallback = RouteViewKey::new("fallback").unwrap();
+        let mut views = RouteViewRegistry::new();
+        for view in [&layout, &item, &fallback] {
+            views
+                .insert(view.clone(), RouteViewDescriptor::new(driver.clone()))
+                .unwrap();
+        }
+        let router = app
+            .add_ui_router(RouterConfig::new(
+                bevy_ui_router_core::test_support::nested_items_view_route_tree(),
+                views,
+                fallback,
+            ))
+            .unwrap();
+        app.world_mut()
+            .spawn((Node::default(), RouterHostRegistration::new(router)));
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        for _ in 0..8 {
+            app.update();
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .active
+                .is_some()
+            {
+                break;
+            }
+        }
+        let active = app.world().resource::<RouterNavigation>().entries[0]
+            .active
+            .as_ref()
+            .unwrap();
+        let child_slot = active.child_slots()[0].slot();
+        let child_output = active.frames()[1].interactive_entities()[0];
+        (app, child_slot, child_output)
+    }
 
     #[test]
     fn gate_delta_preserves_other_router_permissions() {
@@ -441,5 +581,73 @@ mod tests {
 
         assert_eq!(world.resource::<InputFocus>().get(), None);
         assert_eq!(world.resource::<RouteFocusState>().focused(), None);
+    }
+
+    #[test]
+    fn refresh_does_not_grant_a_missing_active_capability() {
+        let (mut app, active) = active_atomic_app("refresh-no-grant");
+        assert!(
+            app.world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(active)
+        );
+        app.world_mut()
+            .resource_mut::<RouterInputGate>()
+            .allowed
+            .clear();
+
+        refresh_input_gate_system(app.world_mut());
+
+        assert!(
+            !app.world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(active)
+        );
+    }
+
+    #[test]
+    fn refresh_revokes_an_invalid_active_capability() {
+        let (mut app, active) = active_atomic_app("refresh-revoke");
+        assert!(
+            app.world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(active)
+        );
+        *app.world_mut().get_mut::<Visibility>(active).unwrap() = Visibility::Hidden;
+
+        refresh_input_gate_system(app.world_mut());
+
+        assert!(
+            !app.world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(active)
+        );
+    }
+
+    #[test]
+    fn refresh_rejects_child_boundary_drift_and_clears_inert_focus() {
+        let (mut app, child_slot, child_output) = active_nested_app();
+        assert!(
+            app.world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(child_output)
+        );
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(child_output);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(child_output));
+        *app.world_mut()
+            .get_mut::<ChildSlotLifecycle>(child_slot)
+            .unwrap() = ChildSlotLifecycle::RegisteredInert;
+
+        refresh_input_gate_system(app.world_mut());
+
+        assert!(
+            !app.world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(child_output)
+        );
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
     }
 }

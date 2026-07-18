@@ -20,7 +20,7 @@ use crate::{
     input::{RouteFocusState, RouterInputGate},
     navigation::RouterEntry,
     presentation::{
-        FrameLifecycle, RealizedFrame, validate_active_frame,
+        FrameLifecycle, RealizedFrame, validate_active_frame_with_child_slots,
         validate_realized_frame_with_child_slots,
     },
     registry::{
@@ -607,7 +607,14 @@ impl RouterAuthorityAudits {
                             .collect::<Vec<_>>();
                         validate_realized_frame_with_child_slots(world, frame, &child_slots)
                     }
-                    AuthorityFrameLifecycle::Active => validate_active_frame(world, frame),
+                    AuthorityFrameLifecycle::Active => {
+                        let child_slots = tracked_child_slots
+                            .iter()
+                            .filter(|slot| slot.parent() == frame.frame())
+                            .map(|slot| (slot.anchor(), slot.expected_anchor_children().to_vec()))
+                            .collect::<Vec<_>>();
+                        validate_active_frame_with_child_slots(world, frame, &child_slots)
+                    }
                     AuthorityFrameLifecycle::LeavingInert => {
                         frame_registry_is_current(world, frame, EntityLifecycle::Leaving)
                     }
@@ -1380,6 +1387,68 @@ mod tests {
 
     #[derive(Component)]
     struct AuditCleanupDrift;
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn active_nested_audit_uses_active_child_slot_expectations() {
+        let (mut app, failed, _, _, _) = crate::navigation::tests::failed_nested_branch_fixture();
+        let router = app.world().resource::<RouterNavigation>().entries[0].handle;
+        let mut active = failed.into_realized_for_test();
+        let targets = active
+            .entering_mutation_targets(EntityLifecycle::PreparedInert, EntityLifecycle::Active);
+        let transitions = active.lifecycle_transitions(EntityLifecycle::Active, false);
+        let resulting = app.world_mut().resource_scope(
+            |world, mut registry: bevy_ecs::prelude::Mut<RouteEntityRegistry>| {
+                let registry_plan = registry
+                    .prepare_lifecycle_mutation(&transitions)
+                    .expect("prepared nested claims remain exact");
+                let resulting = registry_plan.resulting_claims().to_vec();
+                crate::presentation::prepare_presentation_mutation(world, &targets)
+                    .expect("prepared nested presentation remains exact")
+                    .apply();
+                registry_plan.apply(&mut registry);
+                resulting
+            },
+        );
+        let rebind = active
+            .prepare_claim_rebind(
+                &resulting,
+                EntityLifecycle::PreparedInert,
+                EntityLifecycle::Active,
+            )
+            .expect("all nested claim aliases remain exact");
+        active.apply_claim_rebind(rebind);
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0].active = Some(active);
+
+        app.world_mut().resource_scope(
+            |world, navigation: bevy_ecs::prelude::Mut<RouterNavigation>| {
+                world.resource_scope(
+                    |world, mut audits: bevy_ecs::prelude::Mut<RouterAuthorityAudits>| {
+                        audits.refresh(world, &navigation.entries);
+                    },
+                );
+            },
+        );
+
+        let snapshot = app
+            .world()
+            .resource::<RouterAuthorityAudits>()
+            .get(router)
+            .expect("router audit remains present");
+        assert_eq!(snapshot.frames().len(), 2);
+        assert!(
+            snapshot
+                .frames()
+                .iter()
+                .all(|frame| { frame.lifecycle() == AuthorityFrameLifecycle::Active })
+        );
+        assert!(
+            snapshot
+                .slots()
+                .iter()
+                .any(|slot| slot.kind() == AuthoritySlotKind::ChildOutlet)
+        );
+    }
 
     impl EcsViewDriver for AuditDriver {
         fn key(&self) -> ViewDriverKey {

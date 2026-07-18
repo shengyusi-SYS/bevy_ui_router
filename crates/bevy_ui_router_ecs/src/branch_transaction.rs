@@ -2,7 +2,11 @@ use bevy_ui_router_core::integration::{CommitTicket, RootFrameTask};
 
 use crate::{
     mount::{ChildSlotResidual, MountedChildSlot},
-    presentation::RealizedFrame,
+    presentation::{
+        FrameMutationTarget, PreparedFrameMountRebase, RealizedFrame, child_slot_mutation_target,
+        claim_rebind_is_exact,
+    },
+    registry::{EntityLifecycle, ExactRegistryClaim},
 };
 
 #[cfg(feature = "test-support")]
@@ -74,6 +78,18 @@ impl TrackedChildSlot {
         else {
             return false;
         };
+        let (component_lifecycle, visibility) = match self.claim.lifecycle() {
+            crate::registry::EntityLifecycle::PreparedInert => {
+                (ChildSlotLifecycle::RegisteredInert, Visibility::Hidden)
+            }
+            crate::registry::EntityLifecycle::Active => {
+                (ChildSlotLifecycle::Active, Visibility::Visible)
+            }
+            crate::registry::EntityLifecycle::Leaving => {
+                (ChildSlotLifecycle::Leaving, Visibility::Hidden)
+            }
+            crate::registry::EntityLifecycle::Quarantined => return false,
+        };
         let anchor_is_exact = world
             .get_resource::<RouteEntityRegistry>()
             .and_then(|registry| registry.record(self.anchor))
@@ -81,6 +97,7 @@ impl TrackedChildSlot {
                 record.claim() == self.anchor_claim && record.manifest().matches(world, self.anchor)
             });
         record.claim() == self.claim
+            && record.lifecycle() == self.claim.lifecycle()
             && record.manifest().matches(world, self.entity)
             && matches!(
                 record.owner(),
@@ -89,8 +106,7 @@ impl TrackedChildSlot {
             )
             && world.get::<RouteOwnershipSeal>(self.entity)
                 == Some(&RouteOwnershipSeal::new(self.claim.seal()))
-            && world.get::<ChildSlotLifecycle>(self.entity)
-                == Some(&ChildSlotLifecycle::RegisteredInert)
+            && world.get::<ChildSlotLifecycle>(self.entity) == Some(&component_lifecycle)
             && world
                 .get::<ChildSlotAuthority>(self.entity)
                 .is_some_and(|authority| {
@@ -99,7 +115,7 @@ impl TrackedChildSlot {
                         && authority.slot() == self.slot
                 })
             && world.get::<ChildOf>(self.entity).map(ChildOf::parent) == Some(self.anchor)
-            && world.get::<Visibility>(self.entity) == Some(&Visibility::Hidden)
+            && world.get::<Visibility>(self.entity) == Some(&visibility)
             && world.get::<Pickable>(self.entity) == Some(&Pickable::IGNORE)
             && world.get::<Node>(self.entity)
                 == Some(&Node {
@@ -122,6 +138,17 @@ impl TrackedChildSlot {
 pub(crate) struct RealizedBranch {
     frames: Vec<RealizedFrame>,
     child_slots: Vec<MountedChildSlot>,
+}
+
+pub(crate) struct PreparedBranchClaimRebind {
+    frame_claims: Vec<Vec<ExactRegistryClaim>>,
+    all_claims: Vec<ExactRegistryClaim>,
+    expected_current: EntityLifecycle,
+    expected_next: EntityLifecycle,
+}
+
+pub(crate) struct PreparedRootRebase {
+    frame: PreparedFrameMountRebase,
 }
 
 pub(crate) struct RejectedChildSlot {
@@ -244,6 +271,18 @@ impl RealizedBranch {
         self.frames.first()
     }
 
+    pub(crate) fn prepare_root_rebase(&self, leaving: &Self) -> Option<PreparedRootRebase> {
+        let entering_root = self.frames.first()?;
+        let leaving_root = leaving.frames.first()?;
+        Some(PreparedRootRebase {
+            frame: entering_root.prepare_mount_rebase(leaving_root)?,
+        })
+    }
+
+    pub(crate) fn apply_root_rebase(&mut self, prepared: PreparedRootRebase) {
+        self.frames[0].apply_mount_rebase(prepared.frame);
+    }
+
     pub(crate) fn interactive_entities(&self) -> Vec<bevy_ecs::prelude::Entity> {
         self.frames
             .iter()
@@ -252,28 +291,165 @@ impl RealizedBranch {
     }
 
     pub(crate) fn claims(&self) -> impl Iterator<Item = &crate::registry::ExactRegistryClaim> {
-        self.frames.iter().flat_map(RealizedFrame::claims)
+        self.frames
+            .iter()
+            .flat_map(RealizedFrame::claims)
+            .chain(self.child_slots.iter().map(MountedChildSlot::slot_claim))
     }
 
-    pub(crate) fn replace_frame_claims(
-        &mut self,
-        claims: &[crate::registry::ExactRegistryClaim],
-    ) -> bool {
-        let expected = self
-            .frames
+    pub(crate) fn obligation_count(&self) -> usize {
+        self.frames
             .iter()
             .map(RealizedFrame::obligation_count)
-            .sum::<usize>();
-        if expected != claims.len() {
-            return false;
+            .sum::<usize>()
+            + self.child_slots.len()
+    }
+
+    pub(crate) fn leaving_mutation_targets(
+        &self,
+        current: EntityLifecycle,
+        next: EntityLifecycle,
+    ) -> Vec<FrameMutationTarget> {
+        let mut targets = Vec::new();
+        for frame_index in (0..self.frames.len()).rev() {
+            targets.extend(self.frames[frame_index].mutation_targets(current, next, false));
+            if frame_index > 0 {
+                targets.push(child_slot_mutation_target(
+                    &self.child_slots[frame_index - 1],
+                    current,
+                    next,
+                    false,
+                ));
+            }
         }
-        let mut offset = 0;
-        for frame in &mut self.frames {
-            let next = offset + frame.obligation_count();
-            frame.replace_claims(&claims[offset..next]);
-            offset = next;
+        targets
+    }
+
+    pub(crate) fn entering_mutation_targets(
+        &self,
+        current: EntityLifecycle,
+        next: EntityLifecycle,
+    ) -> Vec<FrameMutationTarget> {
+        let mut targets = Vec::new();
+        for frame_index in 0..self.frames.len() {
+            targets.extend(self.frames[frame_index].mutation_targets(current, next, true));
+            if frame_index < self.child_slots.len() {
+                targets.push(child_slot_mutation_target(
+                    &self.child_slots[frame_index],
+                    current,
+                    next,
+                    true,
+                ));
+            }
         }
-        true
+        targets
+    }
+
+    pub(crate) fn lifecycle_transitions(
+        &self,
+        next: EntityLifecycle,
+        leaf_to_root: bool,
+    ) -> Vec<(ExactRegistryClaim, EntityLifecycle)> {
+        let mut transitions = Vec::with_capacity(self.obligation_count());
+        if leaf_to_root {
+            for frame_index in (0..self.frames.len()).rev() {
+                transitions.extend(self.frames[frame_index].lifecycle_transitions(next));
+                if frame_index > 0 {
+                    transitions
+                        .push((self.child_slots[frame_index - 1].slot_claim().clone(), next));
+                }
+            }
+        } else {
+            for frame_index in 0..self.frames.len() {
+                transitions.extend(self.frames[frame_index].lifecycle_transitions(next));
+                if frame_index < self.child_slots.len() {
+                    transitions.push((self.child_slots[frame_index].slot_claim().clone(), next));
+                }
+            }
+        }
+        transitions
+    }
+
+    pub(crate) fn prepare_claim_rebind(
+        &self,
+        claims: &[ExactRegistryClaim],
+        expected_current: EntityLifecycle,
+        expected_next: EntityLifecycle,
+    ) -> Option<PreparedBranchClaimRebind> {
+        if claims.len() != self.obligation_count()
+            || claims.iter().enumerate().any(|(index, claim)| {
+                claims[index + 1..]
+                    .iter()
+                    .any(|other| other.entity() == claim.entity())
+            })
+        {
+            return None;
+        }
+        let frame_claims = self
+            .frames
+            .iter()
+            .map(|frame| {
+                frame
+                    .claims()
+                    .map(|current| {
+                        claims
+                            .iter()
+                            .find(|next| next.entity() == current.entity())
+                            .filter(|next| {
+                                claim_rebind_is_exact(
+                                    current,
+                                    next,
+                                    expected_current,
+                                    expected_next,
+                                )
+                            })
+                            .cloned()
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .collect::<Option<Vec<_>>>();
+        let frame_claims = frame_claims?;
+        if self.child_slots.iter().any(|slot| {
+            claims
+                .iter()
+                .find(|next| next.entity() == slot.slot_claim().entity())
+                .is_none_or(|next| {
+                    !claim_rebind_is_exact(slot.slot_claim(), next, expected_current, expected_next)
+                })
+        }) {
+            return None;
+        }
+        if self.frames.iter().zip(&frame_claims).any(|(frame, next)| {
+            !frame.claims_can_rebind(next, claims, expected_current, expected_next)
+        }) || self
+            .child_slots
+            .iter()
+            .any(|slot| !slot.internal_claims_can_rebind(claims, expected_current, expected_next))
+        {
+            return None;
+        }
+        Some(PreparedBranchClaimRebind {
+            frame_claims,
+            all_claims: claims.to_vec(),
+            expected_current,
+            expected_next,
+        })
+    }
+
+    pub(crate) fn apply_claim_rebind(&mut self, prepared: PreparedBranchClaimRebind) {
+        let PreparedBranchClaimRebind {
+            frame_claims,
+            all_claims,
+            expected_current,
+            expected_next,
+        } = prepared;
+        let _bound_lifecycle_transition = (expected_current, expected_next);
+        for (frame, next) in self.frames.iter_mut().zip(frame_claims) {
+            frame.apply_claim_rebind(&next, &all_claims);
+        }
+        for slot in &mut self.child_slots {
+            slot.apply_internal_claim_rebind(&all_claims);
+        }
     }
 
     pub(crate) fn into_single_frame(mut self) -> Result<Option<RealizedFrame>, Self> {
@@ -334,8 +510,16 @@ impl PreparedBranch {
         self.realized.first_frame()
     }
 
+    pub(crate) const fn as_realized(&self) -> &RealizedBranch {
+        &self.realized
+    }
+
     pub(crate) fn into_realized(self) -> RealizedBranch {
         self.realized
+    }
+
+    pub(crate) const fn from_realized(realized: RealizedBranch) -> Self {
+        Self { realized }
     }
 
     pub(crate) fn into_single_frame(self) -> Result<Option<RealizedFrame>, Self> {
@@ -454,5 +638,61 @@ impl FailedPreparedBranch {
     #[cfg(feature = "test-support")]
     pub(crate) fn tracked_child_slots(&self) -> Vec<TrackedChildSlot> {
         self.realized.tracked_child_slots()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn realized_for_test(&self) -> &RealizedBranch {
+        &self.realized
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_realized_for_test(self) -> RealizedBranch {
+        self.realized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "test-support")]
+    use bevy_camera::visibility::Visibility;
+
+    #[cfg(feature = "test-support")]
+    use super::*;
+    #[cfg(feature = "test-support")]
+    use crate::{
+        components::ChildSlotLifecycle, navigation::tests::failed_nested_branch_fixture,
+        registry::RouteEntityRegistry,
+    };
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn tracked_child_slot_follows_active_and_leaving_claim_lifecycles() {
+        let (mut app, branch, _, _, _) = failed_nested_branch_fixture();
+        let mut tracked = branch
+            .tracked_child_slots()
+            .pop()
+            .expect("nested branch retains one child slot");
+
+        let active = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .compare_exchange_lifecycle(&tracked.claim, EntityLifecycle::Active)
+            .expect("prepared slot claim remains exact");
+        tracked.claim = active;
+        app.world_mut()
+            .entity_mut(tracked.entity)
+            .insert((ChildSlotLifecycle::Active, Visibility::Visible));
+        assert!(tracked.is_current(app.world()));
+
+        let leaving = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .compare_exchange_lifecycle(&tracked.claim, EntityLifecycle::Leaving)
+            .expect("active slot claim remains exact");
+        tracked.claim = leaving;
+        app.world_mut()
+            .entity_mut(tracked.entity)
+            .insert((ChildSlotLifecycle::Leaving, Visibility::Hidden));
+        assert!(tracked.is_current(app.world()));
     }
 }

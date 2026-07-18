@@ -176,6 +176,10 @@ pub(crate) struct OwnershipSeal {
 }
 
 impl OwnershipSeal {
+    pub(crate) const fn stable_identity(self) -> (u64, u64) {
+        (self.domain, self.sequence)
+    }
+
     #[cfg(test)]
     const fn fixture(domain: u64, sequence: u64) -> Self {
         Self { domain, sequence }
