@@ -1072,7 +1072,9 @@ name = "bevy_ui_router"
 version = "0.1.0"
 dependencies = [
  "bevy_app",
+ "bevy_camera",
  "bevy_ecs",
+ "bevy_picking",
  "bevy_ui",
  "bevy_ui_router_bsn",
  "bevy_ui_router_core",

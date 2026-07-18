@@ -11,9 +11,9 @@ use facade_contract_cases::{
 };
 
 #[test]
-fn root_profile_forbidden_consumers_fail_with_expected_rustc_categories() {
+fn nested_profile_forbidden_consumers_fail_with_expected_rustc_categories() {
     let allowlist = read_workspace("docs/facade-export-allowlist.md");
-    let profile = read_workspace("docs/root-push-contract-profile.md");
+    let profile = read_workspace("docs/nested-push-contract-profile.md");
     let modules = markdown_table(
         &allowlist,
         "## 2. Allowed Modules",
@@ -33,7 +33,7 @@ fn root_profile_forbidden_consumers_fail_with_expected_rustc_categories() {
         markdown_table_by_header(&allowlist, &["Module path", "Negative assertion"], 0);
     let exclusions = markdown_table(
         &profile,
-        "### 3.1 Machine-Readable Exclusions",
+        "## 7 Public contract 与阶段 exclusions",
         &["Kind", "Canonical path or normalized item", "First slice"],
     );
     let symbols = root_symbols(&symbols, &exclusions);

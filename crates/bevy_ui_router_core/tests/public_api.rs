@@ -43,26 +43,40 @@ fn route_view_key_is_public_without_raw_value_access() {
 }
 
 #[test]
-fn root_profile_hides_deferred_route_declaration_methods() {
+fn nested_profile_exposes_only_the_child_route_declaration_methods() {
+    use bevy_ui_router_core::{
+        error::RouteError,
+        ids::RouteId,
+        pattern::RoutePattern,
+        route_tree::{RouteNodeOptions, RouteTreeBuilder},
+    };
+
+    let _: fn(&mut RouteTreeBuilder, RouteId, RoutePattern) -> Result<RouteId, RouteError> =
+        RouteTreeBuilder::route;
+    let _: fn(
+        &mut RouteTreeBuilder,
+        RouteId,
+        RoutePattern,
+        RouteNodeOptions,
+    ) -> Result<RouteId, RouteError> = RouteTreeBuilder::route_with_options;
+
     let source = include_str!("../src/route_tree.rs");
 
     assert!(source.contains("pub fn root_with_options("));
     for forbidden in [
         "pub fn with_error_boundary(",
         "pub fn with_error_view(",
-        "pub fn route(",
-        "pub fn route_with_options(",
         "#[cfg(feature = \"test-support\")]",
     ] {
         assert!(
             !source.contains(forbidden),
-            "root profile must not publicly expose `{forbidden}`"
+            "nested profile must not publicly expose `{forbidden}`"
         );
     }
-    for required in ["pub(crate) fn route(", "pub(crate) fn route_with_options("] {
+    for required in ["pub fn route(", "pub fn route_with_options("] {
         assert!(
             source.contains(required),
-            "root profile must retain crate-private `{required}`"
+            "nested profile must expose `{required}`"
         );
     }
 }

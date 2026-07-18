@@ -21,7 +21,7 @@ use crate::history::{HistorySnapshot, MemoryHistory};
 use crate::ids::{NavigationRequestId, RouteSlotId, RouterIdentity};
 use crate::location::RouteLocation;
 use crate::meta::ErrorBoundaryKey;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::mount::MountRegistrationCompletion as CoreMountRegistrationCompletion;
 use crate::mount::{
     MountGrant as CoreMountGrant, MountReceiptAttestation as CoreMountReceiptAttestation,
@@ -211,6 +211,14 @@ impl MountGrant {
         self.inner.slot()
     }
 
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_duplicate(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+
     #[cfg(test)]
     fn attest_receipt(self, digest: u64) -> MountReceiptAttestation {
         MountReceiptAttestation {
@@ -239,6 +247,16 @@ pub struct MountReceiptAttestation {
     inner: CoreMountReceiptAttestation,
 }
 
+impl MountReceiptAttestation {
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_duplicate(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 pub struct MountReceiptProof {
     inner: CoreMountReceiptProof,
 }
@@ -258,6 +276,14 @@ impl MountRegistrationPermit {
         self.inner.slot()
     }
 
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_duplicate(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+
     #[cfg(test)]
     fn complete(self, registration_digest: u64) -> MountRegistrationCompletion {
         MountRegistrationCompletion {
@@ -269,9 +295,15 @@ impl MountRegistrationPermit {
 }
 
 #[cfg(test)]
-pub struct MountRegistrationCompletion {
-    #[cfg_attr(not(test), allow(dead_code))]
+struct MountRegistrationCompletion {
     inner: CoreMountRegistrationCompletion,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub struct MountRegistrationReplays {
+    completion: CoreMountRegistrationCompletion,
+    confirmation: crate::mount::MountConfirmation,
 }
 
 #[must_use = "a mount registration session must complete or reject"]
@@ -291,6 +323,25 @@ impl MountRegistrationSession<'_> {
             self.permit,
             MountRegistrationDigest::from_opaque(registration_digest),
         )
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_complete_with_replays(
+        self,
+        registration_digest: u64,
+    ) -> Result<MountRegistrationReplays, IntegrationError> {
+        let (completion, confirmation) = self
+            .engine
+            .testing_complete_preflighted_mount_registration_with_replays(
+                self.permit,
+                MountRegistrationDigest::from_opaque(registration_digest),
+            )
+            .map_err(map_mount_error)?;
+        Ok(MountRegistrationReplays {
+            completion,
+            confirmation,
+        })
     }
 
     pub fn reject(self) -> FailureCleanupRequest {
@@ -480,6 +531,14 @@ impl MountRequest {
 
     pub fn outlet(&self) -> &RouteSlotKey {
         self.inner.outlet()
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_duplicate(&self) -> Self {
+        Self {
+            inner: self.inner.testing_duplicate(),
+        }
     }
 }
 
@@ -1053,6 +1112,28 @@ impl RouterEngine {
     ) -> Result<(), IntegrationError> {
         self.inner
             .complete_mount_registration(completion.inner)
+            .map_err(map_mount_error)
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_replay_mount_completion(
+        &mut self,
+        replays: &MountRegistrationReplays,
+    ) -> Result<(), IntegrationError> {
+        self.inner
+            .complete_mount_registration(replays.completion.clone())
+            .map_err(map_mount_error)
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_replay_mount_confirmation(
+        &mut self,
+        replays: &MountRegistrationReplays,
+    ) -> Result<(), IntegrationError> {
+        self.inner
+            .consume_mount_confirmation(replays.confirmation.clone())
             .map_err(map_mount_error)
     }
 

@@ -115,46 +115,6 @@ fn route_view_key_error_struct_literal_is_private() {
 }
 
 #[test]
-fn default_consumer_cannot_declare_child_route() {
-    assert_compile_fails(Fixture {
-        name: "default_child_route",
-        code: "use bevy_ui_router_core::pattern::RoutePattern; use bevy_ui_router_core::route_tree::RouteTree; fn main() { let mut builder = RouteTree::builder().root(RoutePattern::path(\"/\").unwrap()).unwrap(); let root = builder.root_id().unwrap(); let _ = builder.route(root, RoutePattern::path(\"child\").unwrap()); }",
-        features: &[],
-        expected_stderr: &["error[E0624]", "method `route` is private"],
-    });
-}
-
-#[test]
-fn test_support_consumer_cannot_declare_child_route() {
-    assert_compile_fails(Fixture {
-        name: "test_support_child_route",
-        code: "use bevy_ui_router_core::pattern::RoutePattern; use bevy_ui_router_core::route_tree::RouteTree; fn main() { let mut builder = RouteTree::builder().root(RoutePattern::path(\"/\").unwrap()).unwrap(); let root = builder.root_id().unwrap(); let _ = builder.route(root, RoutePattern::path(\"child\").unwrap()); }",
-        features: &["test-support"],
-        expected_stderr: &["error[E0624]", "method `route` is private"],
-    });
-}
-
-#[test]
-fn default_consumer_cannot_declare_child_route_with_options() {
-    assert_compile_fails(Fixture {
-        name: "default_child_route_with_options",
-        code: "use bevy_ui_router_core::pattern::RoutePattern; use bevy_ui_router_core::route_tree::{RouteNodeOptions, RouteTree}; fn main() { let mut builder = RouteTree::builder().root(RoutePattern::path(\"/\").unwrap()).unwrap(); let root = builder.root_id().unwrap(); let _ = builder.route_with_options(root, RoutePattern::path(\"child\").unwrap(), RouteNodeOptions::new()); }",
-        features: &[],
-        expected_stderr: &["error[E0624]", "method `route_with_options` is private"],
-    });
-}
-
-#[test]
-fn test_support_consumer_cannot_declare_child_route_with_options() {
-    assert_compile_fails(Fixture {
-        name: "test_support_child_route_with_options",
-        code: "use bevy_ui_router_core::pattern::RoutePattern; use bevy_ui_router_core::route_tree::{RouteNodeOptions, RouteTree}; fn main() { let mut builder = RouteTree::builder().root(RoutePattern::path(\"/\").unwrap()).unwrap(); let root = builder.root_id().unwrap(); let _ = builder.route_with_options(root, RoutePattern::path(\"child\").unwrap(), RouteNodeOptions::new()); }",
-        features: &["test-support"],
-        expected_stderr: &["error[E0624]", "method `route_with_options` is private"],
-    });
-}
-
-#[test]
 fn admission_module_and_protocol_names_are_unreachable() {
     assert_compile_fails(Fixture {
         name: "admission_module_private",
@@ -336,6 +296,56 @@ fn consumer_cannot_bypass_mount_registration_session() {
                 "error[E0599]",
                 "no method named `complete_mount_registration`",
             ],
+        },
+        Fixture {
+            name: "test_support_mount_permit_cannot_complete_forward",
+            code: "use bevy_ui_router_core::integration::MountRegistrationPermit; fn complete(permit: MountRegistrationPermit) { let _ = permit.testing_complete(1); } fn main() {}",
+            features: &["test-support"],
+            expected_stderr: &["error[E0599]", "no method named `testing_complete`"],
+        },
+        Fixture {
+            name: "test_support_engine_cannot_complete_forward",
+            code: "use bevy_ui_router_core::integration::RouterEngine; fn complete(engine: &mut RouterEngine) { let _ = engine.testing_complete_mount_registration(todo!()); } fn main() {}",
+            features: &["test-support"],
+            expected_stderr: &[
+                "error[E0599]",
+                "no method named `testing_complete_mount_registration`",
+            ],
+        },
+        Fixture {
+            name: "test_support_engine_has_no_retaining_confirmation_forwarder",
+            code: "use bevy_ui_router_core::integration::RouterEngine; fn complete(engine: &mut RouterEngine) { let _ = engine.testing_complete_mount_registration_retaining_confirmation(todo!()); } fn main() {}",
+            features: &["test-support"],
+            expected_stderr: &[
+                "error[E0599]",
+                "no method named `testing_complete_mount_registration_retaining_confirmation`",
+            ],
+        },
+    ] {
+        assert_compile_fails(fixture);
+    }
+}
+
+#[test]
+fn test_support_mount_registration_replays_are_opaque_and_non_forgeable() {
+    for fixture in [
+        Fixture {
+            name: "mount_registration_replays_not_clone",
+            code: "use bevy_ui_router_core::integration::MountRegistrationReplays; fn require_clone<T: Clone>() {} fn main() { require_clone::<MountRegistrationReplays>(); }",
+            features: &["test-support"],
+            expected_stderr: &["error[E0277]", "trait `Clone` is not implemented"],
+        },
+        Fixture {
+            name: "mount_registration_replays_not_default",
+            code: "use bevy_ui_router_core::integration::MountRegistrationReplays; fn require_default<T: Default>() {} fn main() { require_default::<MountRegistrationReplays>(); }",
+            features: &["test-support"],
+            expected_stderr: &["error[E0277]", "trait `Default` is not implemented"],
+        },
+        Fixture {
+            name: "mount_registration_replays_fields_private",
+            code: "use bevy_ui_router_core::integration::MountRegistrationReplays; fn main() { let _ = MountRegistrationReplays { completion: todo!(), confirmation: todo!() }; }",
+            features: &["test-support"],
+            expected_stderr: &["error[E0451]", "private"],
         },
     ] {
         assert_compile_fails(fixture);

@@ -27,6 +27,9 @@ pub const AUTHORITY_REGRESSION_CATALOGUE: &[&str] = &[
     "solid_rect_runs_real_layout_and_picking_pipeline",
     "stale_report_identity_is_zero_write",
     "structural_outputs_have_locked_manifest_and_topology",
+    "mount_grant_observer_drift_rejects_after_mutation",
+    "mount_token_replay_is_zero_write",
+    "slot_lifecycle_has_no_orphans",
 ];
 
 fn package_root() -> PathBuf {
@@ -75,7 +78,7 @@ fn catalogue_set() -> BTreeSet<String> {
     names
 }
 
-fn parse_one_column_table(markdown: &str, heading: &str) -> BTreeSet<String> {
+fn parse_one_column_table(markdown: &str, heading: &str) -> Vec<String> {
     let section = markdown
         .split_once(heading)
         .unwrap_or_else(|| panic!("missing catalogue heading `{heading}`"))
@@ -117,7 +120,7 @@ fn parse_one_column_table(markdown: &str, heading: &str) -> BTreeSet<String> {
     assert!(!ordered.is_empty(), "catalogue table must not be empty");
     let names = ordered.iter().cloned().collect::<BTreeSet<_>>();
     assert_eq!(names.len(), ordered.len(), "catalogue table has duplicates");
-    names
+    ordered
 }
 
 fn parse_final_mvp_catalogue(markdown: &str) -> BTreeSet<String> {
@@ -160,18 +163,52 @@ fn direct_tests(file: &syn::File) -> Vec<&ItemFn> {
 }
 
 #[test]
-fn catalogue_matches_root_profile_and_final_mvp_vocabulary() {
+fn catalogue_matches_root_and_nested_profiles_and_final_mvp_vocabulary() {
     let root_profile =
         fs::read_to_string(workspace_root().join("docs/root-push-contract-profile.md"))
             .expect("Root profile must be readable");
     let final_mvp = fs::read_to_string(workspace_root().join("docs/mvp-acceptance-journeys.md"))
         .expect("MVP journeys must be readable");
-    let expected =
+    let root_names =
         parse_one_column_table(&root_profile, "### 3.2 Root Authority Regression Catalogue");
+    let nested_profile =
+        fs::read_to_string(workspace_root().join("docs/nested-push-contract-profile.md"))
+            .expect("Nested profile must be readable");
+    let nested_names = parse_one_column_table(
+        &nested_profile,
+        "### 7.1 Nested Authority Regression Additions",
+    );
+    assert_eq!(
+        root_names.len(),
+        20,
+        "Root catalogue must stay locked at 20"
+    );
+    assert_eq!(nested_names.len(), 3, "Nested must add exactly three names");
+    assert_eq!(
+        AUTHORITY_REGRESSION_CATALOGUE[..20],
+        root_names,
+        "the Rust Root prefix must preserve the profile table order"
+    );
+    assert_eq!(
+        AUTHORITY_REGRESSION_CATALOGUE[20..],
+        nested_names,
+        "the Rust Nested suffix must preserve the profile table order"
+    );
+    let root_set = root_names.into_iter().collect::<BTreeSet<_>>();
+    let nested_set = nested_names.into_iter().collect::<BTreeSet<_>>();
+    let overlap = root_set.intersection(&nested_set).collect::<Vec<_>>();
+    assert!(
+        overlap.is_empty(),
+        "Root and Nested catalogue tables must not overlap: {overlap:?}"
+    );
+    let mut expected = root_set;
+    expected.extend(nested_set);
+    assert_eq!(expected.len(), 23, "Nested cumulative catalogue must be 23");
     let catalogue = catalogue_set();
+    assert_eq!(catalogue.len(), 23, "Rust catalogue must stay locked at 23");
     assert_eq!(
         catalogue, expected,
-        "Rust catalogue must match Root profile"
+        "Rust catalogue must match the Root and Nested profile union"
     );
     let final_names = parse_final_mvp_catalogue(&final_mvp);
     let unknown = catalogue
@@ -180,7 +217,7 @@ fn catalogue_matches_root_profile_and_final_mvp_vocabulary() {
         .collect::<Vec<_>>();
     assert!(
         unknown.is_empty(),
-        "Root catalogue contains non-final-MVP names: {unknown:?}"
+        "Nested catalogue contains non-final-MVP names: {unknown:?}"
     );
 }
 

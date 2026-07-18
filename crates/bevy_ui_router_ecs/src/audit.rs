@@ -129,6 +129,32 @@ pub struct AuthorityFrameMapping {
     lifecycle: AuthorityFrameLifecycle,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityOutletMapping {
+    parent: RouteFrameVersion,
+    key: RouteSlotKey,
+    anchor: AuditEntityId,
+    child_slot: Option<AuditEntityId>,
+}
+
+impl AuthorityOutletMapping {
+    pub fn parent(&self) -> &RouteFrameVersion {
+        &self.parent
+    }
+
+    pub fn key(&self) -> &RouteSlotKey {
+        &self.key
+    }
+
+    pub fn anchor(&self) -> AuditEntityId {
+        self.anchor
+    }
+
+    pub fn child_slot(&self) -> Option<AuditEntityId> {
+        self.child_slot
+    }
+}
+
 impl AuthorityFrameMapping {
     pub fn frame(&self) -> &RouteFrameVersion {
         &self.frame
@@ -253,6 +279,7 @@ pub struct RouterAuthorityAuditSnapshot {
     host: Option<AuthorityHostMapping>,
     slots: Vec<AuthoritySlotMapping>,
     frames: Vec<AuthorityFrameMapping>,
+    outlets: Vec<AuthorityOutletMapping>,
     content: Vec<AuthorityContentMapping>,
     orphan_slots: Vec<RouteSlotId>,
     orphan_slot_mappings: Vec<AuthoritySlotMapping>,
@@ -268,6 +295,7 @@ impl RouterAuthorityAuditSnapshot {
             host: None,
             slots: Vec::new(),
             frames: Vec::new(),
+            outlets: Vec::new(),
             content: Vec::new(),
             orphan_slots: Vec::new(),
             orphan_slot_mappings: Vec::new(),
@@ -288,6 +316,10 @@ impl RouterAuthorityAuditSnapshot {
 
     pub fn frames(&self) -> &[AuthorityFrameMapping] {
         &self.frames
+    }
+
+    pub fn outlets(&self) -> &[AuthorityOutletMapping] {
+        &self.outlets
     }
 
     pub fn content(&self) -> &[AuthorityContentMapping] {
@@ -567,6 +599,7 @@ impl RouterAuthorityAudits {
             );
             let mut owned_states = vec![(top_slot_id, AuditEntityState::PresentOwned)];
             let mut frames = Vec::new();
+            let mut outlets = Vec::new();
             let mut content = Vec::new();
             let mut samples = Vec::new();
             let tracked_child_slots = entry
@@ -675,6 +708,68 @@ impl RouterAuthorityAudits {
                     slot_entity,
                     lifecycle,
                 });
+                let expected_lifecycle = match lifecycle {
+                    AuthorityFrameLifecycle::PreparedInert => EntityLifecycle::PreparedInert,
+                    AuthorityFrameLifecycle::Active => EntityLifecycle::Active,
+                    AuthorityFrameLifecycle::LeavingInert => EntityLifecycle::Leaving,
+                    AuthorityFrameLifecycle::Quarantined => continue,
+                };
+                for outlet in frame.outlets() {
+                    let anchor_is_exact = outlet.parent() == frame.frame()
+                        && world
+                            .get_resource::<RouteEntityRegistry>()
+                            .and_then(|registry| registry.record(outlet.anchor()))
+                            .is_some_and(|record| {
+                                record.claim() == *outlet.anchor_claim()
+                                    && record.lifecycle() == expected_lifecycle
+                                    && matches!(
+                                        record.owner(),
+                                        RegistryOwner::Committed(EntityOwner::FrameOutput {
+                                            frame: owner_frame,
+                                            ..
+                                        }) if owner_frame == outlet.parent()
+                                    )
+                                    && record.manifest().matches(world, outlet.anchor())
+                                    && world.get::<RouteOwnershipSeal>(outlet.anchor())
+                                        == Some(&RouteOwnershipSeal::new(record.seal()))
+                            });
+                    if !anchor_is_exact {
+                        continue;
+                    }
+                    let anchor = self.id_for(
+                        entry.handle,
+                        outlet.anchor(),
+                        true,
+                        Some(frame.frame()),
+                        request,
+                        interactive.contains(&outlet.anchor()),
+                        false,
+                    );
+                    let child_slot = tracked_child_slots
+                        .iter()
+                        .find(|slot| {
+                            slot.parent() == outlet.parent()
+                                && slot.outlet() == outlet.key()
+                                && slot.anchor() == outlet.anchor()
+                        })
+                        .map(|slot| {
+                            self.id_for(
+                                entry.handle,
+                                slot.entity(),
+                                true,
+                                Some(slot.parent()),
+                                request,
+                                false,
+                                false,
+                            )
+                        });
+                    outlets.push(AuthorityOutletMapping {
+                        parent: outlet.parent().clone(),
+                        key: outlet.key().clone(),
+                        anchor,
+                        child_slot,
+                    });
+                }
                 for (entity, rect) in frame.audit_content() {
                     let id = self.id_for(
                         entry.handle,
@@ -760,6 +855,24 @@ impl RouterAuthorityAudits {
                     ));
                 }
             }
+            outlets.sort_by(|left, right| {
+                (
+                    left.parent.router().raw(),
+                    left.parent.host().raw(),
+                    left.parent.slot().raw(),
+                    left.parent.frame().raw(),
+                    left.parent.generation().raw(),
+                    left.key.as_str(),
+                )
+                    .cmp(&(
+                        right.parent.router().raw(),
+                        right.parent.host().raw(),
+                        right.parent.slot().raw(),
+                        right.parent.frame().raw(),
+                        right.parent.generation().raw(),
+                        right.key.as_str(),
+                    ))
+            });
             let snapshot = self.finalize_snapshot(
                 world,
                 entry,
@@ -773,6 +886,7 @@ impl RouterAuthorityAudits {
                     }),
                     slots,
                     frames,
+                    outlets,
                     content,
                     orphan_slots,
                     orphan_slot_mappings,

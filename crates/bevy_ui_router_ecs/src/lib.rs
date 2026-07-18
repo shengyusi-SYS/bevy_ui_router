@@ -29,9 +29,9 @@ pub use app_ext::{
 #[cfg(feature = "test-support")]
 pub use audit::{
     AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
-    AuthorityFrameMapping, AuthorityHostMapping, AuthoritySlotKind, AuthoritySlotMapping,
-    RouterAuthorityAuditSnapshot, RouterAuthorityAudits, RouterLifecycleAuditEvent,
-    RouterLifecycleAuditEventKind,
+    AuthorityFrameMapping, AuthorityHostMapping, AuthorityOutletMapping, AuthoritySlotKind,
+    AuthoritySlotMapping, RouterAuthorityAuditSnapshot, RouterAuthorityAudits,
+    RouterLifecycleAuditEvent, RouterLifecycleAuditEventKind,
 };
 pub use content::{
     ContentColor, ContentEntity, ContentPrimitiveError, ContentPrimitiveErrorKind,
@@ -58,8 +58,8 @@ pub mod prelude {
     #[cfg(feature = "test-support")]
     pub use crate::{
         AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
-        AuthorityFrameMapping, AuthorityHostMapping, AuthoritySlotKind, AuthoritySlotMapping,
-        RouterAuthorityAuditSnapshot, RouterAuthorityAudits, RouterLifecycleAuditEvent,
-        RouterLifecycleAuditEventKind,
+        AuthorityFrameMapping, AuthorityHostMapping, AuthorityOutletMapping, AuthoritySlotKind,
+        AuthoritySlotMapping, RouterAuthorityAuditSnapshot, RouterAuthorityAudits,
+        RouterLifecycleAuditEvent, RouterLifecycleAuditEventKind,
     };
 }

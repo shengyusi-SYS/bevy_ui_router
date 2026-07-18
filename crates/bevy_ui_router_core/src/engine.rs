@@ -389,7 +389,7 @@ impl FrameMountRequest {
         &self.outlet
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn testing_duplicate(&self) -> Self {
         Self {
             token: self.token.clone(),
@@ -577,6 +577,20 @@ struct PendingMount {
     child_index: usize,
     parent: RouteFrameVersion,
     outlet: RouteSlotKey,
+}
+
+struct ConfirmedChildPublication {
+    current: CurrentWork,
+    record_index: usize,
+    record: NavigationRequestRecord,
+    phase: NavigationPhase,
+    identity: FrameTaskIdentity,
+    frame: RouteFrameVersion,
+    target: FrameMountTarget,
+    location: RouteLocation,
+    matched: MatchedRoute,
+    view: RouteViewKey,
+    input: RouteViewInput,
 }
 
 #[derive(Clone, Debug)]
@@ -966,12 +980,38 @@ impl RouterEngine {
         &mut self,
         completion: MountRegistrationCompletion,
     ) -> Result<(), MountError> {
+        self.complete_mount_registration_with_replay(completion)
+            .map(drop)
+    }
+
+    fn complete_mount_registration_with_replay(
+        &mut self,
+        completion: MountRegistrationCompletion,
+    ) -> Result<MountConfirmation, MountError> {
         self.mount.validate_completion(&completion)?;
-        if !self.has_live_mount_context(&WorkStage::ConfirmingMount, None) {
-            return Err(MountError::WrongPhase);
-        }
+        let publication = self.prepare_confirmed_child(completion.slot())?;
         let confirmation = self.mount.complete_registration(&completion)?;
-        self.issue_confirmed_child(confirmation);
+        let replay = confirmation.clone();
+        self.consume_prepared_mount_confirmation(confirmation, publication)?;
+        Ok(replay)
+    }
+
+    pub(crate) fn consume_mount_confirmation(
+        &mut self,
+        confirmation: MountConfirmation,
+    ) -> Result<(), MountError> {
+        self.mount.validate_confirmation(&confirmation)?;
+        let publication = self.prepare_confirmed_child(confirmation.slot())?;
+        self.consume_prepared_mount_confirmation(confirmation, publication)
+    }
+
+    fn consume_prepared_mount_confirmation(
+        &mut self,
+        confirmation: MountConfirmation,
+        publication: ConfirmedChildPublication,
+    ) -> Result<(), MountError> {
+        self.mount.consume_confirmation(&confirmation)?;
+        self.apply_confirmed_child(publication);
         Ok(())
     }
 
@@ -1006,6 +1046,18 @@ impl RouterEngine {
         let completion = permit.complete(registration_digest);
         self.complete_mount_registration(completion)
             .expect("an exclusively borrowed preflighted registration remains valid")
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_complete_preflighted_mount_registration_with_replays(
+        &mut self,
+        permit: MountRegistrationPermit,
+        registration_digest: MountRegistrationDigest,
+    ) -> Result<(MountRegistrationCompletion, MountConfirmation), MountError> {
+        let completion = permit.complete(registration_digest);
+        let replay = completion.clone();
+        let confirmation = self.complete_mount_registration_with_replay(completion)?;
+        Ok((replay, confirmation))
     }
 
     pub(crate) fn reject_preflighted_mount_registration(
@@ -2100,35 +2152,32 @@ impl RouterEngine {
         }));
     }
 
-    fn issue_confirmed_child(&mut self, confirmation: MountConfirmation) {
-        debug_assert!(confirmation.has_valid_binding());
-        let slot = confirmation.slot();
-        let pending = self
-            .current
-            .as_mut()
-            .expect("confirmed mount belongs to current work")
-            .pending_mount
-            .take()
-            .expect("confirming work has pending child facts");
+    fn prepare_confirmed_child(
+        &self,
+        slot: RouteSlotId,
+    ) -> Result<ConfirmedChildPublication, MountError> {
+        if !self.has_live_mount_context(&WorkStage::ConfirmingMount, None) {
+            return Err(MountError::WrongPhase);
+        }
+        let mut current = self.current.clone().ok_or(MountError::WrongPhase)?;
+        let pending = current.pending_mount.take().ok_or(MountError::WrongPhase)?;
         let index = pending.child_index;
-        let (request, transaction, host, host_epoch, location, matched, reserved) = {
-            let current = self.current.as_ref().expect("current work exists");
-            let matched = current
-                .branch
-                .as_ref()
-                .and_then(|branch| branch.routes().get(index))
-                .expect("reserved child index belongs to matched branch")
-                .clone();
-            (
-                current.identity.request,
-                current.identity.transaction,
-                current.identity.host,
-                current.identity.host_epoch,
-                current.location.clone(),
-                matched,
-                current.reservation[index],
-            )
-        };
+        let matched = current
+            .branch
+            .as_ref()
+            .and_then(|branch| branch.routes().get(index))
+            .cloned()
+            .ok_or(MountError::WrongPhase)?;
+        let reserved = current
+            .reservation
+            .get(index)
+            .copied()
+            .ok_or(MountError::WrongPhase)?;
+        let request = current.identity.request;
+        let transaction = current.identity.transaction;
+        let host = current.identity.host;
+        let host_epoch = current.identity.host_epoch;
+        let location = current.location.clone();
         let origin = FrameOrigin::MatchedRoute(matched.route());
         let frame = RouteFrameVersion::new(
             self.router,
@@ -2158,8 +2207,8 @@ impl RouterEngine {
         let view = self
             .matcher
             .view_binding(matched.route())
-            .expect("each scheduled route has a view binding")
-            .clone();
+            .cloned()
+            .ok_or(MountError::WrongPhase)?;
         let input = RouteViewInput::new(
             location.clone(),
             Some(matched.route()),
@@ -2167,16 +2216,58 @@ impl RouterEngine {
             origin,
             None,
         );
-        let current = self.current.as_mut().expect("current work exists");
         current.identity = identity.clone();
         current.target_frames.push(frame.clone());
         current.current_target = target.clone();
         current.stage = WorkStage::Applying;
-        self.record_mut(request)
-            .expect("running record is retained")
+        let record_index = self
+            .records
+            .iter()
+            .position(|record| record.id() == request)
+            .ok_or(MountError::WrongPhase)?;
+        let mut record = self.records[record_index].clone();
+        record
             .append_trace(NavigationTraceEvent::frame_task_issued(frame.clone()))
-            .expect("running trace is open");
-        self.transition_with_trace(request, NavigationPhase::ApplyingFrame(index));
+            .map_err(|_| MountError::WrongPhase)?;
+        let phase = NavigationPhase::ApplyingFrame(index);
+        record
+            .transition(RequestStatus::Running(phase.clone()))
+            .map_err(|_| MountError::WrongPhase)?;
+        record
+            .append_trace(NavigationTraceEvent::request_phase_changed(phase.clone()))
+            .map_err(|_| MountError::WrongPhase)?;
+        Ok(ConfirmedChildPublication {
+            current,
+            record_index,
+            record,
+            phase,
+            identity,
+            frame,
+            target,
+            location,
+            matched,
+            view,
+            input,
+        })
+    }
+
+    fn apply_confirmed_child(&mut self, publication: ConfirmedChildPublication) {
+        let ConfirmedChildPublication {
+            current,
+            record_index,
+            record,
+            phase,
+            identity,
+            frame,
+            target,
+            location,
+            matched,
+            view,
+            input,
+        } = publication;
+        self.current = Some(current);
+        self.records[record_index] = record;
+        self.state.set_request(Some(RequestStatus::Running(phase)));
         self.issued_view_tasks.push(identity.clone());
         self.action = Some(EngineAction::FrameTask(FrameTask {
             identity,
@@ -4449,6 +4540,52 @@ mod tests {
             ]
         );
         engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+    }
+
+    #[test]
+    fn mount_confirmation_consumer_rejects_foreign_and_consumed_replays_without_write() {
+        fn completed_confirmation(
+            engine: &mut RouterEngine,
+            digest: u64,
+        ) -> crate::mount::MountConfirmation {
+            let (_, _, mount) =
+                begin_nested_mount(engine, vec![crate::slot::RouteSlotKey::default()]);
+            let grant = engine.resolve_mount(mount).unwrap();
+            let receipt =
+                grant.attest_receipt(crate::mount::MountReceiptDigest::from_opaque(digest));
+            let permit = engine.accept_mount_receipt(receipt).unwrap();
+            let completion = permit.complete(crate::mount::MountRegistrationDigest::from_opaque(
+                digest + 1,
+            ));
+            engine
+                .complete_mount_registration_with_replay(completion)
+                .unwrap()
+        }
+
+        let mut source = ready_engine();
+        let replay = completed_confirmation(&mut source, 0x431);
+        let completed = source.snapshot();
+        assert_eq!(
+            source.consume_mount_confirmation(replay),
+            Err(crate::mount::MountError::Stale)
+        );
+        assert_eq!(source.snapshot(), completed);
+
+        let mut foreign_source = ready_engine();
+        let foreign = completed_confirmation(&mut foreign_source, 0x439);
+        let mut receiver = ready_engine();
+        let (_, _, mount) =
+            begin_nested_mount(&mut receiver, vec![crate::slot::RouteSlotKey::default()]);
+        let grant = receiver.resolve_mount(mount).unwrap();
+        let receipt = grant.attest_receipt(crate::mount::MountReceiptDigest::from_opaque(0x443));
+        receiver.accept_mount_receipt(receipt).unwrap();
+        let before = receiver.snapshot();
+        assert_eq!(
+            receiver.consume_mount_confirmation(foreign),
+            Err(crate::mount::MountError::Foreign)
+        );
+        assert_eq!(receiver.snapshot(), before);
+        assert!(receiver.action().is_none());
     }
 
     #[test]

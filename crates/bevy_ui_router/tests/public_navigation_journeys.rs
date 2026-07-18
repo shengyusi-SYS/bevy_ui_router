@@ -6,12 +6,14 @@ use std::{
 };
 
 use bevy_app::App;
+use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
     component::ComponentId,
     entity::Entity,
     hierarchy::{ChildOf, Children},
     prelude::Component,
 };
+use bevy_picking::Pickable;
 use bevy_ui::{BackgroundColor, Node, Val};
 use bevy_ui_router::prelude::*;
 
@@ -51,6 +53,8 @@ enum FixtureMode {
 struct EffectRecord {
     view: RouteViewKey,
     location: RouteLocation,
+    route: Option<RouteId>,
+    id_param: Option<String>,
     fragment: Option<String>,
     origin: FrameOrigin,
     failure: Option<NavigationFailureKind>,
@@ -93,6 +97,8 @@ impl FixtureControl {
         state.effects.push(EffectRecord {
             view: effect.view().clone(),
             location: effect.input().location().clone(),
+            route: effect.input().route(),
+            id_param: effect.input().params().get("id").map(str::to_owned),
             fragment: effect.input().fragment().map(str::to_owned),
             origin: effect.input().origin().clone(),
             failure: effect.input().failure().map(NavigationFailure::kind),
@@ -112,6 +118,7 @@ impl FixtureControl {
 struct FixtureDriver {
     key: ViewDriverKey,
     control: FixtureControl,
+    outlet_view: Option<RouteViewKey>,
 }
 
 impl EcsViewDriver for FixtureDriver {
@@ -127,7 +134,12 @@ impl EcsViewDriver for FixtureDriver {
     ) -> ViewBuildReport {
         match self.control.mode_and_record(effect) {
             FixtureMode::Success { width } => {
-                stage_rect(content, width);
+                let container = stage_rect(content, width);
+                if self.outlet_view.as_ref() == Some(effect.view()) {
+                    content
+                        .declare_outlet(container, RouteSlotKey::default())
+                        .expect("layout outlet should stage");
+                }
                 report.applied()
             }
             FixtureMode::BuildFailure => report.build_failed("fixture build failure"),
@@ -139,7 +151,7 @@ impl EcsViewDriver for FixtureDriver {
     }
 }
 
-fn stage_rect(content: &mut FrameContentWriter<'_>, width: u16) {
+fn stage_rect(content: &mut FrameContentWriter<'_>, width: u16) -> ContentEntity {
     let container = content
         .spawn_empty()
         .expect("fixture container should stage");
@@ -152,6 +164,7 @@ fn stage_rect(content: &mut FrameContentWriter<'_>, width: u16) {
     content
         .add_child(container, rect)
         .expect("fixture content edge should stage");
+    container
 }
 
 struct RootFixture {
@@ -189,6 +202,7 @@ fn root_fixture(pattern: &str) -> RootFixture {
         .register_ui_view_driver(FixtureDriver {
             key: ViewDriverKey::new("fixture-driver").unwrap(),
             control: control.clone(),
+            outlet_view: None,
         })
         .unwrap();
     let routes = RouteTree::builder()
@@ -269,6 +283,126 @@ fn root_fixture(pattern: &str) -> RootFixture {
         existing_children,
         host_fingerprint,
         admission_entities,
+    }
+}
+
+struct NestedFixture {
+    app: App,
+    router: RouterHandle,
+    control: FixtureControl,
+    layout: RouteViewKey,
+    leaf: RouteViewKey,
+    layout_route: RouteId,
+    leaf_route: RouteId,
+    host_fingerprint: HostBoundaryFingerprint,
+}
+
+fn nested_fixture() -> NestedFixture {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+
+    let layout = RouteViewKey::new("nested-layout").unwrap();
+    let leaf = RouteViewKey::new("nested-leaf").unwrap();
+    let fallback = RouteViewKey::new("nested-fallback").unwrap();
+    let control = FixtureControl::default();
+    for (view, width) in [
+        (layout.clone(), 41),
+        (leaf.clone(), 43),
+        (fallback.clone(), FALLBACK_RECT_WIDTH),
+    ] {
+        control.set_mode(&view, FixtureMode::Success { width });
+    }
+    let driver = app
+        .register_ui_view_driver(FixtureDriver {
+            key: ViewDriverKey::new("nested-driver").unwrap(),
+            control: control.clone(),
+            outlet_view: Some(layout.clone()),
+        })
+        .unwrap();
+    let mut routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::pathless(),
+            RouteNodeOptions::new().with_view(layout.clone()),
+        )
+        .unwrap();
+    let layout_route = routes.root_id().unwrap();
+    let leaf_route = routes
+        .route_with_options(
+            layout_route,
+            RoutePattern::path("items/:id").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(leaf.clone())
+                .with_slot(RouteSlotKey::default()),
+        )
+        .unwrap();
+    let routes = routes.build().unwrap();
+    let mut views = RouteViewRegistry::new();
+    for view in [layout.clone(), leaf.clone(), fallback.clone()] {
+        views
+            .insert(view, RouteViewDescriptor::new(driver.clone()))
+            .unwrap();
+    }
+    let router = app
+        .add_ui_router(RouterConfig::new(routes, views, fallback))
+        .unwrap();
+
+    let host = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(640.0),
+                height: Val::Px(360.0),
+                ..Node::default()
+            },
+            HostSentinel(7),
+            HostMetadata(73),
+            RouterHostRegistration::new(router),
+        ))
+        .id();
+    let existing_child = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(13.0),
+                height: Val::Px(17.0),
+                ..Node::default()
+            },
+            ExistingChild(11),
+            ChildOf(host),
+        ))
+        .id();
+    let existing_sibling = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(19.0),
+                height: Val::Px(29.0),
+                ..Node::default()
+            },
+            ExistingSibling(17),
+            ChildOf(host),
+        ))
+        .id();
+    let existing_children = vec![existing_child, existing_sibling];
+    let mut host_fingerprint = capture_host_boundary(&app, host, &existing_children);
+    app.update();
+    host_fingerprint.top_slot = app
+        .world()
+        .get::<Children>(host)
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|child| !existing_children.contains(child));
+
+    NestedFixture {
+        app,
+        router,
+        control,
+        layout,
+        leaf,
+        layout_route,
+        leaf_route,
+        host_fingerprint,
     }
 }
 
@@ -606,10 +740,201 @@ fn assert_real_solid_rect(app: &mut App, width: u16) {
             .expect("a realized SolidRect must carry BackgroundColor"),
         &BackgroundColor::default()
     );
+    assert_ne!(
+        app.world()
+            .get::<Visibility>(entities[0])
+            .expect("a realized SolidRect must carry Visibility"),
+        &Visibility::Hidden
+    );
+    let pickable = app
+        .world()
+        .get::<Pickable>(entities[0])
+        .expect("a realized SolidRect must carry Pickable");
+    assert!(pickable.should_block_lower);
+    assert!(pickable.is_hoverable);
     let gate = app.world().resource::<RouterInputGate>();
     assert!(gate.allows_pointer(entities[0]));
     assert!(gate.allows_keyboard(entities[0]));
     assert!(gate.allows_gamepad(entities[0]));
+}
+
+fn next_trace_event(
+    trace: &[NavigationTraceEvent],
+    after: Option<usize>,
+    kind: NavigationTraceEventKind,
+    predicate: impl Fn(&NavigationTraceEvent) -> bool,
+) -> usize {
+    trace
+        .iter()
+        .enumerate()
+        .skip(after.map_or(0, |index| index + 1))
+        .find_map(|(index, event)| (event.kind() == kind && predicate(event)).then_some(index))
+        .unwrap_or_else(|| panic!("missing ordered {kind:?} event after {after:?}: {trace:?}"))
+}
+
+#[test]
+fn nested_push_journey_a() {
+    let mut fixture = nested_fixture();
+    let request_id = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        RouteLocation::new("/items/1"),
+        None,
+        None,
+    );
+    let request = request_snapshot(&fixture.app, fixture.router, request_id);
+    let router = router_snapshot(&fixture.app, fixture.router);
+    let effects = fixture.control.effects();
+
+    assert_eq!(
+        effects
+            .iter()
+            .map(|effect| effect.view.clone())
+            .collect::<Vec<_>>(),
+        vec![fixture.layout.clone(), fixture.leaf.clone()]
+    );
+    assert_eq!(effects[0].location, RouteLocation::new("/items/1"));
+    assert_eq!(effects[0].route, Some(fixture.layout_route));
+    assert_eq!(effects[0].id_param, None);
+    assert_eq!(effects[0].fragment, None);
+    assert_eq!(
+        effects[0].origin,
+        FrameOrigin::MatchedRoute(fixture.layout_route)
+    );
+    assert_eq!(effects[1].location, RouteLocation::new("/items/1"));
+    assert_eq!(effects[1].route, Some(fixture.leaf_route));
+    assert_eq!(effects[1].id_param.as_deref(), Some("1"));
+    assert_eq!(effects[1].fragment, None);
+    assert_eq!(
+        effects[1].origin,
+        FrameOrigin::MatchedRoute(fixture.leaf_route)
+    );
+
+    assert_eq!(router.active().frames().len(), 2);
+    assert_eq!(
+        router.history().entries(),
+        &[RouteLocation::new("/items/1")]
+    );
+    assert_eq!(request.status(), &RequestStatus::Succeeded);
+    assert!(!router.cleanup().foreground_pending());
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+    assert_real_solid_rect(&mut fixture.app, 41);
+    assert_real_solid_rect(&mut fixture.app, 43);
+
+    let parent = &router.active().frames()[0];
+    let child = &router.active().frames()[1];
+    assert_eq!(
+        parent.origin(),
+        &FrameOrigin::MatchedRoute(fixture.layout_route)
+    );
+    assert_eq!(
+        child.origin(),
+        &FrameOrigin::MatchedRoute(fixture.leaf_route)
+    );
+    let default_outlet = RouteSlotKey::default();
+    let trace = request.trace();
+    let mut cursor = None;
+    cursor = Some(next_trace_event(
+        trace,
+        cursor,
+        NavigationTraceEventKind::FrameTaskIssued,
+        |event| event.frame() == Some(parent),
+    ));
+    cursor = Some(next_trace_event(
+        trace,
+        cursor,
+        NavigationTraceEventKind::ShellPrepared,
+        |event| event.frame() == Some(parent),
+    ));
+    cursor = Some(next_trace_event(
+        trace,
+        cursor,
+        NavigationTraceEventKind::ViewApplied,
+        |event| event.frame() == Some(parent),
+    ));
+    cursor = Some(next_trace_event(
+        trace,
+        cursor,
+        NavigationTraceEventKind::OutletRegistered,
+        |event| event.frame() == Some(parent) && event.outlet() == Some(&default_outlet),
+    ));
+    cursor = Some(next_trace_event(
+        trace,
+        cursor,
+        NavigationTraceEventKind::MountRequested,
+        |event| event.frame() == Some(parent) && event.outlet() == Some(&default_outlet),
+    ));
+    cursor = Some(next_trace_event(
+        trace,
+        cursor,
+        NavigationTraceEventKind::MountResolved,
+        |event| event.frame() == Some(parent) && event.outlet() == Some(&default_outlet),
+    ));
+    cursor = Some(next_trace_event(
+        trace,
+        cursor,
+        NavigationTraceEventKind::MountGranted,
+        |event| {
+            event.frame() == Some(parent)
+                && event.outlet() == Some(&default_outlet)
+                && event.slot() == Some(child.slot())
+        },
+    ));
+    cursor = Some(next_trace_event(
+        trace,
+        cursor,
+        NavigationTraceEventKind::FrameTaskIssued,
+        |event| event.frame() == Some(child),
+    ));
+    cursor = Some(next_trace_event(
+        trace,
+        cursor,
+        NavigationTraceEventKind::ShellPrepared,
+        |event| event.frame() == Some(child),
+    ));
+    cursor = Some(next_trace_event(
+        trace,
+        cursor,
+        NavigationTraceEventKind::ViewApplied,
+        |event| event.frame() == Some(child),
+    ));
+    cursor = Some(next_trace_event(
+        trace,
+        cursor,
+        NavigationTraceEventKind::FrameActivated,
+        |event| event.frame() == Some(parent),
+    ));
+    cursor = Some(next_trace_event(
+        trace,
+        cursor,
+        NavigationTraceEventKind::FrameActivated,
+        |event| event.frame() == Some(child),
+    ));
+    cursor = Some(next_trace_event(
+        trace,
+        cursor,
+        NavigationTraceEventKind::CommitPublished,
+        |_| true,
+    ));
+    cursor = Some(next_trace_event(
+        trace,
+        cursor,
+        NavigationTraceEventKind::RequestPhaseChanged,
+        |event| event.phase() == Some(&NavigationPhase::PostCommitCleanup),
+    ));
+    cursor = Some(next_trace_event(
+        trace,
+        cursor,
+        NavigationTraceEventKind::CleanupSettled,
+        |event| event.cleanup_disposition().is_none(),
+    ));
+    let terminal = next_trace_event(
+        trace,
+        cursor,
+        NavigationTraceEventKind::RequestTerminal,
+        |_| true,
+    );
+    assert_eq!(terminal + 1, trace.len());
 }
 
 #[test]

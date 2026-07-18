@@ -399,11 +399,6 @@ fn validate_exclusion_vocabulary(exclusions: &[TableRow]) {
     let expected = BTreeSet::from([
         (
             "symbol",
-            "bevy_ui_router::ecs::AuthorityOutletMapping",
-            "Nested push",
-        ),
-        (
-            "symbol",
             "bevy_ui_router::ecs::InputProbeResult",
             "Authority closure",
         ),
@@ -439,11 +434,6 @@ fn validate_exclusion_vocabulary(exclusions: &[TableRow]) {
         ),
         (
             "associated",
-            "bevy_ui_router::ecs::FrameContentWriter::declare_outlet",
-            "Nested push",
-        ),
-        (
-            "associated",
             "bevy_ui_router::ecs::RouterNavigation::replace",
             "History",
         ),
@@ -451,16 +441,6 @@ fn validate_exclusion_vocabulary(exclusions: &[TableRow]) {
             "associated",
             "bevy_ui_router::ecs::RouterNavigation::back",
             "History",
-        ),
-        (
-            "associated",
-            "bevy_ui_router::core::RouteTreeBuilder::route_with_options",
-            "Nested push",
-        ),
-        (
-            "associated",
-            "bevy_ui_router::core::RouteTreeBuilder::route",
-            "Nested push",
         ),
         (
             "associated",
@@ -474,18 +454,13 @@ fn validate_exclusion_vocabulary(exclusions: &[TableRow]) {
         ),
         (
             "associated",
-            "bevy_ui_router::ecs::RouterAuthorityAuditSnapshot::outlets",
-            "Nested push",
-        ),
-        (
-            "associated",
             "bevy_ui_router::ecs::RouterAuthorityAuditSnapshot::quarantines",
             "Authority closure",
         ),
     ]);
     assert_eq!(
         actual, expected,
-        "Root profile exclusion path/slice mapping drifted"
+        "Nested profile exclusion path/slice mapping drifted"
     );
 }
 
@@ -4560,7 +4535,7 @@ mod mutation_tests {
 
     fn contract_rows() -> (Vec<SymbolRow>, Vec<TableRow>) {
         let allowlist = read_workspace("docs/facade-export-allowlist.md");
-        let profile = read_workspace("docs/root-push-contract-profile.md");
+        let profile = read_workspace("docs/nested-push-contract-profile.md");
         let symbols = markdown_table(
             &allowlist,
             "## 3. Allowed Type/Value/Trait Symbols",
@@ -4568,7 +4543,7 @@ mod mutation_tests {
         );
         let exclusions = markdown_table(
             &profile,
-            "### 3.1 Machine-Readable Exclusions",
+            "## 7 Public contract 与阶段 exclusions",
             &["Kind", "Canonical path or normalized item", "First slice"],
         );
         (root_symbols(&symbols, &exclusions), exclusions)

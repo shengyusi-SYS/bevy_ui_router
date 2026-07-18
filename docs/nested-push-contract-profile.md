@@ -231,9 +231,9 @@ Nested 阶段从最终合同中解锁且只解锁
 | `mount_token_replay_is_zero_write` |
 | `slot_lifecycle_has_no_orphans` |
 
-Nested 当前 catalogue 精确等于 [Root Authority Regression Catalogue](root-push-contract-profile.md#32-root-authority-regression-catalogue) 的 19 项与上表 3 项的集合并集，共 22 项
+Nested 当前 catalogue 精确等于 [Root Authority Regression Catalogue](root-push-contract-profile.md#32-root-authority-regression-catalogue) 的 20 项与上表 3 项的集合并集，共 23 项
 
-catalogue target 必须解析两个一列表格，拒绝空项、重复项与非最终 MVP 名称，并与 Rust 常量、`#[cfg(test)]` 直接注册集合双向相等；`scripts/verify-authority-regressions.ps1` 使用同一 22 项集合核对 binary registration 和实际通过数
+catalogue target 必须解析两个一列表格，拒绝空项、重复项与非最终 MVP 名称，并与 Rust 常量、`#[cfg(test)]` 直接注册集合双向相等；`scripts/verify-authority-regressions.ps1` 使用同一 23 项集合核对 binary registration 和实际通过数
 
 ## 8 观察面与验收
 

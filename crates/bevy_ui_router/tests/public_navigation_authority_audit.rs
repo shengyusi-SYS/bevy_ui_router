@@ -4,6 +4,7 @@ use bevy_ui_router::prelude::*;
 
 struct AuditDriver {
     key: ViewDriverKey,
+    outlet_view: Option<RouteViewKey>,
 }
 
 impl EcsViewDriver for AuditDriver {
@@ -13,7 +14,7 @@ impl EcsViewDriver for AuditDriver {
 
     fn apply(
         &mut self,
-        _effect: &ViewBuildEffect,
+        effect: &ViewBuildEffect,
         content: &mut FrameContentWriter<'_>,
         report: EcsViewReportSession<'_>,
     ) -> ViewBuildReport {
@@ -26,6 +27,11 @@ impl EcsViewDriver for AuditDriver {
         content
             .add_child(root, rect)
             .expect("content edge should stage");
+        if self.outlet_view.as_ref() == Some(effect.view()) {
+            content
+                .declare_outlet(root, RouteSlotKey::default())
+                .expect("layout outlet should stage");
+        }
         report.applied()
     }
 }
@@ -37,6 +43,7 @@ fn root_push_publishes_read_only_authority_mappings_from_the_real_registry() {
     let driver = app
         .register_ui_view_driver(AuditDriver {
             key: ViewDriverKey::new("authority-audit-driver").unwrap(),
+            outlet_view: None,
         })
         .unwrap();
     let view = RouteViewKey::new("authority-audit-root").unwrap();
@@ -133,4 +140,93 @@ fn root_push_publishes_read_only_authority_mappings_from_the_real_registry() {
         prepared < active,
         "unexpected lifecycle audit order: {kinds:?}"
     );
+}
+
+#[test]
+fn nested_outlet_authority_is_opaque_and_exact() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let layout = RouteViewKey::new("authority-audit-layout").unwrap();
+    let leaf = RouteViewKey::new("authority-audit-leaf").unwrap();
+    let fallback = RouteViewKey::new("authority-audit-fallback").unwrap();
+    let driver = app
+        .register_ui_view_driver(AuditDriver {
+            key: ViewDriverKey::new("nested-authority-audit-driver").unwrap(),
+            outlet_view: Some(layout.clone()),
+        })
+        .unwrap();
+    let mut routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::pathless(),
+            RouteNodeOptions::new().with_view(layout.clone()),
+        )
+        .unwrap();
+    let layout_route = routes.root_id().unwrap();
+    routes
+        .route_with_options(
+            layout_route,
+            RoutePattern::path("items/:id").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(leaf.clone())
+                .with_slot(RouteSlotKey::default()),
+        )
+        .unwrap();
+    let routes = routes.build().unwrap();
+    let mut views = RouteViewRegistry::new();
+    for view in [layout, leaf, fallback.clone()] {
+        views
+            .insert(view, RouteViewDescriptor::new(driver.clone()))
+            .unwrap();
+    }
+    let router = app
+        .add_ui_router(RouterConfig::new(routes, views, fallback))
+        .unwrap();
+    app.world_mut()
+        .spawn((Node::default(), RouterHostRegistration::new(router)));
+    app.update();
+
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/items/1"))
+        .unwrap();
+    for _ in 0..16 {
+        app.update();
+        if matches!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .request(router, request),
+            RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded
+        ) {
+            break;
+        }
+    }
+
+    let audits = app.world().resource::<RouterAuthorityAudits>();
+    let audit = audits.get(router).expect("installed router has an audit");
+    assert_eq!(audit.frames().len(), 2);
+    assert_eq!(audit.slots().len(), 2);
+    assert_eq!(audit.outlets().len(), 1);
+    assert_eq!(audit.slots()[0].kind(), AuthoritySlotKind::HostTop);
+    assert_eq!(audit.slots()[1].kind(), AuthoritySlotKind::ChildOutlet);
+    assert_ne!(audit.frames()[0].root(), audit.frames()[1].root());
+    assert_eq!(
+        audit.frames()[0].lifecycle(),
+        AuthorityFrameLifecycle::Active
+    );
+    assert_eq!(
+        audit.frames()[1].lifecycle(),
+        AuthorityFrameLifecycle::Active
+    );
+    assert_eq!(audit.frames()[0].slot_entity(), audit.slots()[0].entity());
+    assert_eq!(audit.frames()[1].slot_entity(), audit.slots()[1].entity());
+    let outlet = &audit.outlets()[0];
+    assert_eq!(outlet.parent(), audit.frames()[0].frame());
+    assert_eq!(outlet.key(), &RouteSlotKey::default());
+    assert_eq!(outlet.child_slot(), Some(audit.slots()[1].entity()));
+    assert_eq!(
+        audit.owned_entity_state(outlet.anchor()),
+        AuditEntityState::PresentOwned
+    );
+    assert!(audit.orphan_slots().is_empty());
 }

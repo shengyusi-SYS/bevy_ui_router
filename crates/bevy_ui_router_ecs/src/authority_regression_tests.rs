@@ -7,26 +7,28 @@ use bevy_ecs::{
 };
 use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
-use bevy_ui::Node;
+use bevy_ui::{Node, Val};
 use bevy_ui_router_core::prelude::{
     NavigationPhase, NavigationRequestId, RequestStatus, RouteLocation, RouteNodeOptions,
-    RoutePattern, RouteTree, RouteViewKey,
+    RoutePattern, RouteSlotKey, RouteTree, RouteViewKey,
 };
 use bevy_ui_router_view::{RouteViewDescriptor, RouteViewRegistry, ViewBuildEffect, ViewDriverKey};
 
 use crate::{
     AppRouterExt, BevyUiRouterPlugin, ContentColor, ContentWriteErrorKind, EcsViewDriver,
-    EcsViewReportSession, FrameContentWriter, RouterConfig, RouterHandle, RouterHostRegistration,
-    SolidRect, ViewBuildReport,
+    EcsViewReportSession, FrameContentWriter, RequestLookup, RouterConfig, RouterHandle,
+    RouterHostRegistration, RouterSnapshots, SolidRect, ViewBuildReport,
     cleanup::CleanupAttempt,
-    components::RouterInputBarrier,
+    components::{ChildSlotLifecycle, RouterInputBarrier},
     input::RouteFocusState,
     navigation::{
         RouterNavigation, collect_navigation_system, commit_presentation_system,
         drive_navigation_system, observe_authority_system, settle_cleanup_system,
     },
     presentation::FrameOutput,
-    registry::{QuarantineLeaseTable, RouteEntityRegistry},
+    registry::{
+        EntityLifecycle, EntityOwner, QuarantineLeaseTable, RegistryOwner, RouteEntityRegistry,
+    },
 };
 
 #[derive(Component)]
@@ -47,6 +49,9 @@ struct RepairReparent {
     parent: Option<Entity>,
 }
 
+#[derive(Resource, Default)]
+struct MountDriftArmed(bool);
+
 struct AuthorityDriver {
     key: ViewDriverKey,
 }
@@ -54,6 +59,35 @@ struct AuthorityDriver {
 struct PendingCycleDriver {
     key: ViewDriverKey,
     calls: usize,
+}
+
+struct NestedAuthorityDriver {
+    key: ViewDriverKey,
+}
+
+impl EcsViewDriver for NestedAuthorityDriver {
+    fn key(&self) -> ViewDriverKey {
+        self.key.clone()
+    }
+
+    fn apply(
+        &mut self,
+        effect: &ViewBuildEffect,
+        content: &mut FrameContentWriter<'_>,
+        report: EcsViewReportSession<'_>,
+    ) -> ViewBuildReport {
+        let container = content.spawn_empty().unwrap();
+        let rect = content
+            .spawn_solid_rect(SolidRect::new(21, 13, ContentColor::srgba8(9, 17, 33, 255)).unwrap())
+            .unwrap();
+        content.add_child(container, rect).unwrap();
+        if effect.view() == &RouteViewKey::new("layout").unwrap() {
+            content
+                .declare_outlet(container, RouteSlotKey::default())
+                .unwrap();
+        }
+        report.applied()
+    }
 }
 
 impl EcsViewDriver for PendingCycleDriver {
@@ -272,6 +306,124 @@ fn world_entity_snapshot(app: &App) -> Vec<(Entity, Vec<bevy_ecs::component::Com
     snapshot
 }
 
+fn install_nested_authority_router(app: &mut App, label: &str) -> (RouterHandle, Entity) {
+    let key = ViewDriverKey::new(format!("{label}-nested-driver")).unwrap();
+    app.register_ui_view_driver(NestedAuthorityDriver { key: key.clone() })
+        .unwrap();
+    let mut views = RouteViewRegistry::new();
+    for view in ["layout", "item", "fallback"] {
+        views
+            .insert(
+                RouteViewKey::new(view).unwrap(),
+                RouteViewDescriptor::new(key.clone()),
+            )
+            .unwrap();
+    }
+    let router = app
+        .add_ui_router(RouterConfig::new(
+            bevy_ui_router_core::test_support::nested_items_view_route_tree(),
+            views,
+            RouteViewKey::new("fallback").unwrap(),
+        ))
+        .unwrap();
+    let host = app
+        .world_mut()
+        .spawn((
+            Node::default(),
+            RouterHostRegistration::new(router),
+            AppHostSentinel,
+        ))
+        .id();
+    (router, host)
+}
+
+#[derive(Debug, PartialEq)]
+struct AppHostEvidence {
+    entity: Entity,
+    node: Node,
+    registration: (RouterHandle, u64),
+    components: Vec<bevy_ecs::component::ComponentId>,
+    children: Vec<Entity>,
+}
+
+fn app_host_evidence(app: &App, host: Entity) -> AppHostEvidence {
+    let host_ref = app
+        .world()
+        .get_entity(host)
+        .expect("the exact app-owned host must remain alive");
+    AppHostEvidence {
+        entity: host,
+        node: host_ref
+            .get::<Node>()
+            .expect("the exact app-owned host must retain Node")
+            .clone(),
+        registration: host_ref
+            .get::<RouterHostRegistration>()
+            .expect("the exact app-owned host must retain its registration")
+            .testing_identity(),
+        components: host_ref.archetype().components().to_vec(),
+        children: host_ref
+            .get::<Children>()
+            .map_or_else(Vec::new, |children| children.iter().copied().collect()),
+    }
+}
+
+fn settle_public_request(
+    app: &mut App,
+    router: RouterHandle,
+    location: RouteLocation,
+) -> NavigationRequestId {
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, location)
+        .unwrap();
+    for _ in 0..16 {
+        app.update();
+        if matches!(
+            app.world().resource::<RouterSnapshots>().request(router, request),
+            RequestLookup::Found(snapshot)
+                if matches!(snapshot.status(), RequestStatus::Succeeded | RequestStatus::Failed(_))
+        ) {
+            return request;
+        }
+    }
+    panic!("nested authority request did not settle")
+}
+
+fn assert_stable_child_slot_closure(app: &App) {
+    let navigation = app.world().resource::<RouterNavigation>();
+    let entry = &navigation.entries[0];
+    assert!(entry.engine.snapshot().running_request().is_none());
+    assert!(entry.cleanup_ledger.is_none());
+    let active_slots = entry
+        .active
+        .as_ref()
+        .into_iter()
+        .flat_map(|branch| branch.child_slots())
+        .map(|slot| slot.slot())
+        .collect::<Vec<_>>();
+    let registry = app.world().resource::<RouteEntityRegistry>();
+    assert!(
+        registry
+            .records()
+            .iter()
+            .all(|record| !matches!(record.owner(), RegistryOwner::Provisional(_)))
+    );
+    let registered_slots = registry
+        .records()
+        .iter()
+        .filter_map(|record| match record.owner() {
+            RegistryOwner::Committed(EntityOwner::ChildSlot { .. }) => {
+                assert_eq!(record.lifecycle(), EntityLifecycle::Active);
+                Some(record.entity())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(registered_slots, active_slots);
+}
+
 #[test]
 fn commit_gate_switch_is_same_frame_atomic() {
     crate::navigation::tests::commit_switches_registry_pickable_gate_and_core_history_in_one_system(
@@ -291,6 +443,148 @@ fn host_grant_observer_drift_rejects_after_mutation() {
 #[test]
 fn host_ui_topology_requires_all_node_ancestry() {
     crate::host::tests::rejects_non_node_host_and_cycles_and_revisions_are_monotonic();
+}
+
+#[test]
+fn mount_grant_observer_drift_rejects_after_mutation() {
+    crate::mount::tests::verify_mount_grant_observer_drift_contract();
+
+    let mut app = App::new();
+    app.world_mut().insert_resource(MountDriftArmed::default());
+    app.world_mut()
+        .register_component_hooks::<ChildSlotLifecycle>()
+        .on_insert(|mut world, HookContext { entity, .. }| {
+            if world
+                .get_resource::<MountDriftArmed>()
+                .is_some_and(|armed| armed.0)
+            {
+                world.commands().entity(entity).insert(Node {
+                    width: Val::Percent(99.0),
+                    height: Val::Percent(100.0),
+                    ..Node::default()
+                });
+            }
+        });
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let (router, host) = install_nested_authority_router(&mut app, "grant-drift");
+    app.update();
+    let first = settle_public_request(&mut app, router, RouteLocation::new("/items/1"));
+    assert!(matches!(
+        app.world().resource::<RouterSnapshots>().request(router, first),
+        RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded
+    ));
+    let before = app
+        .world()
+        .resource::<RouterSnapshots>()
+        .get(router)
+        .unwrap()
+        .clone();
+    let seal_before = app
+        .world()
+        .resource::<RouteEntityRegistry>()
+        .latest_issued_seal()
+        .unwrap();
+    let host_before = app_host_evidence(&app, host);
+
+    app.world_mut().resource_mut::<MountDriftArmed>().0 = true;
+    let rejected = settle_public_request(&mut app, router, RouteLocation::new("/items/2"));
+    let rejected_slot = match app
+        .world()
+        .resource::<RouterSnapshots>()
+        .request(router, rejected)
+    {
+        RequestLookup::Found(snapshot) => {
+            assert!(matches!(
+                snapshot.status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == bevy_ui_router_core::prelude::NavigationFailureKind::Mount
+            ));
+            snapshot
+                .trace()
+                .iter()
+                .find(|event| {
+                    event.kind()
+                        == bevy_ui_router_core::prelude::NavigationTraceEventKind::MountRejectedAfterMutation
+                })
+                .and_then(|event| event.slot())
+                .expect("post-mutation rejection must retain the burned slot id")
+        }
+        _ => panic!("rejected request must remain retained"),
+    };
+    let after = app
+        .world()
+        .resource::<RouterSnapshots>()
+        .get(router)
+        .unwrap();
+    assert_eq!(after.active(), before.active());
+    assert_eq!(after.history(), before.history());
+    assert_eq!(app_host_evidence(&app, host), host_before);
+    assert!(app.world().get::<AppHostSentinel>(host).is_some());
+    assert!(
+        app.world()
+            .resource::<RouteEntityRegistry>()
+            .latest_issued_seal()
+            .is_some_and(|seal| seal.stable_identity() > seal_before.stable_identity())
+    );
+    assert_stable_child_slot_closure(&app);
+
+    app.world_mut().resource_mut::<MountDriftArmed>().0 = false;
+    let next = settle_public_request(&mut app, router, RouteLocation::new("/items/3"));
+    assert!(matches!(
+        app.world().resource::<RouterSnapshots>().request(router, next),
+        RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded
+    ));
+    let next_slot = app.world().resource::<RouterNavigation>().entries[0]
+        .active
+        .as_ref()
+        .unwrap()
+        .child_slots()[0]
+        .slot_id();
+    assert!(next_slot.raw() > rejected_slot.raw());
+    assert_stable_child_slot_closure(&app);
+}
+
+#[test]
+fn mount_token_replay_is_zero_write() {
+    crate::mount::tests::verify_mount_artifact_replay_contract();
+}
+
+#[test]
+fn slot_lifecycle_has_no_orphans() {
+    crate::mount::tests::verify_child_slot_precommit_lifecycle_contract();
+
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let (router, _host) = install_nested_authority_router(&mut app, "slot-lifecycle");
+    app.update();
+    let first = settle_public_request(&mut app, router, RouteLocation::new("/items/1"));
+    assert!(matches!(
+        app.world().resource::<RouterSnapshots>().request(router, first),
+        RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded
+    ));
+    assert_stable_child_slot_closure(&app);
+    let old_slot = app.world().resource::<RouterNavigation>().entries[0]
+        .active
+        .as_ref()
+        .unwrap()
+        .child_slots()[0]
+        .slot();
+
+    let replacement = settle_public_request(&mut app, router, RouteLocation::new("/items/2"));
+    assert!(matches!(
+        app.world()
+            .resource::<RouterSnapshots>()
+            .request(router, replacement),
+        RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded
+    ));
+    assert_stable_child_slot_closure(&app);
+    assert!(app.world().get_entity(old_slot).is_err());
+    assert!(
+        app.world()
+            .resource::<RouteEntityRegistry>()
+            .record(old_slot)
+            .is_none()
+    );
 }
 
 #[test]

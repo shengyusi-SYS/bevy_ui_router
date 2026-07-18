@@ -104,6 +104,12 @@ pub(crate) enum OutstandingMount {
         slot: RouteSlotId,
         receipt_digest: MountReceiptDigest,
     },
+    Confirmed {
+        identity: MountIdentity,
+        slot: RouteSlotId,
+        receipt_digest: MountReceiptDigest,
+        registration_digest: MountRegistrationDigest,
+    },
 }
 
 impl OutstandingMount {
@@ -111,7 +117,8 @@ impl OutstandingMount {
         match self {
             Self::Requested(identity)
             | Self::Granted { identity, .. }
-            | Self::Confirming { identity, .. } => identity,
+            | Self::Confirming { identity, .. }
+            | Self::Confirmed { identity, .. } => identity,
         }
     }
 }
@@ -267,8 +274,46 @@ impl MountIssuer {
                 Some(completion.registration_digest),
             ),
         };
-        self.outstanding = None;
+        self.outstanding = Some(OutstandingMount::Confirmed {
+            identity: completion.identity.clone(),
+            slot: completion.slot,
+            receipt_digest: completion.receipt_digest,
+            registration_digest: completion.registration_digest,
+        });
         Ok(confirmation)
+    }
+
+    pub(crate) fn validate_confirmation(
+        &self,
+        confirmation: &MountConfirmation,
+    ) -> Result<(), MountError> {
+        if !confirmation.has_valid_binding() || !identity_is_coherent(&confirmation.identity) {
+            return Err(MountError::Foreign);
+        }
+        match self.outstanding.as_ref() {
+            Some(OutstandingMount::Confirmed {
+                identity,
+                slot,
+                receipt_digest,
+                registration_digest,
+            }) if identity == &confirmation.identity
+                && *slot == confirmation.slot
+                && *receipt_digest == confirmation.receipt_digest
+                && *registration_digest == confirmation.registration_digest =>
+            {
+                Ok(())
+            }
+            _ => Err(self.mismatch(&confirmation.identity)),
+        }
+    }
+
+    pub(crate) fn consume_confirmation(
+        &mut self,
+        confirmation: &MountConfirmation,
+    ) -> Result<(), MountError> {
+        self.validate_confirmation(confirmation)?;
+        self.outstanding = None;
+        Ok(())
     }
 
     pub(crate) fn reject_after_mutation<A: MountMutationArtifact + ?Sized>(
@@ -585,6 +630,10 @@ impl MountRegistrationPermit {
 }
 
 impl MountRegistrationCompletion {
+    pub(crate) const fn slot(&self) -> RouteSlotId {
+        self.slot
+    }
+
     fn has_valid_binding(&self) -> bool {
         self.binding
             == artifact_binding(
@@ -1036,7 +1085,8 @@ mod tests {
         let first_permit = fixture.issuer.accept_receipt(&first_receipt).unwrap();
         let old_permit = first_permit.clone();
         let completion = first_permit.complete(MountRegistrationDigest::from_opaque(89));
-        fixture.issuer.complete_registration(&completion).unwrap();
+        let confirmation = fixture.issuer.complete_registration(&completion).unwrap();
+        fixture.issuer.consume_confirmation(&confirmation).unwrap();
 
         let current_grant = fixture.grant();
         let (current_receipt, _) =
@@ -1295,6 +1345,11 @@ mod tests {
         let confirmation = fixture.issuer.complete_registration(&completion).unwrap();
         assert!(confirmation.has_valid_binding());
         assert_eq!(child_slot(&confirmation), expected_slot);
+        assert!(matches!(
+            fixture.issuer.outstanding,
+            Some(OutstandingMount::Confirmed { .. })
+        ));
+        fixture.issuer.consume_confirmation(&confirmation).unwrap();
         assert!(fixture.issuer.outstanding.is_none());
     }
 

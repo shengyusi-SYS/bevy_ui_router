@@ -33,6 +33,21 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+std::thread_local! {
+    static REJECT_NEXT_CHILD_SLOT_OWNER_CAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn reject_next_child_slot_owner_cas() {
+    REJECT_NEXT_CHILD_SLOT_OWNER_CAS.with(|fault| fault.set(true));
+}
+
+#[cfg(test)]
+fn child_slot_owner_cas_fault_injected() -> bool {
+    REJECT_NEXT_CHILD_SLOT_OWNER_CAS.with(|fault| fault.replace(false))
+}
+
 #[derive(Debug)]
 pub(crate) struct ProvisionalChildSlot {
     slot: Entity,
@@ -637,9 +652,17 @@ pub(crate) fn confirm_child_slot(
         outlet: provisional.outlet.clone(),
         slot: slot_id,
     });
-    let committed_claim = world
-        .resource_mut::<RouteEntityRegistry>()
-        .compare_exchange_owner(&provisional.slot_claim, committed_owner);
+    #[cfg(test)]
+    let reject_owner_cas = child_slot_owner_cas_fault_injected();
+    #[cfg(not(test))]
+    let reject_owner_cas = false;
+    let committed_claim = if reject_owner_cas {
+        None
+    } else {
+        world
+            .resource_mut::<RouteEntityRegistry>()
+            .compare_exchange_owner(&provisional.slot_claim, committed_owner)
+    };
     let Some(committed_claim) = committed_claim else {
         let cleanup = session.reject();
         return Err(confirmation_failure(
@@ -1461,7 +1484,8 @@ pub(crate) mod tests {
     use bevy_ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Node};
     use bevy_ui_router_core::{
         integration::{
-            CleanupManifest, EngineAction, MountGrant, MountMutationArtifact, RouterEngine,
+            CleanupManifest, EngineAction, IntegrationError, MountGrant, MountMutationArtifact,
+            MountRequest, RouterEngine,
         },
         prelude::{RouteLocation, RouteSlotKey, RouteViewKey},
     };
@@ -1674,6 +1698,30 @@ pub(crate) mod tests {
         usize,
         MountGrant,
     ) {
+        let (world, candidate, top_slot, engine, frame, local_index, request) =
+            realized_parent_awaiting_mount();
+        let mut engine = engine;
+        let grant = engine.resolve_mount(request).unwrap();
+        (
+            world,
+            candidate,
+            top_slot,
+            engine,
+            frame,
+            local_index,
+            grant,
+        )
+    }
+
+    fn realized_parent_awaiting_mount() -> (
+        World,
+        ValidatedHostCandidate,
+        bevy_ecs::prelude::Entity,
+        RouterEngine,
+        RealizedFrame,
+        usize,
+        MountRequest,
+    ) {
         let (mut world, candidate, top_slot, top_slot_claim, mut engine, task) =
             pending_nested_parent_fixture();
         let mut plan = ContentPlan::new();
@@ -1702,7 +1750,6 @@ pub(crate) mod tests {
         let EngineAction::MountRequest(request) = engine.action().unwrap() else {
             panic!("child mount request expected")
         };
-        let grant = engine.resolve_mount(request).unwrap();
         (
             world,
             candidate,
@@ -1710,8 +1757,31 @@ pub(crate) mod tests {
             engine,
             frame,
             local_index,
-            grant,
+            request,
         )
+    }
+
+    fn realized_parent_without_outlet() -> (World, RouterEngine, RealizedFrame, MountGrant) {
+        let (mut world, candidate, top_slot, top_slot_claim, mut engine, task) =
+            pending_nested_parent_fixture();
+        let frame = realize_frame(
+            &mut world,
+            candidate,
+            top_slot,
+            top_slot_claim,
+            task.frame().clone(),
+            task.view_request_sequence(),
+            ContentPlan::new().accept(),
+        )
+        .unwrap();
+        engine
+            .report_applied_with_outlets(task, vec![RouteSlotKey::default()])
+            .unwrap();
+        let EngineAction::MountRequest(request) = engine.action().unwrap() else {
+            panic!("declared logical outlet must issue one mount request")
+        };
+        let grant = engine.resolve_mount(request).unwrap();
+        (world, engine, frame, grant)
     }
 
     #[test]
@@ -3020,5 +3090,764 @@ pub(crate) mod tests {
         ));
         assert!(engine.action().is_none());
         assert!(!focus_is_in_slot(&world, slot));
+    }
+
+    pub(crate) fn verify_mount_grant_observer_drift_contract() {
+        authority_batch_rejects_anchor_children_order_drift_in_the_same_batch();
+        child_slot_foreign_anchor_child_drift_rejects_before_owner_cas();
+        child_slot_post_cas_node_value_drift_rejects_registered_residual();
+        child_slot_seal_and_slot_id_are_not_reused_after_failure();
+    }
+
+    fn world_registry_snapshot(
+        world: &World,
+    ) -> (
+        Vec<(Entity, Vec<bevy_ecs::component::ComponentId>)>,
+        Vec<crate::registry::RouteEntityRecord>,
+        Option<crate::registry::OwnershipSeal>,
+    ) {
+        let mut entities = world
+            .iter_entities()
+            .map(|entity| (entity.id(), entity.archetype().components().to_vec()))
+            .collect::<Vec<_>>();
+        entities.sort_by_key(|(entity, _)| entity.to_bits());
+        (
+            entities,
+            world.resource::<RouteEntityRegistry>().records().to_vec(),
+            world.resource::<RouteEntityRegistry>().latest_issued_seal(),
+        )
+    }
+
+    fn assert_terminal_mount_cleanup(
+        world: &mut World,
+        engine: &mut RouterEngine,
+        parent: RealizedFrame,
+        residual: Option<ChildSlotResidual>,
+        request: bevy_ui_router_core::integration::FailureCleanupRequest,
+    ) {
+        let mut branch = crate::branch_transaction::PreparedBranch::empty();
+        branch.push_frame(parent).unwrap();
+        let failed = match residual {
+            Some(residual) => crate::branch_transaction::FailedPreparedBranch::with_mount_residual(
+                branch, residual,
+            ),
+            None => crate::branch_transaction::FailedPreparedBranch::new(branch),
+        };
+        world.insert_resource(InputFocus::default());
+        world.insert_resource(RouteFocusState::default());
+        let manifest = crate::cleanup::FrozenCleanupManifest::from_failed_prepared_branch(
+            world,
+            world.resource::<RouteEntityRegistry>(),
+            &failed,
+        )
+        .expect("exact failed mount state must freeze one physical manifest");
+        let manifest_digest = manifest.digest();
+        let obligation_count = manifest.len();
+        let reserved = crate::cleanup::CleanupLedger::reserve(manifest)
+            .expect("failed mount cleanup must reserve its receipt ledger");
+        let logical_roots = request.logical_roots().to_vec();
+        let cleanup = engine
+            .prepare_failure_cleanup_retaining(
+                request,
+                CleanupManifest::new(logical_roots, manifest_digest, obligation_count),
+            )
+            .unwrap();
+        let mut ledger =
+            crate::cleanup::CleanupLedger::activate_failed(reserved.bind_batch(cleanup), failed);
+        let attempt = ledger.attempt(world).unwrap();
+        assert!(ledger.settle(world, attempt));
+        let completion = ledger
+            .pending_completion()
+            .expect("every failed mount obligation must have one completion receipt");
+        engine.complete_cleanup(completion).unwrap();
+        assert!(engine.snapshot().running_request().is_none());
+        assert!(engine.action().is_none());
+        assert!(
+            world
+                .resource::<RouteEntityRegistry>()
+                .records()
+                .iter()
+                .all(|record| !matches!(record.owner(), RegistryOwner::Provisional(_)))
+        );
+        assert!(
+            world
+                .resource::<RouteEntityRegistry>()
+                .records()
+                .iter()
+                .all(|record| !matches!(
+                    record.owner(),
+                    RegistryOwner::Committed(EntityOwner::ChildSlot { .. })
+                ))
+        );
+        let child_slot_entities = world
+            .iter_entities()
+            .filter(|entity| entity.get::<ChildSlotLifecycle>().is_some())
+            .map(|entity| entity.id())
+            .collect::<Vec<_>>();
+        let leases = world.resource::<QuarantineLeaseTable>();
+        for entity in child_slot_entities {
+            assert!(
+                world
+                    .resource::<RouteEntityRegistry>()
+                    .record(entity)
+                    .is_some()
+                    || leases.record(entity).is_some()
+                    || leases.unresolved_record(entity).is_some(),
+                "a surviving child-slot entity must have an exact terminal owner",
+            );
+        }
+    }
+
+    pub(crate) fn verify_mount_artifact_replay_contract() {
+        let (
+            receiver_world,
+            _candidate,
+            _top_slot,
+            mut request_receiver,
+            _parent,
+            _local_index,
+            receiver_request,
+        ) = realized_parent_awaiting_mount();
+        let (
+            _source_world,
+            _candidate,
+            _top_slot,
+            _request_source,
+            _parent,
+            _local_index,
+            foreign_request,
+        ) = realized_parent_awaiting_mount();
+        let before = world_registry_snapshot(&receiver_world);
+        let core_before = request_receiver.snapshot();
+        let foreign_error = match request_receiver.resolve_mount(foreign_request) {
+            Ok(_) => panic!("a foreign request must not allocate a receiver slot"),
+            Err(error) => error,
+        };
+        assert_eq!(foreign_error.kind(), IntegrationError::ForeignRouter);
+        assert_eq!(request_receiver.snapshot(), core_before);
+        assert_eq!(world_registry_snapshot(&receiver_world), before);
+        assert!(request_receiver.action().is_none());
+        let receiver_slot = request_receiver
+            .resolve_mount(receiver_request)
+            .unwrap()
+            .slot();
+        let (_world, _candidate, _top_slot, mut control, _parent, _index, control_request) =
+            realized_parent_awaiting_mount();
+        assert_eq!(
+            receiver_slot,
+            control.resolve_mount(control_request).unwrap().slot(),
+            "foreign request rejection must not advance the receiver slot allocator"
+        );
+
+        let (
+            mut grant_world,
+            _candidate,
+            _top_slot,
+            mut grant_receiver,
+            grant_parent,
+            _index,
+            receiver_grant,
+        ) = realized_parent_with_outlet();
+        let (_world, _candidate, _top_slot, _source, _parent, _index, foreign_grant) =
+            realized_parent_with_outlet();
+        let before = world_registry_snapshot(&grant_world);
+        let core_before = grant_receiver.snapshot();
+        let failure = stage_child_slot(
+            &mut grant_world,
+            &grant_parent,
+            &RouteSlotKey::default(),
+            &foreign_grant,
+        )
+        .expect_err("a foreign grant must fail before child-slot staging");
+        assert_eq!(failure.kind(), ChildSlotStageErrorKind::GrantMismatch);
+        assert!(failure.into_residual().is_none());
+        assert_eq!(grant_receiver.snapshot(), core_before);
+        assert_eq!(world_registry_snapshot(&grant_world), before);
+        assert!(grant_receiver.action().is_none());
+        let exact_staged = stage_child_slot(
+            &mut grant_world,
+            &grant_parent,
+            &RouteSlotKey::default(),
+            &receiver_grant,
+        )
+        .expect("the exact receiver grant must remain usable");
+        assert!(grant_world.get_entity(exact_staged.slot()).is_ok());
+
+        let (
+            mut receipt_world,
+            _candidate,
+            _top_slot,
+            mut receipt_receiver,
+            receipt_parent,
+            _index,
+            receiver_grant,
+        ) = realized_parent_with_outlet();
+        let staged = stage_child_slot(
+            &mut receipt_world,
+            &receipt_parent,
+            &RouteSlotKey::default(),
+            &receiver_grant,
+        )
+        .unwrap();
+        let (receiver_receipt, _receiver_proof) =
+            receiver_grant.attest_receipt_with_proof(staged.receipt().digest());
+        let (_world, _candidate, _top_slot, _source, _parent, _index, foreign_grant) =
+            realized_parent_with_outlet();
+        let (foreign_receipt, _foreign_proof) =
+            foreign_grant.attest_receipt_with_proof(0x4652_4354);
+        let before = world_registry_snapshot(&receipt_world);
+        let core_before = receipt_receiver.snapshot();
+        let foreign_error = match receipt_receiver.accept_mount_receipt(foreign_receipt) {
+            Ok(_) => panic!("a foreign receipt must not issue a receiver permit"),
+            Err(error) => error,
+        };
+        assert_eq!(foreign_error.kind(), IntegrationError::ForeignRouter);
+        assert_eq!(receipt_receiver.snapshot(), core_before);
+        assert_eq!(world_registry_snapshot(&receipt_world), before);
+        assert!(receipt_receiver.action().is_none());
+        assert!(
+            receipt_receiver
+                .accept_mount_receipt(receiver_receipt)
+                .is_ok()
+        );
+
+        let (
+            mut permit_world,
+            _candidate,
+            _top_slot,
+            mut permit_receiver,
+            permit_parent,
+            _index,
+            receiver_grant,
+        ) = realized_parent_with_outlet();
+        let staged = stage_child_slot(
+            &mut permit_world,
+            &permit_parent,
+            &RouteSlotKey::default(),
+            &receiver_grant,
+        )
+        .unwrap();
+        let (receiver_receipt, receiver_proof) =
+            receiver_grant.attest_receipt_with_proof(staged.receipt().digest());
+        let receiver_permit = permit_receiver
+            .accept_mount_receipt(receiver_receipt)
+            .unwrap();
+        let (
+            mut source_world,
+            _candidate,
+            _top_slot,
+            mut permit_source,
+            source_parent,
+            _index,
+            source_grant,
+        ) = realized_parent_with_outlet();
+        let source_staged = stage_child_slot(
+            &mut source_world,
+            &source_parent,
+            &RouteSlotKey::default(),
+            &source_grant,
+        )
+        .unwrap();
+        let (source_receipt, _source_proof) =
+            source_grant.attest_receipt_with_proof(source_staged.receipt().digest());
+        let foreign_permit = permit_source.accept_mount_receipt(source_receipt).unwrap();
+        let before = world_registry_snapshot(&permit_world);
+        let core_before = permit_receiver.snapshot();
+        let foreign_error =
+            match permit_receiver.begin_mount_registration(foreign_permit, &receiver_proof) {
+                Ok(_) => panic!("a foreign permit must not open a receiver session"),
+                Err(error) => error,
+            };
+        assert_eq!(foreign_error.kind(), IntegrationError::ForeignRouter);
+        assert_eq!(permit_receiver.snapshot(), core_before);
+        assert_eq!(world_registry_snapshot(&permit_world), before);
+        assert!(permit_receiver.action().is_none());
+        let exact_session = permit_receiver
+            .begin_mount_registration(receiver_permit, &receiver_proof)
+            .expect("the exact receiver permit must remain usable");
+        drop(exact_session);
+
+        fn completed_foreign_replays() -> bevy_ui_router_core::integration::MountRegistrationReplays
+        {
+            let (mut world, _candidate, _top_slot, mut engine, parent, _index, grant) =
+                realized_parent_with_outlet();
+            let staged =
+                stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant).unwrap();
+            let (receipt, proof) = grant.attest_receipt_with_proof(staged.receipt().digest());
+            let permit = engine.accept_mount_receipt(receipt).unwrap();
+            engine
+                .begin_mount_registration(permit, &proof)
+                .unwrap()
+                .testing_complete_with_replays(0x4652_504c)
+                .unwrap()
+        }
+
+        let foreign_replays = completed_foreign_replays();
+        let (
+            mut confirmation_world,
+            _candidate,
+            _top_slot,
+            mut confirmation_receiver,
+            confirmation_parent,
+            _index,
+            receiver_grant,
+        ) = realized_parent_with_outlet();
+        let staged = stage_child_slot(
+            &mut confirmation_world,
+            &confirmation_parent,
+            &RouteSlotKey::default(),
+            &receiver_grant,
+        )
+        .unwrap();
+        let (receiver_receipt, receiver_proof) =
+            receiver_grant.attest_receipt_with_proof(staged.receipt().digest());
+        let receiver_permit = confirmation_receiver
+            .accept_mount_receipt(receiver_receipt)
+            .unwrap();
+        let before = world_registry_snapshot(&confirmation_world);
+        let core_before = confirmation_receiver.snapshot();
+        assert_eq!(
+            confirmation_receiver.testing_replay_mount_completion(&foreign_replays),
+            Err(IntegrationError::ForeignRouter)
+        );
+        assert_eq!(confirmation_receiver.snapshot(), core_before);
+        assert_eq!(world_registry_snapshot(&confirmation_world), before);
+        assert!(confirmation_receiver.action().is_none());
+        assert_eq!(
+            confirmation_receiver.testing_replay_mount_confirmation(&foreign_replays),
+            Err(IntegrationError::ForeignRouter)
+        );
+        assert_eq!(confirmation_receiver.snapshot(), core_before);
+        assert_eq!(world_registry_snapshot(&confirmation_world), before);
+        assert!(confirmation_receiver.action().is_none());
+        confirmation_receiver
+            .begin_mount_registration(receiver_permit, &receiver_proof)
+            .unwrap()
+            .testing_complete_with_replays(0x4558_4143)
+            .unwrap();
+        assert!(matches!(
+            confirmation_receiver.action(),
+            Some(EngineAction::FrameTask(_))
+        ));
+
+        let (mut world, _candidate, _top_slot, mut engine, parent, _local_index, request) =
+            realized_parent_awaiting_mount();
+        let request_replay = request.testing_duplicate();
+        let grant = engine.resolve_mount(request).unwrap();
+        let first_slot = grant.slot();
+        let before = world_registry_snapshot(&world);
+        let core_before = engine.snapshot();
+        let request_error = match engine.resolve_mount(request_replay) {
+            Ok(_) => panic!("a consumed mount request must not allocate another grant"),
+            Err(error) => error,
+        };
+        assert_eq!(request_error.kind(), IntegrationError::Stale);
+        assert_eq!(engine.snapshot(), core_before);
+        assert_eq!(world_registry_snapshot(&world), before);
+
+        let grant_replay = grant.testing_duplicate();
+        let staged = stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant)
+            .expect("the exact grant must stage one provisional child slot");
+        let (receipt, proof) = grant.attest_receipt_with_proof(staged.receipt().digest());
+        let receipt_replay = receipt.testing_duplicate();
+        let permit = engine.accept_mount_receipt(receipt).unwrap();
+
+        let before = world_registry_snapshot(&world);
+        let core_before = engine.snapshot();
+        let grant_error =
+            match engine.reject_mount_after_mutation(MountMutationArtifact::Grant(grant_replay)) {
+                Ok(_) => panic!("a consumed grant must not authorize another mutation terminal"),
+                Err(error) => error,
+            };
+        assert_eq!(grant_error.kind(), IntegrationError::Stale);
+        assert_eq!(engine.snapshot(), core_before);
+        assert_eq!(world_registry_snapshot(&world), before);
+
+        let before = world_registry_snapshot(&world);
+        let core_before = engine.snapshot();
+        let receipt_error = match engine.accept_mount_receipt(receipt_replay) {
+            Ok(_) => panic!("a consumed receipt must not issue another permit"),
+            Err(error) => error,
+        };
+        assert_eq!(receipt_error.kind(), IntegrationError::Stale);
+        assert_eq!(engine.snapshot(), core_before);
+        assert_eq!(world_registry_snapshot(&world), before);
+
+        let permit_replay = permit.testing_duplicate();
+        let session = engine.begin_mount_registration(permit, &proof).unwrap();
+        let replays = session.testing_complete_with_replays(0x5250_4c59).unwrap();
+        let EngineAction::FrameTask(child_task) = engine.action().unwrap() else {
+            panic!("the exact completion must issue exactly one child action")
+        };
+
+        let before = world_registry_snapshot(&world);
+        let core_before = engine.snapshot();
+        let permit_error = match engine.begin_mount_registration(permit_replay, &proof) {
+            Ok(_) => panic!("a consumed permit must fail before provisional-to-registered CAS"),
+            Err(error) => error,
+        };
+        assert_eq!(permit_error.kind(), IntegrationError::Stale);
+        assert_eq!(engine.snapshot(), core_before);
+        assert_eq!(world_registry_snapshot(&world), before);
+
+        let before = world_registry_snapshot(&world);
+        let core_before = engine.snapshot();
+        assert_eq!(
+            engine.testing_replay_mount_completion(&replays),
+            Err(IntegrationError::Stale),
+        );
+        assert_eq!(engine.snapshot(), core_before);
+        assert_eq!(world_registry_snapshot(&world), before);
+
+        let before = world_registry_snapshot(&world);
+        let core_before = engine.snapshot();
+        assert_eq!(
+            engine.testing_replay_mount_confirmation(&replays),
+            Err(IntegrationError::Stale),
+        );
+        assert_eq!(engine.snapshot(), core_before);
+        assert_eq!(world_registry_snapshot(&world), before);
+        assert!(engine.action().is_none());
+
+        let cleanup_request = engine
+            .report_failed(
+                child_task,
+                bevy_ui_router_core::integration::ViewFailureKind::Apply,
+                "finish replay fixture",
+            )
+            .unwrap()
+            .unwrap();
+        let residual = staged.into_residual(&mut world);
+        assert_terminal_mount_cleanup(
+            &mut world,
+            &mut engine,
+            parent,
+            Some(residual),
+            cleanup_request,
+        );
+
+        engine.push(RouteLocation::new("/items/2")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(parent_task) = engine.action().unwrap() else {
+            panic!("the next request must issue a parent task")
+        };
+        engine
+            .report_applied_with_outlets(parent_task, vec![RouteSlotKey::default()])
+            .unwrap();
+        let EngineAction::MountRequest(next_request) = engine.action().unwrap() else {
+            panic!("the next request must issue one mount request")
+        };
+        let next_slot = engine.resolve_mount(next_request).unwrap().slot();
+        assert_eq!(next_slot.raw(), first_slot.raw() + 1);
+    }
+
+    fn stage_failure_settles_without_orphan(
+        install_drift: impl FnOnce(&mut World),
+        expected: ChildSlotStageErrorKind,
+    ) {
+        let (mut world, _candidate, _top_slot, mut engine, parent, _local_index, grant) =
+            realized_parent_with_outlet();
+        install_drift(&mut world);
+        let failure = stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant)
+            .expect_err("the selected precommit stage drift must fail closed");
+        assert_eq!(failure.kind(), expected);
+        let residual = failure
+            .into_residual()
+            .expect("observer-capable stage drift must retain one cleanup residual");
+        let cleanup = engine
+            .reject_mount_after_mutation(MountMutationArtifact::Grant(grant))
+            .unwrap();
+        assert_terminal_mount_cleanup(&mut world, &mut engine, parent, Some(residual), cleanup);
+    }
+
+    fn registry_rejection_settles_without_orphan() {
+        let (mut world, _candidate, _top_slot, mut engine, parent, _local_index, grant) =
+            realized_parent_with_outlet();
+        let staged = stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant)
+            .expect("the first exact slot stages");
+        let failure = stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant)
+            .expect_err("the duplicate logical owner must fail before an empty entity survives");
+        assert_eq!(failure.kind(), ChildSlotStageErrorKind::RegistryRejected);
+        assert!(failure.into_residual().is_none());
+        let residual = staged.into_residual(&mut world);
+        let cleanup = engine
+            .reject_mount_after_mutation(MountMutationArtifact::Grant(grant))
+            .unwrap();
+        assert_terminal_mount_cleanup(&mut world, &mut engine, parent, Some(residual), cleanup);
+    }
+
+    fn preallocation_failure_settles_without_orphan(scenario: ChildSlotStageErrorKind) {
+        match scenario {
+            ChildSlotStageErrorKind::MissingFoundation => {
+                let (mut world, _candidate, _top_slot, mut engine, parent, _, grant) =
+                    realized_parent_with_outlet();
+                let registry = world.remove_resource::<RouteEntityRegistry>().unwrap();
+                let failure =
+                    stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant)
+                        .expect_err("missing registry foundation must fail before allocation");
+                assert_eq!(failure.kind(), scenario);
+                assert!(failure.into_residual().is_none());
+                world.insert_resource(registry);
+                let cleanup = engine
+                    .reject_mount_after_mutation(MountMutationArtifact::Grant(grant))
+                    .unwrap();
+                assert_terminal_mount_cleanup(&mut world, &mut engine, parent, None, cleanup);
+            }
+            ChildSlotStageErrorKind::GrantMismatch => {
+                let (mut world, _candidate, _top_slot, mut engine, parent, _, grant) =
+                    realized_parent_with_outlet();
+                let failure = stage_child_slot(
+                    &mut world,
+                    &parent,
+                    &RouteSlotKey::named("wrong").unwrap(),
+                    &grant,
+                )
+                .expect_err("wrong outlet binding must reject the grant without allocation");
+                assert_eq!(failure.kind(), scenario);
+                assert!(failure.into_residual().is_none());
+                let cleanup = engine
+                    .reject_mount_after_mutation(MountMutationArtifact::Grant(grant))
+                    .unwrap();
+                assert_terminal_mount_cleanup(&mut world, &mut engine, parent, None, cleanup);
+            }
+            ChildSlotStageErrorKind::MissingOutlet => {
+                let (mut world, mut engine, parent, grant) = realized_parent_without_outlet();
+                let failure =
+                    stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant)
+                        .expect_err("a logical outlet without a realized anchor must fail closed");
+                assert_eq!(failure.kind(), scenario);
+                assert!(failure.into_residual().is_none());
+                let cleanup = engine
+                    .reject_mount_after_mutation(MountMutationArtifact::Grant(grant))
+                    .unwrap();
+                assert_terminal_mount_cleanup(&mut world, &mut engine, parent, None, cleanup);
+            }
+            ChildSlotStageErrorKind::InvalidOutlet => {
+                let (mut world, _candidate, _top_slot, mut engine, parent, _, grant) =
+                    realized_parent_with_outlet();
+                let anchor = parent
+                    .outlet(&RouteSlotKey::default())
+                    .expect("fixture has a default outlet")
+                    .anchor();
+                world.entity_mut(anchor).insert(ForeignChildSlotComponent);
+                let failure =
+                    stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant)
+                        .expect_err("drifted outlet anchor must fail before child-slot allocation");
+                assert_eq!(failure.kind(), scenario);
+                assert!(failure.into_residual().is_none());
+                let cleanup = engine
+                    .reject_mount_after_mutation(MountMutationArtifact::Grant(grant))
+                    .unwrap();
+                assert_terminal_mount_cleanup(&mut world, &mut engine, parent, None, cleanup);
+            }
+            _ => panic!("scenario must be one preallocation failure class"),
+        }
+    }
+
+    fn owner_cas_rejection_settles_without_orphan() {
+        let (mut world, _candidate, _top_slot, mut engine, parent, _local_index, grant) =
+            realized_parent_with_outlet();
+        let staged =
+            stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant).unwrap();
+        let (receipt, proof) = grant.attest_receipt_with_proof(staged.receipt().digest());
+        let permit = engine.accept_mount_receipt(receipt).unwrap();
+        reject_next_child_slot_owner_cas();
+        let failure = confirm_child_slot(&mut world, &mut engine, staged, permit, &proof)
+            .expect_err("injected owner CAS rejection must retain terminal cleanup authority");
+        assert_eq!(
+            failure.kind(),
+            ChildSlotConfirmationErrorKind::OwnerCasRejected
+        );
+        let (cleanup, begin_error, residual) = failure.into_parts();
+        assert!(begin_error.is_none());
+        assert_terminal_mount_cleanup(
+            &mut world,
+            &mut engine,
+            parent,
+            Some(residual),
+            cleanup.expect("owner CAS rejection retains exact cleanup authority"),
+        );
+    }
+
+    fn pre_cas_receipt_drift_settles_without_orphan() {
+        let (mut world, _candidate, _top_slot, mut engine, parent, _local_index, grant) =
+            realized_parent_with_outlet();
+        let staged =
+            stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant).unwrap();
+        let slot = staged.slot();
+        let (receipt, proof) = grant.attest_receipt_with_proof(staged.receipt().digest());
+        let permit = engine.accept_mount_receipt(receipt).unwrap();
+        world.entity_mut(slot).remove::<RouterInputBarrier>();
+        let failure = confirm_child_slot(&mut world, &mut engine, staged, permit, &proof)
+            .expect_err("pre-CAS receipt drift must reject registration");
+        assert_eq!(failure.kind(), ChildSlotConfirmationErrorKind::ReceiptDrift);
+        let (cleanup, begin_error, residual) = failure.into_parts();
+        assert!(begin_error.is_none());
+        assert_terminal_mount_cleanup(
+            &mut world,
+            &mut engine,
+            parent,
+            Some(residual),
+            cleanup.expect("receipt drift retains exact cleanup authority"),
+        );
+    }
+
+    fn post_cas_drift_settles_without_orphan() {
+        let (mut world, _candidate, _top_slot, mut engine, parent, _local_index, grant) =
+            realized_parent_with_outlet();
+        world.insert_resource(RegistrationDriftArmed::default());
+        world.insert_resource(InputFocus::default());
+        world.insert_resource(RouteFocusState::default());
+        world
+            .register_component_hooks::<ChildSlotLifecycle>()
+            .on_insert(|mut world, HookContext { entity, .. }| {
+                if world
+                    .get_resource::<RegistrationDriftArmed>()
+                    .is_some_and(|armed| armed.0)
+                {
+                    world.commands().entity(entity).insert(Node {
+                        width: Val::Percent(99.0),
+                        ..Node::default()
+                    });
+                }
+            });
+        let staged =
+            stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant).unwrap();
+        let (receipt, proof) = grant.attest_receipt_with_proof(staged.receipt().digest());
+        let permit = engine.accept_mount_receipt(receipt).unwrap();
+        world.resource_mut::<RegistrationDriftArmed>().0 = true;
+        let failure = confirm_child_slot(&mut world, &mut engine, staged, permit, &proof)
+            .expect_err("post-CAS observer drift must reject registration");
+        assert_eq!(failure.kind(), ChildSlotConfirmationErrorKind::PostCasDrift);
+        let (cleanup, begin_error, residual) = failure.into_parts();
+        assert!(begin_error.is_none());
+        assert_terminal_mount_cleanup(
+            &mut world,
+            &mut engine,
+            parent,
+            Some(residual),
+            cleanup.expect("post-CAS drift retains exact cleanup authority"),
+        );
+    }
+
+    fn foreign_registration_proof_settles_without_orphan() {
+        let (mut world, _candidate, _top_slot, mut engine, parent, _local_index, grant) =
+            realized_parent_with_outlet();
+        let staged =
+            stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant).unwrap();
+        let (receipt, _proof) = grant.attest_receipt_with_proof(staged.receipt().digest());
+        let permit = engine.accept_mount_receipt(receipt).unwrap();
+
+        let (
+            mut foreign_world,
+            _candidate,
+            _top_slot,
+            mut foreign_engine,
+            foreign_parent,
+            _,
+            foreign_grant,
+        ) = realized_parent_with_outlet();
+        let foreign_staged = stage_child_slot(
+            &mut foreign_world,
+            &foreign_parent,
+            &RouteSlotKey::default(),
+            &foreign_grant,
+        )
+        .unwrap();
+        let (foreign_receipt, foreign_proof) =
+            foreign_grant.attest_receipt_with_proof(foreign_staged.receipt().digest());
+        let _foreign_permit = foreign_engine
+            .accept_mount_receipt(foreign_receipt)
+            .unwrap();
+
+        let failure = confirm_child_slot(&mut world, &mut engine, staged, permit, &foreign_proof)
+            .expect_err("foreign proof must reject before owner CAS");
+        assert_eq!(
+            failure.kind(),
+            ChildSlotConfirmationErrorKind::RegistrationBegin
+        );
+        let (cleanup, begin_error, residual) = failure.into_parts();
+        assert!(begin_error.is_none());
+        assert_terminal_mount_cleanup(
+            &mut world,
+            &mut engine,
+            parent,
+            Some(residual),
+            cleanup.expect("foreign proof retains source cleanup authority"),
+        );
+    }
+
+    pub(crate) fn verify_child_slot_precommit_lifecycle_contract() {
+        preallocation_failure_settles_without_orphan(ChildSlotStageErrorKind::MissingFoundation);
+        preallocation_failure_settles_without_orphan(ChildSlotStageErrorKind::GrantMismatch);
+        preallocation_failure_settles_without_orphan(ChildSlotStageErrorKind::MissingOutlet);
+        preallocation_failure_settles_without_orphan(ChildSlotStageErrorKind::InvalidOutlet);
+        stage_failure_settles_without_orphan(
+            |world| {
+                world
+                    .register_component_hooks::<ChildSlotBarrierProbe>()
+                    .on_insert(|mut world, HookContext { entity, .. }| {
+                        world
+                            .commands()
+                            .entity(entity)
+                            .remove::<RouterInputBarrier>();
+                    });
+            },
+            ChildSlotStageErrorKind::BarrierDrift,
+        );
+        stage_failure_settles_without_orphan(
+            |world| {
+                world
+                    .register_component_hooks::<ChildSlotNodeProbe>()
+                    .on_insert(|mut world, HookContext { entity, .. }| {
+                        world
+                            .commands()
+                            .entity(entity)
+                            .insert(ForeignChildSlotComponent);
+                    });
+            },
+            ChildSlotStageErrorKind::NodeDrift,
+        );
+        stage_failure_settles_without_orphan(
+            |world| {
+                world
+                    .register_component_hooks::<ChildSlotAuthorityProbe>()
+                    .on_insert(|mut world, HookContext { entity, .. }| {
+                        world
+                            .commands()
+                            .entity(entity)
+                            .remove::<RouteOwnershipSeal>();
+                    });
+            },
+            ChildSlotStageErrorKind::AuthorityDrift,
+        );
+        stage_failure_settles_without_orphan(
+            |world| {
+                let foreign_parent = world.spawn_empty().id();
+                world.insert_resource(ForeignParent(foreign_parent));
+                world
+                    .register_component_hooks::<ChildSlotRelationshipProbe>()
+                    .on_insert(|mut world, HookContext { entity, .. }| {
+                        let parent = world.resource::<ForeignParent>().0;
+                        world.commands().entity(entity).insert(ChildOf(parent));
+                    });
+            },
+            ChildSlotStageErrorKind::RelationshipDrift,
+        );
+        stage_failure_settles_without_orphan(
+            |world| {
+                world
+                    .register_component_hooks::<ChildSlotAuthorityProbe>()
+                    .on_insert(|mut world, HookContext { entity, .. }| {
+                        world.commands().entity(entity).despawn();
+                    });
+            },
+            ChildSlotStageErrorKind::AuthorityDrift,
+        );
+        registry_rejection_settles_without_orphan();
+        pre_cas_receipt_drift_settles_without_orphan();
+        foreign_registration_proof_settles_without_orphan();
+        owner_cas_rejection_settles_without_orphan();
+        post_cas_drift_settles_without_orphan();
     }
 }

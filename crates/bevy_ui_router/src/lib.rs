@@ -67,9 +67,9 @@ pub mod ecs {
     #[cfg(feature = "ecs-test-support")]
     pub use bevy_ui_router_ecs::{
         AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
-        AuthorityFrameMapping, AuthorityHostMapping, AuthoritySlotKind, AuthoritySlotMapping,
-        RouterAuthorityAuditSnapshot, RouterAuthorityAudits, RouterLifecycleAuditEvent,
-        RouterLifecycleAuditEventKind,
+        AuthorityFrameMapping, AuthorityHostMapping, AuthorityOutletMapping, AuthoritySlotKind,
+        AuthoritySlotMapping, RouterAuthorityAuditSnapshot, RouterAuthorityAudits,
+        RouterLifecycleAuditEvent, RouterLifecycleAuditEventKind,
     };
 }
 
@@ -120,8 +120,8 @@ pub mod prelude {
     #[cfg(feature = "ecs-test-support")]
     pub use crate::ecs::{
         AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
-        AuthorityFrameMapping, AuthorityHostMapping, AuthoritySlotKind, AuthoritySlotMapping,
-        RouterAuthorityAuditSnapshot, RouterAuthorityAudits, RouterLifecycleAuditEvent,
-        RouterLifecycleAuditEventKind,
+        AuthorityFrameMapping, AuthorityHostMapping, AuthorityOutletMapping, AuthoritySlotKind,
+        AuthoritySlotMapping, RouterAuthorityAuditSnapshot, RouterAuthorityAudits,
+        RouterLifecycleAuditEvent, RouterLifecycleAuditEventKind,
     };
 }

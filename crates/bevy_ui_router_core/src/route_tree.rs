@@ -275,8 +275,7 @@ impl RouteTreeBuilder {
         self.root
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn route_with_options(
+    pub fn route_with_options(
         &mut self,
         parent: RouteId,
         pattern: RoutePattern,
@@ -285,12 +284,7 @@ impl RouteTreeBuilder {
         self.route_inner(parent, pattern, options)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn route(
-        &mut self,
-        parent: RouteId,
-        pattern: RoutePattern,
-    ) -> Result<RouteId, RouteError> {
+    pub fn route(&mut self, parent: RouteId, pattern: RoutePattern) -> Result<RouteId, RouteError> {
         self.route_inner(parent, pattern, RouteNodeOptions::new())
     }
 

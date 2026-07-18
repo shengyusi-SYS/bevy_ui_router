@@ -1025,28 +1025,36 @@ git commit -m "feat(ecs): commit nested branches frame locally"
 ### Task 8: Opaque outlet audit, public Journey A and Nested authority gates
 
 **Files:**
+- Modify: `Cargo.lock`
 - Modify: `crates/bevy_ui_router_core/src/route_tree.rs`
+- Modify: `crates/bevy_ui_router_core/src/mount.rs` (production final-confirmation single consumption)
+- Modify: `crates/bevy_ui_router_core/src/engine.rs` (production confirmation consumer and replay coverage)
+- Modify: `crates/bevy_ui_router_core/src/integration.rs` (session-only opaque test-support replays)
 - Modify: `crates/bevy_ui_router_core/tests/public_api.rs`
 - Modify: `crates/bevy_ui_router_core/tests/compile_fail_boundary.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/content.rs`
+- Modify: `crates/bevy_ui_router_ecs/src/app_ext.rs` (test-only exact host registration evidence)
 - Modify: `crates/bevy_ui_router_ecs/src/audit.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/lib.rs`
+- Modify: `crates/bevy_ui_router_ecs/src/mount.rs` (test-only fact aggregation; no production visibility change)
 - Modify: `crates/bevy_ui_router_ecs/src/authority_regression_tests.rs`
 - Modify: `crates/bevy_ui_router_ecs/tests/authority_regression_catalogue.rs`
 - Modify: `crates/bevy_ui_router/src/lib.rs`
+- Modify: `crates/bevy_ui_router/Cargo.toml`
 - Modify: `crates/bevy_ui_router/tests/public_navigation_journeys.rs`
 - Modify: `crates/bevy_ui_router/tests/public_navigation_authority_audit.rs`
-- Modify: `crates/bevy_ui_router/tests/root_navigation_surface.rs`
 - Modify: `crates/bevy_ui_router/tests/facade_export_allowlist.rs`
 - Modify: `crates/bevy_ui_router/tests/facade_authority_compile_fail.rs`
 - Modify: `crates/bevy_ui_router/tests/support/facade_contract_cases.rs`
+- Modify: `docs/nested-push-contract-profile.md`
+- Modify: `docs/superpowers/plans/2026-07-16-nested-push-implementation-plan.md`
 - Test: `scripts/verify-authority-regressions.ps1`
 
 **Interfaces:**
 - Consumes: committed nested branch, exact child-slot bindings and frame-local audit traversal
 - Produces: atomic public unlock of `RouteTreeBuilder::{route, route_with_options}` and `FrameContentWriter::declare_outlet` with the Nested facade profile switch
 - Produces: opaque `AuthorityOutletMapping` tied by its snapshot to router/host and directly to parent frame, outlet key, anchor and optional child slot
-- Produces: Nested stage gate with Root 19 plus exactly three Nested authority catalogue cases
+- Produces: Nested stage gate with Root 20 plus exactly three Nested authority catalogue cases
 
 - [ ] **Step 1: Write public facade surface RED**
 
@@ -1141,13 +1149,14 @@ Require the outlet DTO to expose opaque identities and lifecycle facts only; it 
 
 - [ ] **Step 4: Register the exact Nested authority catalogue additions**
 
-Keep the script-readable catalogue as one flat 22-string literal, appending only the three Nested names after the locked Root 19 entries
+Keep the script-readable catalogue as one flat 23-string literal, appending only the three Nested names after the locked Root 20 entries
 
 ```rust
 pub const AUTHORITY_REGRESSION_CATALOGUE: &[&str] = &[
     "cleanup_observer_reentry_supersedes_attempt",
     "cleanup_receipt_replay_is_rejected",
     "commit_gate_switch_is_same_frame_atomic",
+    "exact_owned_cleanup_cycle_is_world_zero_and_retains_authority",
     "foreign_component_quarantine_avoids_hooks",
     "foreign_descendant_quarantines_owned_ancestor",
     "host_children_change_only_top_slot_membership",
@@ -1170,7 +1179,7 @@ pub const AUTHORITY_REGRESSION_CATALOGUE: &[&str] = &[
 ];
 ```
 
-Update the catalogue target to parse the Root and Nested profile tables, validate their union against the final MVP vocabulary and require exact equality with the Rust constant/direct test set; keep `scripts/verify-authority-regressions.ps1` as the single binary-registration and actual-pass gate over the resulting 22-item constant
+Update the catalogue target to parse the Root and Nested profile tables, reject cross-table duplicates, lock the cumulative count at 23, validate their union against the final MVP vocabulary and require exact equality with the Rust constant/direct test set; keep `scripts/verify-authority-regressions.ps1` as the single binary-registration and actual-pass gate over the resulting 23-item constant
 
 Switch the facade closed-world tests from the Root profile to `docs/nested-push-contract-profile.md`, require its exact 12 remaining exclusions, and prove the five unlocked APIs compile while History, Recovery and Authority-closure APIs remain rejected
 
@@ -1225,21 +1234,24 @@ Implement the three direct `#[test]` regressions in `authority_regression_tests.
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features ecs --test public_navigation_journeys
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features test-support --test public_navigation_authority_audit
-cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features ecs --test root_navigation_surface
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_export_allowlist
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_authority_compile_fail
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --test authority_regression_catalogue
 & .\scripts\verify-authority-regressions.ps1
 ```
 
-Expected: public Journey A, opaque audit, negative facade contract, Root regressions and all 22 cumulative authority cases pass
+Expected: public Journey A, opaque audit, negative facade contract, Root regressions and all 23 cumulative authority cases pass
+
+Root regression 由完整 `public_navigation_journeys` target 中既有的四个 Root case，以及 facade positive/closed-world gates 共同覆盖
+
+当前没有独立的 `root_navigation_surface` Cargo test target
 
 - [ ] **Step 8: Review and commit**
 
-Review gate: public callers cannot mint identity, bypass the driver, select active frames or mutate audit entities; the Root profile remains locked at 19
+Review gate: public callers cannot mint identity, bypass the driver, select active frames or mutate audit entities; the Root profile remains locked at 20
 
 ```powershell
-git add -- crates/bevy_ui_router_core/src/route_tree.rs crates/bevy_ui_router_core/tests/public_api.rs crates/bevy_ui_router_core/tests/compile_fail_boundary.rs crates/bevy_ui_router_ecs/src/content.rs crates/bevy_ui_router_ecs/src/audit.rs crates/bevy_ui_router_ecs/src/lib.rs crates/bevy_ui_router_ecs/src/authority_regression_tests.rs crates/bevy_ui_router_ecs/tests/authority_regression_catalogue.rs crates/bevy_ui_router/src/lib.rs crates/bevy_ui_router/tests/public_navigation_journeys.rs crates/bevy_ui_router/tests/public_navigation_authority_audit.rs crates/bevy_ui_router/tests/root_navigation_surface.rs crates/bevy_ui_router/tests/facade_export_allowlist.rs crates/bevy_ui_router/tests/facade_authority_compile_fail.rs crates/bevy_ui_router/tests/support/facade_contract_cases.rs
+git add -- Cargo.lock crates/bevy_ui_router_core/src/route_tree.rs crates/bevy_ui_router_core/src/mount.rs crates/bevy_ui_router_core/src/engine.rs crates/bevy_ui_router_core/src/integration.rs crates/bevy_ui_router_core/tests/public_api.rs crates/bevy_ui_router_core/tests/compile_fail_boundary.rs crates/bevy_ui_router_ecs/src/app_ext.rs crates/bevy_ui_router_ecs/src/content.rs crates/bevy_ui_router_ecs/src/audit.rs crates/bevy_ui_router_ecs/src/lib.rs crates/bevy_ui_router_ecs/src/mount.rs crates/bevy_ui_router_ecs/src/authority_regression_tests.rs crates/bevy_ui_router_ecs/tests/authority_regression_catalogue.rs crates/bevy_ui_router/Cargo.toml crates/bevy_ui_router/src/lib.rs crates/bevy_ui_router/tests/public_navigation_journeys.rs crates/bevy_ui_router/tests/public_navigation_authority_audit.rs crates/bevy_ui_router/tests/facade_export_allowlist.rs crates/bevy_ui_router/tests/facade_authority_compile_fail.rs crates/bevy_ui_router/tests/support/facade_contract_cases.rs docs/nested-push-contract-profile.md docs/superpowers/plans/2026-07-16-nested-push-implementation-plan.md
 git diff --cached --name-only
 git diff --cached --check
 git commit -m "test: prove nested push public authority"
@@ -1273,7 +1285,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test
 & .\scripts\verify-authority-regressions.ps1
 ```
 
-Expected: every command exits 0, the catalogue target proves Root 19 plus Nested 3 and the authority script reports exactly 22 registered/passed cases with no missing or duplicate name
+Expected: every command exits 0, the catalogue target proves Root 20 plus Nested 3 and the authority script reports exactly 23 registered/passed cases with no missing or duplicate name
 
 - [ ] **Step 2: Run the full workspace gate serially**
 
@@ -1312,7 +1324,7 @@ Expected: the planning baseline, exact implementation range and tracked plan res
 ```markdown
 - Nested Push: PASS
 - Proven: real parent outlet, sealed mount, root-to-leaf apply, atomic full-branch publication, frame-local input/focus and exact cleanup
-- Authority catalogue: Root 19 + Nested 3 = 22
+- Authority catalogue: Root 20 + Nested 3 = 23
 - Still pending: Reconciliation Journey B, common-prefix preservation, replace/back, Recovery, Authority closure and final MVP gate
 ```
 
@@ -1337,7 +1349,7 @@ Expected: documentation consistently distinguishes Nested PASS from incomplete R
 ## Plan self-review checklist
 
 - [x] Every requirement in `docs/nested-push-contract-profile.md` maps to Tasks 1-9
-- [x] Root Push fallback, depth-one fragment behavior and Root authority 19 remain locked regressions
+- [x] Root Push fallback, depth-one fragment behavior and Root authority 20 remain locked regressions
 - [x] Mount identity binds router, host epoch, parent frame, outlet key, transaction and single-use sequence
 - [x] Core owns logical lifecycle only; ECS exclusively owns exact Entity manifests, ledgers, receipts and physical cleanup
 - [x] Registry-first ordering and post-write exact validation cover every observer-capable staging write

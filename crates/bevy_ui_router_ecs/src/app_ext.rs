@@ -80,6 +80,11 @@ impl RouterHostRegistration {
         self.router
     }
 
+    #[cfg(test)]
+    pub(crate) const fn testing_identity(&self) -> (RouterHandle, u64) {
+        (self.router, self.incarnation)
+    }
+
     pub(crate) const fn incarnation(&self) -> u64 {
         self.incarnation
     }

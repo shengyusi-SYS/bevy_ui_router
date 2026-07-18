@@ -423,26 +423,26 @@ impl<'a> FrameContentWriter<'a> {
         Ok(())
     }
 
-    pub(crate) fn declare_outlet(
+    pub fn declare_outlet(
         &mut self,
-        entity: ContentEntity,
-        slot: RouteSlotKey,
+        anchor: ContentEntity,
+        key: RouteSlotKey,
     ) -> Result<(), ContentWriteError> {
-        self.validate_session(entity)?;
-        self.validate_live(entity)?;
+        self.validate_session(anchor)?;
+        self.validate_live(anchor)?;
 
         if self
             .plan
             .outlets
             .iter()
-            .any(|(_, declared_slot)| declared_slot == &slot)
+            .any(|(_, declared_slot)| declared_slot == &key)
         {
             return Err(ContentWriteError::new(
                 ContentWriteErrorKind::DuplicateOutlet,
             ));
         }
 
-        self.plan.outlets.push((entity, slot));
+        self.plan.outlets.push((anchor, key));
         Ok(())
     }
 

@@ -116,7 +116,10 @@ fn assert_bevy_dependency(location: &str, name: &str, package: &str, dependency:
         "Bevy dependency `{name}` in [{location}] must not declare branch"
     );
     assert!(
-        matches!(package, "bevy_app" | "bevy_ecs" | "bevy_ui"),
+        matches!(
+            package,
+            "bevy_app" | "bevy_camera" | "bevy_ecs" | "bevy_picking" | "bevy_ui"
+        ),
         "unexpected Bevy workspace package `{package}` in [{location}]"
     );
     assert_eq!(
@@ -208,11 +211,25 @@ fn assert_facade_dependency_contract(manifest: &toml::Value, owner: &toml::Value
     let dev_dependencies = manifest["dev-dependencies"].as_table().unwrap();
     assert_table_keys(
         dev_dependencies,
-        &["bevy_app", "bevy_ecs", "bevy_ui", "syn", "toml"],
+        &[
+            "bevy_app",
+            "bevy_camera",
+            "bevy_ecs",
+            "bevy_picking",
+            "bevy_ui",
+            "syn",
+            "toml",
+        ],
         "[dev-dependencies]",
     );
 
-    for dependency in ["bevy_app", "bevy_ecs", "bevy_ui"] {
+    for dependency in [
+        "bevy_app",
+        "bevy_camera",
+        "bevy_ecs",
+        "bevy_picking",
+        "bevy_ui",
+    ] {
         let facade_dependency = dev_dependencies[dependency].as_table().unwrap();
         assert_table_keys(
             facade_dependency,
@@ -478,9 +495,9 @@ fn facade_manifest_is_closed_world() {
 }
 
 #[test]
-fn root_profile_tables_and_curated_facade_source_are_closed_world() {
+fn nested_profile_tables_and_curated_facade_source_are_closed_world() {
     let allowlist = read_workspace("docs/facade-export-allowlist.md");
-    let profile = read_workspace("docs/root-push-contract-profile.md");
+    let profile = read_workspace("docs/nested-push-contract-profile.md");
     let modules = markdown_table(
         &allowlist,
         "## 2. Allowed Modules",
@@ -493,12 +510,12 @@ fn root_profile_tables_and_curated_facade_source_are_closed_world() {
     );
     let exclusions = markdown_table(
         &profile,
-        "### 3.1 Machine-Readable Exclusions",
+        "## 7 Public contract 与阶段 exclusions",
         &["Kind", "Canonical path or normalized item", "First slice"],
     );
     assert_eq!(modules.len(), 7);
     assert!(symbols.len() > 100);
-    assert_eq!(exclusions.len(), 17);
+    assert_eq!(exclusions.len(), 12);
 
     let source = std::fs::read_to_string(facade_dir().join("src/lib.rs")).unwrap();
     assert_eq!(
@@ -518,9 +535,9 @@ fn root_profile_tables_and_curated_facade_source_are_closed_world() {
 }
 
 #[test]
-fn isolated_positive_consumers_cover_the_root_feature_matrix() {
+fn isolated_positive_consumers_cover_the_nested_feature_matrix() {
     let allowlist = read_workspace("docs/facade-export-allowlist.md");
-    let profile = read_workspace("docs/root-push-contract-profile.md");
+    let profile = read_workspace("docs/nested-push-contract-profile.md");
     let modules = markdown_table(
         &allowlist,
         "## 2. Allowed Modules",
@@ -533,7 +550,7 @@ fn isolated_positive_consumers_cover_the_root_feature_matrix() {
     );
     let exclusions = markdown_table(
         &profile,
-        "### 3.1 Machine-Readable Exclusions",
+        "## 7 Public contract 与阶段 exclusions",
         &["Kind", "Canonical path or normalized item", "First slice"],
     );
     let symbols = root_symbols(&symbols, &exclusions);
