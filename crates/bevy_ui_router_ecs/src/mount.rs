@@ -40,6 +40,7 @@ pub(crate) struct ProvisionalChildSlot {
     outlet: RouteSlotKey,
     anchor: Entity,
     anchor_claim: ExactRegistryClaim,
+    prior_anchor_children: Vec<Entity>,
 }
 
 impl ProvisionalChildSlot {
@@ -49,6 +50,10 @@ impl ProvisionalChildSlot {
 
     pub(crate) const fn slot_claim(&self) -> &ExactRegistryClaim {
         &self.slot_claim
+    }
+
+    pub(crate) fn prior_anchor_children(&self) -> &[Entity] {
+        &self.prior_anchor_children
     }
 }
 
@@ -87,6 +92,31 @@ impl StagedChildSlot {
 
     pub(crate) const fn receipt(&self) -> &MountReceipt {
         &self.receipt
+    }
+
+    pub(crate) fn into_residual(self, world: &mut World) -> ChildSlotResidual {
+        let Self { provisional, .. } = self;
+        clear_slot_focus(world, provisional.slot);
+        let state = if world.get_entity(provisional.slot).is_err() {
+            ChildSlotResidualState::Absent
+        } else if matches!(
+            world
+                .resource::<RouteEntityRegistry>()
+                .record(provisional.slot)
+                .map(|record| record.owner()),
+            Some(RegistryOwner::Committed(
+                crate::registry::EntityOwner::ChildSlot { .. }
+            ))
+        ) {
+            ChildSlotResidualState::Registered
+        } else {
+            ChildSlotResidualState::Provisional
+        };
+        ChildSlotResidual {
+            state,
+            provisional,
+            authorized_manifest: child_slot_authorized_manifest(world),
+        }
     }
 }
 
@@ -160,6 +190,7 @@ pub(crate) enum ChildSlotResidualState {
 pub(crate) struct ChildSlotResidual {
     state: ChildSlotResidualState,
     provisional: ProvisionalChildSlot,
+    authorized_manifest: ComponentManifest,
 }
 
 impl ChildSlotResidual {
@@ -173,6 +204,30 @@ impl ChildSlotResidual {
 
     pub(crate) const fn claim(&self) -> &ExactRegistryClaim {
         &self.provisional.slot_claim
+    }
+
+    pub(crate) const fn parent(&self) -> &RouteFrameVersion {
+        &self.provisional.parent
+    }
+
+    pub(crate) const fn outlet(&self) -> &RouteSlotKey {
+        &self.provisional.outlet
+    }
+
+    pub(crate) const fn anchor(&self) -> Entity {
+        self.provisional.anchor
+    }
+
+    pub(crate) const fn anchor_claim(&self) -> &ExactRegistryClaim {
+        &self.provisional.anchor_claim
+    }
+
+    pub(crate) const fn authorized_manifest(&self) -> &ComponentManifest {
+        &self.authorized_manifest
+    }
+
+    pub(crate) fn prior_anchor_children(&self) -> &[Entity] {
+        self.provisional.prior_anchor_children()
     }
 }
 
@@ -318,6 +373,7 @@ pub(crate) fn stage_child_slot(
         outlet: outlet_key.clone(),
         anchor: outlet.anchor(),
         anchor_claim: outlet.anchor_claim().clone(),
+        prior_anchor_children: prior_anchor_children.clone(),
     };
     if !validate_stage_registry(world, &provisional, &initial_manifest)
         || !initial_manifest.matches(world, slot)
@@ -672,6 +728,99 @@ fn validate_registered_slot(
         && !focus_is_in_slot(world, slot.slot)
 }
 
+pub(crate) fn mounted_child_slot_is_isolated(world: &World, slot: &MountedChildSlot) -> bool {
+    world
+        .get_resource::<RouteEntityRegistry>()
+        .and_then(|registry| registry.record(slot.slot))
+        .is_some_and(|record| {
+            record.claim() == slot.slot_claim
+                && record.manifest().matches(world, slot.slot)
+                && record.owner()
+                    == &RegistryOwner::Committed(crate::registry::EntityOwner::ChildSlot {
+                        parent: slot.parent.clone(),
+                        outlet: slot.outlet.clone(),
+                        slot: slot.slot_id,
+                    })
+        })
+        && world.get::<Visibility>(slot.slot) == Some(&Visibility::Hidden)
+        && world.get::<Pickable>(slot.slot) == Some(&Pickable::IGNORE)
+        && world
+            .get::<RouterInputBarrier>(slot.slot)
+            .is_some_and(RouterInputBarrier::denies_all)
+        && world.get::<RouteOwnershipSeal>(slot.slot)
+            == Some(&RouteOwnershipSeal::new(slot.slot_claim.seal()))
+        && world.get::<ChildSlotLifecycle>(slot.slot) == Some(&ChildSlotLifecycle::RegisteredInert)
+        && world
+            .get::<ChildSlotAuthority>(slot.slot)
+            .is_some_and(|authority| {
+                authority.parent() == &slot.parent
+                    && authority.outlet() == &slot.outlet
+                    && authority.slot() == slot.slot_id
+            })
+        && world.get::<ChildOf>(slot.slot).map(ChildOf::parent) == Some(slot.anchor)
+        && children_of(world, slot.anchor) == slot.expected_anchor_children
+}
+
+pub(crate) fn residual_child_slot_is_isolated(world: &World, residual: &ChildSlotResidual) -> bool {
+    if world.get_entity(residual.entity()).is_err() {
+        return residual.state == ChildSlotResidualState::Absent;
+    }
+    let Some(record) = world
+        .get_resource::<RouteEntityRegistry>()
+        .and_then(|registry| registry.record(residual.entity()))
+    else {
+        return false;
+    };
+    if record.claim() != *residual.claim() {
+        return false;
+    }
+    let visibility_is_safe = world
+        .get::<Visibility>(residual.entity())
+        .is_none_or(|visibility| *visibility == Visibility::Hidden);
+    let pickable_is_safe = world
+        .get::<Pickable>(residual.entity())
+        .is_none_or(|pickable| *pickable == Pickable::IGNORE);
+    let barrier_is_safe = world
+        .get::<RouterInputBarrier>(residual.entity())
+        .is_none_or(RouterInputBarrier::denies_all);
+    let seal_is_exact = world
+        .get::<RouteOwnershipSeal>(residual.entity())
+        .is_none_or(|seal| *seal == RouteOwnershipSeal::new(residual.claim().seal()));
+    let lifecycle_is_exact = world
+        .get::<ChildSlotLifecycle>(residual.entity())
+        .is_none_or(|lifecycle| match residual.state {
+            ChildSlotResidualState::Provisional => {
+                *lifecycle == ChildSlotLifecycle::ProvisionalInert
+            }
+            ChildSlotResidualState::Registered => *lifecycle == ChildSlotLifecycle::RegisteredInert,
+            ChildSlotResidualState::Absent => false,
+        });
+    let authority_is_exact = world
+        .get::<ChildSlotAuthority>(residual.entity())
+        .is_none_or(|authority| {
+            let slot = match residual.claim().owner() {
+                RegistryOwner::Committed(crate::registry::EntityOwner::ChildSlot {
+                    slot, ..
+                })
+                | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { slot, .. }) => *slot,
+                _ => return false,
+            };
+            authority.parent() == residual.parent()
+                && authority.outlet() == residual.outlet()
+                && authority.slot() == slot
+        });
+    let relationship_is_exact = world
+        .get::<ChildOf>(residual.entity())
+        .is_none_or(|parent| parent.parent() == residual.anchor());
+    visibility_is_safe
+        && pickable_is_safe
+        && barrier_is_safe
+        && seal_is_exact
+        && lifecycle_is_exact
+        && authority_is_exact
+        && relationship_is_exact
+}
+
 fn confirmation_failure(
     world: &mut World,
     kind: ChildSlotConfirmationErrorKind,
@@ -694,10 +843,15 @@ fn confirmation_failure(
     } else {
         ChildSlotResidualState::Provisional
     };
+    let authorized_manifest = child_slot_authorized_manifest(world);
     ChildSlotConfirmationFailure {
         kind,
         terminal,
-        residual: ChildSlotResidual { state, provisional },
+        residual: ChildSlotResidual {
+            state,
+            provisional,
+            authorized_manifest,
+        },
     }
 }
 
@@ -998,10 +1152,45 @@ fn stage_failure(
     } else {
         ChildSlotResidualState::Absent
     };
+    let authorized_manifest = child_slot_authorized_manifest(world);
     ChildSlotStageFailure {
         kind,
-        residual: Some(ChildSlotResidual { state, provisional }),
+        residual: Some(ChildSlotResidual {
+            state,
+            provisional,
+            authorized_manifest,
+        }),
     }
+}
+
+fn child_slot_authorized_manifest(world: &World) -> ComponentManifest {
+    let mut explicit = [
+        world.components().component_id::<Visibility>(),
+        world.components().component_id::<Pickable>(),
+        world.components().component_id::<RouterInputBarrier>(),
+        world.components().component_id::<ChildSlotBarrierProbe>(),
+        world.components().component_id::<Node>(),
+        world.components().component_id::<ChildSlotNodeProbe>(),
+        world.components().component_id::<RouteOwnershipSeal>(),
+        world.components().component_id::<ChildSlotLifecycle>(),
+        world.components().component_id::<ChildSlotAuthority>(),
+        world.components().component_id::<ChildSlotAuthorityProbe>(),
+        world.components().component_id::<ChildOf>(),
+        world
+            .components()
+            .component_id::<ChildSlotRelationshipProbe>(),
+        world.components().component_id::<Children>(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let registered = explicit.clone();
+    for component in registered {
+        if let Some(required) = world.get_required_components_by_id(component) {
+            explicit.extend(required.iter_ids());
+        }
+    }
+    ComponentManifest::new(explicit)
 }
 
 fn children_of(world: &World, entity: Entity) -> Vec<Entity> {
@@ -1886,7 +2075,7 @@ pub(crate) mod tests {
             .reject_mount_after_mutation(MountMutationArtifact::Grant(grant))
             .unwrap();
         let cleanup = engine
-            .prepare_failure_cleanup(
+            .prepare_failure_cleanup_retaining(
                 cleanup_request,
                 CleanupManifest::new(vec![parent.frame().clone()], 701, 1),
             )
@@ -2005,6 +2194,138 @@ pub(crate) mod tests {
                 .resource::<RouteEntityRegistry>()
                 .record(mounted.slot())
                 .is_some_and(|record| record.manifest().matches(&world, mounted.slot()))
+        );
+    }
+
+    #[test]
+    fn prepared_branch_rejects_mismatched_mounted_anchor_without_world_or_registry_write() {
+        let (mut world, _candidate, _top_slot, mut engine, parent, _local_index, grant) =
+            realized_parent_with_outlet();
+        let staged =
+            stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant).unwrap();
+        let digest = staged.receipt().digest();
+        let (attestation, proof) = grant.attest_receipt_with_proof(digest);
+        let permit = engine.accept_mount_receipt(attestation).unwrap();
+        let mut mounted = confirm_child_slot(&mut world, &mut engine, staged, permit, &proof)
+            .expect("exact child slot should confirm");
+        mounted.anchor = world.spawn_empty().id();
+        let world_before = world
+            .iter_entities()
+            .map(|entity| (entity.id(), entity.archetype().components().to_vec()))
+            .collect::<Vec<_>>();
+        let registry_before = world.resource::<RouteEntityRegistry>().records().to_vec();
+        let mut branch = crate::branch_transaction::PreparedBranch::empty();
+        branch.push_frame(parent).unwrap();
+
+        let rejected = branch.push_child_slot(mounted).unwrap_err();
+        let rejected_entity = rejected.slot().slot();
+        assert_eq!(branch.frames().len(), 1);
+        assert!(branch.child_slots().is_empty());
+        assert_eq!(
+            world
+                .iter_entities()
+                .map(|entity| (entity.id(), entity.archetype().components().to_vec()))
+                .collect::<Vec<_>>(),
+            world_before
+        );
+        assert_eq!(
+            world.resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+
+        let failed = crate::branch_transaction::FailedPreparedBranch::with_rejected_child_slot(
+            branch, rejected,
+        );
+        world.insert_resource(InputFocus::default());
+        world.insert_resource(RouteFocusState::default());
+        let manifest = crate::cleanup::FrozenCleanupManifest::from_failed_prepared_branch(
+            &world,
+            world.resource::<RouteEntityRegistry>(),
+            &failed,
+        )
+        .expect("canonical append-before anchor must authorize rejected slot cleanup");
+        assert!(manifest.entities().contains(&rejected_entity));
+        let mut ledger =
+            match crate::cleanup::CleanupLedger::for_failed_prepared_branch(&world, failed) {
+                Ok(ledger) => ledger,
+                Err(_) => panic!("rejected slot must remain owned by one cleanup ledger"),
+            };
+        let attempt = ledger.attempt(&world).unwrap();
+        assert!(ledger.settle(&mut world, attempt));
+        assert!(
+            world
+                .resource::<RouteEntityRegistry>()
+                .record(rejected_entity)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn canonical_absent_rejected_slot_preserves_unknown_parent_as_unresolved() {
+        let (mut world, _candidate, _top_slot, mut engine, parent, _local_index, grant) =
+            realized_parent_with_outlet();
+        let staged =
+            stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant).unwrap();
+        let digest = staged.receipt().digest();
+        let (attestation, proof) = grant.attest_receipt_with_proof(digest);
+        let permit = engine.accept_mount_receipt(attestation).unwrap();
+        let mut mounted = confirm_child_slot(&mut world, &mut engine, staged, permit, &proof)
+            .expect("exact child slot should confirm");
+        let slot = mounted.slot();
+        let source_claim = mounted.slot_claim().clone();
+        let EngineAction::FrameTask(child_task) = engine.action().unwrap() else {
+            panic!("confirmed slot must issue its child task")
+        };
+        mounted.parent = child_task.frame().clone();
+        let app_parent = world.spawn_empty().id();
+        world
+            .entity_mut(slot)
+            .insert((ForeignChildSlotComponent, ChildOf(app_parent)));
+        world.flush();
+
+        let mut branch = crate::branch_transaction::PreparedBranch::empty();
+        branch.push_frame(parent).unwrap();
+        let rejected = branch.push_child_slot(mounted).unwrap_err();
+        assert!(rejected.canonical_anchor().is_none());
+        assert!(rejected.canonical_anchor_claim().is_none());
+        let failed = crate::branch_transaction::FailedPreparedBranch::with_rejected_child_slot(
+            branch, rejected,
+        );
+        world.insert_resource(InputFocus::default());
+        world.insert_resource(RouteFocusState::default());
+        let manifest = crate::cleanup::FrozenCleanupManifest::from_failed_prepared_branch(
+            &world,
+            world.resource::<RouteEntityRegistry>(),
+            &failed,
+        )
+        .expect("the exact source claim must freeze without trusting an intended anchor");
+        assert_eq!(manifest.entities().first(), Some(&slot));
+        let mut ledger = crate::cleanup::CleanupLedger::for_failed_prepared_branch(&world, failed)
+            .unwrap_or_else(|_| panic!("the rejected slot must retain one cleanup owner"));
+        let attempt = ledger.attempt(&world).unwrap();
+        assert!(ledger.settle(&mut world, attempt));
+
+        assert!(world.get_entity(app_parent).is_ok());
+        assert_eq!(
+            world.get::<ChildOf>(slot).map(ChildOf::parent),
+            Some(app_parent)
+        );
+        assert!(world.get::<ForeignChildSlotComponent>(slot).is_some());
+        assert_eq!(
+            world.get::<ChildSlotLifecycle>(slot),
+            Some(&ChildSlotLifecycle::RegisteredInert)
+        );
+        assert!(
+            world
+                .resource::<RouteEntityRegistry>()
+                .record(slot)
+                .is_none()
+        );
+        assert!(
+            world
+                .resource::<QuarantineLeaseTable>()
+                .unresolved_record(slot)
+                .is_some_and(|record| record.claim() == source_claim)
         );
     }
 

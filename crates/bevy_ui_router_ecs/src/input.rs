@@ -12,9 +12,12 @@ use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
 
 use crate::{
-    components::RouterInputBarrier,
-    presentation::validate_active_frame,
-    registry::{EntityLifecycle, ExactRegistryClaim, QuarantineLeaseTable, RouteEntityRegistry},
+    components::{ChildSlotAuthority, ChildSlotLifecycle, RouteOwnershipSeal, RouterInputBarrier},
+    presentation::{FrameLifecycle, validate_active_frame},
+    registry::{
+        EntityLifecycle, EntityOwner, ExactRegistryClaim, ProvisionalOwner, QuarantineLeaseTable,
+        RegistryOwner, RouteEntityRegistry,
+    },
 };
 
 #[derive(Default, Resource, Debug)]
@@ -145,6 +148,7 @@ pub(crate) fn refresh_input_gate_system(world: &mut World) {
             .entries
             .iter()
             .filter_map(|entry| entry.active.as_ref())
+            .flat_map(|branch| branch.frames())
             .filter(|frame| validate_active_frame(world, frame))
             .flat_map(|frame| frame.interactive_entities())
             .collect()
@@ -183,6 +187,7 @@ fn fail_closed_invalid_active_frames(world: &mut World) -> HashSet<Entity> {
             .entries
             .iter()
             .filter_map(|entry| entry.active.as_ref())
+            .flat_map(|branch| branch.frames())
             .filter(|frame| !validate_active_frame(world, frame))
             .map(|frame| frame.claims().cloned().collect::<Vec<_>>())
             .collect::<Vec<_>>()
@@ -235,11 +240,28 @@ fn prepare_physical_isolation<'w>(
 }
 
 fn clear_inert_subtree_focus(world: &mut World, invalid_active: &HashSet<Entity>) {
-    let quarantine_roots = world
+    let inert_roots = world
         .resource::<QuarantineLeaseTable>()
         .inert_owned_entities()
         .collect::<Vec<_>>();
-    let mut blocked = observed_descendant_closure(world, quarantine_roots);
+    let stale_roots = inert_roots
+        .iter()
+        .copied()
+        .filter(|entity| !inert_table_root_is_exact(world, *entity))
+        .collect::<HashSet<_>>();
+    let mut stack = inert_roots
+        .into_iter()
+        .filter(|entity| !stale_roots.contains(entity))
+        .collect::<Vec<_>>();
+    let mut blocked = HashSet::new();
+    while let Some(entity) = stack.pop() {
+        if stale_roots.contains(&entity) || !blocked.insert(entity) {
+            continue;
+        }
+        if let Some(children) = world.get::<Children>(entity) {
+            stack.extend(children.iter().copied());
+        }
+    }
     blocked.extend(invalid_active.iter().copied());
     let input = world.get_resource::<InputFocus>().and_then(InputFocus::get);
     let clear_input = input.is_some_and(|focused| {
@@ -261,11 +283,15 @@ fn clear_inert_subtree_focus(world: &mut World, invalid_active: &HashSet<Entity>
 
 fn nearest_registry_boundary_is_inert(world: &World, focused: Entity) -> bool {
     let registry = world.resource::<RouteEntityRegistry>();
+    let table = world.resource::<QuarantineLeaseTable>();
     let mut current = focused;
     let mut visited = HashSet::new();
     loop {
         if !visited.insert(current) {
             return true;
+        }
+        if table.record(current).is_some() || table.unresolved_record(current).is_some() {
+            return inert_table_root_is_exact(world, current);
         }
         if let Some(record) = registry.record(current) {
             return record.lifecycle() != EntityLifecycle::Active;
@@ -275,6 +301,67 @@ fn nearest_registry_boundary_is_inert(world: &World, focused: Entity) -> bool {
         };
         current = parent;
     }
+}
+
+fn inert_table_root_is_exact(world: &World, entity: Entity) -> bool {
+    let table = world.resource::<QuarantineLeaseTable>();
+    let Some(record) = table
+        .record(entity)
+        .or_else(|| table.unresolved_record(entity))
+    else {
+        return false;
+    };
+    let claim = record.claim();
+    let lifecycle_is_exact = match claim.owner() {
+        RegistryOwner::Committed(
+            EntityOwner::FrameShell(_)
+            | EntityOwner::FrameContentTarget(_)
+            | EntityOwner::FrameOutput { .. },
+        ) => world.get::<FrameLifecycle>(entity) == Some(&FrameLifecycle(claim.lifecycle())),
+        RegistryOwner::Committed(EntityOwner::ChildSlot {
+            parent,
+            outlet,
+            slot,
+        })
+        | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
+            parent,
+            outlet,
+            slot,
+        }) => {
+            let expected_lifecycle = match (claim.owner(), claim.lifecycle()) {
+                (
+                    RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { .. }),
+                    EntityLifecycle::PreparedInert,
+                ) => ChildSlotLifecycle::ProvisionalInert,
+                (
+                    RegistryOwner::Committed(EntityOwner::ChildSlot { .. }),
+                    EntityLifecycle::PreparedInert,
+                ) => ChildSlotLifecycle::RegisteredInert,
+                (
+                    RegistryOwner::Committed(EntityOwner::ChildSlot { .. })
+                    | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { .. }),
+                    EntityLifecycle::Quarantined,
+                ) => ChildSlotLifecycle::Quarantined,
+                _ => return false,
+            };
+            world.get::<ChildSlotLifecycle>(entity) == Some(&expected_lifecycle)
+                && world
+                    .get::<ChildSlotAuthority>(entity)
+                    .is_some_and(|authority| {
+                        authority.parent() == parent
+                            && authority.outlet() == outlet
+                            && authority.slot() == *slot
+                    })
+        }
+        _ => false,
+    };
+    world.get::<RouteOwnershipSeal>(entity) == Some(&RouteOwnershipSeal::new(claim.seal()))
+        && lifecycle_is_exact
+        && world.get::<Visibility>(entity) == Some(&Visibility::Hidden)
+        && world.get::<Pickable>(entity) == Some(&Pickable::IGNORE)
+        && world
+            .get::<RouterInputBarrier>(entity)
+            .is_some_and(RouterInputBarrier::denies_all)
 }
 
 pub(crate) fn observed_descendant_closure(

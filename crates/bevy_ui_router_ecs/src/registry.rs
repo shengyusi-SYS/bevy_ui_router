@@ -19,6 +19,42 @@ use crate::presentation::VerifiedFrameQuarantineTransfer;
 static NEXT_SEAL_DOMAIN: AtomicU64 = AtomicU64::new(1);
 static NEXT_QUARANTINE_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_UNRESOLVED_PREPARATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_VERIFIED_PREPARATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_unresolved_preparation_for_test() {
+    FAIL_NEXT_UNRESOLVED_PREPARATION.set(true);
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_verified_preparation_for_test() {
+    FAIL_NEXT_VERIFIED_PREPARATION.set(true);
+}
+
+#[cfg(test)]
+fn verified_preparation_fault_injected() -> bool {
+    FAIL_NEXT_VERIFIED_PREPARATION.replace(false)
+}
+
+#[cfg(not(test))]
+const fn verified_preparation_fault_injected() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn unresolved_preparation_fault_injected() -> bool {
+    FAIL_NEXT_UNRESOLVED_PREPARATION.replace(false)
+}
+
+#[cfg(not(test))]
+const fn unresolved_preparation_fault_injected() -> bool {
+    false
+}
+
 fn allocate_registry_domain(counter: &AtomicU64) -> Option<u64> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -651,6 +687,9 @@ impl QuarantineLeaseTable {
         manifests: Vec<(Entity, ComponentManifest)>,
         facts: QuarantineFacts,
     ) -> Result<PreparedQuarantineTransfer, QuarantineTransferError> {
+        if verified_preparation_fault_injected() {
+            return Err(QuarantineTransferError::CapacityExhausted);
+        }
         if claims.is_empty() || manifests.len() != claims.len() {
             return Err(QuarantineTransferError::EmptyOwnedSet);
         }
@@ -735,6 +774,9 @@ impl QuarantineLeaseTable {
         actual_manifests: Vec<(Entity, ComponentManifest)>,
         facts: QuarantineFacts,
     ) -> Result<PreparedUnresolvedResidualTransfer, QuarantineTransferError> {
+        if unresolved_preparation_fault_injected() {
+            return Err(QuarantineTransferError::CapacityExhausted);
+        }
         if claims.is_empty() || actual_manifests.len() != claims.len() {
             return Err(QuarantineTransferError::EmptyOwnedSet);
         }

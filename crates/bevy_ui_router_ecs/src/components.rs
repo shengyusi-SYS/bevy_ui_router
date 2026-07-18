@@ -94,6 +94,7 @@ impl ChildSlotAuthority {
 pub(crate) enum ChildSlotLifecycle {
     ProvisionalInert,
     RegisteredInert,
+    Quarantined,
 }
 
 #[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]

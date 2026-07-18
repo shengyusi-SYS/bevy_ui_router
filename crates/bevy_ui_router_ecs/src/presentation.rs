@@ -38,16 +38,18 @@ use crate::components::{
     ChildSlotAuthorityProbe, ChildSlotBarrierProbe, ChildSlotNodeProbe, ChildSlotRelationshipProbe,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FrameMountBinding {
     slot: Entity,
     slot_claim: ExactRegistryClaim,
     kind: FrameMountBindingKind,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum FrameMountBindingKind {
-    HostTop,
+    HostTop {
+        host: Entity,
+    },
     ChildOutlet {
         parent: RouteFrameVersion,
         outlet: bevy_ui_router_core::slot::RouteSlotKey,
@@ -58,11 +60,11 @@ enum FrameMountBindingKind {
 }
 
 impl FrameMountBinding {
-    fn host_top(slot: Entity, slot_claim: ExactRegistryClaim) -> Self {
+    fn host_top(slot: Entity, slot_claim: ExactRegistryClaim, host: Entity) -> Self {
         Self {
             slot,
             slot_claim,
-            kind: FrameMountBindingKind::HostTop,
+            kind: FrameMountBindingKind::HostTop { host },
         }
     }
 
@@ -88,6 +90,36 @@ impl FrameMountBinding {
         &self.slot_claim
     }
 
+    pub(crate) const fn physical_parent(&self) -> (Entity, Option<&ExactRegistryClaim>) {
+        match &self.kind {
+            FrameMountBindingKind::HostTop { host } => (*host, None),
+            FrameMountBindingKind::ChildOutlet {
+                anchor,
+                anchor_claim,
+                ..
+            } => (*anchor, Some(anchor_claim)),
+        }
+    }
+
+    pub(crate) fn matches_mounted_child_slot(&self, mounted: &MountedChildSlot) -> bool {
+        self.slot == mounted.slot()
+            && self.slot_claim == *mounted.slot_claim()
+            && matches!(
+                &self.kind,
+                FrameMountBindingKind::ChildOutlet {
+                    parent,
+                    outlet,
+                    anchor,
+                    anchor_claim,
+                    expected_anchor_children,
+                } if parent == mounted.parent()
+                    && outlet == mounted.outlet()
+                    && *anchor == mounted.anchor()
+                    && anchor_claim == mounted.anchor_claim()
+                    && expected_anchor_children == mounted.expected_anchor_children()
+            )
+    }
+
     #[cfg(test)]
     pub(crate) const fn is_child_outlet(&self) -> bool {
         matches!(self.kind, FrameMountBindingKind::ChildOutlet { .. })
@@ -98,7 +130,13 @@ impl FrameMountBinding {
 struct FrameShell(RouteFrameVersion);
 
 #[derive(Component, Clone, Debug, Eq, PartialEq)]
-struct FrameContentTarget(RouteFrameVersion);
+pub(crate) struct FrameContentTarget(RouteFrameVersion);
+
+impl FrameContentTarget {
+    pub(crate) fn matches_frame(&self, frame: &RouteFrameVersion) -> bool {
+        self.0 == *frame
+    }
+}
 
 #[cfg(test)]
 #[derive(bevy_ecs::prelude::Resource)]
@@ -110,7 +148,76 @@ struct MountChildrenManifestCasDriftProbe {
 pub(crate) struct FrameOutput {
     frame: RouteFrameVersion,
     local_index: usize,
-    primitive: Option<crate::content::ContentPrimitiveKind>,
+    solid_rect: Option<crate::content::SolidRect>,
+}
+
+impl FrameOutput {
+    pub(crate) fn matches_owner(&self, frame: &RouteFrameVersion, local_index: usize) -> bool {
+        self.frame == *frame && self.local_index == local_index
+    }
+
+    pub(crate) fn canonical_values_match(
+        &self,
+        world: &World,
+        entity: Entity,
+        lifecycle: EntityLifecycle,
+    ) -> bool {
+        let (node, background, interactive) = match self.solid_rect {
+            None => (
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    ..Node::default()
+                },
+                BackgroundColor::default(),
+                false,
+            ),
+            Some(rect) => {
+                let color = rect.color();
+                (
+                    Node {
+                        width: Val::Px(f32::from(rect.width_px())),
+                        height: Val::Px(f32::from(rect.height_px())),
+                        flex_shrink: 0.0,
+                        ..Node::default()
+                    },
+                    BackgroundColor(Color::srgba_u8(
+                        color.red(),
+                        color.green(),
+                        color.blue(),
+                        color.alpha(),
+                    )),
+                    true,
+                )
+            }
+        };
+        let (visibility, pickable, input_allowed) = match lifecycle {
+            EntityLifecycle::PreparedInert => (Visibility::Hidden, Pickable::IGNORE, false),
+            EntityLifecycle::Active => (
+                Visibility::Visible,
+                if interactive {
+                    ACTIVE_PICKABLE
+                } else {
+                    Pickable::IGNORE
+                },
+                interactive,
+            ),
+            EntityLifecycle::Leaving | EntityLifecycle::Quarantined => return false,
+        };
+        world.get::<Node>(entity) == Some(&node)
+            && world.get::<BackgroundColor>(entity) == Some(&background)
+            && world.get::<Visibility>(entity) == Some(&visibility)
+            && world.get::<Pickable>(entity) == Some(&pickable)
+            && world
+                .get::<RouterInputBarrier>(entity)
+                .is_some_and(|barrier| {
+                    if input_allowed {
+                        barrier.allows_all()
+                    } else {
+                        barrier.denies_all()
+                    }
+                })
+    }
 }
 
 #[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
@@ -166,9 +273,16 @@ pub(crate) struct RealizedFrame {
     mount: FrameMountBinding,
     prior_mount_children: Vec<Entity>,
     shell: Entity,
+    mount_stage: FrameMountStage,
     entities: Vec<RealizedEntity>,
     outlets: Vec<RealizedOutlet>,
     prewrite_complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameMountStage {
+    ShellAllocated,
+    ShellAttached,
 }
 
 pub(crate) struct VerifiedFrameQuarantineTransfer {
@@ -275,6 +389,32 @@ impl RealizedFrame {
 
     pub(crate) const fn mount_binding(&self) -> &FrameMountBinding {
         &self.mount
+    }
+
+    pub(crate) fn prior_mount_children(&self) -> &[Entity] {
+        &self.prior_mount_children
+    }
+
+    pub(crate) const fn shell_is_attached(&self) -> bool {
+        matches!(self.mount_stage, FrameMountStage::ShellAttached)
+    }
+
+    pub(crate) fn rebase_mount_after_replacing(&mut self, leaving: &Self) -> bool {
+        let mut expected_prior = leaving.prior_mount_children.clone();
+        expected_prior.push(leaving.shell);
+        if !self.shell_is_attached()
+            || !leaving.shell_is_attached()
+            || self.mount != leaving.mount
+            || self.prior_mount_children != expected_prior
+        {
+            return false;
+        }
+        self.prior_mount_children = leaving.prior_mount_children.clone();
+        true
+    }
+
+    pub(crate) fn expected_owned_children(&self, parent: Entity) -> Vec<Entity> {
+        expected_children(self, parent)
     }
 
     pub(crate) fn outlet(
@@ -434,10 +574,11 @@ pub(crate) fn realize_frame_deferred(
     output: u64,
     plan: AcceptedContentPlan,
 ) -> Result<RealizedFrame, DeferredRealizationFailure> {
+    let host = host_candidate.host();
     realize_frame_with_binding_deferred(
         world,
         host_candidate,
-        FrameMountBinding::host_top(top_slot, top_slot_claim),
+        FrameMountBinding::host_top(top_slot, top_slot_claim, host),
         frame,
         output,
         plan,
@@ -668,6 +809,7 @@ fn realize_frame_with_binding_deferred(
         mount,
         prior_mount_children: mount_children_before,
         shell: realized[0].entity,
+        mount_stage: FrameMountStage::ShellAttached,
         entities: realized,
         outlets,
         prewrite_complete: true,
@@ -750,6 +892,7 @@ fn partial_realized_frame(
         mount,
         prior_mount_children,
         shell,
+        mount_stage: FrameMountStage::ShellAllocated,
         entities,
         outlets: Vec::new(),
         prewrite_complete: false,
@@ -773,7 +916,7 @@ fn validate_mount_binding_allowing_additions(
     allowed_manifest_additions: &[ComponentId],
 ) -> Result<(), RealizationError> {
     match &mount.kind {
-        FrameMountBindingKind::HostTop => validate_top_slot(
+        FrameMountBindingKind::HostTop { .. } => validate_top_slot(
             world,
             host_candidate,
             mount.slot,
@@ -1059,14 +1202,13 @@ fn insert_realized_components(
     frame: &RouteFrameVersion,
     kind: RealizedContentKind,
 ) {
-    let (node, background, primitive) = match kind {
+    let (node, background) = match kind {
         RealizedContentKind::Empty => (
             Node {
                 width: Val::Percent(100.0),
                 height: Val::Percent(100.0),
                 ..Node::default()
             },
-            None,
             None,
         ),
         RealizedContentKind::SolidRect(rect) => {
@@ -1084,7 +1226,6 @@ fn insert_realized_components(
                     color.blue(),
                     color.alpha(),
                 ))),
-                Some(crate::content::ContentPrimitiveKind::SolidRect),
             )
         }
     };
@@ -1109,7 +1250,10 @@ fn insert_realized_components(
             RegistryOwner::Committed(EntityOwner::FrameOutput { local_index, .. }) => *local_index,
             _ => unreachable!("output claim has output owner"),
         },
-        primitive,
+        solid_rect: match kind {
+            RealizedContentKind::Empty => None,
+            RealizedContentKind::SolidRect(rect) => Some(rect),
+        },
     });
     world
         .entity_mut(realized.entity)
@@ -1164,7 +1308,7 @@ fn runtime_ui_component_ids(world: &mut World) -> [ComponentId; 2] {
 pub(crate) fn assert_locked_component_manifest_closure(world: &mut World, frame: &RealizedFrame) {
     let runtime = runtime_ui_component_ids(world);
     let mount_slot_explicit = match &frame.mount.kind {
-        FrameMountBindingKind::HostTop => vec![
+        FrameMountBindingKind::HostTop { .. } => vec![
             world.register_component::<Visibility>(),
             world.register_component::<Pickable>(),
             world.register_component::<RouterInputBarrier>(),
@@ -1365,6 +1509,23 @@ fn exact_manifest_cas_is_current(
 }
 
 pub(crate) fn validate_realized_frame(world: &World, frame: &RealizedFrame) -> bool {
+    validate_realized_frame_allowing_child_slots(world, frame, &[])
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn validate_realized_frame_with_child_slots(
+    world: &World,
+    frame: &RealizedFrame,
+    child_slots: &[(Entity, Vec<Entity>)],
+) -> bool {
+    validate_realized_frame_allowing_child_slots(world, frame, child_slots)
+}
+
+fn validate_realized_frame_allowing_child_slots(
+    world: &World,
+    frame: &RealizedFrame,
+    child_slots: &[(Entity, Vec<Entity>)],
+) -> bool {
     if validate_mount_binding(world, &frame.host_candidate, &frame.mount, frame.frame()).is_err()
         || !mount_slot_children_are_exact(world, frame)
         || frame_focus_is_in_subtree(world, frame)
@@ -1392,11 +1553,19 @@ pub(crate) fn validate_realized_frame(world: &World, frame: &RealizedFrame) -> b
             world.get::<FrameLifecycle>(realized.entity)
                 == Some(&FrameLifecycle(EntityLifecycle::PreparedInert)),
             world.get::<ChildOf>(realized.entity).map(ChildOf::parent) == Some(realized.parent),
-            exact_children_match(
-                world,
-                realized.entity,
-                expected_children(frame, realized.entity),
-            ),
+            child_slots
+                .iter()
+                .find_map(|(anchor, expected)| {
+                    (*anchor == realized.entity)
+                        .then(|| exact_children_match(world, realized.entity, expected.clone()))
+                })
+                .unwrap_or_else(|| {
+                    exact_children_match(
+                        world,
+                        realized.entity,
+                        expected_children(frame, realized.entity),
+                    )
+                }),
             realized_values_match(world, realized, frame.frame()),
         ];
         checks.into_iter().all(|valid| valid)
@@ -1705,14 +1874,18 @@ pub(crate) fn isolate_frame_for_settlement(world: &mut World, frame: &RealizedFr
         if world.get::<Visibility>(realized.entity).is_none() {
             world.entity_mut(realized.entity).insert(Visibility::Hidden);
             world.flush();
-            if !frame_claim_is_current(world, realized) {
+            if !frame_claim_is_current(world, realized)
+                || world.get::<Visibility>(realized.entity) != Some(&Visibility::Hidden)
+            {
                 return false;
             }
         }
         if world.get::<Pickable>(realized.entity).is_none() {
             world.entity_mut(realized.entity).insert(Pickable::IGNORE);
             world.flush();
-            if !frame_claim_is_current(world, realized) {
+            if !frame_claim_is_current(world, realized)
+                || world.get::<Pickable>(realized.entity) != Some(&Pickable::IGNORE)
+            {
                 return false;
             }
         }
@@ -1721,17 +1894,32 @@ pub(crate) fn isolate_frame_for_settlement(world: &mut World, frame: &RealizedFr
                 .entity_mut(realized.entity)
                 .insert(RouterInputBarrier::deny_all());
             world.flush();
-            if !frame_claim_is_current(world, realized) {
+            if !frame_claim_is_current(world, realized)
+                || !world
+                    .get::<RouterInputBarrier>(realized.entity)
+                    .is_some_and(RouterInputBarrier::denies_all)
+            {
                 return false;
             }
         }
-        *world.get_mut::<Visibility>(realized.entity).unwrap() = Visibility::Hidden;
-        *world.get_mut::<Pickable>(realized.entity).unwrap() = Pickable::IGNORE;
-        *world
-            .get_mut::<RouterInputBarrier>(realized.entity)
-            .unwrap() = RouterInputBarrier::deny_all();
+        let Some(mut visibility) = world.get_mut::<Visibility>(realized.entity) else {
+            return false;
+        };
+        *visibility = Visibility::Hidden;
+        let Some(mut pickable) = world.get_mut::<Pickable>(realized.entity) else {
+            return false;
+        };
+        *pickable = Pickable::IGNORE;
+        let Some(mut barrier) = world.get_mut::<RouterInputBarrier>(realized.entity) else {
+            return false;
+        };
+        *barrier = RouterInputBarrier::deny_all();
     }
     clear_frame_focus(world, frame);
+    frame_is_isolated_for_settlement(world, frame)
+}
+
+pub(crate) fn frame_is_isolated_for_settlement(world: &World, frame: &RealizedFrame) -> bool {
     frame.entities.iter().all(|realized| {
         frame_claim_is_current(world, realized)
             && world.get::<Visibility>(realized.entity) == Some(&Visibility::Hidden)
@@ -1796,8 +1984,8 @@ fn realized_values_match(
             else {
                 return false;
             };
-            let (node, background, primitive) = match realized.solid_rect {
-                None => (expected_container, Some(BackgroundColor::default()), None),
+            let (node, background) = match realized.solid_rect {
+                None => (expected_container, Some(BackgroundColor::default())),
                 Some(rect) => {
                     let color = rect.color();
                     (
@@ -1813,7 +2001,6 @@ fn realized_values_match(
                             color.blue(),
                             color.alpha(),
                         ))),
-                        Some(crate::content::ContentPrimitiveKind::SolidRect),
                     )
                 }
             };
@@ -1823,7 +2010,7 @@ fn realized_values_match(
                     == Some(&FrameOutput {
                         frame: frame.clone(),
                         local_index: *local_index,
-                        primitive,
+                        solid_rect: realized.solid_rect,
                     })
         }
     }
@@ -2016,7 +2203,7 @@ fn frame_version_matches_mount(
 ) -> bool {
     match (&mount.kind, mount_owner) {
         (
-            FrameMountBindingKind::HostTop,
+            FrameMountBindingKind::HostTop { .. },
             RegistryOwner::Committed(EntityOwner::HostTopSlot { host, slot }),
         ) => candidate.slot() == *slot && host_version_matches_frame(host, candidate),
         (
@@ -3245,6 +3432,8 @@ pub(crate) mod tests {
             world.resource::<RouteEntityRegistry>().records().len(),
             registry_count_before + 1
         );
+        assert!(world.get_entity(residual.shell()).is_ok());
+        assert!(world.get::<ChildOf>(residual.shell()).is_none());
 
         let mut ledger = crate::cleanup::CleanupLedger::for_failed_realization(&world, residual)
             .expect("partial realization has an exact foreground ledger");

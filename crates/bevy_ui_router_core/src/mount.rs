@@ -512,6 +512,10 @@ impl MountGrant {
 }
 
 impl MountReceiptAttestation {
+    pub(crate) const fn slot(&self) -> RouteSlotId {
+        self.slot
+    }
+
     fn has_valid_binding(&self) -> bool {
         self.binding
             == artifact_binding(
@@ -632,6 +636,24 @@ impl MountMutationArtifact for MountGrant {
 
     fn has_valid_binding(&self) -> bool {
         MountGrant::has_valid_binding(self)
+    }
+}
+
+impl MountMutationArtifact for MountReceiptAttestation {
+    fn identity(&self) -> &MountIdentity {
+        &self.identity
+    }
+
+    fn slot(&self) -> RouteSlotId {
+        self.slot
+    }
+
+    fn phase(&self) -> MountMutationPhase {
+        MountMutationPhase::Granted
+    }
+
+    fn has_valid_binding(&self) -> bool {
+        MountReceiptAttestation::has_valid_binding(self)
     }
 }
 

@@ -4,16 +4,21 @@ use bevy_ecs::{prelude::World, resource::Resource};
 use bevy_input_focus::InputFocus;
 use bevy_ui_router_core::{
     integration::{
-        CleanupManifest, CommitTicket, EngineAction, FailureCleanupRequest, IntegrationError,
-        MountRequest, RootFrameTask, RouterEngine, ViewFailureKind,
+        CleanupManifest, EngineAction, FailureCleanupRequest, FrameMountTarget, IntegrationError,
+        MountMutationArtifact, MountReceiptProof, MountRegistrationBeginError, MountRequest,
+        ResolveMountOwner, RootFrameTask, RouterEngine, ViewFailureKind,
     },
-    prelude::{NavigationRequestId, RouteLocation},
+    prelude::{MountRejectionKind, NavigationRequestId, RouteLocation},
 };
-use bevy_ui_router_view::{RouteViewRegistry, integration as view_integration};
+use bevy_ui_router_view::{RouteViewRegistry, ViewBuildEffect, integration as view_integration};
 
 use crate::{
     app_ext::{RouterHandle, ViewDriverStore},
-    cleanup::{CleanupLedger, FrozenCleanupManifest, RouterCleanupObservation},
+    branch_transaction::{FailedPreparedBranch, PendingCommit, PreparedBranch, RealizedBranch},
+    cleanup::{
+        CleanupLedger, FrozenCleanupManifest, RouterCleanupObservation,
+        failed_prepared_branch_roots_are_exact,
+    },
     content::{ContentPlan, FrameContentWriter},
     driver::{EcsViewReportSession, ReportSeal, ViewBuildReport, ViewBuildReportKind},
     host::{
@@ -27,10 +32,15 @@ use crate::{
         RouteFocusState, RouterInputGate, observed_descendant_closure, prepare_focus_mutation,
         prepare_input_gate_mutation,
     },
+    mount::{
+        ChildSlotResidual, StagedChildSlot, confirm_child_slot, mounted_child_slot_is_isolated,
+        residual_child_slot_is_isolated, stage_child_slot,
+    },
     presentation::{
-        DeferredRealizationFailure, RealizedFrame, isolate_frame_for_settlement,
-        prepare_presentation_mutation, realize_frame_deferred, validate_active_frame,
-        validate_leaving_frame, validate_realized_frame,
+        DeferredRealizationFailure, RealizedFrame, frame_is_isolated_for_settlement,
+        isolate_frame_for_settlement, prepare_presentation_mutation, realize_child_frame_deferred,
+        realize_frame_deferred, validate_active_frame, validate_leaving_frame,
+        validate_realized_frame,
     },
     registry::{EntityLifecycle, RouteEntityRegistry},
     snapshots::RouterSnapshots,
@@ -53,23 +63,46 @@ pub(crate) struct HostBinding {
     pub(crate) candidate: ValidatedHostCandidate,
 }
 
-struct PendingCommit {
-    ticket: Option<CommitTicket>,
-    task: Option<RootFrameTask>,
-    realized: Option<RealizedFrame>,
+enum PendingFailedBranchTerminal {
+    Task {
+        task: RootFrameTask,
+        failure: ViewFailureKind,
+        message: &'static str,
+    },
+    TaskWithPhysicalResidual {
+        task: RootFrameTask,
+        failure: ViewFailureKind,
+        message: &'static str,
+    },
+    Request(FailureCleanupRequest),
+    RegistrationBegin(MountRegistrationBeginError),
 }
 
-struct PendingFailureCleanup {
+struct PendingFailedBranch {
+    terminal: PendingFailedBranchTerminal,
+    branch: FailedPreparedBranch,
+}
+
+struct PendingFrameDrive {
     task: RootFrameTask,
-    failure: ViewFailureKind,
-    message: &'static str,
-    state: FailureCleanupState,
+    effect: ViewBuildEffect,
+    pending: PendingCommit,
 }
 
-enum FailureCleanupState {
-    Unisolated(RealizedFrame),
-    Unprepared(RealizedFrame),
-    Prepared(CleanupLedger),
+enum PendingMountMutationPayload {
+    Grant {
+        residual: Option<ChildSlotResidual>,
+    },
+    Receipt {
+        staged: StagedChildSlot,
+        proof: MountReceiptProof,
+    },
+}
+
+struct PendingMountMutationRejection {
+    pending: PendingCommit,
+    artifact: MountMutationArtifact,
+    payload: PendingMountMutationPayload,
 }
 
 pub(crate) struct RouterEntry {
@@ -79,11 +112,12 @@ pub(crate) struct RouterEntry {
     pub(crate) host: Option<HostBinding>,
     host_settlement: Option<ProvisionalHostSettlement>,
     pending_commit: Option<PendingCommit>,
+    pending_frame_drive: Option<PendingFrameDrive>,
     pending_mount_request: Option<MountRequest>,
-    pending_failure_cleanup_request: Option<FailureCleanupRequest>,
-    pub(crate) active: Option<RealizedFrame>,
+    pending_mount_mutation_rejection: Option<PendingMountMutationRejection>,
+    pending_failed_branch: Option<PendingFailedBranch>,
+    pub(crate) active: Option<RealizedBranch>,
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
-    failure_cleanup: Option<PendingFailureCleanup>,
     cleanup_observation: RouterCleanupObservation,
     pub(crate) requests: Vec<NavigationRequestId>,
 }
@@ -92,8 +126,8 @@ impl RouterEntry {
     pub(crate) fn cleanup_summary(&self) -> bevy_ui_router_core::CleanupSummary {
         self.cleanup_observation.summary(
             self.cleanup_ledger.is_some()
-                || self.failure_cleanup.is_some()
-                || self.pending_failure_cleanup_request.is_some()
+                || self.pending_failed_branch.is_some()
+                || self.pending_mount_mutation_rejection.is_some()
                 || self.host_settlement.is_some(),
         )
     }
@@ -122,14 +156,79 @@ impl RouterEntry {
     pub(crate) fn pending_frame(&self) -> Option<&RealizedFrame> {
         self.pending_commit
             .as_ref()
-            .and_then(|pending| pending.realized.as_ref())
+            .and_then(|pending| pending.branch.first_frame())
+            .or_else(|| {
+                self.pending_frame_drive
+                    .as_ref()
+                    .and_then(|pending| pending.pending.branch.first_frame())
+            })
+            .or_else(|| {
+                self.pending_mount_mutation_rejection
+                    .as_ref()
+                    .and_then(|pending| pending.pending.branch.first_frame())
+            })
     }
 
     #[cfg(feature = "test-support")]
-    pub(crate) fn leaving_frame(&self) -> Option<&RealizedFrame> {
+    pub(crate) fn pending_frames(&self) -> impl Iterator<Item = &RealizedFrame> {
+        self.pending_commit
+            .iter()
+            .flat_map(|pending| pending.branch.frames())
+            .chain(
+                self.pending_frame_drive
+                    .iter()
+                    .flat_map(|pending| pending.pending.branch.frames()),
+            )
+            .chain(
+                self.pending_mount_mutation_rejection
+                    .iter()
+                    .flat_map(|pending| pending.pending.branch.frames()),
+            )
+            .chain(
+                self.pending_failed_branch
+                    .iter()
+                    .flat_map(|pending| pending.branch.frames()),
+            )
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn leaving_cleanup_frames(&self) -> &[RealizedFrame] {
         self.cleanup_ledger
             .as_ref()
-            .and_then(CleanupLedger::leaving)
+            .map(CleanupLedger::leaving_frames)
+            .unwrap_or(&[])
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn failed_cleanup_frames(&self) -> &[RealizedFrame] {
+        self.cleanup_ledger
+            .as_ref()
+            .map(CleanupLedger::failed_prepared_frames)
+            .unwrap_or(&[])
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
+        let mut slots = Vec::new();
+        if let Some(pending) = &self.pending_commit {
+            slots.extend(pending.branch.tracked_child_slots());
+        }
+        if let Some(pending) = &self.pending_frame_drive {
+            slots.extend(pending.pending.branch.tracked_child_slots());
+        }
+        if let Some(pending) = &self.pending_mount_mutation_rejection {
+            slots.extend(pending.pending.branch.tracked_child_slots());
+        }
+        if let Some(pending) = &self.pending_failed_branch {
+            slots.extend(pending.branch.tracked_child_slots());
+        }
+        if let Some(active) = &self.active {
+            slots.extend(active.tracked_child_slots());
+        }
+        if let Some(ledger) = &self.cleanup_ledger {
+            slots.extend(ledger.tracked_child_slots());
+        }
+        slots
     }
 }
 
@@ -172,11 +271,12 @@ impl RouterNavigation {
             host: None,
             host_settlement: None,
             pending_commit: None,
+            pending_frame_drive: None,
             pending_mount_request: None,
-            pending_failure_cleanup_request: None,
+            pending_mount_mutation_rejection: None,
+            pending_failed_branch: None,
             active: None,
             cleanup_ledger: None,
-            failure_cleanup: None,
             cleanup_observation: RouterCleanupObservation::default(),
             requests: Vec::new(),
         });
@@ -348,23 +448,241 @@ fn apply_applied_driver_report(
     report: &ViewBuildReport,
     plan: ContentPlan,
 ) -> Result<RealizedFrame, DriverReportApplicationError> {
+    apply_applied_driver_report_to_branch(
+        world,
+        engine,
+        host_candidate,
+        top_slot,
+        top_slot_claim,
+        None,
+        task,
+        report,
+        plan,
+    )
+}
+
+fn apply_applied_driver_report_to_branch(
+    world: &mut World,
+    engine: &mut RouterEngine,
+    host_candidate: ValidatedHostCandidate,
+    top_slot: bevy_ecs::entity::Entity,
+    top_slot_claim: crate::registry::ExactRegistryClaim,
+    branch: Option<&PreparedBranch>,
+    task: &RootFrameTask,
+    report: &ViewBuildReport,
+    plan: ContentPlan,
+) -> Result<RealizedFrame, DriverReportApplicationError> {
     if report.kind() != ViewBuildReportKind::Applied
         || report.identity() != &task.report_identity()
-        || engine.validate_report_identity(task).is_err()
+        || engine.inspect_report_identity(task).is_err()
     {
         return Err(DriverReportApplicationError::Stale);
     }
 
-    realize_frame_deferred(
-        world,
-        host_candidate,
-        top_slot,
-        top_slot_claim,
-        task.frame().clone(),
-        task.view_request_sequence(),
-        plan.accept(),
-    )
+    match task.mount_target() {
+        FrameMountTarget::TopSlot { .. } if branch.is_none() => realize_frame_deferred(
+            world,
+            host_candidate,
+            top_slot,
+            top_slot_claim,
+            task.frame().clone(),
+            task.view_request_sequence(),
+            plan.accept(),
+        ),
+        FrameMountTarget::ChildOutlet { .. } => {
+            let Some(branch) = branch else {
+                return Err(DriverReportApplicationError::Stale);
+            };
+            let (Some(parent), Some(mounted)) = (branch.last_frame(), branch.child_slots().last())
+            else {
+                return Err(DriverReportApplicationError::Stale);
+            };
+            realize_child_frame_deferred(
+                world,
+                parent,
+                mounted,
+                task,
+                task.view_request_sequence(),
+                plan.accept(),
+            )
+        }
+        FrameMountTarget::TopSlot { .. } => return Err(DriverReportApplicationError::Stale),
+    }
     .map_err(DriverReportApplicationError::Realization)
+}
+
+fn realized_outlet_keys(frame: &RealizedFrame) -> Vec<bevy_ui_router_core::slot::RouteSlotKey> {
+    let mut outlets = frame
+        .outlets()
+        .iter()
+        .map(|outlet| outlet.key().clone())
+        .collect::<Vec<_>>();
+    outlets.sort();
+    outlets.dedup();
+    outlets
+}
+
+fn failed_prepared_branch(
+    pending: PendingCommit,
+    residual: Option<crate::mount::ChildSlotResidual>,
+) -> FailedPreparedBranch {
+    match residual {
+        Some(residual) => FailedPreparedBranch::with_mount_residual(pending.branch, residual),
+        None => FailedPreparedBranch::new(pending.branch),
+    }
+}
+
+fn retry_pending_mount_mutation_rejection(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    pending_rejection: PendingMountMutationRejection,
+) -> Option<PendingMountMutationRejection> {
+    let PendingMountMutationRejection {
+        pending,
+        artifact,
+        payload,
+    } = pending_rejection;
+    match entry.engine.reject_mount_after_mutation(artifact) {
+        Ok(request) => {
+            let residual = match payload {
+                PendingMountMutationPayload::Grant { residual } => residual,
+                PendingMountMutationPayload::Receipt { staged, proof } => {
+                    drop(proof);
+                    Some(staged.into_residual(world))
+                }
+            };
+            entry.pending_failed_branch = Some(PendingFailedBranch {
+                terminal: PendingFailedBranchTerminal::Request(request),
+                branch: failed_prepared_branch(pending, residual),
+            });
+            None
+        }
+        Err(error) => Some(PendingMountMutationRejection {
+            pending,
+            artifact: error.into_owner(),
+            payload,
+        }),
+    }
+}
+
+fn stale_driver_report_owner(pending: PendingCommit, task: RootFrameTask) -> PendingFailedBranch {
+    PendingFailedBranch {
+        terminal: PendingFailedBranchTerminal::Task {
+            task,
+            failure: ViewFailureKind::Apply,
+            message: "route view report application became stale",
+        },
+        branch: failed_prepared_branch(pending, None),
+    }
+}
+
+fn nested_failure_terminal(
+    engine: &mut RouterEngine,
+    task: RootFrameTask,
+    failure: ViewFailureKind,
+    message: &'static str,
+) -> PendingFailedBranchTerminal {
+    if engine.inspect_report_identity(&task).is_err() {
+        return PendingFailedBranchTerminal::Task {
+            task,
+            failure,
+            message,
+        };
+    }
+    let request = engine
+        .report_failed(task, failure, message)
+        .expect("validated nested task must remain reportable")
+        .expect("nested task failure must issue sealed cleanup authority");
+    PendingFailedBranchTerminal::Request(request)
+}
+
+fn failed_branch_focus_closure(
+    world: &World,
+    branch: &FailedPreparedBranch,
+) -> Vec<bevy_ecs::prelude::Entity> {
+    let roots = branch
+        .frames()
+        .iter()
+        .chain(branch.detached_frames())
+        .flat_map(RealizedFrame::claims)
+        .map(crate::registry::ExactRegistryClaim::entity)
+        .chain(branch.child_slots().iter().map(|slot| slot.slot()))
+        .chain(
+            branch
+                .mount_residuals()
+                .iter()
+                .map(crate::mount::ChildSlotResidual::entity),
+        )
+        .chain(
+            branch
+                .rejected_child_slots()
+                .iter()
+                .map(|slot| slot.slot().slot()),
+        )
+        .collect::<Vec<_>>();
+    let mut closure = observed_descendant_closure(world, roots)
+        .into_iter()
+        .collect::<Vec<_>>();
+    closure.sort_by_key(|entity| entity.to_bits());
+    closure
+}
+
+fn release_focus_for_closure(world: &mut World, closure: &[bevy_ecs::prelude::Entity]) {
+    world.resource_scope(
+        |world, input_focus: bevy_ecs::change_detection::Mut<InputFocus>| {
+            world.resource_scope(
+                |_world, route_focus: bevy_ecs::change_detection::Mut<RouteFocusState>| {
+                    prepare_focus_mutation(input_focus, route_focus, closure).apply();
+                },
+            );
+        },
+    );
+}
+
+fn focus_is_outside_closure(world: &World, closure: &[bevy_ecs::prelude::Entity]) -> bool {
+    world
+        .get_resource::<InputFocus>()
+        .and_then(InputFocus::get)
+        .is_none_or(|focused| !closure.contains(&focused))
+        && world
+            .get_resource::<RouteFocusState>()
+            .and_then(RouteFocusState::focused)
+            .is_none_or(|focused| !closure.contains(&focused))
+}
+
+fn isolate_failed_prepared_branch(world: &mut World, branch: &FailedPreparedBranch) -> bool {
+    if !failed_prepared_branch_roots_are_exact(world, branch) {
+        return false;
+    }
+    let focus_closure = failed_branch_focus_closure(world, branch);
+    release_focus_for_closure(world, &focus_closure);
+    let frames_are_isolated = branch
+        .frames()
+        .iter()
+        .chain(branch.detached_frames())
+        .all(|frame| isolate_frame_for_settlement(world, frame));
+    let child_slots_are_isolated = branch
+        .child_slots()
+        .iter()
+        .all(|slot| mounted_child_slot_is_isolated(world, slot))
+        && branch
+            .rejected_child_slots()
+            .iter()
+            .all(|slot| mounted_child_slot_is_isolated(world, slot.slot()));
+    let residuals_are_isolated = branch
+        .mount_residuals()
+        .iter()
+        .all(|slot| residual_child_slot_is_isolated(world, slot));
+    release_focus_for_closure(world, &focus_closure);
+    frames_are_isolated
+        && child_slots_are_isolated
+        && residuals_are_isolated
+        && branch
+            .frames()
+            .iter()
+            .chain(branch.detached_frames())
+            .all(|frame| frame_is_isolated_for_settlement(world, frame))
+        && focus_is_outside_closure(world, &focus_closure)
 }
 
 pub(crate) fn drive_navigation_system(world: &mut World) {
@@ -373,73 +691,139 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
             world.resource_scope(
                 |world, mut drivers: bevy_ecs::change_detection::Mut<ViewDriverStore>| {
                     for entry in &mut navigation.entries {
-                        if entry.pending_commit.is_some()
-                            || entry.failure_cleanup.is_some()
-                            || entry.pending_failure_cleanup_request.is_some()
+                        if let Some(pending_rejection) =
+                            entry.pending_mount_mutation_rejection.take()
                         {
+                            entry.pending_mount_mutation_rejection =
+                                retry_pending_mount_mutation_rejection(
+                                    world,
+                                    entry,
+                                    pending_rejection,
+                                );
                             continue;
                         }
-                        let pending_failure_cleanup_request =
-                            match &mut entry.pending_failure_cleanup_request {
-                                vacant @ None => vacant,
-                                Some(_) => continue,
+                        if entry.pending_failed_branch.is_some() {
+                            continue;
+                        }
+                        if entry.pending_commit.as_ref().is_some_and(|pending| {
+                            pending.ticket.is_some() || pending.final_task.is_some()
+                        }) {
+                            continue;
+                        }
+                        let (action, retry_context) =
+                            if let Some(retry) = entry.pending_frame_drive.take() {
+                                (
+                                    Some(EngineAction::FrameTask(retry.task)),
+                                    Some((retry.pending, retry.effect)),
+                                )
+                            } else {
+                                (
+                                    entry
+                                        .pending_mount_request
+                                        .take()
+                                        .map(EngineAction::MountRequest)
+                                        .or_else(|| entry.engine.action()),
+                                    None,
+                                )
                             };
-                        let pending_mount_request = match &mut entry.pending_mount_request {
-                            vacant @ None => vacant,
-                            Some(_) => continue,
-                        };
-                        let Some(action) = entry.engine.action() else {
+                        let Some(action) = action else {
                             continue;
                         };
                         match action {
                             EngineAction::Commit(ticket) => {
-                                entry.pending_commit = Some(PendingCommit {
-                                    ticket: Some(ticket),
-                                    task: None,
-                                    realized: None,
-                                });
+                                let mut pending = PendingCommit::new();
+                                pending.ticket = Some(ticket);
+                                entry.pending_commit = Some(pending);
                             }
                             EngineAction::FrameTask(mut task) => {
+                                let task_mount_target = task.mount_target();
+                                let realizing_root =
+                                    matches!(task_mount_target, FrameMountTarget::TopSlot { .. });
+                                let (mut pending, retry_effect) = match retry_context {
+                                    Some((pending, effect)) => (pending, Some(effect)),
+                                    None => (
+                                        entry
+                                            .pending_commit
+                                            .take()
+                                            .unwrap_or_else(PendingCommit::new),
+                                        None,
+                                    ),
+                                };
+                                let expected_child_outlet =
+                                    match entry.engine.expected_child_outlet(&task) {
+                                        Ok(expected) => expected,
+                                        Err(_) => {
+                                            entry.pending_failed_branch =
+                                                Some(stale_driver_report_owner(pending, task));
+                                            continue;
+                                        }
+                                    };
                                 let Some(host) = entry.host.as_ref() else {
-                                    let _ = entry.engine.report_failed(
+                                    let failure = entry.engine.report_failed(
                                         task,
                                         ViewFailureKind::Apply,
                                         "router host unavailable during frame apply",
                                     );
+                                    if let Ok(Some(request)) = failure {
+                                        entry.pending_failed_branch = Some(PendingFailedBranch {
+                                            terminal: PendingFailedBranchTerminal::Request(request),
+                                            branch: failed_prepared_branch(pending, None),
+                                        });
+                                    }
                                     continue;
                                 };
                                 if !validated_host_candidate_is_current(world, &host.candidate) {
-                                    let _ = entry.engine.report_failed(
+                                    let failure = entry.engine.report_failed(
                                         task,
                                         ViewFailureKind::Apply,
                                         "router host authority changed before frame realization",
                                     );
+                                    if let Ok(Some(request)) = failure {
+                                        entry.pending_failed_branch = Some(PendingFailedBranch {
+                                            terminal: PendingFailedBranchTerminal::Request(request),
+                                            branch: failed_prepared_branch(pending, None),
+                                        });
+                                    }
                                     continue;
                                 }
                                 let Some(driver_key) =
                                     view_integration::driver_key(&entry.views, task.view())
                                         .cloned()
                                 else {
-                                    let _ = entry.engine.report_failed(
+                                    let failure = entry.engine.report_failed(
                                         task,
                                         ViewFailureKind::Build,
                                         "route view binding unavailable",
                                     );
+                                    if let Ok(Some(request)) = failure {
+                                        entry.pending_failed_branch = Some(PendingFailedBranch {
+                                            terminal: PendingFailedBranchTerminal::Request(request),
+                                            branch: failed_prepared_branch(pending, None),
+                                        });
+                                    }
                                     continue;
                                 };
                                 let Some(driver) = drivers.get_mut(&driver_key) else {
-                                    let _ = entry.engine.report_failed(
+                                    let failure = entry.engine.report_failed(
                                         task,
                                         ViewFailureKind::Build,
                                         "route view driver unavailable",
                                     );
+                                    if let Ok(Some(request)) = failure {
+                                        entry.pending_failed_branch = Some(PendingFailedBranch {
+                                            terminal: PendingFailedBranchTerminal::Request(request),
+                                            branch: failed_prepared_branch(pending, None),
+                                        });
+                                    }
                                     continue;
                                 };
-                                let effect = view_integration::build_effect(
-                                    task.view().clone(),
-                                    task.take_input(),
-                                    task.view_request_sequence(),
-                                );
+                                let effect = retry_effect.unwrap_or_else(|| {
+                                    view_integration::build_effect(
+                                        task.view().clone(),
+                                        task.take_input(),
+                                        task.view_request_sequence(),
+                                    )
+                                });
                                 let mut plan = ContentPlan::new();
                                 let mut writer = FrameContentWriter::new(&mut plan);
                                 let mut seal = ReportSeal::new();
@@ -450,10 +834,23 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                     EcsViewReportSession::new(&mut seal, report_identity),
                                 );
                                 if report.identity() != &task.report_identity() {
+                                    entry.pending_frame_drive = Some(PendingFrameDrive {
+                                        task,
+                                        effect,
+                                        pending,
+                                    });
                                     continue;
                                 }
                                 if report.kind() != ViewBuildReportKind::Applied {
-                                    if entry.engine.validate_report_identity(&task).is_err() {
+                                    if entry.engine.inspect_report_identity(&task).is_err() {
+                                        entry.pending_failed_branch = Some(PendingFailedBranch {
+                                            terminal: PendingFailedBranchTerminal::Task {
+                                                task,
+                                                failure: ViewFailureKind::Apply,
+                                                message: "route view report identity became stale",
+                                            },
+                                            branch: failed_prepared_branch(pending, None),
+                                        });
                                         continue;
                                     }
                                     let failure = match report.kind() {
@@ -461,70 +858,374 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                         ViewBuildReportKind::ApplyFailed => ViewFailureKind::Apply,
                                         ViewBuildReportKind::Applied => unreachable!(),
                                     };
-                                    let _ = entry.engine.report_failed(
+                                    let failure = entry.engine.report_failed(
                                         task,
                                         failure,
                                         "route view driver rejected the frame",
                                     );
+                                    if let Ok(Some(request)) = failure {
+                                        entry.pending_failed_branch = Some(PendingFailedBranch {
+                                            terminal: PendingFailedBranchTerminal::Request(request),
+                                            branch: failed_prepared_branch(pending, None),
+                                        });
+                                    }
                                     continue;
                                 }
-                                let realized = apply_applied_driver_report(
+                                let realized = apply_applied_driver_report_to_branch(
                                     world,
                                     &mut entry.engine,
                                     host.candidate.clone(),
                                     host.top_slot,
                                     host.top_slot_claim.clone(),
+                                    (!pending.branch.frames().is_empty()).then_some(&pending.branch),
                                     &task,
                                     &report,
                                     plan,
                                 );
                                 let realized = match realized {
                                     Ok(realized) => realized,
-                                    Err(DriverReportApplicationError::Stale) => continue,
+                                    Err(DriverReportApplicationError::Stale) => {
+                                        entry.pending_failed_branch =
+                                            Some(stale_driver_report_owner(pending, task));
+                                        continue;
+                                    }
                                     Err(DriverReportApplicationError::Realization(failure)) => {
                                         let (_error, residual) = failure.into_parts();
                                         if let Some(residual) = residual {
-                                            let state = match CleanupLedger::for_failed_realization(
-                                                world, residual,
-                                            ) {
-                                                Ok(ledger) => FailureCleanupState::Prepared(ledger),
+                                            let failed_branch = match pending.branch.push_frame(residual) {
+                                                Ok(()) => failed_prepared_branch(pending, None),
                                                 Err(residual) => {
-                                                    FailureCleanupState::Unprepared(residual)
+                                                    FailedPreparedBranch::with_detached_frame(
+                                                        pending.branch,
+                                                        residual,
+                                                    )
                                                 }
                                             };
-                                            entry.failure_cleanup = Some(PendingFailureCleanup {
-                                                task,
-                                                failure: ViewFailureKind::Apply,
-                                                message: "frame realization rejected",
-                                                state,
-                                            });
+                                            if realizing_root {
+                                                entry.pending_failed_branch =
+                                                    Some(PendingFailedBranch {
+                                                        terminal: PendingFailedBranchTerminal::TaskWithPhysicalResidual {
+                                                        task,
+                                                        failure: ViewFailureKind::Apply,
+                                                        message: "frame realization rejected",
+                                                    },
+                                                        branch: failed_branch,
+                                                    });
+                                            } else {
+                                                let terminal = nested_failure_terminal(
+                                                    &mut entry.engine,
+                                                    task,
+                                                    ViewFailureKind::Apply,
+                                                    "frame realization rejected",
+                                                );
+                                                entry.pending_failed_branch =
+                                                    Some(PendingFailedBranch {
+                                                        terminal,
+                                                        branch: failed_branch,
+                                                    });
+                                            }
                                         } else {
-                                            let _ = entry.engine.report_failed(
+                                            let failure = entry.engine.report_failed(
                                                 task,
                                                 ViewFailureKind::Apply,
                                                 "frame realization rejected",
                                             );
+                                            if let Ok(Some(request)) = failure {
+                                                entry.pending_failed_branch =
+                                                    Some(PendingFailedBranch {
+                                                        terminal:
+                                                            PendingFailedBranchTerminal::Request(
+                                                                request,
+                                                            ),
+                                                        branch: failed_prepared_branch(pending, None),
+                                                    });
+                                            }
                                         }
                                         continue;
                                     }
                                 };
-                                entry.pending_commit = Some(PendingCommit {
-                                    ticket: None,
-                                    task: Some(task),
-                                    realized: Some(realized),
-                                });
+                                if let Err(realized) = pending.branch.push_frame(realized) {
+                                    let failed_branch = FailedPreparedBranch::with_detached_frame(
+                                        pending.branch,
+                                        realized,
+                                    );
+                                    if realizing_root {
+                                        entry.pending_failed_branch = Some(PendingFailedBranch {
+                                            terminal: PendingFailedBranchTerminal::TaskWithPhysicalResidual {
+                                                task,
+                                                failure: ViewFailureKind::Apply,
+                                                message: "frame branch append rejected",
+                                            },
+                                            branch: failed_branch,
+                                        });
+                                    } else {
+                                        let terminal = nested_failure_terminal(
+                                            &mut entry.engine,
+                                            task,
+                                            ViewFailureKind::Apply,
+                                            "frame branch append rejected",
+                                        );
+                                        entry.pending_failed_branch = Some(PendingFailedBranch {
+                                            terminal,
+                                            branch: failed_branch,
+                                        });
+                                    }
+                                    continue;
+                                }
+                                if expected_child_outlet.is_some() {
+                                    let Some(parent) = pending.branch.last_frame() else {
+                                        entry.pending_commit = Some(pending);
+                                        continue;
+                                    };
+                                    if !validate_realized_frame(world, parent) {
+                                        entry.pending_failed_branch = Some(PendingFailedBranch {
+                                            terminal: PendingFailedBranchTerminal::Task {
+                                                task,
+                                                failure: ViewFailureKind::Apply,
+                                                message: "parent frame preflight rejected",
+                                            },
+                                            branch: failed_prepared_branch(pending, None),
+                                        });
+                                        continue;
+                                    }
+                                    if entry
+                                        .engine
+                                        .report_applied_with_outlets(
+                                            task,
+                                            realized_outlet_keys(parent),
+                                        )
+                                        .is_err()
+                                    {
+                                        let terminal = match entry.engine.action() {
+                                            Some(EngineAction::FrameTask(task)) => {
+                                                PendingFailedBranchTerminal::Task {
+                                                    task,
+                                                    failure: ViewFailureKind::Apply,
+                                                    message: "parent outlet report rejected",
+                                                }
+                                            }
+                                            Some(EngineAction::FailureCleanup(request)) => {
+                                                PendingFailedBranchTerminal::Request(request)
+                                            }
+                                            _ => {
+                                                entry.pending_commit = Some(pending);
+                                                continue;
+                                            }
+                                        };
+                                        entry.pending_failed_branch = Some(PendingFailedBranch {
+                                            terminal,
+                                            branch: failed_prepared_branch(pending, None),
+                                        });
+                                        continue;
+                                    }
+                                } else {
+                                    pending.final_task = Some(task);
+                                }
+                                entry.pending_commit = Some(pending);
                             }
                             EngineAction::MountRequest(request) => {
-                                // The vacant-slot borrow is acquired before taking the sealed
-                                // action, so an existing request fails closed without either
-                                // capability being removed, overwritten, or discarded.
-                                *pending_mount_request = Some(request);
+                                entry.pending_mount_request = Some(request);
+                                let Some(mut pending) = entry.pending_commit.take() else {
+                                    continue;
+                                };
+                                let request_is_exact = entry
+                                    .pending_mount_request
+                                    .as_ref()
+                                    .is_some_and(|request| {
+                                        entry.engine.validate_mount_request(request).is_ok()
+                                    });
+                                if !request_is_exact {
+                                    entry.pending_commit = Some(pending);
+                                    continue;
+                                }
+                                let (parent_is_exact, outlet_exists, outlet) = {
+                                    let request = entry
+                                        .pending_mount_request
+                                        .as_ref()
+                                        .expect("validated mount request remains held");
+                                    let parent = pending.branch.last_frame();
+                                    (
+                                        parent.is_some_and(|parent| {
+                                            parent.frame() == request.parent()
+                                                && validate_realized_frame(world, parent)
+                                        }),
+                                        parent.is_some_and(|parent| {
+                                            parent.outlet(request.outlet()).is_some()
+                                        }),
+                                        request.outlet().clone(),
+                                    )
+                                };
+                                if !parent_is_exact || !outlet_exists {
+                                    let request = entry
+                                        .pending_mount_request
+                                        .take()
+                                        .expect("validated mount request remains held");
+                                    let rejection = if !parent_is_exact {
+                                        MountRejectionKind::InvalidOutlet
+                                    } else {
+                                        MountRejectionKind::MissingOutlet
+                                    };
+                                    match entry.engine.reject_mount(request, rejection) {
+                                        Ok(request) => {
+                                            entry.pending_failed_branch =
+                                                Some(PendingFailedBranch {
+                                                    terminal:
+                                                        PendingFailedBranchTerminal::Request(
+                                                            request,
+                                                        ),
+                                                    branch: failed_prepared_branch(pending, None),
+                                                });
+                                        }
+                                        Err(error) => {
+                                            entry.pending_mount_request = Some(error.into_owner());
+                                            entry.pending_commit = Some(pending);
+                                        }
+                                    }
+                                    continue;
+                                }
+                                let request = entry
+                                    .pending_mount_request
+                                    .take()
+                                    .expect("validated mount request remains held");
+                                let grant = match entry.engine.resolve_mount(request) {
+                                    Ok(grant) => grant,
+                                    Err(error) => {
+                                        if let ResolveMountOwner::Returned(request) =
+                                            error.into_owner()
+                                        {
+                                            entry.pending_mount_request = Some(request);
+                                        }
+                                        entry.pending_commit = Some(pending);
+                                        continue;
+                                    }
+                                };
+                                let parent = pending
+                                    .branch
+                                    .last_frame()
+                                    .expect("validated mount request retains its parent frame");
+                                let staged = match stage_child_slot(world, parent, &outlet, &grant) {
+                                    Ok(staged) => staged,
+                                    Err(failure) => {
+                                        let residual = failure.into_residual();
+                                        match entry.engine.reject_mount_after_mutation(
+                                            MountMutationArtifact::Grant(grant),
+                                        ) {
+                                            Ok(request) => {
+                                                entry.pending_failed_branch =
+                                                    Some(PendingFailedBranch {
+                                                        terminal:
+                                                            PendingFailedBranchTerminal::Request(
+                                                                request,
+                                                            ),
+                                                        branch: failed_prepared_branch(
+                                                            pending, residual,
+                                                        ),
+                                                    });
+                                            }
+                                            Err(error) => {
+                                                entry.pending_mount_mutation_rejection =
+                                                    Some(PendingMountMutationRejection {
+                                                        pending,
+                                                        artifact: error.into_owner(),
+                                                        payload:
+                                                            PendingMountMutationPayload::Grant {
+                                                                residual,
+                                                            },
+                                                    });
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                };
+                                let receipt_digest = staged.receipt().digest();
+                                let (attestation, proof) =
+                                    grant.attest_receipt_with_proof(receipt_digest);
+                                let permit = match entry.engine.accept_mount_receipt(attestation) {
+                                    Ok(permit) => permit,
+                                    Err(error) => {
+                                        let pending_rejection =
+                                            PendingMountMutationRejection {
+                                                pending,
+                                                artifact: MountMutationArtifact::Receipt(
+                                                    error.into_owner(),
+                                                ),
+                                                payload:
+                                                    PendingMountMutationPayload::Receipt {
+                                                        staged,
+                                                        proof,
+                                                    },
+                                            };
+                                        entry.pending_mount_mutation_rejection =
+                                            retry_pending_mount_mutation_rejection(
+                                                world,
+                                                entry,
+                                                pending_rejection,
+                                            );
+                                        continue;
+                                    }
+                                };
+                                match confirm_child_slot(
+                                    world,
+                                    &mut entry.engine,
+                                    staged,
+                                    permit,
+                                    &proof,
+                                ) {
+                                    Ok(mounted) => {
+                                        match pending.branch.push_child_slot(mounted) {
+                                            Ok(()) => entry.pending_commit = Some(pending),
+                                            Err(rejected) => {
+                                                let Some(EngineAction::FrameTask(task)) =
+                                                    entry.engine.action()
+                                                else {
+                                                    panic!(
+                                                        "confirmed child slot append rejection must retain its issued child task"
+                                                    )
+                                                };
+                                                let terminal = nested_failure_terminal(
+                                                    &mut entry.engine,
+                                                    task,
+                                                    ViewFailureKind::Apply,
+                                                    "child slot branch append rejected",
+                                                );
+                                                entry.pending_failed_branch =
+                                                    Some(PendingFailedBranch {
+                                                        terminal,
+                                                        branch: FailedPreparedBranch::with_rejected_child_slot(
+                                                            pending.branch,
+                                                            rejected,
+                                                        ),
+                                                    });
+                                            }
+                                        }
+                                    }
+                                    Err(failure) => {
+                                        let (cleanup, begin, residual) = failure.into_parts();
+                                        let terminal = if let Some(request) = cleanup {
+                                            PendingFailedBranchTerminal::Request(request)
+                                        } else if let Some(error) = begin {
+                                            PendingFailedBranchTerminal::RegistrationBegin(error)
+                                        } else {
+                                            unreachable!("confirmation failure retains one terminal")
+                                        };
+                                        entry.pending_failed_branch = Some(PendingFailedBranch {
+                                            terminal,
+                                            branch: failed_prepared_branch(
+                                                pending,
+                                                Some(residual),
+                                            ),
+                                        });
+                                    }
+                                }
                             }
                             EngineAction::FailureCleanup(request) => {
-                                // Task 6 consumes this unique by-value capability together with
-                                // the failed prepared branch; until then the holder is inert and
-                                // its vacancy is checked before taking another engine action.
-                                *pending_failure_cleanup_request = Some(request);
+                                let Some(pending) = entry.pending_commit.take() else {
+                                    continue;
+                                };
+                                entry.pending_failed_branch = Some(PendingFailedBranch {
+                                    terminal: PendingFailedBranchTerminal::Request(request),
+                                    branch: failed_prepared_branch(pending, None),
+                                });
                             }
                         }
                     }
@@ -542,6 +1243,15 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                 let Some(mut pending) = entry.pending_commit.take() else {
                     continue;
                 };
+                if pending.branch.frames().len() > 1
+                    || !pending.branch.child_slots().is_empty()
+                    || (!pending.branch.frames().is_empty()
+                        && pending.ticket.is_none()
+                        && pending.final_task.is_none())
+                {
+                    entry.pending_commit = Some(pending);
+                    continue;
+                }
                 let Some(host) = entry.host.as_ref() else {
                     entry.pending_commit = Some(pending);
                     continue;
@@ -553,72 +1263,74 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                     continue;
                 }
                 if pending
-                    .realized
-                    .as_ref()
+                    .frame()
                     .is_some_and(|frame| !validate_realized_frame(world, frame))
                 {
-                    let frame = pending
-                        .realized
-                        .take()
-                        .expect("the invalid pending preflight identified its realized frame");
-                    let Some(task) = pending.task.take() else {
+                    let Some(task) = pending.final_task.take() else {
                         entry.pending_commit = Some(pending);
                         continue;
                     };
-                    let state = if isolate_frame_for_settlement(world, &frame) {
-                        match CleanupLedger::for_failed_realization(world, frame) {
-                            Ok(ledger) => FailureCleanupState::Prepared(ledger),
-                            Err(frame) => FailureCleanupState::Unprepared(frame),
-                        }
-                    } else {
-                        FailureCleanupState::Unisolated(frame)
-                    };
-                    entry.failure_cleanup = Some(PendingFailureCleanup {
-                        task,
-                        failure: ViewFailureKind::Apply,
-                        message: "frame final preflight rejected",
-                        state,
+                    entry.pending_failed_branch = Some(PendingFailedBranch {
+                        terminal: PendingFailedBranchTerminal::TaskWithPhysicalResidual {
+                            task,
+                            failure: ViewFailureKind::Apply,
+                            message: "frame final preflight rejected",
+                        },
+                        branch: failed_prepared_branch(pending, None),
                     });
                     continue;
                 }
-                let active_is_valid_for_role = entry.active.as_ref().is_none_or(|frame| {
-                    if pending.realized.is_some() {
-                        validate_leaving_frame(world, frame)
-                    } else {
-                        validate_active_frame(world, frame)
-                    }
+                let active_is_valid_for_role = entry.active.as_ref().is_none_or(|branch| {
+                    branch.frames().iter().all(|frame| {
+                        if pending.frame().is_some() {
+                            validate_leaving_frame(world, frame)
+                        } else {
+                            validate_active_frame(world, frame)
+                        }
+                    })
                 });
                 if !active_is_valid_for_role {
                     entry.pending_commit = Some(pending);
                     continue;
                 }
 
-                let mut entering = pending.realized.take();
+                let mut entering = pending.take_single_frame();
                 let mut leaving = if entering.is_some() {
                     entry.active.take()
                 } else {
                     None
                 };
-                let logical_roots = leaving
+                let logical_roots: Vec<_> = leaving
                     .as_ref()
-                    .map(|frame| vec![frame.frame().clone()])
+                    .map(|branch| {
+                        branch
+                            .frames()
+                            .iter()
+                            .map(|frame| frame.frame().clone())
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let gate_before = leaving
                     .as_ref()
                     .or(entry.active.as_ref())
-                    .map(RealizedFrame::interactive_entities)
+                    .map(RealizedBranch::interactive_entities)
                     .unwrap_or_default();
-                let gate_after = entering
-                    .as_ref()
-                    .or(entry.active.as_ref())
-                    .map(RealizedFrame::interactive_entities)
-                    .unwrap_or_default();
+                let gate_after = entering.as_ref().map_or_else(
+                    || {
+                        entry
+                            .active
+                            .as_ref()
+                            .map(RealizedBranch::interactive_entities)
+                            .unwrap_or_default()
+                    },
+                    RealizedFrame::interactive_entities,
+                );
                 let focus_leaving = leaving
                     .as_ref()
-                    .map(|frame| {
+                    .map(|branch| {
                         let mut closure = observed_descendant_closure(
                             world,
-                            frame.claims().map(|claim| claim.entity()),
+                            branch.claims().map(|claim| claim.entity()),
                         )
                         .into_iter()
                         .collect::<Vec<_>>();
@@ -628,13 +1340,15 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                     .unwrap_or_default();
                 let mut targets = Vec::new();
                 let mut transitions = Vec::new();
-                if let Some(frame) = leaving.as_ref() {
-                    targets.extend(frame.mutation_targets(
-                        EntityLifecycle::Active,
-                        EntityLifecycle::Leaving,
-                        false,
-                    ));
-                    transitions.extend(frame.lifecycle_transitions(EntityLifecycle::Leaving));
+                if let Some(branch) = leaving.as_ref() {
+                    for frame in branch.frames() {
+                        targets.extend(frame.mutation_targets(
+                            EntityLifecycle::Active,
+                            EntityLifecycle::Leaving,
+                            false,
+                        ));
+                        transitions.extend(frame.lifecycle_transitions(EntityLifecycle::Leaving));
+                    }
                 }
                 let leaving_count = transitions.len();
                 if let Some(frame) = entering.as_ref() {
@@ -663,13 +1377,17 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                                                     .prepare_lifecycle_mutation(&transitions)?;
                                                 let resulting_claims =
                                                     registry_plan.resulting_claims().to_vec();
-                                                let frozen_manifest = match leaving.as_ref() {
+                                                let frozen_manifest = match leaving
+                                                    .as_ref()
+                                                    .and_then(RealizedBranch::first_frame)
+                                                {
                                                     Some(frame) => {
                                                         match FrozenCleanupManifest::from_frame(
                                                             world,
                                                             &registry,
                                                             frame,
                                                             &resulting_claims[..leaving_count],
+                                                            entering.as_ref(),
                                                         ) {
                                                             Some(manifest) => manifest,
                                                             None => return None,
@@ -699,7 +1417,7 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                                                 let presentation_plan =
                                                     prepare_presentation_mutation(world, &targets)?;
                                                 if pending.ticket.is_none() {
-                                                    let task = pending.task.take()?;
+                                                    let task = pending.final_task.take()?;
                                                     pending.ticket =
                                                         entry.engine.report_applied(task).ok();
                                                 }
@@ -736,22 +1454,33 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                     if let Some(frame) = leaving {
                         entry.active = Some(frame);
                     }
-                    pending.realized = entering;
-                    if pending.ticket.is_some() || pending.task.is_some() {
+                    if let Some(frame) = entering {
+                        pending.restore_single_frame(frame);
+                    }
+                    if pending.ticket.is_some() || pending.final_task.is_some() {
                         entry.pending_commit = Some(pending);
                     }
                     continue;
                 };
-                if let Some(frame) = leaving.as_mut() {
-                    frame.replace_claims(&resulting_claims[..leaving_count]);
+                if let Some(branch) = leaving.as_mut() {
+                    assert!(branch.replace_frame_claims(&resulting_claims[..leaving_count]));
                 }
                 if let Some(frame) = entering.as_mut() {
                     frame.replace_claims(&resulting_claims[leaving_count..]);
                 }
-                if let Some(frame) = entering {
-                    entry.active = Some(frame);
+                if let (Some(leaving), Some(entering)) = (
+                    leaving.as_ref().and_then(RealizedBranch::first_frame),
+                    entering.as_mut(),
+                ) {
+                    assert!(entering.rebase_mount_after_replacing(leaving));
                 }
-                entry.cleanup_ledger = Some(CleanupLedger::activate(cleanup_ledger, leaving));
+                if let Some(frame) = entering {
+                    entry.active = Some(RealizedBranch::from_single_frame(frame));
+                }
+                entry.cleanup_ledger = Some(CleanupLedger::activate_leaving_branch(
+                    cleanup_ledger,
+                    leaving,
+                ));
             }
         },
     );
@@ -762,62 +1491,118 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             for entry in &mut navigation.entries {
-                if let Some(mut failure) = entry.failure_cleanup.take() {
-                    let mut ledger = match failure.state {
-                        FailureCleanupState::Prepared(ledger) => ledger,
-                        FailureCleanupState::Unisolated(frame) => {
-                            if !isolate_frame_for_settlement(world, &frame) {
-                                failure.state = FailureCleanupState::Unisolated(frame);
-                                entry.failure_cleanup = Some(failure);
-                                continue;
-                            }
-                            match CleanupLedger::for_failed_realization(world, frame) {
-                                Ok(ledger) => ledger,
-                                Err(frame) => {
-                                    failure.state = FailureCleanupState::Unprepared(frame);
-                                    entry.failure_cleanup = Some(failure);
-                                    continue;
+                if let Some(failed) = entry.pending_failed_branch.take() {
+                    if entry.cleanup_ledger.is_some() {
+                        entry.pending_failed_branch = Some(failed);
+                        continue;
+                    }
+                    let terminal_is_current = match &failed.terminal {
+                        PendingFailedBranchTerminal::Task { task, .. }
+                        | PendingFailedBranchTerminal::TaskWithPhysicalResidual { task, .. } => {
+                            entry.engine.inspect_report_identity(task).is_ok()
+                        }
+                        PendingFailedBranchTerminal::RegistrationBegin(error) => {
+                            error.validate_rejection(&entry.engine).is_ok()
+                        }
+                        PendingFailedBranchTerminal::Request(_) => true,
+                    };
+                    if !terminal_is_current {
+                        entry.pending_failed_branch = Some(failed);
+                        continue;
+                    }
+                    let manifest = {
+                        let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+                            entry.pending_failed_branch = Some(failed);
+                            continue;
+                        };
+                        FrozenCleanupManifest::from_failed_prepared_branch(
+                            world,
+                            registry,
+                            &failed.branch,
+                        )
+                    };
+                    let Some(manifest) = manifest else {
+                        entry.pending_failed_branch = Some(failed);
+                        continue;
+                    };
+                    if !manifest.preflight(world)
+                        || !isolate_failed_prepared_branch(world, &failed.branch)
+                        || !manifest.preflight(world)
+                    {
+                        entry.pending_failed_branch = Some(failed);
+                        continue;
+                    }
+                    let manifest_digest = manifest.digest();
+                    let obligation_count = manifest.len();
+                    let Some(reserved) = CleanupLedger::reserve(manifest) else {
+                        entry.pending_failed_branch = Some(failed);
+                        continue;
+                    };
+                    let PendingFailedBranch { terminal, branch } = failed;
+                    let request = match terminal {
+                        PendingFailedBranchTerminal::Task {
+                            task,
+                            failure,
+                            message,
+                        } => {
+                            match entry.engine.report_failed(task, failure, message) {
+                                Ok(Some(request)) => request,
+                                Ok(None) if obligation_count == 0 => continue,
+                                Ok(None) | Err(_) => {
+                                    unreachable!(
+                                        "an exact failed branch with physical obligations must issue cleanup"
+                                    )
                                 }
                             }
                         }
-                        FailureCleanupState::Unprepared(residual) => {
-                            match CleanupLedger::for_failed_realization(world, residual) {
-                                Ok(ledger) => ledger,
-                                Err(residual) => {
-                                    failure.state = FailureCleanupState::Unprepared(residual);
-                                    entry.failure_cleanup = Some(failure);
+                        PendingFailedBranchTerminal::TaskWithPhysicalResidual {
+                            task,
+                            failure,
+                            message,
+                        } => entry
+                            .engine
+                            .report_failed_with_physical_residual(task, failure, message)
+                            .expect(
+                                "an exact isolated physical residual retains its report task",
+                            ),
+                        PendingFailedBranchTerminal::Request(request) => request,
+                        PendingFailedBranchTerminal::RegistrationBegin(error) => {
+                            match error.reject(&mut entry.engine) {
+                                Ok(request) => request,
+                                Err(error) => {
+                                    entry.pending_failed_branch = Some(PendingFailedBranch {
+                                        terminal: PendingFailedBranchTerminal::RegistrationBegin(
+                                            error,
+                                        ),
+                                        branch,
+                                    });
                                     continue;
                                 }
                             }
                         }
                     };
-                    if !entry.observe_cleanup_receipts(&mut ledger) {
-                        failure.state = FailureCleanupState::Prepared(ledger);
-                        entry.failure_cleanup = Some(failure);
-                        continue;
-                    }
-                    if !ledger.is_settled() {
-                        let Some(attempt) = ledger.attempt(world) else {
-                            failure.state = FailureCleanupState::Prepared(ledger);
-                            entry.failure_cleanup = Some(failure);
-                            continue;
-                        };
-                        let settled = ledger.settle(world, attempt);
-                        if !entry.observe_cleanup_receipts(&mut ledger) {
-                            failure.state = FailureCleanupState::Prepared(ledger);
-                            entry.failure_cleanup = Some(failure);
-                            continue;
-                        }
-                        if !settled {
-                            failure.state = FailureCleanupState::Prepared(ledger);
-                            entry.failure_cleanup = Some(failure);
+                    let logical_roots = request.logical_roots().to_vec();
+                    let cleanup = match entry.engine.prepare_failure_cleanup_retaining(
+                        request,
+                        CleanupManifest::new(
+                            logical_roots,
+                            manifest_digest,
+                            obligation_count,
+                        ),
+                    ) {
+                        Ok(cleanup) => cleanup,
+                        Err(error) => {
+                            entry.pending_failed_branch = Some(PendingFailedBranch {
+                                terminal: PendingFailedBranchTerminal::Request(error.into_owner()),
+                                branch,
+                            });
                             continue;
                         }
-                    }
-                    entry
-                        .engine
-                        .report_failed(failure.task, failure.failure, failure.message)
-                        .expect("a physically settled failed realization retains its exact task");
+                    };
+                    entry.cleanup_ledger = Some(CleanupLedger::activate_failed(
+                        reserved.bind_batch(cleanup),
+                        branch,
+                    ));
                 }
                 let Some(mut ledger) = entry.cleanup_ledger.take() else {
                     continue;
@@ -893,7 +1678,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::{
         app_ext::{AppRouterExt, RouterConfig, RouterHostRegistration},
+        cleanup::{CleanupPostcheckDrift, CleanupPostcheckPhase},
         components::{
+            ChildSlotAuthorityProbe, ChildSlotBarrierProbe, ChildSlotLifecycle,
             ProvisionalPostWriteProbe, ProvisionalSlotLifecycle, RouteOwnershipSeal,
             RouterInputBarrier,
         },
@@ -905,7 +1692,7 @@ pub(crate) mod tests {
         presentation::FrameOutput,
         registry::{
             ComponentManifest, EntityOwner, ProvisionalOwner, ProvisionalTopSlotOwner,
-            QuarantineLeaseTable, RegistryOwner,
+            QuarantineLeaseTable, RegistryOwner, fail_next_verified_preparation_for_test,
         },
     };
     use bevy_app::{App, PostUpdate, PreUpdate, Update};
@@ -931,8 +1718,8 @@ pub(crate) mod tests {
     use bevy_ui::{ComputedNode, Node, UiGlobalTransform, Val};
     use bevy_ui_router_core::integration::ViewReportIdentity;
     use bevy_ui_router_core::prelude::{
-        NavigationFailureKind, RequestStatus, RouteNodeOptions, RoutePattern, RouteTree,
-        RouteViewKey,
+        FrameOrigin, NavigationFailureKind, NavigationPhase, NavigationTraceEventKind,
+        RequestStatus, RouteNodeOptions, RoutePattern, RouteTree, RouteViewKey,
     };
     use bevy_ui_router_view::{
         RouteViewDescriptor, RouteViewRegistry, ViewBuildEffect, ViewDriverKey,
@@ -951,6 +1738,12 @@ pub(crate) mod tests {
 
     struct AtomicDriver {
         key: ViewDriverKey,
+    }
+
+    struct ReplayIdentityDriver {
+        key: ViewDriverKey,
+        replay: std::sync::Arc<std::sync::Mutex<Option<ViewReportIdentity>>>,
+        observed: std::sync::Arc<std::sync::Mutex<Vec<ViewReportIdentity>>>,
     }
 
     impl EcsViewDriver for AtomicDriver {
@@ -973,8 +1766,72 @@ pub(crate) mod tests {
         }
     }
 
+    impl EcsViewDriver for ReplayIdentityDriver {
+        fn key(&self) -> ViewDriverKey {
+            self.key.clone()
+        }
+
+        fn apply(
+            &mut self,
+            _effect: &ViewBuildEffect,
+            content: &mut FrameContentWriter<'_>,
+            report: EcsViewReportSession<'_>,
+        ) -> ViewBuildReport {
+            self.observed
+                .lock()
+                .unwrap()
+                .push(report.testing_identity());
+            content
+                .spawn_solid_rect(
+                    SolidRect::new(24, 16, ContentColor::srgba8(1, 2, 3, 255)).unwrap(),
+                )
+                .unwrap();
+            let replay = self.replay.lock().unwrap().take();
+            if let Some(identity) = replay {
+                let mut seal = ReportSeal::new();
+                EcsViewReportSession::new(&mut seal, identity).applied()
+            } else {
+                report.applied()
+            }
+        }
+    }
+
     struct PanicDriver {
         key: ViewDriverKey,
+    }
+
+    struct NestedDriver {
+        key: ViewDriverKey,
+        observed: std::sync::Arc<std::sync::Mutex<Vec<RouteViewKey>>>,
+        declare_outlet: bool,
+    }
+
+    impl EcsViewDriver for NestedDriver {
+        fn key(&self) -> ViewDriverKey {
+            self.key.clone()
+        }
+
+        fn apply(
+            &mut self,
+            effect: &ViewBuildEffect,
+            content: &mut FrameContentWriter<'_>,
+            report: EcsViewReportSession<'_>,
+        ) -> ViewBuildReport {
+            self.observed.lock().unwrap().push(effect.view().clone());
+            if effect.view() == &RouteViewKey::new("layout").unwrap() && self.declare_outlet {
+                let anchor = content.spawn_empty().unwrap();
+                content
+                    .declare_outlet(anchor, bevy_ui_router_core::slot::RouteSlotKey::default())
+                    .unwrap();
+            } else {
+                content
+                    .spawn_solid_rect(
+                        SolidRect::new(24, 16, ContentColor::srgba8(1, 2, 3, 255)).unwrap(),
+                    )
+                    .unwrap();
+            }
+            report.applied()
+        }
     }
 
     impl EcsViewDriver for PanicDriver {
@@ -1001,6 +1858,57 @@ pub(crate) mod tests {
     struct PersistentOnePickableRemoval {
         remaining_before_target: usize,
         target: Option<Entity>,
+    }
+
+    #[derive(Resource)]
+    struct OnePickableRemoval {
+        remaining_before_target: usize,
+        removed: bool,
+    }
+
+    #[derive(Clone)]
+    enum CleanupDespawnDriftAction {
+        TargetRegistryClaim(crate::registry::ExactRegistryClaim),
+        ExternalParentSeal(Entity),
+    }
+
+    #[derive(Resource)]
+    struct CleanupDespawnDrift {
+        target: Entity,
+        action: CleanupDespawnDriftAction,
+    }
+
+    #[derive(Resource, Default)]
+    struct PickableRepairParentDrift {
+        target: Option<Entity>,
+        parent: Option<Entity>,
+        fired: bool,
+    }
+
+    fn install_cleanup_despawn_drift_hook(app: &mut App) {
+        app.world_mut()
+            .register_component_hooks::<RouteOwnershipSeal>()
+            .on_despawn(|mut world, HookContext { entity, .. }| {
+                let action = world
+                    .get_resource::<CleanupDespawnDrift>()
+                    .filter(|drift| drift.target == entity)
+                    .map(|drift| drift.action.clone());
+                match action {
+                    Some(CleanupDespawnDriftAction::TargetRegistryClaim(claim)) => {
+                        world
+                            .resource_mut::<RouteEntityRegistry>()
+                            .compare_exchange_lifecycle(&claim, EntityLifecycle::Quarantined);
+                    }
+                    Some(CleanupDespawnDriftAction::ExternalParentSeal(parent)) => {
+                        let seal = world.resource_mut::<RouteEntityRegistry>().issue_seal();
+                        world
+                            .commands()
+                            .entity(parent)
+                            .insert(RouteOwnershipSeal::new(seal));
+                    }
+                    None => {}
+                }
+            });
     }
 
     #[derive(Resource)]
@@ -1036,6 +1944,9 @@ pub(crate) mod tests {
 
     #[derive(Component)]
     struct CleanupDriftMarker;
+
+    #[derive(Resource, Default)]
+    struct ChildFrameDriftArmed(bool);
 
     #[derive(Component)]
     struct FinalPreflightForeignComponent;
@@ -1112,6 +2023,1151 @@ pub(crate) mod tests {
         router
     }
 
+    fn install_replay_router(
+        app: &mut App,
+        label: &str,
+        replay: std::sync::Arc<std::sync::Mutex<Option<ViewReportIdentity>>>,
+        observed: std::sync::Arc<std::sync::Mutex<Vec<ViewReportIdentity>>>,
+    ) -> RouterHandle {
+        let driver = ViewDriverKey::new(format!("{label}-driver")).unwrap();
+        app.register_ui_view_driver(ReplayIdentityDriver {
+            key: driver.clone(),
+            replay,
+            observed,
+        })
+        .unwrap();
+        let view = RouteViewKey::new(format!("{label}-view")).unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/:id").unwrap(),
+                RouteNodeOptions::new().with_view(view.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut views = RouteViewRegistry::new();
+        views
+            .insert(view.clone(), RouteViewDescriptor::new(driver))
+            .unwrap();
+        let router = app
+            .add_ui_router(RouterConfig::new(routes, views, view))
+            .unwrap();
+        app.world_mut()
+            .spawn((Node::default(), RouterHostRegistration::new(router)));
+        router
+    }
+
+    fn install_nested_router(
+        app: &mut App,
+        observed: std::sync::Arc<std::sync::Mutex<Vec<RouteViewKey>>>,
+        declare_outlet: bool,
+    ) -> RouterHandle {
+        let key = ViewDriverKey::new("nested-driver").unwrap();
+        app.register_ui_view_driver(NestedDriver {
+            key: key.clone(),
+            observed,
+            declare_outlet,
+        })
+        .unwrap();
+        let layout = RouteViewKey::new("layout").unwrap();
+        let item = RouteViewKey::new("item").unwrap();
+        let fallback = RouteViewKey::new("fallback").unwrap();
+        let mut views = RouteViewRegistry::new();
+        for view in [&layout, &item, &fallback] {
+            views
+                .insert(view.clone(), RouteViewDescriptor::new(key.clone()))
+                .unwrap();
+        }
+        let router = app
+            .add_ui_router(RouterConfig::new(
+                bevy_ui_router_core::test_support::nested_items_view_route_tree(),
+                views,
+                fallback,
+            ))
+            .unwrap();
+        app.world_mut()
+            .spawn((Node::default(), RouterHostRegistration::new(router)));
+        router
+    }
+
+    fn returned_receipt_bundle_fixture() -> (App, NavigationRequestId, Entity, Vec<Entity>) {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        observe_authority_system(app.world_mut());
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+
+        let (request, slot, frame_entities) = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = &mut navigation.entries[0];
+                let pending = entry.pending_commit.take().unwrap();
+                let EngineAction::MountRequest(mount) = entry.engine.action().unwrap() else {
+                    panic!("realized parent must retain its mount request")
+                };
+                let request = mount.request();
+                let outlet = mount.outlet().clone();
+                let grant = entry.engine.resolve_mount(mount).unwrap();
+                let parent = pending.branch.last_frame().unwrap();
+                let staged = stage_child_slot(world, parent, &outlet, &grant).unwrap();
+                let slot = staged.slot();
+                let frame_entities = pending
+                    .branch
+                    .frames()
+                    .iter()
+                    .flat_map(RealizedFrame::claims)
+                    .map(crate::registry::ExactRegistryClaim::entity)
+                    .collect::<Vec<_>>();
+                let (receipt, proof) = grant.attest_receipt_with_proof(staged.receipt().digest());
+                let mut foreign = RouterEngine::install(
+                    bevy_ui_router_core::test_support::nested_items_view_route_tree(),
+                    RouteViewKey::new("fallback").unwrap(),
+                )
+                .unwrap();
+                let error = match foreign.accept_mount_receipt(receipt) {
+                    Ok(_) => panic!("foreign engine must return the receipt capability"),
+                    Err(error) => error,
+                };
+                entry.pending_mount_mutation_rejection = Some(PendingMountMutationRejection {
+                    pending,
+                    artifact: MountMutationArtifact::Receipt(error.into_owner()),
+                    payload: PendingMountMutationPayload::Receipt { staged, proof },
+                });
+                (request, slot, frame_entities)
+            },
+        );
+        (app, request, slot, frame_entities)
+    }
+
+    #[test]
+    fn returned_receipt_bundle_rejects_into_sealed_failure_cleanup() {
+        let (mut app, request, slot, frame_entities) = returned_receipt_bundle_fixture();
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let bundle = entry.pending_mount_mutation_rejection.as_ref().unwrap();
+            let PendingMountMutationPayload::Receipt { staged, proof } = &bundle.payload else {
+                panic!("returned receipt must retain its staged receipt payload")
+            };
+            assert_eq!(staged.slot(), slot);
+            assert!(matches!(bundle.artifact, MountMutationArtifact::Receipt(_)));
+            let _proof = proof;
+            assert!(entry.pending_commit.is_none());
+        }
+        assert!(app.world().get_entity(slot).is_ok());
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(slot)
+                .is_some()
+        );
+
+        drive_navigation_system(app.world_mut());
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert!(entry.pending_mount_mutation_rejection.is_none());
+            let failed = entry.pending_failed_branch.as_ref().unwrap();
+            assert_eq!(failed.branch.frames().len(), 1);
+            assert_eq!(failed.branch.mount_residuals().len(), 1);
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Running(NavigationPhase::CleanupPending)
+            ));
+        }
+
+        settle_cleanup_system(app.world_mut());
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        let request = entry.engine.request(request).unwrap();
+        assert!(matches!(request.status(), RequestStatus::Failed(_)));
+        assert!(request.trace().iter().any(|event| {
+            event.kind() == NavigationTraceEventKind::CleanupSettled
+                && event.cleanup_disposition().is_some()
+        }));
+        assert_eq!(
+            request.trace().last().map(|event| event.kind()),
+            Some(NavigationTraceEventKind::RequestTerminal)
+        );
+        assert!(app.world().get_entity(slot).is_err());
+        assert!(
+            frame_entities
+                .iter()
+                .all(|entity| app.world().get_entity(*entity).is_err())
+        );
+    }
+
+    #[test]
+    fn receipt_rejection_error_retains_one_bundle_until_exact_retry() {
+        let (mut app, request, slot, frame_entities) = returned_receipt_bundle_fixture();
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let world_before = authority_world_fingerprint(app.world());
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            navigation.entries[0]
+                .engine
+                .testing_set_mount_receipt_context_live(false);
+        }
+
+        drive_navigation_system(app.world_mut());
+
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let bundle = entry.pending_mount_mutation_rejection.as_ref().unwrap();
+            let PendingMountMutationPayload::Receipt { staged, proof } = &bundle.payload else {
+                panic!("receipt rejection retry must retain the receipt payload")
+            };
+            assert_eq!(staged.slot(), slot);
+            assert_eq!(
+                bundle
+                    .pending
+                    .branch
+                    .frames()
+                    .iter()
+                    .flat_map(RealizedFrame::claims)
+                    .map(crate::registry::ExactRegistryClaim::entity)
+                    .collect::<Vec<_>>(),
+                frame_entities
+            );
+            assert!(matches!(bundle.artifact, MountMutationArtifact::Receipt(_)));
+            let _proof = proof;
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Running(NavigationPhase::ApplyingFrame(_))
+                    | RequestStatus::Running(NavigationPhase::CleanupPending)
+            ));
+        }
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            navigation.entries[0]
+                .engine
+                .testing_set_mount_receipt_context_live(true);
+        }
+        drive_navigation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert!(entry.pending_mount_mutation_rejection.is_none());
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(_)
+        ));
+        assert_eq!(
+            entry
+                .engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .filter(|event| {
+                    event.kind()
+                        == bevy_ui_router_core::prelude::NavigationTraceEventKind::MountRejectedAfterMutation
+                })
+                .count(),
+            1
+        );
+    }
+
+    pub(crate) fn failed_nested_branch_fixture()
+    -> (App, FailedPreparedBranch, Vec<Entity>, Entity, Vec<Entity>) {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        observe_authority_system(app.world_mut());
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let (branch, child_entities, child_slot, parent_entities) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let pending = navigation.entries[0].pending_commit.take().unwrap();
+            let child_entities = pending.branch.frames()[1]
+                .claims()
+                .map(|claim| claim.entity())
+                .collect::<Vec<_>>();
+            let child_slot = pending.branch.child_slots()[0].slot();
+            let parent_entities = pending.branch.frames()[0]
+                .claims()
+                .map(|claim| claim.entity())
+                .collect::<Vec<_>>();
+            (
+                FailedPreparedBranch::new(pending.branch),
+                child_entities,
+                child_slot,
+                parent_entities,
+            )
+        };
+        (app, branch, child_entities, child_slot, parent_entities)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn failed_cleanup_ledger_audits_frames_as_prepared_inert() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "failed-cleanup-audit");
+        observe_authority_system(app.world_mut());
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/first"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let branch = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            FailedPreparedBranch::new(navigation.entries[0].pending_commit.take().unwrap().branch)
+        };
+        let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+            app.world(),
+            app.world().resource::<RouteEntityRegistry>(),
+            &branch,
+        )
+        .unwrap();
+        let prepared = CleanupLedger::reserve(manifest).unwrap();
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0].cleanup_ledger =
+            Some(CleanupLedger::activate_failed(prepared, branch));
+
+        refresh_authority_audits(app.world_mut());
+
+        let snapshot = app
+            .world()
+            .resource::<crate::audit::RouterAuthorityAudits>()
+            .get(router)
+            .unwrap();
+        assert_eq!(snapshot.frames().len(), 1);
+        assert!(snapshot.frames().iter().all(|frame| {
+            frame.lifecycle() == crate::audit::AuthorityFrameLifecycle::PreparedInert
+        }));
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn tracked_child_slot_is_current_on_first_fresh_audit() {
+        let (mut app, branch, _child_entities, child_slot_entity, _parent_entities) =
+            failed_nested_branch_fixture();
+        let router = app.world().resource::<RouterNavigation>().entries[0].handle;
+        let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+            app.world(),
+            app.world().resource::<RouteEntityRegistry>(),
+            &branch,
+        )
+        .unwrap();
+        let expected_frames = branch
+            .frames()
+            .iter()
+            .map(|frame| frame.frame().clone())
+            .collect::<Vec<_>>();
+        let frame_validity = branch
+            .frames()
+            .iter()
+            .map(|frame| validate_realized_frame(app.world(), frame))
+            .collect::<Vec<_>>();
+        let prepared = CleanupLedger::reserve(manifest).unwrap();
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0].cleanup_ledger =
+            Some(CleanupLedger::activate_failed(prepared, branch));
+        app.world_mut()
+            .insert_resource(crate::audit::RouterAuthorityAudits::new());
+
+        refresh_authority_audits(app.world_mut());
+
+        let snapshot = app
+            .world()
+            .resource::<crate::audit::RouterAuthorityAudits>()
+            .get(router)
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .frames()
+                .iter()
+                .map(|frame| frame.frame().clone())
+                .collect::<Vec<_>>(),
+            expected_frames,
+            "standalone frame validity: {frame_validity:?}"
+        );
+        assert_eq!(snapshot.slots().len(), 2);
+        assert_eq!(
+            snapshot.slots()[1].kind(),
+            crate::audit::AuthoritySlotKind::ChildOutlet
+        );
+        assert!(snapshot.orphan_slots().is_empty());
+        let host_slot = snapshot
+            .slots()
+            .iter()
+            .find(|slot| slot.kind() == crate::audit::AuthoritySlotKind::HostTop)
+            .unwrap();
+        let child_slot_mapping = snapshot
+            .slots()
+            .iter()
+            .find(|slot| slot.kind() == crate::audit::AuthoritySlotKind::ChildOutlet)
+            .unwrap();
+        let parent_frame = snapshot
+            .frames()
+            .iter()
+            .find(|frame| frame.frame() == &expected_frames[0])
+            .unwrap();
+        let child_frame = snapshot
+            .frames()
+            .iter()
+            .find(|frame| frame.frame() == &expected_frames[1])
+            .unwrap();
+        assert_eq!(parent_frame.slot_entity(), host_slot.entity());
+        assert_eq!(child_frame.slot_entity(), child_slot_mapping.entity());
+        assert_ne!(child_frame.slot_entity(), host_slot.entity());
+        assert_ne!(child_frame.root(), child_frame.slot_entity());
+        let child_slot = child_slot_mapping.id();
+
+        app.world_mut().entity_mut(child_slot_entity).insert(Node {
+            width: Val::Percent(99.0),
+            height: Val::Percent(100.0),
+            ..Node::default()
+        });
+        app.world_mut().flush();
+        refresh_authority_audits(app.world_mut());
+        refresh_authority_audits(app.world_mut());
+        let drifted = app
+            .world()
+            .resource::<crate::audit::RouterAuthorityAudits>()
+            .get(router)
+            .unwrap();
+        assert_eq!(drifted.slots().len(), 1);
+        assert!(drifted.orphan_slots().contains(&child_slot));
+
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0].cleanup_ledger = None;
+        refresh_authority_audits(app.world_mut());
+        refresh_authority_audits(app.world_mut());
+
+        let registry_only = app
+            .world()
+            .resource::<crate::audit::RouterAuthorityAudits>()
+            .get(router)
+            .unwrap();
+        assert_eq!(registry_only.slots().len(), 1);
+        assert!(registry_only.orphan_slots().contains(&child_slot));
+    }
+
+    #[test]
+    fn nested_branch_drives_parent_mount_and_child_before_commit() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let layout = RouteViewKey::new("layout").unwrap();
+        let item = RouteViewKey::new("item").unwrap();
+        let router = install_nested_router(&mut app, observed.clone(), true);
+
+        observe_authority_system(app.world_mut());
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        assert_eq!(*observed.lock().unwrap(), vec![layout.clone()]);
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let pending = navigation.entries[0].pending_commit.as_ref().unwrap();
+            assert_eq!(pending.branch.frames().len(), 1);
+            assert!(pending.branch.child_slots().is_empty());
+            assert!(pending.branch.frames()[0].claims().all(|claim| {
+                app.world().get::<Visibility>(claim.entity()) == Some(&Visibility::Hidden)
+                    && app.world().get::<Pickable>(claim.entity()) == Some(&Pickable::IGNORE)
+                    && app
+                        .world()
+                        .get::<RouterInputBarrier>(claim.entity())
+                        .is_some_and(RouterInputBarrier::denies_all)
+            }));
+        }
+
+        drive_navigation_system(app.world_mut());
+        assert_eq!(*observed.lock().unwrap(), vec![layout.clone()]);
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let pending = navigation.entries[0].pending_commit.as_ref().unwrap();
+            assert_eq!(pending.branch.frames().len(), 1);
+            assert_eq!(pending.branch.child_slots().len(), 1);
+            let slot = pending.branch.child_slots()[0].slot();
+            assert_eq!(
+                app.world().get::<Visibility>(slot),
+                Some(&Visibility::Hidden)
+            );
+            assert_eq!(app.world().get::<Pickable>(slot), Some(&Pickable::IGNORE));
+            assert!(
+                app.world()
+                    .get::<RouterInputBarrier>(slot)
+                    .is_some_and(RouterInputBarrier::denies_all)
+            );
+            assert_ne!(app.world().resource::<InputFocus>().get(), Some(slot));
+        }
+
+        drive_navigation_system(app.world_mut());
+        assert_eq!(*observed.lock().unwrap(), vec![layout, item]);
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        let pending = entry.pending_commit.as_ref().unwrap();
+        assert_eq!(pending.branch.frames().len(), 2);
+        assert_eq!(pending.branch.child_slots().len(), 1);
+        assert!(pending.final_task.is_some());
+        assert!(entry.active.is_none());
+    }
+
+    #[test]
+    fn nested_full_schedule_keeps_branch_pending_and_core_unpublished() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+
+        app.update();
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let pending = navigation.entries[0].pending_commit.as_ref().unwrap();
+            assert_eq!(pending.branch.frames().len(), 1);
+            assert!(pending.branch.child_slots().is_empty());
+            assert!(pending.final_task.is_none());
+        }
+        app.update();
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let pending = navigation.entries[0].pending_commit.as_ref().unwrap();
+            assert_eq!(pending.branch.frames().len(), 1);
+            assert_eq!(pending.branch.child_slots().len(), 1);
+        }
+        app.update();
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        let pending = entry.pending_commit.as_ref().unwrap();
+        assert_eq!(pending.branch.frames().len(), 2);
+        assert_eq!(pending.branch.child_slots().len(), 1);
+        assert!(pending.final_task.is_some());
+        assert!(entry.active.is_none());
+        assert!(entry.engine.active().frames().is_empty());
+        assert!(pending.branch.frames().iter().all(|frame| {
+            frame.claims().all(|claim| {
+                app.world().get::<Visibility>(claim.entity()) == Some(&Visibility::Hidden)
+                    && app.world().get::<Pickable>(claim.entity()) == Some(&Pickable::IGNORE)
+                    && app
+                        .world()
+                        .get::<RouterInputBarrier>(claim.entity())
+                        .is_some_and(RouterInputBarrier::denies_all)
+            })
+        }));
+        assert!(pending.branch.child_slots().iter().all(|slot| {
+            app.world().get::<Visibility>(slot.slot()) == Some(&Visibility::Hidden)
+                && app.world().get::<Pickable>(slot.slot()) == Some(&Pickable::IGNORE)
+                && app
+                    .world()
+                    .get::<RouterInputBarrier>(slot.slot())
+                    .is_some_and(RouterInputBarrier::denies_all)
+        }));
+    }
+
+    #[test]
+    fn nested_missing_outlet_rejects_before_slot_or_registry_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, false);
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let world_before = authority_world_fingerprint(app.world());
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let seal_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .latest_issued_seal();
+
+        drive_navigation_system(app.world_mut());
+
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .latest_issued_seal(),
+            seal_before
+        );
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert!(entry.pending_commit.is_none());
+        assert!(entry.pending_mount_request.is_none());
+        assert!(entry.pending_failed_branch.is_some());
+        let request_view = entry.engine.request(request).unwrap();
+        let trace = request_view.trace();
+        assert!(
+            trace.iter().any(|event| {
+                event.mount_rejection() == Some(MountRejectionKind::MissingOutlet)
+            })
+        );
+        assert!(trace.iter().all(|event| {
+            event.kind() != bevy_ui_router_core::prelude::NavigationTraceEventKind::MountGranted
+        }));
+    }
+
+    #[test]
+    fn nested_invalid_outlet_rejects_before_slot_or_registry_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let anchor = app.world().resource::<RouterNavigation>().entries[0]
+            .pending_commit
+            .as_ref()
+            .unwrap()
+            .branch
+            .frames()[0]
+            .outlets()[0]
+            .anchor();
+        app.world_mut()
+            .entity_mut(anchor)
+            .remove::<RouteOwnershipSeal>();
+        app.world_mut().flush();
+        let world_before = authority_world_fingerprint(app.world());
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let seal_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .latest_issued_seal();
+
+        drive_navigation_system(app.world_mut());
+
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .latest_issued_seal(),
+            seal_before
+        );
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert!(entry.pending_failed_branch.is_some());
+        let request_view = entry.engine.request(request).unwrap();
+        let trace = request_view.trace();
+        assert!(
+            trace.iter().any(|event| {
+                event.mount_rejection() == Some(MountRejectionKind::InvalidOutlet)
+            })
+        );
+        assert!(trace.iter().all(|event| {
+            event.kind() != bevy_ui_router_core::prelude::NavigationTraceEventKind::MountGranted
+        }));
+    }
+
+    fn assert_nested_slot_residual_settles(
+        app: &mut App,
+        request: NavigationRequestId,
+        expected_state: crate::mount::ChildSlotResidualState,
+    ) {
+        let (residual_claim, expected_receipts) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Running(_)
+            ));
+            let failed = entry.pending_failed_branch.as_ref().unwrap();
+            let residual = &failed.branch.mount_residuals()[0];
+            assert_eq!(residual.state(), expected_state);
+            let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                app.world(),
+                app.world().resource::<RouteEntityRegistry>(),
+                &failed.branch,
+            )
+            .unwrap();
+            (residual.claim().clone(), manifest.len())
+        };
+
+        settle_cleanup_system(app.world_mut());
+
+        assert_ne!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(residual_claim.entity())
+                .map(|record| record.claim()),
+            Some(residual_claim)
+        );
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let entry = &mut navigation.entries[0];
+        assert!(entry.pending_failed_branch.is_none());
+        let request = entry.engine.request(request).unwrap();
+        assert!(matches!(request.status(), RequestStatus::Failed(_)));
+        let receipt_count = request
+            .trace()
+            .iter()
+            .filter(|event| event.cleanup_disposition().is_some())
+            .count();
+        assert_eq!(receipt_count, expected_receipts);
+        assert_eq!(
+            request
+                .trace()
+                .iter()
+                .map(|event| event.kind())
+                .rev()
+                .take(2)
+                .collect::<Vec<_>>(),
+            vec![
+                bevy_ui_router_core::prelude::NavigationTraceEventKind::RequestTerminal,
+                bevy_ui_router_core::prelude::NavigationTraceEventKind::CleanupSettled,
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_provisional_slot_residual_settles_before_core_advances() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        app.world_mut()
+            .register_component_hooks::<ChildSlotBarrierProbe>()
+            .on_insert(|mut world, HookContext { entity, .. }| {
+                world
+                    .commands()
+                    .entity(entity)
+                    .remove::<RouterInputBarrier>();
+            });
+
+        drive_navigation_system(app.world_mut());
+
+        assert_nested_slot_residual_settles(
+            &mut app,
+            request,
+            crate::mount::ChildSlotResidualState::Provisional,
+        );
+    }
+
+    #[test]
+    fn provisional_slot_with_foreign_component_converges_as_unresolved() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        app.world_mut()
+            .register_component_hooks::<ChildSlotBarrierProbe>()
+            .on_insert(|mut world, HookContext { entity, .. }| {
+                world.commands().entity(entity).insert(CleanupDriftMarker);
+            });
+
+        drive_navigation_system(app.world_mut());
+
+        let residual = app.world().resource::<RouterNavigation>().entries[0]
+            .pending_failed_branch
+            .as_ref()
+            .unwrap()
+            .branch
+            .mount_residuals()[0]
+            .entity();
+        let actual_parent = app
+            .world()
+            .get::<bevy_ecs::hierarchy::ChildOf>(residual)
+            .map(bevy_ecs::hierarchy::ChildOf::parent);
+        let source_claim = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(residual)
+            .unwrap()
+            .claim();
+        assert!(app.world().get::<CleanupDriftMarker>(residual).is_some());
+        assert!(app.world().get::<RouteOwnershipSeal>(residual).is_none());
+        assert!(app.world().get::<ChildSlotLifecycle>(residual).is_none());
+        assert!(
+            app.world()
+                .get::<crate::components::ChildSlotAuthority>(residual)
+                .is_none()
+        );
+
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(residual);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(residual));
+        crate::registry::fail_next_unresolved_preparation_for_test();
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(entry.cleanup_ledger.as_ref().unwrap().receipt_count(), 0);
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(residual)
+                .is_some_and(|record| record.claim() == source_claim)
+        );
+        assert!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .unresolved_record(residual)
+                .is_none()
+        );
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        assert_eq!(
+            app.world()
+                .get::<bevy_ecs::hierarchy::ChildOf>(residual)
+                .map(bevy_ecs::hierarchy::ChildOf::parent),
+            actual_parent
+        );
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(
+            matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(_)
+            ),
+            "status: {:?}",
+            entry.engine.request(request).unwrap().status()
+        );
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(residual)
+                .is_none()
+        );
+        assert!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .unresolved_record(residual)
+                .is_some()
+        );
+        assert!(app.world().get::<CleanupDriftMarker>(residual).is_some());
+        assert!(app.world().get::<RouteOwnershipSeal>(residual).is_none());
+        assert!(app.world().get::<ChildSlotLifecycle>(residual).is_none());
+        assert!(
+            app.world()
+                .get::<crate::components::ChildSlotAuthority>(residual)
+                .is_none()
+        );
+        assert_eq!(
+            app.world()
+                .get::<bevy_ecs::hierarchy::ChildOf>(residual)
+                .map(bevy_ecs::hierarchy::ChildOf::parent),
+            actual_parent
+        );
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        assert_eq!(
+            app.world().get::<Visibility>(residual),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(
+            app.world().get::<Pickable>(residual),
+            Some(&Pickable::IGNORE)
+        );
+        assert!(
+            app.world()
+                .get::<RouterInputBarrier>(residual)
+                .is_some_and(RouterInputBarrier::denies_all)
+        );
+    }
+
+    #[test]
+    fn nested_registered_slot_residual_settles_before_core_advances() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        app.world_mut()
+            .register_component_hooks::<ChildSlotLifecycle>()
+            .on_insert(|mut world, HookContext { entity, .. }| {
+                if world.get::<ChildSlotLifecycle>(entity)
+                    == Some(&ChildSlotLifecycle::RegisteredInert)
+                {
+                    world.commands().entity(entity).insert(Node {
+                        width: Val::Percent(99.0),
+                        height: Val::Percent(100.0),
+                        ..Node::default()
+                    });
+                }
+            });
+
+        drive_navigation_system(app.world_mut());
+
+        assert_nested_slot_residual_settles(
+            &mut app,
+            request,
+            crate::mount::ChildSlotResidualState::Registered,
+        );
+    }
+
+    #[test]
+    fn nested_absent_slot_residual_settles_before_core_advances() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        app.world_mut()
+            .register_component_hooks::<ChildSlotAuthorityProbe>()
+            .on_insert(|mut world, HookContext { entity, .. }| {
+                world.commands().entity(entity).despawn();
+            });
+
+        drive_navigation_system(app.world_mut());
+
+        assert_nested_slot_residual_settles(
+            &mut app,
+            request,
+            crate::mount::ChildSlotResidualState::Absent,
+        );
+    }
+
+    #[test]
+    fn nested_partial_child_frame_settles_before_core_advances() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        app.world_mut()
+            .insert_resource(ChildFrameDriftArmed::default());
+        app.world_mut()
+            .register_component_hooks::<FrameOutput>()
+            .on_add(|mut world, HookContext { entity, .. }| {
+                if world
+                    .get_resource::<ChildFrameDriftArmed>()
+                    .is_some_and(|armed| armed.0)
+                {
+                    world.commands().entity(entity).insert(CleanupDriftMarker);
+                }
+            });
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        app.world_mut().resource_mut::<ChildFrameDriftArmed>().0 = true;
+
+        drive_navigation_system(app.world_mut());
+
+        let (claims, child_slot, expected_receipts) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Running(_)
+            ));
+            let failed = entry.pending_failed_branch.as_ref().unwrap();
+            assert_eq!(failed.branch.frames().len(), 2);
+            assert_eq!(failed.branch.child_slots().len(), 1);
+            assert!(failed.branch.mount_residuals().is_empty());
+            let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                app.world(),
+                app.world().resource::<RouteEntityRegistry>(),
+                &failed.branch,
+            )
+            .unwrap();
+            let claims = failed
+                .branch
+                .frames()
+                .iter()
+                .flat_map(RealizedFrame::claims)
+                .cloned()
+                .chain(
+                    failed
+                        .branch
+                        .child_slots()
+                        .iter()
+                        .map(|slot| slot.slot_claim().clone()),
+                )
+                .collect::<Vec<_>>();
+            (
+                claims,
+                failed.branch.child_slots()[0].slot(),
+                manifest.len(),
+            )
+        };
+
+        settle_cleanup_system(app.world_mut());
+
+        for claim in claims {
+            assert_ne!(
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(claim.entity())
+                    .map(|record| record.claim()),
+                Some(claim)
+            );
+        }
+        assert_eq!(
+            app.world().get::<ChildSlotLifecycle>(child_slot),
+            Some(&ChildSlotLifecycle::Quarantined)
+        );
+        assert_eq!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .record(child_slot)
+                .unwrap()
+                .lifecycle(),
+            EntityLifecycle::Quarantined
+        );
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        let request = entry.engine.request(request).unwrap();
+        assert!(matches!(request.status(), RequestStatus::Failed(_)));
+        assert_eq!(
+            request
+                .trace()
+                .iter()
+                .filter(|event| event.cleanup_disposition().is_some())
+                .count(),
+            expected_receipts
+        );
+        assert_eq!(
+            request
+                .trace()
+                .iter()
+                .map(|event| event.kind())
+                .rev()
+                .take(2)
+                .collect::<Vec<_>>(),
+            vec![
+                bevy_ui_router_core::prelude::NavigationTraceEventKind::RequestTerminal,
+                bevy_ui_router_core::prelude::NavigationTraceEventKind::CleanupSettled,
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_mount_resolution_exhaustion_reissues_without_driver_rerun() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let layout = RouteViewKey::new("layout").unwrap();
+        let router = install_nested_router(&mut app, observed.clone(), true);
+        observe_authority_system(app.world_mut());
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            navigation.entries[0].engine.testing_exhaust_slot_counter();
+        }
+        let world_before = authority_world_fingerprint(app.world());
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+
+        drive_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+
+        assert_eq!(*observed.lock().unwrap(), vec![layout]);
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        let navigation = app.world().resource::<RouterNavigation>();
+        let pending = navigation.entries[0].pending_commit.as_ref().unwrap();
+        assert_eq!(pending.branch.frames().len(), 1);
+        assert!(pending.branch.child_slots().is_empty());
+        assert!(pending.final_task.is_none());
+    }
+
     fn authority_world_fingerprint(
         world: &World,
     ) -> Vec<(Entity, Vec<bevy_ecs::component::ComponentId>)> {
@@ -1134,6 +3190,882 @@ pub(crate) mod tests {
         let mut seal = ReportSeal::new();
         let report = EcsViewReportSession::new(&mut seal, identity).applied();
         (plan, report)
+    }
+
+    fn foreign_report_identity(label: &str) -> ViewReportIdentity {
+        let view = RouteViewKey::new(format!("{label}-view")).unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(view.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut engine = RouterEngine::install(routes, view).unwrap();
+        let token = engine.request_host_admission().unwrap();
+        let grant = engine.grant_host_admission(&token).unwrap();
+        engine.confirm_host(grant);
+        engine.push(RouteLocation::new("/")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("foreign engine must issue one frame task")
+        };
+        task.report_identity()
+    }
+
+    #[test]
+    fn exact_root_stale_application_retains_task_outside_final_task() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "root-stale-owner");
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        let (task, host_candidate, top_slot, top_slot_claim) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            let EngineAction::FrameTask(task) = entry.engine.action().unwrap() else {
+                panic!("root task must be issued")
+            };
+            let host = entry.host.as_ref().unwrap();
+            (
+                task,
+                host.candidate.clone(),
+                host.top_slot,
+                host.top_slot_claim.clone(),
+            )
+        };
+        let before_world = authority_world_fingerprint(app.world());
+        let before_registry = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let pending = PendingCommit::new();
+        let (plan, report) = applied_report_with_identity(task.report_identity());
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = &mut navigation.entries[0];
+                let result = apply_applied_driver_report_to_branch(
+                    world,
+                    &mut entry.engine,
+                    host_candidate,
+                    top_slot,
+                    top_slot_claim,
+                    Some(&pending.branch),
+                    &task,
+                    &report,
+                    plan,
+                );
+                assert!(matches!(result, Err(DriverReportApplicationError::Stale)));
+                entry.pending_failed_branch = Some(stale_driver_report_owner(pending, task));
+            },
+        );
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.pending_commit.is_none());
+        let failed = entry.pending_failed_branch.as_ref().unwrap();
+        assert!(matches!(
+            failed.terminal,
+            PendingFailedBranchTerminal::Task { .. }
+        ));
+        assert!(failed.branch.frames().is_empty());
+        assert_eq!(authority_world_fingerprint(app.world()), before_world);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            before_registry
+        );
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        let status = entry.engine.request(request).unwrap().status().clone();
+        assert_eq!(status, RequestStatus::Running(NavigationPhase::Recovering));
+        assert_eq!(authority_world_fingerprint(app.world()), before_world);
+    }
+
+    #[test]
+    fn exact_child_stale_application_retains_nonleaf_branch_for_cleanup() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let (task, pending, host_candidate, top_slot, top_slot_claim) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            let EngineAction::FrameTask(task) = entry.engine.action().unwrap() else {
+                panic!("child task must be issued")
+            };
+            let host = entry.host.as_ref().unwrap();
+            let host_candidate = host.candidate.clone();
+            let top_slot = host.top_slot;
+            let top_slot_claim = host.top_slot_claim.clone();
+            (
+                task,
+                entry.pending_commit.take().unwrap(),
+                host_candidate,
+                top_slot,
+                top_slot_claim,
+            )
+        };
+        let owned = pending
+            .branch
+            .frames()
+            .iter()
+            .flat_map(RealizedFrame::claims)
+            .map(crate::registry::ExactRegistryClaim::entity)
+            .chain(pending.branch.child_slots().iter().map(|slot| slot.slot()))
+            .collect::<Vec<_>>();
+        let (plan, report) = applied_report_with_identity(task.report_identity());
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = &mut navigation.entries[0];
+                let result = apply_applied_driver_report_to_branch(
+                    world,
+                    &mut entry.engine,
+                    host_candidate,
+                    top_slot,
+                    top_slot_claim,
+                    None,
+                    &task,
+                    &report,
+                    plan,
+                );
+                assert!(matches!(result, Err(DriverReportApplicationError::Stale)));
+                entry.pending_failed_branch = Some(stale_driver_report_owner(pending, task));
+            },
+        );
+        let failed = app.world().resource::<RouterNavigation>().entries[0]
+            .pending_failed_branch
+            .as_ref()
+            .unwrap();
+        assert_eq!(failed.branch.frames().len(), 1);
+        assert_eq!(failed.branch.child_slots().len(), 1);
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(_)
+        ));
+        assert!(owned.iter().all(|entity| {
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(*entity)
+                .is_none()
+        }));
+    }
+
+    fn prepare_exact_child_stale_failure(app: &mut App) -> (NavigationRequestId, RouterHandle) {
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(app, observed, true);
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let (task, pending, host_candidate, top_slot, top_slot_claim) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            let EngineAction::FrameTask(task) = entry.engine.action().unwrap() else {
+                panic!("child task must be issued")
+            };
+            let host = entry.host.as_ref().unwrap();
+            (
+                task,
+                entry.pending_commit.take().unwrap(),
+                host.candidate.clone(),
+                host.top_slot,
+                host.top_slot_claim.clone(),
+            )
+        };
+        let (plan, report) = applied_report_with_identity(task.report_identity());
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = &mut navigation.entries[0];
+                let result = apply_applied_driver_report_to_branch(
+                    world,
+                    &mut entry.engine,
+                    host_candidate,
+                    top_slot,
+                    top_slot_claim,
+                    None,
+                    &task,
+                    &report,
+                    plan,
+                );
+                assert!(matches!(result, Err(DriverReportApplicationError::Stale)));
+                entry.pending_failed_branch = Some(stale_driver_report_owner(pending, task));
+            },
+        );
+        (request, router)
+    }
+
+    #[test]
+    fn nested_pending_clean_removal_releases_child_slot_focus() {
+        let mut app = App::new();
+        let (_request, _router) = prepare_exact_child_stale_failure(&mut app);
+        let child_slot = app.world().resource::<RouterNavigation>().entries[0]
+            .pending_failed_branch
+            .as_ref()
+            .unwrap()
+            .branch
+            .child_slots()[0]
+            .slot();
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(child_slot);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(child_slot));
+
+        settle_cleanup_system(app.world_mut());
+
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        assert!(app.world().get_entity(child_slot).is_err());
+    }
+
+    #[test]
+    fn stale_external_parent_is_world_zero_and_preserves_foreign_descendant_focus() {
+        let mut app = App::new();
+        let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+        let (frame_shell, top_slot_claim) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            (
+                entry
+                    .pending_failed_branch
+                    .as_ref()
+                    .unwrap()
+                    .branch
+                    .frames()[0]
+                    .shell(),
+                entry.host.as_ref().unwrap().top_slot_claim.clone(),
+            )
+        };
+        let foreign = app.world_mut().spawn(ChildOf(frame_shell)).id();
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(foreign);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(foreign));
+        app.world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .compare_exchange_lifecycle(&top_slot_claim, EntityLifecycle::Quarantined)
+            .unwrap();
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.pending_failed_branch.is_some());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(_)
+        ));
+        assert_eq!(app.world().resource::<InputFocus>().get(), Some(foreign));
+        assert_eq!(
+            app.world().resource::<RouteFocusState>().focused(),
+            Some(foreign)
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(frame_shell),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(
+            app.world().get::<Pickable>(frame_shell),
+            Some(&Pickable::IGNORE)
+        );
+        assert!(
+            app.world()
+                .get::<RouterInputBarrier>(frame_shell)
+                .is_some_and(RouterInputBarrier::denies_all)
+        );
+    }
+
+    #[test]
+    fn stale_failed_branch_root_preserves_app_descendant_focus_without_a_ledger() {
+        let mut app = App::new();
+        let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+        let (root, claim) = {
+            let failed = app.world().resource::<RouterNavigation>().entries[0]
+                .pending_failed_branch
+                .as_ref()
+                .unwrap();
+            let root = failed.branch.frames()[0].shell();
+            let claim = app
+                .world()
+                .resource::<RouteEntityRegistry>()
+                .record(root)
+                .unwrap()
+                .claim();
+            (root, claim)
+        };
+        let app_descendant = app.world_mut().spawn(ChildOf(root)).id();
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(app_descendant);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(app_descendant));
+        app.world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .compare_exchange_lifecycle(&claim, EntityLifecycle::Quarantined)
+            .unwrap();
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.pending_failed_branch.is_some());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(_)
+        ));
+        assert_eq!(
+            app.world().resource::<InputFocus>().get(),
+            Some(app_descendant)
+        );
+        assert_eq!(
+            app.world().resource::<RouteFocusState>().focused(),
+            Some(app_descendant)
+        );
+    }
+
+    #[test]
+    pub(crate) fn failed_branch_relationship_cycle_is_world_zero_and_retains_focus() {
+        let mut app = App::new();
+        let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+        let (cycle_child, cycle_parent, claims) = {
+            let failed = app.world().resource::<RouterNavigation>().entries[0]
+                .pending_failed_branch
+                .as_ref()
+                .unwrap();
+            let frame = &failed.branch.frames()[0];
+            let cycle_child = frame.outlets()[0].anchor();
+            let cycle_parent = app
+                .world()
+                .get::<ChildOf>(cycle_child)
+                .map(ChildOf::parent)
+                .unwrap();
+            (
+                cycle_child,
+                cycle_parent,
+                frame.claims().cloned().collect::<Vec<_>>(),
+            )
+        };
+        app.world_mut()
+            .entity_mut(cycle_parent)
+            .insert(ChildOf(cycle_child));
+        app.world_mut().flush();
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(cycle_child);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(cycle_child));
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let values_before = claims
+            .iter()
+            .map(|claim| {
+                (
+                    claim.entity(),
+                    *app.world().get::<Visibility>(claim.entity()).unwrap(),
+                    *app.world().get::<Pickable>(claim.entity()).unwrap(),
+                    *app.world()
+                        .get::<RouterInputBarrier>(claim.entity())
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.pending_failed_branch.is_some());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(_)
+        ));
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(
+            app.world().resource::<InputFocus>().get(),
+            Some(cycle_child)
+        );
+        assert_eq!(
+            app.world().resource::<RouteFocusState>().focused(),
+            Some(cycle_child)
+        );
+        assert_eq!(
+            claims
+                .iter()
+                .map(|claim| {
+                    (
+                        claim.entity(),
+                        *app.world().get::<Visibility>(claim.entity()).unwrap(),
+                        *app.world().get::<Pickable>(claim.entity()).unwrap(),
+                        *app.world()
+                            .get::<RouterInputBarrier>(claim.entity())
+                            .unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            values_before
+        );
+    }
+
+    #[test]
+    fn nested_pending_isolation_observer_drift_retains_inert_owner_for_retry() {
+        let mut app = App::new();
+        app.world_mut()
+            .register_component_hooks::<Pickable>()
+            .on_insert(|mut world, HookContext { entity, .. }| {
+                let remove = world
+                    .get_resource::<PersistentOnePickableRemoval>()
+                    .is_some_and(|drift| drift.target == Some(entity));
+                if remove {
+                    world.commands().entity(entity).remove::<Pickable>();
+                }
+            });
+        let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+        let target = app.world().resource::<RouterNavigation>().entries[0]
+            .pending_failed_branch
+            .as_ref()
+            .unwrap()
+            .branch
+            .frames()[0]
+            .shell();
+        app.world_mut().entity_mut(target).remove::<Pickable>();
+        app.world_mut()
+            .insert_resource(PersistentOnePickableRemoval {
+                remaining_before_target: 0,
+                target: Some(target),
+            });
+
+        for _ in 0..2 {
+            settle_cleanup_system(app.world_mut());
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(entry.pending_failed_branch.is_some());
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Running(_)
+            ));
+            assert_eq!(
+                app.world().get::<Visibility>(target),
+                Some(&Visibility::Hidden)
+            );
+            assert!(
+                app.world()
+                    .get::<RouterInputBarrier>(target)
+                    .is_some_and(RouterInputBarrier::denies_all)
+            );
+            assert!(
+                app.world()
+                    .get::<Pickable>(target)
+                    .is_none_or(|pickable| *pickable == Pickable::IGNORE)
+            );
+        }
+    }
+
+    #[test]
+    fn post_despawn_registry_claim_cas_cannot_mint_a_cleanup_receipt() {
+        let mut app = App::new();
+        install_cleanup_despawn_drift_hook(&mut app);
+        let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+        let (target, claim) = {
+            let failed = app.world().resource::<RouterNavigation>().entries[0]
+                .pending_failed_branch
+                .as_ref()
+                .unwrap();
+            let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                app.world(),
+                app.world().resource::<RouteEntityRegistry>(),
+                &failed.branch,
+            )
+            .unwrap();
+            let target = manifest.entities()[0];
+            let claim = app
+                .world()
+                .resource::<RouteEntityRegistry>()
+                .record(target)
+                .unwrap()
+                .claim();
+            (target, claim)
+        };
+        app.world_mut().insert_resource(CleanupDespawnDrift {
+            target,
+            action: CleanupDespawnDriftAction::TargetRegistryClaim(claim),
+        });
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let ledger = entry
+            .cleanup_ledger
+            .as_ref()
+            .expect("failed receipt CAS must retain the activated owner");
+        assert_eq!(ledger.receipt_count(), 0);
+        assert!(!ledger.is_settled());
+        assert!(!ledger.failed_prepared_frames().is_empty());
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(_)
+        ));
+        assert!(app.world().get_entity(target).is_err());
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(target)
+                .unwrap()
+                .lifecycle(),
+            EntityLifecycle::Quarantined
+        );
+    }
+
+    #[test]
+    fn post_despawn_external_parent_drift_stops_before_the_next_obligation() {
+        let mut app = App::new();
+        install_cleanup_despawn_drift_hook(&mut app);
+        let (_request, _router) = prepare_exact_child_stale_failure(&mut app);
+        let (first, later, top_slot) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let failed = entry.pending_failed_branch.as_ref().unwrap();
+            let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                app.world(),
+                app.world().resource::<RouteEntityRegistry>(),
+                &failed.branch,
+            )
+            .unwrap();
+            let entities = manifest.entities();
+            (
+                entities[0],
+                entities[1],
+                entry.host.as_ref().unwrap().top_slot,
+            )
+        };
+        app.world_mut().insert_resource(CleanupDespawnDrift {
+            target: first,
+            action: CleanupDespawnDriftAction::ExternalParentSeal(top_slot),
+        });
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let ledger = entry.cleanup_ledger.as_ref().unwrap();
+        assert_eq!(ledger.receipt_count(), 1);
+        assert!(!ledger.is_settled());
+        assert!(app.world().get_entity(first).is_err());
+        assert!(app.world().get_entity(later).is_ok());
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(later)
+                .is_some()
+        );
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let ledger = entry.cleanup_ledger.as_ref().unwrap();
+        assert_eq!(ledger.receipt_count(), 1);
+        assert!(!ledger.is_settled());
+        assert!(app.world().get_entity(later).is_ok());
+    }
+
+    #[test]
+    fn foreign_stale_task_is_held_before_manifest_reservation_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let first = install_atomic_router(&mut app, "foreign-stale-source");
+        let second = install_atomic_router(&mut app, "foreign-stale-target");
+        observe_authority_system(app.world_mut());
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(first, RouteLocation::new("/"))
+            .unwrap();
+        let _second_request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(second, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let source = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == first)
+                .unwrap();
+            let EngineAction::FrameTask(task) = source.engine.action().unwrap() else {
+                panic!("source task must be issued")
+            };
+            let target = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == second)
+                .unwrap();
+            target.pending_failed_branch =
+                Some(stale_driver_report_owner(PendingCommit::new(), task));
+        }
+        let before_world = authority_world_fingerprint(app.world());
+        let before_registry = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let before_engine = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == second)
+            .unwrap()
+            .engine
+            .snapshot();
+        crate::cleanup::fail_next_reservation_for_test();
+
+        settle_cleanup_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == second)
+            .unwrap();
+        assert!(entry.pending_failed_branch.is_some());
+        assert!(entry.cleanup_ledger.is_none());
+        assert_eq!(entry.engine.snapshot(), before_engine);
+        assert_eq!(authority_world_fingerprint(app.world()), before_world);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            before_registry
+        );
+
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let target = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == second)
+                .unwrap();
+            let EngineAction::FrameTask(task) = target.engine.action().unwrap() else {
+                panic!("target task must remain current")
+            };
+            target.pending_failed_branch =
+                Some(stale_driver_report_owner(PendingCommit::new(), task));
+        }
+        settle_cleanup_system(app.world_mut());
+        assert!(
+            app.world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == second)
+                .unwrap()
+                .pending_failed_branch
+                .is_some(),
+            "the unconsumed reservation fault must reject the first exact retry"
+        );
+        settle_cleanup_system(app.world_mut());
+        assert!(
+            app.world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == second)
+                .unwrap()
+                .pending_failed_branch
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn production_foreign_report_retains_exact_task_and_retries_without_authority_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let replay = std::sync::Arc::new(std::sync::Mutex::new(Some(foreign_report_identity(
+            "production-foreign-report",
+        ))));
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_replay_router(
+            &mut app,
+            "production-foreign-target",
+            replay,
+            observed.clone(),
+        );
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/first"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        let world_before = authority_world_fingerprint(app.world());
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let (active_before, history_before, status_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            (
+                entry.engine.active().clone(),
+                entry.engine.history().clone(),
+                entry.engine.request(request).unwrap().status().clone(),
+            )
+        };
+
+        drive_navigation_system(app.world_mut());
+
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert_eq!(entry.engine.active(), &active_before);
+            assert_eq!(entry.engine.history(), &history_before);
+            assert_eq!(
+                entry.engine.request(request).unwrap().status(),
+                &status_before
+            );
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+        }
+
+        drive_navigation_system(app.world_mut());
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert!(observed[0] == observed[1]);
+        drop(observed);
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+        assert!(matches!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .unwrap()
+                .status(),
+            RequestStatus::Succeeded
+        ));
+    }
+
+    #[test]
+    fn production_same_router_old_report_retains_new_exact_task_and_retries() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let replay = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_replay_router(
+            &mut app,
+            "production-old-report",
+            replay.clone(),
+            observed.clone(),
+        );
+        observe_authority_system(app.world_mut());
+        let first = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/first"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+        assert!(matches!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(first)
+                .unwrap()
+                .status(),
+            RequestStatus::Succeeded
+        ));
+        let old_identity = observed.lock().unwrap()[0].clone();
+        *replay.lock().unwrap() = Some(old_identity.clone());
+        let second = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/second"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        let world_before = authority_world_fingerprint(app.world());
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let status_before = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .request(second)
+            .unwrap()
+            .status()
+            .clone();
+
+        drive_navigation_system(app.world_mut());
+
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(second)
+                .unwrap()
+                .status(),
+            &status_before
+        );
+
+        drive_navigation_system(app.world_mut());
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 3);
+        assert!(observed[0] == old_identity);
+        assert!(observed[1] != observed[0]);
+        assert!(observed[1] == observed[2]);
+        drop(observed);
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+        assert!(matches!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(second)
+                .unwrap()
+                .status(),
+            RequestStatus::Succeeded
+        ));
     }
 
     #[test]
@@ -1351,7 +4283,7 @@ pub(crate) mod tests {
             navigation.entries[0]
                 .pending_commit
                 .as_ref()
-                .and_then(|pending| pending.realized.as_ref())
+                .and_then(PendingCommit::frame)
                 .and_then(|frame| frame.interactive_entities().first().copied())
         };
         let Some(output) = output else { return };
@@ -1416,8 +4348,21 @@ pub(crate) mod tests {
             let entry = &navigation.entries[0];
             (
                 (
-                    entry.active.as_ref().unwrap().frame().clone(),
-                    entry.active.as_ref().unwrap().shell(),
+                    entry
+                        .active
+                        .as_ref()
+                        .unwrap()
+                        .first_frame()
+                        .unwrap()
+                        .frame()
+                        .clone(),
+                    entry
+                        .active
+                        .as_ref()
+                        .unwrap()
+                        .first_frame()
+                        .unwrap()
+                        .shell(),
                 ),
                 entry.engine.history().clone(),
             )
@@ -1450,8 +4395,21 @@ pub(crate) mod tests {
         );
         assert_eq!(
             (
-                entry.active.as_ref().unwrap().frame().clone(),
-                entry.active.as_ref().unwrap().shell()
+                entry
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .first_frame()
+                    .unwrap()
+                    .frame()
+                    .clone(),
+                entry
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .first_frame()
+                    .unwrap()
+                    .shell()
             ),
             active_before
         );
@@ -1492,7 +4450,10 @@ pub(crate) mod tests {
         let (leaving, leaving_output) = {
             let navigation = app.world().resource::<RouterNavigation>();
             let frame = navigation.entries[0].active.as_ref().unwrap();
-            (frame.shell(), frame.interactive_entities()[0])
+            (
+                frame.first_frame().unwrap().shell(),
+                frame.interactive_entities()[0],
+            )
         };
         let foreign = app.world_mut().spawn_empty().id();
         app.world_mut()
@@ -1512,7 +4473,16 @@ pub(crate) mod tests {
             entry.pending_commit.is_none(),
             "leaving quarantine must not poll forever"
         );
-        assert_ne!(entry.active.as_ref().unwrap().shell(), leaving);
+        assert_ne!(
+            entry
+                .active
+                .as_ref()
+                .unwrap()
+                .first_frame()
+                .unwrap()
+                .shell(),
+            leaving
+        );
         assert!(matches!(
             entry.engine.request(request).unwrap().status(),
             RequestStatus::Succeeded
@@ -1554,7 +4524,10 @@ pub(crate) mod tests {
         let (leaving_shell, leaving_output) = {
             let navigation = app.world().resource::<RouterNavigation>();
             let frame = navigation.entries[0].active.as_ref().unwrap();
-            (frame.shell(), frame.interactive_entities()[0])
+            (
+                frame.first_frame().unwrap().shell(),
+                frame.interactive_entities()[0],
+            )
         };
         app.world_mut()
             .entity_mut(leaving_output)
@@ -1565,6 +4538,8 @@ pub(crate) mod tests {
                 app.world().resource::<RouterNavigation>().entries[0]
                     .active
                     .as_ref()
+                    .unwrap()
+                    .first_frame()
                     .unwrap()
             ),
             "a protected foreign component must not invalidate a preserved active frame"
@@ -1586,7 +4561,16 @@ pub(crate) mod tests {
             entry.pending_commit.is_none(),
             "request must not poll forever"
         );
-        assert_ne!(entry.active.as_ref().unwrap().shell(), leaving_shell);
+        assert_ne!(
+            entry
+                .active
+                .as_ref()
+                .unwrap()
+                .first_frame()
+                .unwrap()
+                .shell(),
+            leaving_shell
+        );
         assert!(matches!(
             entry.engine.request(request).unwrap().status(),
             RequestStatus::Succeeded
@@ -1607,6 +4591,394 @@ pub(crate) mod tests {
         let gate = app.world().resource::<RouterInputGate>();
         assert!(!gate.allows_pointer(leaving_output));
         assert!(gate.allows_pointer(entry.active.as_ref().unwrap().interactive_entities()[0]));
+    }
+
+    #[test]
+    fn refresh_does_not_cross_a_stale_terminal_root_after_quarantine_retry() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "quarantine-parent-postcheck");
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+
+        let (leaving_output, obligation_count, top_slot, top_slot_seal) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let frame = navigation.entries[0]
+                .active
+                .as_ref()
+                .unwrap()
+                .first_frame()
+                .unwrap();
+            (
+                frame.interactive_entities()[0],
+                frame.obligation_count(),
+                frame.top_slot(),
+                frame.mount_binding().slot_claim().seal(),
+            )
+        };
+        app.world_mut()
+            .entity_mut(leaving_output)
+            .insert(FinalPreflightForeignComponent);
+        let foreign = app.world_mut().spawn(ChildOf(leaving_output)).id();
+        app.world_mut()
+            .insert_resource(CleanupPostcheckDrift::external_parent(
+                CleanupPostcheckPhase::VerifiedTransfer,
+                top_slot,
+            ));
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/").with_fragment("replacement"))
+            .unwrap();
+
+        app.update();
+
+        let lease_count = app
+            .world()
+            .resource::<QuarantineLeaseTable>()
+            .leases()
+            .len();
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let ledger = entry.cleanup_ledger.as_ref().unwrap();
+        assert_eq!(ledger.receipt_count(), obligation_count);
+        assert!(!ledger.is_settled());
+        assert!(!ledger.leaving_frames().is_empty());
+        assert_eq!(lease_count, 1);
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+        ));
+
+        app.update();
+        let ledger = app.world().resource::<RouterNavigation>().entries[0]
+            .cleanup_ledger
+            .as_ref()
+            .unwrap();
+        assert_eq!(ledger.receipt_count(), obligation_count);
+        assert_eq!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .leases()
+                .len(),
+            lease_count
+        );
+
+        let stale_root_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(leaving_output)
+            .insert(RouteOwnershipSeal::new(stale_root_seal));
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(foreign);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(foreign));
+
+        app.world_mut()
+            .entity_mut(top_slot)
+            .insert(RouteOwnershipSeal::new(top_slot_seal));
+        app.update();
+        app.update();
+
+        assert!(matches!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .unwrap()
+                .status(),
+            RequestStatus::Succeeded
+        ));
+        assert_eq!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .leases()
+                .len(),
+            lease_count
+        );
+        assert_eq!(app.world().resource::<InputFocus>().get(), Some(foreign));
+        assert_eq!(
+            app.world().resource::<RouteFocusState>().focused(),
+            Some(foreign)
+        );
+        let completion_count = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .request(request)
+            .unwrap()
+            .trace()
+            .iter()
+            .filter(|event| {
+                event.kind() == NavigationTraceEventKind::CleanupSettled
+                    && event.cleanup_disposition().is_none()
+            })
+            .count();
+        assert_eq!(completion_count, 1);
+        app.update();
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .filter(|event| {
+                    event.kind() == NavigationTraceEventKind::CleanupSettled
+                        && event.cleanup_disposition().is_none()
+                })
+                .count(),
+            completion_count
+        );
+    }
+
+    #[test]
+    fn fallback_postcheck_focus_drift_retries_without_duplicate_transfer() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "fallback-focus-postcheck");
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+
+        let (leaving_output, obligation_count) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let frame = navigation.entries[0]
+                .active
+                .as_ref()
+                .unwrap()
+                .first_frame()
+                .unwrap();
+            (frame.interactive_entities()[0], frame.obligation_count())
+        };
+        let foreign = app.world_mut().spawn(CleanupDriftMarker).id();
+        app.world_mut()
+            .entity_mut(leaving_output)
+            .add_child(foreign);
+        fail_next_verified_preparation_for_test();
+        app.world_mut()
+            .insert_resource(CleanupPostcheckDrift::focus(
+                CleanupPostcheckPhase::Fallback,
+                foreign,
+            ));
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/").with_fragment("replacement"))
+            .unwrap();
+
+        app.update();
+
+        let lease_count = app
+            .world()
+            .resource::<QuarantineLeaseTable>()
+            .leases()
+            .len();
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let ledger = entry.cleanup_ledger.as_ref().unwrap();
+        assert_eq!(ledger.receipt_count(), obligation_count);
+        assert!(!ledger.is_settled());
+        assert!(ledger.leaving_frames().is_empty());
+        assert_eq!(app.world().resource::<InputFocus>().get(), Some(foreign));
+        assert_eq!(
+            app.world().resource::<RouteFocusState>().focused(),
+            Some(foreign)
+        );
+        assert_eq!(lease_count, 1);
+
+        app.world_mut().entity_mut(foreign).remove::<ChildOf>();
+        app.world_mut().flush();
+        app.update();
+        app.update();
+
+        assert_eq!(app.world().resource::<InputFocus>().get(), Some(foreign));
+        assert_eq!(
+            app.world().resource::<RouteFocusState>().focused(),
+            Some(foreign)
+        );
+        assert!(matches!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .unwrap()
+                .status(),
+            RequestStatus::Succeeded
+        ));
+        assert_eq!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .leases()
+                .len(),
+            lease_count
+        );
+        let completion_count = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .request(request)
+            .unwrap()
+            .trace()
+            .iter()
+            .filter(|event| {
+                event.kind() == NavigationTraceEventKind::CleanupSettled
+                    && event.cleanup_disposition().is_none()
+            })
+            .count();
+        assert_eq!(completion_count, 1);
+        app.update();
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .filter(|event| {
+                    event.kind() == NavigationTraceEventKind::CleanupSettled
+                        && event.cleanup_disposition().is_none()
+                })
+                .count(),
+            completion_count
+        );
+    }
+
+    #[test]
+    fn pickable_repair_parent_drift_is_zero_transfer_and_retryable() {
+        let mut app = App::new();
+        app.world_mut()
+            .insert_resource(PickableRepairParentDrift::default());
+        app.world_mut()
+            .register_component_hooks::<Pickable>()
+            .on_insert(|mut world, HookContext { entity, .. }| {
+                let parent = {
+                    let Some(mut drift) = world.get_resource_mut::<PickableRepairParentDrift>()
+                    else {
+                        return;
+                    };
+                    if drift.fired || drift.target != Some(entity) {
+                        return;
+                    }
+                    drift.fired = true;
+                    drift.parent
+                };
+                let Some(parent) = parent else { return };
+                let stale_seal = world.resource_mut::<RouteEntityRegistry>().issue_seal();
+                world
+                    .commands()
+                    .entity(parent)
+                    .insert(RouteOwnershipSeal::new(stale_seal));
+            });
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "repair-parent-drift");
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+
+        let (target, leaving_entities, top_slot, top_slot_seal) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let frame = navigation.entries[0]
+                .active
+                .as_ref()
+                .unwrap()
+                .first_frame()
+                .unwrap();
+            let target = frame
+                .claims()
+                .map(|claim| claim.entity())
+                .find(|entity| *entity != frame.shell())
+                .unwrap();
+            (
+                target,
+                frame
+                    .claims()
+                    .map(|claim| claim.entity())
+                    .collect::<Vec<_>>(),
+                frame.top_slot(),
+                frame.mount_binding().slot_claim().seal(),
+            )
+        };
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/").with_fragment("replacement"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+        let leaving_claims = leaving_entities
+            .iter()
+            .map(|entity| {
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(*entity)
+                    .unwrap()
+                    .claim()
+            })
+            .collect::<Vec<_>>();
+        {
+            let mut drift = app.world_mut().resource_mut::<PickableRepairParentDrift>();
+            drift.target = Some(target);
+            drift.parent = Some(top_slot);
+        }
+        app.world_mut().entity_mut(target).remove::<Pickable>();
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let ledger = entry.cleanup_ledger.as_ref().unwrap();
+        assert_eq!(ledger.receipt_count(), 0);
+        assert!(!ledger.leaving_frames().is_empty());
+        assert_eq!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .leases()
+                .len(),
+            0
+        );
+        assert_eq!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .unresolved_residuals()
+                .len(),
+            0
+        );
+        assert!(leaving_claims.iter().all(|claim| {
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(claim.entity())
+                .is_some_and(|record| record.claim() == *claim)
+        }));
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+        ));
+
+        app.world_mut()
+            .entity_mut(top_slot)
+            .insert(RouteOwnershipSeal::new(top_slot_seal));
+        settle_cleanup_system(app.world_mut());
+
+        assert!(matches!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .unwrap()
+                .status(),
+            RequestStatus::Succeeded
+        ));
+        assert_eq!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .leases()
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -2087,8 +5459,8 @@ pub(crate) mod tests {
         assert_eq!(entry.engine.snapshot(), before_projection);
         assert!(entry.pending_commit.is_some());
         assert!(entry.pending_commit.as_ref().unwrap().ticket.is_none());
-        assert!(entry.pending_commit.as_ref().unwrap().task.is_some());
-        assert!(entry.pending_commit.as_ref().unwrap().realized.is_some());
+        assert!(entry.pending_commit.as_ref().unwrap().final_task.is_some());
+        assert!(entry.pending_commit.as_ref().unwrap().frame().is_some());
         assert_eq!(
             app.world().resource::<RouteEntityRegistry>().records(),
             before_records
@@ -2149,7 +5521,7 @@ pub(crate) mod tests {
         drive_navigation_system(app.world_mut());
 
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
-        assert!(entry.failure_cleanup.is_some());
+        assert!(entry.pending_failed_branch.is_some());
         assert!(matches!(
             entry.engine.request(request).unwrap().status(),
             RequestStatus::Running(_)
@@ -2189,10 +5561,16 @@ pub(crate) mod tests {
         }
 
         settle_cleanup_system(app.world_mut());
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .pending_failed_branch
+                .is_some()
+        );
+        settle_cleanup_system(app.world_mut());
 
         assert!(
             app.world().resource::<RouterNavigation>().entries[0]
-                .failure_cleanup
+                .pending_failed_branch
                 .is_none()
         );
         let action = app.world_mut().resource_mut::<RouterNavigation>().entries[0]
@@ -2205,6 +5583,106 @@ pub(crate) mod tests {
                 .record(*entity)
                 .is_some()
         }));
+        let navigation = app.world().resource::<RouterNavigation>();
+        let request_view = navigation.entries[0].engine.request(request).unwrap();
+        let trace = request_view.trace();
+        let settled = trace
+            .iter()
+            .position(|event| {
+                event.kind() == NavigationTraceEventKind::CleanupSettled
+                    && event.cleanup_disposition().is_none()
+            })
+            .unwrap();
+        let fallback = trace
+            .iter()
+            .rposition(|event| {
+                event.kind() == NavigationTraceEventKind::FrameTaskIssued
+                    && event
+                        .frame()
+                        .is_some_and(|frame| frame.origin() == &FrameOrigin::RouterFallback)
+            })
+            .unwrap();
+        assert!(settled < fallback);
+    }
+
+    #[test]
+    fn failed_fallback_root_partial_residual_waits_for_core_cleanup_before_terminal() {
+        let mut app = App::new();
+        app.world_mut()
+            .register_component_hooks::<FrameOutput>()
+            .on_add(|mut world, HookContext { entity, .. }| {
+                world.commands().entity(entity).insert(CleanupDriftMarker);
+            });
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "fallback-partial-cleanup");
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+
+        drive_navigation_system(app.world_mut());
+
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(entry.pending_failed_branch.is_some());
+            assert!(entry.cleanup_ledger.is_none());
+            assert_eq!(
+                entry.engine.request(request).unwrap().status(),
+                &RequestStatus::Running(NavigationPhase::ApplyingFrame(0))
+            );
+        }
+
+        settle_cleanup_system(app.world_mut());
+
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert_eq!(
+                entry.engine.request(request).unwrap().status(),
+                &RequestStatus::Running(NavigationPhase::Recovering)
+            );
+        }
+
+        drive_navigation_system(app.world_mut());
+
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(entry.pending_failed_branch.is_some());
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Running(_)
+            ));
+        }
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::RecoveryFailed
+        ));
+        assert_eq!(
+            entry
+                .engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .filter(|event| {
+                    event.kind() == NavigationTraceEventKind::CleanupSettled
+                        && event.cleanup_disposition().is_none()
+                })
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -2253,7 +5731,7 @@ pub(crate) mod tests {
             let pending = navigation.entries[0]
                 .pending_commit
                 .as_ref()
-                .and_then(|pending| pending.realized.as_ref())
+                .and_then(PendingCommit::frame)
                 .unwrap();
             (
                 pending.claims().cloned().collect::<Vec<_>>(),
@@ -2409,6 +5887,8 @@ pub(crate) mod tests {
                 .active
                 .as_ref()
                 .unwrap()
+                .first_frame()
+                .unwrap()
         ));
         let leaving = app.world().resource::<RouterNavigation>().entries[0]
             .active
@@ -2449,6 +5929,8 @@ pub(crate) mod tests {
                 .active
                 .as_ref()
                 .unwrap()
+                .first_frame()
+                .unwrap()
         ));
         *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(leaving);
         app.world_mut()
@@ -2474,6 +5956,8 @@ pub(crate) mod tests {
             app.world().resource::<RouterNavigation>().entries[0]
                 .active
                 .as_ref()
+                .unwrap()
+                .first_frame()
                 .unwrap()
         ));
         assert_eq!(app.world().resource::<InputFocus>().get(), None);
@@ -2510,6 +5994,8 @@ pub(crate) mod tests {
                 .active
                 .as_ref()
                 .unwrap()
+                .first_frame()
+                .unwrap()
         ));
 
         *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(active);
@@ -2529,6 +6015,8 @@ pub(crate) mod tests {
             app.world().resource::<RouterNavigation>().entries[0]
                 .active
                 .as_ref()
+                .unwrap()
+                .first_frame()
                 .unwrap()
         ));
         *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(active);
@@ -2649,7 +6137,10 @@ pub(crate) mod tests {
             .active
             .as_ref()
             .unwrap();
-        assert!(!validate_active_frame(app.world(), active));
+        assert!(!validate_active_frame(
+            app.world(),
+            active.first_frame().unwrap()
+        ));
 
         crate::input::refresh_input_gate_system(app.world_mut());
         assert!(
@@ -2712,6 +6203,8 @@ pub(crate) mod tests {
             app.world().resource::<RouterNavigation>().entries[0]
                 .active
                 .as_ref()
+                .unwrap()
+                .first_frame()
                 .unwrap()
         ));
 
@@ -2895,7 +6388,10 @@ pub(crate) mod tests {
             .active
             .as_ref()
             .unwrap();
-        assert!(!validate_active_frame(app.world(), active));
+        assert!(!validate_active_frame(
+            app.world(),
+            active.first_frame().unwrap()
+        ));
     }
 
     #[test]
@@ -3033,7 +6529,12 @@ pub(crate) mod tests {
             |world, navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 crate::presentation::assert_locked_component_manifest_closure(
                     world,
-                    navigation.entries[0].active.as_ref().unwrap(),
+                    navigation.entries[0]
+                        .active
+                        .as_ref()
+                        .unwrap()
+                        .first_frame()
+                        .unwrap(),
                 );
             },
         );
@@ -3113,7 +6614,7 @@ pub(crate) mod tests {
         let pending = app.world().resource::<RouterNavigation>().entries[0]
             .pending_commit
             .as_ref()
-            .and_then(|pending| pending.realized.as_ref())
+            .and_then(PendingCommit::frame)
             .unwrap()
             .interactive_entities()[0];
         app.world_mut().run_schedule(PostUpdate);
@@ -3191,11 +6692,13 @@ pub(crate) mod tests {
                     .active
                     .as_ref()
                     .unwrap()
+                    .first_frame()
+                    .unwrap()
             ),
             app.world().resource::<RouterNavigation>().entries[0]
                 .pending_commit
                 .as_ref()
-                .and_then(|pending| pending.realized.as_ref())
+                .and_then(PendingCommit::frame)
                 .is_some_and(|frame| validate_realized_frame(app.world(), frame)),
             app.world().resource::<RouterNavigation>().entries[0]
                 .host
@@ -3264,7 +6767,12 @@ pub(crate) mod tests {
             |world, navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 crate::presentation::assert_locked_component_manifest_closure(
                     world,
-                    navigation.entries[0].active.as_ref().unwrap(),
+                    navigation.entries[0]
+                        .active
+                        .as_ref()
+                        .unwrap()
+                        .first_frame()
+                        .unwrap(),
                 );
             },
         );
@@ -3836,7 +7344,103 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn unresolved_pending_residual_does_not_block_the_next_frame() {
+    fn stale_cleanup_mount_parent_claim_is_zero_write_and_retains_the_owner() {
+        let mut app = App::new();
+        app.world_mut()
+            .register_component_hooks::<Pickable>()
+            .on_insert(|mut world, HookContext { entity, .. }| {
+                let remove = {
+                    let Some(mut drift) = world.get_resource_mut::<OnePickableRemoval>() else {
+                        return;
+                    };
+                    if drift.removed {
+                        false
+                    } else if drift.remaining_before_target == 0 {
+                        drift.removed = true;
+                        true
+                    } else {
+                        drift.remaining_before_target -= 1;
+                        false
+                    }
+                };
+                if remove {
+                    world.commands().entity(entity).remove::<Pickable>();
+                }
+            });
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "stale-cleanup-parent");
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        app.world_mut().insert_resource(OnePickableRemoval {
+            remaining_before_target: 2,
+            removed: false,
+        });
+
+        drive_navigation_system(app.world_mut());
+
+        let (top_slot, top_slot_claim, frame_claims) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let failure = navigation.entries[0]
+                .pending_failed_branch
+                .as_ref()
+                .unwrap();
+            let frame = &failure.branch.frames()[0];
+            (
+                frame.top_slot(),
+                frame.mount_binding().slot_claim().clone(),
+                frame.claims().cloned().collect::<Vec<_>>(),
+            )
+        };
+        let parent_manifest = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(top_slot)
+            .unwrap()
+            .manifest()
+            .clone();
+        let stale_parent_claim = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .compare_exchange_lifecycle(&top_slot_claim, EntityLifecycle::Quarantined)
+            .unwrap();
+
+        settle_cleanup_system(app.world_mut());
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        let failed = entry.pending_failed_branch.as_ref().unwrap();
+        assert_eq!(failed.branch.frames().len(), 1);
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(frame_claims.iter().all(|claim| {
+            app.world().get_entity(claim.entity()).is_ok()
+                && app
+                    .world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(claim.entity())
+                    .is_some_and(|record| record.claim() == *claim)
+        }));
+        let parent_record = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(top_slot)
+            .unwrap();
+        assert_eq!(parent_record.claim(), stale_parent_claim);
+        assert_eq!(parent_record.manifest(), &parent_manifest);
+        assert!(parent_manifest.matches(app.world(), top_slot));
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(_)
+        ));
+        assert!(entry.active.is_none());
+    }
+
+    #[test]
+    fn observer_drift_retains_failure_owner_without_blocking_the_next_frame() {
         let mut app = App::new();
         app.world_mut()
             .register_component_hooks::<Pickable>()
@@ -3887,7 +7491,7 @@ pub(crate) mod tests {
         ));
         assert!(
             app.world().resource::<RouterNavigation>().entries[0]
-                .failure_cleanup
+                .pending_failed_branch
                 .is_some()
         );
         assert_eq!(
@@ -3900,39 +7504,61 @@ pub(crate) mod tests {
 
         settle_cleanup_system(app.world_mut());
 
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
         assert!(matches!(
-            app.world().resource::<RouterNavigation>().entries[0]
-                .engine
-                .request(first)
-                .unwrap()
-                .status(),
+            entry.engine.request(first).unwrap().status(),
             RequestStatus::Running(_)
         ));
+        assert!(entry.pending_failed_branch.is_some());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(entry.active.is_none());
+        assert_eq!(entry.engine.history().len(), 0);
+        let retained = entry
+            .pending_failed_branch
+            .as_ref()
+            .unwrap()
+            .branch
+            .frames()
+            .iter()
+            .flat_map(RealizedFrame::interactive_entities)
+            .collect::<Vec<_>>();
+        assert!(!retained.is_empty());
+        assert!(retained.iter().all(|entity| {
+            app.world().get::<Visibility>(*entity) == Some(&Visibility::Hidden)
+                && app
+                    .world()
+                    .get::<RouterInputBarrier>(*entity)
+                    .is_some_and(RouterInputBarrier::denies_all)
+        }));
         assert_eq!(
             app.world()
                 .resource::<QuarantineLeaseTable>()
                 .unresolved_residuals()
                 .len(),
-            1
+            0
         );
-        assert!(
+        let retained_claims = entry
+            .pending_failed_branch
+            .as_ref()
+            .unwrap()
+            .branch
+            .frames()
+            .iter()
+            .flat_map(|frame| frame.claims().cloned())
+            .collect::<Vec<_>>();
+        assert!(!retained_claims.is_empty());
+        assert!(retained_claims.iter().all(|claim| {
             app.world()
                 .resource::<RouteEntityRegistry>()
-                .records()
-                .iter()
-                .all(|record| !matches!(
-                    record.owner(),
-                    RegistryOwner::Committed(
-                        EntityOwner::FrameShell(_)
-                            | EntityOwner::FrameContentTarget(_)
-                            | EntityOwner::FrameOutput { .. }
-                    )
-                ))
-        );
+                .record(claim.entity())
+                .is_some_and(|record| record.claim() == *claim)
+        }));
 
         app.world_mut()
             .remove_resource::<PersistentOnePickableRemoval>();
 
+        settle_cleanup_system(app.world_mut());
         drive_navigation_system(app.world_mut());
         commit_presentation_system(app.world_mut());
         settle_cleanup_system(app.world_mut());
@@ -3942,7 +7568,12 @@ pub(crate) mod tests {
             let RequestStatus::Failed(failure) = request.status() else {
                 panic!("successful fallback must terminalize the original apply failure")
             };
-            assert_eq!(failure.kind(), NavigationFailureKind::Apply);
+            assert_eq!(
+                failure.kind(),
+                NavigationFailureKind::Apply,
+                "{}",
+                failure.message()
+            );
             assert_eq!(entry.engine.history().len(), 0);
             assert!(entry.active.is_some());
             assert!(
@@ -3973,7 +7604,7 @@ pub(crate) mod tests {
         assert!(entry.active.is_some());
         assert!(validate_active_frame(
             app.world(),
-            entry.active.as_ref().unwrap()
+            entry.active.as_ref().unwrap().first_frame().unwrap()
         ));
     }
 }

@@ -13,7 +13,8 @@ use crate::engine::{
     FailureCleanupRequest as CoreFailureCleanupRequest, FrameMountRequest as CoreFrameMountRequest,
     FrameMountTarget as CoreFrameMountTarget, FrameTask as CoreFrameTask,
     MountMutationArtifact as CoreMountMutationArtifact, PreparedPublication, PrivateRequestLookup,
-    PushError as CorePushError, ReportError as CoreReportError, RouterEngine as CoreRouterEngine,
+    PushError as CorePushError, ReportError as CoreReportError,
+    ResolveMountOwner as CoreResolveMountOwner, RouterEngine as CoreRouterEngine,
 };
 use crate::frame::RouteFrameVersion;
 use crate::history::{HistorySnapshot, MemoryHistory};
@@ -54,6 +55,138 @@ pub enum IntegrationError {
     Stale,
     Invalid,
     InvalidManifest,
+}
+
+#[doc(hidden)]
+pub enum ResolveMountOwner {
+    Returned(MountRequest),
+    Reissued,
+}
+
+#[doc(hidden)]
+#[must_use = "a failed mount resolution retains or reissues its request capability"]
+pub struct ResolveMountError {
+    kind: IntegrationError,
+    owner: ResolveMountOwner,
+}
+
+impl ResolveMountError {
+    pub const fn kind(&self) -> IntegrationError {
+        self.kind
+    }
+
+    pub fn into_owner(self) -> ResolveMountOwner {
+        self.owner
+    }
+}
+
+#[doc(hidden)]
+#[must_use = "a failed mount rejection retains its request capability"]
+pub struct RejectMountError {
+    kind: IntegrationError,
+    owner: MountRequest,
+}
+
+impl RejectMountError {
+    pub const fn kind(&self) -> IntegrationError {
+        self.kind
+    }
+
+    pub fn into_owner(self) -> MountRequest {
+        self.owner
+    }
+}
+
+#[doc(hidden)]
+#[must_use = "a failed receipt acceptance retains its attestation capability"]
+pub struct AcceptMountReceiptError {
+    kind: IntegrationError,
+    owner: MountReceiptAttestation,
+}
+
+impl AcceptMountReceiptError {
+    pub const fn kind(&self) -> IntegrationError {
+        self.kind
+    }
+
+    pub fn into_owner(self) -> MountReceiptAttestation {
+        self.owner
+    }
+}
+
+#[doc(hidden)]
+#[must_use = "a failed mutation rejection retains its mutation capability"]
+pub struct RejectMountMutationError {
+    kind: IntegrationError,
+    owner: MountMutationArtifact,
+}
+
+impl RejectMountMutationError {
+    pub const fn kind(&self) -> IntegrationError {
+        self.kind
+    }
+
+    pub fn into_owner(self) -> MountMutationArtifact {
+        self.owner
+    }
+}
+
+#[doc(hidden)]
+#[must_use = "a failed cleanup preparation retains its cleanup request"]
+pub struct PrepareFailureCleanupError {
+    kind: IntegrationError,
+    owner: FailureCleanupRequest,
+}
+
+impl PrepareFailureCleanupError {
+    pub const fn kind(&self) -> IntegrationError {
+        self.kind
+    }
+
+    pub fn into_owner(self) -> FailureCleanupRequest {
+        self.owner
+    }
+}
+
+fn format_capability_error(
+    formatter: &mut std::fmt::Formatter<'_>,
+    name: &str,
+    kind: IntegrationError,
+) -> std::fmt::Result {
+    formatter
+        .debug_struct(name)
+        .field("kind", &kind)
+        .finish_non_exhaustive()
+}
+
+impl std::fmt::Debug for ResolveMountError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format_capability_error(formatter, "ResolveMountError", self.kind)
+    }
+}
+
+impl std::fmt::Debug for RejectMountError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format_capability_error(formatter, "RejectMountError", self.kind)
+    }
+}
+
+impl std::fmt::Debug for AcceptMountReceiptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format_capability_error(formatter, "AcceptMountReceiptError", self.kind)
+    }
+}
+
+impl std::fmt::Debug for RejectMountMutationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format_capability_error(formatter, "RejectMountMutationError", self.kind)
+    }
+}
+
+impl std::fmt::Debug for PrepareFailureCleanupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format_capability_error(formatter, "PrepareFailureCleanupError", self.kind)
+    }
 }
 
 pub struct HostAdmissionToken {
@@ -180,16 +313,21 @@ impl MountRegistrationBeginError {
         self.kind
     }
 
+    #[doc(hidden)]
+    pub fn validate_rejection(&self, engine: &RouterEngine) -> Result<(), IntegrationError> {
+        engine
+            .inner
+            .validate_mount_registration_rejection(&self.permit)
+            .map_err(map_mount_error)
+    }
+
     pub fn reject(
         self,
         engine: &mut RouterEngine,
     ) -> Result<FailureCleanupRequest, MountRegistrationBeginError> {
-        if let Err(error) = engine
-            .inner
-            .validate_mount_registration_rejection(&self.permit)
-        {
+        if let Err(kind) = self.validate_rejection(engine) {
             return Err(Self {
-                kind: map_mount_error(error),
+                kind,
                 permit: self.permit,
             });
         }
@@ -348,6 +486,8 @@ impl MountRequest {
 #[doc(hidden)]
 pub enum MountMutationArtifact {
     Grant(MountGrant),
+    #[doc(hidden)]
+    Receipt(MountReceiptAttestation),
     RegistrationPermit(MountRegistrationPermit),
 }
 
@@ -799,11 +939,22 @@ impl RouterEngine {
         }
     }
 
-    pub fn resolve_mount(&mut self, request: MountRequest) -> Result<MountGrant, IntegrationError> {
+    pub fn resolve_mount(
+        &mut self,
+        request: MountRequest,
+    ) -> Result<MountGrant, ResolveMountError> {
         self.inner
             .resolve_mount(request.inner)
             .map(MountGrant::sealed)
-            .map_err(map_mount_error)
+            .map_err(|error| ResolveMountError {
+                kind: map_mount_error(error.kind()),
+                owner: match error.into_owner() {
+                    CoreResolveMountOwner::Returned(inner) => {
+                        ResolveMountOwner::Returned(MountRequest { inner })
+                    }
+                    CoreResolveMountOwner::Reissued => ResolveMountOwner::Reissued,
+                },
+            })
     }
 
     #[doc(hidden)]
@@ -811,20 +962,28 @@ impl RouterEngine {
         &mut self,
         request: MountRequest,
         rejection: MountRejectionKind,
-    ) -> Result<FailureCleanupRequest, IntegrationError> {
+    ) -> Result<FailureCleanupRequest, RejectMountError> {
         self.inner
             .reject_mount(request.inner, rejection)
             .map(|inner| FailureCleanupRequest { inner })
-            .map_err(map_mount_error)
+            .map_err(|error| RejectMountError {
+                kind: map_mount_error(error.kind()),
+                owner: MountRequest {
+                    inner: error.into_owner(),
+                },
+            })
     }
 
     #[doc(hidden)]
     pub fn reject_mount_after_mutation(
         &mut self,
         artifact: MountMutationArtifact,
-    ) -> Result<FailureCleanupRequest, IntegrationError> {
+    ) -> Result<FailureCleanupRequest, RejectMountMutationError> {
         let artifact = match artifact {
             MountMutationArtifact::Grant(grant) => CoreMountMutationArtifact::Grant(grant.inner),
+            MountMutationArtifact::Receipt(receipt) => {
+                CoreMountMutationArtifact::Receipt(receipt.inner)
+            }
             MountMutationArtifact::RegistrationPermit(permit) => {
                 CoreMountMutationArtifact::RegistrationPermit(permit.inner)
             }
@@ -832,17 +991,35 @@ impl RouterEngine {
         self.inner
             .reject_mount_after_mutation(artifact)
             .map(|inner| FailureCleanupRequest { inner })
-            .map_err(map_mount_error)
+            .map_err(|error| RejectMountMutationError {
+                kind: map_mount_error(error.kind()),
+                owner: match error.into_owner() {
+                    CoreMountMutationArtifact::Grant(inner) => {
+                        MountMutationArtifact::Grant(MountGrant { inner })
+                    }
+                    CoreMountMutationArtifact::Receipt(inner) => {
+                        MountMutationArtifact::Receipt(MountReceiptAttestation { inner })
+                    }
+                    CoreMountMutationArtifact::RegistrationPermit(inner) => {
+                        MountMutationArtifact::RegistrationPermit(MountRegistrationPermit { inner })
+                    }
+                },
+            })
     }
 
     pub fn accept_mount_receipt(
         &mut self,
         receipt: MountReceiptAttestation,
-    ) -> Result<MountRegistrationPermit, IntegrationError> {
+    ) -> Result<MountRegistrationPermit, AcceptMountReceiptError> {
         self.inner
             .accept_mount_receipt(receipt.inner)
             .map(MountRegistrationPermit::sealed)
-            .map_err(map_mount_error)
+            .map_err(|error| AcceptMountReceiptError {
+                kind: map_mount_error(error.kind()),
+                owner: MountReceiptAttestation {
+                    inner: error.into_owner(),
+                },
+            })
     }
 
     pub fn begin_mount_registration<'engine>(
@@ -888,6 +1065,42 @@ impl RouterEngine {
             .map_err(map_report_error)
     }
 
+    #[doc(hidden)]
+    pub fn inspect_report_identity(&self, task: &RootFrameTask) -> Result<(), IntegrationError> {
+        self.inner
+            .inspect_view_report_identity(task.inner.identity())
+            .map_err(map_report_error)
+    }
+
+    #[doc(hidden)]
+    pub fn expected_child_outlet(
+        &self,
+        task: &RootFrameTask,
+    ) -> Result<Option<RouteSlotKey>, IntegrationError> {
+        self.inner
+            .expected_child_outlet(task.inner.identity())
+            .map_err(map_report_error)
+    }
+
+    #[doc(hidden)]
+    pub fn validate_mount_request(&self, request: &MountRequest) -> Result<(), IntegrationError> {
+        self.inner
+            .validate_mount_request(&request.inner)
+            .map_err(map_mount_error)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn testing_exhaust_slot_counter(&mut self) {
+        self.inner.testing_exhaust_slot_counter();
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn testing_set_mount_receipt_context_live(&mut self, live: bool) {
+        self.inner.testing_set_mount_receipt_context_live(live);
+    }
+
     pub fn report_failed(
         &mut self,
         task: RootFrameTask,
@@ -909,16 +1122,46 @@ impl RouterEngine {
     }
 
     #[doc(hidden)]
+    pub fn report_failed_with_physical_residual(
+        &mut self,
+        task: RootFrameTask,
+        kind: ViewFailureKind,
+        message: &'static str,
+    ) -> Result<FailureCleanupRequest, IntegrationError> {
+        let kind = match kind {
+            ViewFailureKind::Build => NavigationFailureKind::Build,
+            ViewFailureKind::Apply => NavigationFailureKind::Apply,
+        };
+        self.inner
+            .begin_view_report(task.inner.identity())
+            .map(|session| FailureCleanupRequest {
+                inner: session.failed_with_physical_residual(NavigationFailure::new(kind, message)),
+            })
+            .map_err(map_report_error)
+    }
+
+    #[cfg(test)]
+    #[doc(hidden)]
     pub fn prepare_failure_cleanup(
         &mut self,
         request: FailureCleanupRequest,
         manifest: CleanupManifest,
     ) -> Result<CleanupBatch, IntegrationError> {
+        self.prepare_failure_cleanup_retaining(request, manifest)
+            .map_err(|error| error.kind())
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_failure_cleanup_retaining(
+        &mut self,
+        request: FailureCleanupRequest,
+        manifest: CleanupManifest,
+    ) -> Result<CleanupBatch, PrepareFailureCleanupError> {
         let manifest_digest = manifest.manifest_digest;
         let obligation_count = manifest.obligation_count;
         let inner = self
             .inner
-            .prepare_failure_cleanup(
+            .prepare_failure_cleanup_retaining(
                 request.inner,
                 CleanupManifestSeal::new(
                     manifest.logical_roots,
@@ -926,7 +1169,12 @@ impl RouterEngine {
                     obligation_count,
                 ),
             )
-            .map_err(map_failure_cleanup_error)?;
+            .map_err(|error| PrepareFailureCleanupError {
+                kind: map_failure_cleanup_error(error.kind()),
+                owner: FailureCleanupRequest {
+                    inner: error.into_owner(),
+                },
+            })?;
         Ok(CleanupBatch {
             inner,
             manifest_digest,
@@ -1158,6 +1406,21 @@ mod tests {
         engine
     }
 
+    fn pending_mount_request(engine: &mut RouterEngine) -> MountRequest {
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("parent frame task expected")
+        };
+        engine
+            .report_applied_with_outlets(parent, vec![RouteSlotKey::default()])
+            .unwrap();
+        let EngineAction::MountRequest(request) = engine.action().unwrap() else {
+            panic!("mount request expected")
+        };
+        request
+    }
+
     fn pending_nested_receipt(engine: &mut RouterEngine, digest: u64) -> MountReceiptAttestation {
         engine.push(RouteLocation::new("/items/1")).unwrap();
         engine.collect();
@@ -1378,13 +1641,376 @@ mod tests {
     }
 
     #[test]
+    fn expected_child_outlet_query_is_exact_and_read_only_for_foreign_and_stale_tasks() {
+        let mut receiver = confirmed_nested_engine();
+        receiver.push(RouteLocation::new("/items/1")).unwrap();
+        receiver.collect();
+        let EngineAction::FrameTask(parent) = receiver.action().unwrap() else {
+            panic!("parent frame task expected")
+        };
+        let stale_parent = FrameTask {
+            inner: parent.inner.testing_duplicate(),
+        };
+        let before_exact = receiver.inner.testing_snapshot();
+        assert_eq!(
+            receiver.expected_child_outlet(&parent),
+            Ok(Some(RouteSlotKey::default()))
+        );
+        assert_eq!(receiver.inner.testing_snapshot(), before_exact);
+
+        let mut foreign = confirmed_nested_engine();
+        foreign.push(RouteLocation::new("/items/1")).unwrap();
+        foreign.collect();
+        let EngineAction::FrameTask(foreign_parent) = foreign.action().unwrap() else {
+            panic!("foreign parent frame task expected")
+        };
+        assert_eq!(parent.frame().slot(), foreign_parent.frame().slot());
+        let before_foreign = receiver.inner.testing_snapshot();
+        assert_eq!(
+            receiver.expected_child_outlet(&foreign_parent),
+            Err(IntegrationError::Invalid)
+        );
+        assert_eq!(receiver.inner.testing_snapshot(), before_foreign);
+
+        receiver
+            .report_applied_with_outlets(parent, vec![RouteSlotKey::default()])
+            .unwrap();
+        let before_stale = receiver.inner.testing_snapshot();
+        assert_eq!(
+            receiver.expected_child_outlet(&stale_parent),
+            Err(IntegrationError::Duplicate)
+        );
+        assert_eq!(receiver.inner.testing_snapshot(), before_stale);
+
+        let EngineAction::MountRequest(mount) = receiver.action().unwrap() else {
+            panic!("parent report must retain the mount request")
+        };
+        let receipt = receiver.resolve_mount(mount).unwrap().attest_receipt(401);
+        let completion = receiver
+            .accept_mount_receipt(receipt)
+            .unwrap()
+            .complete(409);
+        receiver.complete_mount_registration(completion).unwrap();
+        let EngineAction::FrameTask(child) = receiver.action().unwrap() else {
+            panic!("completed mount must issue the leaf task")
+        };
+        let before_leaf = receiver.inner.testing_snapshot();
+        assert_eq!(receiver.expected_child_outlet(&child), Ok(None));
+        assert_eq!(receiver.inner.testing_snapshot(), before_leaf);
+    }
+
+    #[test]
+    fn report_identity_inspection_is_read_only_for_foreign_duplicate_and_stale_tasks() {
+        let mut receiver = confirmed_nested_engine();
+        receiver.push(RouteLocation::new("/items/1")).unwrap();
+        receiver.collect();
+        let EngineAction::FrameTask(parent) = receiver.action().unwrap() else {
+            panic!("parent frame task expected")
+        };
+        let stale_parent = FrameTask {
+            inner: parent.inner.testing_duplicate(),
+        };
+        let before_exact = receiver.inner.testing_snapshot();
+        assert_eq!(receiver.inspect_report_identity(&parent), Ok(()));
+        assert_eq!(receiver.inner.testing_snapshot(), before_exact);
+
+        let mut foreign = confirmed_nested_engine();
+        foreign.push(RouteLocation::new("/items/1")).unwrap();
+        foreign.collect();
+        let EngineAction::FrameTask(foreign_parent) = foreign.action().unwrap() else {
+            panic!("foreign parent frame task expected")
+        };
+        let before_foreign = receiver.inner.testing_snapshot();
+        assert_eq!(
+            receiver.inspect_report_identity(&foreign_parent),
+            Err(IntegrationError::Invalid)
+        );
+        assert_eq!(receiver.inner.testing_snapshot(), before_foreign);
+
+        receiver
+            .report_applied_with_outlets(parent, vec![RouteSlotKey::default()])
+            .unwrap();
+        let before_duplicate = receiver.inner.testing_snapshot();
+        assert_eq!(
+            receiver.inspect_report_identity(&stale_parent),
+            Err(IntegrationError::Duplicate)
+        );
+        assert_eq!(receiver.inner.testing_snapshot(), before_duplicate);
+
+        let EngineAction::MountRequest(mount) = receiver.action().unwrap() else {
+            panic!("parent report must retain the mount request")
+        };
+        let receipt = receiver.resolve_mount(mount).unwrap().attest_receipt(421);
+        let completion = receiver
+            .accept_mount_receipt(receipt)
+            .unwrap()
+            .complete(431);
+        receiver.complete_mount_registration(completion).unwrap();
+        let EngineAction::FrameTask(_child) = receiver.action().unwrap() else {
+            panic!("completed mount must issue the leaf task")
+        };
+        let before_stale = receiver.inner.testing_snapshot();
+        assert_eq!(
+            receiver.inspect_report_identity(&stale_parent),
+            Err(IntegrationError::Stale)
+        );
+        assert_eq!(receiver.inner.testing_snapshot(), before_stale);
+    }
+
+    #[test]
+    fn mount_request_validation_is_exact_and_read_only_for_foreign_and_stale_tokens() {
+        fn pending_mount(engine: &mut RouterEngine) -> MountRequest {
+            engine.push(RouteLocation::new("/items/1")).unwrap();
+            engine.collect();
+            let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+                panic!("parent frame task expected")
+            };
+            engine
+                .report_applied_with_outlets(parent, vec![RouteSlotKey::default()])
+                .unwrap();
+            let EngineAction::MountRequest(request) = engine.action().unwrap() else {
+                panic!("mount request expected")
+            };
+            request
+        }
+
+        let mut receiver = confirmed_nested_engine();
+        let exact = pending_mount(&mut receiver);
+        let stale = MountRequest {
+            inner: exact.inner.testing_duplicate(),
+        };
+        let before_exact = receiver.inner.testing_snapshot();
+        assert_eq!(receiver.validate_mount_request(&exact), Ok(()));
+        assert_eq!(receiver.inner.testing_snapshot(), before_exact);
+
+        let mut foreign = confirmed_nested_engine();
+        let foreign = pending_mount(&mut foreign);
+        assert_eq!(exact.parent().slot(), foreign.parent().slot());
+        let before_foreign = receiver.inner.testing_snapshot();
+        assert_eq!(
+            receiver.validate_mount_request(&foreign),
+            Err(IntegrationError::ForeignRouter)
+        );
+        assert_eq!(receiver.inner.testing_snapshot(), before_foreign);
+
+        receiver.resolve_mount(exact).unwrap();
+        let before_stale = receiver.inner.testing_snapshot();
+        assert_eq!(
+            receiver.validate_mount_request(&stale),
+            Err(IntegrationError::Stale)
+        );
+        assert_eq!(receiver.inner.testing_snapshot(), before_stale);
+    }
+
+    #[test]
+    fn foreign_mount_resolution_returns_request_to_source_without_receiver_write() {
+        let mut source = confirmed_nested_engine();
+        let request = pending_mount_request(&mut source);
+        let mut receiver = confirmed_nested_engine();
+        let before = receiver.inner.testing_snapshot();
+
+        let error = match receiver.resolve_mount(request) {
+            Ok(_) => panic!("a foreign mount request must not resolve"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), IntegrationError::ForeignRouter);
+        let request = match error.into_owner() {
+            ResolveMountOwner::Returned(request) => request,
+            ResolveMountOwner::Reissued => {
+                panic!("a foreign request remains owned by the caller")
+            }
+        };
+        assert_eq!(receiver.inner.testing_snapshot(), before);
+        assert!(source.resolve_mount(request).is_ok());
+    }
+
+    #[test]
+    fn exhausted_mount_resolution_reports_core_reissued_request() {
+        let mut engine = confirmed_nested_engine();
+        let request = pending_mount_request(&mut engine);
+        engine.inner.testing_exhaust_slot_counter();
+        let before = engine.snapshot();
+
+        let error = match engine.resolve_mount(request) {
+            Ok(_) => panic!("an exhausted slot allocator must not issue a grant"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), IntegrationError::Exhausted);
+        assert!(matches!(error.into_owner(), ResolveMountOwner::Reissued));
+        let Some(EngineAction::MountRequest(reissued)) = engine.action() else {
+            panic!("Core must reissue the exact exhausted request")
+        };
+        assert!(engine.validate_mount_request(&reissued).is_ok());
+        assert_eq!(engine.snapshot(), before);
+    }
+
+    #[test]
+    fn foreign_mount_rejection_returns_request_to_source_without_receiver_write() {
+        let mut source = confirmed_nested_engine();
+        let request = pending_mount_request(&mut source);
+        let mut receiver = confirmed_nested_engine();
+        let before = receiver.inner.testing_snapshot();
+
+        let error = match receiver.reject_mount(request, MountRejectionKind::MissingOutlet) {
+            Ok(_) => panic!("a foreign mount request must not reject receiver work"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), IntegrationError::ForeignRouter);
+        let request = error.into_owner();
+        assert_eq!(receiver.inner.testing_snapshot(), before);
+        assert!(
+            source
+                .reject_mount(request, MountRejectionKind::MissingOutlet)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn foreign_mount_receipt_returns_attestation_to_source_without_receiver_write() {
+        let mut source = confirmed_nested_engine();
+        let receipt = pending_nested_receipt(&mut source, 439);
+        let mut receiver = confirmed_nested_engine();
+        let before = receiver.inner.testing_snapshot();
+
+        let error = match receiver.accept_mount_receipt(receipt) {
+            Ok(_) => panic!("a foreign receipt must not open receiver registration"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), IntegrationError::ForeignRouter);
+        let receipt = error.into_owner();
+        assert_eq!(receiver.inner.testing_snapshot(), before);
+        assert!(source.accept_mount_receipt(receipt).is_ok());
+    }
+
+    #[test]
+    fn returned_exact_mount_receipt_is_unique_grant_stage_rejection_authority() {
+        let mut source = confirmed_nested_engine();
+        let receipt = pending_nested_receipt(&mut source, 440);
+        let replay = MountReceiptAttestation {
+            inner: receipt.inner.clone(),
+        };
+        let mut receiver = confirmed_nested_engine();
+        let error = match receiver.accept_mount_receipt(receipt) {
+            Ok(_) => panic!("a foreign receipt must not open receiver registration"),
+            Err(error) => error,
+        };
+        let receipt = error.into_owner();
+
+        assert!(
+            source
+                .reject_mount_after_mutation(MountMutationArtifact::Receipt(receipt))
+                .is_ok()
+        );
+        let settled = source.inner.testing_snapshot();
+        let error = match source.reject_mount_after_mutation(MountMutationArtifact::Receipt(replay))
+        {
+            Ok(_) => panic!("a consumed receipt must not reject twice"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), IntegrationError::Stale);
+        assert!(matches!(
+            error.into_owner(),
+            MountMutationArtifact::Receipt(_)
+        ));
+        assert_eq!(source.inner.testing_snapshot(), settled);
+    }
+
+    #[test]
+    fn foreign_mount_receipt_rejection_returns_artifact_without_receiver_write() {
+        let mut source = confirmed_nested_engine();
+        let receipt = pending_nested_receipt(&mut source, 441);
+        let mut receiver = confirmed_nested_engine();
+        let before = receiver.inner.testing_snapshot();
+
+        let error =
+            match receiver.reject_mount_after_mutation(MountMutationArtifact::Receipt(receipt)) {
+                Ok(_) => panic!("a foreign receipt must not reject receiver work"),
+                Err(error) => error,
+            };
+
+        assert_eq!(error.kind(), IntegrationError::ForeignRouter);
+        let artifact = error.into_owner();
+        assert!(matches!(artifact, MountMutationArtifact::Receipt(_)));
+        assert_eq!(receiver.inner.testing_snapshot(), before);
+        assert!(source.reject_mount_after_mutation(artifact).is_ok());
+    }
+
+    #[test]
+    fn accepted_mount_receipt_cannot_reject_the_confirming_stage() {
+        let mut engine = confirmed_nested_engine();
+        let receipt = pending_nested_receipt(&mut engine, 442);
+        let stale = MountReceiptAttestation {
+            inner: receipt.inner.clone(),
+        };
+        let _permit = engine.accept_mount_receipt(receipt).unwrap();
+        let before = engine.inner.testing_snapshot();
+
+        let error = match engine.reject_mount_after_mutation(MountMutationArtifact::Receipt(stale))
+        {
+            Ok(_) => panic!("an accepted receipt must not reject confirming work"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), IntegrationError::Stale);
+        assert!(matches!(
+            error.into_owner(),
+            MountMutationArtifact::Receipt(_)
+        ));
+        assert_eq!(engine.inner.testing_snapshot(), before);
+    }
+
+    #[test]
+    fn foreign_mount_grant_rejection_returns_artifact_to_source_without_receiver_write() {
+        let mut source = confirmed_nested_engine();
+        let request = pending_mount_request(&mut source);
+        let grant = source.resolve_mount(request).unwrap();
+        let mut receiver = confirmed_nested_engine();
+        let before = receiver.inner.testing_snapshot();
+
+        let error = match receiver.reject_mount_after_mutation(MountMutationArtifact::Grant(grant))
+        {
+            Ok(_) => panic!("a foreign grant must not reject receiver work"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), IntegrationError::ForeignRouter);
+        let artifact = error.into_owner();
+        assert_eq!(receiver.inner.testing_snapshot(), before);
+        assert!(source.reject_mount_after_mutation(artifact).is_ok());
+    }
+
+    #[test]
+    fn foreign_mount_permit_rejection_returns_artifact_to_source_without_receiver_write() {
+        let mut source = confirmed_nested_engine();
+        let (_, _, _, permit, _) = pending_mount_registration(&mut source, "/items/1", 443);
+        let mut receiver = confirmed_nested_engine();
+        let before = receiver.inner.testing_snapshot();
+
+        let error = match receiver
+            .reject_mount_after_mutation(MountMutationArtifact::RegistrationPermit(permit))
+        {
+            Ok(_) => panic!("a foreign permit must not reject receiver work"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), IntegrationError::ForeignRouter);
+        let artifact = error.into_owner();
+        assert_eq!(receiver.inner.testing_snapshot(), before);
+        assert!(source.reject_mount_after_mutation(artifact).is_ok());
+    }
+
+    #[test]
     fn foreign_mount_receipt_and_completion_are_stable_in_idle_and_terminal_receivers() {
         let mut idle_receipt_receiver = confirmed_nested_engine();
         let mut receipt_source = confirmed_nested_engine();
         let foreign_receipt = pending_nested_receipt(&mut receipt_source, 251);
         assert!(matches!(
             idle_receipt_receiver.accept_mount_receipt(foreign_receipt),
-            Err(IntegrationError::ForeignRouter)
+            Err(error) if error.kind() == IntegrationError::ForeignRouter
         ));
 
         let mut terminal_receipt_receiver = confirmed_nested_engine();
@@ -1393,7 +2019,7 @@ mod tests {
         let foreign_receipt = pending_nested_receipt(&mut terminal_receipt_source, 257);
         assert!(matches!(
             terminal_receipt_receiver.accept_mount_receipt(foreign_receipt),
-            Err(IntegrationError::ForeignRouter)
+            Err(error) if error.kind() == IntegrationError::ForeignRouter
         ));
 
         let mut idle_completion_receiver = confirmed_nested_engine();
@@ -1426,7 +2052,7 @@ mod tests {
         let after_receipt = engine.snapshot();
         assert!(matches!(
             engine.accept_mount_receipt(receipt_replay),
-            Err(IntegrationError::Stale)
+            Err(error) if error.kind() == IntegrationError::Stale
         ));
         assert_eq!(engine.snapshot(), after_receipt);
 
@@ -1580,6 +2206,116 @@ mod tests {
             Err(IntegrationError::ForeignRouter)
         ));
         assert_eq!(receiver.snapshot(), before);
+    }
+
+    #[test]
+    fn retaining_failure_cleanup_returns_foreign_request_without_receiver_mutation() {
+        let mut source = confirmed_nested_engine();
+        source.push(RouteLocation::new("/items/1")).unwrap();
+        source.collect();
+        let EngineAction::FrameTask(parent) = source.action().unwrap() else {
+            panic!("parent task expected")
+        };
+        source
+            .report_applied_with_outlets(parent, Vec::new())
+            .unwrap();
+        let EngineAction::MountRequest(mount) = source.action().unwrap() else {
+            panic!("mount request expected")
+        };
+        let failure = source
+            .reject_mount(mount, MountRejectionKind::MissingOutlet)
+            .unwrap();
+        let request = failure.request();
+        let roots = failure.logical_roots().to_vec();
+
+        let mut receiver = confirmed_nested_engine();
+        let before = receiver.snapshot();
+        let error = match receiver
+            .prepare_failure_cleanup_retaining(failure, CleanupManifest::new(roots.clone(), 229, 1))
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a foreign cleanup request must be retained"),
+        };
+
+        assert_eq!(error.kind(), IntegrationError::ForeignRouter);
+        let retained = error.into_owner();
+        assert_eq!(retained.request(), request);
+        assert_eq!(retained.logical_roots(), roots);
+        assert_eq!(receiver.snapshot(), before);
+    }
+
+    #[test]
+    fn retaining_failure_cleanup_returns_stale_request_without_engine_mutation() {
+        let mut engine = confirmed_nested_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("parent task expected")
+        };
+        engine
+            .report_applied_with_outlets(parent, Vec::new())
+            .unwrap();
+        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
+            panic!("mount request expected")
+        };
+        let failure = engine
+            .reject_mount(mount, MountRejectionKind::MissingOutlet)
+            .unwrap();
+        let stale = FailureCleanupRequest {
+            inner: failure.inner.testing_duplicate(),
+        };
+        let roots = failure.logical_roots().to_vec();
+        engine
+            .prepare_failure_cleanup(failure, CleanupManifest::new(roots.clone(), 231, 1))
+            .unwrap();
+        let before = engine.snapshot();
+
+        let error = match engine
+            .prepare_failure_cleanup_retaining(stale, CleanupManifest::new(roots.clone(), 233, 1))
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a stale cleanup request must be retained"),
+        };
+
+        assert_eq!(error.kind(), IntegrationError::Stale);
+        let retained = error.into_owner();
+        assert_eq!(retained.logical_roots(), roots);
+        assert_eq!(engine.snapshot(), before);
+    }
+
+    #[test]
+    fn retaining_failure_cleanup_returns_invalid_manifest_request_without_engine_mutation() {
+        let mut engine = confirmed_nested_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("parent task expected")
+        };
+        engine
+            .report_applied_with_outlets(parent, Vec::new())
+            .unwrap();
+        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
+            panic!("mount request expected")
+        };
+        let failure = engine
+            .reject_mount(mount, MountRejectionKind::MissingOutlet)
+            .unwrap();
+        let request = failure.request();
+        let roots = failure.logical_roots().to_vec();
+        let before = engine.snapshot();
+
+        let error = match engine
+            .prepare_failure_cleanup_retaining(failure, CleanupManifest::new(Vec::new(), 237, 1))
+        {
+            Err(error) => error,
+            Ok(_) => panic!("an invalid cleanup manifest must retain its request"),
+        };
+
+        assert_eq!(error.kind(), IntegrationError::InvalidManifest);
+        let retained = error.into_owner();
+        assert_eq!(retained.request(), request);
+        assert_eq!(retained.logical_roots(), roots);
+        assert_eq!(engine.snapshot(), before);
     }
 
     #[test]
@@ -2057,6 +2793,46 @@ mod tests {
             fallback.input().failure().map(NavigationFailure::kind),
             Some(NavigationFailureKind::Build)
         );
+    }
+
+    #[test]
+    fn physical_root_residual_requires_sealed_cleanup_before_fallback() {
+        let (mut engine, grant) = ready_engine();
+        engine.confirm_host(grant);
+        let request = engine.push(RouteLocation::new("/")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(normal) = engine.action().unwrap() else {
+            panic!("normal root task expected")
+        };
+
+        let failure = engine
+            .report_failed_with_physical_residual(
+                normal,
+                ViewFailureKind::Apply,
+                "partial root apply failed",
+            )
+            .unwrap();
+        assert!(failure.logical_roots().is_empty());
+        assert!(engine.action().is_none());
+        let cleanup = engine
+            .prepare_failure_cleanup(failure, CleanupManifest::new(Vec::new(), 0x51_45_41_4c, 2))
+            .unwrap();
+        assert_eq!(cleanup.obligation_count(), 2);
+        assert!(engine.action().is_none());
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::CleanupPending)
+        );
+
+        engine
+            .complete_cleanup(cleanup.complete(0x43_4f_4d_50, 2))
+            .unwrap();
+
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::Recovering)
+        );
+        assert!(matches!(engine.action(), Some(EngineAction::FrameTask(_))));
     }
 
     #[test]

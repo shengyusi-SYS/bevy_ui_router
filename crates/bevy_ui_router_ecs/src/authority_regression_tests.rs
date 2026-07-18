@@ -5,6 +5,7 @@ use bevy_ecs::{
     lifecycle::HookContext,
     prelude::{Entity, Resource},
 };
+use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
 use bevy_ui::Node;
 use bevy_ui_router_core::prelude::{
@@ -19,6 +20,7 @@ use crate::{
     SolidRect, ViewBuildReport,
     cleanup::CleanupAttempt,
     components::RouterInputBarrier,
+    input::RouteFocusState,
     navigation::{
         RouterNavigation, collect_navigation_system, commit_presentation_system,
         drive_navigation_system, observe_authority_system, settle_cleanup_system,
@@ -183,7 +185,7 @@ fn begin_replacement(harness: &mut Harness) -> (Leaving, NavigationRequestId) {
         let navigation = harness.app.world().resource::<RouterNavigation>();
         let frame = navigation.entries[0].active.as_ref().unwrap();
         Leaving {
-            shell: frame.shell(),
+            shell: frame.first_frame().unwrap().shell(),
             output: frame.interactive_entities()[0],
             entities: frame.claims().map(|claim| claim.entity()).collect(),
         }
@@ -315,8 +317,8 @@ fn pending_cycle_rejects_without_touching_active() {
         let navigation = app.world().resource::<RouterNavigation>();
         let active = navigation.entries[0].active.as_ref().unwrap();
         (
-            active.frame().clone(),
-            active.shell(),
+            active.first_frame().unwrap().frame().clone(),
+            active.first_frame().unwrap().shell(),
             active.interactive_entities(),
             active.claims().cloned().collect::<Vec<_>>(),
         )
@@ -350,8 +352,8 @@ fn pending_cycle_rejects_without_touching_active() {
     let active = entry.active.as_ref().unwrap();
     assert_eq!(
         (
-            active.frame().clone(),
-            active.shell(),
+            active.first_frame().unwrap().frame().clone(),
+            active.first_frame().unwrap().shell(),
             active.interactive_entities(),
             active.claims().cloned().collect::<Vec<_>>(),
         ),
@@ -403,6 +405,7 @@ fn stale_report_identity_is_zero_write() {
 #[test]
 fn structural_outputs_have_locked_manifest_and_topology() {
     crate::presentation::tests::realization_is_stable_registered_and_inert();
+    crate::cleanup::tests::external_frame_output_value_and_manifest_drift_is_zero_write_and_retains_focus();
 }
 
 #[test]
@@ -464,6 +467,184 @@ fn post_commit_cleanup_drift_supersedes_attempt() {
             .record(leaving.shell)
             .is_some()
     );
+}
+
+#[test]
+fn exact_owned_cleanup_cycle_is_world_zero_and_retains_authority() {
+    let mut harness = harness("exact-owned-cleanup-cycle");
+    first_push(&mut harness);
+    let (leaving, request) = begin_replacement(&mut harness);
+    let cycle_child = leaving.output;
+    let cycle_parent = harness
+        .app
+        .world()
+        .get::<ChildOf>(cycle_child)
+        .map(ChildOf::parent)
+        .expect("frame output must have an exact-owned parent");
+    assert!(leaving.entities.contains(&cycle_parent));
+    harness
+        .app
+        .world_mut()
+        .entity_mut(cycle_parent)
+        .insert(ChildOf(cycle_child));
+    harness.app.world_mut().flush();
+    assert_eq!(
+        harness
+            .app
+            .world()
+            .get::<ChildOf>(cycle_parent)
+            .map(ChildOf::parent),
+        Some(cycle_child)
+    );
+    assert_eq!(
+        harness
+            .app
+            .world()
+            .get::<ChildOf>(cycle_child)
+            .map(ChildOf::parent),
+        Some(cycle_parent)
+    );
+
+    *harness.app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(cycle_parent);
+    harness
+        .app
+        .world_mut()
+        .resource_mut::<RouteFocusState>()
+        .set_focused(Some(cycle_parent));
+    let records_before = harness
+        .app
+        .world()
+        .resource::<RouteEntityRegistry>()
+        .records()
+        .to_vec();
+    let parents_before = leaving
+        .entities
+        .iter()
+        .map(|entity| {
+            (
+                *entity,
+                harness
+                    .app
+                    .world()
+                    .get::<ChildOf>(*entity)
+                    .map(ChildOf::parent),
+            )
+        })
+        .collect::<Vec<_>>();
+    let children_before = leaving
+        .entities
+        .iter()
+        .map(|entity| {
+            (
+                *entity,
+                harness
+                    .app
+                    .world()
+                    .get::<Children>(*entity)
+                    .map(|children| children.iter().copied().collect::<Vec<_>>()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let leases_before = harness
+        .app
+        .world()
+        .resource::<QuarantineLeaseTable>()
+        .leases()
+        .len();
+    let unresolved_before = harness
+        .app
+        .world()
+        .resource::<QuarantineLeaseTable>()
+        .unresolved_residuals()
+        .len();
+    let attempt = issue_attempt(&mut harness);
+
+    assert!(!settle_attempt(&mut harness, attempt));
+
+    assert_eq!(
+        harness.app.world().resource::<InputFocus>().get(),
+        Some(cycle_parent)
+    );
+    assert_eq!(
+        harness.app.world().resource::<RouteFocusState>().focused(),
+        Some(cycle_parent)
+    );
+    assert_eq!(receipt_count(&harness), 0);
+    assert_eq!(
+        harness
+            .app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records(),
+        records_before
+    );
+    assert_eq!(
+        harness
+            .app
+            .world()
+            .resource::<QuarantineLeaseTable>()
+            .leases()
+            .len(),
+        leases_before
+    );
+    assert_eq!(
+        harness
+            .app
+            .world()
+            .resource::<QuarantineLeaseTable>()
+            .unresolved_residuals()
+            .len(),
+        unresolved_before
+    );
+    assert!(
+        leaving
+            .entities
+            .iter()
+            .all(|entity| harness.app.world().get_entity(*entity).is_ok())
+    );
+    assert_eq!(
+        leaving
+            .entities
+            .iter()
+            .map(|entity| {
+                (
+                    *entity,
+                    harness
+                        .app
+                        .world()
+                        .get::<ChildOf>(*entity)
+                        .map(ChildOf::parent),
+                )
+            })
+            .collect::<Vec<_>>(),
+        parents_before
+    );
+    assert_eq!(
+        leaving
+            .entities
+            .iter()
+            .map(|entity| {
+                (
+                    *entity,
+                    harness
+                        .app
+                        .world()
+                        .get::<Children>(*entity)
+                        .map(|children| children.iter().copied().collect::<Vec<_>>()),
+                )
+            })
+            .collect::<Vec<_>>(),
+        children_before
+    );
+    let entry = &harness.app.world().resource::<RouterNavigation>().entries[0];
+    let ledger = entry.cleanup_ledger.as_ref().unwrap();
+    assert!(!ledger.leaving_frames().is_empty());
+    assert!(ledger.pending_completion().is_none());
+    assert!(matches!(
+        entry.engine.request(request).unwrap().status(),
+        RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+    ));
+    crate::navigation::tests::failed_branch_relationship_cycle_is_world_zero_and_retains_focus();
 }
 
 #[test]
@@ -672,7 +853,7 @@ fn cleanup_observer_reentry_supersedes_attempt() {
         let navigation = harness.app.world().resource::<RouterNavigation>();
         let frame = navigation.entries[0].active.as_ref().unwrap();
         Leaving {
-            shell: frame.shell(),
+            shell: frame.first_frame().unwrap().shell(),
             output: frame.interactive_entities()[0],
             entities: frame.claims().map(|claim| claim.entity()).collect(),
         }

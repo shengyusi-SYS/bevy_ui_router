@@ -363,6 +363,80 @@ fn mount_receipt_proof_and_registration_session_are_not_clone() {
             features: &[],
             expected_stderr: &["error[E0277]", "trait `Clone` is not implemented"],
         },
+        Fixture {
+            name: "resolve_mount_owner_not_clone",
+            code: "use bevy_ui_router_core::integration::ResolveMountOwner; fn require_clone<T: Clone>() {} fn main() { require_clone::<ResolveMountOwner>(); }",
+            features: &[],
+            expected_stderr: &["error[E0277]", "trait `Clone` is not implemented"],
+        },
+        Fixture {
+            name: "resolve_mount_error_not_clone",
+            code: "use bevy_ui_router_core::integration::ResolveMountError; fn require_clone<T: Clone>() {} fn main() { require_clone::<ResolveMountError>(); }",
+            features: &[],
+            expected_stderr: &["error[E0277]", "trait `Clone` is not implemented"],
+        },
+        Fixture {
+            name: "reject_mount_error_not_clone",
+            code: "use bevy_ui_router_core::integration::RejectMountError; fn require_clone<T: Clone>() {} fn main() { require_clone::<RejectMountError>(); }",
+            features: &[],
+            expected_stderr: &["error[E0277]", "trait `Clone` is not implemented"],
+        },
+        Fixture {
+            name: "accept_mount_receipt_error_not_clone",
+            code: "use bevy_ui_router_core::integration::AcceptMountReceiptError; fn require_clone<T: Clone>() {} fn main() { require_clone::<AcceptMountReceiptError>(); }",
+            features: &[],
+            expected_stderr: &["error[E0277]", "trait `Clone` is not implemented"],
+        },
+        Fixture {
+            name: "reject_mount_mutation_error_not_clone",
+            code: "use bevy_ui_router_core::integration::RejectMountMutationError; fn require_clone<T: Clone>() {} fn main() { require_clone::<RejectMountMutationError>(); }",
+            features: &[],
+            expected_stderr: &["error[E0277]", "trait `Clone` is not implemented"],
+        },
+        Fixture {
+            name: "prepare_failure_cleanup_error_not_clone",
+            code: "use bevy_ui_router_core::integration::PrepareFailureCleanupError; fn require_clone<T: Clone>() {} fn main() { require_clone::<PrepareFailureCleanupError>(); }",
+            features: &[],
+            expected_stderr: &["error[E0277]", "trait `Clone` is not implemented"],
+        },
+    ] {
+        assert_compile_fails(fixture);
+    }
+}
+
+#[test]
+fn consumer_cannot_construct_mount_capability_errors() {
+    for fixture in [
+        Fixture {
+            name: "resolve_mount_error_fields_private",
+            code: "use bevy_ui_router_core::integration::{IntegrationError, ResolveMountError}; fn main() { let _ = ResolveMountError { kind: IntegrationError::Invalid, owner: panic!() }; }",
+            features: &[],
+            expected_stderr: &["error[E0451]", "private"],
+        },
+        Fixture {
+            name: "reject_mount_error_fields_private",
+            code: "use bevy_ui_router_core::integration::{IntegrationError, RejectMountError}; fn main() { let _ = RejectMountError { kind: IntegrationError::Invalid, owner: panic!() }; }",
+            features: &[],
+            expected_stderr: &["error[E0451]", "private"],
+        },
+        Fixture {
+            name: "accept_mount_receipt_error_fields_private",
+            code: "use bevy_ui_router_core::integration::{AcceptMountReceiptError, IntegrationError}; fn main() { let _ = AcceptMountReceiptError { kind: IntegrationError::Invalid, owner: panic!() }; }",
+            features: &[],
+            expected_stderr: &["error[E0451]", "private"],
+        },
+        Fixture {
+            name: "reject_mount_mutation_error_fields_private",
+            code: "use bevy_ui_router_core::integration::{IntegrationError, RejectMountMutationError}; fn main() { let _ = RejectMountMutationError { kind: IntegrationError::Invalid, owner: panic!() }; }",
+            features: &[],
+            expected_stderr: &["error[E0451]", "private"],
+        },
+        Fixture {
+            name: "prepare_failure_cleanup_error_fields_private",
+            code: "use bevy_ui_router_core::integration::{IntegrationError, PrepareFailureCleanupError}; fn main() { let _ = PrepareFailureCleanupError { kind: IntegrationError::Invalid, owner: panic!() }; }",
+            features: &[],
+            expected_stderr: &["error[E0451]", "private"],
+        },
     ] {
         assert_compile_fails(fixture);
     }

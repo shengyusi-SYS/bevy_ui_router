@@ -8,6 +8,7 @@ use bevy_ui_router_core::{
     HostVersion,
     frame::RouteFrameVersion,
     ids::{NavigationRequestId, RouteSlotId},
+    integration::host_version_matches_frame,
     slot::RouteSlotKey,
 };
 
@@ -18,7 +19,10 @@ use crate::{
     host::validated_host_candidate_is_current,
     input::{RouteFocusState, RouterInputGate},
     navigation::RouterEntry,
-    presentation::{FrameLifecycle, RealizedFrame, validate_active_frame, validate_realized_frame},
+    presentation::{
+        FrameLifecycle, RealizedFrame, validate_active_frame,
+        validate_realized_frame_with_child_slots,
+    },
     registry::{
         EntityLifecycle, EntityOwner, QuarantineLeaseTable, RegistryOwner, RouteEntityRegistry,
     },
@@ -445,15 +449,19 @@ impl RouterAuthorityAudits {
         for entry in entries {
             let namespace = self.ensure_namespace(entry.handle);
             let request = entry.engine.snapshot().running_request();
-            let known_frames = [
-                entry.pending_frame(),
-                entry.active.as_ref(),
-                entry.leaving_frame(),
-            ]
-            .into_iter()
-            .flatten()
-            .map(|frame| frame.frame().clone())
-            .collect::<Vec<_>>();
+            let known_frames = entry
+                .pending_frames()
+                .chain(
+                    entry
+                        .active
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|branch| branch.frames()),
+                )
+                .chain(entry.leaving_cleanup_frames())
+                .chain(entry.failed_cleanup_frames())
+                .map(|frame| frame.frame().clone())
+                .collect::<Vec<_>>();
             let previous = self.snapshots.iter().find_map(|(handle, snapshot)| {
                 (*handle == entry.handle).then_some(snapshot.clone())
             });
@@ -561,17 +569,44 @@ impl RouterAuthorityAudits {
             let mut frames = Vec::new();
             let mut content = Vec::new();
             let mut samples = Vec::new();
-            for (frame, lifecycle) in [
-                (
-                    entry.pending_frame(),
-                    AuthorityFrameLifecycle::PreparedInert,
-                ),
-                (entry.active.as_ref(), AuthorityFrameLifecycle::Active),
-                (entry.leaving_frame(), AuthorityFrameLifecycle::LeavingInert),
-            ] {
-                let Some(frame) = frame else { continue };
+            let tracked_child_slots = entry
+                .tracked_child_slots()
+                .into_iter()
+                .filter(|slot| slot.is_current(world))
+                .collect::<Vec<_>>();
+            let frame_roles = entry
+                .pending_frames()
+                .map(|frame| (frame, AuthorityFrameLifecycle::PreparedInert))
+                .chain(
+                    entry
+                        .active
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|branch| branch.frames())
+                        .map(|frame| (frame, AuthorityFrameLifecycle::Active)),
+                )
+                .chain(
+                    entry
+                        .leaving_cleanup_frames()
+                        .iter()
+                        .map(|frame| (frame, AuthorityFrameLifecycle::LeavingInert)),
+                )
+                .chain(
+                    entry
+                        .failed_cleanup_frames()
+                        .iter()
+                        .map(|frame| (frame, AuthorityFrameLifecycle::PreparedInert)),
+                );
+            for (frame, lifecycle) in frame_roles {
                 let frame_is_current = match lifecycle {
-                    AuthorityFrameLifecycle::PreparedInert => validate_realized_frame(world, frame),
+                    AuthorityFrameLifecycle::PreparedInert => {
+                        let child_slots = tracked_child_slots
+                            .iter()
+                            .filter(|slot| slot.parent() == frame.frame())
+                            .map(|slot| (slot.anchor(), slot.expected_anchor_children().to_vec()))
+                            .collect::<Vec<_>>();
+                        validate_realized_frame_with_child_slots(world, frame, &child_slots)
+                    }
                     AuthorityFrameLifecycle::Active => validate_active_frame(world, frame),
                     AuthorityFrameLifecycle::LeavingInert => {
                         frame_registry_is_current(world, frame, EntityLifecycle::Leaving)
@@ -606,10 +641,31 @@ impl RouterAuthorityAudits {
                     }
                 }
                 let root = root.expect("validated frame must include its shell");
+                let slot_entity = if frame.mount_binding().slot() == host.top_slot
+                    && frame.frame().slot() == host.slot_id
+                {
+                    top_slot_id
+                } else {
+                    let Some(tracked) = tracked_child_slots.iter().find(|tracked| {
+                        tracked.entity() == frame.mount_binding().slot()
+                            && tracked.slot() == frame.frame().slot()
+                    }) else {
+                        continue;
+                    };
+                    self.id_for(
+                        entry.handle,
+                        tracked.entity(),
+                        true,
+                        Some(tracked.parent()),
+                        request,
+                        false,
+                        false,
+                    )
+                };
                 frames.push(AuthorityFrameMapping {
                     frame: frame.frame().clone(),
                     root,
-                    slot_entity: top_slot_id,
+                    slot_entity,
                     lifecycle,
                 });
                 for (entity, rect) in frame.audit_content() {
@@ -650,36 +706,29 @@ impl RouterAuthorityAudits {
                 parent_frame: None,
                 outlet: None,
             }];
-            if let Some(registry) = world.get_resource::<RouteEntityRegistry>() {
-                for record in registry.records() {
-                    let RegistryOwner::Committed(EntityOwner::ChildSlot {
-                        parent,
-                        outlet,
-                        slot,
-                    }) = record.owner()
-                    else {
-                        continue;
-                    };
-                    if !frames.iter().any(|frame| frame.frame == *parent)
-                        || slots.iter().any(|item| item.id == *slot)
-                    {
-                        continue;
-                    }
-                    let Some(entity) = self.identities.iter().find_map(|item| {
-                        (item.router == entry.handle && item.entity == record.entity())
-                            .then_some(item.id)
-                    }) else {
-                        continue;
-                    };
-                    slots.push(AuthoritySlotMapping {
-                        id: *slot,
-                        entity,
-                        host: host.version.clone(),
-                        kind: AuthoritySlotKind::ChildOutlet,
-                        parent_frame: Some(parent.clone()),
-                        outlet: Some(outlet.clone()),
-                    });
+            for tracked in &tracked_child_slots {
+                if !frames.iter().any(|frame| frame.frame == *tracked.parent())
+                    || slots.iter().any(|item| item.id == tracked.slot())
+                {
+                    continue;
                 }
+                let entity = self.id_for(
+                    entry.handle,
+                    tracked.entity(),
+                    true,
+                    Some(tracked.parent()),
+                    request,
+                    false,
+                    false,
+                );
+                slots.push(AuthoritySlotMapping {
+                    id: tracked.slot(),
+                    entity,
+                    host: host.version.clone(),
+                    kind: AuthoritySlotKind::ChildOutlet,
+                    parent_frame: Some(tracked.parent().clone()),
+                    outlet: Some(tracked.outlet().clone()),
+                });
             }
             let orphan_slot_mappings = self.collect_orphan_slots(
                 world,
@@ -1185,9 +1234,7 @@ impl RouterAuthorityAudits {
         let mut facts = Vec::new();
         if let Some(registry) = world.get_resource::<RouteEntityRegistry>() {
             for record in registry.records() {
-                if let RegistryOwner::Committed(owner) = record.owner() {
-                    facts.push((record.entity(), owner.clone()));
-                }
+                facts.push((record.entity(), record.owner().clone()));
             }
         }
         if let Some(table) = world.get_resource::<QuarantineLeaseTable>() {
@@ -1195,17 +1242,18 @@ impl RouterAuthorityAudits {
                 let record = table
                     .record(entity)
                     .or_else(|| table.unresolved_record(entity));
-                if let Some(record) = record
-                    && let RegistryOwner::Committed(owner) = record.owner()
-                {
-                    facts.push((entity, owner.clone()));
+                if let Some(record) = record {
+                    facts.push((entity, record.owner().clone()));
                 }
             }
         }
         facts.sort_by_key(|(entity, owner)| {
             let slot_priority = match owner {
-                EntityOwner::ChildSlot { .. } => 0,
-                EntityOwner::HostTopSlot { .. } => 1,
+                RegistryOwner::Committed(EntityOwner::ChildSlot { .. })
+                | RegistryOwner::Provisional(crate::registry::ProvisionalOwner::ChildSlot {
+                    ..
+                }) => 0,
+                RegistryOwner::Committed(EntityOwner::HostTopSlot { .. }) => 1,
                 _ => 2,
             };
             (slot_priority, entity.to_bits())
@@ -1214,7 +1262,7 @@ impl RouterAuthorityAudits {
 
         for (entity, owner) in facts {
             let mapping = match owner {
-                EntityOwner::HostTopSlot { host, slot }
+                RegistryOwner::Committed(EntityOwner::HostTopSlot { host, slot })
                     if host_versions.contains(&host)
                         && !current.iter().any(|item| item.id == slot) =>
                 {
@@ -1228,16 +1276,30 @@ impl RouterAuthorityAudits {
                         outlet: None,
                     })
                 }
-                EntityOwner::ChildSlot {
+                RegistryOwner::Committed(EntityOwner::ChildSlot {
                     parent,
                     outlet,
                     slot,
-                } if frame_versions.contains(&parent)
+                })
+                | RegistryOwner::Provisional(crate::registry::ProvisionalOwner::ChildSlot {
+                    parent,
+                    outlet,
+                    slot,
+                }) if (frame_versions.contains(&parent)
+                    || host_versions
+                        .iter()
+                        .any(|host| host_version_matches_frame(host, &parent)))
                     && !current.iter().any(|item| item.id == slot) =>
                 {
                     let Some(host) = known_host
+                        .filter(|host| host_version_matches_frame(host, &parent))
                         .cloned()
-                        .or_else(|| host_versions.first().cloned())
+                        .or_else(|| {
+                            host_versions
+                                .iter()
+                                .find(|host| host_version_matches_frame(host, &parent))
+                                .cloned()
+                        })
                     else {
                         continue;
                     };
@@ -1661,6 +1723,8 @@ mod tests {
             .active
             .as_ref()
             .unwrap()
+            .first_frame()
+            .unwrap()
             .frame()
             .clone();
         let slot_claim = app
@@ -1757,7 +1821,7 @@ mod tests {
             (
                 host.version.clone(),
                 host.slot_id,
-                frame.frame().clone(),
+                frame.first_frame().unwrap().frame().clone(),
                 frame.interactive_entities()[0],
             )
         };
@@ -1779,18 +1843,27 @@ mod tests {
             )
             .unwrap();
         app.world_mut().entity_mut(child).insert(ChildOf(app_host));
+        let top_slot = app.world().resource::<RouterNavigation>().entries[0]
+            .host
+            .as_ref()
+            .unwrap()
+            .top_slot;
+        let top_claim = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(top_slot)
+            .unwrap()
+            .claim();
+        assert!(
+            app.world_mut()
+                .resource_mut::<RouteEntityRegistry>()
+                .remove_exact(&top_claim)
+        );
 
         let mut fresh = RouterAuthorityAudits::new();
         fresh.ensure_namespace(router);
-        let orphans = fresh.collect_orphan_slots(
-            app.world(),
-            router,
-            None,
-            std::slice::from_ref(&frame),
-            None,
-            &[],
-            Some(&host),
-        );
+        let orphans =
+            fresh.collect_orphan_slots(app.world(), router, None, &[], None, &[], Some(&host));
         assert_eq!(orphans.len(), 1);
         assert_eq!(orphans[0].id(), slot);
         assert_eq!(orphans[0].kind(), AuthoritySlotKind::ChildOutlet);
@@ -1802,6 +1875,86 @@ mod tests {
         );
         assert_eq!(fresh.entity_for(orphans[0].entity()), Some(child));
         assert!(app.world().get_entity(app_host).is_ok());
+
+        let committed_claim = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(child)
+            .unwrap()
+            .claim();
+        assert!(
+            app.world_mut()
+                .resource_mut::<RouteEntityRegistry>()
+                .remove_exact(&committed_claim)
+        );
+        let provisional = app.world_mut().spawn_empty().id();
+        let provisional_manifest =
+            crate::registry::ComponentManifest::from_world(app.world(), provisional).unwrap();
+        let provisional_owner =
+            RegistryOwner::Provisional(crate::registry::ProvisionalOwner::ChildSlot {
+                parent: frame.clone(),
+                outlet: RouteSlotKey::named("provisional-child").unwrap(),
+                slot,
+            });
+        {
+            let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
+            let seal = registry.issue_seal();
+            registry
+                .register(
+                    provisional,
+                    provisional_owner,
+                    seal,
+                    provisional_manifest,
+                    EntityLifecycle::PreparedInert,
+                )
+                .unwrap();
+        }
+        let mut fresh_provisional = RouterAuthorityAudits::new();
+        fresh_provisional.ensure_namespace(router);
+        let provisional_orphans = fresh_provisional.collect_orphan_slots(
+            app.world(),
+            router,
+            None,
+            &[],
+            None,
+            &[],
+            Some(&host),
+        );
+        assert_eq!(provisional_orphans.len(), 1);
+        assert_eq!(
+            provisional_orphans[0].kind(),
+            AuthoritySlotKind::ChildOutlet
+        );
+        assert_eq!(provisional_orphans[0].parent_frame(), Some(&frame));
+        assert_eq!(
+            fresh_provisional.entity_for(provisional_orphans[0].entity()),
+            Some(provisional)
+        );
+
+        let (other_app, _branch, _child_entities, _child_slot, _parent_entities) =
+            crate::navigation::tests::failed_nested_branch_fixture();
+        let other_host = other_app.world().resource::<RouterNavigation>().entries[0]
+            .host
+            .as_ref()
+            .unwrap()
+            .version
+            .clone();
+        let mut cross_router = RouterAuthorityAudits::new();
+        cross_router.ensure_namespace(router);
+        assert!(
+            cross_router
+                .collect_orphan_slots(app.world(), router, None, &[], None, &[], Some(&other_host),)
+                .iter()
+                .all(|slot| slot.kind() != AuthoritySlotKind::ChildOutlet)
+        );
+
+        let mut no_host = RouterAuthorityAudits::new();
+        no_host.ensure_namespace(router);
+        assert!(
+            no_host
+                .collect_orphan_slots(app.world(), router, None, &[], None, &[], None)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1849,6 +2002,8 @@ mod tests {
         let removed_entity = app.world().resource::<RouterNavigation>().entries[0]
             .active
             .as_ref()
+            .unwrap()
+            .first_frame()
             .unwrap()
             .shell();
 

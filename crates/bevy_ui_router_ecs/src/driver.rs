@@ -85,6 +85,11 @@ impl<'a> EcsViewReportSession<'a> {
             identity: self.identity,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn testing_identity(&self) -> ViewReportIdentity {
+        self.identity.clone()
+    }
 }
 
 pub trait EcsViewDriver: Send + Sync + 'static {

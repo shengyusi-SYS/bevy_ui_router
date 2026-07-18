@@ -206,6 +206,19 @@ impl FrameTask {
         &self.target
     }
 
+    #[cfg(test)]
+    pub(crate) fn testing_duplicate(&self) -> Self {
+        Self {
+            identity: self.identity.clone(),
+            frame: self.frame.clone(),
+            target: self.target.clone(),
+            location: self.location.clone(),
+            matched: self.matched.clone(),
+            view: self.view.clone(),
+            input: None,
+        }
+    }
+
     pub(crate) fn into_applied_report(self, outlets: Vec<RouteSlotKey>) -> AppliedFrameReport {
         AppliedFrameReport {
             identity: self.identity,
@@ -241,7 +254,7 @@ enum AppliedReportMode {
 
 impl AppliedFrameReport {
     #[cfg(test)]
-    fn testing_duplicate(&self) -> Self {
+    pub(crate) fn testing_duplicate(&self) -> Self {
         self.clone()
     }
 }
@@ -255,7 +268,41 @@ pub(crate) struct FrameMountRequest {
 
 pub(crate) enum MountMutationArtifact {
     Grant(MountGrant),
+    Receipt(MountReceiptAttestation),
     RegistrationPermit(MountRegistrationPermit),
+}
+
+pub(crate) enum ResolveMountOwner {
+    Returned(FrameMountRequest),
+    Reissued,
+}
+
+pub(crate) struct MountCapabilityError<Owner> {
+    kind: MountError,
+    owner: Owner,
+}
+
+impl<Owner> MountCapabilityError<Owner> {
+    const fn new(kind: MountError, owner: Owner) -> Self {
+        Self { kind, owner }
+    }
+
+    pub(crate) const fn kind(&self) -> MountError {
+        self.kind
+    }
+
+    pub(crate) fn into_owner(self) -> Owner {
+        self.owner
+    }
+}
+
+impl<Owner> std::fmt::Debug for MountCapabilityError<Owner> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MountCapabilityError")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -267,12 +314,47 @@ enum PendingFailureKind {
     AuthorityLost,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailureCleanupContinuation {
+    Terminal,
+    BeginFallback,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FailureCleanupRequest {
     identity: FrameTaskIdentity,
     expected: PendingFailureKind,
     logical_roots: Vec<RouteFrameVersion>,
     failure: NavigationFailure,
+    continuation: FailureCleanupContinuation,
+}
+
+pub(crate) struct FailureCleanupPrepareError {
+    kind: FailureCleanupError,
+    owner: FailureCleanupRequest,
+}
+
+impl FailureCleanupPrepareError {
+    const fn new(kind: FailureCleanupError, owner: FailureCleanupRequest) -> Self {
+        Self { kind, owner }
+    }
+
+    pub(crate) const fn kind(&self) -> FailureCleanupError {
+        self.kind
+    }
+
+    pub(crate) fn into_owner(self) -> FailureCleanupRequest {
+        self.owner
+    }
+}
+
+impl std::fmt::Debug for FailureCleanupPrepareError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FailureCleanupPrepareError")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FailureCleanupRequest {
@@ -289,7 +371,7 @@ impl FailureCleanupRequest {
     }
 
     #[cfg(test)]
-    fn testing_duplicate(&self) -> Self {
+    pub(crate) fn testing_duplicate(&self) -> Self {
         self.clone()
     }
 }
@@ -308,7 +390,7 @@ impl FrameMountRequest {
     }
 
     #[cfg(test)]
-    fn testing_duplicate(&self) -> Self {
+    pub(crate) fn testing_duplicate(&self) -> Self {
         Self {
             token: self.token.clone(),
             request: self.request,
@@ -463,6 +545,7 @@ enum WorkStage {
     FailureCleanupPrepared {
         outstanding: CleanupBatchToken,
         failure: NavigationFailure,
+        continuation: FailureCleanupContinuation,
     },
 }
 
@@ -804,21 +887,37 @@ impl RouterEngine {
     pub(crate) fn resolve_mount(
         &mut self,
         request: FrameMountRequest,
-    ) -> Result<MountGrant, MountError> {
-        self.mount.validate_request_token(&request.token)?;
+    ) -> Result<MountGrant, MountCapabilityError<ResolveMountOwner>> {
+        if let Err(kind) = self.mount.validate_request_token(&request.token) {
+            return Err(MountCapabilityError::new(
+                kind,
+                ResolveMountOwner::Returned(request),
+            ));
+        }
         if !self.has_live_mount_context(
             &WorkStage::AwaitingMount,
             Some((request.request, &request.parent, &request.outlet)),
         ) {
-            return Err(MountError::WrongPhase);
+            return Err(MountCapabilityError::new(
+                MountError::WrongPhase,
+                ResolveMountOwner::Returned(request),
+            ));
         }
         let grant = match self.mount.grant(&request.token, &mut self.ids) {
             Ok(grant) => grant,
             Err(MountError::Exhausted) => {
                 self.action = Some(EngineAction::MountRequest(request));
-                return Err(MountError::Exhausted);
+                return Err(MountCapabilityError::new(
+                    MountError::Exhausted,
+                    ResolveMountOwner::Reissued,
+                ));
             }
-            Err(error) => return Err(error),
+            Err(kind) => {
+                return Err(MountCapabilityError::new(
+                    kind,
+                    ResolveMountOwner::Returned(request),
+                ));
+            }
         };
         let slot = grant.slot();
         let current = self.current.as_mut().expect("mount was preflighted");
@@ -845,12 +944,17 @@ impl RouterEngine {
     pub(crate) fn accept_mount_receipt(
         &mut self,
         receipt: MountReceiptAttestation,
-    ) -> Result<MountRegistrationPermit, MountError> {
-        self.mount.validate_receipt(&receipt)?;
-        if !self.has_live_mount_context(&WorkStage::AwaitingReceipt, None) {
-            return Err(MountError::WrongPhase);
+    ) -> Result<MountRegistrationPermit, MountCapabilityError<MountReceiptAttestation>> {
+        if let Err(kind) = self.mount.validate_receipt(&receipt) {
+            return Err(MountCapabilityError::new(kind, receipt));
         }
-        let permit = self.mount.accept_receipt(&receipt)?;
+        if !self.has_live_mount_context(&WorkStage::AwaitingReceipt, None) {
+            return Err(MountCapabilityError::new(MountError::WrongPhase, receipt));
+        }
+        let permit = match self.mount.accept_receipt(&receipt) {
+            Ok(permit) => permit,
+            Err(kind) => return Err(MountCapabilityError::new(kind, receipt)),
+        };
         self.current
             .as_mut()
             .expect("receipt was preflighted")
@@ -916,13 +1020,15 @@ impl RouterEngine {
         &mut self,
         request: FrameMountRequest,
         rejection: MountRejectionKind,
-    ) -> Result<FailureCleanupRequest, MountError> {
-        self.mount.validate_request_token(&request.token)?;
+    ) -> Result<FailureCleanupRequest, MountCapabilityError<FrameMountRequest>> {
+        if let Err(kind) = self.mount.validate_request_token(&request.token) {
+            return Err(MountCapabilityError::new(kind, request));
+        }
         if !self.has_live_mount_context(
             &WorkStage::AwaitingMount,
             Some((request.request, &request.parent, &request.outlet)),
         ) {
-            return Err(MountError::WrongPhase);
+            return Err(MountCapabilityError::new(MountError::WrongPhase, request));
         }
         if !matches!(
             rejection,
@@ -930,9 +1036,11 @@ impl RouterEngine {
                 | MountRejectionKind::InvalidOutlet
                 | MountRejectionKind::ParentAuthorityLost
         ) {
-            return Err(MountError::WrongPhase);
+            return Err(MountCapabilityError::new(MountError::WrongPhase, request));
         }
-        self.mount.reject(&request.token)?;
+        if let Err(kind) = self.mount.reject(&request.token) {
+            return Err(MountCapabilityError::new(kind, request));
+        }
         self.record_mut(request.request)
             .expect("mount rejection request is retained")
             .append_trace(NavigationTraceEvent::mount_rejected(
@@ -948,19 +1056,27 @@ impl RouterEngine {
     pub(crate) fn reject_mount_after_mutation(
         &mut self,
         artifact: MountMutationArtifact,
-    ) -> Result<FailureCleanupRequest, MountError> {
+    ) -> Result<FailureCleanupRequest, MountCapabilityError<MountMutationArtifact>> {
         let expected_stage = match &artifact {
-            MountMutationArtifact::Grant(_) => WorkStage::AwaitingReceipt,
+            MountMutationArtifact::Grant(_) | MountMutationArtifact::Receipt(_) => {
+                WorkStage::AwaitingReceipt
+            }
             MountMutationArtifact::RegistrationPermit(_) => WorkStage::ConfirmingMount,
         };
-        match &artifact {
-            MountMutationArtifact::Grant(grant) => self.mount.validate_mutation_artifact(grant)?,
-            MountMutationArtifact::RegistrationPermit(permit) => {
-                self.mount.validate_mutation_artifact(permit)?
+        let validation = match &artifact {
+            MountMutationArtifact::Grant(grant) => self.mount.validate_mutation_artifact(grant),
+            MountMutationArtifact::Receipt(receipt) => {
+                self.mount.validate_mutation_artifact(receipt)
             }
+            MountMutationArtifact::RegistrationPermit(permit) => {
+                self.mount.validate_mutation_artifact(permit)
+            }
+        };
+        if let Err(kind) = validation {
+            return Err(MountCapabilityError::new(kind, artifact));
         }
         if !self.has_live_mount_context(&expected_stage, None) {
-            return Err(MountError::WrongPhase);
+            return Err(MountCapabilityError::new(MountError::WrongPhase, artifact));
         }
         let (request, parent, outlet) = self
             .current
@@ -977,13 +1093,18 @@ impl RouterEngine {
             .expect("live mount context retains pending facts");
         let slot = match &artifact {
             MountMutationArtifact::Grant(grant) => grant.slot(),
+            MountMutationArtifact::Receipt(receipt) => receipt.slot(),
             MountMutationArtifact::RegistrationPermit(permit) => permit.slot(),
         };
-        match &artifact {
-            MountMutationArtifact::Grant(grant) => self.mount.reject_after_mutation(grant)?,
+        let rejection = match &artifact {
+            MountMutationArtifact::Grant(grant) => self.mount.reject_after_mutation(grant),
+            MountMutationArtifact::Receipt(receipt) => self.mount.reject_after_mutation(receipt),
             MountMutationArtifact::RegistrationPermit(permit) => {
-                self.mount.reject_after_mutation(permit)?
+                self.mount.reject_after_mutation(permit)
             }
+        };
+        if let Err(kind) = rejection {
+            return Err(MountCapabilityError::new(kind, artifact));
         }
         self.record_mut(request)
             .expect("mount rejection request is retained")
@@ -1105,28 +1226,50 @@ impl RouterEngine {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_failure_cleanup(
         &mut self,
         request: FailureCleanupRequest,
         seal: CleanupManifestSeal,
     ) -> Result<CleanupBatchToken, FailureCleanupError> {
+        self.prepare_failure_cleanup_retaining(request, seal)
+            .map_err(|error| error.kind())
+    }
+
+    pub(crate) fn prepare_failure_cleanup_retaining(
+        &mut self,
+        request: FailureCleanupRequest,
+        seal: CleanupManifestSeal,
+    ) -> Result<CleanupBatchToken, FailureCleanupPrepareError> {
         if request.identity.router_identity() != self.router {
-            return Err(FailureCleanupError::Foreign);
+            return Err(FailureCleanupPrepareError::new(
+                FailureCleanupError::Foreign,
+                request,
+            ));
         }
         let Some(current) = self.current.as_ref() else {
-            return Err(FailureCleanupError::Stale);
+            return Err(FailureCleanupPrepareError::new(
+                FailureCleanupError::Stale,
+                request,
+            ));
         };
         let valid_request = matches!(
             &current.stage,
             WorkStage::FailureCleanupManifestPending { expected } if expected == &request
         );
         if !valid_request {
-            return Err(FailureCleanupError::Stale);
+            return Err(FailureCleanupPrepareError::new(
+                FailureCleanupError::Stale,
+                request,
+            ));
         }
         if request.logical_roots != seal.logical_roots()
-            || request.logical_roots.is_empty() != (seal.obligation_count() == 0)
+            || (!request.logical_roots.is_empty() && seal.obligation_count() == 0)
         {
-            return Err(FailureCleanupError::InvalidManifest);
+            return Err(FailureCleanupPrepareError::new(
+                FailureCleanupError::InvalidManifest,
+                request,
+            ));
         }
 
         let cleanup = CleanupBatchToken::sealed(
@@ -1142,6 +1285,7 @@ impl RouterEngine {
             .stage = WorkStage::FailureCleanupPrepared {
             outstanding: cleanup.clone(),
             failure: request.failure,
+            continuation: request.continuation,
         };
         Ok(cleanup)
     }
@@ -1161,10 +1305,7 @@ impl RouterEngine {
         &mut self,
         identity: &RootTaskIdentity,
     ) -> Result<(), ReportError> {
-        let accepted = self.current.as_ref().is_some_and(|current| {
-            current.stage == WorkStage::Applying && current.identity == *identity
-        });
-        if accepted {
+        if self.inspect_view_report_identity(identity).is_ok() {
             return Ok(());
         }
 
@@ -1199,6 +1340,80 @@ impl RouterEngine {
             };
         self.record_report_disposition(identity, disposition, message);
         Err(error)
+    }
+
+    pub(crate) fn inspect_view_report_identity(
+        &self,
+        identity: &RootTaskIdentity,
+    ) -> Result<(), ReportError> {
+        if self.current.as_ref().is_some_and(|current| {
+            current.stage == WorkStage::Applying && current.identity == *identity
+        }) {
+            return Ok(());
+        }
+        let known = self
+            .issued_view_tasks
+            .iter()
+            .any(|issued| issued == identity);
+        let latest_for_request = self
+            .issued_view_tasks
+            .iter()
+            .rev()
+            .find(|issued| issued.request == identity.request);
+        if known && latest_for_request.is_some_and(|latest| latest == identity) {
+            Err(ReportError::Duplicate)
+        } else if known {
+            Err(ReportError::Stale)
+        } else {
+            Err(ReportError::Invalid)
+        }
+    }
+
+    pub(crate) fn expected_child_outlet(
+        &self,
+        identity: &RootTaskIdentity,
+    ) -> Result<Option<RouteSlotKey>, ReportError> {
+        let Some(current) = self.current.as_ref() else {
+            return Err(ReportError::Stale);
+        };
+        if current.stage == WorkStage::Applying && current.identity == *identity {
+            return Ok(current
+                .branch
+                .as_ref()
+                .and_then(|branch| branch.routes().get(identity.branch_index + 1))
+                .map(|matched| matched.slot().clone()));
+        }
+        let known = self
+            .issued_view_tasks
+            .iter()
+            .any(|issued| issued == identity);
+        let latest_for_request = self
+            .issued_view_tasks
+            .iter()
+            .rev()
+            .find(|issued| issued.request == identity.request);
+        if known && latest_for_request.is_some_and(|latest| latest == identity) {
+            Err(ReportError::Duplicate)
+        } else if known {
+            Err(ReportError::Stale)
+        } else {
+            Err(ReportError::Invalid)
+        }
+    }
+
+    pub(crate) fn validate_mount_request(
+        &self,
+        request: &FrameMountRequest,
+    ) -> Result<(), MountError> {
+        self.mount.validate_request_token(&request.token)?;
+        if self.has_live_mount_context(
+            &WorkStage::AwaitingMount,
+            Some((request.request, &request.parent, &request.outlet)),
+        ) {
+            Ok(())
+        } else {
+            Err(MountError::WrongPhase)
+        }
     }
 
     pub(crate) fn seal_commit(
@@ -1300,7 +1515,8 @@ impl RouterEngine {
                 WorkStage::FailureCleanupPrepared {
                     outstanding,
                     failure,
-                } => Some((outstanding.clone(), Some(failure.clone()))),
+                    continuation,
+                } => Some((outstanding.clone(), Some((failure.clone(), *continuation)))),
                 WorkStage::Applying
                 | WorkStage::AwaitingMount
                 | WorkStage::AwaitingReceipt
@@ -1335,8 +1551,22 @@ impl RouterEngine {
         let request = current.identity.request;
         let (completed_token, failure) =
             outstanding.expect("validated cleanup has an outstanding token");
+        if let Some((failure, FailureCleanupContinuation::BeginFallback)) = &failure {
+            let failure = failure.clone();
+            self.record_mut(request)
+                .expect("running record is retained")
+                .append_trace(NavigationTraceEvent::cleanup_settled(None))
+                .expect("cleanup trace is open");
+            self.completed_cleanup.push(CompletedCleanupTombstone {
+                request,
+                token: completed_token,
+            });
+            self.begin_fallback(request, failure);
+            return Ok(());
+        }
         let terminal_status = match failure {
-            Some(failure) => RequestStatus::Failed(failure),
+            Some((failure, FailureCleanupContinuation::Terminal)) => RequestStatus::Failed(failure),
+            Some((_, FailureCleanupContinuation::BeginFallback)) => unreachable!(),
             None => match &current.attempt {
                 AttemptKind::Normal => RequestStatus::Succeeded,
                 AttemptKind::Fallback { original_failure } => {
@@ -1706,6 +1936,19 @@ impl RouterEngine {
         expected: PendingFailureKind,
         failure: NavigationFailure,
     ) -> FailureCleanupRequest {
+        self.begin_failure_cleanup_with_continuation(
+            expected,
+            failure,
+            FailureCleanupContinuation::Terminal,
+        )
+    }
+
+    fn begin_failure_cleanup_with_continuation(
+        &mut self,
+        expected: PendingFailureKind,
+        failure: NavigationFailure,
+        continuation: FailureCleanupContinuation,
+    ) -> FailureCleanupRequest {
         let current = self
             .current
             .as_ref()
@@ -1715,6 +1958,7 @@ impl RouterEngine {
             expected,
             logical_roots: current.applied_frames.iter().rev().cloned().collect(),
             failure,
+            continuation,
         };
         let phase = if request.expected == PendingFailureKind::AuthorityLost {
             NavigationPhase::Recovering
@@ -2235,6 +2479,18 @@ impl RouterEngine {
         };
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_set_mount_receipt_context_live(&mut self, live: bool) {
+        self.current
+            .as_mut()
+            .expect("mount receipt fixture retains current work")
+            .stage = if live {
+            WorkStage::AwaitingReceipt
+        } else {
+            WorkStage::ConfirmingMount
+        };
+    }
+
     #[cfg(test)]
     fn testing_exhaust_reservation_counter(&mut self, counter: crate::ids::ReservationCounter) {
         self.ids
@@ -2244,6 +2500,11 @@ impl RouterEngine {
     #[cfg(test)]
     fn testing_exhaust_mount_sequence_counter(&mut self) {
         self.ids.testing_exhaust_mount_sequence_counter();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_exhaust_slot_counter(&mut self) {
+        self.ids.testing_exhaust_slot_counter();
     }
 
     #[cfg(test)]
@@ -2396,6 +2657,57 @@ impl ViewReportSession<'_> {
                 None
             }
         }
+    }
+
+    pub(crate) fn failed_with_physical_residual(
+        self,
+        failure: NavigationFailure,
+    ) -> FailureCleanupRequest {
+        let branch_index = self.identity.branch_index;
+        let attempt = self
+            .engine
+            .current
+            .as_ref()
+            .expect("report was preflighted")
+            .attempt
+            .clone();
+        let diagnostic_message = match &attempt {
+            AttemptKind::Normal => format!(
+                "accepted normal {:?} failure with physical residual: {}",
+                failure.kind(),
+                failure.message()
+            ),
+            AttemptKind::Fallback { .. } => format!(
+                "accepted fallback {:?} failure with physical residual: {}",
+                failure.kind(),
+                failure.message()
+            ),
+        };
+        self.engine.record_report_disposition(
+            &self.identity,
+            ReportDisposition::Accepted,
+            diagnostic_message,
+        );
+        let expected = match failure.kind() {
+            NavigationFailureKind::Build => PendingFailureKind::Build,
+            NavigationFailureKind::Apply => PendingFailureKind::Apply,
+            _ => PendingFailureKind::Apply,
+        };
+        let (failure, continuation) = match attempt {
+            AttemptKind::Normal if branch_index == 0 => {
+                (failure, FailureCleanupContinuation::BeginFallback)
+            }
+            AttemptKind::Normal => (failure, FailureCleanupContinuation::Terminal),
+            AttemptKind::Fallback { .. } => (
+                NavigationFailure::new(
+                    NavigationFailureKind::RecoveryFailed,
+                    "router fallback failed",
+                ),
+                FailureCleanupContinuation::Terminal,
+            ),
+        };
+        self.engine
+            .begin_failure_cleanup_with_continuation(expected, failure, continuation)
     }
 }
 
@@ -4455,7 +4767,7 @@ mod tests {
         let exhausted = engine.ids.snapshot();
 
         assert!(matches!(
-            engine.resolve_mount(mount),
+            engine.resolve_mount(mount).map_err(|error| error.kind()),
             Err(crate::mount::MountError::Exhausted)
         ));
         assert_eq!(engine.ids.snapshot(), exhausted);
@@ -4517,7 +4829,7 @@ mod tests {
         let before = engine.snapshot();
 
         assert_eq!(
-            engine.resolve_mount(mount),
+            engine.resolve_mount(mount).map_err(|error| error.kind()),
             Err(crate::mount::MountError::WrongPhase)
         );
         assert_eq!(engine.snapshot(), before);
@@ -4531,7 +4843,9 @@ mod tests {
         let before = engine.snapshot();
 
         assert_eq!(
-            engine.reject_mount(mount, crate::trace::MountRejectionKind::MissingOutlet),
+            engine
+                .reject_mount(mount, crate::trace::MountRejectionKind::MissingOutlet)
+                .map_err(|error| error.kind()),
             Err(crate::mount::MountError::WrongPhase)
         );
         assert_eq!(engine.snapshot(), before);
@@ -4552,7 +4866,7 @@ mod tests {
         let before = engine.snapshot();
 
         assert_eq!(
-            engine.resolve_mount(mount),
+            engine.resolve_mount(mount).map_err(|error| error.kind()),
             Err(crate::mount::MountError::WrongPhase)
         );
         assert_eq!(engine.snapshot(), before);
@@ -4568,7 +4882,9 @@ mod tests {
         let before = engine.snapshot();
 
         assert_eq!(
-            engine.reject_mount_after_mutation(super::MountMutationArtifact::Grant(grant)),
+            engine
+                .reject_mount_after_mutation(super::MountMutationArtifact::Grant(grant))
+                .map_err(|error| error.kind()),
             Err(crate::mount::MountError::WrongPhase)
         );
         assert_eq!(engine.snapshot(), before);
@@ -4586,9 +4902,11 @@ mod tests {
         let before = engine.snapshot();
 
         assert_eq!(
-            engine.reject_mount_after_mutation(super::MountMutationArtifact::RegistrationPermit(
-                permit
-            ),),
+            engine
+                .reject_mount_after_mutation(super::MountMutationArtifact::RegistrationPermit(
+                    permit
+                ),)
+                .map_err(|error| error.kind()),
             Err(crate::mount::MountError::WrongPhase)
         );
         assert_eq!(engine.snapshot(), before);
@@ -4605,7 +4923,9 @@ mod tests {
         let before = engine.snapshot();
 
         assert_eq!(
-            engine.accept_mount_receipt(receipt),
+            engine
+                .accept_mount_receipt(receipt)
+                .map_err(|error| error.kind()),
             Err(crate::mount::MountError::WrongPhase)
         );
         assert_eq!(engine.snapshot(), before);
@@ -4664,7 +4984,7 @@ mod tests {
         let before = engine.snapshot();
 
         assert_eq!(
-            engine.resolve_mount(mount),
+            engine.resolve_mount(mount).map_err(|error| error.kind()),
             Err(crate::mount::MountError::WrongPhase)
         );
         assert_eq!(engine.snapshot(), before);
@@ -4683,7 +5003,9 @@ mod tests {
         let before = engine.snapshot();
 
         assert_eq!(
-            engine.reject_mount(mount, crate::trace::MountRejectionKind::MissingOutlet),
+            engine
+                .reject_mount(mount, crate::trace::MountRejectionKind::MissingOutlet)
+                .map_err(|error| error.kind()),
             Err(crate::mount::MountError::WrongPhase)
         );
         assert_eq!(engine.snapshot(), before);
@@ -4703,7 +5025,9 @@ mod tests {
         let before = engine.snapshot();
 
         assert_eq!(
-            engine.reject_mount(mount, crate::trace::MountRejectionKind::MissingOutlet),
+            engine
+                .reject_mount(mount, crate::trace::MountRejectionKind::MissingOutlet)
+                .map_err(|error| error.kind()),
             Err(crate::mount::MountError::WrongPhase)
         );
         assert_eq!(engine.snapshot(), before);
@@ -4726,7 +5050,9 @@ mod tests {
         let before = engine.snapshot();
 
         assert_eq!(
-            engine.accept_mount_receipt(receipt),
+            engine
+                .accept_mount_receipt(receipt)
+                .map_err(|error| error.kind()),
             Err(crate::mount::MountError::WrongPhase)
         );
         assert_eq!(engine.snapshot(), before);
@@ -4774,7 +5100,9 @@ mod tests {
         let before = engine.snapshot();
 
         assert_eq!(
-            engine.reject_mount_after_mutation(super::MountMutationArtifact::Grant(grant)),
+            engine
+                .reject_mount_after_mutation(super::MountMutationArtifact::Grant(grant))
+                .map_err(|error| error.kind()),
             Err(crate::mount::MountError::WrongPhase)
         );
         assert_eq!(engine.snapshot(), before);
@@ -5256,17 +5584,21 @@ mod tests {
 
         let before = engine.snapshot();
         assert_eq!(
-            engine.reject_mount(foreign, crate::trace::MountRejectionKind::MissingOutlet),
+            engine
+                .reject_mount(foreign, crate::trace::MountRejectionKind::MissingOutlet)
+                .map_err(|error| error.kind()),
             Err(crate::mount::MountError::Foreign)
         );
         assert_eq!(engine.snapshot(), before);
 
         let before = engine.snapshot();
         assert_eq!(
-            engine.reject_mount(
-                exact.testing_duplicate(),
-                crate::trace::MountRejectionKind::RejectedAfterMutation,
-            ),
+            engine
+                .reject_mount(
+                    exact.testing_duplicate(),
+                    crate::trace::MountRejectionKind::RejectedAfterMutation,
+                )
+                .map_err(|error| error.kind()),
             Err(crate::mount::MountError::WrongPhase)
         );
         assert_eq!(engine.snapshot(), before);
@@ -5276,7 +5608,9 @@ mod tests {
             .unwrap();
         let failed = engine.snapshot();
         assert_eq!(
-            engine.reject_mount(replay, crate::trace::MountRejectionKind::MissingOutlet),
+            engine
+                .reject_mount(replay, crate::trace::MountRejectionKind::MissingOutlet)
+                .map_err(|error| error.kind()),
             Err(crate::mount::MountError::Stale)
         );
         assert_eq!(engine.snapshot(), failed);
@@ -5425,7 +5759,9 @@ mod tests {
 
         let before = resolve_engine.snapshot();
         assert!(matches!(
-            resolve_engine.resolve_mount(foreign_request),
+            resolve_engine
+                .resolve_mount(foreign_request)
+                .map_err(|error| error.kind()),
             Err(crate::mount::MountError::Foreign)
         ));
         assert_eq!(resolve_engine.snapshot(), before);
@@ -5433,7 +5769,9 @@ mod tests {
         let grant_replay = exact_grant.clone();
         let resolved = resolve_engine.snapshot();
         assert!(matches!(
-            resolve_engine.resolve_mount(replay_request),
+            resolve_engine
+                .resolve_mount(replay_request)
+                .map_err(|error| error.kind()),
             Err(crate::mount::MountError::Stale)
         ));
         assert_eq!(resolve_engine.snapshot(), resolved);
@@ -5447,7 +5785,8 @@ mod tests {
         let before = resolve_engine.snapshot();
         assert!(matches!(
             resolve_engine
-                .reject_mount_after_mutation(super::MountMutationArtifact::Grant(foreign_grant)),
+                .reject_mount_after_mutation(super::MountMutationArtifact::Grant(foreign_grant))
+                .map_err(|error| error.kind()),
             Err(crate::mount::MountError::Foreign)
         ));
         assert_eq!(resolve_engine.snapshot(), before);
@@ -5458,7 +5797,8 @@ mod tests {
         let failed = resolve_engine.snapshot();
         assert!(matches!(
             resolve_engine
-                .reject_mount_after_mutation(super::MountMutationArtifact::Grant(grant_replay)),
+                .reject_mount_after_mutation(super::MountMutationArtifact::Grant(grant_replay))
+                .map_err(|error| error.kind()),
             Err(crate::mount::MountError::Stale)
         ));
         assert_eq!(resolve_engine.snapshot(), failed);
@@ -5487,5 +5827,124 @@ mod tests {
         };
         assert_eq!(fallback.identity().request(), request);
         assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
+    }
+
+    #[test]
+    fn root_partial_failure_waits_for_cleanup_completion_before_fallback() {
+        let mut engine = ready_engine();
+        let request = engine.push(RouteLocation::new("/")).unwrap();
+        let EngineAction::FrameTask(root) = engine.action().unwrap() else {
+            panic!("root task expected")
+        };
+        let failure = engine
+            .begin_view_report(root.identity())
+            .unwrap()
+            .failed_with_physical_residual(NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "partial root apply failed",
+            ));
+
+        assert!(failure.logical_roots().is_empty());
+        assert!(engine.action().is_none());
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::CleanupPending)
+        );
+        let cleanup = engine
+            .prepare_failure_cleanup(
+                failure,
+                CleanupManifestSeal::new(Vec::new(), manifest_digest(211), 3),
+            )
+            .unwrap();
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::Recovering)
+        );
+        let Some(EngineAction::FrameTask(fallback)) = engine.action() else {
+            panic!("cleanup completion must issue the fallback task")
+        };
+        assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
+        let trace = engine.request(request).unwrap().trace();
+        let settled = trace
+            .iter()
+            .position(|event| event.kind() == NavigationTraceEventKind::CleanupSettled)
+            .unwrap();
+        let fallback_issued = trace
+            .iter()
+            .rposition(|event| {
+                event.kind() == NavigationTraceEventKind::FrameTaskIssued
+                    && event
+                        .frame()
+                        .is_some_and(|frame| frame.origin() == &FrameOrigin::RouterFallback)
+            })
+            .unwrap();
+        assert!(settled < fallback_issued);
+    }
+
+    #[test]
+    fn fallback_partial_failure_waits_for_cleanup_before_recovery_terminal() {
+        let mut engine = ready_engine();
+        let request = engine.push(RouteLocation::new("/")).unwrap();
+        let EngineAction::FrameTask(root) = engine.action().unwrap() else {
+            panic!("root task expected")
+        };
+        engine
+            .begin_view_report(root.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "normal root failed",
+            ));
+        let Some(EngineAction::FrameTask(fallback)) = engine.action() else {
+            panic!("normal root failure must issue fallback")
+        };
+        let failure = engine
+            .begin_view_report(fallback.identity())
+            .unwrap()
+            .failed_with_physical_residual(NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "partial fallback apply failed",
+            ));
+
+        assert!(failure.logical_roots().is_empty());
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Running(_)
+        ));
+        let cleanup = engine
+            .prepare_failure_cleanup(
+                failure,
+                CleanupManifestSeal::new(Vec::new(), manifest_digest(223), 2),
+            )
+            .unwrap();
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Running(_)
+        ));
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::RecoveryFailed
+        ));
+        assert!(engine.action().is_none());
+        assert_eq!(
+            engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .map(|event| event.kind())
+                .rev()
+                .take(2)
+                .collect::<Vec<_>>(),
+            vec![
+                NavigationTraceEventKind::RequestTerminal,
+                NavigationTraceEventKind::CleanupSettled,
+            ]
+        );
     }
 }

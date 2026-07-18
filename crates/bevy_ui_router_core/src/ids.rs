@@ -510,7 +510,7 @@ impl CoreIdAllocator {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn testing_exhaust_slot_counter(&mut self) {
         self.next_slot = u64::MAX;
     }

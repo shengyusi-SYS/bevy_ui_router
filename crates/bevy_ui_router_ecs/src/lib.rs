@@ -5,6 +5,7 @@ mod app_ext;
 mod audit;
 #[cfg(test)]
 mod authority_regression_tests;
+mod branch_transaction;
 mod cleanup;
 mod components;
 mod content;
