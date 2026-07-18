@@ -13,7 +13,7 @@ use bevy_picking::Pickable;
 
 use crate::{
     components::{ChildSlotAuthority, ChildSlotLifecycle, RouteOwnershipSeal, RouterInputBarrier},
-    frame_local::validate_committed_branch,
+    frame_local::validate_active_branch_with_entering,
     presentation::FrameLifecycle,
     registry::{
         EntityLifecycle, EntityOwner, ExactRegistryClaim, ProvisionalOwner, QuarantineLeaseTable,
@@ -148,12 +148,20 @@ pub(crate) fn refresh_input_gate_system(world: &mut World) {
         for branch in navigation
             .entries
             .iter()
-            .filter_map(|entry| entry.active.as_ref())
+            .filter_map(|entry| entry.active.as_ref().map(|active| (entry, active)))
         {
-            if validate_committed_branch(world, branch, false).is_ok() {
-                allowed.extend(branch.interactive_entities());
+            let (entry, active) = branch;
+            if validate_active_branch_with_entering(
+                world,
+                active,
+                entry.current_reconciliation_entering_branch(),
+                entry.current_mount_new_staging_allowance(),
+            )
+            .is_ok()
+            {
+                allowed.extend(active.interactive_entities());
             } else {
-                invalid_claims.push(branch.claims().cloned().collect::<Vec<_>>());
+                invalid_claims.push(active.claims().cloned().collect::<Vec<_>>());
             }
         }
         (allowed, invalid_claims)
@@ -397,7 +405,7 @@ mod tests {
         app_ext::{AppRouterExt, RouterConfig, RouterHostRegistration},
         content::{ContentColor, FrameContentWriter, SolidRect},
         driver::{EcsViewDriver, EcsViewReportSession, ViewBuildReport},
-        navigation::RouterNavigation,
+        navigation::{RouterNavigation, collect_navigation_system, drive_navigation_system},
         plugin::BevyUiRouterPlugin,
     };
     use bevy_app::App;
@@ -533,6 +541,27 @@ mod tests {
         (app, child_slot, child_output)
     }
 
+    fn stage_nested_replacement(app: &mut App) {
+        let router = app.world().resource::<RouterNavigation>().entries[0].handle;
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/2"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        for _ in 0..8 {
+            drive_navigation_system(app.world_mut());
+            if app
+                .world()
+                .resource::<RouterNavigation>()
+                .pending_shape_for_test()
+                .is_some_and(|(_, _, final_task)| final_task)
+            {
+                return;
+            }
+        }
+        panic!("nested replacement did not reach its sealed pending projection");
+    }
+
     #[test]
     fn gate_delta_preserves_other_router_permissions() {
         let mut world = World::new();
@@ -649,5 +678,44 @@ mod tests {
         );
         assert_eq!(app.world().resource::<InputFocus>().get(), None);
         assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+    }
+
+    #[test]
+    fn refresh_rejects_an_unknown_sibling_beside_an_active_child_shell() {
+        let (mut app, child_slot, child_output) = active_nested_app();
+        app.world_mut().spawn(ChildOf(child_slot));
+
+        refresh_input_gate_system(app.world_mut());
+
+        assert!(
+            !app.world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(child_output)
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(child_slot),
+            Some(&Visibility::Hidden)
+        );
+    }
+
+    #[test]
+    fn refresh_rejects_a_pending_sibling_after_its_projection_authority_is_stale() {
+        let (mut app, child_slot, child_output) = active_nested_app();
+        stage_nested_replacement(&mut app);
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .stale_pending_projection_for_test();
+
+        refresh_input_gate_system(app.world_mut());
+
+        assert!(
+            !app.world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(child_output)
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(child_slot),
+            Some(&Visibility::Hidden)
+        );
     }
 }

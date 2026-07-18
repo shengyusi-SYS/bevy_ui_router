@@ -60,6 +60,8 @@ enum FrameMountBindingKind {
         anchor: Entity,
         anchor_claim: ExactRegistryClaim,
         expected_anchor_children: Vec<Entity>,
+        staging_lifecycle: EntityLifecycle,
+        allowed_existing_shells: Vec<ExactRegistryClaim>,
     },
 }
 
@@ -82,6 +84,27 @@ impl FrameMountBinding {
                 anchor: mounted.anchor(),
                 anchor_claim: mounted.anchor_claim().clone(),
                 expected_anchor_children: mounted.expected_anchor_children().to_vec(),
+                staging_lifecycle: EntityLifecycle::PreparedInert,
+                allowed_existing_shells: Vec::new(),
+            },
+        }
+    }
+
+    fn from_reconciliation_staging_mount(
+        mount: &crate::branch_transaction::SealedReconciliationStagingMount<'_>,
+    ) -> Self {
+        let mounted = mount.slot();
+        Self {
+            slot: mounted.slot(),
+            slot_claim: mounted.slot_claim().clone(),
+            kind: FrameMountBindingKind::ChildOutlet {
+                parent: mounted.parent().clone(),
+                outlet: mounted.outlet().clone(),
+                anchor: mounted.anchor(),
+                anchor_claim: mounted.anchor_claim().clone(),
+                expected_anchor_children: mounted.expected_anchor_children().to_vec(),
+                staging_lifecycle: mount.expected_slot_lifecycle(),
+                allowed_existing_shells: mount.allowed_existing_shells().to_vec(),
             },
         }
     }
@@ -116,12 +139,70 @@ impl FrameMountBinding {
                     anchor,
                     anchor_claim,
                     expected_anchor_children,
+                    ..
                 } if parent == mounted.parent()
                     && outlet == mounted.outlet()
                     && *anchor == mounted.anchor()
                     && anchor_claim == mounted.anchor_claim()
                     && expected_anchor_children == mounted.expected_anchor_children()
             )
+    }
+
+    pub(crate) fn same_physical_mount(&self, other: &Self) -> bool {
+        if self.slot != other.slot || self.slot_claim != other.slot_claim {
+            return false;
+        }
+        match (&self.kind, &other.kind) {
+            (
+                FrameMountBindingKind::HostTop { host: left },
+                FrameMountBindingKind::HostTop { host: right },
+            ) => left == right,
+            (
+                FrameMountBindingKind::ChildOutlet {
+                    parent: left_parent,
+                    outlet: left_outlet,
+                    anchor: left_anchor,
+                    anchor_claim: left_anchor_claim,
+                    expected_anchor_children: left_children,
+                    ..
+                },
+                FrameMountBindingKind::ChildOutlet {
+                    parent: right_parent,
+                    outlet: right_outlet,
+                    anchor: right_anchor,
+                    anchor_claim: right_anchor_claim,
+                    expected_anchor_children: right_children,
+                    ..
+                },
+            ) => {
+                left_parent == right_parent
+                    && left_outlet == right_outlet
+                    && left_anchor == right_anchor
+                    && left_anchor_claim == right_anchor_claim
+                    && left_children == right_children
+            }
+            _ => false,
+        }
+    }
+
+    fn allows_existing_shell(&self, claim: &ExactRegistryClaim) -> bool {
+        matches!(
+            &self.kind,
+            FrameMountBindingKind::ChildOutlet {
+                allowed_existing_shells,
+                ..
+            } if allowed_existing_shells.iter().any(|allowed| allowed == claim)
+        )
+    }
+
+    pub(crate) fn staging_existing_shells(&self) -> &[ExactRegistryClaim] {
+        match &self.kind {
+            FrameMountBindingKind::HostTop { .. } => &[],
+            FrameMountBindingKind::ChildOutlet {
+                allowed_existing_shells,
+                ..
+            } => allowed_existing_shells,
+        }
     }
 
     fn internal_claims_can_rebind(
@@ -155,8 +236,16 @@ impl FrameMountBinding {
 
     fn apply_internal_claim_rebind(&mut self, claims: &[ExactRegistryClaim]) {
         apply_claim_alias_rebind(&mut self.slot_claim, claims);
-        if let FrameMountBindingKind::ChildOutlet { anchor_claim, .. } = &mut self.kind {
+        if let FrameMountBindingKind::ChildOutlet {
+            anchor_claim,
+            allowed_existing_shells,
+            ..
+        } = &mut self.kind
+        {
             apply_claim_alias_rebind(anchor_claim, claims);
+            for claim in allowed_existing_shells {
+                apply_claim_alias_rebind(claim, claims);
+            }
         }
     }
 
@@ -571,9 +660,13 @@ impl<'w> PreparedPresentationMutation<'w> {
                 .all(|(position, (index, entity))| {
                     *index == position
                         && if position < split_at {
-                            entity.current == EntityLifecycle::Active
-                                && entity.next == EntityLifecycle::Leaving
-                                && !entity.active_after
+                            matches!(
+                                (entity.current, entity.next),
+                                (
+                                    EntityLifecycle::Active | EntityLifecycle::PreparedInert,
+                                    EntityLifecycle::Leaving
+                                ) | (EntityLifecycle::Active, EntityLifecycle::PreparedInert)
+                            ) && !entity.active_after
                         } else {
                             entity.current == EntityLifecycle::PreparedInert
                                 && entity.next == EntityLifecycle::Active
@@ -683,6 +776,35 @@ impl RealizedFrame {
         &self.mount
     }
 
+    pub(crate) fn sealed_reconciliation_entering_shell_for(
+        &self,
+        existing: &Self,
+    ) -> Option<&ExactRegistryClaim> {
+        let existing_shell = existing.entities.iter().find_map(|entity| {
+            (entity.entity == existing.shell
+                && entity.claim.lifecycle() == EntityLifecycle::Active
+                && matches!(
+                    entity.claim.owner(),
+                    RegistryOwner::Committed(EntityOwner::FrameShell(owner))
+                        if owner == existing.frame()
+                ))
+            .then_some(&entity.claim)
+        })?;
+        let entering_shell = self.entities.iter().find_map(|entity| {
+            (entity.entity == self.shell
+                && entity.claim.lifecycle() == EntityLifecycle::PreparedInert
+                && matches!(
+                    entity.claim.owner(),
+                    RegistryOwner::Committed(EntityOwner::FrameShell(owner))
+                        if owner == self.frame()
+                ))
+            .then_some(&entity.claim)
+        })?;
+        (self.mount.same_physical_mount(&existing.mount)
+            && self.mount.allows_existing_shell(existing_shell))
+        .then_some(entering_shell)
+    }
+
     pub(crate) fn prior_mount_children(&self) -> &[Entity] {
         &self.prior_mount_children
     }
@@ -696,7 +818,7 @@ impl RealizedFrame {
         expected_prior.push(leaving.shell);
         if !self.shell_is_attached()
             || !leaving.shell_is_attached()
-            || self.mount != leaving.mount
+            || !self.mount.same_physical_mount(&leaving.mount)
             || self.prior_mount_children != expected_prior
         {
             return None;
@@ -1007,6 +1129,43 @@ pub(crate) fn realize_child_frame_deferred(
     )
 }
 
+pub(crate) fn realize_reconciliation_child_frame_deferred(
+    world: &mut World,
+    mount: &crate::branch_transaction::SealedReconciliationStagingMount<'_>,
+    task: &FrameTask,
+    output: u64,
+    plan: AcceptedContentPlan,
+) -> Result<RealizedFrame, DeferredRealizationFailure> {
+    let FrameMountTarget::ChildOutlet {
+        parent: task_parent,
+        outlet: task_outlet,
+    } = task.mount_target()
+    else {
+        return Err(DeferredRealizationFailure::before_complete_frame(
+            RealizationError::InvalidMount,
+        ));
+    };
+    let parent = mount.parent();
+    let mounted = mount.slot();
+    if parent.frame() != mounted.parent()
+        || task_parent != *mounted.parent()
+        || task_outlet != *mounted.outlet()
+        || task.frame().slot() != mounted.slot_id()
+    {
+        return Err(DeferredRealizationFailure::before_complete_frame(
+            RealizationError::InvalidMount,
+        ));
+    }
+    realize_frame_with_binding_deferred(
+        world,
+        parent.host_candidate.clone(),
+        FrameMountBinding::from_reconciliation_staging_mount(mount),
+        task.frame().clone(),
+        output,
+        plan,
+    )
+}
+
 fn realize_frame_with_binding_deferred(
     world: &mut World,
     host_candidate: ValidatedHostCandidate,
@@ -1310,23 +1469,36 @@ fn validate_mount_binding_allowing_additions(
             anchor,
             anchor_claim,
             expected_anchor_children,
-        } => validate_child_mount_slot(
-            world,
-            host_candidate,
-            mount.slot,
-            &mount.slot_claim,
-            parent,
-            outlet,
-            *anchor,
-            anchor_claim,
-            expected_anchor_children,
-            frame,
-            allowed_manifest_additions,
-            false,
-            EntityLifecycle::PreparedInert,
-            ChildSlotLifecycle::RegisteredInert,
-            Visibility::Hidden,
-        ),
+            staging_lifecycle,
+            ..
+        } => {
+            let (component_lifecycle, visibility) = match staging_lifecycle {
+                EntityLifecycle::PreparedInert => {
+                    (ChildSlotLifecycle::RegisteredInert, Visibility::Hidden)
+                }
+                EntityLifecycle::Active => (ChildSlotLifecycle::Active, Visibility::Visible),
+                EntityLifecycle::Leaving | EntityLifecycle::Quarantined => {
+                    return Err(RealizationError::InvalidMount);
+                }
+            };
+            validate_child_mount_slot(
+                world,
+                host_candidate,
+                mount.slot,
+                &mount.slot_claim,
+                parent,
+                outlet,
+                *anchor,
+                anchor_claim,
+                expected_anchor_children,
+                frame,
+                allowed_manifest_additions,
+                false,
+                *staging_lifecycle,
+                component_lifecycle,
+                visibility,
+            )
+        }
     }
 }
 
@@ -1352,6 +1524,7 @@ fn validate_committed_mount_binding(
             anchor,
             anchor_claim,
             expected_anchor_children,
+            ..
         } => validate_child_mount_slot(
             world,
             host_candidate,
@@ -1955,7 +2128,7 @@ fn exact_manifest_cas_is_current(
 }
 
 pub(crate) fn validate_realized_frame(world: &World, frame: &RealizedFrame) -> bool {
-    validate_realized_frame_allowing_child_slots(world, frame, &[])
+    validate_realized_frame_allowing_child_slots(world, frame, &[], None)
 }
 
 pub(crate) fn validate_realized_frame_with_child_slots(
@@ -1963,18 +2136,48 @@ pub(crate) fn validate_realized_frame_with_child_slots(
     frame: &RealizedFrame,
     child_slots: &[(Entity, Vec<Entity>)],
 ) -> bool {
-    validate_realized_frame_allowing_child_slots(world, frame, child_slots)
+    validate_realized_frame_allowing_child_slots(world, frame, child_slots, None)
+}
+
+pub(crate) fn validate_reconciliation_entering_frame_with_child_slots(
+    world: &World,
+    frame: &RealizedFrame,
+    child_slots: &[(Entity, Vec<Entity>)],
+    existing_mount: Option<&RealizedFrame>,
+) -> bool {
+    validate_realized_frame_allowing_child_slots(world, frame, child_slots, existing_mount)
 }
 
 fn validate_realized_frame_allowing_child_slots(
     world: &World,
     frame: &RealizedFrame,
     child_slots: &[(Entity, Vec<Entity>)],
+    existing_mount: Option<&RealizedFrame>,
 ) -> bool {
-    if validate_mount_binding(world, &frame.host_candidate, &frame.mount, frame.frame()).is_err()
-        || !mount_slot_children_are_exact(world, frame)
-        || frame_focus_is_in_subtree(world, frame)
-    {
+    let sealed_existing_mount = existing_mount.is_some_and(|existing| {
+        frame
+            .sealed_reconciliation_entering_shell_for(existing)
+            .is_some()
+    });
+    let mount_valid = if sealed_existing_mount {
+        validate_committed_mount_binding(
+            world,
+            &frame.host_candidate,
+            &frame.mount,
+            frame.frame(),
+            true,
+        )
+        .is_ok()
+    } else {
+        validate_mount_binding(world, &frame.host_candidate, &frame.mount, frame.frame()).is_ok()
+    };
+    let mount_children_valid = if sealed_existing_mount {
+        mount_slot_children_are_acceptable(world, frame, true, &[])
+    } else {
+        mount_slot_children_are_exact(world, frame)
+    };
+    let focus_present = frame_focus_is_in_subtree(world, frame);
+    if !mount_valid || !mount_children_valid || focus_present {
         return false;
     }
     frame.entities.iter().all(|realized| {
@@ -2192,8 +2395,23 @@ pub(crate) fn validate_active_frame_with_child_slots(
     frame: &RealizedFrame,
     child_slots: &[(Entity, Vec<Entity>)],
 ) -> bool {
+    validate_active_frame_with_child_slots_and_entering_shells(world, frame, child_slots, &[])
+}
+
+pub(crate) fn validate_active_frame_with_child_slots_and_entering_shells(
+    world: &World,
+    frame: &RealizedFrame,
+    child_slots: &[(Entity, Vec<Entity>)],
+    entering_shells: &[ExactRegistryClaim],
+) -> bool {
     matches!(
-        classify_committed_frame(world, frame, CommittedFrameRole::Preserved, child_slots,),
+        classify_committed_frame(
+            world,
+            frame,
+            CommittedFrameRole::Preserved,
+            child_slots,
+            entering_shells,
+        ),
         CommittedFramePreflight::Ready
     )
 }
@@ -2208,7 +2426,7 @@ pub(crate) fn validate_leaving_frame_with_child_slots(
     child_slots: &[(Entity, Vec<Entity>)],
 ) -> bool {
     matches!(
-        classify_committed_frame(world, frame, CommittedFrameRole::Leaving, child_slots),
+        classify_committed_frame(world, frame, CommittedFrameRole::Leaving, child_slots, &[],),
         CommittedFramePreflight::Ready | CommittedFramePreflight::ReadyWithQuarantine
     )
 }
@@ -2231,19 +2449,21 @@ fn classify_committed_frame(
     frame: &RealizedFrame,
     role: CommittedFrameRole,
     child_slots: &[(Entity, Vec<Entity>)],
+    entering_shells: &[ExactRegistryClaim],
 ) -> CommittedFramePreflight {
     let leaving_child_boundary = matches!(role, CommittedFrameRole::Leaving)
         && matches!(frame.mount.kind, FrameMountBindingKind::ChildOutlet { .. });
-    if validate_committed_mount_binding(
+    let binding_valid = validate_committed_mount_binding(
         world,
         &frame.host_candidate,
         &frame.mount,
         frame.frame(),
         leaving_child_boundary,
     )
-    .is_ok()
-        && mount_slot_children_are_acceptable(world, frame, leaving_child_boundary)
-    {
+    .is_ok();
+    let mount_children_valid =
+        mount_slot_children_are_acceptable(world, frame, leaving_child_boundary, entering_shells);
+    if binding_valid && mount_children_valid {
         // Continue with the role-sensitive closure checks below.
     } else {
         return CommittedFramePreflight::Invalid;
@@ -2524,7 +2744,7 @@ fn realized_values_match(
     }
 }
 
-fn expected_children(frame: &RealizedFrame, parent: Entity) -> Vec<Entity> {
+pub(crate) fn expected_children(frame: &RealizedFrame, parent: Entity) -> Vec<Entity> {
     frame
         .entities
         .iter()
@@ -2579,13 +2799,14 @@ fn apply_mount_children_manifest_cas_drift_probe(world: &mut World, mount_slot: 
 }
 
 fn mount_slot_children_are_exact(world: &World, frame: &RealizedFrame) -> bool {
-    mount_slot_children_are_acceptable(world, frame, false)
+    mount_slot_children_are_acceptable(world, frame, false, &[])
 }
 
 fn mount_slot_children_are_acceptable(
     world: &World,
     frame: &RealizedFrame,
     allow_foreign_children: bool,
+    entering_shells: &[ExactRegistryClaim],
 ) -> bool {
     let slot_entity = frame.mount.slot();
     let registry = world.resource::<RouteEntityRegistry>();
@@ -2615,7 +2836,14 @@ fn mount_slot_children_are_acceptable(
             if !frame_version_matches_mount(&frame.mount, mount_owner, child_frame)
                 || (child == frame.shell && child_frame != &frame.frame)
                 || (child != frame.shell && child_frame == &frame.frame)
-                || !record.manifest().matches(world, child)
+                || !(if child != frame.shell
+                    && (frame.mount.allows_existing_shell(&record.claim())
+                        || entering_shells.iter().any(|claim| *claim == record.claim()))
+                {
+                    manifest_contains_expected(world, child, record.manifest())
+                } else {
+                    record.manifest().matches(world, child)
+                })
                 || world
                     .get::<RouteOwnershipSeal>(child)
                     .map(|seal| seal.seal())
@@ -3401,6 +3629,7 @@ pub(crate) mod tests {
         prepared_outputs: usize,
         committed_slots: usize,
         provisional_slots: usize,
+        pending: Option<(usize, usize, bool)>,
     }
 
     fn drive_nested_until_prepared(app: &mut App) {
@@ -3434,10 +3663,17 @@ pub(crate) mod tests {
                         )
                     })
                     .count(),
+                pending: app
+                    .world()
+                    .resource::<RouterNavigation>()
+                    .pending_shape_for_test(),
             };
-            let ready = sample.prepared_outputs == 2
-                && sample.committed_slots == 1
-                && sample.provisional_slots == 0;
+            let ready = sample.pending.is_some_and(|(frames, slots, final_task)| {
+                final_task
+                    && sample.prepared_outputs == frames
+                    && sample.committed_slots == slots
+                    && sample.provisional_slots == 0
+            });
             trace.push(sample);
             if ready {
                 return;
@@ -3780,6 +4016,12 @@ pub(crate) mod tests {
             2
         );
         commit_presentation_system(app.world_mut());
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .is_some(),
+            "suffix replacement must reserve one leaving cleanup ledger"
+        );
         settle_cleanup_system(app.world_mut());
         app.world_mut().run_schedule(PostUpdate);
 
@@ -3862,7 +4104,7 @@ pub(crate) mod tests {
         collect_navigation_system(app.world_mut());
         drive_nested_until_prepared(&mut app);
         let pending = interactive_outputs(app.world(), EntityLifecycle::PreparedInert);
-        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.len(), 1);
         app.world_mut().run_schedule(PostUpdate);
         move_mouse_to(&mut app, primary_window, topology.child_primitive);
         let pending_hover = app
@@ -3897,11 +4139,14 @@ pub(crate) mod tests {
         commit_presentation_system(app.world_mut());
         assert_eq!(
             interactive_outputs(app.world(), EntityLifecycle::Leaving),
-            active_before
+            vec![topology.child_primitive]
         );
+        let mut expected_active = vec![topology.parent_primitive];
+        expected_active.extend(&pending);
+        expected_active.sort_by_key(|entity| entity.to_bits());
         assert_eq!(
             interactive_outputs(app.world(), EntityLifecycle::Active),
-            pending
+            expected_active
         );
         app.world_mut().run_schedule(PostUpdate);
         app.world_mut().run_schedule(PreUpdate);
@@ -3912,7 +4157,7 @@ pub(crate) mod tests {
             .cloned()
             .unwrap_or_default();
         assert!(committed_hover.keys().all(|entity| {
-            app.world().get::<FrameOutput>(*entity).is_none() || pending.contains(entity)
+            app.world().get::<FrameOutput>(*entity).is_none() || expected_active.contains(entity)
         }));
         for (entity, deliveries) in &old_deliveries {
             assert_eq!(
@@ -3937,9 +4182,15 @@ pub(crate) mod tests {
             .get(&PointerId::Mouse)
             .cloned()
             .unwrap_or_default();
+        assert!(
+            app.world()
+                .resource::<crate::input::RouterInputGate>()
+                .allows_pointer(replacement.child_primitive),
+            "committed replacement must retain its exact pointer capability"
+        );
         assert!(final_hover.contains_key(&replacement.child_primitive));
         assert!(final_hover.keys().all(|entity| {
-            app.world().get::<FrameOutput>(*entity).is_none() || pending.contains(entity)
+            app.world().get::<FrameOutput>(*entity).is_none() || expected_active.contains(entity)
         }));
         assert_eq!(
             app.world()
@@ -3958,7 +4209,12 @@ pub(crate) mod tests {
                     .unwrap_or_default(),
                 deliveries
             );
-            assert!(app.world().get_entity(entity).is_err());
+            if entity == topology.parent_primitive {
+                assert!(app.world().get_entity(entity).is_ok());
+            } else {
+                assert_eq!(entity, topology.child_primitive);
+                assert!(app.world().get_entity(entity).is_err());
+            }
         }
         assert_eq!(
             app.world_mut()
@@ -3996,6 +4252,8 @@ pub(crate) mod tests {
                 anchor: first_slot,
                 anchor_claim: first_claim,
                 expected_anchor_children: Vec::new(),
+                staging_lifecycle: EntityLifecycle::PreparedInert,
+                allowed_existing_shells: Vec::new(),
             },
         };
         let owner = RegistryOwner::Committed(EntityOwner::ChildSlot {

@@ -14,14 +14,22 @@ use bevy_ui_router_view::{RouteViewRegistry, ViewBuildEffect, integration as vie
 
 use crate::{
     app_ext::{RouterHandle, ViewDriverStore},
-    branch_transaction::{FailedPreparedBranch, PendingCommit, PreparedBranch, RealizedBranch},
+    branch_transaction::{
+        FailedPreparedBranch, PendingCommit, PreparedBranch, RealizedBranch,
+        ReconciliationAuthorityIdentity, ReconciliationProjectionFacts,
+        SealedExistingReconciliation, SealedMountNewStagingAllowance,
+        seal_reconciliation_staging_mount,
+    },
     cleanup::{
         CleanupLedger, FrozenCleanupManifest, RouterCleanupObservation,
         failed_prepared_branch_roots_are_exact,
     },
     content::{ContentPlan, FrameContentWriter},
     driver::{EcsViewReportSession, ReportSeal, ViewBuildReport, ViewBuildReportKind},
-    frame_local::{validate_committed_branch, validate_prepared_branch},
+    frame_local::{
+        validate_active_branch_for_splice, validate_branch_descendants, validate_committed_branch,
+        validate_reconciliation_entering_branch,
+    },
     host::{
         HostCandidateClassification, HostCandidateRevisionLatch, HostCandidateRevisionState,
         ProvisionalHostSettlement, ValidatedHostCandidate, activate_granted_top_slot,
@@ -38,16 +46,15 @@ use crate::{
         residual_child_slot_is_isolated, stage_child_slot,
     },
     presentation::{
-        DeferredRealizationFailure, RealizedFrame, frame_is_isolated_for_settlement,
-        isolate_frame_for_settlement, prepare_presentation_mutation, realize_child_frame_deferred,
-        realize_frame_deferred, validate_realized_frame,
+        DeferredRealizationFailure, RealizedFrame, expected_children,
+        frame_is_isolated_for_settlement, isolate_frame_for_settlement,
+        prepare_presentation_mutation, realize_child_frame_deferred, realize_frame_deferred,
+        realize_reconciliation_child_frame_deferred, validate_active_frame,
+        validate_realized_frame,
     },
     registry::{EntityLifecycle, RouteEntityRegistry},
     snapshots::RouterSnapshots,
 };
-
-#[cfg(test)]
-use crate::presentation::validate_active_frame;
 
 fn allocate_navigation_domain(counter: &AtomicU64) -> Option<u64> {
     counter
@@ -106,6 +113,134 @@ struct PendingMountMutationRejection {
     pending: PendingCommit,
     artifact: MountMutationArtifact,
     payload: PendingMountMutationPayload,
+    allowance: Option<SealedMountNewStagingAllowance>,
+}
+
+struct MountNewStagingSeed {
+    request: NavigationRequestId,
+    parent: RouteFrameVersion,
+    outlet: bevy_ui_router_core::slot::RouteSlotKey,
+    slot: bevy_ui_router_core::ids::RouteSlotId,
+    anchor: bevy_ecs::prelude::Entity,
+    anchor_claim: crate::registry::ExactRegistryClaim,
+    baseline_anchor_children: Vec<bevy_ecs::prelude::Entity>,
+}
+
+impl MountNewStagingSeed {
+    fn from_validated_request(
+        world: &World,
+        request: NavigationRequestId,
+        parent: &RealizedFrame,
+        outlet: &bevy_ui_router_core::slot::RouteSlotKey,
+        slot: bevy_ui_router_core::ids::RouteSlotId,
+    ) -> Option<Self> {
+        let outlet_record = parent.outlet(outlet)?;
+        let anchor = outlet_record.anchor();
+        let baseline_anchor_children = expected_children(parent, anchor);
+        let actual = world
+            .get::<bevy_ecs::hierarchy::Children>(anchor)
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        (outlet_record.parent() == parent.frame()
+            && outlet_record.key() == outlet
+            && actual == baseline_anchor_children)
+            .then(|| Self {
+                request,
+                parent: parent.frame().clone(),
+                outlet: outlet.clone(),
+                slot,
+                anchor,
+                anchor_claim: outlet_record.anchor_claim().clone(),
+                baseline_anchor_children,
+            })
+    }
+
+    fn seal_staged(
+        self,
+        world: &World,
+        staged: &StagedChildSlot,
+    ) -> Option<SealedMountNewStagingAllowance> {
+        self.seal_entity(world, staged.slot(), staged.slot_claim().clone())
+    }
+
+    fn seal_residual(
+        self,
+        world: &World,
+        residual: &ChildSlotResidual,
+    ) -> Option<SealedMountNewStagingAllowance> {
+        (residual.parent() == &self.parent
+            && residual.outlet() == &self.outlet
+            && residual.anchor() == self.anchor
+            && residual.anchor_claim() == &self.anchor_claim)
+            .then_some(())?;
+        self.seal_entity(world, residual.entity(), residual.claim().clone())
+    }
+
+    fn seal_entity(
+        self,
+        world: &World,
+        entity: bevy_ecs::prelude::Entity,
+        claim: crate::registry::ExactRegistryClaim,
+    ) -> Option<SealedMountNewStagingAllowance> {
+        use bevy_camera::visibility::Visibility;
+        use bevy_picking::Pickable;
+
+        let attached = world
+            .get::<bevy_ecs::hierarchy::ChildOf>(entity)
+            .map(bevy_ecs::hierarchy::ChildOf::parent)
+            == Some(self.anchor);
+        let mut expected_anchor_children = self.baseline_anchor_children;
+        if attached {
+            expected_anchor_children.push(entity);
+        }
+        let actual_anchor_children = world
+            .get::<bevy_ecs::hierarchy::Children>(self.anchor)
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let record_is_exact = world
+            .resource::<RouteEntityRegistry>()
+            .record(entity)
+            .is_some_and(|record| record.claim() == claim);
+        let authority_is_exact = world
+            .get::<crate::components::ChildSlotAuthority>(entity)
+            .is_some_and(|authority| {
+                authority.parent() == &self.parent
+                    && authority.outlet() == &self.outlet
+                    && authority.slot() == self.slot
+            });
+        let lifecycle_is_inert = matches!(
+            world.get::<crate::components::ChildSlotLifecycle>(entity),
+            Some(
+                crate::components::ChildSlotLifecycle::ProvisionalInert
+                    | crate::components::ChildSlotLifecycle::RegisteredInert
+            )
+        );
+        if !record_is_exact
+            || world.get::<crate::components::RouteOwnershipSeal>(entity)
+                != Some(&crate::components::RouteOwnershipSeal::new(claim.seal()))
+            || !authority_is_exact
+            || !lifecycle_is_inert
+            || world.get::<Visibility>(entity) != Some(&Visibility::Hidden)
+            || world.get::<Pickable>(entity) != Some(&Pickable::IGNORE)
+            || !world
+                .get::<crate::components::RouterInputBarrier>(entity)
+                .is_some_and(crate::components::RouterInputBarrier::denies_all)
+            || actual_anchor_children != expected_anchor_children
+        {
+            return None;
+        }
+        SealedMountNewStagingAllowance::seal(
+            self.request,
+            self.parent,
+            self.outlet,
+            self.slot,
+            entity,
+            claim,
+            self.anchor,
+            self.anchor_claim,
+            expected_anchor_children,
+        )
+    }
 }
 
 pub(crate) struct RouterEntry {
@@ -116,6 +251,7 @@ pub(crate) struct RouterEntry {
     host_settlement: Option<ProvisionalHostSettlement>,
     pending_commit: Option<PendingCommit>,
     pending_frame_drive: Option<PendingFrameDrive>,
+    pending_mount_frame_task: Option<RootFrameTask>,
     pending_mount_request: Option<MountRequest>,
     pending_mount_mutation_rejection: Option<PendingMountMutationRejection>,
     pending_failed_branch: Option<PendingFailedBranch>,
@@ -126,6 +262,63 @@ pub(crate) struct RouterEntry {
 }
 
 impl RouterEntry {
+    pub(crate) fn current_reconciliation_entering_branch(&self) -> Option<&RealizedBranch> {
+        let pending = self.pending_commit.as_ref()?;
+        let projection_is_current = if let Some(ticket) = pending.ticket.as_ref() {
+            self.engine
+                .reconciliation_projection_for_commit(ticket)
+                .is_ok()
+        } else if let Some(task) = pending.final_task.as_ref() {
+            self.engine.reconciliation_projection_for_task(task).is_ok()
+        } else if let Some(task) = self.pending_mount_frame_task.as_ref() {
+            self.engine
+                .reconciliation_projection_for_task(task)
+                .ok()
+                .and_then(|projection| {
+                    seal_reconciliation_staging_mount(
+                        &projection,
+                        self.active.as_ref(),
+                        &pending.branch,
+                        task,
+                    )
+                })
+                .is_some_and(|mount| {
+                    mount.role() == crate::branch_transaction::ReconciliationSlotRoleKind::MountNew
+                        && mount.expected_slot_lifecycle() == EntityLifecycle::PreparedInert
+                })
+        } else {
+            false
+        };
+        projection_is_current.then_some(pending.branch.as_realized())
+    }
+
+    pub(crate) fn current_mount_new_staging_allowance(
+        &self,
+    ) -> Option<&SealedMountNewStagingAllowance> {
+        if let Some(allowance) = self
+            .pending_mount_mutation_rejection
+            .as_ref()
+            .and_then(|pending| pending.allowance.as_ref())
+        {
+            return Some(allowance);
+        }
+        if let Some(failed) = self.pending_failed_branch.as_ref() {
+            let allowance = failed.branch.mount_new_allowance()?;
+            let terminal_is_exact = match &failed.terminal {
+                PendingFailedBranchTerminal::Request(request) => {
+                    allowance.matches_request(request.request())
+                }
+                PendingFailedBranchTerminal::RegistrationBegin(_) => true,
+                PendingFailedBranchTerminal::Task { .. }
+                | PendingFailedBranchTerminal::TaskWithPhysicalResidual { .. } => false,
+            };
+            return terminal_is_exact.then_some(allowance);
+        }
+        self.cleanup_ledger
+            .as_ref()
+            .and_then(CleanupLedger::mount_new_staging_allowance)
+    }
+
     pub(crate) fn cleanup_summary(&self) -> bevy_ui_router_core::CleanupSummary {
         self.cleanup_observation.summary(
             self.cleanup_ledger.is_some()
@@ -275,6 +468,7 @@ impl RouterNavigation {
             host_settlement: None,
             pending_commit: None,
             pending_frame_drive: None,
+            pending_mount_frame_task: None,
             pending_mount_request: None,
             pending_mount_mutation_rejection: None,
             pending_failed_branch: None,
@@ -306,6 +500,43 @@ impl RouterNavigation {
         })?;
         entry.requests.push(request);
         Ok(request)
+    }
+}
+
+#[cfg(test)]
+impl RouterNavigation {
+    pub(crate) fn pending_shape_for_test(&self) -> Option<(usize, usize, bool)> {
+        self.entries
+            .first()?
+            .pending_commit
+            .as_ref()
+            .map(|pending| {
+                (
+                    pending.branch.frames().len(),
+                    pending.branch.child_slots().len(),
+                    pending.final_task.is_some(),
+                )
+            })
+    }
+
+    pub(crate) fn stale_pending_projection_for_test(&mut self) {
+        let entry = self
+            .entries
+            .first_mut()
+            .expect("test router entry must remain installed");
+        let pending = entry
+            .pending_commit
+            .as_mut()
+            .expect("test pending branch must remain staged");
+        let task = pending
+            .final_task
+            .take()
+            .expect("test pending branch must retain its final task authority");
+        let _ = entry.engine.report_failed(
+            task,
+            ViewFailureKind::Apply,
+            "test consumes the pending projection authority",
+        );
     }
 }
 
@@ -458,6 +689,7 @@ fn apply_applied_driver_report(
         top_slot,
         top_slot_claim,
         None,
+        None,
         task,
         report,
         plan,
@@ -471,6 +703,7 @@ fn apply_applied_driver_report_to_branch(
     top_slot: bevy_ecs::entity::Entity,
     top_slot_claim: crate::registry::ExactRegistryClaim,
     branch: Option<&PreparedBranch>,
+    active: Option<&RealizedBranch>,
     task: &RootFrameTask,
     report: &ViewBuildReport,
     plan: ContentPlan,
@@ -496,14 +729,32 @@ fn apply_applied_driver_report_to_branch(
             let Some(branch) = branch else {
                 return Err(DriverReportApplicationError::Stale);
             };
-            let (Some(parent), Some(mounted)) = (branch.last_frame(), branch.child_slots().last())
+            if active.is_none() {
+                let (Some(parent), Some(mounted)) =
+                    (branch.last_frame(), branch.child_slots().last())
+                else {
+                    return Err(DriverReportApplicationError::Stale);
+                };
+                return realize_child_frame_deferred(
+                    world,
+                    parent,
+                    mounted,
+                    task,
+                    task.view_request_sequence(),
+                    plan.accept(),
+                )
+                .map_err(DriverReportApplicationError::Realization);
+            }
+            let projection = engine
+                .reconciliation_projection_for_task(task)
+                .map_err(|_| DriverReportApplicationError::Stale)?;
+            let Some(mount) = seal_reconciliation_staging_mount(&projection, active, branch, task)
             else {
                 return Err(DriverReportApplicationError::Stale);
             };
-            realize_child_frame_deferred(
+            realize_reconciliation_child_frame_deferred(
                 world,
-                parent,
-                mounted,
+                &mount,
                 task,
                 task.view_request_sequence(),
                 plan.accept(),
@@ -535,6 +786,60 @@ fn failed_prepared_branch(
     }
 }
 
+fn complete_zero_physical_failure(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    request: FailureCleanupRequest,
+    branch: FailedPreparedBranch,
+) -> Result<(), PendingFailedBranch> {
+    let manifest = world
+        .get_resource::<RouteEntityRegistry>()
+        .and_then(|registry| {
+            FrozenCleanupManifest::from_failed_prepared_branch(world, registry, &branch)
+        });
+    let Some(manifest) = manifest.filter(|manifest| manifest.len() == 0) else {
+        return Err(PendingFailedBranch {
+            terminal: PendingFailedBranchTerminal::Request(request),
+            branch,
+        });
+    };
+    let manifest_digest = manifest.digest();
+    let Some(reserved) = CleanupLedger::reserve(manifest) else {
+        return Err(PendingFailedBranch {
+            terminal: PendingFailedBranchTerminal::Request(request),
+            branch,
+        });
+    };
+    let logical_roots = request.logical_roots().to_vec();
+    let cleanup = match entry.engine.prepare_failure_cleanup_retaining(
+        request,
+        CleanupManifest::new(logical_roots, manifest_digest, 0),
+    ) {
+        Ok(cleanup) => cleanup,
+        Err(error) => {
+            return Err(PendingFailedBranch {
+                terminal: PendingFailedBranchTerminal::Request(error.into_owner()),
+                branch,
+            });
+        }
+    };
+    let mut ledger = CleanupLedger::activate_failed(reserved.bind_batch(cleanup), branch);
+    if !ledger.is_settled() {
+        let Some(attempt) = ledger.attempt(world) else {
+            unreachable!("an exact zero-physical cleanup ledger issues one attempt when needed")
+        };
+        assert!(ledger.settle(world, attempt));
+    }
+    let completion = ledger
+        .pending_completion()
+        .expect("an empty exact cleanup ledger settles immediately");
+    entry
+        .engine
+        .complete_cleanup(completion)
+        .expect("an exact empty cleanup completion is current");
+    Ok(())
+}
+
 fn retry_pending_mount_mutation_rejection(
     world: &mut World,
     entry: &mut RouterEntry,
@@ -544,6 +849,7 @@ fn retry_pending_mount_mutation_rejection(
         pending,
         artifact,
         payload,
+        allowance,
     } = pending_rejection;
     match entry.engine.reject_mount_after_mutation(artifact) {
         Ok(request) => {
@@ -556,7 +862,8 @@ fn retry_pending_mount_mutation_rejection(
             };
             entry.pending_failed_branch = Some(PendingFailedBranch {
                 terminal: PendingFailedBranchTerminal::Request(request),
-                branch: failed_prepared_branch(pending, residual),
+                branch: failed_prepared_branch(pending, residual)
+                    .with_mount_new_allowance(allowance),
             });
             None
         }
@@ -564,6 +871,7 @@ fn retry_pending_mount_mutation_rejection(
             pending,
             artifact: error.into_owner(),
             payload,
+            allowance,
         }),
     }
 }
@@ -719,6 +1027,8 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                     Some(EngineAction::FrameTask(retry.task)),
                                     Some((retry.pending, retry.effect)),
                                 )
+                            } else if let Some(task) = entry.pending_mount_frame_task.take() {
+                                (Some(EngineAction::FrameTask(task)), None)
                             } else {
                                 (
                                     entry
@@ -867,10 +1177,12 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                         "route view driver rejected the frame",
                                     );
                                     if let Ok(Some(request)) = failure {
-                                        entry.pending_failed_branch = Some(PendingFailedBranch {
-                                            terminal: PendingFailedBranchTerminal::Request(request),
-                                            branch: failed_prepared_branch(pending, None),
-                                        });
+                                        let branch = failed_prepared_branch(pending, None);
+                                        if let Err(failed) = complete_zero_physical_failure(
+                                            world, entry, request, branch,
+                                        ) {
+                                            entry.pending_failed_branch = Some(failed);
+                                        }
                                     }
                                     continue;
                                 }
@@ -880,7 +1192,8 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                     host.candidate.clone(),
                                     host.top_slot,
                                     host.top_slot_claim.clone(),
-                                    (!pending.branch.frames().is_empty()).then_some(&pending.branch),
+                                    (!realizing_root).then_some(&pending.branch),
+                                    entry.active.as_ref(),
                                     &task,
                                     &report,
                                     plan,
@@ -1028,9 +1341,10 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                             }
                             EngineAction::MountRequest(request) => {
                                 entry.pending_mount_request = Some(request);
-                                let Some(mut pending) = entry.pending_commit.take() else {
-                                    continue;
-                                };
+                                let mut pending = entry
+                                    .pending_commit
+                                    .take()
+                                    .unwrap_or_else(PendingCommit::new);
                                 let request_is_exact = entry
                                     .pending_mount_request
                                     .as_ref()
@@ -1041,21 +1355,47 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                     entry.pending_commit = Some(pending);
                                     continue;
                                 }
-                                let (parent_is_exact, outlet_exists, outlet) = {
+                                let request_identity = entry
+                                    .pending_mount_request
+                                    .as_ref()
+                                    .expect("validated mount request remains held")
+                                    .request();
+                                let (
+                                    parent_is_exact,
+                                    parent_is_active,
+                                    outlet_exists,
+                                    outlet,
+                                    mount_parent,
+                                ) = {
                                     let request = entry
                                         .pending_mount_request
                                         .as_ref()
                                         .expect("validated mount request remains held");
-                                    let parent = pending.branch.last_frame();
+                                    let entering_parent = pending
+                                        .branch
+                                        .frames()
+                                        .iter()
+                                        .find(|frame| frame.frame() == request.parent());
+                                    let active_parent = entry.active.as_ref().and_then(|branch| {
+                                        branch
+                                            .frames()
+                                            .iter()
+                                            .find(|frame| frame.frame() == request.parent())
+                                    });
+                                    let exact_entering = entering_parent.is_some_and(|parent| {
+                                        validate_realized_frame(world, parent)
+                                    });
+                                    let exact_active = active_parent
+                                        .is_some_and(|parent| validate_active_frame(world, parent));
+                                    let parent = entering_parent.or(active_parent);
                                     (
-                                        parent.is_some_and(|parent| {
-                                            parent.frame() == request.parent()
-                                                && validate_realized_frame(world, parent)
-                                        }),
+                                        exact_entering ^ exact_active,
+                                        exact_active,
                                         parent.is_some_and(|parent| {
                                             parent.outlet(request.outlet()).is_some()
                                         }),
                                         request.outlet().clone(),
+                                        request.parent().clone(),
                                     )
                                 };
                                 if !parent_is_exact || !outlet_exists {
@@ -1102,14 +1442,61 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                         continue;
                                     }
                                 };
-                                let parent = pending
-                                    .branch
-                                    .last_frame()
-                                    .expect("validated mount request retains its parent frame");
-                                let staged = match stage_child_slot(world, parent, &outlet, &grant) {
-                                    Ok(staged) => staged,
+                                let allowance_seed = if parent_is_active {
+                                    entry
+                                        .active
+                                        .as_ref()
+                                        .and_then(|branch| {
+                                            branch.frames().iter().find(|frame| {
+                                                frame.frame() == &mount_parent
+                                            })
+                                        })
+                                        .and_then(|parent| {
+                                            MountNewStagingSeed::from_validated_request(
+                                                world,
+                                                request_identity,
+                                                parent,
+                                                &outlet,
+                                                grant.slot(),
+                                            )
+                                        })
+                                } else {
+                                    None
+                                };
+                                let staged_result = {
+                                    let parent = if parent_is_active {
+                                        entry
+                                            .active
+                                            .as_ref()
+                                            .and_then(|branch| {
+                                                branch.frames().iter().find(|frame| {
+                                                    frame.frame() == &mount_parent
+                                                })
+                                            })
+                                            .expect("validated active mount parent remains exact")
+                                    } else {
+                                        pending
+                                            .branch
+                                            .frames()
+                                            .iter()
+                                            .find(|frame| frame.frame() == &mount_parent)
+                                            .expect("validated entering mount parent remains exact")
+                                    };
+                                    stage_child_slot(world, parent, &outlet, &grant)
+                                };
+                                let (staged, allowance) = match staged_result {
+                                    Ok(staged) => {
+                                        let allowance = allowance_seed
+                                            .and_then(|seed| seed.seal_staged(world, &staged));
+                                        (staged, allowance)
+                                    }
                                     Err(failure) => {
                                         let residual = failure.into_residual();
+                                        let allowance = allowance_seed.and_then(|seed| {
+                                            residual
+                                                .as_ref()
+                                                .and_then(|residual| seed.seal_residual(world, residual))
+                                        });
                                         match entry.engine.reject_mount_after_mutation(
                                             MountMutationArtifact::Grant(grant),
                                         ) {
@@ -1120,9 +1507,8 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                                             PendingFailedBranchTerminal::Request(
                                                                 request,
                                                             ),
-                                                        branch: failed_prepared_branch(
-                                                            pending, residual,
-                                                        ),
+                                                        branch: failed_prepared_branch(pending, residual)
+                                                            .with_mount_new_allowance(allowance),
                                                     });
                                             }
                                             Err(error) => {
@@ -1134,6 +1520,7 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                                             PendingMountMutationPayload::Grant {
                                                                 residual,
                                                             },
+                                                        allowance,
                                                     });
                                             }
                                         }
@@ -1157,6 +1544,7 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                                         staged,
                                                         proof,
                                                     },
+                                                allowance,
                                             };
                                         entry.pending_mount_mutation_rejection =
                                             retry_pending_mount_mutation_rejection(
@@ -1175,8 +1563,35 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                     &proof,
                                 ) {
                                     Ok(mounted) => {
-                                        match pending.branch.push_child_slot(mounted) {
-                                            Ok(()) => entry.pending_commit = Some(pending),
+                                        let pushed = if parent_is_active {
+                                            let parent = entry
+                                                .active
+                                                .as_ref()
+                                                .and_then(|branch| {
+                                                    branch.frames().iter().find(|frame| {
+                                                        frame.frame() == &mount_parent
+                                                    })
+                                                })
+                                                .expect(
+                                                    "confirmed active mount parent remains exact",
+                                                );
+                                            pending
+                                                .branch
+                                                .push_reconciliation_child_slot(mounted, parent)
+                                        } else {
+                                            pending.branch.push_child_slot(mounted)
+                                        };
+                                        match pushed {
+                                            Ok(()) => {
+                                                let Some(EngineAction::FrameTask(task)) =
+                                                    entry.engine.action()
+                                                else {
+                                                    entry.pending_commit = Some(pending);
+                                                    continue;
+                                                };
+                                                entry.pending_mount_frame_task = Some(task);
+                                                entry.pending_commit = Some(pending);
+                                            }
                                             Err(rejected) => {
                                                 let Some(EngineAction::FrameTask(task)) =
                                                     entry.engine.action()
@@ -1204,6 +1619,8 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                     }
                                     Err(failure) => {
                                         let (cleanup, begin, residual) = failure.into_parts();
+                                        let allowance = allowance
+                                            .and_then(|allowance| allowance.rebind_residual(&residual));
                                         let terminal = if let Some(request) = cleanup {
                                             PendingFailedBranchTerminal::Request(request)
                                         } else if let Some(error) = begin {
@@ -1213,10 +1630,8 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                         };
                                         entry.pending_failed_branch = Some(PendingFailedBranch {
                                             terminal,
-                                            branch: failed_prepared_branch(
-                                                pending,
-                                                Some(residual),
-                                            ),
+                                            branch: failed_prepared_branch(pending, Some(residual))
+                                                .with_mount_new_allowance(allowance),
                                         });
                                     }
                                 }
@@ -1253,20 +1668,114 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                     entry.pending_commit = Some(pending);
                     continue;
                 }
-                let Some(host) = entry.host.as_ref() else {
+                let Some(authority_root) = entry
+                    .active
+                    .as_ref()
+                    .and_then(RealizedBranch::first_frame)
+                    .or_else(|| pending.branch.first_frame())
+                else {
                     entry.pending_commit = Some(pending);
                     continue;
                 };
-                if world.get_entity(host.host).is_err()
-                    || !validated_host_candidate_is_current(world, &host.candidate)
+                let Some(authority) = ReconciliationAuthorityIdentity::from_frame(
+                    authority_root.frame(),
+                    authority_root.frame().host(),
+                    authority_root.frame().slot(),
+                ) else {
+                    entry.pending_commit = Some(pending);
+                    continue;
+                };
+                let (facts, has_leaving) = {
+                    let projection = match (pending.ticket.as_ref(), pending.final_task.as_ref()) {
+                        (Some(ticket), _) => {
+                            entry.engine.reconciliation_projection_for_commit(ticket)
+                        }
+                        (None, Some(task)) => {
+                            entry.engine.reconciliation_projection_for_task(task)
+                        }
+                        (None, None) => {
+                            entry.pending_commit = Some(pending);
+                            continue;
+                        }
+                    };
+                    let Ok(projection) = projection else {
+                        if entry.active.is_none() {
+                            match commit_projectionless_initial_branch(world, entry, pending) {
+                                Ok(()) => continue,
+                                Err(owner) => {
+                                    entry.pending_commit = Some(owner);
+                                    continue;
+                                }
+                            }
+                        }
+                        entry.pending_commit = Some(pending);
+                        continue;
+                    };
+                    let has_leaving = projection.leaving().len() != 0;
+                    let Some(facts) = ReconciliationProjectionFacts::from_core(&projection, authority)
+                    else {
+                        entry.pending_commit = Some(pending);
+                        continue;
+                    };
+                    (facts, has_leaving)
+                };
+                let had_active = entry.active.is_some();
+                let active_owner = entry.active.take().unwrap_or_else(RealizedBranch::empty);
+                let sealed = match SealedExistingReconciliation::prepare_from_projection(
+                    active_owner,
+                    facts,
+                ) {
+                    Ok(sealed) => sealed,
+                    Err(failure) => {
+                        let (active, _) = failure.into_parts();
+                        entry.active = had_active.then_some(active);
+                        entry.pending_commit = Some(pending);
+                        continue;
+                    }
+                };
+                let entering_owner =
+                    std::mem::replace(&mut pending.branch, PreparedBranch::empty());
+                let mut splice = match sealed.bind_entering(entering_owner) {
+                    Ok(splice) => splice,
+                    Err(failure) => {
+                        let (sealed, entering, _) = failure.into_parts();
+                        let (active, _, _roles) = sealed.reject().into_parts();
+                        entry.active = had_active.then_some(active);
+                        pending.branch = entering;
+                        entry.pending_commit = Some(pending);
+                        continue;
+                    }
+                };
+                let host_is_current = entry.host.as_ref().is_some_and(|host| {
+                    world.get_entity(host.host).is_ok()
+                        && validated_host_candidate_is_current(world, &host.candidate)
+                });
+                if !host_is_current
+                    || validate_active_branch_for_splice(
+                        world,
+                        splice.preserved(),
+                        splice.entering(),
+                        splice.slot_roles(),
+                    )
+                    .is_err()
                 {
+                    let (active, entering, _roles) = splice.reject().into_parts();
+                    entry.active = had_active.then_some(active);
+                    pending.branch = entering;
                     entry.pending_commit = Some(pending);
                     continue;
                 }
-                let replaces_active = !pending.branch.frames().is_empty();
-                if replaces_active
-                    && validate_prepared_branch(world, pending.branch.as_realized()).is_err()
+                if validate_reconciliation_entering_branch(
+                    world,
+                    splice.entering(),
+                    splice.preserved(),
+                    splice.leaving(),
+                )
+                .is_err()
                 {
+                    let (active, entering, _roles) = splice.reject().into_parts();
+                    entry.active = had_active.then_some(active);
+                    pending.branch = entering;
                     let Some(task) = pending.final_task.take() else {
                         entry.pending_commit = Some(pending);
                         continue;
@@ -1283,66 +1792,47 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                     entry.pending_failed_branch = Some(failed);
                     continue;
                 }
-                let active_descendants = match entry.active.as_ref() {
-                    Some(branch) => match validate_committed_branch(world, branch, replaces_active) {
-                        Ok(descendants) => descendants,
-                        Err(_) => {
+                if has_leaving
+                    && validate_committed_branch(world, splice.leaving(), true).is_err()
+                {
+                    let (active, entering, _roles) = splice.reject().into_parts();
+                    entry.active = had_active.then_some(active);
+                    pending.branch = entering;
+                    entry.pending_commit = Some(pending);
+                    continue;
+                }
+                let focus_leaving = match validate_branch_descendants(world, splice.leaving()) {
+                    Ok(descendants) => descendants,
+                    Err(_) => {
+                        let (active, entering, _roles) = splice.reject().into_parts();
+                        entry.active = had_active.then_some(active);
+                        pending.branch = entering;
+                        entry.pending_commit = Some(pending);
+                        continue;
+                    }
+                };
+                let logical_roots = logical_cleanup_roots(splice.leaving());
+                let gate_before = splice.current_interactive_entities();
+                let gate_after = splice.resulting_interactive_entities();
+                let (targets, isolate_count) = splice.presentation_mutation_targets();
+                let transitions = splice.lifecycle_transitions();
+                let leaving_count = splice.leaving().obligation_count();
+                let root_rebase = if !splice.leaving().frames().is_empty()
+                    && !splice.entering().frames().is_empty()
+                {
+                    match splice.prepare_root_rebase() {
+                        Some(prepared) => Some(prepared),
+                        None => {
+                            let (active, entering, _roles) = splice.reject().into_parts();
+                            entry.active = had_active.then_some(active);
+                            pending.branch = entering;
                             entry.pending_commit = Some(pending);
                             continue;
                         }
-                    },
-                    None => Vec::new(),
-                };
-
-                let mut entering = replaces_active.then(|| {
-                    std::mem::replace(&mut pending.branch, PreparedBranch::empty()).into_realized()
-                });
-                let mut leaving = if entering.is_some() {
-                    entry.active.take()
+                    }
                 } else {
                     None
                 };
-                let logical_roots = leaving
-                    .as_ref()
-                    .map(logical_cleanup_roots)
-                    .unwrap_or_default();
-                let gate_before = leaving
-                    .as_ref()
-                    .or(entry.active.as_ref())
-                    .map(RealizedBranch::interactive_entities)
-                    .unwrap_or_default();
-                let gate_after = entering.as_ref().map_or_else(
-                    || {
-                        entry
-                            .active
-                            .as_ref()
-                            .map(RealizedBranch::interactive_entities)
-                            .unwrap_or_default()
-                    },
-                    RealizedBranch::interactive_entities,
-                );
-                let focus_leaving = focus_targets_for_commit(replaces_active, active_descendants);
-                let mut targets = Vec::new();
-                let mut transitions = Vec::new();
-                if let Some(branch) = leaving.as_ref() {
-                    targets.extend(branch.leaving_mutation_targets(
-                        EntityLifecycle::Active,
-                        EntityLifecycle::Leaving,
-                    ));
-                    transitions.extend(
-                        branch.lifecycle_transitions(EntityLifecycle::Leaving, true),
-                    );
-                }
-                let leaving_count = transitions.len();
-                if let Some(branch) = entering.as_ref() {
-                    targets.extend(branch.entering_mutation_targets(
-                        EntityLifecycle::PreparedInert,
-                        EntityLifecycle::Active,
-                    ));
-                    transitions.extend(
-                        branch.lifecycle_transitions(EntityLifecycle::Active, false),
-                    );
-                }
                 let committed = world.resource_scope(
                     |world, gate: bevy_ecs::change_detection::Mut<RouterInputGate>| {
                         world.resource_scope(
@@ -1361,18 +1851,22 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                                                     .prepare_lifecycle_mutation(&transitions)?;
                                                 let resulting_claims =
                                                     registry_plan.resulting_claims().to_vec();
-                                                let frozen_manifest = match leaving.as_ref() {
-                                                    Some(branch) => match FrozenCleanupManifest::from_leaving_branch(
+                                                let frozen_manifest = if leaving_count == 0 {
+                                                    FrozenCleanupManifest::empty()
+                                                } else {
+                                                    match FrozenCleanupManifest::from_leaving_branch(
                                                         world,
                                                         &registry,
-                                                        branch,
+                                                        splice.leaving(),
                                                         &resulting_claims[..leaving_count],
-                                                        entering.as_ref(),
+                                                        (!splice.entering().frames().is_empty())
+                                                            .then_some(splice.entering()),
                                                     ) {
                                                         Some(manifest) => manifest,
-                                                        None => return None,
-                                                    },
-                                                    None => FrozenCleanupManifest::empty(),
+                                                        None => {
+                                                            return None;
+                                                        }
+                                                    }
                                                 };
                                                 let manifest_digest = frozen_manifest.digest();
                                                 let obligation_count = frozen_manifest.len();
@@ -1393,39 +1887,20 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                                                     route_focus,
                                                     &focus_leaving,
                                                 );
-                                                let leaving_rebind = match leaving.as_ref() {
-                                                    Some(branch) => Some(branch.prepare_claim_rebind(
-                                                        &resulting_claims[..leaving_count],
-                                                        EntityLifecycle::Active,
-                                                        EntityLifecycle::Leaving,
-                                                    )?),
-                                                    None => None,
-                                                };
-                                                let entering_rebind = match entering.as_ref() {
-                                                    Some(branch) => Some(branch.prepare_claim_rebind(
-                                                        &resulting_claims[leaving_count..],
-                                                        EntityLifecycle::PreparedInert,
-                                                        EntityLifecycle::Active,
-                                                    )?),
-                                                    None => None,
-                                                };
-                                                let root_rebase = match (
-                                                    leaving.as_ref(),
-                                                    entering.as_ref(),
-                                                ) {
-                                                    (Some(leaving), Some(entering)) => Some(
-                                                        entering.prepare_root_rebase(leaving)?,
-                                                    ),
-                                                    (None, _) => None,
-                                                    (Some(_), None) => return None,
-                                                };
+                                                let claim_rebind =
+                                                    splice.prepare_claim_rebind(&resulting_claims)?;
                                                 let presentation_plan =
                                                     prepare_presentation_mutation(world, &targets)?
-                                                        .seal_commit(leaving_count)?;
+                                                        .seal_commit(isolate_count)?;
                                                 if pending.ticket.is_none() {
-                                                    let task = pending.final_task.take()?;
-                                                    pending.ticket =
-                                                        entry.engine.report_applied(task).ok();
+                                                    let task = pending.final_task.take().expect(
+                                                        "fully preflighted legacy leaf task remains owned",
+                                                    );
+                                                    pending.ticket = Some(
+                                                        entry.engine.report_applied(task).expect(
+                                                            "sealed task projection must report exactly once",
+                                                        ),
+                                                    );
                                                 }
                                                 let ticket = pending.ticket.as_ref()?;
                                                 let prepared = match entry
@@ -1439,20 +1914,9 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                                                 let cleanup_ledger =
                                                     reserved_ledger.bind_batch(cleanup);
                                                 pending.ticket.take();
-                                                if let (Some(branch), Some(rebind)) =
-                                                    (leaving.as_mut(), leaving_rebind)
-                                                {
-                                                    branch.apply_claim_rebind(rebind);
-                                                }
-                                                if let (Some(branch), Some(rebind)) =
-                                                    (entering.as_mut(), entering_rebind)
-                                                {
-                                                    branch.apply_claim_rebind(rebind);
-                                                }
-                                                if let (Some(branch), Some(rebase)) =
-                                                    (entering.as_mut(), root_rebase)
-                                                {
-                                                    branch.apply_root_rebase(rebase);
+                                                splice.apply_claim_rebind(claim_rebind);
+                                                if let Some(rebase) = root_rebase {
+                                                    splice.apply_root_rebase(rebase);
                                                 }
                                                 entry.engine.publish(prepared, || {
                                                     presentation_plan.apply_staged(
@@ -1471,28 +1935,134 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                     },
                 );
                 let Some(cleanup_ledger) = committed else {
-                    if let Some(frame) = leaving {
-                        entry.active = Some(frame);
-                    }
-                    if let Some(branch) = entering {
-                        pending.branch = PreparedBranch::from_realized(branch);
-                    }
+                    let (active, entering, _roles) = splice.reject().into_parts();
+                    entry.active = had_active.then_some(active);
+                    pending.branch = entering;
                     if pending.ticket.is_some() || pending.final_task.is_some() {
                         entry.pending_commit = Some(pending);
                     }
                     continue;
                 };
-                if let Some(branch) = entering {
-                    entry.active = Some(branch);
-                }
+                let outcome = splice.apply();
+                let (active, leaving) = outcome.into_active_and_leaving();
+                entry.active = (!active.frames().is_empty()).then_some(active);
                 entry.cleanup_ledger = Some(CleanupLedger::activate_leaving_branch(
                     cleanup_ledger,
-                    leaving,
+                    (!leaving.frames().is_empty() || !leaving.child_slots().is_empty())
+                        .then_some(leaving),
                 ));
             }
         },
     );
     refresh_authority_audits(world);
+}
+
+fn commit_projectionless_initial_branch(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    mut pending: PendingCommit,
+) -> Result<(), PendingCommit> {
+    if pending.ticket.is_some()
+        || pending.final_task.is_none()
+        || pending.branch.frames().is_empty()
+        || entry.active.is_some()
+    {
+        return Err(pending);
+    }
+    let task_is_current = pending
+        .final_task
+        .as_ref()
+        .is_some_and(|task| entry.engine.inspect_report_identity(task).is_ok());
+    if !task_is_current {
+        return Err(pending);
+    }
+    let mut entering =
+        std::mem::replace(&mut pending.branch, PreparedBranch::empty()).into_realized();
+    let gate_after = entering.interactive_entities();
+    let targets =
+        entering.entering_mutation_targets(EntityLifecycle::PreparedInert, EntityLifecycle::Active);
+    let transitions = entering.lifecycle_transitions(EntityLifecycle::Active, false);
+    let committed = world.resource_scope(
+        |world, gate: bevy_ecs::change_detection::Mut<RouterInputGate>| {
+            world.resource_scope(
+                |world, input_focus: bevy_ecs::change_detection::Mut<InputFocus>| {
+                    world.resource_scope(
+                        |world, route_focus: bevy_ecs::change_detection::Mut<RouteFocusState>| {
+                            world.resource_scope(
+                                |world,
+                                 mut registry: bevy_ecs::change_detection::Mut<
+                                    RouteEntityRegistry,
+                                >| {
+                                    let registry_plan =
+                                        registry.prepare_lifecycle_mutation(&transitions)?;
+                                    let resulting_claims =
+                                        registry_plan.resulting_claims().to_vec();
+                                    let frozen_manifest = FrozenCleanupManifest::empty();
+                                    let manifest_digest = frozen_manifest.digest();
+                                    let obligation_count = frozen_manifest.len();
+                                    let reserved_ledger = CleanupLedger::reserve(frozen_manifest)?;
+                                    let gate_plan =
+                                        prepare_input_gate_mutation(gate, &[], gate_after)?;
+                                    let focus_plan =
+                                        prepare_focus_mutation(input_focus, route_focus, &[]);
+                                    let entering_rebind = entering.prepare_claim_rebind(
+                                        &resulting_claims,
+                                        EntityLifecycle::PreparedInert,
+                                        EntityLifecycle::Active,
+                                    )?;
+                                    let presentation_plan =
+                                        prepare_presentation_mutation(world, &targets)?
+                                            .seal_commit(0)?;
+                                    let task = pending
+                                        .final_task
+                                        .take()
+                                        .expect("projectionless recovery task remains owned");
+                                    let ticket = entry
+                                        .engine
+                                        .report_applied(task)
+                                        .expect("preflighted recovery task remains reportable");
+                                    pending.ticket = Some(ticket);
+                                    let prepared = match entry.engine.prepare_commit(
+                                        pending
+                                            .ticket
+                                            .as_ref()
+                                            .expect("reported recovery task owns a commit ticket"),
+                                        CleanupManifest::new(
+                                            Vec::new(),
+                                            manifest_digest,
+                                            obligation_count,
+                                        ),
+                                    ) {
+                                        Ok(prepared) => prepared,
+                                        Err(_) => return None,
+                                    };
+                                    let cleanup = prepared.cleanup().clone();
+                                    let cleanup_ledger = reserved_ledger.bind_batch(cleanup);
+                                    pending.ticket.take();
+                                    entering.apply_claim_rebind(entering_rebind);
+                                    entry.engine.publish(prepared, || {
+                                        presentation_plan.apply_staged(
+                                            |_| focus_plan.apply(),
+                                            |_| registry_plan.apply(&mut registry),
+                                            |_| gate_plan.apply(),
+                                        );
+                                    });
+                                    Some(cleanup_ledger)
+                                },
+                            )
+                        },
+                    )
+                },
+            )
+        },
+    );
+    let Some(cleanup_ledger) = committed else {
+        pending.branch = PreparedBranch::from_realized(entering);
+        return Err(pending);
+    };
+    entry.active = Some(entering);
+    entry.cleanup_ledger = Some(CleanupLedger::activate_leaving_branch(cleanup_ledger, None));
+    Ok(())
 }
 
 fn focus_targets_for_commit(
@@ -1855,6 +2425,10 @@ pub(crate) mod tests {
         declare_outlet: bool,
     }
 
+    struct DeepNestedDriver {
+        key: ViewDriverKey,
+    }
+
     impl EcsViewDriver for NestedDriver {
         fn key(&self) -> ViewDriverKey {
             self.key.clone()
@@ -1868,6 +2442,35 @@ pub(crate) mod tests {
         ) -> ViewBuildReport {
             self.observed.lock().unwrap().push(effect.view().clone());
             if effect.view() == &RouteViewKey::new("layout").unwrap() && self.declare_outlet {
+                let anchor = content.spawn_empty().unwrap();
+                content
+                    .declare_outlet(anchor, bevy_ui_router_core::slot::RouteSlotKey::default())
+                    .unwrap();
+            } else {
+                content
+                    .spawn_solid_rect(
+                        SolidRect::new(24, 16, ContentColor::srgba8(1, 2, 3, 255)).unwrap(),
+                    )
+                    .unwrap();
+            }
+            report.applied()
+        }
+    }
+
+    impl EcsViewDriver for DeepNestedDriver {
+        fn key(&self) -> ViewDriverKey {
+            self.key.clone()
+        }
+
+        fn apply(
+            &mut self,
+            effect: &ViewBuildEffect,
+            content: &mut FrameContentWriter<'_>,
+            report: EcsViewReportSession<'_>,
+        ) -> ViewBuildReport {
+            if effect.view() == &RouteViewKey::new("deep-layout").unwrap()
+                || effect.view() == &RouteViewKey::new("deep-section").unwrap()
+            {
                 let anchor = content.spawn_empty().unwrap();
                 content
                     .declare_outlet(anchor, bevy_ui_router_core::slot::RouteSlotKey::default())
@@ -2209,6 +2812,86 @@ pub(crate) mod tests {
         router
     }
 
+    fn install_deep_nested_router(app: &mut App) -> RouterHandle {
+        let key = ViewDriverKey::new("deep-nested-driver").unwrap();
+        app.register_ui_view_driver(DeepNestedDriver { key: key.clone() })
+            .unwrap();
+        let layout = RouteViewKey::new("deep-layout").unwrap();
+        let section = RouteViewKey::new("deep-section").unwrap();
+        let item = RouteViewKey::new("deep-item").unwrap();
+        let fallback = RouteViewKey::new("deep-fallback").unwrap();
+        let mut views = RouteViewRegistry::new();
+        for view in [&layout, &section, &item, &fallback] {
+            views
+                .insert(view.clone(), RouteViewDescriptor::new(key.clone()))
+                .unwrap();
+        }
+        let mut builder = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(layout),
+            )
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let section_route = builder
+            .route_with_options(
+                root,
+                RoutePattern::path("sections/:section").unwrap(),
+                RouteNodeOptions::new().with_view(section),
+            )
+            .unwrap();
+        builder
+            .route_with_options(
+                section_route,
+                RoutePattern::path("items/:id").unwrap(),
+                RouteNodeOptions::new().with_view(item),
+            )
+            .unwrap();
+        let router = app
+            .add_ui_router(RouterConfig::new(builder.build().unwrap(), views, fallback))
+            .unwrap();
+        app.world_mut()
+            .spawn((Node::default(), RouterHostRegistration::new(router)));
+        router
+    }
+
+    fn prepare_deep_nested_branch_for_commit(
+        app: &mut App,
+        router: RouterHandle,
+        location: RouteLocation,
+    ) -> NavigationRequestId {
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, location)
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        for _ in 0..5 {
+            drive_navigation_system(app.world_mut());
+        }
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .pending_commit
+                .is_some()
+        );
+        request
+    }
+
+    fn commit_initial_deep_nested_branch(app: &mut App, router: RouterHandle) {
+        prepare_deep_nested_branch_for_commit(
+            app,
+            router,
+            RouteLocation::new("/sections/a/items/1"),
+        );
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.pending_commit.is_none());
+        assert_eq!(entry.active.as_ref().unwrap().frames().len(), 3);
+        assert_eq!(entry.active.as_ref().unwrap().child_slots().len(), 2);
+        assert!(entry.cleanup_ledger.is_none());
+    }
+
     fn prepare_nested_branch_for_commit(
         app: &mut App,
         router: RouterHandle,
@@ -2223,13 +2906,31 @@ pub(crate) mod tests {
         for _ in 0..3 {
             drive_navigation_system(app.world_mut());
         }
-        let pending = app.world().resource::<RouterNavigation>().entries[0]
-            .pending_commit
-            .as_ref()
-            .unwrap();
-        assert_eq!(pending.branch.frames().len(), 2);
-        assert_eq!(pending.branch.child_slots().len(), 1);
-        assert!(pending.final_task.is_some());
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        let pending = entry.pending_commit.as_ref().unwrap();
+        let projection = match (pending.ticket.as_ref(), pending.final_task.as_ref()) {
+            (Some(ticket), _) => entry
+                .engine
+                .reconciliation_projection_for_commit(ticket)
+                .expect("pending commit ticket retains its sealed projection"),
+            (None, Some(final_task)) => entry
+                .engine
+                .reconciliation_projection_for_task(final_task)
+                .expect("pending leaf retains its sealed projection"),
+            (None, None) => panic!("pending branch retains a ticket or final task"),
+        };
+        assert_eq!(pending.branch.frames().len(), projection.entering().len());
+        assert_eq!(
+            pending.branch.child_slots().len(),
+            projection
+                .child_slots()
+                .filter(|slot| {
+                    slot.kind()
+                        == bevy_ui_router_core::integration::ReconciliationChildSlotRoleKind::MountNew
+                })
+                .count()
+        );
         request
     }
 
@@ -2267,6 +2968,18 @@ pub(crate) mod tests {
                 Some(foreign)
             }
         }
+    }
+
+    fn install_foreign_component_hooks(app: &mut App) {
+        app.init_resource::<ForeignComponentHooks>();
+        app.world_mut()
+            .register_component_hooks::<FinalPreflightForeignComponent>()
+            .on_remove(|mut world, HookContext { .. }| {
+                world.resource_mut::<ForeignComponentHooks>().removed += 1;
+            })
+            .on_despawn(|mut world, HookContext { .. }| {
+                world.resource_mut::<ForeignComponentHooks>().despawned += 1;
+            });
     }
 
     fn assert_child_slot_boundary_drift_remains_foreign(
@@ -2342,6 +3055,7 @@ pub(crate) mod tests {
                     pending,
                     artifact: MountMutationArtifact::Receipt(error.into_owner()),
                     payload: PendingMountMutationPayload::Receipt { staged, proof },
+                    allowance: None,
                 });
                 (request, slot, frame_entities)
             },
@@ -2810,7 +3524,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn nested_commit_schedule_probe_is_old_old_then_new_new() {
+    fn nested_commit_schedule_probe_is_old_then_atomic_suffix_splice() {
         let source = include_str!("navigation.rs");
         assert!(!source.contains(concat!(
             "old_shells.into_iter().rev()",
@@ -2917,11 +3631,11 @@ pub(crate) mod tests {
                     route_focus: Some(old_focus),
                 },
                 NestedCommitScheduleSample {
-                    physical: NestedBranchSide::New,
+                    physical: NestedBranchSide::Mixed,
                     gate: NestedBranchSide::New,
-                    registry: NestedBranchSide::New,
-                    ecs: NestedBranchSide::New,
-                    core: NestedBranchSide::New,
+                    registry: NestedBranchSide::Mixed,
+                    ecs: NestedBranchSide::Mixed,
+                    core: NestedBranchSide::Mixed,
                     history: NestedBranchSide::New,
                     input_focus: None,
                     route_focus: None,
@@ -2932,9 +3646,7 @@ pub(crate) mod tests {
             probe.order,
             vec![
                 NestedCommitOrder::Leaving(old_shells[1]),
-                NestedCommitOrder::Leaving(old_shells[0]),
                 NestedCommitOrder::Entering(new_shells[0]),
-                NestedCommitOrder::Entering(new_shells[1]),
             ]
         );
         assert!(matches!(
@@ -3002,11 +3714,8 @@ pub(crate) mod tests {
                     .map(|entity| (entity, NestedCleanupUnit::ParentFrame)),
             );
             (
-                old.obligation_count(),
-                old.frames()
-                    .iter()
-                    .map(|frame| frame.frame().clone())
-                    .collect::<Vec<_>>(),
+                child_entities.len(),
+                vec![old.frames()[1].frame().clone()],
                 child_slot,
                 units,
             )
@@ -3031,7 +3740,7 @@ pub(crate) mod tests {
         {
             let entry = &app.world().resource::<RouterNavigation>().entries[0];
             let ledger = entry.cleanup_ledger.as_ref().unwrap();
-            assert_eq!(ledger.leaving_frames().len(), 2);
+            assert_eq!(ledger.leaving_frames().len(), 1);
             assert_eq!(
                 ledger
                     .leaving_frames()
@@ -3067,15 +3776,14 @@ pub(crate) mod tests {
                 }
                 units
             });
-        assert_eq!(
-            cleanup_units,
-            vec![
-                NestedCleanupUnit::ChildFrame,
-                NestedCleanupUnit::ChildSlot,
-                NestedCleanupUnit::ParentFrame,
-            ]
+        assert_eq!(cleanup_units, vec![NestedCleanupUnit::ChildFrame]);
+        assert!(app.world().get_entity(child_slot).is_ok());
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(child_slot)
+                .is_some_and(|record| record.lifecycle() == EntityLifecycle::Active)
         );
-        assert!(app.world().get_entity(child_slot).is_err());
 
         {
             let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
@@ -3177,11 +3885,7 @@ pub(crate) mod tests {
 
     #[test]
     fn nested_leaving_unit_drift_is_quarantined_without_crossing_authority() {
-        for drift_unit in [
-            NestedCleanupUnit::ChildFrame,
-            NestedCleanupUnit::ChildSlot,
-            NestedCleanupUnit::ParentFrame,
-        ] {
+        for drift_unit in [NestedCleanupUnit::ChildFrame] {
             let mut app = App::new();
             app.add_plugins(BevyUiRouterPlugin::default());
             let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3349,7 +4053,16 @@ pub(crate) mod tests {
         let router = install_nested_router(&mut app, observed, true);
         app.update();
         commit_initial_nested_branch(&mut app, router);
-        let (old_claims, old_slots, old_interactive) = {
+        let (
+            old_claims,
+            preserved_claims,
+            leaving_claims,
+            preserved_slot_claim,
+            leaving_frame,
+            old_slots,
+            preserved_interactive,
+            leaving_interactive,
+        ) = {
             let navigation = app.world().resource::<RouterNavigation>();
             let old = navigation.entries[0].active.as_ref().unwrap();
             assert_eq!(
@@ -3362,14 +4075,19 @@ pub(crate) mod tests {
             );
             (
                 old.claims().cloned().collect::<Vec<_>>(),
+                old.frames()[0].claims().cloned().collect::<Vec<_>>(),
+                old.frames()[1].claims().cloned().collect::<Vec<_>>(),
+                old.child_slots()[0].slot_claim().clone(),
+                old.frames()[1].frame().clone(),
                 old.child_slots()
                     .iter()
                     .map(|slot| slot.slot())
                     .collect::<Vec<_>>(),
-                old.interactive_entities(),
+                old.frames()[0].interactive_entities(),
+                old.frames()[1].interactive_entities(),
             )
         };
-        let old_focus = *old_interactive.last().unwrap();
+        let old_focus = leaving_interactive[0];
         *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(old_focus);
         app.world_mut()
             .resource_mut::<RouteFocusState>()
@@ -3429,19 +4147,35 @@ pub(crate) mod tests {
                 .is_some_and(|pending| pending.final_task.is_some()),
         );
         let active = entry.active.as_ref().unwrap();
+        let expected_active = preserved_claims
+            .iter()
+            .chain(&new_claims)
+            .map(|claim| claim.entity())
+            .chain(std::iter::once(preserved_slot_claim.entity()))
+            .collect::<Vec<_>>();
         assert_eq!(
             active
                 .claims()
                 .map(|claim| claim.entity())
                 .collect::<Vec<_>>(),
-            new_claims
-                .iter()
-                .map(|claim| claim.entity())
-                .collect::<Vec<_>>()
+            expected_active
         );
         assert_eq!(entry.engine.history().current(), Some(&replacement));
-        assert!(entry.cleanup_ledger.is_some());
-        assert!(old_claims.iter().all(|claim| {
+        let ledger = entry.cleanup_ledger.as_ref().unwrap();
+        assert_eq!(ledger.leaving_frames().len(), 1);
+        assert_eq!(ledger.leaving_frames()[0].frame(), &leaving_frame);
+        assert_eq!(
+            ledger.batch().unwrap().obligation_count(),
+            leaving_claims.len()
+        );
+        assert!(preserved_claims.iter().all(|claim| {
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(claim.entity())
+                .is_some_and(|record| record.lifecycle() == EntityLifecycle::Active)
+                && app.world().get::<Visibility>(claim.entity()) == Some(&Visibility::Visible)
+        }));
+        assert!(leaving_claims.iter().all(|claim| {
             app.world()
                 .resource::<RouteEntityRegistry>()
                 .record(claim.entity())
@@ -3454,13 +4188,18 @@ pub(crate) mod tests {
                     .is_some_and(RouterInputBarrier::denies_all)
         }));
         assert!(old_slots.iter().all(|slot| {
-            app.world().get::<ChildSlotLifecycle>(*slot) == Some(&ChildSlotLifecycle::Leaving)
-                && app.world().get::<Visibility>(*slot) == Some(&Visibility::Hidden)
+            app.world().get::<ChildSlotLifecycle>(*slot) == Some(&ChildSlotLifecycle::Active)
+                && app.world().get::<Visibility>(*slot) == Some(&Visibility::Visible)
                 && app.world().get::<Pickable>(*slot) == Some(&Pickable::IGNORE)
         }));
         let gate = app.world().resource::<RouterInputGate>();
         assert!(
-            old_interactive
+            preserved_interactive
+                .iter()
+                .all(|entity| gate.allows_pointer(*entity))
+        );
+        assert!(
+            leaving_interactive
                 .iter()
                 .all(|entity| !gate.allows_pointer(*entity))
         );
@@ -3474,60 +4213,88 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn nested_fragment_push_replaces_the_whole_branch() {
+    fn nested_fragment_push_splices_only_the_projected_suffix() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
         let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let router = install_nested_router(&mut app, observed, true);
         app.update();
         commit_initial_nested_branch(&mut app, router);
-        let (old_claims, old_frames, old_slots, expected_receipts, history_len_before) = {
+        let (
+            preserved_claims,
+            leaving_claims,
+            old_frames,
+            leaving_frame,
+            preserved_slot_claim,
+            history_len_before,
+        ) = {
             let navigation = app.world().resource::<RouterNavigation>();
             let entry = &navigation.entries[0];
             let old = entry.active.as_ref().unwrap();
             (
-                old.claims().cloned().collect::<Vec<_>>(),
+                old.frames()[0].claims().cloned().collect::<Vec<_>>(),
+                old.frames()[1].claims().cloned().collect::<Vec<_>>(),
                 old.frames()
                     .iter()
                     .map(RealizedFrame::shell)
                     .collect::<Vec<_>>(),
-                old.child_slots()
-                    .iter()
-                    .map(|slot| slot.slot())
-                    .collect::<Vec<_>>(),
-                old.obligation_count(),
+                old.frames()[1].frame().clone(),
+                old.child_slots()[0].slot_claim().clone(),
                 entry.engine.history().len(),
             )
         };
         let replacement = RouteLocation::new("/items/1").with_fragment("details");
 
         let request = prepare_nested_branch_for_commit(&mut app, router, replacement.clone());
+        let entering_claims = app.world().resource::<RouterNavigation>().entries[0]
+            .pending_commit
+            .as_ref()
+            .unwrap()
+            .branch
+            .as_realized()
+            .claims()
+            .cloned()
+            .collect::<Vec<_>>();
         commit_presentation_system(app.world_mut());
 
         {
             let navigation = app.world().resource::<RouterNavigation>();
             let entry = &navigation.entries[0];
             let active = entry.active.as_ref().unwrap();
-            assert_ne!(
-                active
-                    .frames()
-                    .iter()
-                    .map(RealizedFrame::shell)
-                    .collect::<Vec<_>>(),
-                old_frames
+            assert_eq!(active.frames()[0].shell(), old_frames[0]);
+            assert_ne!(active.frames()[1].shell(), old_frames[1]);
+            assert_eq!(
+                active.child_slots()[0].slot(),
+                preserved_slot_claim.entity()
             );
-            assert_ne!(
+            let expected_active = preserved_claims
+                .iter()
+                .chain(&entering_claims)
+                .map(|claim| claim.entity())
+                .chain(std::iter::once(preserved_slot_claim.entity()))
+                .collect::<Vec<_>>();
+            assert_eq!(
                 active
-                    .child_slots()
-                    .iter()
-                    .map(|slot| slot.slot())
+                    .claims()
+                    .map(|claim| claim.entity())
                     .collect::<Vec<_>>(),
-                old_slots
+                expected_active
             );
             let ledger = entry.cleanup_ledger.as_ref().unwrap();
-            assert_eq!(ledger.leaving_frames().len(), old_frames.len());
+            assert_eq!(ledger.leaving_frames().len(), 1);
+            assert_eq!(ledger.leaving_frames()[0].frame(), &leaving_frame);
             assert_eq!(ledger.receipt_count(), 0);
-            assert!(old_claims.iter().all(|claim| {
+            assert!(preserved_claims.iter().all(|claim| {
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(claim.entity())
+                    .is_some_and(|record| {
+                        record.owner() == claim.owner()
+                            && record.seal() == claim.seal()
+                            && record.lifecycle() == EntityLifecycle::Active
+                    })
+            }));
+            assert!(leaving_claims.iter().all(|claim| {
                 app.world()
                     .resource::<RouteEntityRegistry>()
                     .record(claim.entity())
@@ -3549,8 +4316,8 @@ pub(crate) mod tests {
 
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
         assert!(entry.cleanup_ledger.is_none());
-        assert_eq!(expected_receipts, old_claims.len());
-        assert!(old_claims.iter().all(|claim| {
+        let expected_receipts = leaving_claims.len();
+        assert!(leaving_claims.iter().all(|claim| {
             app.world().get_entity(claim.entity()).is_err()
                 && app
                     .world()
@@ -3558,6 +4325,23 @@ pub(crate) mod tests {
                     .record(claim.entity())
                     .is_none()
         }));
+        assert!(preserved_claims.iter().all(|claim| {
+            app.world().get_entity(claim.entity()).is_ok()
+                && app
+                    .world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(claim.entity())
+                    .is_some_and(|record| {
+                        record.owner() == claim.owner()
+                            && record.seal() == claim.seal()
+                            && record.lifecycle() == EntityLifecycle::Active
+                    })
+        }));
+        assert!(
+            app.world()
+                .get_entity(preserved_slot_claim.entity())
+                .is_ok()
+        );
         let request = entry.engine.request(request).unwrap();
         assert!(matches!(request.status(), RequestStatus::Succeeded));
         assert_eq!(
@@ -3605,7 +4389,7 @@ pub(crate) mod tests {
             .as_ref()
             .unwrap()
             .branch
-            .frames()[1]
+            .frames()[0]
             .interactive_entities()[0];
         app.world_mut().entity_mut(target).insert((
             Visibility::Visible,
@@ -4270,6 +5054,178 @@ pub(crate) mod tests {
         task.report_identity()
     }
 
+    fn commit_nested_parent_only(app: &mut App, router: RouterHandle) {
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .unwrap();
+        assert_eq!(entry.active.as_ref().unwrap().frames().len(), 1);
+        assert!(entry.pending_commit.is_none());
+    }
+
+    #[test]
+    fn confirmed_mount_frame_task_is_consumed_exactly_once_into_final_task() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed.clone(), true);
+        observe_authority_system(app.world_mut());
+        commit_nested_parent_only(&mut app, router);
+
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let task_identity = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(entry.pending_commit.is_some());
+            entry
+                .pending_mount_frame_task
+                .as_ref()
+                .expect("confirmed MountNew owns its issued task")
+                .report_identity()
+        };
+        let driver_calls_before = observed.lock().unwrap().len();
+
+        drive_navigation_system(app.world_mut());
+
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(entry.pending_mount_frame_task.is_none());
+            assert!(
+                entry
+                    .pending_commit
+                    .as_ref()
+                    .and_then(|pending| pending.final_task.as_ref())
+                    .map(RootFrameTask::report_identity)
+                    == Some(task_identity.clone())
+            );
+        }
+        assert_eq!(observed.lock().unwrap().len(), driver_calls_before + 1);
+
+        drive_navigation_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.pending_mount_frame_task.is_none());
+        assert!(
+            entry
+                .pending_commit
+                .as_ref()
+                .and_then(|pending| pending.final_task.as_ref())
+                .map(RootFrameTask::report_identity)
+                == Some(task_identity)
+        );
+        assert_eq!(observed.lock().unwrap().len(), driver_calls_before + 1);
+    }
+
+    #[test]
+    fn stale_confirmed_mount_frame_task_transfers_once_without_authority_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let source = install_atomic_router(&mut app, "mount-task-stale-source");
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let target = install_nested_router(&mut app, observed, true);
+        observe_authority_system(app.world_mut());
+        commit_nested_parent_only(&mut app, target);
+
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(source, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        let source_task = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let source_entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == source)
+                .unwrap();
+            let EngineAction::FrameTask(task) = source_entry.engine.action().unwrap() else {
+                panic!("source router owns one exact task")
+            };
+            task
+        };
+
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(target, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let (source_identity, target_identity) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let target_entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == target)
+                .unwrap();
+            let target_task = target_entry
+                .pending_mount_frame_task
+                .take()
+                .expect("confirmed target mount owns its child task");
+            let source_identity = source_task.report_identity();
+            let target_identity = target_task.report_identity();
+            target_entry.pending_mount_frame_task = Some(source_task);
+            let source_entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == source)
+                .unwrap();
+            source_entry.pending_mount_frame_task = Some(target_task);
+            (source_identity, target_identity)
+        };
+        let before_world = authority_world_fingerprint(app.world());
+        let before_registry = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+
+        drive_navigation_system(app.world_mut());
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let source_entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == source)
+            .unwrap();
+        let target_entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == target)
+            .unwrap();
+        assert!(source_entry.pending_mount_frame_task.is_none());
+        assert!(target_entry.pending_mount_frame_task.is_none());
+        assert!(matches!(
+            source_entry.pending_failed_branch.as_ref().map(|failed| &failed.terminal),
+            Some(PendingFailedBranchTerminal::Task { task, .. })
+                if task.report_identity() == target_identity
+        ));
+        assert!(matches!(
+            target_entry.pending_failed_branch.as_ref().map(|failed| &failed.terminal),
+            Some(PendingFailedBranchTerminal::Task { task, .. })
+                if task.report_identity() == source_identity
+        ));
+        assert_eq!(authority_world_fingerprint(app.world()), before_world);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            before_registry,
+        );
+    }
+
     #[test]
     fn exact_root_stale_application_retains_task_outside_final_task() {
         let mut app = App::new();
@@ -4314,6 +5270,7 @@ pub(crate) mod tests {
                     top_slot,
                     top_slot_claim,
                     Some(&pending.branch),
+                    None,
                     &task,
                     &report,
                     plan,
@@ -4364,9 +5321,10 @@ pub(crate) mod tests {
         let (task, pending, host_candidate, top_slot, top_slot_claim) = {
             let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
             let entry = &mut navigation.entries[0];
-            let EngineAction::FrameTask(task) = entry.engine.action().unwrap() else {
-                panic!("child task must be issued")
-            };
+            let task = entry
+                .pending_mount_frame_task
+                .take()
+                .expect("confirmed child mount must own its issued task");
             let host = entry.host.as_ref().unwrap();
             let host_candidate = host.candidate.clone();
             let top_slot = host.top_slot;
@@ -4397,6 +5355,7 @@ pub(crate) mod tests {
                     host_candidate,
                     top_slot,
                     top_slot_claim,
+                    None,
                     None,
                     &task,
                     &report,
@@ -4446,9 +5405,10 @@ pub(crate) mod tests {
         let (task, pending, host_candidate, top_slot, top_slot_claim) = {
             let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
             let entry = &mut navigation.entries[0];
-            let EngineAction::FrameTask(task) = entry.engine.action().unwrap() else {
-                panic!("child task must be issued")
-            };
+            let task = entry
+                .pending_mount_frame_task
+                .take()
+                .expect("confirmed child mount must own its issued task");
             let host = entry.host.as_ref().unwrap();
             (
                 task,
@@ -4468,6 +5428,7 @@ pub(crate) mod tests {
                     host_candidate,
                     top_slot,
                     top_slot_claim,
+                    None,
                     None,
                     &task,
                     &report,
@@ -5800,15 +6761,7 @@ pub(crate) mod tests {
     fn leaving_foreign_component_is_terminal_and_quarantined_without_hooks() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
-        app.init_resource::<ForeignComponentHooks>();
-        app.world_mut()
-            .register_component_hooks::<FinalPreflightForeignComponent>()
-            .on_remove(|mut world, HookContext { .. }| {
-                world.resource_mut::<ForeignComponentHooks>().removed += 1;
-            })
-            .on_despawn(|mut world, HookContext { .. }| {
-                world.resource_mut::<ForeignComponentHooks>().despawned += 1;
-            });
+        install_foreign_component_hooks(&mut app);
         let router = install_atomic_router(&mut app, "leaving-foreign-component");
         app.update();
         app.world_mut()
@@ -5889,12 +6842,13 @@ pub(crate) mod tests {
         assert!(gate.allows_pointer(entry.active.as_ref().unwrap().interactive_entities()[0]));
     }
 
-    fn nested_leaving_child_slot_boundary_drift_commits(
+    fn nested_preserved_child_slot_boundary_drift_commits_without_mutation(
         drift: ChildSlotBoundaryDrift,
         fragment: &'static str,
     ) {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
+        install_foreign_component_hooks(&mut app);
         let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let router = install_nested_router(&mut app, observed, true);
         let host = app
@@ -5911,17 +6865,153 @@ pub(crate) mod tests {
         app.update();
         commit_initial_nested_branch(&mut app, router);
 
-        let (leaving_slot, leaving_shell) = {
+        let (preserved_slot, preserved_parent_shell, leaving_child_shell) = {
             let active = app.world().resource::<RouterNavigation>().entries[0]
                 .active
                 .as_ref()
                 .unwrap();
-            (active.child_slots()[0].slot(), active.frames()[0].shell())
+            (
+                active.child_slots()[0].slot(),
+                active.frames()[0].shell(),
+                active.frames()[1].shell(),
+            )
         };
         let request = prepare_nested_branch_for_commit(
             &mut app,
             router,
             RouteLocation::new("/items/2").with_fragment(fragment),
+        );
+        let host_before = nested_protected_fingerprint(app.world(), host);
+        let sibling_before = nested_protected_fingerprint(app.world(), sibling);
+        let foreign = apply_child_slot_boundary_drift(&mut app, preserved_slot, drift);
+
+        commit_presentation_system(app.world_mut());
+        for _ in 0..4 {
+            settle_cleanup_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .is_none()
+            {
+                break;
+            }
+        }
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.pending_commit.is_none());
+        assert_eq!(
+            entry.active.as_ref().unwrap().frames()[0].shell(),
+            preserved_parent_shell
+        );
+        assert_ne!(
+            entry.active.as_ref().unwrap().frames()[1].shell(),
+            leaving_child_shell,
+            "preserved-slot splice did not replace child: status={:?}, failed_branch={}, ledger={}",
+            entry.engine.request(request).unwrap().status(),
+            entry.pending_failed_branch.is_some(),
+            entry.cleanup_ledger.is_some(),
+        );
+        let request = entry.engine.request(request).unwrap();
+        assert!(matches!(request.status(), RequestStatus::Succeeded));
+        let expected = match drift {
+            ChildSlotBoundaryDrift::ForeignComponent => {
+                bevy_ui_router_core::prelude::CleanupDisposition::QuarantinedForeignComponent
+            }
+            ChildSlotBoundaryDrift::ForeignDescendant => {
+                bevy_ui_router_core::prelude::CleanupDisposition::QuarantinedForeignDescendant
+            }
+        };
+        assert!(
+            request
+                .trace()
+                .iter()
+                .all(|event| event.cleanup_disposition() != Some(expected))
+        );
+        assert!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .record(preserved_slot)
+                .is_none(),
+            "a preserved child-slot must not transfer to quarantine"
+        );
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(preserved_slot)
+                .is_some_and(|record| record.lifecycle() == EntityLifecycle::Active)
+        );
+        assert_child_slot_boundary_drift_remains_foreign(
+            app.world(),
+            preserved_slot,
+            foreign,
+            drift,
+        );
+        assert_eq!(app.world().resource::<ForeignComponentHooks>().removed, 0);
+        assert_eq!(app.world().resource::<ForeignComponentHooks>().despawned, 0);
+        assert_eq!(nested_protected_fingerprint(app.world(), host), host_before);
+        assert_eq!(
+            nested_protected_fingerprint(app.world(), sibling),
+            sibling_before
+        );
+    }
+
+    #[test]
+    fn nested_preserved_child_slot_foreign_component_commits_without_mutating_slot() {
+        nested_preserved_child_slot_boundary_drift_commits_without_mutation(
+            ChildSlotBoundaryDrift::ForeignComponent,
+            "slot-component",
+        );
+    }
+
+    #[test]
+    fn nested_preserved_child_slot_foreign_descendant_commits_without_mutating_slot() {
+        nested_preserved_child_slot_boundary_drift_commits_without_mutation(
+            ChildSlotBoundaryDrift::ForeignDescendant,
+            "slot-descendant",
+        );
+    }
+
+    fn nested_deep_suffix_leaving_child_slot_boundary_drift_quarantines_slot(
+        drift: ChildSlotBoundaryDrift,
+        fragment: &'static str,
+    ) {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        install_foreign_component_hooks(&mut app);
+        let router = install_deep_nested_router(&mut app);
+        let host = app
+            .world()
+            .iter_entities()
+            .find(|entity| entity.contains::<RouterHostRegistration>())
+            .unwrap()
+            .id();
+        app.world_mut()
+            .entity_mut(host)
+            .insert(NestedAppHostSentinel(0xB0));
+        let sibling = app.world_mut().spawn(NestedAppHostSentinel(0xB1)).id();
+        app.world_mut().entity_mut(host).add_child(sibling);
+        app.update();
+        commit_initial_deep_nested_branch(&mut app, router);
+
+        let (preserved_root, leaving_slot, leaving_shells) = {
+            let active = app.world().resource::<RouterNavigation>().entries[0]
+                .active
+                .as_ref()
+                .unwrap();
+            (
+                active.frames()[0].shell(),
+                active.child_slots()[1].slot(),
+                active
+                    .frames()
+                    .iter()
+                    .skip(1)
+                    .map(RealizedFrame::shell)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let request = prepare_deep_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/sections/b/items/2").with_fragment(fragment),
         );
         let host_before = nested_protected_fingerprint(app.world(), host);
         let sibling_before = nested_protected_fingerprint(app.world(), sibling);
@@ -5940,10 +7030,21 @@ pub(crate) mod tests {
 
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
         assert!(entry.pending_commit.is_none());
-        assert_ne!(
+        assert!(entry.pending_failed_branch.is_none());
+        assert_eq!(entry.active.as_ref().unwrap().frames().len(), 3);
+        assert_eq!(
             entry.active.as_ref().unwrap().frames()[0].shell(),
-            leaving_shell
+            preserved_root
         );
+        assert!(leaving_shells.iter().all(|leaving| {
+            entry
+                .active
+                .as_ref()
+                .unwrap()
+                .frames()
+                .iter()
+                .all(|active| active.shell() != *leaving)
+        }));
         let request = entry.engine.request(request).unwrap();
         assert!(matches!(request.status(), RequestStatus::Succeeded));
         let expected = match drift {
@@ -5958,16 +7059,18 @@ pub(crate) mod tests {
             request
                 .trace()
                 .iter()
-                .any(|event| { event.cleanup_disposition() == Some(expected) })
+                .any(|event| event.cleanup_disposition() == Some(expected))
         );
         assert!(
             app.world()
                 .resource::<QuarantineLeaseTable>()
                 .record(leaving_slot)
                 .is_some(),
-            "the leaving child-slot unit must transfer to foreground quarantine"
+            "the deep leaving child-slot must transfer to quarantine"
         );
         assert_child_slot_boundary_drift_remains_foreign(app.world(), leaving_slot, foreign, drift);
+        assert_eq!(app.world().resource::<ForeignComponentHooks>().removed, 0);
+        assert_eq!(app.world().resource::<ForeignComponentHooks>().despawned, 0);
         assert_eq!(nested_protected_fingerprint(app.world(), host), host_before);
         assert_eq!(
             nested_protected_fingerprint(app.world(), sibling),
@@ -5976,18 +7079,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn nested_leaving_child_slot_foreign_component_commits_and_quarantines_slot() {
-        nested_leaving_child_slot_boundary_drift_commits(
+    fn nested_deep_suffix_leaving_child_slot_foreign_component_is_quarantined() {
+        nested_deep_suffix_leaving_child_slot_boundary_drift_quarantines_slot(
             ChildSlotBoundaryDrift::ForeignComponent,
-            "slot-component",
+            "leaving-slot-component",
         );
     }
 
     #[test]
-    fn nested_leaving_child_slot_foreign_descendant_commits_and_quarantines_slot() {
-        nested_leaving_child_slot_boundary_drift_commits(
+    fn nested_deep_suffix_leaving_child_slot_foreign_descendant_is_quarantined() {
+        nested_deep_suffix_leaving_child_slot_boundary_drift_quarantines_slot(
             ChildSlotBoundaryDrift::ForeignDescendant,
-            "slot-descendant",
+            "leaving-slot-descendant",
         );
     }
 
@@ -5997,10 +7100,9 @@ pub(crate) mod tests {
     ) {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
-        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let router = install_nested_router(&mut app, observed, true);
+        let router = install_deep_nested_router(&mut app);
         app.update();
-        commit_initial_nested_branch(&mut app, router);
+        commit_initial_deep_nested_branch(&mut app, router);
         let (active_shells, history_before) = {
             let entry = &app.world().resource::<RouterNavigation>().entries[0];
             (
@@ -6015,18 +7117,20 @@ pub(crate) mod tests {
                 entry.engine.history().clone(),
             )
         };
-        let request = prepare_nested_branch_for_commit(
+        let request = prepare_deep_nested_branch_for_commit(
             &mut app,
             router,
-            RouteLocation::new("/items/2").with_fragment(fragment),
+            RouteLocation::new("/sections/b/items/2").with_fragment(fragment),
         );
-        let entering_slot = app.world().resource::<RouterNavigation>().entries[0]
-            .pending_commit
-            .as_ref()
-            .unwrap()
-            .branch
-            .child_slots()[0]
-            .slot();
+        let entering_slot = {
+            let pending = app.world().resource::<RouterNavigation>().entries[0]
+                .pending_commit
+                .as_ref()
+                .unwrap();
+            assert_eq!(pending.branch.frames().len(), 2);
+            assert_eq!(pending.branch.child_slots().len(), 1);
+            pending.branch.child_slots()[0].slot()
+        };
         let foreign = apply_child_slot_boundary_drift(&mut app, entering_slot, drift);
 
         commit_presentation_system(app.world_mut());
@@ -6078,20 +7182,19 @@ pub(crate) mod tests {
     fn nested_failed_transfer_keeps_the_same_ledger_for_a_higher_revision() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
-        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let router = install_nested_router(&mut app, observed, true);
+        let router = install_deep_nested_router(&mut app);
         app.update();
-        commit_initial_nested_branch(&mut app, router);
+        commit_initial_deep_nested_branch(&mut app, router);
         let leaving_slot = app.world().resource::<RouterNavigation>().entries[0]
             .active
             .as_ref()
             .unwrap()
-            .child_slots()[0]
+            .child_slots()[1]
             .slot();
-        let request = prepare_nested_branch_for_commit(
+        let request = prepare_deep_nested_branch_for_commit(
             &mut app,
             router,
-            RouteLocation::new("/items/2").with_fragment("retry-transfer"),
+            RouteLocation::new("/sections/b/items/2").with_fragment("retry-transfer"),
         );
         let foreign = apply_child_slot_boundary_drift(
             &mut app,
@@ -8857,8 +9960,28 @@ pub(crate) mod tests {
             let navigation = app.world().resource::<RouterNavigation>();
             let entry = &navigation.entries[0];
             let request = entry.engine.request(first).unwrap();
-            let RequestStatus::Failed(failure) = request.status() else {
-                panic!("fallback publication must retain the original build failure")
+            let status = request.status();
+            let RequestStatus::Failed(failure) = status else {
+                panic!(
+                    "fallback publication must retain the original build failure: {status:?}; pending={:?} projection={:?} failed={} cleanup={} active={}",
+                    entry.pending_commit.as_ref().map(|pending| (
+                        pending.ticket.is_some(),
+                        pending.final_task.is_some(),
+                        pending.branch.frames().len(),
+                        pending.branch.child_slots().len(),
+                    )),
+                    entry
+                        .pending_commit
+                        .as_ref()
+                        .and_then(|pending| pending.final_task.as_ref())
+                        .map(|task| entry
+                            .engine
+                            .reconciliation_projection_for_task(task)
+                            .is_ok()),
+                    entry.pending_failed_branch.is_some(),
+                    entry.cleanup_ledger.is_some(),
+                    entry.active.is_some(),
+                )
             };
             assert_eq!(failure.kind(), NavigationFailureKind::Build);
             assert_eq!(entry.engine.history().len(), 0);

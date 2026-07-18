@@ -1,18 +1,24 @@
 use std::collections::HashSet;
 
+use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
     hierarchy::{ChildOf, Children},
     prelude::{Entity, World},
 };
+use bevy_picking::Pickable;
 use bevy_ui_router_core::frame::RouteFrameVersion;
 
 use crate::{
-    branch_transaction::RealizedBranch,
-    components::RouteOwnershipSeal,
+    branch_transaction::{
+        RealizedBranch, ReconciliationSlotRoleKind, SealedMountNewStagingAllowance,
+        SealedReconciliationSlotRole,
+    },
+    components::{ChildSlotAuthority, ChildSlotLifecycle, RouteOwnershipSeal, RouterInputBarrier},
     mount::{validate_leaving_mounted_child_slot, validate_mounted_child_slot},
     presentation::{
-        validate_active_frame_with_child_slots, validate_leaving_frame_with_child_slots,
-        validate_realized_frame_with_child_slots,
+        validate_active_frame_with_child_slots_and_entering_shells,
+        validate_leaving_frame_with_child_slots, validate_realized_frame_with_child_slots,
+        validate_reconciliation_entering_frame_with_child_slots,
     },
     registry::{
         ComponentManifest, EntityLifecycle, EntityOwner, RegistryOwner, RouteEntityRecord,
@@ -173,9 +179,62 @@ pub(crate) fn validate_prepared_branch(
             frame.claims(),
             branch,
             ManifestPolicy::Strict,
+            &[],
         )?;
     }
     validate_branch_descendants(world, branch).map(|_| ())
+}
+
+pub(crate) fn validate_reconciliation_entering_branch(
+    world: &World,
+    entering: &RealizedBranch,
+    preserved: &RealizedBranch,
+    leaving: &RealizedBranch,
+) -> Result<(), FrameLocalError> {
+    validate_reconciliation_entering_structure(entering, preserved)?;
+    for slot in entering.child_slots() {
+        if !validate_mounted_child_slot(world, slot, EntityLifecycle::PreparedInert) {
+            return Err(FrameLocalError::OwnershipDrift(slot.slot()));
+        }
+    }
+    for frame in entering.frames() {
+        let child_slots = child_slot_expectations(entering, frame.frame());
+        let existing_mounts = leaving
+            .frames()
+            .iter()
+            .filter(|preserved| {
+                frame
+                    .sealed_reconciliation_entering_shell_for(preserved)
+                    .is_some()
+            })
+            .collect::<Vec<_>>();
+        let preserved_slots = preserved
+            .child_slots()
+            .iter()
+            .filter(|slot| frame.mount_binding().matches_mounted_child_slot(slot))
+            .count();
+        if existing_mounts.len() > 1
+            || (existing_mounts.len() == 1 && preserved_slots != 1)
+            || !validate_reconciliation_entering_frame_with_child_slots(
+                world,
+                frame,
+                &child_slots,
+                existing_mounts.first().copied(),
+            )
+        {
+            return Err(FrameLocalError::OwnershipDrift(frame.shell()));
+        }
+        validate_frame_claim_set(
+            world,
+            frame.frame(),
+            frame.shell(),
+            frame.claims(),
+            entering,
+            ManifestPolicy::Strict,
+            &[],
+        )?;
+    }
+    validate_branch_descendants(world, entering).map(|_| ())
 }
 
 pub(crate) fn validate_committed_branch(
@@ -183,23 +242,179 @@ pub(crate) fn validate_committed_branch(
     branch: &RealizedBranch,
     leaving: bool,
 ) -> Result<Vec<Entity>, FrameLocalError> {
+    validate_committed_branch_with_entering(world, branch, leaving, None, None, None)
+}
+
+pub(crate) fn validate_active_branch_with_entering(
+    world: &World,
+    branch: &RealizedBranch,
+    entering: Option<&RealizedBranch>,
+    staging_allowance: Option<&SealedMountNewStagingAllowance>,
+) -> Result<Vec<Entity>, FrameLocalError> {
+    validate_committed_branch_with_entering(world, branch, false, entering, staging_allowance, None)
+}
+
+pub(crate) fn validate_active_branch_for_splice(
+    world: &World,
+    preserved: &RealizedBranch,
+    entering: &RealizedBranch,
+    slot_roles: &[SealedReconciliationSlotRole],
+) -> Result<Vec<Entity>, FrameLocalError> {
+    validate_committed_branch_with_entering(
+        world,
+        preserved,
+        false,
+        Some(entering),
+        None,
+        Some(slot_roles),
+    )
+}
+
+fn validate_committed_branch_with_entering(
+    world: &World,
+    branch: &RealizedBranch,
+    leaving: bool,
+    entering: Option<&RealizedBranch>,
+    staging_allowance: Option<&SealedMountNewStagingAllowance>,
+    sealed_slot_roles: Option<&[SealedReconciliationSlotRole]>,
+) -> Result<Vec<Entity>, FrameLocalError> {
     validate_branch_structure(branch)?;
+    if let Some(allowance) = staging_allowance.filter(|allowance| {
+        world
+            .get::<ChildOf>(allowance.entity())
+            .map(ChildOf::parent)
+            == Some(allowance.anchor())
+    }) {
+        if branch
+            .frames()
+            .iter()
+            .filter(|frame| frame.frame() == allowance.parent())
+            .count()
+            != 1
+            || !validate_mount_new_staging_allowance(world, allowance)
+        {
+            return Err(FrameLocalError::ForeignChildSlot(allowance.entity()));
+        }
+    }
+    let mut sealed_entering_shells = Vec::new();
     for slot in branch.child_slots() {
+        let occupied = branch
+            .frames()
+            .iter()
+            .any(|frame| frame.mount_binding().matches_mounted_child_slot(slot))
+            || entering.into_iter().any(|entering| {
+                entering
+                    .frames()
+                    .iter()
+                    .any(|frame| frame.mount_binding().matches_mounted_child_slot(slot))
+            });
         let valid = if leaving {
             validate_leaving_mounted_child_slot(world, slot)
+        } else if entering.is_some() && occupied {
+            match slot.slot_claim().lifecycle() {
+                EntityLifecycle::Active => validate_leaving_mounted_child_slot(world, slot),
+                EntityLifecycle::PreparedInert => {
+                    validate_mounted_child_slot(world, slot, EntityLifecycle::PreparedInert)
+                }
+                EntityLifecycle::Leaving | EntityLifecycle::Quarantined => false,
+            }
         } else {
-            validate_mounted_child_slot(world, slot, EntityLifecycle::Active)
+            validate_mounted_child_slot(
+                world,
+                slot,
+                if occupied {
+                    EntityLifecycle::Active
+                } else {
+                    EntityLifecycle::PreparedInert
+                },
+            )
         };
         if !valid {
             return Err(FrameLocalError::OwnershipDrift(slot.slot()));
         }
     }
     for frame in branch.frames() {
-        let child_slots = child_slot_expectations(branch, frame.frame());
+        let mut child_slots = child_slot_expectations(branch, frame.frame());
+        let mut external_boundaries = Vec::new();
+        if let Some(entering) = entering {
+            let entering_slots = entering
+                .child_slots()
+                .iter()
+                .filter(|slot| slot.parent() == frame.frame())
+                .collect::<Vec<_>>();
+            if let Some(roles) = sealed_slot_roles {
+                if entering_slots
+                    .iter()
+                    .any(|slot| !sealed_mount_new_expectation_is_unique(roles, slot))
+                    || roles.iter().any(|role| {
+                        role.kind() == ReconciliationSlotRoleKind::MountNew
+                            && role.parent() == frame.frame()
+                            && entering_slots
+                                .iter()
+                                .filter(|slot| sealed_mount_new_role_matches_slot(role, slot))
+                                .count()
+                                != 1
+                    })
+                {
+                    return Err(FrameLocalError::ForeignChildSlot(frame.shell()));
+                }
+                external_boundaries.extend(entering_slots.iter().map(|slot| slot.slot()));
+                child_slots.extend(
+                    entering_slots
+                        .into_iter()
+                        .map(|slot| (slot.anchor(), slot.expected_anchor_children().to_vec())),
+                );
+            } else {
+                external_boundaries.extend(entering_slots.iter().map(|slot| slot.slot()));
+                child_slots.extend(
+                    entering_slots
+                        .into_iter()
+                        .map(|slot| (slot.anchor(), slot.expected_anchor_children().to_vec())),
+                );
+            }
+        }
+        if let Some(allowance) = staging_allowance.filter(|allowance| {
+            allowance.parent() == frame.frame()
+                && world
+                    .get::<ChildOf>(allowance.entity())
+                    .map(ChildOf::parent)
+                    == Some(allowance.anchor())
+        }) {
+            external_boundaries.push(allowance.entity());
+            child_slots.push((
+                allowance.anchor(),
+                allowance.expected_anchor_children().to_vec(),
+            ));
+        }
         let valid = if leaving {
             validate_leaving_frame_with_child_slots(world, frame, &child_slots)
         } else {
-            validate_active_frame_with_child_slots(world, frame, &child_slots)
+            let entering_shells = entering
+                .into_iter()
+                .flat_map(RealizedBranch::frames)
+                .filter_map(|entering| entering.sealed_reconciliation_entering_shell_for(frame))
+                .cloned()
+                .collect::<Vec<_>>();
+            if entering_shells.len() > 1 {
+                return Err(FrameLocalError::OwnershipDrift(frame.shell()));
+            }
+            let valid = validate_active_frame_with_child_slots_and_entering_shells(
+                world,
+                frame,
+                &child_slots,
+                &entering_shells,
+            );
+            if valid {
+                sealed_entering_shells.extend(entering_shells);
+                sealed_entering_shells.extend(
+                    frame
+                        .mount_binding()
+                        .staging_existing_shells()
+                        .iter()
+                        .cloned(),
+                );
+            }
+            valid
         };
         if !valid {
             return Err(FrameLocalError::OwnershipDrift(frame.shell()));
@@ -211,9 +426,134 @@ pub(crate) fn validate_committed_branch(
             frame.claims(),
             branch,
             ManifestPolicy::Observed,
+            &external_boundaries,
         )?;
     }
-    validate_branch_descendants(world, branch)
+    validate_branch_descendants_allowing_entering(world, branch, &sealed_entering_shells)
+}
+
+pub(crate) fn sealed_mount_new_expectation_is_unique(
+    roles: &[SealedReconciliationSlotRole],
+    slot: &crate::mount::MountedChildSlot,
+) -> bool {
+    roles
+        .iter()
+        .filter(|role| sealed_mount_new_role_matches_slot(role, slot))
+        .count()
+        == 1
+}
+
+fn sealed_mount_new_role_matches_slot(
+    role: &SealedReconciliationSlotRole,
+    slot: &crate::mount::MountedChildSlot,
+) -> bool {
+    role.kind() == ReconciliationSlotRoleKind::MountNew
+        && role.current() == EntityLifecycle::PreparedInert
+        && role.next() == Some(EntityLifecycle::Active)
+        && role.entity() == slot.slot()
+        && role.claim() == slot.slot_claim()
+        && role.parent() == slot.parent()
+        && role.outlet() == slot.outlet()
+        && role.slot() == slot.slot_id()
+        && role.anchor() == slot.anchor()
+        && role.anchor_claim() == slot.anchor_claim()
+}
+
+fn validate_mount_new_staging_allowance(
+    world: &World,
+    allowance: &SealedMountNewStagingAllowance,
+) -> bool {
+    let registry = world.resource::<RouteEntityRegistry>();
+    let record_is_exact = registry
+        .record(allowance.entity())
+        .is_some_and(|record| record.claim() == *allowance.claim());
+    let anchor_is_exact = registry
+        .record(allowance.anchor())
+        .is_some_and(|record| record.claim() == *allowance.anchor_claim());
+    record_is_exact
+        && anchor_is_exact
+        && allowance.matches_binding(
+            allowance.parent(),
+            allowance.outlet(),
+            allowance.slot(),
+            allowance.entity(),
+            allowance.claim(),
+            allowance.anchor(),
+            allowance.anchor_claim(),
+        )
+        && world.get::<RouteOwnershipSeal>(allowance.entity())
+            == Some(&RouteOwnershipSeal::new(allowance.claim().seal()))
+        && world
+            .get::<ChildSlotAuthority>(allowance.entity())
+            .is_some_and(|authority| {
+                authority.parent() == allowance.parent()
+                    && authority.outlet() == allowance.outlet()
+                    && authority.slot() == allowance.slot()
+            })
+        && matches!(
+            world.get::<ChildSlotLifecycle>(allowance.entity()),
+            Some(ChildSlotLifecycle::ProvisionalInert | ChildSlotLifecycle::RegisteredInert)
+        )
+        && world.get::<Visibility>(allowance.entity()) == Some(&Visibility::Hidden)
+        && world.get::<Pickable>(allowance.entity()) == Some(&Pickable::IGNORE)
+        && world
+            .get::<RouterInputBarrier>(allowance.entity())
+            .is_some_and(RouterInputBarrier::denies_all)
+        && world
+            .get::<Children>(allowance.anchor())
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default()
+            == allowance.expected_anchor_children()
+}
+
+fn validate_reconciliation_entering_structure(
+    entering: &RealizedBranch,
+    preserved: &RealizedBranch,
+) -> Result<(), FrameLocalError> {
+    if entering.frames().is_empty() {
+        return entering.child_slots().first().map_or(Ok(()), |slot| {
+            Err(FrameLocalError::ForeignChildSlot(slot.slot()))
+        });
+    }
+    let mut roots = 0usize;
+    for frame in entering.frames() {
+        let incoming = entering
+            .child_slots()
+            .iter()
+            .filter(|slot| frame.mount_binding().matches_mounted_child_slot(slot))
+            .count();
+        if incoming == 0 {
+            roots += 1;
+        } else if incoming != 1 {
+            return Err(FrameLocalError::OwnershipDrift(frame.shell()));
+        }
+    }
+    let mut preserved_boundaries = 0usize;
+    for slot in entering.child_slots() {
+        let parent_is_entering = entering
+            .frames()
+            .iter()
+            .any(|frame| frame.frame() == slot.parent());
+        let parent_is_preserved = preserved
+            .frames()
+            .iter()
+            .any(|frame| frame.frame() == slot.parent());
+        let children = entering
+            .frames()
+            .iter()
+            .filter(|frame| frame.mount_binding().matches_mounted_child_slot(slot))
+            .count();
+        if parent_is_entering == parent_is_preserved || children != 1 {
+            return Err(FrameLocalError::ForeignChildSlot(slot.slot()));
+        }
+        preserved_boundaries += usize::from(parent_is_preserved);
+    }
+    if roots + preserved_boundaries != 1 {
+        return Err(FrameLocalError::OwnershipDrift(
+            entering.frames()[0].shell(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_branch_structure(branch: &RealizedBranch) -> Result<(), FrameLocalError> {
@@ -222,8 +562,36 @@ fn validate_branch_structure(branch: &RealizedBranch) -> Result<(), FrameLocalEr
             Err(FrameLocalError::ForeignChildSlot(slot.slot()))
         });
     }
-    if branch.frames().len() != branch.child_slots().len() + 1 {
+    let mut roots = 0usize;
+    for frame in branch.frames() {
+        let incoming = branch
+            .child_slots()
+            .iter()
+            .filter(|slot| frame.mount_binding().matches_mounted_child_slot(slot))
+            .count();
+        if incoming == 0 {
+            roots += 1;
+        } else if incoming != 1 {
+            return Err(FrameLocalError::OwnershipDrift(frame.shell()));
+        }
+    }
+    if roots != 1 {
         return Err(FrameLocalError::OwnershipDrift(branch.frames()[0].shell()));
+    }
+    for slot in branch.child_slots() {
+        if !branch
+            .frames()
+            .iter()
+            .any(|frame| frame.frame() == slot.parent())
+            || branch
+                .frames()
+                .iter()
+                .filter(|frame| frame.mount_binding().matches_mounted_child_slot(slot))
+                .count()
+                > 1
+        {
+            return Err(FrameLocalError::ForeignChildSlot(slot.slot()));
+        }
     }
     Ok(())
 }
@@ -247,6 +615,7 @@ fn validate_frame_claim_set<'a>(
     claims: impl Iterator<Item = &'a crate::registry::ExactRegistryClaim>,
     branch: &RealizedBranch,
     manifest_policy: ManifestPolicy,
+    external_boundaries: &[Entity],
 ) -> Result<(), FrameLocalError> {
     let registry = world
         .get_resource::<RouteEntityRegistry>()
@@ -265,12 +634,17 @@ fn validate_frame_claim_set<'a>(
         .iter()
         .map(|claim| claim.entity())
         .collect::<HashSet<_>>();
-    let boundaries = branch
+    let mut boundaries = branch
         .child_slots()
         .iter()
         .filter(|slot| slot.parent() == frame)
         .map(|slot| slot.slot())
         .collect::<HashSet<_>>();
+    for boundary in external_boundaries {
+        if expected.contains(boundary) || !boundaries.insert(*boundary) {
+            return Err(FrameLocalError::ForeignChildSlot(*boundary));
+        }
+    }
     let actual = physical.into_iter().collect::<HashSet<_>>();
     if actual.len() != expected.len() + boundaries.len()
         || !expected.is_subset(&actual)
@@ -281,9 +655,17 @@ fn validate_frame_claim_set<'a>(
     Ok(())
 }
 
-fn validate_branch_descendants(
+pub(crate) fn validate_branch_descendants(
     world: &World,
     branch: &RealizedBranch,
+) -> Result<Vec<Entity>, FrameLocalError> {
+    validate_branch_descendants_allowing_entering(world, branch, &[])
+}
+
+fn validate_branch_descendants_allowing_entering(
+    world: &World,
+    branch: &RealizedBranch,
+    sealed_entering_shells: &[crate::registry::ExactRegistryClaim],
 ) -> Result<Vec<Entity>, FrameLocalError> {
     if branch.frames().is_empty() {
         return Ok(Vec::new());
@@ -297,14 +679,21 @@ fn validate_branch_descendants(
         let local = collect_frame_focus_unit(world, frame.frame(), frame.shell(), registry)?;
         extend_focus_closure(&mut ordered, &mut branch_seen, local)?;
     }
-    for (index, slot) in branch.child_slots().iter().enumerate() {
-        let child = &branch.frames()[index + 1];
+    for slot in branch.child_slots() {
+        let Some(child) = branch
+            .frames()
+            .iter()
+            .find(|frame| frame.mount_binding().matches_mounted_child_slot(slot))
+        else {
+            continue;
+        };
         let foreign = collect_child_slot_foreign_focus(
             world,
             slot.slot(),
             child.frame(),
             child.shell(),
             registry,
+            sealed_entering_shells,
         )?;
         extend_focus_closure(&mut ordered, &mut branch_seen, foreign)?;
     }
@@ -368,6 +757,7 @@ fn collect_child_slot_foreign_focus(
     child_frame: &RouteFrameVersion,
     child_root: Entity,
     registry: &RouteEntityRegistry,
+    sealed_entering_shells: &[crate::registry::ExactRegistryClaim],
 ) -> Result<Vec<Entity>, FrameLocalError> {
     if world.get::<ChildOf>(child_root).map(ChildOf::parent) != Some(slot)
         || !matches!(
@@ -398,7 +788,13 @@ fn collect_child_slot_foreign_focus(
         if !visited.insert(entity) {
             return Err(FrameLocalError::RelationshipCycle(entity));
         }
-        if registry.record(entity).is_some() {
+        if let Some(record) = registry.record(entity) {
+            if sealed_entering_shells
+                .iter()
+                .any(|claim| claim.entity() == entity && *claim == record.claim())
+            {
+                continue;
+            }
             return Err(FrameLocalError::OwnershipDrift(entity));
         }
         ordered.push(entity);
@@ -724,5 +1120,18 @@ mod tests {
         assert!(closure.contains(&foreign));
         assert!(closure.contains(&foreign_leaf));
         assert!(closure.contains(&child_slot));
+    }
+
+    #[test]
+    fn retained_empty_structure_uses_exact_binding_instead_of_positional_count() {
+        let (_app, branch, _, _, _) = crate::navigation::tests::failed_nested_branch_fixture();
+        let mut retained = branch.into_realized_for_test();
+        let removed = retained
+            .pop_frame_for_test()
+            .expect("nested fixture has one occupied child frame");
+        let slot = &retained.child_slots()[0];
+        assert!(removed.mount_binding().matches_mounted_child_slot(slot));
+
+        assert_eq!(validate_branch_structure(&retained), Ok(()));
     }
 }

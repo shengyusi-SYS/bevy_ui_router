@@ -205,6 +205,7 @@ struct CleanupObligation {
 struct CleanupMountParentSettlement {
     claim: ExactRegistryClaim,
     manifest: ComponentManifest,
+    physical_manifest: ComponentManifest,
     expected_parent: Entity,
     expected_parent_claim: Option<ExactRegistryClaim>,
     removed_child: Entity,
@@ -431,7 +432,7 @@ impl FrozenCleanupManifest {
         {
             return Some(Self::empty());
         }
-        if (frames.is_empty() && !child_slots.is_empty())
+        if (frames.is_empty() && child_slots.len() > 1)
             || (!frames.is_empty()
                 && (child_slots.len() > frames.len() || child_slots.len() + 1 < frames.len()))
         {
@@ -453,7 +454,9 @@ impl FrozenCleanupManifest {
                 .map(|slot| rejected_slot_obligation(registry, slot))
                 .collect::<Option<Vec<_>>>()?,
         );
-        if !child_slots.is_empty() && child_slots.len() == frames.len() {
+        if frames.is_empty() && child_slots.len() == 1 {
+            obligations.push(mounted_slot_obligation(world, registry, &child_slots[0])?);
+        } else if !child_slots.is_empty() && child_slots.len() == frames.len() {
             obligations.push(mounted_slot_obligation(
                 world,
                 registry,
@@ -633,7 +636,9 @@ fn frame_mount_parent_candidate(
     let (children_before, children_after) = if let Some(successor) = successor {
         if !frame.shell_is_attached()
             || !successor.shell_is_attached()
-            || successor.mount_binding() != frame.mount_binding()
+            || !successor
+                .mount_binding()
+                .same_physical_mount(frame.mount_binding())
         {
             return None;
         }
@@ -682,12 +687,8 @@ fn residual_anchor_parent_candidate(
     slot: &ChildSlotResidual,
 ) -> Option<CleanupMountParentCandidate> {
     let mut children_before = slot.prior_anchor_children().to_vec();
-    let child_of = world.components().component_id::<ChildOf>();
-    let removed_child_was_attached = child_of.is_some_and(|component| {
-        slot.authorized_manifest()
-            .component_ids()
-            .contains(&component)
-    });
+    let removed_child_was_attached =
+        world.get::<ChildOf>(slot.entity()).map(ChildOf::parent) == Some(slot.anchor());
     if removed_child_was_attached {
         children_before.push(slot.entity());
     }
@@ -731,7 +732,7 @@ fn freeze_external_mount_parents(
         .map(|obligation| obligation.claim.entity())
         .collect::<HashSet<_>>();
     let mut parents = Vec::<CleanupMountParentSettlement>::new();
-    for candidate in candidates {
+    for mut candidate in candidates {
         let claim = candidate.claim;
         let entity = claim.entity();
         if obligation_entities.contains(&entity) {
@@ -747,6 +748,52 @@ fn freeze_external_mount_parents(
         ) {
             return None;
         }
+        let actual_children = world
+            .get::<Children>(entity)
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let expected_children = candidate
+            .children_before
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        if actual_children
+            .iter()
+            .copied()
+            .filter(|child| expected_children.contains(child))
+            .ne(candidate.children_before.iter().copied())
+            || actual_children.iter().copied().any(|child| {
+                !expected_children.contains(&child)
+                    && (registry.record(child).is_some()
+                        || world
+                            .resource::<QuarantineLeaseTable>()
+                            .record(child)
+                            .is_some()
+                        || world
+                            .resource::<QuarantineLeaseTable>()
+                            .unresolved_record(child)
+                            .is_some())
+            })
+        {
+            return None;
+        }
+        candidate.children_before = actual_children.clone();
+        candidate.children_after = if candidate.removed_child_was_attached {
+            let mut removed = false;
+            actual_children
+                .into_iter()
+                .filter(|child| {
+                    if !removed && *child == candidate.removed_child {
+                        removed = true;
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            actual_children
+        };
         if let Some(existing) = parents
             .iter()
             .find(|parent| parent.claim.entity() == entity)
@@ -762,7 +809,14 @@ fn freeze_external_mount_parents(
             continue;
         }
         let record = registry.record(entity)?;
-        if record.claim() != claim || !record.manifest().matches(world, entity) {
+        let physical_manifest = ComponentManifest::from_world(world, entity)?;
+        if record.claim() != claim
+            || !manifest_contains_required_allowing_children(
+                world,
+                &physical_manifest,
+                record.manifest(),
+            )
+        {
             return None;
         }
         let (expected_parent, expected_parent_claim) =
@@ -770,6 +824,7 @@ fn freeze_external_mount_parents(
         let settlement = CleanupMountParentSettlement {
             claim,
             manifest: record.manifest().clone(),
+            physical_manifest,
             expected_parent,
             expected_parent_claim,
             removed_child: candidate.removed_child,
@@ -847,23 +902,11 @@ fn mount_parent_physical_matches(
     {
         return false;
     }
-    let Some(actual_manifest) = ComponentManifest::from_world(world, parent.claim.entity()) else {
-        return false;
-    };
-    let children = world.components().component_id::<Children>();
-    let manifest_change_is_allowed = actual_manifest
-        .component_ids()
-        .iter()
-        .filter(|component| !parent.manifest.component_ids().contains(component))
-        .chain(
-            parent
-                .manifest
-                .component_ids()
-                .iter()
-                .filter(|component| !actual_manifest.component_ids().contains(component)),
-        )
-        .all(|component| Some(*component) == children);
-    if !manifest_change_is_allowed {
+    if !observed_parent_manifest_differs_only_by_children(
+        world,
+        parent.claim.entity(),
+        &parent.physical_manifest,
+    ) {
         return false;
     }
     let owner_value_is_exact = match parent.claim.owner() {
@@ -971,6 +1014,40 @@ fn mount_parent_physical_matches(
         .map(|children| children.iter().copied().collect::<Vec<_>>())
         .unwrap_or_default()
         == *expected_children
+}
+
+fn observed_parent_manifest_differs_only_by_children(
+    world: &World,
+    entity: Entity,
+    frozen: &ComponentManifest,
+) -> bool {
+    let Some(actual) = ComponentManifest::from_world(world, entity) else {
+        return false;
+    };
+    let children = world.components().component_id::<Children>();
+    actual
+        .component_ids()
+        .iter()
+        .filter(|component| !frozen.component_ids().contains(component))
+        .chain(
+            frozen
+                .component_ids()
+                .iter()
+                .filter(|component| !actual.component_ids().contains(component)),
+        )
+        .all(|component| Some(*component) == children)
+}
+
+fn manifest_contains_required_allowing_children(
+    world: &World,
+    actual: &ComponentManifest,
+    required: &ComponentManifest,
+) -> bool {
+    let children = world.components().component_id::<Children>();
+    required
+        .component_ids()
+        .iter()
+        .all(|component| Some(*component) == children || actual.component_ids().contains(component))
 }
 
 fn mount_parent_frozen_manifest_matches(
@@ -1408,6 +1485,15 @@ impl CleanupLedger {
         }
     }
 
+    pub(crate) fn mount_new_staging_allowance(
+        &self,
+    ) -> Option<&crate::branch_transaction::SealedMountNewStagingAllowance> {
+        match self.owner.as_ref() {
+            Some(CleanupOwner::FailedPrepared(branch)) => branch.mount_new_allowance(),
+            Some(CleanupOwner::Leaving(_)) | None => None,
+        }
+    }
+
     #[cfg(feature = "test-support")]
     pub(crate) fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
         match self.owner.as_ref() {
@@ -1640,19 +1726,25 @@ impl CleanupLedger {
                     return None;
                 }
                 let actual = ComponentManifest::from_world(world, parent.claim.entity())?;
-                let change_is_allowed = actual
-                    .component_ids()
-                    .iter()
-                    .filter(|component| !parent.manifest.component_ids().contains(component))
-                    .chain(
-                        parent
-                            .manifest
-                            .component_ids()
-                            .iter()
-                            .filter(|component| !actual.component_ids().contains(component)),
-                    )
-                    .all(|component| Some(*component) == children);
-                change_is_allowed.then_some((parent.claim.clone(), parent.manifest.clone(), actual))
+                if !observed_parent_manifest_differs_only_by_children(
+                    world,
+                    parent.claim.entity(),
+                    &parent.physical_manifest,
+                ) {
+                    return None;
+                }
+                let next = ComponentManifest::new(
+                    parent
+                        .manifest
+                        .component_ids()
+                        .iter()
+                        .copied()
+                        .filter(|component| Some(*component) != children)
+                        .chain(
+                            children.filter(|component| actual.component_ids().contains(component)),
+                        ),
+                );
+                Some((parent.claim.clone(), parent.manifest.clone(), next))
             })
             .collect()
     }
@@ -1667,14 +1759,25 @@ impl CleanupLedger {
         {
             return false;
         }
-        exchanges.iter().all(|(claim, _, actual)| {
+        exchanges.iter().all(|(claim, _, next)| {
+            let Some(parent) = self
+                .mount_parents
+                .iter()
+                .find(|parent| parent.claim.entity() == claim.entity())
+            else {
+                return false;
+            };
             world
                 .resource::<RouteEntityRegistry>()
                 .record(claim.entity())
                 .is_some_and(|record| {
                     record.claim() == *claim
-                        && record.manifest() == actual
-                        && actual.matches(world, claim.entity())
+                        && record.manifest() == next
+                        && observed_parent_manifest_differs_only_by_children(
+                            world,
+                            claim.entity(),
+                            &parent.physical_manifest,
+                        )
                 })
         }) && world
             .get_resource::<RouteEntityRegistry>()
@@ -3064,6 +3167,10 @@ impl StructuredDigest {
         for component in parent.manifest.component_ids() {
             self.push(component.index() as u64);
         }
+        self.push(parent.physical_manifest.component_ids().len() as u64);
+        for component in parent.physical_manifest.component_ids() {
+            self.push(component.index() as u64);
+        }
         self.push(parent.expected_parent.to_bits());
         if let Some(claim) = &parent.expected_parent_claim {
             self.push(1);
@@ -3882,7 +3989,7 @@ pub(crate) mod tests {
 
     #[test]
     pub(crate) fn external_frame_output_value_and_manifest_drift_is_zero_write_and_retains_focus() {
-        for drift in 0..5 {
+        for drift in 0..6 {
             let (mut app, branch, _child_entities, _child_slot, _parent_entities) =
                 crate::navigation::tests::failed_nested_branch_fixture();
             let mounted = &branch.child_slots()[0];
@@ -3945,12 +4052,19 @@ pub(crate) mod tests {
                         .entity_mut(anchor)
                         .insert(ExternalParentDriftMarker);
                 }
+                5 => {
+                    let foreign = app.world_mut().spawn_empty().id();
+                    app.world_mut().entity_mut(foreign).insert(ChildOf(anchor));
+                }
                 _ => unreachable!(),
             }
             app.world_mut().flush();
             let attempt = ledger.attempt(app.world()).unwrap();
 
-            assert!(!ledger.settle(app.world_mut(), attempt));
+            assert!(
+                !ledger.settle(app.world_mut(), attempt),
+                "external mount-parent drift case {drift} must reject cleanup",
+            );
             assert_eq!(ledger.receipt_count(), 0);
             assert!(app.world().get_entity(slot).is_ok());
             assert_eq!(app.world().resource::<InputFocus>().get(), Some(slot));

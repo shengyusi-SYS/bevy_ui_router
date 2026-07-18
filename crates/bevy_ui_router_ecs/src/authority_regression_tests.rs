@@ -1,4 +1,5 @@
 use bevy_app::App;
+use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
     component::Component,
     hierarchy::{ChildOf, Children},
@@ -20,7 +21,7 @@ use crate::{
     RouterHostRegistration, RouterSnapshots, SolidRect, ViewBuildReport,
     cleanup::CleanupAttempt,
     components::{ChildSlotLifecycle, RouterInputBarrier},
-    input::RouteFocusState,
+    input::{RouteFocusState, RouterInputGate},
     navigation::{
         RouterNavigation, collect_navigation_system, commit_presentation_system,
         drive_navigation_system, observe_authority_system, settle_cleanup_system,
@@ -404,6 +405,7 @@ fn assert_stable_child_slot_closure(app: &App) {
         .map(|slot| slot.slot())
         .collect::<Vec<_>>();
     let registry = app.world().resource::<RouteEntityRegistry>();
+    let gate = app.world().resource::<RouterInputGate>();
     assert!(
         registry
             .records()
@@ -416,6 +418,22 @@ fn assert_stable_child_slot_closure(app: &App) {
         .filter_map(|record| match record.owner() {
             RegistryOwner::Committed(EntityOwner::ChildSlot { .. }) => {
                 assert_eq!(record.lifecycle(), EntityLifecycle::Active);
+                assert_eq!(
+                    app.world().get::<Visibility>(record.entity()),
+                    Some(&Visibility::Visible),
+                );
+                assert_eq!(
+                    app.world().get::<Pickable>(record.entity()),
+                    Some(&Pickable::IGNORE),
+                );
+                assert!(
+                    app.world()
+                        .get::<RouterInputBarrier>(record.entity())
+                        .is_some_and(RouterInputBarrier::denies_all)
+                );
+                assert!(!gate.allows_pointer(record.entity()));
+                assert!(!gate.allows_keyboard(record.entity()));
+                assert!(!gate.allows_gamepad(record.entity()));
                 Some(record.entity())
             }
             _ => None,
@@ -468,7 +486,8 @@ fn mount_grant_observer_drift_rejects_after_mutation() {
     app.add_plugins(BevyUiRouterPlugin::default());
     let (router, host) = install_nested_authority_router(&mut app, "grant-drift");
     app.update();
-    let first = settle_public_request(&mut app, router, RouteLocation::new("/items/1"));
+    // Publish only the parent first so the next append must consume a real MountNew boundary.
+    let first = settle_public_request(&mut app, router, RouteLocation::new("/"));
     assert!(matches!(
         app.world().resource::<RouterSnapshots>().request(router, first),
         RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded
@@ -563,12 +582,13 @@ fn slot_lifecycle_has_no_orphans() {
         RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded
     ));
     assert_stable_child_slot_closure(&app);
-    let old_slot = app.world().resource::<RouterNavigation>().entries[0]
+    let old_slot_claim = app.world().resource::<RouterNavigation>().entries[0]
         .active
         .as_ref()
         .unwrap()
         .child_slots()[0]
-        .slot();
+        .slot_claim()
+        .clone();
 
     let replacement = settle_public_request(&mut app, router, RouteLocation::new("/items/2"));
     assert!(matches!(
@@ -578,12 +598,23 @@ fn slot_lifecycle_has_no_orphans() {
         RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded
     ));
     assert_stable_child_slot_closure(&app);
-    assert!(app.world().get_entity(old_slot).is_err());
+    let active_slot = app.world().resource::<RouterNavigation>().entries[0]
+        .active
+        .as_ref()
+        .unwrap()
+        .child_slots()[0]
+        .slot();
+    assert_eq!(active_slot, old_slot_claim.entity());
+    assert!(app.world().get_entity(old_slot_claim.entity()).is_ok());
     assert!(
         app.world()
             .resource::<RouteEntityRegistry>()
-            .record(old_slot)
-            .is_none()
+            .record(old_slot_claim.entity())
+            .is_some_and(|record| {
+                record.owner() == old_slot_claim.owner()
+                    && record.seal() == old_slot_claim.seal()
+                    && record.lifecycle() == EntityLifecycle::Active
+            })
     );
 }
 
@@ -654,9 +685,12 @@ fn pending_cycle_rejects_without_touching_active() {
         active_before
     );
     assert_eq!(entry.engine.history(), &history_before);
+    // A pending relationship-cycle rejection is entering-local, not an authority loss. Its
+    // zero-physical cleanup terminates the request while retaining the exact old active branch.
     assert!(matches!(
         entry.engine.request(request).unwrap().status(),
-        RequestStatus::Running(NavigationPhase::Recovering)
+        RequestStatus::Failed(failure)
+            if failure.kind() == bevy_ui_router_core::prelude::NavigationFailureKind::Apply
     ));
     assert_eq!(
         app.world()
