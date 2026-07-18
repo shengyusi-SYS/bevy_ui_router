@@ -3481,10 +3481,12 @@ pub(crate) mod tests {
         let router = install_nested_router(&mut app, observed, true);
         app.update();
         commit_initial_nested_branch(&mut app, router);
-        let (old_frames, old_slots) = {
+        let (old_claims, old_frames, old_slots, expected_receipts, history_len_before) = {
             let navigation = app.world().resource::<RouterNavigation>();
-            let old = navigation.entries[0].active.as_ref().unwrap();
+            let entry = &navigation.entries[0];
+            let old = entry.active.as_ref().unwrap();
             (
+                old.claims().cloned().collect::<Vec<_>>(),
                 old.frames()
                     .iter()
                     .map(RealizedFrame::shell)
@@ -3493,32 +3495,84 @@ pub(crate) mod tests {
                     .iter()
                     .map(|slot| slot.slot())
                     .collect::<Vec<_>>(),
+                old.obligation_count(),
+                entry.engine.history().len(),
             )
         };
         let replacement = RouteLocation::new("/items/1").with_fragment("details");
 
-        prepare_nested_branch_for_commit(&mut app, router, replacement.clone());
+        let request = prepare_nested_branch_for_commit(&mut app, router, replacement.clone());
         commit_presentation_system(app.world_mut());
 
-        let navigation = app.world().resource::<RouterNavigation>();
-        let entry = &navigation.entries[0];
-        let active = entry.active.as_ref().unwrap();
-        assert_ne!(
-            active
-                .frames()
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let active = entry.active.as_ref().unwrap();
+            assert_ne!(
+                active
+                    .frames()
+                    .iter()
+                    .map(RealizedFrame::shell)
+                    .collect::<Vec<_>>(),
+                old_frames
+            );
+            assert_ne!(
+                active
+                    .child_slots()
+                    .iter()
+                    .map(|slot| slot.slot())
+                    .collect::<Vec<_>>(),
+                old_slots
+            );
+            let ledger = entry.cleanup_ledger.as_ref().unwrap();
+            assert_eq!(ledger.leaving_frames().len(), old_frames.len());
+            assert_eq!(ledger.receipt_count(), 0);
+            assert!(old_claims.iter().all(|claim| {
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(claim.entity())
+                    .is_some_and(|record| {
+                        record.owner() == claim.owner()
+                            && record.seal() == claim.seal()
+                            && record.lifecycle() == EntityLifecycle::Leaving
+                    })
+            }));
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+            ));
+            assert_eq!(entry.engine.history().len(), history_len_before + 1);
+            assert_eq!(entry.engine.history().current(), Some(&replacement));
+        }
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.cleanup_ledger.is_none());
+        assert_eq!(expected_receipts, old_claims.len());
+        assert!(old_claims.iter().all(|claim| {
+            app.world().get_entity(claim.entity()).is_err()
+                && app
+                    .world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(claim.entity())
+                    .is_none()
+        }));
+        let request = entry.engine.request(request).unwrap();
+        assert!(matches!(request.status(), RequestStatus::Succeeded));
+        assert_eq!(
+            request
+                .trace()
                 .iter()
-                .map(RealizedFrame::shell)
-                .collect::<Vec<_>>(),
-            old_frames
+                .filter(|event| event.cleanup_disposition().is_some())
+                .count(),
+            expected_receipts
         );
-        assert_ne!(
-            active
-                .child_slots()
-                .iter()
-                .map(|slot| slot.slot())
-                .collect::<Vec<_>>(),
-            old_slots
+        assert_eq!(
+            request.trace().last().map(|event| event.kind()),
+            Some(NavigationTraceEventKind::RequestTerminal)
         );
+        assert_eq!(entry.engine.history().len(), history_len_before + 1);
         assert_eq!(entry.engine.history().current(), Some(&replacement));
     }
 

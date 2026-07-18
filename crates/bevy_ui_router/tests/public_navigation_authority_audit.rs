@@ -218,6 +218,34 @@ fn nested_outlet_authority_is_opaque_and_exact() {
         audit.frames()[1].lifecycle(),
         AuthorityFrameLifecycle::Active
     );
+    let active_frames = audit
+        .frames()
+        .iter()
+        .filter(|frame| frame.lifecycle() == AuthorityFrameLifecycle::Active)
+        .map(|frame| frame.frame())
+        .collect::<Vec<_>>();
+    assert_eq!(active_frames.len(), 2);
+    assert_eq!(audit.content().len(), 2);
+    for active_frame in active_frames {
+        let mappings = audit
+            .content()
+            .iter()
+            .filter(|mapping| mapping.frame() == active_frame)
+            .collect::<Vec<_>>();
+        assert_eq!(mappings.len(), 1);
+        let mapping = mappings[0];
+        assert_eq!(mapping.primitive(), ContentPrimitiveKind::SolidRect);
+        assert!(mapping.width_px() > 0);
+        assert!(mapping.height_px() > 0);
+        assert_eq!(mapping.color(), ContentColor::srgba8(11, 23, 47, 255));
+        assert!(!mapping.visibility_hidden());
+        assert!(mapping.pickable_active());
+        assert_eq!(
+            audit.owned_entity_state(mapping.entity()),
+            AuditEntityState::PresentOwned
+        );
+    }
+    assert_ne!(audit.content()[0].entity(), audit.content()[1].entity());
     assert_eq!(audit.frames()[0].slot_entity(), audit.slots()[0].entity());
     assert_eq!(audit.frames()[1].slot_entity(), audit.slots()[1].entity());
     let outlet = &audit.outlets()[0];
