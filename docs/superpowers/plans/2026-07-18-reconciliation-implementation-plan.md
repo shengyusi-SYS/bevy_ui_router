@@ -269,11 +269,13 @@ git commit -m "feat(ecs): model preserved branch splices"
 
 **Files**
 
+- Modify: `crates/bevy_ui_router_ecs/src/branch_transaction.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/navigation.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/presentation.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/input.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/cleanup.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/audit.rs`
+- Modify: `crates/bevy_ui_router_ecs/src/frame_local.rs`
 
 **Produces**
 
@@ -281,6 +283,8 @@ git commit -m "feat(ecs): model preserved branch splices"
 - one preflight over global baseline and three exact closures
 - one atomic suffix splice and Core publication
 - post-commit leaving-suffix ledger only
+- consuming rejection that restores old active and pending entering owners
+- role-sensitive claim rebind for frames and registered child slots
 
 - [ ] **Step 1: Write RED tests**
 
@@ -305,9 +309,11 @@ Preflight must verify
 
 - exact host epoch、top-slot claim、registry partition、active/gate baseline与sealed ticket
 - preserved/leaving/entering Entity、manifest、owner、seal、lifecycle、parent、slot、outlet与acyclic traversal
+- retained empty slots and occupied slots by exact parent/outlet/mount binding rather than vector position
 - role-sensitive foreign component/descendant/protected-parent partition
 - all presentation、registry、slot、gate与focus mutation plans before the first write
 - sealed exact Entity/owner/seal/manifest/parent/lifecycle facts与唯一允许的in-place writes
+- any rejection returns the original active、pending entering and all cleanup owners without clone or World reconstruction
 
 Commit order
 
@@ -333,7 +339,7 @@ The commit tail must not insert、replace or remove components，change relation
 Observer-capable staging and cleanup writes remain outside this tail and retain exact post-write validation
 
 ```powershell
-git add -- crates/bevy_ui_router_ecs/src/navigation.rs crates/bevy_ui_router_ecs/src/presentation.rs crates/bevy_ui_router_ecs/src/input.rs crates/bevy_ui_router_ecs/src/cleanup.rs crates/bevy_ui_router_ecs/src/audit.rs
+git add -- crates/bevy_ui_router_ecs/src/branch_transaction.rs crates/bevy_ui_router_ecs/src/navigation.rs crates/bevy_ui_router_ecs/src/presentation.rs crates/bevy_ui_router_ecs/src/input.rs crates/bevy_ui_router_ecs/src/cleanup.rs crates/bevy_ui_router_ecs/src/audit.rs crates/bevy_ui_router_ecs/src/frame_local.rs
 git diff --cached --name-only
 git diff --cached --check
 git commit -m "feat(ecs): commit reconciled suffixes atomically"
