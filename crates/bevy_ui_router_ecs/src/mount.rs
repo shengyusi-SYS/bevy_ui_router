@@ -182,7 +182,7 @@ impl MountedChildSlot {
     }
 
     #[cfg(test)]
-    fn clone_for_test(&self) -> Self {
+    pub(crate) fn clone_for_test(&self) -> Self {
         Self {
             slot: self.slot,
             slot_claim: self.slot_claim.clone(),
@@ -193,6 +193,20 @@ impl MountedChildSlot {
             expected_anchor_children: self.expected_anchor_children.clone(),
             slot_id: self.slot_id,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_slot_authority_for_test(
+        &mut self,
+        slot: Entity,
+        slot_claim: ExactRegistryClaim,
+        outlet: RouteSlotKey,
+        slot_id: RouteSlotId,
+    ) {
+        self.slot = slot;
+        self.slot_claim = slot_claim;
+        self.outlet = outlet;
+        self.slot_id = slot_id;
     }
 
     pub(crate) fn internal_claims_can_rebind(

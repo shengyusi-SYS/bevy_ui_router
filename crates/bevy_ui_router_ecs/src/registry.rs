@@ -130,7 +130,7 @@ impl RegistryOwner {
         }
     }
 
-    fn conflicts_with(&self, other: &Self) -> bool {
+    pub(crate) fn conflicts_with(&self, other: &Self) -> bool {
         if self == other {
             return true;
         }
@@ -305,6 +305,38 @@ impl ExactRegistryClaim {
             ^ self.seal.domain.rotate_left(11)
             ^ self.seal.sequence.rotate_left(29)
             ^ (self.lifecycle as u64).rotate_left(47)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_entity_for_test(&self, entity: Entity) -> Self {
+        Self {
+            entity,
+            ..self.clone()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_owner_for_test(&self, owner: RegistryOwner) -> Self {
+        Self {
+            owner,
+            ..self.clone()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_seal_for_test(&self, seal: OwnershipSeal) -> Self {
+        Self {
+            seal,
+            ..self.clone()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_lifecycle_for_test(&self, lifecycle: EntityLifecycle) -> Self {
+        Self {
+            lifecycle,
+            ..self.clone()
+        }
     }
 }
 
