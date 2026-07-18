@@ -2,13 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** reviewed, ready for execution
+**Status:** Complete
 
 **Stage contract:** `docs/nested-push-contract-profile.md`
 
-**Planning baseline:** `1ccbcd7`
+**Contract origin:** `1ccbcd7`
 
-**Target version:** Phase 3B.1 `Plan PASS`
+**Execution-plan commit:** `eab1267`
+
+**Implementation range:** `eab1267..702e36e`
+
+**Target version:** Phase 3B.1 `Nested Push PASS`
 
 **Acceptance sources:** `docs/target-architecture.md`、`docs/authority-transition-matrix.md`、`docs/facade-contract-fixture.md`、`docs/facade-export-allowlist.md`、`docs/facade-associated-api-golden.txt`、`docs/mvp-acceptance-journeys.md`
 
@@ -54,7 +58,7 @@ Task 1 开始前，本计划必须已通过独立计划复审并由主代理单�
 - Produces: private stable `AcceptedOutlet { local_index, key }` retained by `AcceptedContentPlan`
 - Preserves: Root-stage public exclusions plus duplicate outlet、foreign session、self-edge、duplicate parent/edge、cycle and driver-return World-zero semantics
 
-- [ ] **Step 1: Write the accepted outlet RED**
+- [x] **Step 1: Write the accepted outlet RED**
 
 Add a content unit test that declares two outlets in reverse declaration order relative to topology and asserts stable `(local_index, key)` order
 
@@ -71,7 +75,7 @@ assert_eq!(
 
 Keep the existing duplicate、foreign-session、cycle and zero-write tests unchanged
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib content::tests::
@@ -79,7 +83,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 
 Expected: fail because `AcceptedContentPlan::outlets` does not exist and accepted plans discard declarations
 
-- [ ] **Step 3: Implement the final accepted-plan shape**
+- [x] **Step 3: Implement the final accepted-plan shape**
 
 ```rust
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,7 +107,7 @@ pub(crate) struct AcceptedContentPlan {
 
 `ContentPlan::accept` maps every live outlet handle to its local index without consulting or mutating `World`, then stores outlets in stable `(local_index, key)` order
 
-- [ ] **Step 4: Verify GREEN and Root compatibility**
+- [x] **Step 4: Verify GREEN and Root compatibility**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --test compile_fail_boundary
@@ -113,7 +117,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-d
 
 Expected: all commands exit 0, nested declaration methods remain excluded from public consumers and existing Root journeys remain green
 
-- [ ] **Step 5: Review and commit**
+- [x] **Step 5: Review and commit**
 
 Review gate: outlet plan remains data-only, stable ordering is explicit and no public surface changes before the Task 8 atomic profile switch
 
@@ -141,7 +145,7 @@ git commit -m "feat(ecs): retain accepted outlet plans"
 - Produces: private `MountRequestToken`、`MountGrant`、`MountReceiptAttestation`、`MountRegistrationPermit`、`MountRegistrationCompletion`、`MountConfirmation`、`MountIssuer` and `MountError`
 - Produces: reject/cancel/grant/accept-receipt/complete-registration/reject-after-mutation single-use transitions
 
-- [ ] **Step 1: Write mount protocol RED tests**
+- [x] **Step 1: Write mount protocol RED tests**
 
 Add direct tests named
 
@@ -158,7 +162,7 @@ The first test snapshots `CoreIdAllocator`, issues a request, proves the slot co
 
 The replay test clones internal test tokens before their first terminal transition and requires every replay to return `MountError::Stale` without changing allocator or issuer state
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib mount::tests::
@@ -166,7 +170,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core -
 
 Expected: compile failure because module and types do not exist
 
-- [ ] **Step 3: Implement the sealed protocol**
+- [x] **Step 3: Implement the sealed protocol**
 
 ```rust
 pub(crate) struct MountRequestToken { identity: MountIdentity, binding: u64 }
@@ -248,7 +252,7 @@ Each binding includes the artifact kind (`Requested`, `Granted`, `Receipt`, `Reg
 
 Do not export these types from `prelude` or facade
 
-- [ ] **Step 4: Verify GREEN and identity non-reuse**
+- [x] **Step 4: Verify GREEN and identity non-reuse**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib mount::tests::
@@ -258,7 +262,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core -
 
 Expected: all mount and allocator tests pass with a visible permanent slot gap after rejected grant
 
-- [ ] **Step 5: Review and commit**
+- [x] **Step 5: Review and commit**
 
 Review gate: no slot ID before resolution, no second allocator, every token transition exact and terminal
 
@@ -293,7 +297,7 @@ git commit -m "feat(core): add sealed child mount protocol"
 - Produces: full root-to-leaf `ActivePresentation::frames()` on one publication
 - Preserves: workspace compilation by retaining an unhandled sealed `MountRequest` in one private ECS holder; Task 6 remains the only slice that consumes it and implements physical mount staging
 
-- [ ] **Step 1: Write happy-path engine RED**
+- [x] **Step 1: Write happy-path engine RED**
 
 Build a two-level route using layout view plus `default` child slot and assert this action order
 
@@ -317,7 +321,7 @@ FrameTaskIssued(parent) -> ShellPrepared(parent) -> ViewApplied(parent)
 -> FrameActivated(parent) -> FrameActivated(child) -> CommitPublished
 ```
 
-- [ ] **Step 2: Write repeated nested classification RED**
+- [x] **Step 2: Write repeated nested classification RED**
 
 ```rust
 equivalent_nested_push_is_zero_entering
@@ -331,7 +335,7 @@ branch_reservation_exhaustion_is_complete_zero_change
 
 The nested replacement tests require fresh parent/child frame IDs and cleanup roots in child-to-parent order without claiming common-prefix reuse
 
-- [ ] **Step 3: Verify RED**
+- [x] **Step 3: Verify RED**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib engine::tests::nested_
@@ -339,7 +343,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core -
 
 Expected: fail because engine emits one leaf-only `RootFrameTask`
 
-- [ ] **Step 4: Generalize task identity and actions**
+- [x] **Step 4: Generalize task identity and actions**
 
 ```rust
 struct FrameTaskIdentity {
@@ -395,7 +399,7 @@ Keep `ViewReportIdentity` opaque and private-field only
 
 `ViewRequestId` uses the frame-task sequence rather than navigation request sequence so parent and child effects in one request are distinct; it remains observational and never becomes authority
 
-- [ ] **Step 5: Implement branch scheduling**
+- [x] **Step 5: Implement branch scheduling**
 
 `push` uses one complete enqueue flow
 
@@ -425,7 +429,7 @@ Mount resolve/grant/registration-completion methods append their exact frame/out
 
 `precompute_publication` writes the complete frame vector, one history intent and one trace
 
-- [ ] **Step 6: Verify GREEN and Root engine suite**
+- [x] **Step 6: Verify GREEN and Root engine suite**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib engine::tests::
@@ -437,7 +441,7 @@ cargo check --locked --workspace --all-targets --all-features -j 1 --config "bui
 
 Expected: full Core engine and View suites pass and every workspace consumer remains exhaustive
 
-- [ ] **Step 7: Review and commit**
+- [x] **Step 7: Review and commit**
 
 Review gate: child task cannot exist before exact registered-slot completion and final mount confirmation, active publication contains one ordered branch, Root semantics stay green
 
@@ -469,7 +473,7 @@ git commit -m "feat(core): schedule nested frame branches"
 - Produces: `Running(CleanupPending|Recovering) -> CleanupSettled -> Failed -> RequestTerminal`
 - Preserves: Root mandatory RouterFallback for match/root build/root apply failure
 
-- [ ] **Step 1: Write terminal-order RED tests**
+- [x] **Step 1: Write terminal-order RED tests**
 
 ```rust
 missing_outlet_waits_for_cleanup_before_mount_failure_terminal
@@ -484,7 +488,7 @@ For each pending case assert no `RequestTerminal` before cleanup completion and 
 
 Also require `MissingOutlet` and `InvalidOutlet` to emit `MountRejected` with the exact `MountRejectionKind`, rejected-after-mutation to emit `MountRejectedAfterMutation`, and parent authority loss to emit `MountRejected(ParentAuthorityLost)` without fallback
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib engine::tests::missing_outlet_
@@ -493,7 +497,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core -
 
 Expected: fail because the root-only engine has no mount failure ticket or nested cleanup state
 
-- [ ] **Step 3: Implement failure tickets and sealed cleanup**
+- [x] **Step 3: Implement failure tickets and sealed cleanup**
 
 ```rust
 enum PendingFailureKind {
@@ -532,7 +536,7 @@ All other precommit nested failure uses `CleanupPending`
 
 Only `complete_cleanup` may append `CleanupSettled`, transition terminal and append the last `RequestTerminal`
 
-- [ ] **Step 4: Verify GREEN and fallback preservation**
+- [x] **Step 4: Verify GREEN and fallback preservation**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib engine::tests::
@@ -543,7 +547,7 @@ cargo check --locked --workspace --all-targets --all-features -j 1 --config "bui
 
 Expected: all Core failure, trace, cleanup and Root fallback tests pass and every workspace consumer retains the new failure capability exhaustively
 
-- [ ] **Step 5: Review and commit**
+- [x] **Step 5: Review and commit**
 
 Review gate: no terminal-before-cleanup path, no nested fallback authority, existing Root fallback remains
 
@@ -581,7 +585,7 @@ git commit -m "feat(core): settle nested failures before terminal"
 - Produces: ECS-only `MountReceipt` attesting the exact staged slot and anchor; Core receives only its opaque digest plus logical grant identity
 - Produces: registry-first `stage_child_slot` and `confirm_child_slot`, plus a non-Clone tracked residual for Task 6 sealed-ledger settlement
 
-- [ ] **Step 0: Close the Core registration-session prerequisite**
+- [x] **Step 0: Close the Core registration-session prerequisite**
 
 Write RED tests proving that two routers with the same raw slot and receipt digest cannot cross a permit/proof pair, an old same-router proof is stale, failed begin is lifecycle zero-write, no child action exists before session completion, and session rejection yields the exact `FailureCleanupRequest`
 
@@ -604,7 +608,7 @@ git diff --cached --check
 git commit -m "feat(core): seal mount registration sessions"
 ```
 
-- [ ] **Step 1: Write realization and registry RED**
+- [x] **Step 1: Write realization and registry RED**
 
 ```rust
 accepted_outlet_maps_to_exact_realized_output
@@ -621,7 +625,7 @@ child_slot_seal_and_slot_id_are_not_reused_after_failure
 
 Install separate observers that despawn, reparent, remove the barrier or add a foreign component after each barrier, Node-required-closure, private-authority and relationship write batch
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib mount::tests::
@@ -630,7 +634,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 
 Expected: compile failure because child-slot production staging and generic mount binding do not exist
 
-- [ ] **Step 3: Generalize provisional registry owner**
+- [x] **Step 3: Generalize provisional registry owner**
 
 ```rust
 enum ProvisionalOwner {
@@ -652,7 +656,7 @@ Keep owner uniqueness, seal consumption and compare-and-swap claims unchanged
 
 Child-slot uniqueness is logical rather than enum equality: the same `(parent, outlet)` conflicts across provisional and committed owners even when the slot differs, and the same router-scoped slot cannot bind another child location
 
-- [ ] **Step 4: Implement mount binding and child-slot staging**
+- [x] **Step 4: Implement mount binding and child-slot staging**
 
 ```rust
 struct FrameMountBinding {
@@ -702,7 +706,7 @@ Staging order is exact and individually testable; the registry starts with the a
 
 Drift before the CAS keeps the slot provisional/inert; drift after the CAS keeps it registered but inert; despawn drift remains a tracked absent residual. All three non-Clone states transfer into Task 6 `FailedPreparedBranch`, and no Task 5 staging error branch may detach, despawn or settle them directly
 
-- [ ] **Step 5: Verify GREEN and locked Node contract**
+- [x] **Step 5: Verify GREEN and locked Node contract**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib mount::tests::
@@ -712,7 +716,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 
 Expected: exact staging, drift rejection and all existing Root physical tests pass
 
-- [ ] **Step 6: Review and commit**
+- [x] **Step 6: Review and commit**
 
 Review gate: registry-first is physically ordered, every observer-capable write is followed by exact validation, app-owned host is untouched
 
@@ -741,7 +745,7 @@ git commit -m "feat(ecs): stage exact child outlet slots"
 - Produces: sequential parent report → mount resolution → child report → pending commit
 - Preserves: one driver call per exact task and opaque report validation before first World/registry write
 
-- [ ] **Step 1: Write branch transaction RED**
+- [x] **Step 1: Write branch transaction RED**
 
 Add an internal two-level fixture and assert
 
@@ -754,7 +758,7 @@ assert!(entry.active_branch().is_empty());
 
 Insert a schedule probe between parent apply and child apply to prove both parent frame and child slot remain hidden、gate-denied、`Pickable::IGNORE` and unfocused
 
-- [ ] **Step 2: Write stale and failure RED**
+- [x] **Step 2: Write stale and failure RED**
 
 Cover foreign/duplicate parent report, stale mount request, missing outlet, invalid anchor, grant drift and child report mismatch
 
@@ -762,7 +766,7 @@ Every case snapshots World and registry before the first unauthorized operation 
 
 For missing/invalid outlet, rejected-after-mutation and child build/apply failure, assert the partial prepared branch and any provisional, registered or absent child-slot residual move to one `FailedPreparedBranch`, its exact manifest orders partial child frame → child slot residual → parent frames, the old active branch/history remain unchanged, and no terminal status appears before every receipt plus Core completion
 
-- [ ] **Step 3: Verify RED**
+- [x] **Step 3: Verify RED**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib navigation::tests::nested_
@@ -771,7 +775,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 
 Expected: fail because `RouterEntry` and `PendingCommit` hold one frame and drive blocks after parent realization
 
-- [ ] **Step 4: Implement branch transaction orchestration**
+- [x] **Step 4: Implement branch transaction orchestration**
 
 ```rust
 struct RealizedBranch {
@@ -851,7 +855,7 @@ On any precommit failure
 5. submit each ECS receipt and the completion digest/count to Core
 6. remove `PendingFailureCleanup` only after Core publishes `CleanupSettled` and the terminal status
 
-- [ ] **Step 5: Verify GREEN and Root driver compatibility**
+- [x] **Step 5: Verify GREEN and Root driver compatibility**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib navigation::tests::nested_
@@ -862,7 +866,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-d
 
 Expected: nested internal flow and all existing Root journeys pass
 
-- [ ] **Step 6: Review and commit**
+- [x] **Step 6: Review and commit**
 
 Review gate: no child effect before registered-slot completion, no second publisher, stale identity rejected before first write
 
@@ -893,7 +897,7 @@ git commit -m "feat(ecs): drive nested branch transactions"
 - Produces: branch cleanup ordering `child frame -> child slot -> parent frame`
 - Preserves: cleanup never mutates or despawns the app-owned host
 
-- [ ] **Step 1: Write frame-local physical traversal RED**
+- [x] **Step 1: Write frame-local physical traversal RED**
 
 Create a two-level fixture with decorative descendants and one registered child slot, then assert the parent frame traversal includes the exact child-slot boundary but excludes every descendant owned by the child frame
 
@@ -910,7 +914,7 @@ assert_eq!(
 
 Add a corrupted relationship cycle fixture and require a closed error before any presentation, input or cleanup mutation
 
-- [ ] **Step 2: Write atomic switch and focus RED**
+- [x] **Step 2: Write atomic switch and focus RED**
 
 Build a visible old branch and an inert prepared branch, then require one commit call to leave no intermediate externally visible state
 
@@ -942,7 +946,7 @@ assert_eq!(history.entries().last(), Some(&successful_location));
 
 Failed replacement must leave the old active branch and history unchanged
 
-- [ ] **Step 3: Write branch cleanup and protected-host RED**
+- [x] **Step 3: Write branch cleanup and protected-host RED**
 
 ```rust
 assert_eq!(cleanup_trace, vec![
@@ -958,7 +962,7 @@ Add exact-claim drift at each cleanup unit and require quarantine or closed fail
 
 Add `nested_node_ancestry_runs_real_layout_and_picking_pipeline` using the locked `bevy_internal::DefaultPlugins`; reuse one `PrimaryWindow`, create one `Camera2d` and do not register `UiPickingPlugin` twice; assert every host → top slot → parent shell → content → outlet anchor → child slot → child shell edge is a real Node ancestry and effective visibility reaches both primitives after commit; raw `PointerHits` may contain backend candidates, but final hover/target events must reach only committed active content and never pending/leaving content
 
-- [ ] **Step 4: Verify RED**
+- [x] **Step 4: Verify RED**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib frame_local::tests::
@@ -971,7 +975,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 
 Expected: fail because physical traversal crosses the whole root subtree and cleanup/presentation still model one frame
 
-- [ ] **Step 5: Implement stable frame-local traversal and atomic branch mutation**
+- [x] **Step 5: Implement stable frame-local traversal and atomic branch mutation**
 
 ```rust
 pub(crate) enum FrameLocalError {
@@ -995,7 +999,7 @@ Build `CommitMutationPlan` entirely from immutable snapshots, validate every exa
 
 Build `FrozenCleanupManifest::from_leaving_branch` as ordered exact Entity units; this leaving cleanup starts only after successful publication and consumes child frames before their child slots and parent frames, while Task 6's distinct `from_failed_prepared_branch` remains the precommit-failure path
 
-- [ ] **Step 6: Verify GREEN and native picking behavior**
+- [x] **Step 6: Verify GREEN and native picking behavior**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib frame_local::tests::
@@ -1009,7 +1013,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 
 Expected: frame-local traversal, old/old-or-new/new atomic branch publication, focus release, native picking isolation and ordered cleanup pass
 
-- [ ] **Step 7: Review and commit**
+- [x] **Step 7: Review and commit**
 
 Review gate: validation is complete before mutation, input/focus cannot cross a child boundary, successful-switch leaving cleanup is post-publication and the app-owned host is unchanged
 
@@ -1056,7 +1060,7 @@ git commit -m "feat(ecs): commit nested branches frame locally"
 - Produces: opaque `AuthorityOutletMapping` tied by its snapshot to router/host and directly to parent frame, outlet key, anchor and optional child slot
 - Produces: Nested stage gate with Root 20 plus exactly three Nested authority catalogue cases
 
-- [ ] **Step 1: Write public facade surface RED**
+- [x] **Step 1: Write public facade surface RED**
 
 Use only `bevy_ui_router::prelude::*` to declare `/items/1`, attach the layout's default outlet and submit a push; do not import owner crates or private integration types
 
@@ -1087,7 +1091,7 @@ let request = app
 
 Expected compile failure: nested route/outlet facade methods are absent or private
 
-- [ ] **Step 2: Write public Journey A RED**
+- [x] **Step 2: Write public Journey A RED**
 
 Drive one public push to `/items/1` and assert the existing public snapshots, effect records and host fingerprint
 
@@ -1121,7 +1125,7 @@ Assert the driver effect order is layout then leaf, the child effect occurs only
 
 Record the public `RouteViewInput` for both effects and assert the leaf receives location `/items/1`, route param `id = "1"`, no fragment and its matched-route origin; this proves the layered apply transports the real match rather than only invoking two view keys
 
-- [ ] **Step 3: Write opaque authority audit RED**
+- [x] **Step 3: Write opaque authority audit RED**
 
 ```rust
 assert_eq!(audit.frames().len(), 2);
@@ -1147,7 +1151,7 @@ assert!(audit.orphan_slots().is_empty());
 
 Require the outlet DTO to expose opaque identities and lifecycle facts only; it must not expose writable Entity handles or authority constructors
 
-- [ ] **Step 4: Register the exact Nested authority catalogue additions**
+- [x] **Step 4: Register the exact Nested authority catalogue additions**
 
 Keep the script-readable catalogue as one flat 23-string literal, appending only the three Nested names after the locked Root 20 entries
 
@@ -1183,7 +1187,7 @@ Update the catalogue target to parse the Root and Nested profile tables, reject 
 
 Switch the facade closed-world tests from the Root profile to `docs/nested-push-contract-profile.md`, require its exact 12 remaining exclusions, and prove the five unlocked APIs compile while History, Recovery and Authority-closure APIs remain rejected
 
-- [ ] **Step 5: Verify RED**
+- [x] **Step 5: Verify RED**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features ecs --test public_navigation_journeys nested_push_journey_a -- --exact
@@ -1194,7 +1198,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 
 Expected: facade/audit gaps and the three absent Nested regressions fail
 
-- [ ] **Step 6: Implement the public path and final audit DTO**
+- [x] **Step 6: Implement the public path and final audit DTO**
 
 ```rust
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1229,7 +1233,7 @@ Implement the three direct `#[test]` regressions in `authority_regression_tests.
 2. `mount_token_replay_is_zero_write` snapshots World and registry, replays stale/foreign/duplicate request, grant, receipt, registration permit, registration completion and final confirmation artifacts, then proves zero physical or registry change and no allocation by observing the next successful slot identity; stale permits must fail closed before provisional→registered CAS, and stale/foreign/duplicate permits or completions must never authorize a child action; Task 2 independently snapshots the private `CoreIdAllocator`
 3. `slot_lifecycle_has_no_orphans` covers successful commit, every precommit failure class and terminal cleanup, requiring no provisional record, no orphan child slot and no unreceipted obligation at stable state
 
-- [ ] **Step 7: Verify GREEN and Root compatibility**
+- [x] **Step 7: Verify GREEN and Root compatibility**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features ecs --test public_navigation_journeys
@@ -1246,7 +1250,7 @@ Root regression 由完整 `public_navigation_journeys` target 中既有的四个
 
 当前没有独立的 `root_navigation_surface` Cargo test target
 
-- [ ] **Step 8: Review and commit**
+- [x] **Step 8: Review and commit**
 
 Review gate: public callers cannot mint identity, bypass the driver, select active frames or mutate audit entities; the Root profile remains locked at 20
 
@@ -1265,6 +1269,7 @@ git commit -m "test: prove nested push public authority"
 - Modify: `docs/current-architecture.md`
 - Modify: `docs/roadmap.md`
 - Modify: `docs/phase-3b1-architecture-review-log.md`
+- Modify: `docs/nested-push-contract-profile.md`
 - Modify: `docs/superpowers/plans/2026-07-16-nested-push-implementation-plan.md`
 
 **Interfaces:**
@@ -1272,7 +1277,7 @@ git commit -m "test: prove nested push public authority"
 - Produces: factual Nested PASS record with exact commands, counts, commit range and reviewer outcomes
 - Preserves: Journey B, common-prefix reuse, final nested fragment semantics, replace/back, Recovery and MVP remain explicitly incomplete
 
-- [ ] **Step 1: Run focused Nested gates**
+- [x] **Step 1: Run focused Nested gates**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core
@@ -1287,7 +1292,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test
 
 Expected: every command exits 0, the catalogue target proves Root 20 plus Nested 3 and the authority script reports exactly 23 registered/passed cases with no missing or duplicate name
 
-- [ ] **Step 2: Run the full workspace gate serially**
+- [x] **Step 2: Run the full workspace gate serially**
 
 ```powershell
 cargo fmt --all -- --check
@@ -1299,7 +1304,7 @@ git diff --check
 
 Expected: format, static checks, every workspace test, doctest and diff check exit 0; record actual counts instead of copying earlier Root counts
 
-- [ ] **Step 3: Run four independent read-only reviews**
+- [x] **Step 3: Run four independent read-only reviews**
 
 Dispatch separate reviewers for specification coverage, Core lifecycle protocol, ECS ownership/physical behavior and public facade/test evidence
 
@@ -1307,19 +1312,20 @@ Each reviewer reports `PASS` or findings classified `Critical`, `Important` or `
 
 Resolve all Critical and Important findings, rerun every affected focused gate and repeat the responsible review until PASS
 
-- [ ] **Step 4: Update factual architecture and progress records**
+- [x] **Step 4: Update factual architecture and progress records**
 
 Record only verified production behavior and fresh command evidence
 
 ```powershell
 git rev-parse 1ccbcd7
-git rev-parse HEAD
-git log --oneline 1ccbcd7..HEAD
+git rev-parse eab1267
+git rev-parse 702e36e
+git log --oneline eab1267..702e36e
 git status --short
 git ls-files --error-unmatch docs/superpowers/plans/2026-07-16-nested-push-implementation-plan.md
 ```
 
-Expected: the planning baseline, exact implementation range and tracked plan resolve successfully; only the intended documentation files may become dirty during this step
+Expected: contract origin、execution-plan commit、exact implementation range 与 tracked plan 均可解析；此步骤只允许指定文档变更
 
 ```markdown
 - Nested Push: PASS
@@ -1330,12 +1336,12 @@ Expected: the planning baseline, exact implementation range and tracked plan res
 
 Mark this plan `Status: Complete` only after all focused gates, full gates and reviews pass
 
-- [ ] **Step 5: Verify documentation and commit**
+- [x] **Step 5: Verify documentation and commit**
 
 ```powershell
 git diff --check
-rg -n "Nested Push|Journey B|common-prefix|Authority catalogue|MVP" docs/current-architecture.md docs/roadmap.md docs/phase-3b1-architecture-review-log.md docs/superpowers/plans/2026-07-16-nested-push-implementation-plan.md
-git add -- docs/current-architecture.md docs/roadmap.md docs/phase-3b1-architecture-review-log.md docs/superpowers/plans/2026-07-16-nested-push-implementation-plan.md
+rg -n "Nested Push|Journey B|common-prefix|Authority catalogue|MVP" docs/current-architecture.md docs/roadmap.md docs/phase-3b1-architecture-review-log.md docs/nested-push-contract-profile.md docs/superpowers/plans/2026-07-16-nested-push-implementation-plan.md
+git add -- docs/current-architecture.md docs/roadmap.md docs/phase-3b1-architecture-review-log.md docs/nested-push-contract-profile.md docs/superpowers/plans/2026-07-16-nested-push-implementation-plan.md
 git diff --cached --name-only
 git diff --cached --check
 git commit -m "docs: record nested push task pass"
@@ -1343,6 +1349,15 @@ git status --short
 ```
 
 Expected: documentation consistently distinguishes Nested PASS from incomplete Reconciliation and MVP work, the final commit succeeds and the worktree is clean
+
+### Task 9 verification record
+
+- Commits：contract `1ccbcd7`，plan `eab1267`，implementation `eab1267..702e36e`，Task 8 `5e8869c`，evidence fix `702e36e`
+- Focused：Core 301、View 15、ECS 273、journeys 5、audit 2、allowlist 46、compile-fail 40
+- Authority：23 catalogue、23 registered、23 passed
+- Workspace：nextest 659/659、0 skipped，doctest 28，fmt/check/diff green
+- Reviews：Core PASS；spec 与 facade findings 修正后 PASS；ECS ownership 实现 PASS，证据缺口由独立复审闭合；final lifecycle/physical review PASS
+- Pending：Journey B/common-prefix Reconciliation、History replace/back、Recovery、Authority closure、MVP gate
 
 ---
 

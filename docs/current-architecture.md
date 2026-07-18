@@ -2,9 +2,9 @@
 
 **文档类型**: 当前事实
 
-**状态**: Root Push Task PASS
+**状态**: Nested Push PASS
 
-**as_of**: Root Push Task 12 completion gate
+**as_of**: Nested Push Task 9 completion gate，`702e36e`
 
 **事实来源**: workspace manifest、实现、固定测试、公开旅程与独立复审
 
@@ -12,14 +12,15 @@
 
 ## 1 当前定位
 
-项目已完成第一条 facade 驱动的 Root push 垂直切片
+项目已完成 facade 驱动的 Root 与首次 Nested push 垂直切片
 
 - facade 安装 plugin、router、view driver 与 app-owned host
 - `push` 经真实 `App::update` 完成匹配、构建、原子切换、cleanup 与 snapshot publication
 - first、equivalent、fragment、changed-root、fallback success/failure 与重复 push 均有公开旅程
-- Root profile 的 exports、associated API、feature graph、manifest 与 authority regression catalogue 已闭合
+- `/items/1` 经真实 parent outlet、sealed child mount 与 root-to-leaf apply 提交两个 active frame
+- Root 与 Nested profile 的 facade、opaque audit、feature graph、manifest 与 authority regression catalogue 已闭合
 
-这是 Root Push Task PASS，不是 Nested Journey PASS 或 MVP PASS
+这是 Nested Push PASS，不是 Journey B、Reconciliation 或 MVP PASS
 
 ## 2 Authority 与 owner 边界
 
@@ -34,7 +35,7 @@
 
 `RouterNavigation` 私有持有 sealed Core `RouterEngine`，ECS report 只携带不可读取、不可构造的 opaque identity projection，最终 publication 仍由 Core sealed task 复验
 
-## 3 Root 运行链
+## 3 Root 与 Nested 运行链
 
 ```text
 PreUpdate: Refresh -> Ready
@@ -59,7 +60,7 @@ Update: ObserveAuthority
 - app-owned host 与 foreign descendants 不被 Router 修改、替换或销毁
 - seal、authority ID、host/frame incarnation 与 cleanup identity 不复用
 
-## 4 已证明的 Root 能力
+## 4 已证明的 Root 与 Nested 能力
 
 - 真实 Core → View → ECS → facade 主链
 - repeated Root push、fragment remount、changed-root replacement 与 history publication
@@ -68,14 +69,25 @@ Update: ObserveAuthority
 - stale report 在首次 World/registry 写入前按 sealed identity 拒绝
 - app-owned host entity、组件、既有 children、relationship 与顺序保持不变
 - locked Bevy layout、visibility、native picking 与 target event delivery
-- Root facade/profile、manifest、signature type graph、positive/negative isolated consumers 与 19 项 authority catalogue
+- parent outlet 登记后逐层 apply，完整 branch 一次 preflight 与一次 Core publication
+- branch-changing 与 nested fragment-only navigation 在 Reconciliation 前安全替换整支 branch
+- frame-local traversal、input/focus barrier、leaf-to-root exact cleanup 与 opaque outlet/content audit
+- Authority catalogue 为 Root 20 + Nested 3 = 23
 
-## 5 后续边界
+## 5 Nested completion evidence
+
+- Contract origin：`1ccbcd7`
+- Execution-plan commit：`eab1267`
+- Implementation range：`eab1267..702e36e`，Task 8 为 `5e8869c`，evidence fix 为 `702e36e`
+- Focused gates：Core 301、View 15、ECS 273、journeys 5、audit 2、allowlist 46、compile-fail 40
+- Authority gate：catalogue 23、registered 23、passed 23
+- Workspace gate：nextest 659/659、0 skipped，doctest 28，fmt/check/diff green
+
+## 6 后续边界
 
 尚未完成
 
-- Nested push 与真实 parent outlet lifecycle
-- common-prefix Reconciliation
+- Journey B 与 common-prefix Reconciliation
 - replace/back History
 - host-loss 与 stale replay Recovery
 - background reaper、完整 audit 与多 router 压测的 Authority closure

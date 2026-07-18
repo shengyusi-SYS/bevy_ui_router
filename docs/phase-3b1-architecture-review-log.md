@@ -1,7 +1,7 @@
 # Phase 3B.1 Architecture Review Log
 
-**状态**: Phase 3B.1 `Plan PASS`；结构重写评估为 `NO REWRITE`
-**审查日期**: 2026-07-10
+**状态**: Phase 3B.1 `Nested Push PASS`；结构重写评估为 `NO REWRITE`
+**审查日期**: 2026-07-10；Nested completion 2026-07-18
 
 ## Round 1
 
@@ -543,3 +543,34 @@ Facade 审查为 `PASS`；架构与事实审查均为 `NEEDS REVISION`，共同�
 负责人接受该结论：README已定义单向权威顺序，Target、Matrix、Fixture、Allowlist、Golden、Journeys各自拥有不同合同面；跨文档重复主要是架构、公共调用和验收之间的必要投影，不是历史补丁堆积。整体重写会重新打开已通过的lifecycle/facade合同，增加golden与表格schema漂移风险，收益不足。
 
 提交前只做非重写整理：README增加按问题查找索引，Target修正两处过期章节引用。Review Log保持历史证据原貌，Golden保持machine-readable格式，不拆分、不改写。至此Phase 3B.1达到`Plan PASS`；下一步是提交本轮规划文档，提交后暂停，不立即编写详细实施计划。
+
+## Nested Push Task 9 completion
+
+### 提交范围
+
+- Contract origin：`1ccbcd7`
+- Execution-plan commit：`eab1267`
+- Implementation range：`eab1267..702e36e`
+- Task 8 public authority：`5e8869c`
+- Completion evidence fix：`702e36e`
+
+### 验证事实
+
+- Focused：Core 301、View 15、ECS 273、public journeys 5、authority audit 2、allowlist 46、compile-fail 40
+- Authority：catalogue 23、registered 23、passed 23
+- Workspace：nextest 659/659、0 skipped，doctest 28
+- Format/static：fmt、workspace check、diff check green
+
+### 独立复审
+
+- Core lifecycle protocol：PASS
+- Specification coverage：初审 findings 修正后 PASS
+- Public facade/test evidence：初审 findings 修正后 PASS
+- ECS ownership：实现 PASS，证据缺口由独立复审闭合
+- Final lifecycle/physical review：PASS
+
+### 阶段结论
+
+- Nested Push：PASS
+- Authority catalogue：Root 20 + Nested 3 = 23
+- 仍未完成：Journey B/common-prefix Reconciliation、History replace/back、Recovery、Authority closure、MVP gate

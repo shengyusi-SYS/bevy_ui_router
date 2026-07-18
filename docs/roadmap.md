@@ -1,8 +1,8 @@
 # Roadmap
 
-**状态**: Phase 3B.1 `Root Push PASS`
+**状态**: Phase 3B.1 `Nested Push PASS`
 
-**更新时间**: 2026-07-16
+**更新时间**: 2026-07-18
 
 ## 已完成
 
@@ -13,22 +13,25 @@
 
 详细边界见 [Root Push Contract Profile](root-push-contract-profile.md) 与 [Root Push Review Log](superpowers/plans/2026-07-11-root-push-review-log.md)
 
+- [x] **Nested push**
+  - 真实 parent outlet、sealed child mount 与 root-to-leaf apply
+  - whole-branch preflight、原子 publication、frame-local input/focus 与 exact cleanup
+  - Journey A、opaque outlet/content audit 与 Root 20 + Nested 3 authority gate
+
+详细边界见 [Nested Push Contract Profile](nested-push-contract-profile.md) 与 [Nested Push Implementation Plan](superpowers/plans/2026-07-16-nested-push-implementation-plan.md)
+
 ## Now
 
-1. **Nested push**
-   - 真实 parent outlet
-   - `MountRequested → Resolved → Granted`
-   - opaque outlet audit mapping、逐层 apply 与 frame-local traversal
-2. **Reconciliation**
+1. **Reconciliation**
    - leaf replacement 与 common-prefix preservation
    - leaving input/focus isolation 与 cleanup receipt
-3. **History**
+2. **History**
    - replace、back、zero-entering 与成功后提交
-4. **Recovery**
+3. **Recovery**
    - view/mount failure、error presentation、host loss 与 stale replay
-5. **Authority closure**
+4. **Authority closure**
    - multi-router stress、完整 opaque audit、lease authority、background reaper 与 cleanup replay
-6. **MVP gate**
+5. **MVP gate**
    - facade journeys、authority regressions、feature matrix、workspace tests 与独立 factual review
 
 每个切片仍须从公开 facade 命令经过真实 `App::update` 到稳定 snapshot，不新增第二条 lifecycle publisher

@@ -1,8 +1,14 @@
 # Nested Push 阶段合同 Profile
 
-**状态**: Nested push 设计基线
+**状态**: Nested Push PASS
 
-**当前实现基准**: `71b5d67`
+**合同起点**: `1ccbcd7`
+
+**执行计划提交**: `eab1267`
+
+**最终实现提交**: `702e36e`
+
+**实现范围**: `eab1267..702e36e`
 
 **适用规范**: [Target Architecture](target-architecture.md)、[Authority Transition Matrix](authority-transition-matrix.md)、[MVP Acceptance Journeys](mvp-acceptance-journeys.md)、[Facade Contract Fixture](facade-contract-fixture.md)
 
