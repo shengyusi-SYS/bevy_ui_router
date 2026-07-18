@@ -270,6 +270,14 @@ pub(crate) fn validate_active_branch_for_splice(
     )
 }
 
+pub(crate) fn validate_leaving_branch_for_splice(
+    world: &World,
+    leaving: &RealizedBranch,
+    slot_roles: &[SealedReconciliationSlotRole],
+) -> Result<Vec<Entity>, FrameLocalError> {
+    validate_committed_branch_with_entering(world, leaving, true, None, None, Some(slot_roles))
+}
+
 fn validate_committed_branch_with_entering(
     world: &World,
     branch: &RealizedBranch,
@@ -308,11 +316,15 @@ fn validate_committed_branch_with_entering(
                     .iter()
                     .any(|frame| frame.mount_binding().matches_mounted_child_slot(slot))
             });
-        let valid = if leaving {
-            validate_leaving_mounted_child_slot(world, slot)
+        let valid = if let Some(roles) = sealed_slot_roles {
+            validate_sealed_existing_slot_role(world, slot, roles, leaving)
+        } else if leaving {
+            validate_leaving_mounted_child_slot(world, slot, EntityLifecycle::Active)
         } else if entering.is_some() && occupied {
             match slot.slot_claim().lifecycle() {
-                EntityLifecycle::Active => validate_leaving_mounted_child_slot(world, slot),
+                EntityLifecycle::Active => {
+                    validate_leaving_mounted_child_slot(world, slot, EntityLifecycle::Active)
+                }
                 EntityLifecycle::PreparedInert => {
                     validate_mounted_child_slot(world, slot, EntityLifecycle::PreparedInert)
                 }
@@ -331,6 +343,30 @@ fn validate_committed_branch_with_entering(
         };
         if !valid {
             return Err(FrameLocalError::OwnershipDrift(slot.slot()));
+        }
+    }
+    if let Some(roles) = sealed_slot_roles {
+        let mismatched_role = roles.iter().find(|role| {
+            let belongs_to_branch = if leaving {
+                role.kind() == ReconciliationSlotRoleKind::Leaving
+            } else {
+                matches!(
+                    role.kind(),
+                    ReconciliationSlotRoleKind::PreservedActive
+                        | ReconciliationSlotRoleKind::RetainEmpty
+                        | ReconciliationSlotRoleKind::ActivateExisting
+                )
+            };
+            belongs_to_branch
+                && branch
+                    .child_slots()
+                    .iter()
+                    .filter(|slot| sealed_existing_role_matches_slot(role, slot))
+                    .count()
+                    != 1
+        });
+        if let Some(role) = mismatched_role {
+            return Err(FrameLocalError::OwnershipDrift(role.entity()));
         }
     }
     for frame in branch.frames() {
@@ -430,6 +466,73 @@ fn validate_committed_branch_with_entering(
         )?;
     }
     validate_branch_descendants_allowing_entering(world, branch, &sealed_entering_shells)
+}
+
+fn validate_sealed_existing_slot_role(
+    world: &World,
+    slot: &crate::mount::MountedChildSlot,
+    roles: &[SealedReconciliationSlotRole],
+    leaving: bool,
+) -> bool {
+    let mut matching = roles
+        .iter()
+        .filter(|role| sealed_existing_role_matches_slot(role, slot));
+    let Some(role) = matching.next() else {
+        return false;
+    };
+    if matching.next().is_some() {
+        return false;
+    }
+    let transition_is_valid = if leaving {
+        role.kind() == ReconciliationSlotRoleKind::Leaving
+            && matches!(
+                role.current(),
+                EntityLifecycle::Active | EntityLifecycle::PreparedInert
+            )
+            && role.next() == Some(EntityLifecycle::Leaving)
+    } else {
+        matches!(
+            (role.kind(), role.current(), role.next()),
+            (
+                ReconciliationSlotRoleKind::PreservedActive,
+                EntityLifecycle::Active,
+                None,
+            ) | (
+                ReconciliationSlotRoleKind::RetainEmpty,
+                EntityLifecycle::Active,
+                Some(EntityLifecycle::PreparedInert),
+            ) | (
+                ReconciliationSlotRoleKind::RetainEmpty,
+                EntityLifecycle::PreparedInert,
+                None,
+            ) | (
+                ReconciliationSlotRoleKind::ActivateExisting,
+                EntityLifecycle::PreparedInert,
+                Some(EntityLifecycle::Active),
+            )
+        )
+    };
+    if !transition_is_valid {
+        return false;
+    }
+    if role.current() == EntityLifecycle::PreparedInert && !leaving {
+        validate_mounted_child_slot(world, slot, role.current())
+    } else {
+        validate_leaving_mounted_child_slot(world, slot, role.current())
+    }
+}
+
+fn sealed_existing_role_matches_slot(
+    role: &SealedReconciliationSlotRole,
+    slot: &crate::mount::MountedChildSlot,
+) -> bool {
+    role.entity() == slot.slot()
+        && role.claim() == slot.slot_claim()
+        && role.parent() == slot.parent()
+        && role.outlet() == slot.outlet()
+        && role.slot() == slot.slot_id()
+        && role.anchor() == slot.anchor()
+        && role.anchor_claim() == slot.anchor_claim()
 }
 
 pub(crate) fn sealed_mount_new_expectation_is_unique(

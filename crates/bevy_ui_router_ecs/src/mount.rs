@@ -842,8 +842,12 @@ pub(crate) fn validate_mounted_child_slot(
     validate_mounted_child_slot_with_policy(world, slot, lifecycle, false)
 }
 
-pub(crate) fn validate_leaving_mounted_child_slot(world: &World, slot: &MountedChildSlot) -> bool {
-    validate_mounted_child_slot_with_policy(world, slot, EntityLifecycle::Active, true)
+pub(crate) fn validate_leaving_mounted_child_slot(
+    world: &World,
+    slot: &MountedChildSlot,
+    lifecycle: EntityLifecycle,
+) -> bool {
+    validate_mounted_child_slot_with_policy(world, slot, lifecycle, true)
 }
 
 fn validate_mounted_child_slot_with_policy(

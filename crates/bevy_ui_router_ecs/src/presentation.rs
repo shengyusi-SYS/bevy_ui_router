@@ -510,6 +510,7 @@ pub(crate) struct PreparedCommitPresentationMutation<'w> {
 pub(crate) enum TestCommitMutation {
     Leaving(Entity),
     Entering(Entity),
+    PreparedInert(Entity),
 }
 
 #[cfg(test)]
@@ -538,7 +539,10 @@ fn record_test_commit_mutation(entity: Entity, next: EntityLifecycle) {
         match next {
             EntityLifecycle::Leaving => trace.push(TestCommitMutation::Leaving(entity)),
             EntityLifecycle::Active => trace.push(TestCommitMutation::Entering(entity)),
-            EntityLifecycle::PreparedInert | EntityLifecycle::Quarantined => {}
+            EntityLifecycle::PreparedInert => {
+                trace.push(TestCommitMutation::PreparedInert(entity));
+            }
+            EntityLifecycle::Quarantined => {}
         }
     });
 }

@@ -308,19 +308,13 @@ impl FrozenCleanupManifest {
         projected_claims: &[ExactRegistryClaim],
         successor: Option<&RealizedBranch>,
     ) -> Option<Self> {
-        if successor.is_some_and(|branch| {
-            branch.frames().is_empty()
-                || branch.child_slots().len().checked_add(1) != Some(branch.frames().len())
-        }) {
-            return None;
-        }
         Self::from_leaving_branch_parts(
             world,
             registry,
             branch.frames(),
             branch.child_slots(),
             projected_claims,
-            successor.and_then(RealizedBranch::first_frame),
+            successor,
         )
     }
 
@@ -330,14 +324,8 @@ impl FrozenCleanupManifest {
         frames: &[RealizedFrame],
         child_slots: &[MountedChildSlot],
         projected_claims: &[ExactRegistryClaim],
-        successor_root: Option<&RealizedFrame>,
+        successor: Option<&RealizedBranch>,
     ) -> Option<Self> {
-        if frames.is_empty() {
-            return (child_slots.is_empty() && projected_claims.is_empty()).then(Self::empty);
-        }
-        if child_slots.len().checked_add(1) != Some(frames.len()) {
-            return None;
-        }
         let obligation_count = frames.iter().try_fold(child_slots.len(), |count, frame| {
             count.checked_add(frame.obligation_count())
         })?;
@@ -345,39 +333,83 @@ impl FrozenCleanupManifest {
             .iter()
             .map(ExactRegistryClaim::entity)
             .collect::<HashSet<_>>();
-        if projected_claims.len() != obligation_count
-            || unique.len() != projected_claims.len()
-            || projected_claims
-                .iter()
-                .any(|claim| claim.lifecycle() != EntityLifecycle::Leaving)
+        if unique.len() != projected_claims.len() {
+            return None;
+        }
+        let leaving_entities = frames
+            .iter()
+            .flat_map(RealizedFrame::claims)
+            .map(ExactRegistryClaim::entity)
+            .chain(child_slots.iter().map(MountedChildSlot::slot))
+            .collect::<HashSet<_>>();
+        if leaving_entities.len() != obligation_count
+            || leaving_entities.iter().any(|entity| {
+                projected_claims
+                    .iter()
+                    .filter(|claim| claim.entity() == *entity)
+                    .count()
+                    != 1
+                    || projected_claims.iter().any(|claim| {
+                        claim.entity() == *entity && claim.lifecycle() != EntityLifecycle::Leaving
+                    })
+            })
         {
             return None;
         }
 
         let mut obligations = Vec::with_capacity(obligation_count);
-        for frame_index in (0..frames.len()).rev() {
-            let frame_projected = frames[frame_index]
-                .claims()
-                .map(|current| {
-                    projected_claims
-                        .iter()
-                        .find(|claim| claim.entity() == current.entity())
-                        .cloned()
-                })
-                .collect::<Option<Vec<_>>>()?;
-            obligations.extend(frame_obligations(
-                registry,
-                &frames[frame_index],
-                &frame_projected,
-            )?);
-            if frame_index > 0 {
-                let slot = &child_slots[frame_index - 1];
+        if frames.is_empty() {
+            for slot in child_slots {
                 let projected = projected_claims
                     .iter()
                     .find(|claim| claim.entity() == slot.slot())?;
                 obligations.push(mounted_slot_obligation_with_claim(
                     registry, slot, projected,
                 )?);
+            }
+        } else {
+            if child_slots
+                .iter()
+                .any(|slot| !leaving_slot_has_exact_parent(frames, slot))
+            {
+                return None;
+            }
+            let mut incoming = vec![None; frames.len()];
+            for (slot_index, slot) in child_slots.iter().enumerate() {
+                let mut children = frames
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, frame)| frame.mount_binding().matches_mounted_child_slot(slot));
+                if let Some((child_index, _)) = children.next() {
+                    if children.next().is_some()
+                        || incoming[child_index].replace(slot_index).is_some()
+                    {
+                        return None;
+                    }
+                }
+            }
+            let roots = incoming
+                .iter()
+                .enumerate()
+                .filter_map(|(index, incoming)| incoming.is_none().then_some(index))
+                .collect::<Vec<_>>();
+            if roots.is_empty() {
+                return None;
+            }
+            let mut visit = vec![0u8; frames.len()];
+            for root in roots {
+                append_exact_leaving_unit(
+                    registry,
+                    frames,
+                    child_slots,
+                    projected_claims,
+                    root,
+                    &mut visit,
+                    &mut obligations,
+                )?;
+            }
+            if visit.iter().any(|state| *state != 2) {
+                return None;
             }
         }
         if obligations.len() != obligation_count
@@ -393,12 +425,9 @@ impl FrozenCleanupManifest {
 
         let mut parent_candidates = frames
             .iter()
-            .enumerate()
-            .map(|(index, frame)| {
-                frame_mount_parent_candidate(
-                    frame,
-                    (index == 0).then_some(successor_root).flatten(),
-                )
+            .map(|frame| {
+                let successor = exact_successor_for_mount(frame, successor)?;
+                frame_mount_parent_candidate(frame, successor)
             })
             .collect::<Option<Vec<_>>>()?;
         parent_candidates.extend(
@@ -407,8 +436,9 @@ impl FrozenCleanupManifest {
                 .map(mounted_anchor_parent_candidate)
                 .collect::<Option<Vec<_>>>()?,
         );
-        let mount_parents =
+        let mut mount_parents =
             freeze_external_mount_parents(world, registry, &obligations, parent_candidates)?;
+        rebind_external_mount_parent_claims(&mut mount_parents, projected_claims)?;
         let digest = frozen_manifest_digest(&obligations, &mount_parents);
         Some(Self {
             obligations,
@@ -565,6 +595,100 @@ impl FrozenCleanupManifest {
             .map(|obligation| obligation.claim.entity())
             .collect()
     }
+}
+
+fn leaving_slot_has_exact_parent(frames: &[RealizedFrame], slot: &MountedChildSlot) -> bool {
+    let mut parents = frames.iter().filter(|frame| frame.frame() == slot.parent());
+    let Some(parent) = parents.next() else {
+        return false;
+    };
+    parents.next().is_none()
+        && parent.outlet(slot.outlet()).is_some_and(|outlet| {
+            outlet.anchor() == slot.anchor()
+                && outlet.anchor_claim() == slot.anchor_claim()
+                && parent.claims().any(|claim| claim == slot.anchor_claim())
+        })
+        && slot.slot_claim().owner()
+            == &RegistryOwner::Committed(EntityOwner::ChildSlot {
+                parent: slot.parent().clone(),
+                outlet: slot.outlet().clone(),
+                slot: slot.slot_id(),
+            })
+}
+
+fn append_exact_leaving_unit(
+    registry: &RouteEntityRegistry,
+    frames: &[RealizedFrame],
+    child_slots: &[MountedChildSlot],
+    projected_claims: &[ExactRegistryClaim],
+    frame_index: usize,
+    visit: &mut [u8],
+    obligations: &mut Vec<CleanupObligation>,
+) -> Option<()> {
+    match visit.get(frame_index).copied()? {
+        0 => visit[frame_index] = 1,
+        1 => return None,
+        2 => return Some(()),
+        _ => return None,
+    }
+    let frame = frames.get(frame_index)?;
+    for slot in child_slots
+        .iter()
+        .filter(|slot| slot.parent() == frame.frame())
+    {
+        let mut children = frames
+            .iter()
+            .enumerate()
+            .filter(|(_, child)| child.mount_binding().matches_mounted_child_slot(slot));
+        if let Some((child_index, _)) = children.next() {
+            if children.next().is_some() {
+                return None;
+            }
+            append_exact_leaving_unit(
+                registry,
+                frames,
+                child_slots,
+                projected_claims,
+                child_index,
+                visit,
+                obligations,
+            )?;
+        }
+        let projected = projected_claims
+            .iter()
+            .find(|claim| claim.entity() == slot.slot())?;
+        obligations.push(mounted_slot_obligation_with_claim(
+            registry, slot, projected,
+        )?);
+    }
+    let frame_projected = frame
+        .claims()
+        .map(|current| {
+            projected_claims
+                .iter()
+                .find(|claim| claim.entity() == current.entity())
+                .cloned()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    obligations.extend(frame_obligations(registry, frame, &frame_projected)?);
+    visit[frame_index] = 2;
+    Some(())
+}
+
+fn exact_successor_for_mount<'a>(
+    frame: &RealizedFrame,
+    successor: Option<&'a RealizedBranch>,
+) -> Option<Option<&'a RealizedFrame>> {
+    let mut matches = successor
+        .into_iter()
+        .flat_map(RealizedBranch::frames)
+        .filter(|candidate| {
+            candidate
+                .mount_binding()
+                .same_physical_mount(frame.mount_binding())
+        });
+    let successor = matches.next();
+    matches.next().is_none().then_some(successor)
 }
 
 fn current_frame_obligations(
@@ -839,6 +963,46 @@ fn freeze_external_mount_parents(
     }
     parents.sort_by_key(|parent| parent.claim.entity().to_bits());
     Some(parents)
+}
+
+fn rebind_external_mount_parent_claims(
+    parents: &mut [CleanupMountParentSettlement],
+    projected_claims: &[ExactRegistryClaim],
+) -> Option<()> {
+    for parent in parents {
+        if let Some(projected) = projected_claims
+            .iter()
+            .find(|claim| claim.entity() == parent.claim.entity())
+        {
+            if projected.owner() != parent.claim.owner()
+                || projected.seal() != parent.claim.seal()
+                || matches!(
+                    projected.lifecycle(),
+                    EntityLifecycle::Leaving | EntityLifecycle::Quarantined
+                )
+            {
+                return None;
+            }
+            parent.claim = projected.clone();
+        }
+        if let Some(expected_parent_claim) = &mut parent.expected_parent_claim
+            && let Some(projected) = projected_claims
+                .iter()
+                .find(|claim| claim.entity() == expected_parent_claim.entity())
+        {
+            if projected.owner() != expected_parent_claim.owner()
+                || projected.seal() != expected_parent_claim.seal()
+                || matches!(
+                    projected.lifecycle(),
+                    EntityLifecycle::Leaving | EntityLifecycle::Quarantined
+                )
+            {
+                return None;
+            }
+            *expected_parent_claim = projected.clone();
+        }
+    }
+    Some(())
 }
 
 fn resolve_mount_parent_authority(
@@ -3333,21 +3497,46 @@ pub(crate) mod tests {
         frames: &[RealizedFrame],
         child_slots: &[MountedChildSlot],
     ) -> Vec<ExactRegistryClaim> {
-        let mut transitions = Vec::new();
-        for frame_index in (0..frames.len()).rev() {
-            transitions.extend(frames[frame_index].lifecycle_transitions(EntityLifecycle::Leaving));
-            if frame_index > 0 {
-                transitions.push((
-                    child_slots[frame_index - 1].slot_claim().clone(),
-                    EntityLifecycle::Leaving,
-                ));
-            }
-        }
+        let transitions = frames
+            .iter()
+            .flat_map(|frame| frame.lifecycle_transitions(EntityLifecycle::Leaving))
+            .chain(
+                child_slots
+                    .iter()
+                    .map(|slot| (slot.slot_claim().clone(), EntityLifecycle::Leaving)),
+            )
+            .collect::<Vec<_>>();
         registry
             .prepare_lifecycle_mutation(&transitions)
             .unwrap()
             .resulting_claims()
             .to_vec()
+    }
+
+    #[test]
+    fn slot_only_leaving_manifest_freezes_exact_obligation_and_mount_parent() {
+        let (app, branch, _child_entities, child_slot, _parent_entities) =
+            crate::navigation::tests::failed_nested_branch_fixture();
+        let slot = &branch.child_slots()[0];
+        let registry = app.world().resource::<RouteEntityRegistry>();
+        let projected = projected_leaving_claims(registry, &[], std::slice::from_ref(slot));
+
+        let manifest = FrozenCleanupManifest::from_leaving_branch_parts(
+            app.world(),
+            registry,
+            &[],
+            std::slice::from_ref(slot),
+            &projected,
+            None,
+        )
+        .expect("a slot-only exact leaving residual must freeze independently");
+
+        assert_eq!(manifest.entities(), vec![child_slot]);
+        assert_eq!(manifest.mount_parents.len(), 1);
+        assert_eq!(manifest.mount_parents[0].claim, *slot.anchor_claim());
+        let reserved = CleanupLedger::reserve(manifest).unwrap();
+        assert_eq!(reserved.obligations.len(), 1);
+        assert_eq!(reserved.receipts, vec![None]);
     }
 
     #[test]

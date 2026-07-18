@@ -16,7 +16,7 @@ use crate::{
     app_ext::{RouterHandle, ViewDriverStore},
     branch_transaction::{
         FailedPreparedBranch, PendingCommit, PreparedBranch, RealizedBranch,
-        ReconciliationAuthorityIdentity, ReconciliationProjectionFacts,
+        ReconciliationAuthorityIdentity, ReconciliationProjectionFacts, ReconciliationSlotRoleKind,
         SealedExistingReconciliation, SealedMountNewStagingAllowance,
         seal_reconciliation_staging_mount,
     },
@@ -27,8 +27,8 @@ use crate::{
     content::{ContentPlan, FrameContentWriter},
     driver::{EcsViewReportSession, ReportSeal, ViewBuildReport, ViewBuildReportKind},
     frame_local::{
-        validate_active_branch_for_splice, validate_branch_descendants, validate_committed_branch,
-        validate_reconciliation_entering_branch,
+        validate_active_branch_for_splice, validate_branch_descendants,
+        validate_leaving_branch_for_splice, validate_reconciliation_entering_branch,
     },
     host::{
         HostCandidateClassification, HostCandidateRevisionLatch, HostCandidateRevisionState,
@@ -1735,7 +1735,7 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                 };
                 let entering_owner =
                     std::mem::replace(&mut pending.branch, PreparedBranch::empty());
-                let mut splice = match sealed.bind_entering(entering_owner) {
+                let splice = match sealed.bind_entering(entering_owner) {
                     Ok(splice) => splice,
                     Err(failure) => {
                         let (sealed, entering, _) = failure.into_parts();
@@ -1793,7 +1793,12 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                     continue;
                 }
                 if has_leaving
-                    && validate_committed_branch(world, splice.leaving(), true).is_err()
+                    && validate_leaving_branch_for_splice(
+                        world,
+                        splice.leaving(),
+                        splice.slot_roles(),
+                    )
+                    .is_err()
                 {
                     let (active, entering, _roles) = splice.reject().into_parts();
                     entry.active = had_active.then_some(active);
@@ -1801,7 +1806,7 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                     entry.pending_commit = Some(pending);
                     continue;
                 }
-                let focus_leaving = match validate_branch_descendants(world, splice.leaving()) {
+                let mut focus_leaving = match validate_branch_descendants(world, splice.leaving()) {
                     Ok(descendants) => descendants,
                     Err(_) => {
                         let (active, entering, _roles) = splice.reject().into_parts();
@@ -1811,6 +1816,17 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                         continue;
                     }
                 };
+                let retained_empty_focus = observed_descendant_closure(
+                    world,
+                    splice
+                        .slot_roles()
+                        .iter()
+                        .filter(|role| role.kind() == ReconciliationSlotRoleKind::RetainEmpty)
+                        .map(|role| role.entity()),
+                );
+                focus_leaving.extend(retained_empty_focus);
+                focus_leaving.sort_by_key(|entity| entity.to_bits());
+                focus_leaving.dedup();
                 let logical_roots = logical_cleanup_roots(splice.leaving());
                 let gate_before = splice.current_interactive_entities();
                 let gate_after = splice.resulting_interactive_entities();
@@ -1833,6 +1849,7 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                 } else {
                     None
                 };
+                let mut splice_owner = Some(splice);
                 let committed = world.resource_scope(
                     |world, gate: bevy_ecs::change_detection::Mut<RouterInputGate>| {
                         world.resource_scope(
@@ -1854,11 +1871,12 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                                                 let frozen_manifest = if leaving_count == 0 {
                                                     FrozenCleanupManifest::empty()
                                                 } else {
+                                                    let splice = splice_owner.as_ref()?;
                                                     match FrozenCleanupManifest::from_leaving_branch(
                                                         world,
                                                         &registry,
                                                         splice.leaving(),
-                                                        &resulting_claims[..leaving_count],
+                                                        &resulting_claims,
                                                         (!splice.entering().frames().is_empty())
                                                             .then_some(splice.entering()),
                                                     ) {
@@ -1887,8 +1905,9 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                                                     route_focus,
                                                     &focus_leaving,
                                                 );
-                                                let claim_rebind =
-                                                    splice.prepare_claim_rebind(&resulting_claims)?;
+                                                let claim_rebind = splice_owner
+                                                    .as_ref()?
+                                                    .prepare_claim_rebind(&resulting_claims)?;
                                                 let presentation_plan =
                                                     prepare_presentation_mutation(world, &targets)?
                                                         .seal_commit(isolate_count)?;
@@ -1914,18 +1933,39 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                                                 let cleanup_ledger =
                                                     reserved_ledger.bind_batch(cleanup);
                                                 pending.ticket.take();
+                                                let mut splice = splice_owner
+                                                    .take()
+                                                    .expect("fully prepared commit retains its sealed splice");
                                                 splice.apply_claim_rebind(claim_rebind);
                                                 if let Some(rebase) = root_rebase {
                                                     splice.apply_root_rebase(rebase);
                                                 }
-                                                entry.engine.publish(prepared, || {
+                                                let outcome = splice.apply();
+                                                let (active, leaving) =
+                                                    outcome.into_active_and_leaving();
+                                                let next_active = (!active.frames().is_empty())
+                                                    .then_some(active);
+                                                let next_cleanup = Some(
+                                                    CleanupLedger::activate_leaving_branch(
+                                                        cleanup_ledger,
+                                                        (!leaving.frames().is_empty()
+                                                            || !leaving.child_slots().is_empty())
+                                                        .then_some(leaving),
+                                                    ),
+                                                );
+                                                let engine = &mut entry.engine;
+                                                let active_owner = &mut entry.active;
+                                                let cleanup_owner = &mut entry.cleanup_ledger;
+                                                engine.publish(prepared, || {
                                                     presentation_plan.apply_staged(
                                                         |_| focus_plan.apply(),
                                                         |_| registry_plan.apply(&mut registry),
                                                         |_| gate_plan.apply(),
                                                     );
+                                                    *active_owner = next_active;
+                                                    *cleanup_owner = next_cleanup;
                                                 });
-                                                Some(cleanup_ledger)
+                                                Some(())
                                             },
                                         )
                                     },
@@ -1934,7 +1974,10 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                         )
                     },
                 );
-                let Some(cleanup_ledger) = committed else {
+                let Some(()) = committed else {
+                    let splice = splice_owner
+                        .take()
+                        .expect("failed commit retains its sealed splice owner");
                     let (active, entering, _roles) = splice.reject().into_parts();
                     entry.active = had_active.then_some(active);
                     pending.branch = entering;
@@ -1943,14 +1986,6 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                     }
                     continue;
                 };
-                let outcome = splice.apply();
-                let (active, leaving) = outcome.into_active_and_leaving();
-                entry.active = (!active.frames().is_empty()).then_some(active);
-                entry.cleanup_ledger = Some(CleanupLedger::activate_leaving_branch(
-                    cleanup_ledger,
-                    (!leaving.frames().is_empty() || !leaving.child_slots().is_empty())
-                        .then_some(leaving),
-                ));
             }
         },
     );
@@ -1976,12 +2011,12 @@ fn commit_projectionless_initial_branch(
     if !task_is_current {
         return Err(pending);
     }
-    let mut entering =
-        std::mem::replace(&mut pending.branch, PreparedBranch::empty()).into_realized();
+    let entering = std::mem::replace(&mut pending.branch, PreparedBranch::empty()).into_realized();
     let gate_after = entering.interactive_entities();
     let targets =
         entering.entering_mutation_targets(EntityLifecycle::PreparedInert, EntityLifecycle::Active);
     let transitions = entering.lifecycle_transitions(EntityLifecycle::Active, false);
+    let mut entering_owner = Some(entering);
     let committed = world.resource_scope(
         |world, gate: bevy_ecs::change_detection::Mut<RouterInputGate>| {
             world.resource_scope(
@@ -2005,11 +2040,11 @@ fn commit_projectionless_initial_branch(
                                         prepare_input_gate_mutation(gate, &[], gate_after)?;
                                     let focus_plan =
                                         prepare_focus_mutation(input_focus, route_focus, &[]);
-                                    let entering_rebind = entering.prepare_claim_rebind(
-                                        &resulting_claims,
-                                        EntityLifecycle::PreparedInert,
-                                        EntityLifecycle::Active,
-                                    )?;
+                                    let entering_rebind = entering_owner.as_ref()?.prepare_claim_rebind(
+                                            &resulting_claims,
+                                            EntityLifecycle::PreparedInert,
+                                            EntityLifecycle::Active,
+                                        )?;
                                     let presentation_plan =
                                         prepare_presentation_mutation(world, &targets)?
                                             .seal_commit(0)?;
@@ -2039,15 +2074,30 @@ fn commit_projectionless_initial_branch(
                                     let cleanup = prepared.cleanup().clone();
                                     let cleanup_ledger = reserved_ledger.bind_batch(cleanup);
                                     pending.ticket.take();
+                                    let mut entering = entering_owner.take().expect(
+                                        "fully prepared projectionless commit retains its entering owner",
+                                    );
                                     entering.apply_claim_rebind(entering_rebind);
-                                    entry.engine.publish(prepared, || {
+                                    let next_active = Some(entering);
+                                    let next_cleanup = Some(
+                                        CleanupLedger::activate_leaving_branch(
+                                            cleanup_ledger,
+                                            None,
+                                        ),
+                                    );
+                                    let engine = &mut entry.engine;
+                                    let active_owner = &mut entry.active;
+                                    let cleanup_owner = &mut entry.cleanup_ledger;
+                                    engine.publish(prepared, || {
                                         presentation_plan.apply_staged(
                                             |_| focus_plan.apply(),
                                             |_| registry_plan.apply(&mut registry),
                                             |_| gate_plan.apply(),
                                         );
+                                        *active_owner = next_active;
+                                        *cleanup_owner = next_cleanup;
                                     });
-                                    Some(cleanup_ledger)
+                                    Some(())
                                 },
                             )
                         },
@@ -2056,12 +2106,13 @@ fn commit_projectionless_initial_branch(
             )
         },
     );
-    let Some(cleanup_ledger) = committed else {
+    let Some(()) = committed else {
+        let entering = entering_owner
+            .take()
+            .expect("failed projectionless commit retains its entering owner");
         pending.branch = PreparedBranch::from_realized(entering);
         return Err(pending);
     };
-    entry.active = Some(entering);
-    entry.cleanup_ledger = Some(CleanupLedger::activate_leaving_branch(cleanup_ledger, None));
     Ok(())
 }
 
@@ -4361,6 +4412,235 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn nested_truncate_retain_empty_commits_once_without_retry() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        commit_initial_nested_branch(&mut app, router);
+        let retained_slot = app.world().resource::<RouterNavigation>().entries[0]
+            .active
+            .as_ref()
+            .unwrap()
+            .child_slots()[0]
+            .slot();
+
+        let request = prepare_nested_branch_for_commit(&mut app, router, RouteLocation::new("/"));
+        commit_presentation_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(
+            entry.pending_commit.is_none(),
+            "a sealed RetainEmpty truncate must not remain in retry"
+        );
+        let active = entry.active.as_ref().unwrap();
+        assert_eq!(active.frames().len(), 1);
+        assert_eq!(active.child_slots().len(), 1);
+        assert_eq!(active.child_slots()[0].slot(), retained_slot);
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(retained_slot)
+                .map(|record| record.lifecycle()),
+            Some(EntityLifecycle::PreparedInert),
+        );
+        assert!(entry.cleanup_ledger.is_some());
+
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+        ));
+    }
+
+    #[test]
+    fn repeated_nested_truncate_is_a_sealed_retain_empty_no_op() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        commit_initial_nested_branch(&mut app, router);
+        let truncated = RouteLocation::new("/");
+
+        let first = prepare_nested_branch_for_commit(&mut app, router, truncated.clone());
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+
+        let (frame_before, shell_before, slot_before, claims_before, history_len_before) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(matches!(
+                entry.engine.request(first).unwrap().status(),
+                RequestStatus::Succeeded
+            ));
+            let active = entry.active.as_ref().unwrap();
+            assert_eq!(active.frames().len(), 1);
+            assert_eq!(active.child_slots().len(), 1);
+            assert_eq!(
+                active.child_slots()[0].slot_claim().lifecycle(),
+                EntityLifecycle::PreparedInert
+            );
+            (
+                active.frames()[0].frame().clone(),
+                active.frames()[0].shell(),
+                active.child_slots()[0].clone_for_test(),
+                active.claims().cloned().collect::<Vec<_>>(),
+                entry.engine.history().len(),
+            )
+        };
+
+        let repeated = prepare_nested_branch_for_commit(&mut app, router, truncated.clone());
+        arm_test_commit_mutation_trace();
+        commit_presentation_system(app.world_mut());
+        assert_eq!(
+            take_test_commit_mutation_trace(),
+            Vec::<TestCommitMutation>::new(),
+            "an unchanged PreparedInert RetainEmpty role must not reach presentation apply"
+        );
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.pending_commit.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(matches!(
+            entry.engine.request(repeated).unwrap().status(),
+            RequestStatus::Succeeded
+        ));
+        assert_eq!(entry.engine.history().len(), history_len_before + 1);
+        assert_eq!(entry.engine.history().current(), Some(&truncated));
+        let active = entry.active.as_ref().unwrap();
+        assert_eq!(active.frames().len(), 1);
+        assert_eq!(active.child_slots().len(), 1);
+        assert_eq!(active.frames()[0].frame(), &frame_before);
+        assert_eq!(active.frames()[0].shell(), shell_before);
+        assert_eq!(active.claims().cloned().collect::<Vec<_>>(), claims_before);
+        let slot_after = &active.child_slots()[0];
+        assert_eq!(slot_after.slot(), slot_before.slot());
+        assert_eq!(slot_after.slot_claim(), slot_before.slot_claim());
+        assert_eq!(slot_after.parent(), slot_before.parent());
+        assert_eq!(slot_after.outlet(), slot_before.outlet());
+        assert_eq!(slot_after.anchor(), slot_before.anchor());
+        assert_eq!(slot_after.anchor_claim(), slot_before.anchor_claim());
+        assert_eq!(slot_after.slot_id(), slot_before.slot_id());
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(slot_after.slot())
+                .map(|record| (record.owner(), record.seal(), record.lifecycle())),
+            Some((
+                slot_before.slot_claim().owner(),
+                slot_before.slot_claim().seal(),
+                EntityLifecycle::PreparedInert,
+            )),
+        );
+    }
+
+    #[test]
+    fn nested_truncate_retain_empty_releases_direct_and_descendant_focus() {
+        for focus_descendant in [false, true] {
+            let mut app = App::new();
+            app.add_plugins(BevyUiRouterPlugin::default());
+            let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let router = install_nested_router(&mut app, observed, true);
+            app.update();
+            commit_initial_nested_branch(&mut app, router);
+            let retained_slot = app.world().resource::<RouterNavigation>().entries[0]
+                .active
+                .as_ref()
+                .unwrap()
+                .child_slots()[0]
+                .slot();
+            let focused = if focus_descendant {
+                app.world_mut().spawn(ChildOf(retained_slot)).id()
+            } else {
+                retained_slot
+            };
+            *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(focused);
+            app.world_mut()
+                .resource_mut::<RouteFocusState>()
+                .set_focused(Some(focused));
+
+            prepare_nested_branch_for_commit(&mut app, router, RouteLocation::new("/"));
+            commit_presentation_system(app.world_mut());
+
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(entry.pending_commit.is_none());
+            assert_eq!(app.world().resource::<InputFocus>().get(), None);
+            assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+            if focus_descendant {
+                assert_eq!(
+                    app.world().get::<ChildOf>(focused).map(ChildOf::parent),
+                    Some(retained_slot),
+                    "focus release must not mutate a foreign descendant"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_cleans_terminal_retained_empty_slot_by_exact_binding() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_deep_nested_router(&mut app);
+        app.update();
+        commit_initial_deep_nested_branch(&mut app, router);
+
+        let truncate = prepare_deep_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/sections/a"),
+        );
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+        let (retained_slot, app_host) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let request = entry.engine.request(truncate).unwrap();
+            let status = request.status();
+            assert!(
+                matches!(status, RequestStatus::Succeeded),
+                "truncate cleanup did not settle: {status:?}; receipts={:?}; settled={:?}",
+                entry
+                    .cleanup_ledger
+                    .as_ref()
+                    .map(CleanupLedger::receipt_count),
+                entry.cleanup_ledger.as_ref().map(CleanupLedger::is_settled),
+            );
+            let active = entry.active.as_ref().unwrap();
+            let retained_slot = active
+                .child_slots()
+                .iter()
+                .find(|slot| slot.parent() == active.frames()[1].frame())
+                .unwrap()
+                .slot();
+            let app_host = app
+                .world()
+                .get::<ChildOf>(active.frames()[0].top_slot())
+                .unwrap()
+                .parent();
+            (retained_slot, app_host)
+        };
+
+        let replacement =
+            prepare_deep_nested_branch_for_commit(&mut app, router, RouteLocation::new("/"));
+        commit_presentation_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(
+            entry.pending_commit.is_none(),
+            "terminal retained-empty slots must not make exact cleanup preflight retry"
+        );
+        assert!(entry.cleanup_ledger.is_some());
+        settle_cleanup_system(app.world_mut());
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(matches!(
+            entry.engine.request(replacement).unwrap().status(),
+            RequestStatus::Succeeded
+        ));
+        assert!(app.world().get_entity(retained_slot).is_err());
+        assert!(app.world().get_entity(app_host).is_ok());
+    }
+
+    #[test]
     fn nested_replacement_failed_preflight_is_immediately_inert_and_preserves_active() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
@@ -6540,7 +6820,9 @@ pub(crate) mod tests {
                     TestCommitMutation::Entering(entity) if new_shells.contains(&entity) => {
                         Some(NestedCommitOrder::Entering(entity))
                     }
-                    TestCommitMutation::Leaving(_) | TestCommitMutation::Entering(_) => None,
+                    TestCommitMutation::Leaving(_)
+                    | TestCommitMutation::Entering(_)
+                    | TestCommitMutation::PreparedInert(_) => None,
                 }),
         );
         probe.armed = false;
@@ -8125,7 +8407,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn sealed_commit_tail_contains_no_fallible_cleanup_binding_branch() {
+    fn core_publish_is_the_last_semantic_commit_step_on_both_paths() {
         let source = include_str!("navigation.rs");
         let commit = source
             .split_once("pub(crate) fn commit_presentation_system")
@@ -8136,6 +8418,36 @@ pub(crate) mod tests {
             .0;
 
         assert!(!commit.contains("cleanup_batch_matches"));
+        let publish_tails = commit
+            .match_indices("engine.publish(prepared, || {")
+            .map(|(start, _)| {
+                let tail = &commit[start..];
+                let end = tail
+                    .find("Some(())")
+                    .expect("each publish must return immediately through its prepared success");
+                &tail[..end]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(publish_tails.len(), 2, "splice and projectionless paths");
+        for tail in publish_tails {
+            assert!(tail.contains("*active_owner = next_active;"));
+            assert!(tail.contains("*cleanup_owner = next_cleanup;"));
+            for forbidden in [
+                "?",
+                ".sort",
+                "Vec::",
+                "into_active_and_leaving",
+                "CleanupLedger::activate",
+                "apply_claim_rebind",
+                "entry.active =",
+                "entry.cleanup_ledger =",
+            ] {
+                assert!(
+                    !tail.contains(forbidden),
+                    "publish tail must contain only prepared in-place mutations: {forbidden}"
+                );
+            }
+        }
     }
 
     #[test]

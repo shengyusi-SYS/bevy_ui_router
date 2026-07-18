@@ -925,35 +925,37 @@ impl SealedReconciliationSplice {
             ));
         }
         targets.extend(self.slot_roles.iter().filter_map(|role| {
-            (role.kind() == ReconciliationSlotRoleKind::RetainEmpty).then(|| {
-                child_slot_mutation_target(
-                    self.preserved
-                        .child_slots
-                        .iter()
-                        .find(|slot| slot.slot() == role.entity())
-                        .expect("sealed retained-empty role retains its exact slot owner"),
-                    role.current(),
-                    role.next()
-                        .expect("sealed retained-empty role has a lifecycle transition"),
-                    false,
-                )
-            })
+            if role.kind() != ReconciliationSlotRoleKind::RetainEmpty {
+                return None;
+            }
+            let next = role.next()?;
+            Some(child_slot_mutation_target(
+                self.preserved
+                    .child_slots
+                    .iter()
+                    .find(|slot| slot.slot() == role.entity())
+                    .expect("sealed retained-empty role retains its exact slot owner"),
+                role.current(),
+                next,
+                false,
+            ))
         }));
         let isolate_count = targets.len();
         targets.extend(self.slot_roles.iter().filter_map(|role| {
-            (role.kind() == ReconciliationSlotRoleKind::ActivateExisting).then(|| {
-                child_slot_mutation_target(
-                    self.preserved
-                        .child_slots
-                        .iter()
-                        .find(|slot| slot.slot() == role.entity())
-                        .expect("sealed activate-existing role retains its exact slot owner"),
-                    role.current(),
-                    role.next()
-                        .expect("sealed activate-existing role has a lifecycle transition"),
-                    true,
-                )
-            })
+            if role.kind() != ReconciliationSlotRoleKind::ActivateExisting {
+                return None;
+            }
+            let next = role.next()?;
+            Some(child_slot_mutation_target(
+                self.preserved
+                    .child_slots
+                    .iter()
+                    .find(|slot| slot.slot() == role.entity())
+                    .expect("sealed activate-existing role retains its exact slot owner"),
+                role.current(),
+                next,
+                true,
+            ))
         }));
         let mount_new_entities = self
             .slot_roles
