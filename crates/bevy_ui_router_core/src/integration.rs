@@ -516,6 +516,12 @@ impl FrameTask {
                 parent: parent.clone(),
                 outlet: outlet.clone(),
             },
+            CoreFrameMountTarget::RegisteredChildSlot { parent, outlet } => {
+                FrameMountTarget::ChildOutlet {
+                    parent: parent.clone(),
+                    outlet: outlet.clone(),
+                }
+            }
         }
     }
 }
@@ -1676,6 +1682,15 @@ mod tests {
                 RouteNodeOptions::new().with_view(RouteViewKey::new("item").unwrap()),
             )
             .unwrap();
+        builder
+            .route_with_options(
+                root,
+                RoutePattern::path("side/:id").unwrap(),
+                RouteNodeOptions::new()
+                    .with_slot(RouteSlotKey::named("side").unwrap())
+                    .with_view(RouteViewKey::new("side-item").unwrap()),
+            )
+            .unwrap();
         builder.build().unwrap()
     }
 
@@ -1788,15 +1803,19 @@ mod tests {
     ) {
         let request = engine.push(RouteLocation::new(location)).unwrap();
         engine.collect();
-        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
-            panic!("parent frame task expected")
-        };
-        let parent_frame = parent.frame().clone();
-        engine
-            .report_applied_with_outlets(parent, vec![RouteSlotKey::default()])
-            .unwrap();
-        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
-            panic!("mount request expected")
+        let (parent_frame, mount) = match engine.action().unwrap() {
+            EngineAction::FrameTask(parent) => {
+                let parent_frame = parent.frame().clone();
+                engine
+                    .report_applied_with_outlets(parent, vec![RouteSlotKey::default()])
+                    .unwrap();
+                let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
+                    panic!("mount request expected")
+                };
+                (parent_frame, mount)
+            }
+            EngineAction::MountRequest(mount) => (mount.parent().clone(), mount),
+            _ => panic!("parent task or direct mount request expected"),
         };
         let grant = engine.resolve_mount(mount).unwrap();
         let slot = grant.slot();
@@ -1852,8 +1871,8 @@ mod tests {
         engine.publish(prepared, || {});
         engine.complete_cleanup(cleanup.complete_empty()).unwrap();
 
-        let (request, parent, _, permit, _) =
-            pending_mount_registration(&mut engine, "/items/2", 313);
+        let (request, _parent, _, permit, _) =
+            pending_mount_registration(&mut engine, "/side/2", 313);
         let before = engine.inner.testing_snapshot();
         let error = match engine.begin_mount_registration(permit, &old_proof) {
             Ok(_) => panic!("an old same-router proof must not open a registration session"),
@@ -1864,7 +1883,7 @@ mod tests {
         assert_eq!(engine.inner.testing_snapshot(), before);
         let failure = error.reject(&mut engine).unwrap();
         assert_eq!(failure.request(), request);
-        assert_eq!(failure.logical_roots(), &[parent]);
+        assert!(failure.logical_roots().is_empty());
     }
 
     #[test]
