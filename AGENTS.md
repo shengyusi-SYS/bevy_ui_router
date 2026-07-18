@@ -24,7 +24,11 @@
 - frame/root 身份与 generation 必须可追踪，至少能关联到 Router、host、slot、frame identity 和 generation。
 - 用于 admission 或 authority 的 revision 必须绑定显式实例身份，不能只依赖 change tick、查询时序或可复用数值
 - ownership seal 和 authority ID 一经消费，不得因失败、删除或 quarantine 而复用；registry 变更必须校验当前 exact Entity、owner、seal 和预期 lifecycle
+- lifecycle 或角色转换必须分别冻结并校验 current 与 next；不得从提交后的结构反推 current，`next=None` 是合法 no-op，只参与校验，不得进入 mutation plan
+- retained-empty、slot-only 或其他稀疏拓扑不得用 frame/slot 数量关系或数组位置推导 authority、ownership 或 cleanup obligation；必须使用 parent、outlet、slot identity、mount binding 和 exact claim
 - Router-created Entity 必须先登记 ownership，再写 component 或 relationship；可能触发 hook/observer 的写入完成后必须复验，drift 时保持 inert 并 fail closed
+- authority preflight 必须用携带原 owner 的类型化结果区分 ready、pending rejection、authority loss 和可重试准备失败，不能用同一个空值或 retry 分支混合不同生命周期语义
+- 可见状态切换必须在 publication 前完成全部校验、分配、排序、owner 组合、claim rebind 和 cleanup reservation；publication 是最后语义步骤，执行阶段只允许预备好的不可失败原位 mutation，返回后不得再安装 owner 或执行可失败工作
 - 不持有 `&mut World` 跨 `await`。
 - 异步结果 apply 前必须执行 stale check；身份不匹配必须丢弃，不能产生可见状态变化。
 - pending scene 不能视为 active UI；active UI 只能来自已完成 resolve/apply 且通过身份校验的结果。
@@ -61,6 +65,10 @@
 - 只要涉及 Rust 代码，至少运行相关格式检查、静态检查或说明未运行原因。
 - 涉及 ownership 时，验证 Router、host、slot、frame identity 和 generation 标记完整。
 - 涉及 admission、registry 或 staging 时，验证同 tick identity 变化、历史 seal/stale claim 拒绝和 post-write observer drift 不会越权写入
+- 涉及 lifecycle 或角色转换时，验证 current 与 next 独立绑定，且 no-op 不产生 presentation、registry、cleanup 或其他物理 mutation
+- 涉及 retained-empty、slot-only 或稀疏分支时，验证 exact binding，不以集合数量或数组位置代替拓扑事实
+- 涉及 authority preflight 时，验证各类结果保持独立语义并返还原 owner，永久 drift 不会退化为无界 retry
+- 涉及 atomic publication 时，验证 publication 后没有分配、排序、owner 安装、可失败校验或结构写入
 - 涉及异步逻辑时，验证 stale check 覆盖 router、frame、generation 和 task 身份。
 - 涉及 hidden/retained subtree 时，验证输入隔离与 focus 释放。
 - 涉及 resolve/apply 时，验证失败会清理 router-owned 局部状态，且不触碰 app-owned host。
