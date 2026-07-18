@@ -276,6 +276,7 @@ git commit -m "feat(ecs): model preserved branch splices"
 - Modify: `crates/bevy_ui_router_ecs/src/cleanup.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/audit.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/frame_local.rs`
+- Modify: `crates/bevy_ui_router_ecs/src/authority_regression_tests.rs`
 
 **Produces**
 
@@ -339,7 +340,7 @@ The commit tail must not insert、replace or remove components，change relation
 Observer-capable staging and cleanup writes remain outside this tail and retain exact post-write validation
 
 ```powershell
-git add -- crates/bevy_ui_router_ecs/src/branch_transaction.rs crates/bevy_ui_router_ecs/src/navigation.rs crates/bevy_ui_router_ecs/src/presentation.rs crates/bevy_ui_router_ecs/src/input.rs crates/bevy_ui_router_ecs/src/cleanup.rs crates/bevy_ui_router_ecs/src/audit.rs crates/bevy_ui_router_ecs/src/frame_local.rs
+git add -- crates/bevy_ui_router_ecs/src/branch_transaction.rs crates/bevy_ui_router_ecs/src/navigation.rs crates/bevy_ui_router_ecs/src/presentation.rs crates/bevy_ui_router_ecs/src/input.rs crates/bevy_ui_router_ecs/src/cleanup.rs crates/bevy_ui_router_ecs/src/audit.rs crates/bevy_ui_router_ecs/src/frame_local.rs crates/bevy_ui_router_ecs/src/authority_regression_tests.rs
 git diff --cached --name-only
 git diff --cached --check
 git commit -m "feat(ecs): commit reconciled suffixes atomically"
