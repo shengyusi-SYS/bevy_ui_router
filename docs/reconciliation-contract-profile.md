@@ -30,6 +30,7 @@
 - `replace` 与 `back` 的公开 history 语义
 - Journey C 与 Journey F2 的完整 facade PASS
 - 完整 Recovery，包括 error presentation、mount recovery、host loss 后重建与重放策略
+- `CommitPublished` 后且 foreground cleanup 未完成时的 host/registration loss、ledger transfer 与 severe anomaly 终态
 - background reaper、完整多 router stress 与 Authority closure
 - 最终 MVP gate
 - BSN adapter 与 MVP 后 primitive 扩展
@@ -37,6 +38,8 @@
 本切片只推进既有 `push` history entries，Journey B 成功后 entries 与 cursor 精确对应 `/items/1`, `/items/2`，fragment reconciliation 不提前宣称 `replace` history 合同完成
 
 本切片仍包含 pre-commit `AuthorityLost` 的最小 settlement，用于安全隔离并清空失效 Core/ECS active
+
+Authority Transition Matrix 对 post-commit host/registration loss 的最终语义保持不变，该窗口由后续 Recovery 切片实现，Reconciliation PASS 不宣称覆盖
 
 ## 3 Owner 与 authority 边界
 
