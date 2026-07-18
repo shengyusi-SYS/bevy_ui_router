@@ -8,7 +8,10 @@ use crate::admission::{
 use crate::branch::{MatchedBranch, MatchedRoute, RouteParams};
 use crate::cleanup::{CleanupBatchToken, CleanupCompletion, CleanupManifestSeal};
 use crate::diagnostics::{DiagnosticEvent, ReportDisposition};
-use crate::frame::{FrameOrigin, RouteFrameVersion};
+use crate::frame::{
+    FrameOrigin, LogicalChildSlotBinding, ReconciliationProjectionError, RouteFrameVersion,
+    RouteReconciliationProjection,
+};
 use crate::history::{HistoryIntent, MemoryHistory};
 use crate::ids::{
     CoreIdAllocator, FrameTaskId, NavigationRequestId, ReservedBranchAttempt, ReservedFrameAttempt,
@@ -425,8 +428,7 @@ impl CommitTicket {
         self.identity.host_epoch = epoch;
     }
 
-    #[cfg(test)]
-    const fn identity(&self) -> &RootTaskIdentity {
+    pub(crate) const fn identity(&self) -> &RootTaskIdentity {
         &self.identity
     }
 
@@ -472,6 +474,7 @@ struct PublicationPlan {
     state: RouterNavigationState,
     history: MemoryHistory,
     active_branch: Option<MatchedBranch>,
+    active_child_slots: Vec<LogicalChildSlotBinding>,
     record_index: usize,
     published_record: NavigationRequestRecord,
     current: CurrentWork,
@@ -570,6 +573,7 @@ struct CurrentWork {
     cleanup_batch: crate::ids::CleanupBatchId,
     cleanup_roots: Vec<RouteFrameVersion>,
     attempt: AttemptKind,
+    reconciliation: Option<RouteReconciliationProjection>,
 }
 
 #[derive(Clone, Debug)]
@@ -633,6 +637,7 @@ pub(crate) struct RouterEngine {
     state: RouterNavigationState,
     history: MemoryHistory,
     active_branch: Option<MatchedBranch>,
+    active_child_slots: Vec<LogicalChildSlotBinding>,
     records: VecDeque<NavigationRequestRecord>,
     evicted_through: Option<u64>,
     highest_issued: Option<u64>,
@@ -663,6 +668,7 @@ impl RouterEngine {
             state: RouterNavigationState::new(router),
             history: MemoryHistory::new(),
             active_branch: None,
+            active_child_slots: Vec::new(),
             records: VecDeque::new(),
             evicted_through: None,
             highest_issued: None,
@@ -787,6 +793,9 @@ impl RouterEngine {
                 self.reissue_current_frame_task();
             }
             return Err(error);
+        }
+        if self.reject_current_reconciliation_drift() {
+            return Err(ReportError::Stale);
         }
         let sorted_unique = report.outlets.windows(2).all(|pair| pair[0] < pair[1]);
         let next_outlet = self.current.as_ref().and_then(|current| {
@@ -989,6 +998,18 @@ impl RouterEngine {
         completion: MountRegistrationCompletion,
     ) -> Result<MountConfirmation, MountError> {
         self.mount.validate_completion(&completion)?;
+        if !self.current.as_ref().is_some_and(|current| {
+            current.stage == WorkStage::ConfirmingMount && current.pending_mount.is_some()
+        }) {
+            return Err(MountError::WrongPhase);
+        }
+        if !self.current_reconciliation_matches_active() {
+            let confirmation = self.mount.complete_registration(&completion)?;
+            self.mount.consume_confirmation(&confirmation)?;
+            let rejected = self.reject_current_reconciliation_drift();
+            debug_assert!(rejected);
+            return Err(MountError::WrongPhase);
+        }
         let publication = self.prepare_confirmed_child(completion.slot())?;
         let confirmation = self.mount.complete_registration(&completion)?;
         let replay = confirmation.clone();
@@ -1001,6 +1022,17 @@ impl RouterEngine {
         confirmation: MountConfirmation,
     ) -> Result<(), MountError> {
         self.mount.validate_confirmation(&confirmation)?;
+        if !self.current.as_ref().is_some_and(|current| {
+            current.stage == WorkStage::ConfirmingMount && current.pending_mount.is_some()
+        }) {
+            return Err(MountError::WrongPhase);
+        }
+        if !self.current_reconciliation_matches_active() {
+            self.mount.consume_confirmation(&confirmation)?;
+            let rejected = self.reject_current_reconciliation_drift();
+            debug_assert!(rejected);
+            return Err(MountError::WrongPhase);
+        }
         let publication = self.prepare_confirmed_child(confirmation.slot())?;
         self.consume_prepared_mount_confirmation(confirmation, publication)
     }
@@ -1479,7 +1511,14 @@ impl RouterEngine {
         if current.stage != WorkStage::ReadyToCommit || current.identity != ticket.identity {
             return Err(CommitError::Stale);
         }
+        if self.reject_current_reconciliation_drift() {
+            return Err(CommitError::Stale);
+        }
 
+        let current = self
+            .current
+            .as_ref()
+            .expect("commit identity was validated");
         if current.cleanup_roots != seal.logical_roots()
             || current.cleanup_roots.is_empty() != (seal.obligation_count() == 0)
         {
@@ -1543,6 +1582,7 @@ impl RouterEngine {
             state,
             history,
             active_branch,
+            active_child_slots,
             record_index,
             published_record,
             current,
@@ -1552,6 +1592,7 @@ impl RouterEngine {
         self.state = state;
         self.history = history;
         self.active_branch = active_branch;
+        self.active_child_slots = active_child_slots;
         self.current = Some(current);
     }
 
@@ -1702,6 +1743,21 @@ impl RouterEngine {
             .map(NavigationRequestRecord::requested)
     }
 
+    pub(crate) fn reconciliation_projection_for(
+        &self,
+        identity: &RootTaskIdentity,
+    ) -> Option<&RouteReconciliationProjection> {
+        self.current.as_ref().and_then(|current| {
+            let projection = current.reconciliation.as_ref()?;
+            (current.identity == *identity
+                && current.branch.as_ref().is_some_and(|branch| {
+                    branch.branch_fingerprint() == projection.target_fingerprint()
+                })
+                && self.current_reconciliation_matches_active())
+            .then_some(projection)
+        })
+    }
+
     pub(crate) fn matched(&self) -> Option<&crate::fingerprint::RouteBranchFingerprint> {
         self.running_request()
             .and_then(|request| self.request(request))
@@ -1821,6 +1877,15 @@ impl RouterEngine {
             && self
                 .current_active_branch()
                 .is_some_and(|active| active.branch_fingerprint() == branch.branch_fingerprint());
+        let reconciliation_fragment = !equivalent
+            && active_location.is_some_and(|active| {
+                active.path() == location.path()
+                    && active.search() == location.search()
+                    && active.fragment() != location.fragment()
+            })
+            && self
+                .current_active_branch()
+                .is_some_and(|active| active.branch_fingerprint() == branch.branch_fingerprint());
 
         let host = self
             .state
@@ -1829,6 +1894,47 @@ impl RouterEngine {
             .clone();
         let top_slot = self.state.top_slot().expect("confirmed host has top slot");
         let reserved_frames = reservation.frames().to_vec();
+        let reserved_frame_ids = reserved_frames
+            .iter()
+            .map(|reserved| reserved.frame())
+            .collect::<Vec<_>>();
+        let reconciliation = match RouteReconciliationProjection::from_running(
+            self.router,
+            host.host(),
+            host.epoch(),
+            top_slot,
+            active_location,
+            self.current_active_branch(),
+            active_frames,
+            &self.active_child_slots,
+            &branch,
+            &reserved_frame_ids,
+            reconciliation_fragment,
+        ) {
+            Ok(projection) => projection,
+            Err(ReconciliationProjectionError::InvalidActiveBaseline) => {
+                self.fail_reserved_request(
+                    request,
+                    NavigationFailure::new(
+                        NavigationFailureKind::AuthorityLost,
+                        "active branch failed reconciliation projection",
+                    ),
+                );
+                self.start_next();
+                return;
+            }
+            Err(ReconciliationProjectionError::GenerationExhausted) => {
+                self.fail_reserved_request(
+                    request,
+                    NavigationFailure::new(
+                        NavigationFailureKind::AuthorityLost,
+                        "route generation exhausted",
+                    ),
+                );
+                self.start_next();
+                return;
+            }
+        };
 
         if equivalent {
             let leaf_index = branch.routes().len() - 1;
@@ -1866,6 +1972,7 @@ impl RouterEngine {
                 cleanup_batch: reservation.cleanup_batch(),
                 cleanup_roots: Vec::new(),
                 attempt: AttemptKind::Normal,
+                reconciliation: Some(reconciliation),
             });
             self.transition_with_trace(request, NavigationPhase::ReadyToSwitch);
             self.action = Some(EngineAction::Commit(CommitTicket { identity }));
@@ -1951,6 +2058,7 @@ impl RouterEngine {
             cleanup_batch: reservation.cleanup_batch(),
             cleanup_roots,
             attempt: AttemptKind::Normal,
+            reconciliation: Some(reconciliation),
         });
         let record = self
             .record_mut(request)
@@ -2131,6 +2239,7 @@ impl RouterEngine {
             cleanup_batch: reserved.cleanup_batch(),
             cleanup_roots,
             attempt: AttemptKind::Fallback { original_failure },
+            reconciliation: None,
         });
         self.action = None;
         self.record_mut(request)
@@ -2391,6 +2500,47 @@ impl RouterEngine {
         self.active_branch.as_ref()
     }
 
+    fn current_reconciliation_matches_active(&self) -> bool {
+        let Some(projection) = self
+            .current
+            .as_ref()
+            .and_then(|current| current.reconciliation.as_ref())
+        else {
+            return true;
+        };
+        let Some(host) = self.state.host() else {
+            return false;
+        };
+        let Some(top_slot) = self.state.top_slot() else {
+            return false;
+        };
+        projection.matches_active(
+            self.router,
+            host.host(),
+            host.epoch(),
+            top_slot,
+            self.state.active().location(),
+            self.current_active_branch(),
+            self.state.active().frames(),
+            &self.active_child_slots,
+        )
+    }
+
+    fn reject_current_reconciliation_drift(&mut self) -> bool {
+        if self.current_reconciliation_matches_active() {
+            return false;
+        }
+        let failure = self.begin_failure_cleanup(
+            PendingFailureKind::AuthorityLost,
+            NavigationFailure::new(
+                NavigationFailureKind::AuthorityLost,
+                "active reconciliation baseline drifted",
+            ),
+        );
+        self.action = Some(EngineAction::FailureCleanup(failure));
+        true
+    }
+
     fn transition_with_trace(&mut self, request: NavigationRequestId, phase: NavigationPhase) {
         let record = self.record_mut(request).expect("request is retained");
         record
@@ -2438,11 +2588,16 @@ impl RouterEngine {
         }
 
         let mut state = self.state.clone();
-        let (active, active_branch) = match &current.attempt {
-            AttemptKind::Normal => (
-                ActivePresentation::route(location, current.target_frames.clone()),
-                current.branch.clone(),
-            ),
+        let (active, active_branch, active_child_slots) = match &current.attempt {
+            AttemptKind::Normal => {
+                let active_child_slots =
+                    occupied_child_slots(current.branch.as_ref(), &current.target_frames);
+                (
+                    ActivePresentation::route(location, current.target_frames.clone()),
+                    current.branch.clone(),
+                    active_child_slots,
+                )
+            }
             AttemptKind::Fallback { original_failure } => (
                 ActivePresentation::error(
                     location,
@@ -2454,6 +2609,7 @@ impl RouterEngine {
                     current.target_frames.clone(),
                 ),
                 None,
+                Vec::new(),
             ),
         };
         state.set_active(active);
@@ -2494,6 +2650,7 @@ impl RouterEngine {
             state,
             history,
             active_branch,
+            active_child_slots,
             record_index,
             published_record,
             current,
@@ -2539,6 +2696,7 @@ impl RouterEngine {
                 .active_branch
                 .as_ref()
                 .map(|branch| format!("{branch:?}")),
+            active_child_slots: self.active_child_slots.clone(),
             records: self.records.clone(),
             evicted_through: self.evicted_through,
             highest_issued: self.highest_issued,
@@ -2665,6 +2823,28 @@ fn mount_failure(rejection: MountRejectionKind) -> (PendingFailureKind, Navigati
 
 fn is_terminal(status: &RequestStatus) -> bool {
     matches!(status, RequestStatus::Succeeded | RequestStatus::Failed(_))
+}
+
+fn occupied_child_slots(
+    branch: Option<&MatchedBranch>,
+    frames: &[RouteFrameVersion],
+) -> Vec<LogicalChildSlotBinding> {
+    let Some(branch) = branch else {
+        return Vec::new();
+    };
+    if branch.routes().len() != frames.len() {
+        return Vec::new();
+    }
+    (1..frames.len())
+        .map(|child_index| {
+            LogicalChildSlotBinding::occupied(
+                child_index - 1,
+                frames[child_index - 1].clone(),
+                branch.routes()[child_index].slot().clone(),
+                frames[child_index].clone(),
+            )
+        })
+        .collect()
 }
 
 pub(crate) struct ViewReportSession<'a> {
@@ -2834,6 +3014,7 @@ pub(crate) struct EngineSnapshot {
     ids: crate::ids::CoreIdAllocatorSnapshot,
     history: MemoryHistory,
     active_branch: Option<String>,
+    active_child_slots: Vec<LogicalChildSlotBinding>,
     records: VecDeque<NavigationRequestRecord>,
     evicted_through: Option<u64>,
     highest_issued: Option<u64>,
@@ -2846,9 +3027,9 @@ pub(crate) struct EngineSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionSnapshot, CleanupError, CommitError, EngineAction, PrivateRequestLookup,
+        ActionSnapshot, CleanupError, CommitError, EngineAction, MountError, PrivateRequestLookup,
         ROUTER_DIAGNOSTIC_RETENTION, ReportError, RootTaskIdentity, RouterEngine,
-        TERMINAL_RETENTION, WorkStage,
+        TERMINAL_RETENTION, WorkStage, occupied_child_slots,
     };
     use crate::admission::HostAdmissionIssuer;
     use crate::cleanup::{
@@ -2856,17 +3037,21 @@ mod tests {
         CleanupManifestSeal,
     };
     use crate::diagnostics::ReportDisposition;
-    use crate::frame::{FrameOrigin, RouteFrameVersion};
+    use crate::frame::{
+        FrameOrigin, LogicalChildSlotBinding, ProjectedChildSlotRoleKind, ProjectedEnteringSlot,
+        RouteFrameVersion,
+    };
     use crate::ids::{
         CleanupBatchId, ReservationCounter, RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId,
     };
     use crate::location::RouteLocation;
     use crate::pattern::RoutePattern;
-    use crate::presentation::ActivePresentationKind;
+    use crate::presentation::{ActivePresentation, ActivePresentationKind};
     use crate::request::{
         NavigationFailure, NavigationFailureKind, NavigationPhase, RequestStatus,
     };
     use crate::route_tree::{RouteNodeOptions, RouteTree};
+    use crate::slot::RouteSlotKey;
     use crate::trace::{NavigationTraceEvent, NavigationTraceEventKind};
     use crate::view_key::RouteViewKey;
 
@@ -2892,6 +3077,31 @@ mod tests {
                 root,
                 RoutePattern::path("about").unwrap(),
                 RouteNodeOptions::new().with_view(RouteViewKey::new("about").unwrap()),
+            )
+            .unwrap();
+        builder.build().unwrap()
+    }
+
+    fn reconciliation_tree() -> RouteTree {
+        let mut builder = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("layout").unwrap()),
+            )
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let items = builder
+            .route_with_options(
+                root,
+                RoutePattern::path("items").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("items").unwrap()),
+            )
+            .unwrap();
+        builder
+            .route_with_options(
+                items,
+                RoutePattern::path(":id").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("item").unwrap()),
             )
             .unwrap();
         builder.build().unwrap()
@@ -3584,6 +3794,70 @@ mod tests {
         CleanupCompletion::attest(cleanup.clone(), digest, cleanup.obligation_count())
     }
 
+    fn pending_reconciliation_mount_completion(
+        engine: &mut RouterEngine,
+    ) -> crate::mount::MountRegistrationCompletion {
+        engine.push(RouteLocation::new("/items/2")).unwrap();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("reconciliation root task expected")
+        };
+        let outlet = engine
+            .current
+            .as_ref()
+            .and_then(|current| current.branch.as_ref())
+            .and_then(|branch| branch.routes().get(1))
+            .map(|route| route.slot().clone())
+            .unwrap();
+        engine
+            .accept_applied_report(task.into_applied_report(vec![outlet]))
+            .unwrap();
+        let EngineAction::MountRequest(request) = engine.action().unwrap() else {
+            panic!("reconciliation mount request expected")
+        };
+        let grant = engine.resolve_mount(request).unwrap();
+        let receipt = grant.attest_receipt(crate::mount::MountReceiptDigest::from_opaque(81));
+        let permit = engine.accept_mount_receipt(receipt).unwrap();
+        permit.complete(crate::mount::MountRegistrationDigest::from_opaque(82))
+    }
+
+    fn settle_reconciliation_authority_loss_and_restart_mount(
+        engine: &mut RouterEngine,
+        active_child_slots: Vec<LogicalChildSlotBinding>,
+    ) {
+        let Some(EngineAction::FailureCleanup(failure)) = engine.action() else {
+            panic!("reconciliation drift must yield failure cleanup")
+        };
+        let request = failure.request();
+        let count = usize::from(!failure.logical_roots().is_empty());
+        let cleanup = prepare_failure_cleanup(engine, failure, 83, count);
+        assert_failure_waits_then_settles(
+            engine,
+            request,
+            &cleanup,
+            NavigationFailureKind::AuthorityLost,
+        );
+
+        engine.active_child_slots = active_child_slots;
+        engine.push(RouteLocation::new("/items/2")).unwrap();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("replacement reconciliation root task expected")
+        };
+        let outlet = engine
+            .current
+            .as_ref()
+            .and_then(|current| current.branch.as_ref())
+            .and_then(|branch| branch.routes().get(1))
+            .map(|route| route.slot().clone())
+            .unwrap();
+        engine
+            .accept_applied_report(task.into_applied_report(vec![outlet]))
+            .unwrap();
+        let EngineAction::MountRequest(request) = engine.action().unwrap() else {
+            panic!("replacement reconciliation mount request expected")
+        };
+        assert!(engine.resolve_mount(request).is_ok());
+    }
+
     fn distinct_identity() -> RootTaskIdentity {
         let mut engine = ready_engine();
         engine.push(RouteLocation::new("/items/1")).unwrap();
@@ -3823,6 +4097,487 @@ mod tests {
             .complete_cleanup(valid_completion(&changed_cleanup))
             .unwrap();
         assert_eq!(engine.history().len(), 4);
+    }
+
+    #[test]
+    fn reconciliation_projection_is_sealed_when_the_request_becomes_running() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let active_frames = engine.active().frames().to_vec();
+
+        engine.enqueue_push(RouteLocation::new("/items/2")).unwrap();
+        engine.collect();
+
+        let current = engine.current.as_ref().expect("request must be running");
+        let projection = current
+            .reconciliation
+            .as_ref()
+            .unwrap_or_else(|| panic!("running reconciliation missing: {current:?}"));
+        assert_eq!(projection.preserved().len(), active_frames.len() - 1);
+        assert_eq!(projection.leaving().len(), 1);
+        assert_eq!(projection.entering().len(), 1);
+        assert_eq!(
+            projection.preserved()[0].version().frame(),
+            active_frames[0].frame()
+        );
+    }
+
+    #[test]
+    fn reconciliation_projection_classifies_equivalent_and_nested_fragment() {
+        let mut engine = ready_engine_with_tree(reconciliation_tree());
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let active = engine.active().frames().to_vec();
+
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        let equivalent = engine
+            .current
+            .as_ref()
+            .and_then(|current| current.reconciliation.as_ref())
+            .unwrap();
+        assert_eq!(equivalent.preserved().len(), active.len());
+        assert!(equivalent.leaving().is_empty());
+        assert!(equivalent.entering().is_empty());
+        assert!(
+            equivalent
+                .child_slots()
+                .iter()
+                .all(|slot| slot.kind() == ProjectedChildSlotRoleKind::PreservedActive)
+        );
+        settle_current(&mut engine);
+
+        engine
+            .push(RouteLocation::new("/items/1").with_fragment("details"))
+            .unwrap();
+        let fragment = engine
+            .current
+            .as_ref()
+            .and_then(|current| current.reconciliation.as_ref())
+            .unwrap();
+        assert_eq!(fragment.preserved().len(), active.len() - 1);
+        assert_eq!(fragment.leaving().len(), 1);
+        assert_eq!(fragment.entering().len(), 1);
+        assert_eq!(fragment.leaving()[0].version(), active.last().unwrap());
+        assert_eq!(
+            fragment.entering()[0].frame(),
+            active.last().unwrap().frame()
+        );
+        assert_eq!(
+            fragment.entering()[0].generation(),
+            active.last().unwrap().generation().next()
+        );
+        assert_eq!(
+            fragment.entering()[0].slot(),
+            ProjectedEnteringSlot::Existing(active.last().unwrap().slot())
+        );
+    }
+
+    #[test]
+    fn reconciliation_projection_classifies_append_truncate_and_empty_slot_reuse() {
+        let mut append = ready_engine_with_tree(reconciliation_tree());
+        append.push(RouteLocation::new("/items")).unwrap();
+        settle_current(&mut append);
+        append.push(RouteLocation::new("/items/1")).unwrap();
+        let projection = append
+            .current
+            .as_ref()
+            .and_then(|current| current.reconciliation.as_ref())
+            .unwrap();
+        assert_eq!(projection.preserved().len(), 2);
+        assert!(projection.leaving().is_empty());
+        assert_eq!(projection.entering().len(), 1);
+        assert_eq!(
+            projection.entering()[0].slot(),
+            ProjectedEnteringSlot::MountNew
+        );
+        assert!(projection.child_slots().iter().any(|slot| {
+            slot.parent_branch_index() == 1 && slot.kind() == ProjectedChildSlotRoleKind::MountNew
+        }));
+
+        let mut reuse = ready_engine_with_tree(reconciliation_tree());
+        reuse.push(RouteLocation::new("/items")).unwrap();
+        settle_current(&mut reuse);
+        let active = reuse.active().frames().to_vec();
+        let target = reuse
+            .matcher
+            .match_location(&RouteLocation::new("/items/1"))
+            .unwrap();
+        let retained_slot = RouteSlotId::new(900);
+        reuse
+            .active_child_slots
+            .push(LogicalChildSlotBinding::retained_empty(
+                1,
+                active[1].clone(),
+                target.routes()[2].slot().clone(),
+                retained_slot,
+            ));
+        reuse.push(RouteLocation::new("/items/1")).unwrap();
+        let projection = reuse
+            .current
+            .as_ref()
+            .and_then(|current| current.reconciliation.as_ref())
+            .unwrap();
+        assert_eq!(
+            projection.entering()[0].slot(),
+            ProjectedEnteringSlot::Existing(retained_slot)
+        );
+        assert!(projection.child_slots().iter().any(|slot| {
+            slot.parent_branch_index() == 1
+                && slot.kind() == ProjectedChildSlotRoleKind::ActivateExisting
+        }));
+
+        let mut truncate = ready_engine_with_tree(reconciliation_tree());
+        truncate.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut truncate);
+        truncate.push(RouteLocation::new("/items")).unwrap();
+        let projection = truncate
+            .current
+            .as_ref()
+            .and_then(|current| current.reconciliation.as_ref())
+            .unwrap();
+        assert_eq!(projection.preserved().len(), 2);
+        assert_eq!(projection.leaving().len(), 1);
+        assert!(projection.entering().is_empty());
+        assert!(projection.child_slots().iter().any(|slot| {
+            slot.parent_branch_index() == 1
+                && slot.kind() == ProjectedChildSlotRoleKind::RetainEmpty
+        }));
+    }
+
+    #[test]
+    fn reconciliation_projection_search_change_fails_closed() {
+        let mut engine = ready_engine_with_tree(reconciliation_tree());
+        engine
+            .push(RouteLocation::new("/items/1").with_search("tab=a"))
+            .unwrap();
+        settle_current(&mut engine);
+
+        engine
+            .push(RouteLocation::new("/items/1").with_search("tab=b"))
+            .unwrap();
+        let projection = engine
+            .current
+            .as_ref()
+            .and_then(|current| current.reconciliation.as_ref())
+            .unwrap();
+        assert!(projection.preserved().is_empty());
+        assert_eq!(projection.leaving().len(), 3);
+        assert_eq!(projection.entering().len(), 3);
+        assert!(
+            projection
+                .child_slots()
+                .iter()
+                .filter(|slot| slot.kind() == ProjectedChildSlotRoleKind::Leaving)
+                .count()
+                >= 2
+        );
+    }
+
+    #[test]
+    fn reconciliation_projection_queued_request_uses_the_newly_published_active() {
+        let mut engine = ready_engine_with_tree(reconciliation_tree());
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let previous = engine.active().frames().to_vec();
+
+        engine.push(RouteLocation::new("/items/2")).unwrap();
+        engine.enqueue_push(RouteLocation::new("/items/3")).unwrap();
+        let cleanup = publish_current(&mut engine);
+        let newly_published = engine.active().frames().to_vec();
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        let projection = engine
+            .current
+            .as_ref()
+            .and_then(|current| current.reconciliation.as_ref())
+            .unwrap();
+        assert_eq!(projection.preserved()[0].version(), &newly_published[0]);
+        assert_eq!(projection.preserved()[1].version(), &newly_published[1]);
+        assert_ne!(projection.preserved()[0].version(), &previous[0]);
+    }
+
+    #[test]
+    fn reconciliation_projection_drift_blocks_later_mount_or_commit_action() {
+        let mut engine = ready_engine_with_tree(reconciliation_tree());
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+
+        engine.push(RouteLocation::new("/items/2")).unwrap();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("whole-branch scheduling still starts with one frame task in Task 1")
+        };
+        engine.active_child_slots.clear();
+        let next_outlet = engine
+            .current
+            .as_ref()
+            .and_then(|current| current.branch.as_ref())
+            .and_then(|branch| branch.routes().get(1))
+            .map(|route| route.slot().clone())
+            .unwrap();
+
+        assert_eq!(
+            engine.accept_applied_report(task.into_applied_report(vec![next_outlet])),
+            Err(ReportError::Stale)
+        );
+        assert!(matches!(
+            engine.action(),
+            Some(EngineAction::FailureCleanup(_))
+        ));
+    }
+
+    #[test]
+    fn reconciliation_projection_unused_equivalent_reservations_remain_burned() {
+        let mut engine = ready_engine_with_tree(reconciliation_tree());
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let before = engine.ids.snapshot();
+
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        let after = engine.ids.snapshot();
+        assert_eq!(after.next_frame(), before.next_frame() + 3);
+        assert_eq!(after.next_frame_task(), before.next_frame_task() + 3);
+        let projection = engine
+            .current
+            .as_ref()
+            .and_then(|current| current.reconciliation.as_ref())
+            .unwrap();
+        assert!(projection.entering().is_empty());
+    }
+
+    #[test]
+    fn reconciliation_projection_rejects_an_empty_binding_for_an_active_child() {
+        let mut engine = ready_engine_with_tree(reconciliation_tree());
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let occupied = engine.active_child_slots[1].clone();
+        engine.active_child_slots[1] = LogicalChildSlotBinding::retained_empty(
+            occupied.parent_branch_index(),
+            occupied.parent().clone(),
+            occupied.outlet().clone(),
+            occupied.slot(),
+        );
+
+        let request = engine.push(RouteLocation::new("/items/2")).unwrap();
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        assert!(engine.current.is_none());
+        assert!(engine.action().is_none());
+    }
+
+    #[test]
+    fn reconciliation_projection_rejects_duplicate_slot_and_parent_outlet_mappings() {
+        for duplicate_slot in [true, false] {
+            let mut engine = ready_engine_with_tree(reconciliation_tree());
+            engine.push(RouteLocation::new("/items/1")).unwrap();
+            settle_current(&mut engine);
+            let occupied = engine.active_child_slots[1].clone();
+            let slot = if duplicate_slot {
+                engine.active_child_slots[0].slot()
+            } else {
+                RouteSlotId::new(901)
+            };
+            let outlet = if duplicate_slot {
+                RouteSlotKey::named("alternate").unwrap()
+            } else {
+                occupied.outlet().clone()
+            };
+            engine
+                .active_child_slots
+                .push(LogicalChildSlotBinding::retained_empty(
+                    occupied.parent_branch_index(),
+                    occupied.parent().clone(),
+                    outlet,
+                    slot,
+                ));
+
+            let request = engine.push(RouteLocation::new("/items/2")).unwrap();
+            assert!(matches!(
+                engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            assert!(engine.current.is_none());
+            assert!(engine.action().is_none());
+        }
+    }
+
+    #[test]
+    fn reconciliation_projection_nested_fragment_overflow_is_pre_mutation() {
+        let mut engine = ready_engine_with_tree(reconciliation_tree());
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let history_before = engine.history().clone();
+        let ids_before = engine.ids.snapshot();
+        let location = engine.active().location().unwrap().clone();
+        let mut frames = engine.active().frames().to_vec();
+        let leaf = frames.last().unwrap().clone();
+        *frames.last_mut().unwrap() = RouteFrameVersion::new(
+            leaf.router_identity(),
+            leaf.host(),
+            leaf.slot(),
+            leaf.origin().clone(),
+            leaf.frame(),
+            RouteGeneration::testing_max(),
+        );
+        engine
+            .state
+            .set_active(ActivePresentation::route(location.clone(), frames.clone()));
+        engine.active_child_slots = occupied_child_slots(engine.active_branch.as_ref(), &frames);
+
+        let request = engine.push(location.with_fragment("overflow")).unwrap();
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        assert_eq!(engine.active().frames(), frames);
+        assert_eq!(engine.history(), &history_before);
+        assert_eq!(
+            engine.ids.snapshot().next_frame(),
+            ids_before.next_frame() + 3
+        );
+        assert!(engine.action().is_none());
+        assert!(
+            engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .all(|event| {
+                    !matches!(
+                        event.kind(),
+                        NavigationTraceEventKind::CleanupSettled
+                            | NavigationTraceEventKind::CommitPublished
+                    )
+                })
+        );
+    }
+
+    #[test]
+    fn reconciliation_projection_stale_commit_cannot_trigger_drift_settlement() {
+        let mut engine = ready_engine_with_tree(reconciliation_tree());
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        engine.push(RouteLocation::new("/items/2")).unwrap();
+        let action = engine.action().unwrap();
+        let ticket = drive_to_commit(&mut engine, action);
+        engine.active_child_slots.clear();
+        let before = engine.snapshot();
+        let stale = ticket.testing_with_identity(distinct_identity());
+        let roots = engine.current.as_ref().unwrap().cleanup_roots.clone();
+        let count = if roots.is_empty() {
+            0
+        } else {
+            NONZERO_OBLIGATION_COUNT
+        };
+
+        assert!(matches!(
+            engine.seal_commit(
+                &stale,
+                CleanupManifestSeal::new(roots.clone(), manifest_digest(70), count),
+            ),
+            Err(CommitError::Stale)
+        ));
+        assert_eq!(engine.snapshot(), before);
+        assert!(matches!(
+            engine.seal_commit(
+                &ticket,
+                CleanupManifestSeal::new(roots, manifest_digest(71), count),
+            ),
+            Err(CommitError::Stale)
+        ));
+        assert!(matches!(
+            engine.action(),
+            Some(EngineAction::FailureCleanup(_))
+        ));
+    }
+
+    #[test]
+    fn reconciliation_projection_foreign_report_cannot_trigger_drift_settlement() {
+        let mut engine = ready_engine_with_tree(reconciliation_tree());
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        engine.push(RouteLocation::new("/items/2")).unwrap();
+        let EngineAction::FrameTask(exact) = engine.action().unwrap() else {
+            panic!("exact task expected")
+        };
+        engine.active_child_slots.clear();
+
+        let mut foreign = ready_engine_with_tree(reconciliation_tree());
+        foreign.push(RouteLocation::new("/items/2")).unwrap();
+        let EngineAction::FrameTask(foreign_task) = foreign.action().unwrap() else {
+            panic!("foreign task expected")
+        };
+        let next_outlet = engine
+            .current
+            .as_ref()
+            .and_then(|current| current.branch.as_ref())
+            .and_then(|branch| branch.routes().get(1))
+            .map(|route| route.slot().clone())
+            .unwrap();
+
+        assert_eq!(
+            engine
+                .accept_applied_report(foreign_task.into_applied_report(vec![next_outlet.clone()])),
+            Err(ReportError::Invalid)
+        );
+        assert!(matches!(engine.action(), Some(EngineAction::FrameTask(_))));
+        assert_eq!(
+            engine.accept_applied_report(exact.into_applied_report(vec![next_outlet])),
+            Err(ReportError::Stale)
+        );
+        assert!(matches!(
+            engine.action(),
+            Some(EngineAction::FailureCleanup(_))
+        ));
+    }
+
+    #[test]
+    fn reconciliation_projection_mount_completion_is_capability_first_then_drift_checked() {
+        let mut engine = ready_engine_with_tree(reconciliation_tree());
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let exact = pending_reconciliation_mount_completion(&mut engine);
+        let active_child_slots = engine.active_child_slots.clone();
+        engine.active_child_slots.clear();
+
+        let mut foreign = ready_engine_with_tree(reconciliation_tree());
+        foreign.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut foreign);
+        let foreign_completion = pending_reconciliation_mount_completion(&mut foreign);
+        let before = engine.snapshot();
+        assert_eq!(
+            engine.complete_mount_registration(foreign_completion),
+            Err(MountError::Foreign)
+        );
+        assert_eq!(engine.snapshot(), before);
+
+        assert_eq!(
+            engine.complete_mount_registration(exact),
+            Err(MountError::WrongPhase)
+        );
+        settle_reconciliation_authority_loss_and_restart_mount(&mut engine, active_child_slots);
+    }
+
+    #[test]
+    fn reconciliation_projection_mount_confirmation_drift_releases_mount_issuer() {
+        let mut engine = ready_engine_with_tree(reconciliation_tree());
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let completion = pending_reconciliation_mount_completion(&mut engine);
+        let confirmation = engine.mount.complete_registration(&completion).unwrap();
+        let active_child_slots = engine.active_child_slots.clone();
+        engine.active_child_slots.clear();
+
+        assert_eq!(
+            engine.consume_mount_confirmation(confirmation),
+            Err(MountError::WrongPhase)
+        );
+        settle_reconciliation_authority_loss_and_restart_mount(&mut engine, active_child_slots);
     }
 
     #[test]

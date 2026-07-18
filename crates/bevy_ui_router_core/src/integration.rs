@@ -16,7 +16,11 @@ use crate::engine::{
     PushError as CorePushError, ReportError as CoreReportError,
     ResolveMountOwner as CoreResolveMountOwner, RouterEngine as CoreRouterEngine,
 };
-use crate::frame::RouteFrameVersion;
+use crate::frame::{
+    LogicalChildSlotBinding, ProjectedChildSlotRole, ProjectedChildSlotRoleKind,
+    ProjectedEnteringFrame, ProjectedEnteringSlot, ProjectedExistingFrame, RouteFrameVersion,
+    RouteReconciliationProjection,
+};
 use crate::history::{HistorySnapshot, MemoryHistory};
 use crate::ids::{NavigationRequestId, RouteSlotId, RouterIdentity};
 use crate::location::RouteLocation;
@@ -679,6 +683,182 @@ impl PreparedCommit {
 
 pub struct NavigationRequestView<'a> {
     record: &'a NavigationRequestRecord,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconciliationChildSlotRoleKind {
+    PreservedActive,
+    RetainEmpty,
+    ActivateExisting,
+    MountNew,
+    Leaving,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconciliationEnteringSlotKind {
+    Existing(RouteSlotId),
+    MountNew,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReconciliationExistingFrameView<'a> {
+    inner: &'a ProjectedExistingFrame,
+}
+
+impl ReconciliationExistingFrameView<'_> {
+    pub fn branch_index(&self) -> usize {
+        self.inner.branch_index()
+    }
+
+    pub fn version(&self) -> &RouteFrameVersion {
+        self.inner.version()
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReconciliationEnteringFrameView<'a> {
+    inner: &'a ProjectedEnteringFrame,
+}
+
+impl ReconciliationEnteringFrameView<'_> {
+    pub fn branch_index(&self) -> usize {
+        self.inner.branch_index()
+    }
+
+    pub fn route(&self) -> crate::ids::RouteId {
+        self.inner.route()
+    }
+
+    pub fn frame(&self) -> crate::ids::RouteFrameId {
+        self.inner.frame()
+    }
+
+    pub fn generation(&self) -> crate::ids::RouteGeneration {
+        self.inner.generation()
+    }
+
+    pub fn slot(&self) -> ReconciliationEnteringSlotKind {
+        match self.inner.slot() {
+            ProjectedEnteringSlot::Existing(slot) => ReconciliationEnteringSlotKind::Existing(slot),
+            ProjectedEnteringSlot::MountNew => ReconciliationEnteringSlotKind::MountNew,
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReconciliationChildSlotBindingView<'a> {
+    inner: &'a LogicalChildSlotBinding,
+}
+
+impl ReconciliationChildSlotBindingView<'_> {
+    pub fn parent_branch_index(&self) -> usize {
+        self.inner.parent_branch_index()
+    }
+
+    pub fn parent(&self) -> &RouteFrameVersion {
+        self.inner.parent()
+    }
+
+    pub fn outlet(&self) -> &RouteSlotKey {
+        self.inner.outlet()
+    }
+
+    pub fn slot(&self) -> RouteSlotId {
+        self.inner.slot()
+    }
+
+    pub fn child(&self) -> Option<&RouteFrameVersion> {
+        self.inner.child()
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReconciliationChildSlotRoleView<'a> {
+    inner: &'a ProjectedChildSlotRole,
+}
+
+impl ReconciliationChildSlotRoleView<'_> {
+    pub fn parent_branch_index(&self) -> usize {
+        self.inner.parent_branch_index()
+    }
+
+    pub fn outlet(&self) -> &RouteSlotKey {
+        self.inner.outlet()
+    }
+
+    pub fn kind(&self) -> ReconciliationChildSlotRoleKind {
+        match self.inner.kind() {
+            ProjectedChildSlotRoleKind::PreservedActive => {
+                ReconciliationChildSlotRoleKind::PreservedActive
+            }
+            ProjectedChildSlotRoleKind::RetainEmpty => ReconciliationChildSlotRoleKind::RetainEmpty,
+            ProjectedChildSlotRoleKind::ActivateExisting => {
+                ReconciliationChildSlotRoleKind::ActivateExisting
+            }
+            ProjectedChildSlotRoleKind::MountNew => ReconciliationChildSlotRoleKind::MountNew,
+            ProjectedChildSlotRoleKind::Leaving => ReconciliationChildSlotRoleKind::Leaving,
+        }
+    }
+
+    pub fn binding(&self) -> Option<ReconciliationChildSlotBindingView<'_>> {
+        self.inner
+            .binding()
+            .map(|inner| ReconciliationChildSlotBindingView { inner })
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReconciliationProjectionView<'a> {
+    inner: &'a RouteReconciliationProjection,
+}
+
+impl<'a> ReconciliationProjectionView<'a> {
+    pub fn preserved(
+        &self,
+    ) -> impl ExactSizeIterator<Item = ReconciliationExistingFrameView<'a>> + 'a {
+        self.inner
+            .preserved()
+            .iter()
+            .map(|inner| ReconciliationExistingFrameView { inner })
+    }
+
+    pub fn leaving(
+        &self,
+    ) -> impl ExactSizeIterator<Item = ReconciliationExistingFrameView<'a>> + 'a {
+        self.inner
+            .leaving()
+            .iter()
+            .map(|inner| ReconciliationExistingFrameView { inner })
+    }
+
+    pub fn entering(
+        &self,
+    ) -> impl ExactSizeIterator<Item = ReconciliationEnteringFrameView<'a>> + 'a {
+        self.inner
+            .entering()
+            .iter()
+            .map(|inner| ReconciliationEnteringFrameView { inner })
+    }
+
+    pub fn child_slots(
+        &self,
+    ) -> impl ExactSizeIterator<Item = ReconciliationChildSlotRoleView<'a>> + 'a {
+        self.inner
+            .child_slots()
+            .iter()
+            .map(|inner| ReconciliationChildSlotRoleView { inner })
+    }
+
+    pub fn target_fingerprint(&self) -> &crate::fingerprint::RouteBranchFingerprint {
+        self.inner.target_fingerprint()
+    }
 }
 
 pub enum RequestLookup<'a> {
@@ -1355,6 +1535,28 @@ impl RouterEngine {
         self.inner.active()
     }
 
+    #[doc(hidden)]
+    pub fn reconciliation_projection_for_task(
+        &self,
+        task: &FrameTask,
+    ) -> Result<ReconciliationProjectionView<'_>, IntegrationError> {
+        self.inner
+            .reconciliation_projection_for(task.inner.identity())
+            .map(|inner| ReconciliationProjectionView { inner })
+            .ok_or(IntegrationError::Stale)
+    }
+
+    #[doc(hidden)]
+    pub fn reconciliation_projection_for_commit(
+        &self,
+        ticket: &CommitTicket,
+    ) -> Result<ReconciliationProjectionView<'_>, IntegrationError> {
+        self.inner
+            .reconciliation_projection_for(ticket.inner.identity())
+            .map(|inner| ReconciliationProjectionView { inner })
+            .ok_or(IntegrationError::Stale)
+    }
+
     pub fn history(&self) -> &MemoryHistory {
         self.inner.history()
     }
@@ -1500,6 +1702,62 @@ mod tests {
             panic!("mount request expected")
         };
         request
+    }
+
+    #[test]
+    fn reconciliation_projection_view_is_read_only_and_slot_aware() {
+        let mut engine = confirmed_nested_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("first reconciliation action must be a frame task")
+        };
+
+        let mut foreign = confirmed_nested_engine();
+        foreign.push(RouteLocation::new("/items/1")).unwrap();
+        foreign.collect();
+        let EngineAction::FrameTask(foreign_task) = foreign.action().unwrap() else {
+            panic!("foreign reconciliation action must be a frame task")
+        };
+        assert!(matches!(
+            engine.reconciliation_projection_for_task(&foreign_task),
+            Err(IntegrationError::Stale)
+        ));
+
+        let projection = engine
+            .reconciliation_projection_for_task(&task)
+            .expect("exact running task borrows one sealed projection");
+        assert_eq!(projection.preserved().len(), 0);
+        assert_eq!(projection.leaving().len(), 0);
+        let entering = projection.entering().collect::<Vec<_>>();
+        assert_eq!(entering.len(), 2);
+        assert!(matches!(
+            entering[0].slot(),
+            ReconciliationEnteringSlotKind::Existing(_)
+        ));
+        assert_eq!(entering[1].slot(), ReconciliationEnteringSlotKind::MountNew);
+        let slots = projection.child_slots().collect::<Vec<_>>();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].kind(), ReconciliationChildSlotRoleKind::MountNew);
+        assert!(slots[0].binding().is_none());
+    }
+
+    #[test]
+    fn equivalent_commit_borrows_the_same_sealed_reconciliation_projection() {
+        let mut engine = confirmed_engine();
+        settle_push(&mut engine, RouteLocation::new("/"));
+        engine.push(RouteLocation::new("/")).unwrap();
+        engine.collect();
+        let EngineAction::Commit(ticket) = engine.action().unwrap() else {
+            panic!("equivalent push must issue a commit ticket")
+        };
+
+        let projection = engine
+            .reconciliation_projection_for_commit(&ticket)
+            .expect("exact commit ticket borrows the current projection");
+        assert_eq!(projection.preserved().len(), 1);
+        assert_eq!(projection.entering().len(), 0);
+        assert_eq!(projection.leaving().len(), 0);
     }
 
     fn pending_nested_receipt(engine: &mut RouterEngine, digest: u64) -> MountReceiptAttestation {

@@ -29,6 +29,7 @@ use crate::ids::{
     RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId, RouterIdentity,
     RouterInstanceId,
 };
+use crate::location::RouteLocation;
 use crate::meta::ErrorBoundaryKey;
 use crate::ownership::CleanupScope;
 use crate::slot::RouteSlotKey;
@@ -403,6 +404,524 @@ impl ActiveBranchBaseline {
     pub(crate) const fn branch_fingerprint(&self) -> &RouteBranchFingerprint {
         &self.branch_fingerprint
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LogicalChildSlotBinding {
+    parent_branch_index: usize,
+    parent: RouteFrameVersion,
+    outlet: RouteSlotKey,
+    slot: RouteSlotId,
+    child: Option<RouteFrameVersion>,
+}
+
+impl LogicalChildSlotBinding {
+    pub(crate) fn occupied(
+        parent_branch_index: usize,
+        parent: RouteFrameVersion,
+        outlet: RouteSlotKey,
+        child: RouteFrameVersion,
+    ) -> Self {
+        Self {
+            parent_branch_index,
+            parent,
+            outlet,
+            slot: child.slot(),
+            child: Some(child),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn retained_empty(
+        parent_branch_index: usize,
+        parent: RouteFrameVersion,
+        outlet: RouteSlotKey,
+        slot: RouteSlotId,
+    ) -> Self {
+        Self {
+            parent_branch_index,
+            parent,
+            outlet,
+            slot,
+            child: None,
+        }
+    }
+
+    pub(crate) const fn parent_branch_index(&self) -> usize {
+        self.parent_branch_index
+    }
+
+    pub(crate) const fn parent(&self) -> &RouteFrameVersion {
+        &self.parent
+    }
+
+    pub(crate) const fn outlet(&self) -> &RouteSlotKey {
+        &self.outlet
+    }
+
+    pub(crate) const fn slot(&self) -> RouteSlotId {
+        self.slot
+    }
+
+    pub(crate) const fn child(&self) -> Option<&RouteFrameVersion> {
+        self.child.as_ref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectedChildSlotRoleKind {
+    PreservedActive,
+    RetainEmpty,
+    ActivateExisting,
+    MountNew,
+    Leaving,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectedChildSlotRole {
+    parent_branch_index: usize,
+    outlet: RouteSlotKey,
+    kind: ProjectedChildSlotRoleKind,
+    binding: Option<LogicalChildSlotBinding>,
+}
+
+impl ProjectedChildSlotRole {
+    fn existing(kind: ProjectedChildSlotRoleKind, binding: LogicalChildSlotBinding) -> Self {
+        Self {
+            parent_branch_index: binding.parent_branch_index(),
+            outlet: binding.outlet().clone(),
+            kind,
+            binding: Some(binding),
+        }
+    }
+
+    fn mount_new(parent_branch_index: usize, outlet: RouteSlotKey) -> Self {
+        Self {
+            parent_branch_index,
+            outlet,
+            kind: ProjectedChildSlotRoleKind::MountNew,
+            binding: None,
+        }
+    }
+
+    pub(crate) const fn parent_branch_index(&self) -> usize {
+        self.parent_branch_index
+    }
+
+    pub(crate) const fn outlet(&self) -> &RouteSlotKey {
+        &self.outlet
+    }
+
+    pub(crate) const fn kind(&self) -> ProjectedChildSlotRoleKind {
+        self.kind
+    }
+
+    pub(crate) const fn binding(&self) -> Option<&LogicalChildSlotBinding> {
+        self.binding.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectedExistingFrame {
+    branch_index: usize,
+    version: RouteFrameVersion,
+}
+
+impl ProjectedExistingFrame {
+    fn new(branch_index: usize, version: RouteFrameVersion) -> Self {
+        Self {
+            branch_index,
+            version,
+        }
+    }
+
+    pub(crate) const fn branch_index(&self) -> usize {
+        self.branch_index
+    }
+
+    pub(crate) const fn version(&self) -> &RouteFrameVersion {
+        &self.version
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectedEnteringSlot {
+    Existing(RouteSlotId),
+    MountNew,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectedEnteringFrame {
+    branch_index: usize,
+    route: RouteId,
+    frame: RouteFrameId,
+    generation: RouteGeneration,
+    slot: ProjectedEnteringSlot,
+}
+
+impl ProjectedEnteringFrame {
+    pub(crate) const fn branch_index(&self) -> usize {
+        self.branch_index
+    }
+
+    pub(crate) const fn route(&self) -> RouteId {
+        self.route
+    }
+
+    pub(crate) const fn frame(&self) -> RouteFrameId {
+        self.frame
+    }
+
+    pub(crate) const fn generation(&self) -> RouteGeneration {
+        self.generation
+    }
+
+    pub(crate) const fn slot(&self) -> ProjectedEnteringSlot {
+        self.slot
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RouteReconciliationBaseline {
+    router: RouterIdentity,
+    host: RouteHostId,
+    host_epoch: u64,
+    top_slot: RouteSlotId,
+    location: Option<RouteLocation>,
+    branch_fingerprint: Option<RouteBranchFingerprint>,
+    frames: Vec<RouteFrameVersion>,
+    child_slots: Vec<LogicalChildSlotBinding>,
+}
+
+impl RouteReconciliationBaseline {
+    fn matches(
+        &self,
+        router: RouterIdentity,
+        host: RouteHostId,
+        host_epoch: u64,
+        top_slot: RouteSlotId,
+        location: Option<&RouteLocation>,
+        branch: Option<&MatchedBranch>,
+        frames: &[RouteFrameVersion],
+        child_slots: &[LogicalChildSlotBinding],
+    ) -> bool {
+        self.router == router
+            && self.host == host
+            && self.host_epoch == host_epoch
+            && self.top_slot == top_slot
+            && self.location.as_ref() == location
+            && self.branch_fingerprint.as_ref() == branch.map(MatchedBranch::branch_fingerprint)
+            && self.frames == frames
+            && self.child_slots == child_slots
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReconciliationProjectionError {
+    InvalidActiveBaseline,
+    GenerationExhausted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RouteReconciliationProjection {
+    baseline: RouteReconciliationBaseline,
+    preserved: Vec<ProjectedExistingFrame>,
+    leaving: Vec<ProjectedExistingFrame>,
+    entering: Vec<ProjectedEnteringFrame>,
+    child_slots: Vec<ProjectedChildSlotRole>,
+    target_fingerprint: RouteBranchFingerprint,
+}
+
+impl RouteReconciliationProjection {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_running(
+        router: RouterIdentity,
+        host: RouteHostId,
+        host_epoch: u64,
+        top_slot: RouteSlotId,
+        active_location: Option<&RouteLocation>,
+        active_branch: Option<&MatchedBranch>,
+        active_frames: &[RouteFrameVersion],
+        active_child_slots: &[LogicalChildSlotBinding],
+        target: &MatchedBranch,
+        reserved_frames: &[RouteFrameId],
+        fragment_only: bool,
+    ) -> Result<Self, ReconciliationProjectionError> {
+        if reserved_frames.len() != target.routes().len()
+            || !active_baseline_is_consistent(
+                router,
+                host,
+                top_slot,
+                active_location,
+                active_branch,
+                active_frames,
+                active_child_slots,
+            )
+        {
+            return Err(ReconciliationProjectionError::InvalidActiveBaseline);
+        }
+
+        let common_prefix = match active_branch {
+            Some(active) if fragment_only => active.routes().len().saturating_sub(1),
+            Some(active) => BranchDiff::compare(active, target).common_prefix_len(),
+            None => 0,
+        };
+        if common_prefix > active_frames.len() || common_prefix > target.routes().len() {
+            return Err(ReconciliationProjectionError::InvalidActiveBaseline);
+        }
+
+        let preserved = active_frames[..common_prefix]
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(branch_index, version)| ProjectedExistingFrame::new(branch_index, version))
+            .collect();
+        let leaving = active_frames[common_prefix..]
+            .iter()
+            .cloned()
+            .enumerate()
+            .rev()
+            .map(|(offset, version)| ProjectedExistingFrame::new(common_prefix + offset, version))
+            .collect();
+
+        let child_slots = project_child_slots(common_prefix, target, active_child_slots);
+        let mut entering = Vec::with_capacity(target.routes().len() - common_prefix);
+        for branch_index in common_prefix..target.routes().len() {
+            let route = &target.routes()[branch_index];
+            let (frame, generation) = if fragment_only
+                && branch_index + 1 == target.routes().len()
+                && branch_index < active_frames.len()
+            {
+                let active = &active_frames[branch_index];
+                (
+                    active.frame(),
+                    active
+                        .generation()
+                        .checked_next()
+                        .map_err(|_| ReconciliationProjectionError::GenerationExhausted)?,
+                )
+            } else {
+                (reserved_frames[branch_index], RouteGeneration::initial())
+            };
+            let slot = if branch_index == 0 {
+                ProjectedEnteringSlot::Existing(top_slot)
+            } else {
+                child_slots
+                    .iter()
+                    .find(|slot| {
+                        slot.parent_branch_index() + 1 == branch_index
+                            && slot.outlet() == route.slot()
+                    })
+                    .map_or(ProjectedEnteringSlot::MountNew, |slot| {
+                        slot.binding()
+                            .map_or(ProjectedEnteringSlot::MountNew, |binding| {
+                                ProjectedEnteringSlot::Existing(binding.slot())
+                            })
+                    })
+            };
+            entering.push(ProjectedEnteringFrame {
+                branch_index,
+                route: route.route(),
+                frame,
+                generation,
+                slot,
+            });
+        }
+
+        Ok(Self {
+            baseline: RouteReconciliationBaseline {
+                router,
+                host,
+                host_epoch,
+                top_slot,
+                location: active_location.cloned(),
+                branch_fingerprint: active_branch.map(|branch| branch.branch_fingerprint().clone()),
+                frames: active_frames.to_vec(),
+                child_slots: active_child_slots.to_vec(),
+            },
+            preserved,
+            leaving,
+            entering,
+            child_slots,
+            target_fingerprint: target.branch_fingerprint().clone(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn matches_active(
+        &self,
+        router: RouterIdentity,
+        host: RouteHostId,
+        host_epoch: u64,
+        top_slot: RouteSlotId,
+        location: Option<&RouteLocation>,
+        branch: Option<&MatchedBranch>,
+        frames: &[RouteFrameVersion],
+        child_slots: &[LogicalChildSlotBinding],
+    ) -> bool {
+        self.baseline.matches(
+            router,
+            host,
+            host_epoch,
+            top_slot,
+            location,
+            branch,
+            frames,
+            child_slots,
+        )
+    }
+
+    pub(crate) fn preserved(&self) -> &[ProjectedExistingFrame] {
+        &self.preserved
+    }
+
+    pub(crate) fn leaving(&self) -> &[ProjectedExistingFrame] {
+        &self.leaving
+    }
+
+    pub(crate) fn entering(&self) -> &[ProjectedEnteringFrame] {
+        &self.entering
+    }
+
+    pub(crate) fn child_slots(&self) -> &[ProjectedChildSlotRole] {
+        &self.child_slots
+    }
+
+    pub(crate) const fn target_fingerprint(&self) -> &RouteBranchFingerprint {
+        &self.target_fingerprint
+    }
+}
+
+fn active_baseline_is_consistent(
+    router: RouterIdentity,
+    host: RouteHostId,
+    top_slot: RouteSlotId,
+    active_location: Option<&RouteLocation>,
+    active_branch: Option<&MatchedBranch>,
+    active_frames: &[RouteFrameVersion],
+    active_child_slots: &[LogicalChildSlotBinding],
+) -> bool {
+    if active_branch.is_some() != active_location.is_some() {
+        return false;
+    }
+    if let Some(branch) = active_branch {
+        if branch.routes().len() != active_frames.len() {
+            return false;
+        }
+        for (branch_index, (route, frame)) in branch.routes().iter().zip(active_frames).enumerate()
+        {
+            let expected_slot = if branch_index == 0 {
+                Some(top_slot)
+            } else {
+                active_child_slots
+                    .iter()
+                    .find(|binding| {
+                        binding.parent_branch_index() + 1 == branch_index
+                            && binding.outlet() == route.slot()
+                            && binding.child() == Some(frame)
+                    })
+                    .map(LogicalChildSlotBinding::slot)
+            };
+            if frame.router_identity() != router
+                || frame.host() != host
+                || frame.origin() != &FrameOrigin::MatchedRoute(route.route())
+                || expected_slot != Some(frame.slot())
+            {
+                return false;
+            }
+        }
+    } else {
+        if active_location.is_some()
+            || active_frames
+                .iter()
+                .enumerate()
+                .any(|(branch_index, frame)| {
+                    frame.router_identity() != router
+                        || frame.host() != host
+                        || (branch_index == 0 && frame.slot() != top_slot)
+                })
+        {
+            return false;
+        }
+    }
+
+    let mut seen_slots = Vec::with_capacity(active_child_slots.len());
+    let mut seen_mappings = Vec::with_capacity(active_child_slots.len());
+    active_child_slots.iter().all(|binding| {
+        let parent_matches =
+            active_frames.get(binding.parent_branch_index()) == Some(binding.parent());
+        let child_matches = binding.child().is_none_or(|child| {
+            active_frames.get(binding.parent_branch_index() + 1) == Some(child)
+                && child.slot() == binding.slot()
+        });
+        let mapping = (binding.parent_branch_index(), binding.outlet().clone());
+        parent_matches
+            && child_matches
+            && !seen_slots.contains(&binding.slot())
+            && !seen_mappings.contains(&mapping)
+            && {
+                seen_slots.push(binding.slot());
+                seen_mappings.push(mapping);
+                true
+            }
+    })
+}
+
+fn project_child_slots(
+    common_prefix: usize,
+    target: &MatchedBranch,
+    active_child_slots: &[LogicalChildSlotBinding],
+) -> Vec<ProjectedChildSlotRole> {
+    let mut projected = Vec::new();
+    let mut consumed = Vec::new();
+
+    for child_index in 1..target.routes().len() {
+        let parent_index = child_index - 1;
+        let outlet = target.routes()[child_index].slot();
+        let existing = if parent_index < common_prefix {
+            active_child_slots.iter().enumerate().find(|(_, binding)| {
+                binding.parent_branch_index() == parent_index && binding.outlet() == outlet
+            })
+        } else {
+            None
+        };
+        if let Some((index, binding)) = existing {
+            consumed.push(index);
+            let kind = if binding.child().is_some() {
+                ProjectedChildSlotRoleKind::PreservedActive
+            } else {
+                ProjectedChildSlotRoleKind::ActivateExisting
+            };
+            projected.push(ProjectedChildSlotRole::existing(kind, binding.clone()));
+        } else {
+            projected.push(ProjectedChildSlotRole::mount_new(
+                parent_index,
+                outlet.clone(),
+            ));
+        }
+    }
+
+    let mut residual = active_child_slots
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !consumed.contains(index))
+        .map(|(_, binding)| {
+            let kind = if binding.parent_branch_index() < common_prefix {
+                ProjectedChildSlotRoleKind::RetainEmpty
+            } else {
+                ProjectedChildSlotRoleKind::Leaving
+            };
+            ProjectedChildSlotRole::existing(kind, binding.clone())
+        })
+        .collect::<Vec<_>>();
+    residual.sort_by(|left, right| {
+        right
+            .parent_branch_index()
+            .cmp(&left.parent_branch_index())
+            .then_with(|| left.outlet().cmp(right.outlet()))
+    });
+    projected.extend(residual);
+    projected
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
