@@ -141,11 +141,36 @@ pub(crate) struct HostGrant {
     top_slot: RouteSlotId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct HostAdmissionConfirmation {
     key: AdmissionKey,
     version: HostVersion,
     top_slot: RouteSlotId,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct HostLease {
+    identity: GrantIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RetiredHostAuthority {
+    identity: GrantIdentity,
+}
+
+#[derive(Debug)]
+pub(crate) struct RetireHostLeaseError {
+    owner: HostLease,
+}
+
+impl RetireHostLeaseError {
+    const fn new(owner: HostLease) -> Self {
+        Self { owner }
+    }
+
+    pub(crate) fn into_owner(self) -> HostLease {
+        self.owner
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -337,9 +362,27 @@ impl HostAdmissionIssuer {
         })
     }
 
+    pub(crate) fn retire_current(
+        &mut self,
+        lease: HostLease,
+    ) -> Result<RetiredHostAuthority, RetireHostLeaseError> {
+        if self.outstanding.is_some() || self.current.as_ref() != Some(&lease.identity) {
+            return Err(RetireHostLeaseError::new(lease));
+        }
+        self.current = None;
+        Ok(RetiredHostAuthority {
+            identity: lease.identity,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn has_outstanding(&self) -> bool {
         self.outstanding.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_current(&self) -> bool {
+        self.current.is_some()
     }
 
     #[cfg(test)]
@@ -381,9 +424,41 @@ impl HostAdmissionConfirmation {
         self.top_slot
     }
 
+    pub(crate) fn into_lease(self) -> HostLease {
+        HostLease {
+            identity: GrantIdentity::from_confirmation(&self),
+        }
+    }
+
     #[cfg(test)]
     fn router(&self) -> RouterInstanceId {
         self.key.router.router()
+    }
+}
+
+impl HostLease {
+    pub(crate) fn matches(
+        &self,
+        router: RouterIdentity,
+        version: &HostVersion,
+        top_slot: RouteSlotId,
+    ) -> bool {
+        self.identity.key.router == router
+            && &self.identity.version == version
+            && self.identity.top_slot == top_slot
+    }
+}
+
+impl RetiredHostAuthority {
+    pub(crate) fn matches(
+        &self,
+        router: RouterIdentity,
+        version: &HostVersion,
+        top_slot: RouteSlotId,
+    ) -> bool {
+        self.identity.key.router == router
+            && &self.identity.version == version
+            && self.identity.top_slot == top_slot
     }
 }
 
@@ -517,6 +592,25 @@ mod tests {
 
         assert_eq!(issuer.issue(router), Err(AdmissionError::AuthorityExists));
         assert_eq!(issuer.snapshot(), confirmed);
+    }
+
+    #[test]
+    fn exact_host_lease_retires_once_and_foreign_issuer_returns_the_owner() {
+        let (mut ids, router, mut issuer) = setup();
+        let token = issuer.issue(router).unwrap();
+        let grant = issuer.grant(&token, &mut ids).unwrap();
+        let confirmation = issuer.confirm(&grant).unwrap();
+        let version = confirmation.version().clone();
+        let top_slot = confirmation.top_slot();
+        let lease = confirmation.into_lease();
+
+        let (_foreign_ids, _foreign_router, mut foreign) = setup();
+        let error = foreign.retire_current(lease).unwrap_err();
+        let retired = issuer.retire_current(error.into_owner()).unwrap();
+
+        assert!(retired.matches(router, &version, top_slot));
+        assert!(issuer.snapshot().current.is_none());
+        assert!(issuer.issue(router).is_ok());
     }
 
     #[test]

@@ -61,6 +61,28 @@ impl RouterInputGate {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct PreparedInputGateIsolation {
+    next: Vec<Entity>,
+}
+
+impl PreparedInputGateIsolation {
+    pub(crate) fn apply(self, gate: &mut RouterInputGate) {
+        gate.allowed = self.next;
+    }
+}
+
+pub(crate) fn try_prepare_input_gate_isolation(
+    gate: &RouterInputGate,
+    targets: &[Entity],
+) -> Result<PreparedInputGateIsolation, ()> {
+    let mut next = Vec::new();
+    next.try_reserve_exact(gate.allowed.len()).map_err(|_| ())?;
+    next.extend(gate.allowed.iter().copied());
+    next.retain(|entity| !targets.contains(entity));
+    Ok(PreparedInputGateIsolation { next })
+}
+
 pub(crate) struct PreparedInputGateMutation<'w> {
     gate: Mut<'w, RouterInputGate>,
     next: Vec<Entity>,

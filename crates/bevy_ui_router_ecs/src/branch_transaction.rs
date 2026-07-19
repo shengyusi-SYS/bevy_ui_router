@@ -1888,6 +1888,19 @@ impl RealizedBranch {
         &self.frames
     }
 
+    #[cfg(test)]
+    pub(crate) fn frames_mut_for_test(&mut self) -> &mut [RealizedFrame] {
+        &mut self.frames
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_last_frame_for_test(&mut self) {
+        let last = self.frames.pop();
+        self.frames.clear();
+        self.frames.extend(last);
+        self.child_slots.clear();
+    }
+
     pub(crate) fn child_slots(&self) -> &[MountedChildSlot] {
         &self.child_slots
     }
@@ -1895,6 +1908,54 @@ impl RealizedBranch {
     #[cfg(test)]
     pub(crate) fn pop_frame_for_test(&mut self) -> Option<RealizedFrame> {
         self.frames.pop()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reverse_frames_for_test(&mut self) {
+        self.frames.reverse();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reverse_child_slots_for_test(&mut self) {
+        self.child_slots.reverse();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_child_slots_for_test(&mut self) {
+        self.child_slots.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_child_slot_unchecked_for_test(&mut self, slot: MountedChildSlot) {
+        self.child_slots.push(slot);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_frame_mount_from_for_test(&mut self, target: usize, source: usize) {
+        let mount = self.frames[source].mount_binding().clone();
+        self.frames[target].replace_mount_binding_for_test(mount);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_frame_claim_for_test(
+        &mut self,
+        frame: usize,
+        entity: bevy_ecs::prelude::Entity,
+        claim: ExactRegistryClaim,
+    ) {
+        self.frames[frame].replace_primary_claim_for_test(entity, claim);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_cycle_for_test(&mut self, frame: usize, slot: usize, mount_source: usize) {
+        let mount = self.frames[mount_source].mount_binding().clone();
+        let mut frame = self.frames.remove(frame);
+        let slot = self.child_slots.remove(slot);
+        frame.replace_mount_binding_for_test(mount);
+        self.frames.clear();
+        self.frames.push(frame);
+        self.child_slots.clear();
+        self.child_slots.push(slot);
     }
 
     #[cfg(feature = "test-support")]
@@ -2456,6 +2517,10 @@ impl FailedPreparedBranch {
         self.realized.frames()
     }
 
+    pub(crate) const fn realized(&self) -> &RealizedBranch {
+        &self.realized
+    }
+
     pub(crate) fn child_slots(&self) -> &[MountedChildSlot] {
         self.realized.child_slots()
     }
@@ -2485,6 +2550,28 @@ impl FailedPreparedBranch {
     #[cfg(test)]
     pub(crate) fn into_realized_for_test(self) -> RealizedBranch {
         self.realized
+    }
+
+    #[cfg(test)]
+    pub(crate) fn duplicate_first_child_slot_for_test(&mut self) {
+        let duplicate = self.realized.child_slots()[0].clone_for_test();
+        self.realized.push_child_slot_unchecked_for_test(duplicate);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_frame_claim_for_test(
+        &mut self,
+        frame: usize,
+        entity: bevy_ecs::prelude::Entity,
+        claim: ExactRegistryClaim,
+    ) {
+        self.realized
+            .replace_frame_claim_for_test(frame, entity, claim);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_rejected_child_slot_for_test(&mut self, slot: RejectedChildSlot) {
+        self.rejected_child_slots.push(slot);
     }
 }
 

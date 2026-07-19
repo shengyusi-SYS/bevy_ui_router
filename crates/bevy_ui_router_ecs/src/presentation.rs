@@ -780,6 +780,24 @@ impl RealizedFrame {
         &self.mount
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_mount_binding_for_test(&mut self, mount: FrameMountBinding) {
+        self.mount = mount;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_primary_claim_for_test(
+        &mut self,
+        entity: Entity,
+        claim: ExactRegistryClaim,
+    ) {
+        self.entities
+            .iter_mut()
+            .find(|realized| realized.entity == entity)
+            .expect("test claim replacement targets one stored frame entity")
+            .claim = claim;
+    }
+
     pub(crate) fn sealed_reconciliation_entering_shell_for(
         &self,
         existing: &Self,
@@ -861,6 +879,11 @@ impl RealizedFrame {
 
     pub(crate) const fn prewrite_complete(&self) -> bool {
         self.prewrite_complete
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_prewrite_incomplete_for_test(&mut self) {
+        self.prewrite_complete = false;
     }
 
     pub(crate) fn claims(&self) -> impl ExactSizeIterator<Item = &ExactRegistryClaim> {
@@ -2593,16 +2616,31 @@ fn owned_children_with_foreign_descendants(
     Some(actual.iter().any(|child| !expected.contains(child)))
 }
 
-pub(crate) fn isolate_frame_for_settlement(world: &mut World, frame: &RealizedFrame) -> bool {
+pub(crate) fn isolate_frame_for_settlement(
+    world: &mut World,
+    frame: &RealizedFrame,
+    requires_exact_isolation: &impl Fn(&ExactRegistryClaim) -> bool,
+) -> bool {
     if !frame
         .entities
         .iter()
+        .filter(|realized| requires_exact_isolation(&realized.claim))
         .all(|realized| frame_claim_is_current(world, realized))
     {
         return false;
     }
-    for realized in &frame.entities {
+    for realized in frame
+        .entities
+        .iter()
+        .filter(|realized| requires_exact_isolation(&realized.claim))
+    {
+        if !frame_claim_is_current(world, realized) {
+            return false;
+        }
         if world.get::<Visibility>(realized.entity).is_none() {
+            if !frame_claim_is_current(world, realized) {
+                return false;
+            }
             world.entity_mut(realized.entity).insert(Visibility::Hidden);
             world.flush();
             if !frame_claim_is_current(world, realized)
@@ -2612,6 +2650,9 @@ pub(crate) fn isolate_frame_for_settlement(world: &mut World, frame: &RealizedFr
             }
         }
         if world.get::<Pickable>(realized.entity).is_none() {
+            if !frame_claim_is_current(world, realized) {
+                return false;
+            }
             world.entity_mut(realized.entity).insert(Pickable::IGNORE);
             world.flush();
             if !frame_claim_is_current(world, realized)
@@ -2621,6 +2662,9 @@ pub(crate) fn isolate_frame_for_settlement(world: &mut World, frame: &RealizedFr
             }
         }
         if world.get::<RouterInputBarrier>(realized.entity).is_none() {
+            if !frame_claim_is_current(world, realized) {
+                return false;
+            }
             world
                 .entity_mut(realized.entity)
                 .insert(RouterInputBarrier::deny_all());
@@ -2633,32 +2677,65 @@ pub(crate) fn isolate_frame_for_settlement(world: &mut World, frame: &RealizedFr
                 return false;
             }
         }
-        let Some(mut visibility) = world.get_mut::<Visibility>(realized.entity) else {
+        if !frame_claim_is_current(world, realized) {
             return false;
-        };
-        *visibility = Visibility::Hidden;
-        let Some(mut pickable) = world.get_mut::<Pickable>(realized.entity) else {
+        }
+        {
+            let Some(mut visibility) = world.get_mut::<Visibility>(realized.entity) else {
+                return false;
+            };
+            *visibility = Visibility::Hidden;
+        }
+        if !frame_claim_is_current(world, realized)
+            || world.get::<Visibility>(realized.entity) != Some(&Visibility::Hidden)
+        {
             return false;
-        };
-        *pickable = Pickable::IGNORE;
-        let Some(mut barrier) = world.get_mut::<RouterInputBarrier>(realized.entity) else {
+        }
+        {
+            let Some(mut pickable) = world.get_mut::<Pickable>(realized.entity) else {
+                return false;
+            };
+            *pickable = Pickable::IGNORE;
+        }
+        if !frame_claim_is_current(world, realized)
+            || world.get::<Pickable>(realized.entity) != Some(&Pickable::IGNORE)
+        {
             return false;
-        };
-        *barrier = RouterInputBarrier::deny_all();
-    }
-    clear_frame_focus(world, frame);
-    frame_is_isolated_for_settlement(world, frame)
-}
-
-pub(crate) fn frame_is_isolated_for_settlement(world: &World, frame: &RealizedFrame) -> bool {
-    frame.entities.iter().all(|realized| {
-        frame_claim_is_current(world, realized)
-            && world.get::<Visibility>(realized.entity) == Some(&Visibility::Hidden)
-            && world.get::<Pickable>(realized.entity) == Some(&Pickable::IGNORE)
-            && world
+        }
+        {
+            let Some(mut barrier) = world.get_mut::<RouterInputBarrier>(realized.entity) else {
+                return false;
+            };
+            *barrier = RouterInputBarrier::deny_all();
+        }
+        if !frame_claim_is_current(world, realized)
+            || !world
                 .get::<RouterInputBarrier>(realized.entity)
                 .is_some_and(RouterInputBarrier::denies_all)
-    })
+        {
+            return false;
+        }
+    }
+    frame_is_isolated_for_settlement(world, frame, requires_exact_isolation)
+}
+
+pub(crate) fn frame_is_isolated_for_settlement(
+    world: &World,
+    frame: &RealizedFrame,
+    requires_exact_isolation: &impl Fn(&ExactRegistryClaim) -> bool,
+) -> bool {
+    frame
+        .entities
+        .iter()
+        .filter(|realized| requires_exact_isolation(&realized.claim))
+        .all(|realized| {
+            frame_claim_is_current(world, realized)
+                && world.get::<Visibility>(realized.entity) == Some(&Visibility::Hidden)
+                && world.get::<Pickable>(realized.entity) == Some(&Pickable::IGNORE)
+                && world
+                    .get::<RouterInputBarrier>(realized.entity)
+                    .is_some_and(RouterInputBarrier::denies_all)
+        })
 }
 
 fn frame_claim_is_current(world: &World, realized: &RealizedEntity) -> bool {

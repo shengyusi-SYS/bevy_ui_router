@@ -219,6 +219,45 @@ impl RouterNavigationState {
         self.active = active;
     }
 
+    pub(crate) fn begin_authority_recovery(
+        &mut self,
+        version: &HostVersion,
+        top_slot: crate::ids::RouteSlotId,
+    ) -> bool {
+        let exact = self.availability == RouterAvailability::Ready
+            && self.authority.as_ref().is_some_and(|authority| {
+                &authority.version == version && authority.top_slot == top_slot
+            });
+        if exact {
+            self.availability = RouterAvailability::RecoveringAuthority;
+        }
+        exact
+    }
+
+    pub(crate) fn complete_authority_settlement(
+        &mut self,
+        version: &HostVersion,
+        top_slot: crate::ids::RouteSlotId,
+    ) -> bool {
+        let exact = self.availability == RouterAvailability::RecoveringAuthority
+            && self.authority.as_ref().is_some_and(|authority| {
+                &authority.version == version && authority.top_slot == top_slot
+            });
+        if exact {
+            self.active = ActivePresentation::none();
+            self.authority = None;
+            self.availability = RouterAvailability::AwaitingHost;
+        }
+        exact
+    }
+
+    pub(crate) fn fail_closed_unavailable(&mut self, reason: RouterUnavailableReason) {
+        self.active = ActivePresentation::none();
+        self.authority = None;
+        self.current_request = None;
+        self.availability = RouterAvailability::Unavailable(reason);
+    }
+
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> Self {
         self.clone()

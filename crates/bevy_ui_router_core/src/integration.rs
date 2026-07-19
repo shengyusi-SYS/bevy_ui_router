@@ -1,14 +1,18 @@
 use crate::admission::{
     AdmissionError as CoreAdmissionError, HostAdmissionIssuer,
     HostAdmissionToken as CoreHostAdmissionToken, HostGrant as CoreHostGrant,
+    HostLease as CoreHostLease,
 };
 use crate::cleanup::{
     CleanupBatchToken, CleanupCompletion as CoreCleanupCompletion, CleanupCompletionDigest,
     CleanupManifestDigest, CleanupManifestSeal, CleanupSummary,
 };
 use crate::engine::{
+    BeginAuthoritySettlementErrorKind as CoreBeginAuthoritySettlementErrorKind,
     CommitError as CoreCommitError, CommitTicket as CoreCommitTicket,
     EngineAction as CoreEngineAction, EngineInstallError as CoreEngineInstallError,
+    FailedAuthoritySettlementTrigger as CoreFailedAuthoritySettlementTrigger,
+    FailedAuthorityTriggerError as CoreFailedAuthorityTriggerError,
     FailureCleanupError as CoreFailureCleanupError,
     FailureCleanupRequest as CoreFailureCleanupRequest, FrameMountRequest as CoreFrameMountRequest,
     FrameMountTarget as CoreFrameMountTarget, FrameTask as CoreFrameTask,
@@ -59,6 +63,70 @@ pub enum IntegrationError {
     Stale,
     Invalid,
     InvalidManifest,
+}
+
+#[doc(hidden)]
+pub struct HostLease {
+    inner: CoreHostLease,
+}
+
+#[doc(hidden)]
+pub struct FailedAuthoritySettlementTrigger {
+    inner: CoreFailedAuthoritySettlementTrigger,
+}
+
+#[cfg(test)]
+impl FailedAuthoritySettlementTrigger {
+    pub fn testing_duplicate(&self) -> Self {
+        Self {
+            inner: self.inner.testing_duplicate(),
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FailedAuthorityTriggerError {
+    Foreign,
+    Stale,
+    WrongPhase,
+    Exhausted,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BeginAuthoritySettlementErrorKind {
+    Foreign,
+    Stale,
+    WrongPhase,
+    InvalidManifest,
+    RetryablePreparation,
+}
+
+#[must_use = "failed authority settlement begin returns the exact host lease"]
+#[doc(hidden)]
+pub struct BeginAuthoritySettlementError {
+    kind: BeginAuthoritySettlementErrorKind,
+    owner: HostLease,
+}
+
+impl BeginAuthoritySettlementError {
+    pub fn kind(&self) -> BeginAuthoritySettlementErrorKind {
+        self.kind
+    }
+
+    pub fn into_owner(self) -> HostLease {
+        self.owner
+    }
+}
+
+impl std::fmt::Debug for BeginAuthoritySettlementError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BeginAuthoritySettlementError")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
 }
 
 #[doc(hidden)]
@@ -1118,7 +1186,8 @@ impl RouterEngine {
         Ok(())
     }
 
-    pub fn confirm_host(&mut self, grant: HostGrant) {
+    #[doc(hidden)]
+    pub fn confirm_host(&mut self, grant: HostGrant) -> HostLease {
         let confirmation = self
             .admission
             .confirm(&grant.inner)
@@ -1131,6 +1200,165 @@ impl RouterEngine {
             self.inner.host().cloned(),
             self.inner.top_slot(),
         ));
+        HostLease {
+            inner: confirmation.into_lease(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn failed_authority_trigger_for_task(
+        &mut self,
+        task: &FrameTask,
+    ) -> Result<FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError> {
+        self.inner
+            .failed_authority_trigger_for_task(task.inner.identity())
+            .map(|inner| FailedAuthoritySettlementTrigger { inner })
+            .map_err(map_failed_authority_trigger_error)
+    }
+
+    #[doc(hidden)]
+    pub fn failed_authority_trigger_for_cleanup(
+        &mut self,
+        request: &FailureCleanupRequest,
+    ) -> Result<FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError> {
+        self.inner
+            .failed_authority_trigger_for_cleanup(&request.inner)
+            .map(|inner| FailedAuthoritySettlementTrigger { inner })
+            .map_err(map_failed_authority_trigger_error)
+    }
+
+    #[doc(hidden)]
+    pub fn failed_authority_trigger_for_registration_begin(
+        &mut self,
+        error: &MountRegistrationBeginError,
+    ) -> Result<FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError> {
+        self.inner
+            .failed_authority_trigger_for_registration_begin(&error.permit)
+            .map(|inner| FailedAuthoritySettlementTrigger { inner })
+            .map_err(map_failed_authority_trigger_error)
+    }
+
+    #[doc(hidden)]
+    pub fn begin_authority_settlement_retaining<F>(
+        &mut self,
+        lease: HostLease,
+        manifest: CleanupManifest,
+        authority_mutation: F,
+    ) -> Result<CleanupBatch, BeginAuthoritySettlementError>
+    where
+        F: FnOnce(CleanupBatch),
+    {
+        self.begin_authority_settlement_with_trigger(lease, None, manifest, authority_mutation)
+    }
+
+    #[doc(hidden)]
+    pub fn begin_failed_authority_settlement_retaining<F>(
+        &mut self,
+        lease: HostLease,
+        trigger: FailedAuthoritySettlementTrigger,
+        manifest: CleanupManifest,
+        authority_mutation: F,
+    ) -> Result<CleanupBatch, BeginAuthoritySettlementError>
+    where
+        F: FnOnce(CleanupBatch),
+    {
+        self.begin_authority_settlement_with_trigger(
+            lease,
+            Some(trigger),
+            manifest,
+            authority_mutation,
+        )
+    }
+
+    fn begin_authority_settlement_with_trigger<F>(
+        &mut self,
+        lease: HostLease,
+        trigger: Option<FailedAuthoritySettlementTrigger>,
+        manifest: CleanupManifest,
+        authority_mutation: F,
+    ) -> Result<CleanupBatch, BeginAuthoritySettlementError>
+    where
+        F: FnOnce(CleanupBatch),
+    {
+        if self.host_trace.try_reserve(2).is_err() {
+            return Err(BeginAuthoritySettlementError {
+                kind: BeginAuthoritySettlementErrorKind::RetryablePreparation,
+                owner: lease,
+            });
+        }
+        let version = self.inner.host().cloned();
+        let slot = self.inner.top_slot();
+        let manifest_digest = manifest.manifest_digest;
+        let obligation_count = manifest.obligation_count;
+        let inner_engine = &mut self.inner;
+        let admission = &mut self.admission;
+        let host_trace = &mut self.host_trace;
+        let seal = CleanupManifestSeal::new(
+            manifest.logical_roots,
+            CleanupManifestDigest::from_opaque(manifest_digest),
+            obligation_count,
+        );
+        let publication = |_: &CoreRouterEngine, inner: CleanupBatchToken| {
+            authority_mutation(CleanupBatch {
+                inner: inner.clone(),
+                manifest_digest,
+                obligation_count,
+            });
+            host_trace.push(HostTraceEvent::project(
+                HostTraceEventKind::SettlementStarted,
+                version.clone(),
+                slot,
+            ));
+        };
+        let result = match trigger {
+            Some(trigger) => inner_engine.begin_failed_authority_settlement_retaining(
+                admission,
+                lease.inner,
+                trigger.inner,
+                seal,
+                publication,
+            ),
+            None => inner_engine.begin_authority_settlement_retaining(
+                admission,
+                lease.inner,
+                seal,
+                publication,
+            ),
+        };
+        let inner = match result {
+            Ok(inner) => inner,
+            Err(error) => {
+                return Err(BeginAuthoritySettlementError {
+                    kind: map_begin_authority_settlement_error(error.kind()),
+                    owner: HostLease {
+                        inner: error.into_owner(),
+                    },
+                });
+            }
+        };
+        Ok(CleanupBatch {
+            inner,
+            manifest_digest,
+            obligation_count,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn fail_closed_authority_protocol_retaining<F>(
+        &mut self,
+        lease: Option<HostLease>,
+        authority_mutation: F,
+    ) -> Result<(), Option<HostLease>>
+    where
+        F: FnOnce(),
+    {
+        self.inner
+            .fail_closed_authority_protocol_retaining(
+                &mut self.admission,
+                lease.map(|lease| lease.inner),
+                authority_mutation,
+            )
+            .map_err(|inner| inner.map(|inner| HostLease { inner }))
     }
 
     pub fn push(
@@ -1502,6 +1730,38 @@ impl RouterEngine {
             })
     }
 
+    #[doc(hidden)]
+    pub fn complete_authority_cleanup<F>(
+        &mut self,
+        completion: CleanupCompletion,
+        mutation: F,
+    ) -> Result<(), IntegrationError>
+    where
+        F: FnOnce(),
+    {
+        if self.host_trace.try_reserve(1).is_err() {
+            return Err(IntegrationError::Invalid);
+        }
+        let version = self.inner.host().cloned();
+        let slot = self.inner.top_slot();
+        let inner = &mut self.inner;
+        let host_trace = &mut self.host_trace;
+        inner
+            .complete_cleanup_with_authority_mutation(completion.inner, || {
+                mutation();
+                host_trace.push(HostTraceEvent::project(
+                    HostTraceEventKind::SettlementCompleted,
+                    version,
+                    slot,
+                ));
+            })
+            .map_err(|error| match error {
+                crate::engine::CleanupError::Duplicate => IntegrationError::Duplicate,
+                crate::engine::CleanupError::Stale => IntegrationError::Stale,
+                crate::engine::CleanupError::Invalid => IntegrationError::Invalid,
+            })
+    }
+
     pub fn observe_cleanup_receipt(
         &mut self,
         batch: &CleanupBatch,
@@ -1604,9 +1864,41 @@ fn map_admission_error(error: CoreAdmissionError) -> IntegrationError {
     }
 }
 
+fn map_failed_authority_trigger_error(
+    error: CoreFailedAuthorityTriggerError,
+) -> FailedAuthorityTriggerError {
+    match error {
+        CoreFailedAuthorityTriggerError::Foreign => FailedAuthorityTriggerError::Foreign,
+        CoreFailedAuthorityTriggerError::Stale => FailedAuthorityTriggerError::Stale,
+        CoreFailedAuthorityTriggerError::WrongPhase => FailedAuthorityTriggerError::WrongPhase,
+        CoreFailedAuthorityTriggerError::Exhausted => FailedAuthorityTriggerError::Exhausted,
+    }
+}
+
+fn map_begin_authority_settlement_error(
+    error: CoreBeginAuthoritySettlementErrorKind,
+) -> BeginAuthoritySettlementErrorKind {
+    match error {
+        CoreBeginAuthoritySettlementErrorKind::Foreign => {
+            BeginAuthoritySettlementErrorKind::Foreign
+        }
+        CoreBeginAuthoritySettlementErrorKind::Stale => BeginAuthoritySettlementErrorKind::Stale,
+        CoreBeginAuthoritySettlementErrorKind::WrongPhase => {
+            BeginAuthoritySettlementErrorKind::WrongPhase
+        }
+        CoreBeginAuthoritySettlementErrorKind::InvalidManifest => {
+            BeginAuthoritySettlementErrorKind::InvalidManifest
+        }
+        CoreBeginAuthoritySettlementErrorKind::RetryablePreparation => {
+            BeginAuthoritySettlementErrorKind::RetryablePreparation
+        }
+    }
+}
+
 fn map_push_error(error: CorePushError) -> IntegrationError {
     match error {
         CorePushError::AwaitingHost => IntegrationError::AwaitingHost,
+        CorePushError::AuthorityRecovering => IntegrationError::AuthorityExists,
         CorePushError::IdExhausted => IntegrationError::Exhausted,
     }
 }
@@ -1702,6 +1994,196 @@ mod tests {
         engine.record_top_slot_registered(&grant).unwrap();
         engine.confirm_host(grant);
         engine
+    }
+
+    fn confirmed_nested_engine_with_lease() -> (RouterEngine, HostLease) {
+        let mut engine =
+            RouterEngine::install(nested_tree(), RouteViewKey::new("fallback").unwrap()).unwrap();
+        let token = engine.request_host_admission().unwrap();
+        let grant = engine.grant_host_admission(&token).unwrap();
+        engine.record_top_slot_registered(&grant).unwrap();
+        let lease = engine.confirm_host(grant);
+        (engine, lease)
+    }
+
+    #[test]
+    fn failed_authority_trigger_is_burned_on_rejection_and_cannot_replay() {
+        let (mut engine, lease) = confirmed_nested_engine_with_lease();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("failed terminal fixture requires one exact frame task")
+        };
+        let trigger = engine.failed_authority_trigger_for_task(&task).unwrap();
+        let replay = trigger.testing_duplicate();
+        let error = match engine.begin_failed_authority_settlement_retaining(
+            lease,
+            trigger,
+            CleanupManifest::new(vec![task.frame().clone(), task.frame().clone()], 0xFA11, 2),
+            |_| panic!("invalid manifest must reject before publication"),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("mismatched Core-frozen roots reject publication"),
+        };
+        assert_eq!(
+            error.kind(),
+            BeginAuthoritySettlementErrorKind::InvalidManifest
+        );
+        let returned_lease = error.into_owner();
+        let replacement = engine.failed_authority_trigger_for_task(&task).unwrap();
+        let replay_error = match engine.begin_failed_authority_settlement_retaining(
+            returned_lease,
+            replay,
+            CleanupManifest::empty(),
+            |_| panic!("burned trigger must not publish"),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate trigger is stale even after rejected publication"),
+        };
+        assert_eq!(
+            replay_error.kind(),
+            BeginAuthoritySettlementErrorKind::Stale
+        );
+        let returned_lease = replay_error.into_owner();
+        let replacement_error = match engine.begin_failed_authority_settlement_retaining(
+            returned_lease,
+            replacement,
+            CleanupManifest::new(vec![task.frame().clone(), task.frame().clone()], 0xFA12, 2),
+            |_| panic!("invalid replacement manifest must not publish"),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the fresh revision must remain live after stale replay rejection"),
+        };
+        assert_eq!(
+            replacement_error.kind(),
+            BeginAuthoritySettlementErrorKind::InvalidManifest
+        );
+        assert_eq!(engine.snapshot().availability(), &RouterAvailability::Ready);
+    }
+
+    #[test]
+    fn failed_authority_task_trigger_accepts_either_core_frozen_root_set() {
+        for include_target in [false, true] {
+            let (mut engine, lease) = confirmed_nested_engine_with_lease();
+            engine.push(RouteLocation::new("/items/1")).unwrap();
+            engine.collect();
+            let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+                panic!("failed terminal fixture requires one exact frame task")
+            };
+            let trigger = engine.failed_authority_trigger_for_task(&task).unwrap();
+            let manifest = if include_target {
+                CleanupManifest::new(vec![task.frame().clone()], 0xFA12, 1)
+            } else {
+                CleanupManifest::empty()
+            };
+            let published = std::cell::Cell::new(false);
+
+            if let Err(_) =
+                engine.begin_failed_authority_settlement_retaining(lease, trigger, manifest, |_| {
+                    published.set(true)
+                })
+            {
+                panic!("either Core-frozen task root set is admissible");
+            }
+
+            assert!(published.get());
+            assert_eq!(
+                engine.snapshot().availability(),
+                &RouterAvailability::RecoveringAuthority
+            );
+        }
+    }
+
+    #[test]
+    fn failed_authority_task_target_root_requires_a_physical_obligation() {
+        let (mut engine, lease) = confirmed_nested_engine_with_lease();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("failed terminal fixture requires one exact frame task")
+        };
+        let trigger = engine.failed_authority_trigger_for_task(&task).unwrap();
+        let error = match engine.begin_failed_authority_settlement_retaining(
+            lease,
+            trigger,
+            CleanupManifest::new(vec![task.frame().clone()], 0xFA13, 0),
+            |_| panic!("target roots without obligations must not publish"),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the target-bearing root set requires a physical obligation"),
+        };
+
+        assert_eq!(
+            error.kind(),
+            BeginAuthoritySettlementErrorKind::InvalidManifest
+        );
+        assert_eq!(engine.snapshot().availability(), &RouterAvailability::Ready);
+    }
+
+    #[test]
+    fn failed_authority_cleanup_trigger_does_not_replace_the_terminal_owner() {
+        let (mut engine, lease) = confirmed_nested_engine_with_lease();
+        let mount = pending_mount_request(&mut engine);
+        let cleanup = engine
+            .reject_mount(mount, MountRejectionKind::MissingOutlet)
+            .unwrap();
+        let roots = cleanup.logical_roots().to_vec();
+        let trigger = engine
+            .failed_authority_trigger_for_cleanup(&cleanup)
+            .unwrap();
+        let error = match engine.begin_failed_authority_settlement_retaining(
+            lease,
+            trigger,
+            CleanupManifest::new(Vec::new(), 0xFA14, 1),
+            |_| panic!("invalid cleanup roots must not publish"),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the failed cleanup trigger freezes its exact logical roots"),
+        };
+        assert_eq!(
+            error.kind(),
+            BeginAuthoritySettlementErrorKind::InvalidManifest
+        );
+
+        engine
+            .prepare_failure_cleanup_retaining(cleanup, CleanupManifest::new(roots, 0xFA15, 1))
+            .expect("the caller still owns the consumable cleanup terminal");
+    }
+
+    #[test]
+    fn failed_authority_registration_trigger_does_not_replace_the_terminal_owner() {
+        let (mut engine, lease) = confirmed_nested_engine_with_lease();
+        let (request, parent, _, permit, _) =
+            pending_mount_registration(&mut engine, "/items/1", 0xFA16);
+        let mut foreign = confirmed_nested_engine();
+        let (_, _, _, _, foreign_proof) =
+            pending_mount_registration(&mut foreign, "/items/1", 0xFA16);
+        let registration = match engine.begin_mount_registration(permit, &foreign_proof) {
+            Err(error) => error,
+            Ok(_) => panic!("foreign proof must retain the exact registration permit"),
+        };
+        let trigger = engine
+            .failed_authority_trigger_for_registration_begin(&registration)
+            .unwrap();
+        let settlement = match engine.begin_failed_authority_settlement_retaining(
+            lease,
+            trigger,
+            CleanupManifest::new(Vec::new(), 0xFA17, 1),
+            |_| panic!("invalid registration roots must not publish"),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("registration trigger freezes current applied roots"),
+        };
+        assert_eq!(
+            settlement.kind(),
+            BeginAuthoritySettlementErrorKind::InvalidManifest
+        );
+
+        let cleanup = registration
+            .reject(&mut engine)
+            .expect("the caller still owns the consumable registration terminal");
+        assert_eq!(cleanup.request(), request);
+        assert_eq!(cleanup.logical_roots(), &[parent]);
     }
 
     fn pending_mount_request(engine: &mut RouterEngine) -> MountRequest {

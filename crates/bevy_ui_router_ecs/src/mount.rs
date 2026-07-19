@@ -209,6 +209,22 @@ impl MountedChildSlot {
         self.slot_id = slot_id;
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_slot_binding_for_test(
+        &mut self,
+        slot: Entity,
+        slot_claim: ExactRegistryClaim,
+        parent: RouteFrameVersion,
+        outlet: RouteSlotKey,
+        slot_id: RouteSlotId,
+    ) {
+        self.slot = slot;
+        self.slot_claim = slot_claim;
+        self.parent = parent;
+        self.outlet = outlet;
+        self.slot_id = slot_id;
+    }
+
     pub(crate) fn internal_claims_can_rebind(
         &self,
         claims: &[ExactRegistryClaim],
@@ -322,6 +338,32 @@ impl ChildSlotResidual {
 
     pub(crate) fn prior_anchor_children(&self) -> &[Entity] {
         self.provisional.prior_anchor_children()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_mounted_with_boundary_for_test(
+        world: &World,
+        mounted: &MountedChildSlot,
+        anchor: Entity,
+        anchor_claim: ExactRegistryClaim,
+    ) -> Self {
+        Self {
+            state: ChildSlotResidualState::Registered,
+            provisional: ProvisionalChildSlot {
+                slot: mounted.slot,
+                slot_claim: mounted.slot_claim.clone(),
+                parent: mounted.parent.clone(),
+                outlet: mounted.outlet.clone(),
+                anchor,
+                anchor_claim,
+                prior_anchor_children: world
+                    .get::<Children>(anchor)
+                    .map(|children| children.iter().copied().collect())
+                    .unwrap_or_default(),
+            },
+            authorized_manifest: ComponentManifest::from_world(world, mounted.slot)
+                .expect("mounted test slot remains present"),
+        }
     }
 }
 
@@ -834,12 +876,50 @@ pub(crate) fn mounted_child_slot_is_isolated(world: &World, slot: &MountedChildS
     validate_mounted_child_slot(world, slot, EntityLifecycle::PreparedInert)
 }
 
+pub(crate) fn mounted_child_slot_structure_is_isolated(
+    world: &World,
+    slot: &MountedChildSlot,
+) -> bool {
+    validate_mounted_child_slot_with_policy(
+        world,
+        slot,
+        EntityLifecycle::PreparedInert,
+        false,
+        false,
+    )
+}
+
+pub(crate) fn mounted_child_slot_local_is_isolated(world: &World, slot: &MountedChildSlot) -> bool {
+    world
+        .get_resource::<RouteEntityRegistry>()
+        .and_then(|registry| registry.record(slot.slot))
+        .is_some_and(|record| {
+            record.claim() == slot.slot_claim
+                && record.lifecycle() == EntityLifecycle::PreparedInert
+        })
+        && world.get::<Visibility>(slot.slot) == Some(&Visibility::Hidden)
+        && world.get::<Pickable>(slot.slot) == Some(&Pickable::IGNORE)
+        && world
+            .get::<RouterInputBarrier>(slot.slot)
+            .is_some_and(RouterInputBarrier::denies_all)
+        && world.get::<RouteOwnershipSeal>(slot.slot)
+            == Some(&RouteOwnershipSeal::new(slot.slot_claim.seal()))
+        && world.get::<ChildSlotLifecycle>(slot.slot) == Some(&ChildSlotLifecycle::RegisteredInert)
+        && world
+            .get::<ChildSlotAuthority>(slot.slot)
+            .is_some_and(|authority| {
+                authority.parent() == &slot.parent
+                    && authority.outlet() == &slot.outlet
+                    && authority.slot() == slot.slot_id
+            })
+}
+
 pub(crate) fn validate_mounted_child_slot(
     world: &World,
     slot: &MountedChildSlot,
     lifecycle: EntityLifecycle,
 ) -> bool {
-    validate_mounted_child_slot_with_policy(world, slot, lifecycle, false)
+    validate_mounted_child_slot_with_policy(world, slot, lifecycle, false, true)
 }
 
 pub(crate) fn validate_leaving_mounted_child_slot(
@@ -847,7 +927,7 @@ pub(crate) fn validate_leaving_mounted_child_slot(
     slot: &MountedChildSlot,
     lifecycle: EntityLifecycle,
 ) -> bool {
-    validate_mounted_child_slot_with_policy(world, slot, lifecycle, true)
+    validate_mounted_child_slot_with_policy(world, slot, lifecycle, true, true)
 }
 
 fn validate_mounted_child_slot_with_policy(
@@ -855,6 +935,7 @@ fn validate_mounted_child_slot_with_policy(
     slot: &MountedChildSlot,
     lifecycle: EntityLifecycle,
     allow_foreign_additions: bool,
+    require_focus_outside: bool,
 ) -> bool {
     let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
         return false;
@@ -906,7 +987,9 @@ fn validate_mounted_child_slot_with_policy(
             })
         && world.get::<ChildOf>(slot.slot).map(ChildOf::parent) == Some(slot.anchor)
         && children_of(world, slot.anchor) == slot.expected_anchor_children
-        && (lifecycle == EntityLifecycle::Active || !focus_is_in_slot(world, slot.slot))
+        && (lifecycle == EntityLifecycle::Active
+            || !require_focus_outside
+            || !focus_is_in_slot(world, slot.slot))
 }
 
 fn manifest_matches_policy(
@@ -984,6 +1067,65 @@ pub(crate) fn residual_child_slot_is_isolated(world: &World, residual: &ChildSlo
         && lifecycle_is_exact
         && authority_is_exact
         && relationship_is_exact
+}
+
+pub(crate) fn residual_child_slot_local_is_isolated(
+    world: &World,
+    residual: &ChildSlotResidual,
+) -> bool {
+    if world.get_entity(residual.entity()).is_err() {
+        return residual.state == ChildSlotResidualState::Absent;
+    }
+    let Some(record) = world
+        .get_resource::<RouteEntityRegistry>()
+        .and_then(|registry| registry.record(residual.entity()))
+    else {
+        return false;
+    };
+    if record.claim() != *residual.claim() {
+        return false;
+    }
+    let visibility_is_safe = world
+        .get::<Visibility>(residual.entity())
+        .is_none_or(|visibility| *visibility == Visibility::Hidden);
+    let pickable_is_safe = world
+        .get::<Pickable>(residual.entity())
+        .is_none_or(|pickable| *pickable == Pickable::IGNORE);
+    let barrier_is_safe = world
+        .get::<RouterInputBarrier>(residual.entity())
+        .is_none_or(RouterInputBarrier::denies_all);
+    let seal_is_exact = world
+        .get::<RouteOwnershipSeal>(residual.entity())
+        .is_none_or(|seal| *seal == RouteOwnershipSeal::new(residual.claim().seal()));
+    let lifecycle_is_exact = world
+        .get::<ChildSlotLifecycle>(residual.entity())
+        .is_none_or(|lifecycle| match residual.state {
+            ChildSlotResidualState::Provisional => {
+                *lifecycle == ChildSlotLifecycle::ProvisionalInert
+            }
+            ChildSlotResidualState::Registered => *lifecycle == ChildSlotLifecycle::RegisteredInert,
+            ChildSlotResidualState::Absent => false,
+        });
+    let authority_is_exact = world
+        .get::<ChildSlotAuthority>(residual.entity())
+        .is_none_or(|authority| {
+            let slot = match residual.claim().owner() {
+                RegistryOwner::Committed(crate::registry::EntityOwner::ChildSlot {
+                    slot, ..
+                })
+                | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { slot, .. }) => *slot,
+                _ => return false,
+            };
+            authority.parent() == residual.parent()
+                && authority.outlet() == residual.outlet()
+                && authority.slot() == slot
+        });
+    visibility_is_safe
+        && pickable_is_safe
+        && barrier_is_safe
+        && seal_is_exact
+        && lifecycle_is_exact
+        && authority_is_exact
 }
 
 fn confirmation_failure(
@@ -2718,6 +2860,20 @@ pub(crate) mod tests {
 
         let rejected = branch.push_child_slot(mounted).unwrap_err();
         let rejected_entity = rejected.slot().slot();
+        let canonical_anchor = rejected
+            .canonical_anchor()
+            .expect("the stored parent supplies the append-before canonical anchor");
+        let (source_parent, source_outlet, source_slot) = match rejected.slot().slot_claim().owner()
+        {
+            RegistryOwner::Committed(EntityOwner::ChildSlot {
+                parent,
+                outlet,
+                slot,
+            }) => (parent.clone(), outlet.clone(), *slot),
+            owner => {
+                panic!("confirmed rejected slot must retain its exact source owner: {owner:?}")
+            }
+        };
         assert_eq!(branch.frames().len(), 1);
         assert!(branch.child_slots().is_empty());
         assert_eq!(
@@ -2734,6 +2890,21 @@ pub(crate) mod tests {
 
         let failed = crate::branch_transaction::FailedPreparedBranch::with_rejected_child_slot(
             branch, rejected,
+        );
+        assert_eq!(
+            crate::cleanup::failed_prepared_rejected_topology_facts_for_test(
+                &world,
+                world.resource::<RouteEntityRegistry>(),
+                &failed,
+            )
+            .expect("the builder must classify the rejected source before freezing cleanup"),
+            vec![(
+                rejected_entity,
+                source_parent,
+                source_outlet,
+                source_slot,
+                Some(canonical_anchor),
+            )]
         );
         world.insert_resource(InputFocus::default());
         world.insert_resource(RouteFocusState::default());
@@ -2772,6 +2943,16 @@ pub(crate) mod tests {
             .expect("exact child slot should confirm");
         let slot = mounted.slot();
         let source_claim = mounted.slot_claim().clone();
+        let (source_parent, source_outlet, source_slot) = match source_claim.owner() {
+            RegistryOwner::Committed(EntityOwner::ChildSlot {
+                parent,
+                outlet,
+                slot,
+            }) => (parent.clone(), outlet.clone(), *slot),
+            owner => {
+                panic!("confirmed rejected slot must retain its exact source owner: {owner:?}")
+            }
+        };
         let EngineAction::FrameTask(child_task) = engine.action().unwrap() else {
             panic!("confirmed slot must issue its child task")
         };
@@ -2789,6 +2970,15 @@ pub(crate) mod tests {
         assert!(rejected.canonical_anchor_claim().is_none());
         let failed = crate::branch_transaction::FailedPreparedBranch::with_rejected_child_slot(
             branch, rejected,
+        );
+        assert_eq!(
+            crate::cleanup::failed_prepared_rejected_topology_facts_for_test(
+                &world,
+                world.resource::<RouteEntityRegistry>(),
+                &failed,
+            )
+            .expect("the builder must keep the exact source owner with no trusted boundary"),
+            vec![(slot, source_parent, source_outlet, source_slot, None,)]
         );
         world.insert_resource(InputFocus::default());
         world.insert_resource(RouteFocusState::default());

@@ -25,8 +25,11 @@ use crate::{
     },
     registry::{
         EntityLifecycle, EntityOwner, QuarantineLeaseTable, RegistryOwner, RouteEntityRegistry,
+        observed_owned_state,
     },
 };
+
+pub use crate::registry::AuditEntityState;
 
 const OWNED_ID_FLAG: u64 = 1 << 32;
 const AUDIT_NAMESPACE_SHIFT: u32 = 33;
@@ -35,15 +38,6 @@ const REMOVED_RETENTION: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct AuditEntityId(u64);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AuditEntityState {
-    PresentOwned,
-    Quarantined,
-    Removed,
-    NotRetained,
-    Unknown,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorityHostMapping {
@@ -353,26 +347,6 @@ impl RouterAuthorityAuditSnapshot {
     }
 }
 
-fn observed_owned_state(world: &World, entity: Entity) -> AuditEntityState {
-    if world
-        .get_resource::<QuarantineLeaseTable>()
-        .is_some_and(|table| {
-            table.record(entity).is_some() || table.unresolved_record(entity).is_some()
-        })
-    {
-        return AuditEntityState::Quarantined;
-    }
-    let record = world
-        .get_resource::<RouteEntityRegistry>()
-        .and_then(|registry| registry.record(entity));
-    match record.map(|record| record.lifecycle()) {
-        Some(EntityLifecycle::Quarantined) => AuditEntityState::Quarantined,
-        Some(_) => AuditEntityState::PresentOwned,
-        None if world.get_entity(entity).is_err() => AuditEntityState::Removed,
-        None => AuditEntityState::Unknown,
-    }
-}
-
 #[derive(Clone)]
 struct AuditIdentityRecord {
     router: RouterHandle,
@@ -492,6 +466,7 @@ impl RouterAuthorityAudits {
                 )
                 .chain(entry.leaving_cleanup_frames())
                 .chain(entry.failed_cleanup_frames())
+                .chain(entry.authority_protocol_residual_frames())
                 .map(|frame| frame.frame().clone())
                 .collect::<Vec<_>>();
             let previous = self.snapshots.iter().find_map(|(handle, snapshot)| {
@@ -524,6 +499,29 @@ impl RouterAuthorityAudits {
                                 .unwrap_or(AuditEntityState::NotRetained),
                         )
                     }));
+                current.owned_states.extend(
+                    entry
+                        .authority_protocol_residual_entities()
+                        .into_iter()
+                        .map(|entity| {
+                            (
+                                self.id_for(
+                                    entry.handle,
+                                    entity,
+                                    true,
+                                    None,
+                                    request,
+                                    false,
+                                    false,
+                                ),
+                                if world.get_entity(entity).is_ok() {
+                                    AuditEntityState::Unknown
+                                } else {
+                                    AuditEntityState::Removed
+                                },
+                            )
+                        }),
+                );
                 let snapshot =
                     self.finalize_snapshot(world, entry, previous.as_ref(), current, &[]);
                 snapshots.push((entry.handle, snapshot));

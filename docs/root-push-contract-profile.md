@@ -66,7 +66,7 @@ The profile parser requires exactly these columns and rejects duplicate or unkno
 | `cleanup_observer_reentry_supersedes_attempt` |
 | `cleanup_receipt_replay_is_rejected` |
 | `commit_gate_switch_is_same_frame_atomic` |
-| `exact_owned_cleanup_cycle_is_world_zero_and_retains_authority` |
+| `exact_owned_cleanup_cycle_quarantines_exact_set_and_releases_focus` |
 | `foreign_component_quarantine_avoids_hooks` |
 | `foreign_descendant_quarantines_owned_ancestor` |
 | `host_children_change_only_top_slot_membership` |

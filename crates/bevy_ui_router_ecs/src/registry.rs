@@ -1,9 +1,13 @@
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashSet,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use bevy_ecs::{
     component::ComponentId,
+    hierarchy::ChildOf,
     prelude::{Entity, Resource, World},
 };
 use bevy_ui_router_core::{
@@ -11,7 +15,10 @@ use bevy_ui_router_core::{
     integration::frame_versions_share_router, slot::RouteSlotKey,
 };
 
-use crate::cleanup::VerifiedCleanupQuarantineTransfer;
+use crate::cleanup::{
+    PreparedAuthorityLostResidualProjection, VerifiedCleanupQuarantineTransfer,
+    cleanup_claim_has_exact_authority,
+};
 use crate::host::HostCandidateRevision;
 use crate::host::VerifiedQuarantineTransfer;
 use crate::presentation::VerifiedFrameQuarantineTransfer;
@@ -19,10 +26,62 @@ use crate::presentation::VerifiedFrameQuarantineTransfer;
 static NEXT_SEAL_DOMAIN: AtomicU64 = AtomicU64::new(1);
 static NEXT_QUARANTINE_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuditEntityState {
+    PresentOwned,
+    Quarantined,
+    Removed,
+    NotRetained,
+    Unknown,
+}
+
+pub(crate) fn observed_owned_state(world: &World, entity: Entity) -> AuditEntityState {
+    let record = world
+        .get_resource::<RouteEntityRegistry>()
+        .and_then(|registry| registry.record(entity));
+    if let Some(lifecycle) = record.map(|record| record.lifecycle()) {
+        return match lifecycle {
+            EntityLifecycle::Quarantined => AuditEntityState::Quarantined,
+            _ => AuditEntityState::PresentOwned,
+        };
+    }
+    if world
+        .get_resource::<QuarantineLeaseTable>()
+        .is_some_and(|table| table.record(entity).is_some())
+    {
+        return AuditEntityState::Quarantined;
+    }
+    if world
+        .get_resource::<QuarantineLeaseTable>()
+        .is_some_and(|table| table.unresolved_record(entity).is_some())
+    {
+        return AuditEntityState::Unknown;
+    }
+    if world
+        .get_resource::<QuarantineLeaseTable>()
+        .is_some_and(|table| table.authority_lost_tombstone(entity).is_some())
+    {
+        return if world.get_entity(entity).is_err() {
+            AuditEntityState::Removed
+        } else {
+            AuditEntityState::Unknown
+        };
+    }
+    if world.get_entity(entity).is_err() {
+        AuditEntityState::Removed
+    } else {
+        AuditEntityState::Unknown
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_UNRESOLVED_PREPARATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_NEXT_VERIFIED_PREPARATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_AUTHORITY_PUBLICATION_CAPACITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static AUTHORITY_PUBLICATION_MUTATION_STARTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static AUTHORITY_POSTMUTATION_RESERVATION_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static AUTHORITY_POSTMUTATION_MANIFEST_MATERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -34,6 +93,70 @@ pub(crate) fn fail_next_unresolved_preparation_for_test() {
 pub(crate) fn fail_next_verified_preparation_for_test() {
     FAIL_NEXT_VERIFIED_PREPARATION.set(true);
 }
+
+#[cfg(test)]
+pub(crate) fn fail_next_authority_publication_capacity_reservation_for_test() {
+    FAIL_NEXT_AUTHORITY_PUBLICATION_CAPACITY.set(true);
+}
+
+#[cfg(test)]
+fn authority_publication_capacity_fault_injected() -> bool {
+    FAIL_NEXT_AUTHORITY_PUBLICATION_CAPACITY.replace(false)
+}
+
+#[cfg(not(test))]
+const fn authority_publication_capacity_fault_injected() -> bool {
+    false
+}
+
+#[cfg(test)]
+pub(crate) struct AuthorityPublicationMutationMarker;
+
+#[cfg(test)]
+impl Drop for AuthorityPublicationMutationMarker {
+    fn drop(&mut self) {
+        AUTHORITY_PUBLICATION_MUTATION_STARTED.set(false);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn begin_authority_publication_mutation_for_test() -> AuthorityPublicationMutationMarker
+{
+    AUTHORITY_PUBLICATION_MUTATION_STARTED.set(true);
+    AuthorityPublicationMutationMarker
+}
+
+#[cfg(test)]
+pub(crate) fn take_authority_postmutation_reservation_attempts_for_test() -> usize {
+    AUTHORITY_POSTMUTATION_RESERVATION_ATTEMPTS.replace(0)
+}
+
+#[cfg(test)]
+pub(crate) fn take_authority_postmutation_manifest_materializations_for_test() -> usize {
+    AUTHORITY_POSTMUTATION_MANIFEST_MATERIALIZATIONS.replace(0)
+}
+
+#[cfg(test)]
+fn note_authority_reservation_attempt() {
+    if AUTHORITY_PUBLICATION_MUTATION_STARTED.get() {
+        AUTHORITY_POSTMUTATION_RESERVATION_ATTEMPTS
+            .set(AUTHORITY_POSTMUTATION_RESERVATION_ATTEMPTS.get() + 1);
+    }
+}
+
+#[cfg(not(test))]
+const fn note_authority_reservation_attempt() {}
+
+#[cfg(test)]
+fn note_component_manifest_materialization() {
+    if AUTHORITY_PUBLICATION_MUTATION_STARTED.get() {
+        AUTHORITY_POSTMUTATION_MANIFEST_MATERIALIZATIONS
+            .set(AUTHORITY_POSTMUTATION_MANIFEST_MATERIALIZATIONS.get() + 1);
+    }
+}
+
+#[cfg(not(test))]
+const fn note_component_manifest_materialization() {}
 
 #[cfg(test)]
 fn verified_preparation_fault_injected() -> bool {
@@ -193,6 +316,7 @@ pub(crate) struct ComponentManifest {
 
 impl ComponentManifest {
     pub(crate) fn new(ids: impl IntoIterator<Item = ComponentId>) -> Self {
+        note_component_manifest_materialization();
         let mut component_ids = ids.into_iter().collect::<Vec<_>>();
         component_ids.sort_unstable();
         component_ids.dedup();
@@ -588,6 +712,13 @@ pub(crate) struct QuarantineLeaseId {
     sequence: u64,
 }
 
+impl QuarantineLeaseId {
+    #[cfg(test)]
+    pub(crate) const fn sequence_for_test(self) -> u64 {
+        self.sequence
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct QuarantineFacts {
     former_app_host: Option<Entity>,
@@ -671,6 +802,11 @@ impl QuarantineLease {
     pub(crate) fn foreign_descendants(&self) -> &[Entity] {
         &self.facts.foreign_descendants
     }
+
+    #[cfg(test)]
+    pub(crate) const fn id_for_test(&self) -> QuarantineLeaseId {
+        self.id
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -695,6 +831,266 @@ pub(crate) struct PreparedUnresolvedResidualTransfer {
     facts: QuarantineFacts,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResidualLeaseId {
+    domain: u64,
+    sequence: u64,
+}
+
+impl ResidualLeaseId {
+    #[cfg(test)]
+    pub(crate) const fn sequence_for_test(self) -> u64 {
+        self.sequence
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthorityLostResidual {
+    id: ResidualLeaseId,
+    generation: u64,
+    operation_sequence: u64,
+    provenance: AuthorityLostResidualProvenance,
+    retired_claim: ExactRegistryClaim,
+    frozen_expected_manifest: ComponentManifest,
+    observed_manifest: Option<ComponentManifest>,
+    entity_present_at_receipt: bool,
+    observed_registry_claim: Option<ExactRegistryClaim>,
+    actual_parent_at_receipt: Option<Entity>,
+    facts: QuarantineFacts,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthorityLostResidualProvenance {
+    ledger_domain: u64,
+    manifest_digest: u64,
+    attempt_revision: u64,
+    obligation: usize,
+    obligation_binding: u64,
+    terminal_receipt_binding: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AuthorityLostTombstone<'a> {
+    residual: &'a AuthorityLostResidual,
+}
+
+impl AuthorityLostTombstone<'_> {
+    pub(crate) const fn id(&self) -> ResidualLeaseId {
+        self.residual.id
+    }
+
+    pub(crate) const fn generation(&self) -> u64 {
+        self.residual.generation
+    }
+
+    pub(crate) const fn operation_sequence(&self) -> u64 {
+        self.residual.operation_sequence
+    }
+
+    pub(crate) const fn former_claim(&self) -> &ExactRegistryClaim {
+        &self.residual.retired_claim
+    }
+}
+
+pub(crate) struct PreparedAuthorityLostResidualTransfer {
+    source_claims: Vec<ExactRegistryClaim>,
+    residuals: Vec<AuthorityLostResidual>,
+}
+
+impl PreparedAuthorityLostResidualTransfer {
+    pub(crate) fn is_current(&self, world: &World) -> bool {
+        let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+            return false;
+        };
+        let Some(table) = world.get_resource::<QuarantineLeaseTable>() else {
+            return false;
+        };
+        !self.residuals.is_empty()
+            && self.residuals.iter().all(|residual| {
+                let entity = residual.retired_claim.entity();
+                let registry_was_exact = self
+                    .source_claims
+                    .iter()
+                    .any(|claim| claim == &residual.retired_claim);
+                let registry_is_current = if registry_was_exact {
+                    registry
+                        .record(entity)
+                        .is_some_and(|record| record.claim() == residual.retired_claim)
+                        && residual.observed_registry_claim.is_none()
+                } else {
+                    registry.record(entity).map(RouteEntityRecord::claim)
+                        == residual.observed_registry_claim
+                };
+                residual.id.domain == table.domain
+                    && residual.id.sequence != 0
+                    && residual.id.sequence <= table.next_residual_sequence
+                    && table.record(entity).is_none()
+                    && table.unresolved_record(entity).is_none()
+                    && table.authority_lost_tombstone(entity).is_none()
+                    && registry_is_current
+                    && (!registry_was_exact
+                        || !cleanup_claim_has_exact_authority(world, &residual.retired_claim))
+                    && (world.get_entity(entity).is_ok() == residual.entity_present_at_receipt)
+                    && world.get::<ChildOf>(entity).map(ChildOf::parent)
+                        == residual.actual_parent_at_receipt
+                    && match &residual.observed_manifest {
+                        Some(manifest) => {
+                            frozen_manifest_matches_archetype_no_alloc(world, entity, manifest)
+                        }
+                        None => world.get_entity(entity).is_err(),
+                    }
+            })
+    }
+}
+
+fn frozen_manifest_matches_archetype_no_alloc(
+    world: &World,
+    entity: Entity,
+    frozen: &ComponentManifest,
+) -> bool {
+    let Ok(entity) = world.get_entity(entity) else {
+        return false;
+    };
+    let archetype = entity.archetype();
+    archetype.components().len() == frozen.component_ids().len()
+        && frozen
+            .component_ids()
+            .iter()
+            .all(|expected| archetype.components().contains(expected))
+}
+
+pub(crate) struct PreparedExactRegistryRetirement {
+    claims: Vec<ExactRegistryClaim>,
+}
+
+pub(crate) struct PreparedAuthorityPublicationCapacity {
+    table_domain: u64,
+    lease_len: usize,
+    authority_lost_len: usize,
+    lease_capacity: usize,
+    authority_lost_capacity: usize,
+    lease_sequence_start: u64,
+    lease_sequence_end: u64,
+    residual_sequence_start: u64,
+    residual_sequence_end: u64,
+    verified_group_count: usize,
+    lost_fact_count: usize,
+    group_count: usize,
+}
+
+impl PreparedAuthorityPublicationCapacity {
+    pub(crate) fn reserve(
+        table: &mut QuarantineLeaseTable,
+        verified_group_count: usize,
+        lost_fact_count: usize,
+        group_count: usize,
+    ) -> Result<Self, QuarantineTransferError> {
+        note_authority_reservation_attempt();
+        if authority_publication_capacity_fault_injected() {
+            return Err(QuarantineTransferError::CapacityExhausted);
+        }
+        if verified_group_count > group_count || (group_count == 0 && lost_fact_count != 0) {
+            return Err(QuarantineTransferError::UnknownOwnedEntity);
+        }
+        let lease_sequence_start = table
+            .next_sequence
+            .checked_add(1)
+            .ok_or(QuarantineTransferError::CapacityExhausted)?;
+        let lease_sequence_end = table
+            .next_sequence
+            .checked_add(verified_group_count as u64)
+            .ok_or(QuarantineTransferError::CapacityExhausted)?;
+        let residual_sequence_start = table
+            .next_residual_sequence
+            .checked_add(1)
+            .ok_or(QuarantineTransferError::CapacityExhausted)?;
+        let residual_sequence_end = table
+            .next_residual_sequence
+            .checked_add(lost_fact_count as u64)
+            .ok_or(QuarantineTransferError::CapacityExhausted)?;
+        table
+            .leases
+            .try_reserve_exact(verified_group_count)
+            .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
+        table
+            .authority_lost
+            .try_reserve_exact(lost_fact_count)
+            .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
+        table.next_sequence = lease_sequence_end;
+        table.next_residual_sequence = residual_sequence_end;
+        Ok(Self {
+            table_domain: table.domain,
+            lease_len: table.leases.len(),
+            authority_lost_len: table.authority_lost.len(),
+            lease_capacity: table.leases.capacity(),
+            authority_lost_capacity: table.authority_lost.capacity(),
+            lease_sequence_start,
+            lease_sequence_end,
+            residual_sequence_start,
+            residual_sequence_end,
+            verified_group_count,
+            lost_fact_count,
+            group_count,
+        })
+    }
+
+    pub(crate) fn revalidates(&self, table: &QuarantineLeaseTable) -> bool {
+        table.domain == self.table_domain
+            && table.leases.len() == self.lease_len
+            && table.authority_lost.len() == self.authority_lost_len
+            && table.leases.capacity() == self.lease_capacity
+            && table.authority_lost.capacity() == self.authority_lost_capacity
+            && table.next_sequence == self.lease_sequence_end
+            && table.next_residual_sequence == self.residual_sequence_end
+            && self
+                .lease_len
+                .checked_add(self.verified_group_count)
+                .is_some_and(|required| required <= self.lease_capacity)
+            && self
+                .authority_lost_len
+                .checked_add(self.lost_fact_count)
+                .is_some_and(|required| required <= self.authority_lost_capacity)
+    }
+
+    const fn verified_group_count(&self) -> usize {
+        self.verified_group_count
+    }
+
+    const fn lost_fact_count(&self) -> usize {
+        self.lost_fact_count
+    }
+
+    const fn group_count(&self) -> usize {
+        self.group_count
+    }
+
+    pub(crate) fn verified_id(&self, ordinal: usize) -> Option<QuarantineLeaseId> {
+        (ordinal < self.verified_group_count).then(|| QuarantineLeaseId {
+            domain: self.table_domain,
+            sequence: self.lease_sequence_start + ordinal as u64,
+        })
+    }
+
+    pub(crate) fn residual_id(&self, offset: usize) -> Option<ResidualLeaseId> {
+        (offset < self.lost_fact_count).then(|| ResidualLeaseId {
+            domain: self.table_domain,
+            sequence: self.residual_sequence_start + offset as u64,
+        })
+    }
+
+    fn lease_sequence_range(&self) -> std::ops::RangeInclusive<u64> {
+        self.lease_sequence_start..=self.lease_sequence_end
+    }
+
+    const fn residual_sequence_start(&self) -> u64 {
+        self.residual_sequence_start
+    }
+
+    const fn residual_sequence_end(&self) -> u64 {
+        self.residual_sequence_end
+    }
+}
+
 #[derive(Resource)]
 pub(crate) struct QuarantineLeaseTable {
     domain: u64,
@@ -702,6 +1098,11 @@ pub(crate) struct QuarantineLeaseTable {
     next_residual_sequence: u64,
     leases: Vec<QuarantineLease>,
     unresolved: Vec<UnresolvedResidual>,
+    /// Fact-only terminal partition for retired claims whose physical
+    /// authority could not be proven. Exact stale registry records may be
+    /// removed during publication, but these records never authorize World
+    /// mutation; their provenance is the originating cleanup receipt.
+    authority_lost: Vec<AuthorityLostResidual>,
 }
 
 impl QuarantineLeaseTable {
@@ -713,6 +1114,7 @@ impl QuarantineLeaseTable {
             next_residual_sequence: 0,
             leases: Vec::new(),
             unresolved: Vec::new(),
+            authority_lost: Vec::new(),
         }
     }
 
@@ -722,6 +1124,7 @@ impl QuarantineLeaseTable {
         claims: Vec<ExactRegistryClaim>,
         manifests: Vec<(Entity, ComponentManifest)>,
         facts: QuarantineFacts,
+        assigned_id: Option<QuarantineLeaseId>,
     ) -> Result<PreparedQuarantineTransfer, QuarantineTransferError> {
         if verified_preparation_fault_injected() {
             return Err(QuarantineTransferError::CapacityExhausted);
@@ -760,16 +1163,25 @@ impl QuarantineLeaseTable {
         if records.len() != claims.len() {
             return Err(QuarantineTransferError::UnknownOwnedEntity);
         }
-        let sequence = self
-            .next_sequence
-            .checked_add(1)
-            .ok_or(QuarantineTransferError::CapacityExhausted)?;
-        self.leases
-            .try_reserve(1)
-            .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
-        let id = QuarantineLeaseId {
-            domain: self.domain,
-            sequence,
+        let id = if let Some(id) = assigned_id {
+            if id.domain != self.domain || id.sequence == 0 || id.sequence > self.next_sequence {
+                return Err(QuarantineTransferError::UnknownOwnedEntity);
+            }
+            id
+        } else {
+            let sequence = self
+                .next_sequence
+                .checked_add(1)
+                .ok_or(QuarantineTransferError::CapacityExhausted)?;
+            note_authority_reservation_attempt();
+            self.leases
+                .try_reserve(1)
+                .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
+            self.next_sequence = sequence;
+            QuarantineLeaseId {
+                domain: self.domain,
+                sequence,
+            }
         };
         Ok(PreparedQuarantineTransfer {
             id,
@@ -784,6 +1196,11 @@ impl QuarantineLeaseTable {
         registry: &mut RouteEntityRegistry,
         prepared: PreparedQuarantineTransfer,
     ) -> QuarantineLeaseId {
+        let capacity = self.leases.capacity();
+        assert!(
+            self.leases.len() < capacity,
+            "prepared quarantine publication exhausted reserved capacity"
+        );
         registry.records.retain(|record| {
             !prepared.source_claims.iter().any(|claim| {
                 record.entity == claim.entity
@@ -792,7 +1209,6 @@ impl QuarantineLeaseTable {
                     && record.lifecycle == claim.lifecycle
             })
         });
-        self.next_sequence = prepared.id.sequence;
         self.leases.push(QuarantineLease {
             id: prepared.id,
             generation: 1,
@@ -800,6 +1216,7 @@ impl QuarantineLeaseTable {
             records: prepared.records,
             facts: prepared.facts,
         });
+        assert_eq!(self.leases.capacity(), capacity);
         prepared.id
     }
 
@@ -850,6 +1267,9 @@ impl QuarantineLeaseTable {
         self.unresolved
             .try_reserve(1)
             .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
+        // Residual identities are consumed at preparation and never reused,
+        // even if a later revalidation abandons the prepared transfer.
+        self.next_residual_sequence = sequence;
         Ok(PreparedUnresolvedResidualTransfer {
             sequence,
             source_claims: claims,
@@ -872,7 +1292,6 @@ impl QuarantineLeaseTable {
                     && record.lifecycle == claim.lifecycle
             })
         });
-        self.next_residual_sequence = prepared.sequence;
         self.unresolved.push(UnresolvedResidual {
             sequence: prepared.sequence,
             records: prepared.records,
@@ -881,11 +1300,169 @@ impl QuarantineLeaseTable {
         });
     }
 
+    fn prepare_authority_lost(
+        &mut self,
+        registry: &RouteEntityRegistry,
+        facts: PreparedAuthorityLostResidualProjection,
+        quarantine_facts: QuarantineFacts,
+        assigned_first_id: Option<ResidualLeaseId>,
+    ) -> Result<PreparedAuthorityLostResidualTransfer, QuarantineTransferError> {
+        if facts.is_empty() {
+            return Err(QuarantineTransferError::EmptyOwnedSet);
+        }
+        let mut receipt_identities = HashSet::new();
+        let mut entities = HashSet::new();
+        for fact in facts.facts() {
+            let entity = fact.retired_claim().entity();
+            let registry_exact = registry
+                .record(entity)
+                .is_some_and(|record| record.claim() == *fact.retired_claim());
+            if fact.manifest_digest() == 0
+                || fact.obligation_binding() == 0
+                || fact.terminal_receipt_binding() == 0
+                || !receipt_identities.insert((
+                    fact.ledger_domain(),
+                    fact.attempt_revision(),
+                    fact.obligation(),
+                ))
+                || !entities.insert(entity)
+                || registry_exact != fact.registry_exact_at_receipt()
+                || (registry_exact && fact.observed_registry_claim().is_some())
+                || (!registry_exact
+                    && registry.record(entity).map(RouteEntityRecord::claim)
+                        != fact.observed_registry_claim().cloned())
+                || self.record(entity).is_some()
+                || self.unresolved_record(entity).is_some()
+                || self.authority_lost.iter().any(|residual| {
+                    residual.retired_claim.entity() == entity
+                        || (
+                            residual.provenance.ledger_domain,
+                            residual.provenance.attempt_revision,
+                            residual.provenance.obligation,
+                        ) == (
+                            fact.ledger_domain(),
+                            fact.attempt_revision(),
+                            fact.obligation(),
+                        )
+                })
+            {
+                return Err(QuarantineTransferError::UnknownOwnedEntity);
+            }
+        }
+        let first_sequence = match assigned_first_id {
+            Some(id) if id.domain == self.domain && id.sequence != 0 => id.sequence,
+            Some(_) => return Err(QuarantineTransferError::UnknownOwnedEntity),
+            None => self
+                .next_residual_sequence
+                .checked_add(1)
+                .ok_or(QuarantineTransferError::CapacityExhausted)?,
+        };
+        if first_sequence == 0 {
+            return Err(QuarantineTransferError::CapacityExhausted);
+        }
+        let last_sequence = first_sequence
+            .checked_add(facts.facts().len() as u64 - 1)
+            .ok_or(QuarantineTransferError::CapacityExhausted)?;
+        if assigned_first_id.is_some() && last_sequence > self.next_residual_sequence {
+            return Err(QuarantineTransferError::UnknownOwnedEntity);
+        }
+        let mut source_claims = Vec::new();
+        source_claims
+            .try_reserve_exact(facts.facts().len())
+            .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
+        source_claims.extend(
+            facts
+                .facts()
+                .iter()
+                .filter(|fact| fact.registry_exact_at_receipt())
+                .map(|fact| fact.retired_claim().clone()),
+        );
+        let mut residuals = Vec::new();
+        residuals
+            .try_reserve_exact(facts.facts().len())
+            .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
+        residuals.extend(
+            facts
+                .into_facts()
+                .into_iter()
+                .enumerate()
+                .map(|(offset, fact)| AuthorityLostResidual {
+                    id: ResidualLeaseId {
+                        domain: self.domain,
+                        sequence: first_sequence + offset as u64,
+                    },
+                    generation: 1,
+                    operation_sequence: 0,
+                    provenance: AuthorityLostResidualProvenance {
+                        ledger_domain: fact.ledger_domain(),
+                        manifest_digest: fact.manifest_digest(),
+                        attempt_revision: fact.attempt_revision(),
+                        obligation: fact.obligation(),
+                        obligation_binding: fact.obligation_binding(),
+                        terminal_receipt_binding: fact.terminal_receipt_binding(),
+                    },
+                    retired_claim: fact.retired_claim().clone(),
+                    frozen_expected_manifest: fact.frozen_expected_manifest().clone(),
+                    observed_manifest: fact.observed_manifest().cloned(),
+                    entity_present_at_receipt: fact.entity_present_at_receipt(),
+                    observed_registry_claim: fact.observed_registry_claim().cloned(),
+                    actual_parent_at_receipt: fact.actual_parent_at_receipt(),
+                    facts: quarantine_facts.clone(),
+                }),
+        );
+        if assigned_first_id.is_none() {
+            note_authority_reservation_attempt();
+            self.authority_lost
+                .try_reserve_exact(residuals.len())
+                .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
+            self.next_residual_sequence = last_sequence;
+        }
+        Ok(PreparedAuthorityLostResidualTransfer {
+            source_claims,
+            residuals,
+        })
+    }
+
+    fn apply_authority_lost(
+        &mut self,
+        registry: &mut RouteEntityRegistry,
+        prepared: PreparedAuthorityLostResidualTransfer,
+    ) {
+        let capacity = self.authority_lost.capacity();
+        assert!(
+            self.authority_lost
+                .len()
+                .checked_add(prepared.residuals.len())
+                .is_some_and(|required| required <= capacity),
+            "prepared authority-lost publication exhausted reserved capacity"
+        );
+        registry.records.retain(|record| {
+            !prepared.source_claims.iter().any(|claim| {
+                record.entity == claim.entity
+                    && record.owner == claim.owner
+                    && record.seal == claim.seal
+                    && record.lifecycle == claim.lifecycle
+            })
+        });
+        self.authority_lost.extend(prepared.residuals);
+        assert_eq!(self.authority_lost.capacity(), capacity);
+    }
+
     pub(crate) fn lease(&self, id: QuarantineLeaseId) -> Option<&QuarantineLease> {
         self.leases.iter().find(|lease| lease.id == id)
     }
     pub(crate) fn leases(&self) -> &[QuarantineLease] {
         &self.leases
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn next_sequence_for_test(&self) -> u64 {
+        self.next_sequence
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn next_residual_sequence_for_test(&self) -> u64 {
+        self.next_residual_sequence
     }
 
     pub(crate) fn record(&self, entity: Entity) -> Option<&RouteEntityRecord> {
@@ -900,6 +1477,18 @@ impl QuarantineLeaseTable {
             .iter()
             .flat_map(|residual| residual.records.iter())
             .find(|record| record.entity == entity)
+    }
+
+    /// Returns an immutable retired-claim tombstone. This is audit evidence,
+    /// never current lifecycle authority.
+    pub(crate) fn authority_lost_tombstone(
+        &self,
+        entity: Entity,
+    ) -> Option<AuthorityLostTombstone<'_>> {
+        self.authority_lost
+            .iter()
+            .find(|residual| residual.retired_claim.entity() == entity)
+            .map(|residual| AuthorityLostTombstone { residual })
     }
 
     pub(crate) fn inert_owned_entities(&self) -> impl Iterator<Item = Entity> + '_ {
@@ -926,7 +1515,7 @@ pub(crate) fn prepare_verified_quarantine_transfer(
     transfer: VerifiedQuarantineTransfer,
 ) -> Result<PreparedQuarantineTransfer, QuarantineTransferError> {
     let (claims, manifests, facts) = transfer.into_parts();
-    table.prepare_verified(registry, claims, manifests, facts)
+    table.prepare_verified(registry, claims, manifests, facts, None)
 }
 
 pub(crate) fn prepare_verified_frame_quarantine_transfer(
@@ -935,7 +1524,7 @@ pub(crate) fn prepare_verified_frame_quarantine_transfer(
     transfer: VerifiedFrameQuarantineTransfer,
 ) -> Result<PreparedQuarantineTransfer, QuarantineTransferError> {
     let (claims, manifests, facts) = transfer.into_parts();
-    table.prepare_verified(registry, claims, manifests, facts)
+    table.prepare_verified(registry, claims, manifests, facts, None)
 }
 
 pub(crate) fn prepare_verified_cleanup_quarantine_transfer(
@@ -944,7 +1533,17 @@ pub(crate) fn prepare_verified_cleanup_quarantine_transfer(
     transfer: VerifiedCleanupQuarantineTransfer,
 ) -> Result<PreparedQuarantineTransfer, QuarantineTransferError> {
     let (claims, manifests, facts) = transfer.into_parts();
-    table.prepare_verified(registry, claims, manifests, facts)
+    table.prepare_verified(registry, claims, manifests, facts, None)
+}
+
+pub(crate) fn prepare_verified_authority_cleanup_quarantine_transfer(
+    table: &mut QuarantineLeaseTable,
+    registry: &RouteEntityRegistry,
+    transfer: VerifiedCleanupQuarantineTransfer,
+    id: QuarantineLeaseId,
+) -> Result<PreparedQuarantineTransfer, QuarantineTransferError> {
+    let (claims, manifests, facts) = transfer.into_parts();
+    table.prepare_verified(registry, claims, manifests, facts, Some(id))
 }
 
 pub(crate) fn apply_prepared_quarantine_transfer(
@@ -971,6 +1570,63 @@ pub(crate) fn apply_prepared_unresolved_residual_transfer(
     prepared: PreparedUnresolvedResidualTransfer,
 ) {
     table.apply_unresolved(registry, prepared);
+}
+
+pub(crate) fn prepare_authority_lost_residual_transfer(
+    table: &mut QuarantineLeaseTable,
+    registry: &RouteEntityRegistry,
+    facts: PreparedAuthorityLostResidualProjection,
+    quarantine_facts: QuarantineFacts,
+) -> Result<PreparedAuthorityLostResidualTransfer, QuarantineTransferError> {
+    table.prepare_authority_lost(registry, facts, quarantine_facts, None)
+}
+
+pub(crate) fn prepare_authority_lost_residual_transfer_in_publication(
+    table: &mut QuarantineLeaseTable,
+    registry: &RouteEntityRegistry,
+    facts: PreparedAuthorityLostResidualProjection,
+    quarantine_facts: QuarantineFacts,
+    first_id: ResidualLeaseId,
+) -> Result<PreparedAuthorityLostResidualTransfer, QuarantineTransferError> {
+    table.prepare_authority_lost(registry, facts, quarantine_facts, Some(first_id))
+}
+
+pub(crate) fn apply_prepared_authority_lost_residual_transfer(
+    table: &mut QuarantineLeaseTable,
+    registry: &mut RouteEntityRegistry,
+    prepared: PreparedAuthorityLostResidualTransfer,
+) {
+    table.apply_authority_lost(registry, prepared);
+}
+
+pub(crate) fn prepare_exact_registry_retirement(
+    registry: &RouteEntityRegistry,
+    claims: Vec<ExactRegistryClaim>,
+) -> Result<PreparedExactRegistryRetirement, QuarantineTransferError> {
+    let mut entities = HashSet::new();
+    if claims.iter().any(|claim| {
+        !entities.insert(claim.entity())
+            || !registry
+                .record(claim.entity())
+                .is_some_and(|record| record.claim() == *claim)
+    }) {
+        return Err(QuarantineTransferError::UnknownOwnedEntity);
+    }
+    Ok(PreparedExactRegistryRetirement { claims })
+}
+
+pub(crate) fn apply_prepared_exact_registry_retirement(
+    registry: &mut RouteEntityRegistry,
+    prepared: PreparedExactRegistryRetirement,
+) {
+    registry.records.retain(|record| {
+        !prepared.claims.iter().any(|claim| {
+            record.entity == claim.entity
+                && record.owner == claim.owner
+                && record.seal == claim.seal
+                && record.lifecycle == claim.lifecycle
+        })
+    });
 }
 
 impl Default for QuarantineLeaseTable {
@@ -1046,6 +1702,76 @@ mod tests {
             assert_eq!(allocate_registry_domain(&counter), None);
             assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
         }
+    }
+
+    #[test]
+    fn authority_publication_capacity_owns_three_verified_closures() {
+        let mut table = QuarantineLeaseTable::new();
+        table.leases.shrink_to_fit();
+
+        let owner = PreparedAuthorityPublicationCapacity::reserve(&mut table, 3, 0, 3)
+            .expect("three verified closures must reserve one aggregate publication tail");
+
+        assert_eq!(owner.verified_group_count(), 3);
+        assert_eq!(owner.lost_fact_count(), 0);
+        assert_eq!(owner.group_count(), 3);
+        assert!(owner.revalidates(&table));
+        assert!(table.leases.capacity() - table.leases.len() >= 3);
+    }
+
+    #[test]
+    fn authority_publication_capacity_burns_three_lost_fact_ids() {
+        let mut table = QuarantineLeaseTable::new();
+        let before = table.next_residual_sequence;
+
+        let owner = PreparedAuthorityPublicationCapacity::reserve(&mut table, 0, 3, 3)
+            .expect("three lost-bearing closures must reserve one aggregate fact tail");
+
+        assert_eq!(owner.residual_sequence_start(), before + 1);
+        assert_eq!(owner.residual_sequence_end(), before + 3);
+        assert_eq!(table.next_residual_sequence, before + 3);
+        assert!(owner.revalidates(&table));
+    }
+
+    #[test]
+    fn authority_publication_capacity_owns_mixed_verified_and_lost_counts() {
+        let mut table = QuarantineLeaseTable::new();
+
+        let owner = PreparedAuthorityPublicationCapacity::reserve(&mut table, 2, 3, 4)
+            .expect("mixed closures must share one aggregate capacity and identity owner");
+
+        assert_eq!(owner.lease_sequence_range(), 1..=2);
+        assert_eq!(owner.residual_sequence_start(), 1);
+        assert_eq!(owner.residual_sequence_end(), 3);
+        assert_eq!(table.next_sequence, 2);
+        assert_eq!(table.next_residual_sequence, 3);
+        assert!(owner.revalidates(&table));
+    }
+
+    #[test]
+    fn insufficient_aggregate_authority_capacity_is_semantically_zero() {
+        let mut table = QuarantineLeaseTable::new();
+        let before = (
+            table.next_sequence,
+            table.next_residual_sequence,
+            table.leases.len(),
+            table.authority_lost.len(),
+        );
+        fail_next_authority_publication_capacity_reservation_for_test();
+
+        assert!(matches!(
+            PreparedAuthorityPublicationCapacity::reserve(&mut table, 3, 3, 3),
+            Err(QuarantineTransferError::CapacityExhausted)
+        ));
+        assert_eq!(
+            (
+                table.next_sequence,
+                table.next_residual_sequence,
+                table.leases.len(),
+                table.authority_lost.len(),
+            ),
+            before
+        );
     }
     use bevy_ecs::{component::Component, prelude::World};
 

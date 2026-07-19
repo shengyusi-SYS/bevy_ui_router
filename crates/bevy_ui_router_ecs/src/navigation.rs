@@ -4,9 +4,11 @@ use bevy_ecs::{prelude::World, resource::Resource};
 use bevy_input_focus::InputFocus;
 use bevy_ui_router_core::{
     integration::{
-        CleanupManifest, EngineAction, FailureCleanupRequest, FrameMountTarget, IntegrationError,
-        MountMutationArtifact, MountReceiptProof, MountRegistrationBeginError, MountRequest,
-        ResolveMountOwner, RootFrameTask, RouterEngine, ViewFailureKind,
+        BeginAuthoritySettlementErrorKind, CleanupManifest, EngineAction,
+        FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError, FailureCleanupRequest,
+        FrameMountTarget, HostLease, IntegrationError, MountMutationArtifact, MountReceiptProof,
+        MountRegistrationBeginError, MountRequest, ResolveMountOwner, RootFrameTask, RouterEngine,
+        ViewFailureKind,
     },
     prelude::{MountRejectionKind, NavigationRequestId, RouteFrameVersion, RouteLocation},
 };
@@ -17,11 +19,14 @@ use crate::{
     branch_transaction::{
         FailedPreparedBranch, PendingCommit, PreparedBranch, RealizedBranch,
         ReconciliationAuthorityIdentity, ReconciliationProjectionFacts, ReconciliationSlotRoleKind,
-        SealedExistingReconciliation, SealedMountNewStagingAllowance,
+        SealedExistingReconciliation, SealedMountNewStagingAllowance, SealedReconciliationSplice,
         seal_reconciliation_staging_mount,
     },
     cleanup::{
-        CleanupLedger, FrozenCleanupManifest, RouterCleanupObservation,
+        AuthoritySettlementManifestError, CleanupLedger, CleanupLedgerReserveErrorKind,
+        FailedAuthorityBoundaryBinding, FailedBoundaryDrift, FailedBoundarySource,
+        FailedManifestBuildError, FailedPreparedTopologyError, FrozenCleanupManifest,
+        PendingBoundaryBinding, RouterCleanupObservation, cleanup_claim_has_exact_authority,
         failed_prepared_branch_roots_are_exact,
     },
     content::{ContentPlan, FrameContentWriter},
@@ -38,12 +43,13 @@ use crate::{
         validated_host_candidate_is_current,
     },
     input::{
-        RouteFocusState, RouterInputGate, observed_descendant_closure, prepare_focus_mutation,
-        prepare_input_gate_mutation,
+        PreparedInputGateIsolation, RouteFocusState, RouterInputGate, observed_descendant_closure,
+        prepare_focus_mutation, prepare_input_gate_mutation, try_prepare_input_gate_isolation,
     },
     mount::{
         ChildSlotResidual, StagedChildSlot, confirm_child_slot, mounted_child_slot_is_isolated,
-        residual_child_slot_is_isolated, stage_child_slot,
+        mounted_child_slot_local_is_isolated, mounted_child_slot_structure_is_isolated,
+        residual_child_slot_is_isolated, residual_child_slot_local_is_isolated, stage_child_slot,
     },
     presentation::{
         DeferredRealizationFailure, RealizedFrame, expected_children,
@@ -52,7 +58,10 @@ use crate::{
         realize_reconciliation_child_frame_deferred, validate_active_frame,
         validate_realized_frame,
     },
-    registry::{EntityLifecycle, RouteEntityRegistry},
+    registry::{
+        EntityLifecycle, EntityOwner, ExactRegistryClaim, ProvisionalOwner, RegistryOwner,
+        RouteEntityRegistry,
+    },
     snapshots::RouterSnapshots,
 };
 
@@ -71,6 +80,105 @@ pub(crate) struct HostBinding {
     pub(crate) top_slot: bevy_ecs::entity::Entity,
     pub(crate) top_slot_claim: crate::registry::ExactRegistryClaim,
     pub(crate) candidate: ValidatedHostCandidate,
+    lease: HostLease,
+}
+
+pub(crate) struct RetiredHostBinding {
+    pub(crate) version: bevy_ui_router_core::HostVersion,
+    pub(crate) slot_id: bevy_ui_router_core::ids::RouteSlotId,
+    pub(crate) host: bevy_ecs::entity::Entity,
+    pub(crate) top_slot: bevy_ecs::entity::Entity,
+    pub(crate) top_slot_claim: crate::registry::ExactRegistryClaim,
+    pub(crate) candidate: ValidatedHostCandidate,
+}
+
+impl HostBinding {
+    fn into_retired(self) -> (RetiredHostBinding, HostLease) {
+        let Self {
+            version,
+            slot_id,
+            host,
+            top_slot,
+            top_slot_claim,
+            candidate,
+            lease,
+        } = self;
+        (
+            RetiredHostBinding {
+                version,
+                slot_id,
+                host,
+                top_slot,
+                top_slot_claim,
+                candidate,
+            },
+            lease,
+        )
+    }
+}
+
+impl RetiredHostBinding {
+    fn restore(self, lease: HostLease) -> HostBinding {
+        let Self {
+            version,
+            slot_id,
+            host,
+            top_slot,
+            top_slot_claim,
+            candidate,
+        } = self;
+        HostBinding {
+            version,
+            slot_id,
+            host,
+            top_slot,
+            top_slot_claim,
+            candidate,
+            lease,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Resource)]
+struct FailedAuthorityBeginManifestRejection {
+    remaining: usize,
+}
+
+#[cfg(test)]
+#[derive(Resource)]
+struct FailedAuthorityTriggerExhaustion {
+    remaining: usize,
+}
+
+#[cfg(test)]
+fn inject_failed_authority_begin_manifest_rejection(
+    world: &mut World,
+    logical_roots: &mut Vec<RouteFrameVersion>,
+) {
+    let reject = world
+        .get_resource_mut::<FailedAuthorityBeginManifestRejection>()
+        .is_some_and(|mut fault| {
+            if fault.remaining == 0 {
+                return false;
+            }
+            fault.remaining -= 1;
+            true
+        });
+    if reject {
+        let duplicate = logical_roots
+            .first()
+            .expect("failed authority rejection fixture requires one sealed root")
+            .clone();
+        logical_roots.push(duplicate);
+    }
+}
+
+#[cfg(not(test))]
+fn inject_failed_authority_begin_manifest_rejection(
+    _world: &mut World,
+    _logical_roots: &mut Vec<RouteFrameVersion>,
+) {
 }
 
 enum PendingFailedBranchTerminal {
@@ -88,9 +196,15 @@ enum PendingFailedBranchTerminal {
     RegistrationBegin(MountRegistrationBeginError),
 }
 
-struct PendingFailedBranch {
+pub(crate) struct PendingFailedBranch {
     terminal: PendingFailedBranchTerminal,
     branch: FailedPreparedBranch,
+}
+
+impl PendingFailedBranch {
+    pub(crate) const fn branch(&self) -> &FailedPreparedBranch {
+        &self.branch
+    }
 }
 
 struct PendingFrameDrive {
@@ -258,7 +372,25 @@ pub(crate) struct RouterEntry {
     pub(crate) active: Option<RealizedBranch>,
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
     cleanup_observation: RouterCleanupObservation,
+    pub(crate) authority_protocol_residual: Option<AuthorityProtocolResidualOwner>,
     pub(crate) requests: Vec<NavigationRequestId>,
+}
+
+pub(crate) struct AuthorityProtocolResidualOwner {
+    kind: AuthorityProtocolResidualKind,
+    isolation_contradiction: Option<AuthorityIsolationContradiction>,
+    active: Option<RealizedBranch>,
+    pending: Option<PendingCommit>,
+    failed: Option<PendingFailedBranch>,
+    pub(crate) host: Option<RetiredHostBinding>,
+}
+
+enum AuthorityProtocolResidualKind {
+    Authority(BeginAuthoritySettlementErrorKind),
+    AuthorityIsolation(AuthorityIsolationContradiction),
+    CleanupLedger(CleanupLedgerReserveErrorKind),
+    AuthorityTrigger(FailedAuthorityTriggerError),
+    FailedManifest(FailedPreparedTopologyError),
 }
 
 impl RouterEntry {
@@ -404,6 +536,71 @@ impl RouterEntry {
     }
 
     #[cfg(feature = "test-support")]
+    pub(crate) fn authority_protocol_residual_frames(&self) -> Vec<&RealizedFrame> {
+        self.authority_protocol_residual
+            .as_ref()
+            .map(|residual| {
+                residual
+                    .active
+                    .iter()
+                    .flat_map(RealizedBranch::frames)
+                    .chain(
+                        residual
+                            .pending
+                            .iter()
+                            .flat_map(|pending| pending.branch.frames()),
+                    )
+                    .chain(
+                        residual
+                            .failed
+                            .iter()
+                            .flat_map(|failed| failed.branch.frames()),
+                    )
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn authority_protocol_residual_entities(&self) -> Vec<bevy_ecs::prelude::Entity> {
+        let Some(residual) = self.authority_protocol_residual.as_ref() else {
+            return Vec::new();
+        };
+        let mut entities = residual
+            .active
+            .iter()
+            .flat_map(RealizedBranch::claims)
+            .chain(
+                residual
+                    .pending
+                    .iter()
+                    .flat_map(|pending| pending.branch.as_realized().claims()),
+            )
+            .chain(residual.failed.iter().flat_map(|failed| {
+                failed
+                    .branch
+                    .frames()
+                    .iter()
+                    .flat_map(RealizedFrame::claims)
+                    .chain(
+                        failed
+                            .branch
+                            .detached_frames()
+                            .iter()
+                            .flat_map(RealizedFrame::claims),
+                    )
+            }))
+            .map(ExactRegistryClaim::entity)
+            .collect::<Vec<_>>();
+        if let Some(host) = &residual.host {
+            entities.push(host.top_slot);
+        }
+        entities.sort_by_key(|entity| entity.to_bits());
+        entities.dedup();
+        entities
+    }
+
+    #[cfg(feature = "test-support")]
     pub(crate) fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
         let mut slots = Vec::new();
         if let Some(pending) = &self.pending_commit {
@@ -475,6 +672,7 @@ impl RouterNavigation {
             active: None,
             cleanup_ledger: None,
             cleanup_observation: RouterCleanupObservation::default(),
+            authority_protocol_residual: None,
             requests: Vec::new(),
         });
         Ok(handle)
@@ -492,6 +690,11 @@ impl RouterNavigation {
             .ok_or_else(|| {
                 NavigationEnqueueError::new(NavigationEnqueueErrorKind::UnknownRouter)
             })?;
+        if entry.authority_protocol_residual.is_some() {
+            return Err(NavigationEnqueueError::new(
+                NavigationEnqueueErrorKind::HostUnavailable,
+            ));
+        }
         let request = entry.engine.push(location).map_err(|error| match error {
             IntegrationError::AwaitingHost => {
                 NavigationEnqueueError::new(NavigationEnqueueErrorKind::HostUnavailable)
@@ -587,7 +790,12 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                         entry.host_settlement = Some(settlement);
                         continue;
                     }
-                    if entry.host.is_some() {
+                    if entry.host.is_some()
+                        || entry
+                            .cleanup_ledger
+                            .as_ref()
+                            .is_some_and(CleanupLedger::is_authority_settlement)
+                    {
                         continue;
                     }
                     let HostCandidateClassification::Unique(candidate) =
@@ -628,7 +836,7 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                                     .record(top_slot)
                                     .expect("activated top slot remains registered")
                                     .claim();
-                                entry.engine.confirm_host(grant);
+                                let lease = entry.engine.confirm_host(grant);
                                 entry.host = Some(HostBinding {
                                     version,
                                     slot_id,
@@ -636,6 +844,7 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                                     top_slot,
                                     top_slot_claim,
                                     candidate,
+                                    lease,
                                 });
                             } else {
                                 let _ = settle_rejected_granted_top_slot(
@@ -795,7 +1004,7 @@ fn complete_zero_physical_failure(
     let manifest = world
         .get_resource::<RouteEntityRegistry>()
         .and_then(|registry| {
-            FrozenCleanupManifest::from_failed_prepared_branch(world, registry, &branch)
+            FrozenCleanupManifest::from_failed_prepared_branch(world, registry, &branch).ok()
         });
     let Some(manifest) = manifest.filter(|manifest| manifest.len() == 0) else {
         return Err(PendingFailedBranch {
@@ -804,11 +1013,27 @@ fn complete_zero_physical_failure(
         });
     };
     let manifest_digest = manifest.digest();
-    let Some(reserved) = CleanupLedger::reserve(manifest) else {
-        return Err(PendingFailedBranch {
-            terminal: PendingFailedBranchTerminal::Request(request),
-            branch,
-        });
+    let reserved = match CleanupLedger::reserve(manifest) {
+        Ok(reserved) => reserved,
+        Err(error) => {
+            let failed = PendingFailedBranch {
+                terminal: PendingFailedBranchTerminal::Request(request),
+                branch,
+            };
+            return match error.kind() {
+                CleanupLedgerReserveErrorKind::RetryableCapacity => Err(failed),
+                kind @ (CleanupLedgerReserveErrorKind::DomainExhausted
+                | CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts) => {
+                    let _returned_manifest = error.into_manifest();
+                    fail_closed_failed_owner_protocol(
+                        world,
+                        entry,
+                        failed,
+                        AuthorityProtocolResidualKind::CleanupLedger(kind),
+                    )
+                }
+            };
+        }
     };
     let logical_roots = request.logical_roots().to_vec();
     let cleanup = match entry.engine.prepare_failure_cleanup_retaining(
@@ -907,29 +1132,43 @@ fn nested_failure_terminal(
     PendingFailedBranchTerminal::Request(request)
 }
 
-fn failed_branch_focus_closure(
-    world: &World,
-    branch: &FailedPreparedBranch,
-) -> Vec<bevy_ecs::prelude::Entity> {
-    let roots = branch
+fn failed_branch_primary_claims(branch: &FailedPreparedBranch) -> Vec<&ExactRegistryClaim> {
+    branch
         .frames()
         .iter()
         .chain(branch.detached_frames())
         .flat_map(RealizedFrame::claims)
-        .map(crate::registry::ExactRegistryClaim::entity)
-        .chain(branch.child_slots().iter().map(|slot| slot.slot()))
+        .chain(branch.child_slots().iter().map(|slot| slot.slot_claim()))
         .chain(
             branch
                 .mount_residuals()
                 .iter()
-                .map(crate::mount::ChildSlotResidual::entity),
+                .map(crate::mount::ChildSlotResidual::claim),
         )
         .chain(
             branch
                 .rejected_child_slots()
                 .iter()
-                .map(|slot| slot.slot().slot()),
+                .map(|slot| slot.slot().slot_claim()),
         )
+        .collect()
+}
+
+fn failed_cleanup_claim_is_current(world: &World, claim: &ExactRegistryClaim) -> bool {
+    world
+        .get_resource::<RouteEntityRegistry>()
+        .and_then(|registry| registry.record(claim.entity()))
+        .is_some_and(|record| record.claim() == *claim)
+        && cleanup_claim_has_exact_authority(world, claim)
+}
+
+fn failed_branch_focus_closure(
+    world: &World,
+    exact_isolation_claims: &[ExactRegistryClaim],
+) -> Vec<bevy_ecs::prelude::Entity> {
+    let roots = exact_isolation_claims
+        .iter()
+        .map(ExactRegistryClaim::entity)
         .collect::<Vec<_>>();
     let mut closure = observed_descendant_closure(world, roots)
         .into_iter()
@@ -961,38 +1200,275 @@ fn focus_is_outside_closure(world: &World, closure: &[bevy_ecs::prelude::Entity]
             .is_none_or(|focused| !closure.contains(&focused))
 }
 
-fn isolate_failed_prepared_branch(world: &mut World, branch: &FailedPreparedBranch) -> bool {
-    if !failed_prepared_branch_roots_are_exact(world, branch) {
+fn isolate_failed_prepared_branch(
+    world: &mut World,
+    branch: &FailedPreparedBranch,
+    manifest: &FrozenCleanupManifest,
+    active: Option<&RealizedBranch>,
+) -> bool {
+    if !failed_prepared_branch_roots_are_exact(world, branch, manifest) {
         return false;
     }
-    let focus_closure = failed_branch_focus_closure(world, branch);
-    release_focus_for_closure(world, &focus_closure);
+    let active_claims = active
+        .map(|active| active.claims().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let exact_isolation_claims = failed_branch_primary_claims(branch)
+        .into_iter()
+        .filter(|claim| failed_cleanup_claim_is_current(world, claim))
+        .filter(|claim| !active_claims.contains(claim))
+        .cloned()
+        .collect::<Vec<_>>();
+    let requires_exact_isolation =
+        |claim: &ExactRegistryClaim| exact_isolation_claims.contains(claim);
+    let mut focus_closure = failed_branch_focus_closure(world, &exact_isolation_claims);
+    let active_focus_before = match active {
+        Some(active) => {
+            let Ok(closure) = validate_branch_descendants(world, active) else {
+                return false;
+            };
+            closure
+        }
+        None => Vec::new(),
+    };
+    if focus_closure
+        .iter()
+        .any(|entity| active_focus_before.contains(entity))
+    {
+        return false;
+    }
     let frames_are_isolated = branch
         .frames()
         .iter()
         .chain(branch.detached_frames())
-        .all(|frame| isolate_frame_for_settlement(world, frame));
+        .all(|frame| isolate_frame_for_settlement(world, frame, &requires_exact_isolation));
     let child_slots_are_isolated = branch
         .child_slots()
         .iter()
-        .all(|slot| mounted_child_slot_is_isolated(world, slot))
+        .filter(|slot| requires_exact_isolation(slot.slot_claim()))
+        .all(|slot| {
+            if manifest.allows_pending_boundary_loss(slot.slot_claim()) {
+                mounted_child_slot_local_is_isolated(world, slot)
+            } else {
+                mounted_child_slot_structure_is_isolated(world, slot)
+            }
+        })
         && branch
             .rejected_child_slots()
             .iter()
-            .all(|slot| mounted_child_slot_is_isolated(world, slot.slot()));
+            .filter(|slot| requires_exact_isolation(slot.slot().slot_claim()))
+            .all(|slot| {
+                if manifest.allows_pending_boundary_loss(slot.slot().slot_claim()) {
+                    mounted_child_slot_local_is_isolated(world, slot.slot())
+                } else {
+                    mounted_child_slot_structure_is_isolated(world, slot.slot())
+                }
+            });
     let residuals_are_isolated = branch
         .mount_residuals()
         .iter()
-        .all(|slot| residual_child_slot_is_isolated(world, slot));
+        .filter(|residual| requires_exact_isolation(residual.claim()))
+        .all(|slot| {
+            if manifest.allows_pending_boundary_loss(slot.claim()) {
+                residual_child_slot_local_is_isolated(world, slot)
+            } else {
+                residual_child_slot_is_isolated(world, slot)
+            }
+        });
+    if residuals_are_isolated {
+        let residual_roots = branch
+            .mount_residuals()
+            .iter()
+            .filter(|residual| {
+                world.get_entity(residual.entity()).is_ok()
+                    && (requires_exact_isolation(residual.claim())
+                        || (!manifest.allows_pending_boundary_loss(residual.claim())
+                            && residual_child_slot_is_isolated(world, residual)))
+            })
+            .map(ChildSlotResidual::entity)
+            .collect::<Vec<_>>();
+        focus_closure.extend(observed_descendant_closure(world, residual_roots));
+        focus_closure.sort_by_key(|entity| entity.to_bits());
+        focus_closure.dedup();
+    }
+    let mut revalidated_focus_closure = failed_branch_focus_closure(world, &exact_isolation_claims);
+    let residual_roots = branch
+        .mount_residuals()
+        .iter()
+        .filter(|residual| {
+            world.get_entity(residual.entity()).is_ok()
+                && (requires_exact_isolation(residual.claim())
+                    || (!manifest.allows_pending_boundary_loss(residual.claim())
+                        && residual_child_slot_is_isolated(world, residual)))
+        })
+        .map(ChildSlotResidual::entity)
+        .collect::<Vec<_>>();
+    revalidated_focus_closure.extend(observed_descendant_closure(world, residual_roots));
+    revalidated_focus_closure.sort_by_key(|entity| entity.to_bits());
+    revalidated_focus_closure.dedup();
+    let active_focus_after = match active {
+        Some(active) => {
+            let Ok(closure) = validate_branch_descendants(world, active) else {
+                return false;
+            };
+            closure
+        }
+        None => Vec::new(),
+    };
+    if revalidated_focus_closure != focus_closure
+        || active_focus_after != active_focus_before
+        || revalidated_focus_closure
+            .iter()
+            .any(|entity| active_focus_after.contains(entity))
+    {
+        return false;
+    }
     release_focus_for_closure(world, &focus_closure);
+    let primary_claim_snapshot_is_current = branch
+        .frames()
+        .iter()
+        .chain(branch.detached_frames())
+        .flat_map(RealizedFrame::claims)
+        .chain(branch.child_slots().iter().map(|slot| slot.slot_claim()))
+        .chain(
+            branch
+                .rejected_child_slots()
+                .iter()
+                .map(|slot| slot.slot().slot_claim()),
+        )
+        .all(|claim| {
+            if active_claims.contains(claim) {
+                failed_cleanup_claim_is_current(world, claim)
+            } else if requires_exact_isolation(claim) {
+                failed_cleanup_claim_is_current(world, claim)
+            } else {
+                !failed_cleanup_claim_is_current(world, claim)
+                    && manifest.allows_pending_boundary_loss(claim)
+            }
+        });
+    let residual_snapshot_is_current = branch.mount_residuals().iter().all(|residual| {
+        if requires_exact_isolation(residual.claim()) {
+            failed_cleanup_claim_is_current(world, residual.claim())
+        } else if manifest.allows_pending_boundary_loss(residual.claim()) {
+            !failed_cleanup_claim_is_current(world, residual.claim())
+        } else {
+            residual_child_slot_is_isolated(world, residual)
+        }
+    });
+    let isolation_snapshot_is_current =
+        primary_claim_snapshot_is_current && residual_snapshot_is_current;
+    let frames_remain_isolated = branch
+        .frames()
+        .iter()
+        .chain(branch.detached_frames())
+        .all(|frame| frame_is_isolated_for_settlement(world, frame, &requires_exact_isolation));
+    let focus_is_outside = focus_is_outside_closure(world, &focus_closure);
+    let child_slots_remain_isolated = branch.child_slots().iter().all(|slot| {
+        if manifest.allows_pending_boundary_loss(slot.slot_claim()) {
+            mounted_child_slot_local_is_isolated(world, slot)
+        } else {
+            mounted_child_slot_is_isolated(world, slot)
+        }
+    }) && branch.rejected_child_slots().iter().all(|slot| {
+        if manifest.allows_pending_boundary_loss(slot.slot().slot_claim()) {
+            mounted_child_slot_local_is_isolated(world, slot.slot())
+        } else {
+            mounted_child_slot_is_isolated(world, slot.slot())
+        }
+    });
     frames_are_isolated
         && child_slots_are_isolated
         && residuals_are_isolated
+        && isolation_snapshot_is_current
+        && frames_remain_isolated
+        && child_slots_remain_isolated
+        && focus_is_outside
+}
+
+fn isolate_exact_failed_prepared_branch(
+    world: &mut World,
+    branch: &FailedPreparedBranch,
+    active: Option<&RealizedBranch>,
+) -> bool {
+    let mut exact_isolation_claims = failed_branch_primary_claims(branch)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if !exact_isolation_claims
+        .iter()
+        .all(|claim| failed_cleanup_claim_is_current(world, claim))
+        || !branch
+            .child_slots()
+            .iter()
+            .all(|slot| mounted_child_slot_structure_is_isolated(world, slot))
+        || !branch
+            .rejected_child_slots()
+            .iter()
+            .all(|slot| mounted_child_slot_structure_is_isolated(world, slot.slot()))
+        || !branch
+            .mount_residuals()
+            .iter()
+            .all(|slot| residual_child_slot_is_isolated(world, slot))
+    {
+        return false;
+    }
+    let Some(validated_focus_before) = validate_branch_descendants(world, branch.realized()).ok()
+    else {
+        return false;
+    };
+    let mut protected_active_focus = Vec::new();
+    if let Some(active) = active {
+        let active_claims = active.claims().cloned().collect::<Vec<_>>();
+        protected_active_focus = active_claims
+            .iter()
+            .map(ExactRegistryClaim::entity)
+            .chain(active.interactive_entities().iter().copied())
+            .collect();
+        exact_isolation_claims.retain(|claim| !active_claims.contains(claim));
+    }
+    let focus_closure = failed_branch_focus_closure(world, &exact_isolation_claims);
+    if focus_closure
+        .iter()
+        .any(|entity| protected_active_focus.contains(entity))
+    {
+        return false;
+    }
+    let requires_exact_isolation =
+        |claim: &ExactRegistryClaim| exact_isolation_claims.contains(claim);
+    let frames_are_isolated = branch
+        .frames()
+        .iter()
+        .chain(branch.detached_frames())
+        .all(|frame| isolate_frame_for_settlement(world, frame, &requires_exact_isolation));
+    if validate_branch_descendants(world, branch.realized())
+        .ok()
+        .as_ref()
+        != Some(&validated_focus_before)
+        || failed_branch_focus_closure(world, &exact_isolation_claims) != focus_closure
+    {
+        return false;
+    }
+    release_focus_for_closure(world, &focus_closure);
+    frames_are_isolated
+        && exact_isolation_claims
+            .iter()
+            .all(|claim| failed_cleanup_claim_is_current(world, claim))
         && branch
             .frames()
             .iter()
             .chain(branch.detached_frames())
-            .all(|frame| frame_is_isolated_for_settlement(world, frame))
+            .all(|frame| frame_is_isolated_for_settlement(world, frame, &requires_exact_isolation))
+        && branch
+            .child_slots()
+            .iter()
+            .all(|slot| mounted_child_slot_is_isolated(world, slot))
+        && branch
+            .rejected_child_slots()
+            .iter()
+            .all(|slot| mounted_child_slot_is_isolated(world, slot.slot()))
+        && branch
+            .mount_residuals()
+            .iter()
+            .all(|slot| residual_child_slot_is_isolated(world, slot))
         && focus_is_outside_closure(world, &focus_closure)
 }
 
@@ -1654,10 +2130,124 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
     refresh_authority_audits(world);
 }
 
+enum ReconciliationPreflightOutcome {
+    Ready {
+        splice: SealedReconciliationSplice,
+        focus_leaving: Vec<bevy_ecs::entity::Entity>,
+    },
+    PendingRejected(SealedReconciliationSplice),
+    AuthorityLost(SealedReconciliationSplice),
+    RetryablePreparation(SealedReconciliationSplice),
+}
+
+fn current_host_binding_is_exact(world: &World, host: &HostBinding) -> bool {
+    let claim_owner_is_exact = matches!(
+        host.top_slot_claim.owner(),
+        crate::registry::RegistryOwner::Committed(
+            crate::registry::EntityOwner::HostTopSlot { host: version, slot }
+        ) if version == &host.version && *slot == host.slot_id
+    );
+    let record_is_exact = world
+        .get_resource::<RouteEntityRegistry>()
+        .and_then(|registry| registry.record(host.top_slot))
+        .is_some_and(|record| {
+            record.claim() == host.top_slot_claim
+                && crate::registry::ComponentManifest::from_world(world, host.top_slot).is_some_and(
+                    |actual| {
+                        let child_of = world
+                            .components()
+                            .component_id::<bevy_ecs::hierarchy::ChildOf>();
+                        let children = world
+                            .components()
+                            .component_id::<bevy_ecs::hierarchy::Children>();
+                        let normalized = |manifest: &crate::registry::ComponentManifest| {
+                            crate::registry::ComponentManifest::new(
+                                manifest
+                                    .component_ids()
+                                    .iter()
+                                    .copied()
+                                    .filter(|component| Some(*component) != child_of)
+                                    .filter(|component| Some(*component) != children),
+                            )
+                        };
+                        normalized(&actual) == normalized(record.manifest())
+                    },
+                )
+        });
+    let parent_is_exact = world
+        .get::<bevy_ecs::hierarchy::ChildOf>(host.top_slot)
+        .map(bevy_ecs::hierarchy::ChildOf::parent)
+        == Some(host.host);
+    let membership_is_exact = world
+        .get::<bevy_ecs::hierarchy::Children>(host.host)
+        .is_some_and(|children| {
+            children
+                .iter()
+                .filter(|child| **child == host.top_slot)
+                .count()
+                == 1
+        });
+    claim_owner_is_exact
+        && host.candidate.host() == host.host
+        && world.get_entity(host.host).is_ok()
+        && validated_host_candidate_is_current(world, &host.candidate)
+        && record_is_exact
+        && cleanup_claim_has_exact_authority(world, &host.top_slot_claim)
+        && parent_is_exact
+        && membership_is_exact
+}
+
+fn reconciliation_preflight(
+    world: &World,
+    host_is_current: bool,
+    has_leaving: bool,
+    splice: SealedReconciliationSplice,
+) -> ReconciliationPreflightOutcome {
+    if world.get_resource::<RouteEntityRegistry>().is_none() {
+        return ReconciliationPreflightOutcome::RetryablePreparation(splice);
+    }
+    if !host_is_current
+        || validate_active_branch_for_splice(
+            world,
+            splice.preserved(),
+            splice.entering(),
+            splice.slot_roles(),
+        )
+        .is_err()
+    {
+        return ReconciliationPreflightOutcome::AuthorityLost(splice);
+    }
+    if validate_reconciliation_entering_branch(
+        world,
+        splice.entering(),
+        splice.preserved(),
+        splice.leaving(),
+    )
+    .is_err()
+    {
+        return ReconciliationPreflightOutcome::PendingRejected(splice);
+    }
+    if has_leaving
+        && validate_leaving_branch_for_splice(world, splice.leaving(), splice.slot_roles()).is_err()
+    {
+        return ReconciliationPreflightOutcome::AuthorityLost(splice);
+    }
+    match validate_branch_descendants(world, splice.leaving()) {
+        Ok(focus_leaving) => ReconciliationPreflightOutcome::Ready {
+            splice,
+            focus_leaving,
+        },
+        Err(_) => ReconciliationPreflightOutcome::AuthorityLost(splice),
+    }
+}
+
 pub(crate) fn commit_presentation_system(world: &mut World) {
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             for entry in &mut navigation.entries {
+                if entry.authority_protocol_residual.is_some() {
+                    continue;
+                }
                 let Some(mut pending) = entry.pending_commit.take() else {
                     continue;
                 };
@@ -1746,69 +2336,123 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                         continue;
                     }
                 };
-                let host_is_current = entry.host.as_ref().is_some_and(|host| {
-                    world.get_entity(host.host).is_ok()
-                        && validated_host_candidate_is_current(world, &host.candidate)
-                });
-                if !host_is_current
-                    || validate_active_branch_for_splice(
-                        world,
-                        splice.preserved(),
-                        splice.entering(),
-                        splice.slot_roles(),
-                    )
-                    .is_err()
-                {
-                    let (active, entering, _roles) = splice.reject().into_parts();
-                    entry.active = had_active.then_some(active);
-                    pending.branch = entering;
-                    entry.pending_commit = Some(pending);
-                    continue;
-                }
-                if validate_reconciliation_entering_branch(
+                let host_is_current = entry
+                    .host
+                    .as_ref()
+                    .is_some_and(|host| current_host_binding_is_exact(world, host));
+                let (splice, mut focus_leaving) = match reconciliation_preflight(
                     world,
-                    splice.entering(),
-                    splice.preserved(),
-                    splice.leaving(),
-                )
-                .is_err()
-                {
-                    let (active, entering, _roles) = splice.reject().into_parts();
-                    entry.active = had_active.then_some(active);
-                    pending.branch = entering;
-                    let Some(task) = pending.final_task.take() else {
-                        entry.pending_commit = Some(pending);
+                    host_is_current,
+                    has_leaving,
+                    splice,
+                ) {
+                    ReconciliationPreflightOutcome::Ready {
+                        splice,
+                        focus_leaving,
+                    } => (splice, focus_leaving),
+                    ReconciliationPreflightOutcome::PendingRejected(splice) => {
+                        let (active, entering, _roles) = splice.reject().into_parts();
+                        entry.active = had_active.then_some(active);
+                        pending.branch = entering;
+                        let Some(task) = pending.final_task.take() else {
+                            entry.pending_commit = Some(pending);
+                            continue;
+                        };
+                        let failed = PendingFailedBranch {
+                            terminal: PendingFailedBranchTerminal::TaskWithPhysicalResidual {
+                                task,
+                                failure: ViewFailureKind::Apply,
+                                message: "frame final preflight rejected",
+                            },
+                            branch: failed_prepared_branch(pending, None),
+                        };
+                        let _ = isolate_exact_failed_prepared_branch(
+                            world,
+                            &failed.branch,
+                            entry.active.as_ref(),
+                        );
+                        entry.pending_failed_branch = Some(failed);
                         continue;
-                    };
-                    let failed = PendingFailedBranch {
-                        terminal: PendingFailedBranchTerminal::TaskWithPhysicalResidual {
-                            task,
-                            failure: ViewFailureKind::Apply,
-                            message: "frame final preflight rejected",
-                        },
-                        branch: failed_prepared_branch(pending, None),
-                    };
-                    let _ = isolate_failed_prepared_branch(world, &failed.branch);
-                    entry.pending_failed_branch = Some(failed);
-                    continue;
-                }
-                if has_leaving
-                    && validate_leaving_branch_for_splice(
-                        world,
-                        splice.leaving(),
-                        splice.slot_roles(),
-                    )
-                    .is_err()
-                {
-                    let (active, entering, _roles) = splice.reject().into_parts();
-                    entry.active = had_active.then_some(active);
-                    pending.branch = entering;
-                    entry.pending_commit = Some(pending);
-                    continue;
-                }
-                let mut focus_leaving = match validate_branch_descendants(world, splice.leaving()) {
-                    Ok(descendants) => descendants,
-                    Err(_) => {
+                    }
+                    ReconciliationPreflightOutcome::AuthorityLost(splice) => {
+                        let (active, entering, _roles) = splice.reject().into_parts();
+                        pending.branch = entering;
+                        match begin_authority_settlement(
+                            world,
+                            entry,
+                            active,
+                            pending,
+                        ) {
+                            AuthoritySettlementBeginOutcome::Begun => {}
+                            AuthoritySettlementBeginOutcome::RetryablePreparation {
+                                active,
+                                pending,
+                            } => {
+                                entry.active = had_active.then_some(active);
+                                entry.pending_commit = Some(pending);
+                            }
+                            AuthoritySettlementBeginOutcome::ProtocolContradiction {
+                                active,
+                                pending,
+                                kind,
+                            } => {
+                                if let Err((active, pending)) =
+                                    fail_closed_normal_authority_protocol(
+                                        world, entry, active, pending, kind,
+                                    )
+                                {
+                                    entry.active = had_active.then_some(active);
+                                    entry.pending_commit = Some(pending);
+                                    continue;
+                                }
+                            }
+                            AuthoritySettlementBeginOutcome::IsolationContradiction {
+                                active,
+                                pending,
+                                contradiction,
+                                isolation,
+                            } => {
+                                if let Err((active, pending)) =
+                                    fail_closed_normal_authority_protocol_prepared(
+                                        world,
+                                        entry,
+                                        active,
+                                        pending,
+                                        AuthorityProtocolResidualKind::AuthorityIsolation(
+                                            contradiction.clone(),
+                                        ),
+                                        isolation,
+                                        Some(contradiction),
+                                    )
+                                {
+                                    entry.active = had_active.then_some(active);
+                                    entry.pending_commit = Some(pending);
+                                    continue;
+                                }
+                            }
+                            AuthoritySettlementBeginOutcome::LedgerContradiction {
+                                active,
+                                pending,
+                                kind,
+                            } => {
+                                if let Err((active, pending)) =
+                                    fail_closed_normal_owner_protocol(
+                                        world,
+                                        entry,
+                                        active,
+                                        pending,
+                                        AuthorityProtocolResidualKind::CleanupLedger(kind),
+                                    )
+                                {
+                                    entry.active = had_active.then_some(active);
+                                    entry.pending_commit = Some(pending);
+                                    continue;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    ReconciliationPreflightOutcome::RetryablePreparation(splice) => {
                         let (active, entering, _roles) = splice.reject().into_parts();
                         entry.active = had_active.then_some(active);
                         pending.branch = entering;
@@ -1850,6 +2494,7 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                     None
                 };
                 let mut splice_owner = Some(splice);
+                let mut cleanup_reserve_contradiction = None;
                 let committed = world.resource_scope(
                     |world, gate: bevy_ecs::change_detection::Mut<RouterInputGate>| {
                         world.resource_scope(
@@ -1894,7 +2539,22 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                                                     obligation_count,
                                                 );
                                                 let reserved_ledger =
-                                                    CleanupLedger::reserve(frozen_manifest)?;
+                                                    match CleanupLedger::reserve(frozen_manifest) {
+                                                        Ok(reserved) => reserved,
+                                                        Err(error) => match error.kind() {
+                                                            CleanupLedgerReserveErrorKind::RetryableCapacity => {
+                                                                return None;
+                                                            }
+                                                            kind @ (CleanupLedgerReserveErrorKind::DomainExhausted
+                                                            | CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts) => {
+                                                                let _returned_manifest =
+                                                                    error.into_manifest();
+                                                                cleanup_reserve_contradiction =
+                                                                    Some(kind);
+                                                                return None;
+                                                            }
+                                                        },
+                                                    };
                                                 let gate_plan = prepare_input_gate_mutation(
                                                     gate,
                                                     &gate_before,
@@ -1979,8 +2639,21 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                         .take()
                         .expect("failed commit retains its sealed splice owner");
                     let (active, entering, _roles) = splice.reject().into_parts();
-                    entry.active = had_active.then_some(active);
                     pending.branch = entering;
+                    if let Some(kind) = cleanup_reserve_contradiction {
+                        if let Err((active, pending)) = fail_closed_normal_owner_protocol(
+                            world,
+                            entry,
+                            active,
+                            pending,
+                            AuthorityProtocolResidualKind::CleanupLedger(kind),
+                        ) {
+                            entry.active = had_active.then_some(active);
+                            entry.pending_commit = Some(pending);
+                        }
+                        continue;
+                    }
+                    entry.active = had_active.then_some(active);
                     if pending.ticket.is_some() || pending.final_task.is_some() {
                         entry.pending_commit = Some(pending);
                     }
@@ -1990,6 +2663,777 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
         },
     );
     refresh_authority_audits(world);
+}
+
+enum AuthoritySettlementBeginOutcome {
+    Begun,
+    RetryablePreparation {
+        active: RealizedBranch,
+        pending: PendingCommit,
+    },
+    ProtocolContradiction {
+        active: RealizedBranch,
+        pending: PendingCommit,
+        kind: BeginAuthoritySettlementErrorKind,
+    },
+    IsolationContradiction {
+        active: RealizedBranch,
+        pending: PendingCommit,
+        contradiction: AuthorityIsolationContradiction,
+        isolation: PreparedAuthorityIsolation,
+    },
+    LedgerContradiction {
+        active: RealizedBranch,
+        pending: PendingCommit,
+        kind: CleanupLedgerReserveErrorKind,
+    },
+}
+
+fn begin_authority_settlement(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    active: RealizedBranch,
+    pending: PendingCommit,
+) -> AuthoritySettlementBeginOutcome {
+    let Some(host) = entry.host.as_ref() else {
+        return AuthoritySettlementBeginOutcome::ProtocolContradiction {
+            active,
+            pending,
+            kind: BeginAuthoritySettlementErrorKind::Stale,
+        };
+    };
+    let frozen = {
+        let registry = world.resource::<RouteEntityRegistry>();
+        match FrozenCleanupManifest::from_authority_settlement(
+            world,
+            registry,
+            &pending.branch,
+            &active,
+            host,
+        ) {
+            Ok(frozen) => frozen,
+            Err(AuthoritySettlementManifestError::RetryableCapacity) => {
+                return AuthoritySettlementBeginOutcome::RetryablePreparation { active, pending };
+            }
+            Err(
+                AuthoritySettlementManifestError::InvalidAuthority
+                | AuthoritySettlementManifestError::InvalidTopology,
+            ) => {
+                return AuthoritySettlementBeginOutcome::ProtocolContradiction {
+                    active,
+                    pending,
+                    kind: BeginAuthoritySettlementErrorKind::InvalidManifest,
+                };
+            }
+        }
+    };
+    let manifest_digest = frozen.digest();
+    let obligation_count = frozen.len();
+    let reserved = match CleanupLedger::reserve(frozen) {
+        Ok(reserved) => reserved,
+        Err(error) => match error.kind() {
+            CleanupLedgerReserveErrorKind::RetryableCapacity => {
+                return AuthoritySettlementBeginOutcome::RetryablePreparation { active, pending };
+            }
+            kind @ (CleanupLedgerReserveErrorKind::DomainExhausted
+            | CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts) => {
+                let _returned_manifest = error.into_manifest();
+                return AuthoritySettlementBeginOutcome::LedgerContradiction {
+                    active,
+                    pending,
+                    kind,
+                };
+            }
+        },
+    };
+
+    let host_children = world
+        .get::<bevy_ecs::hierarchy::Children>(host.host)
+        .map(|children| children.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let top_slot_parent = world
+        .get::<bevy_ecs::hierarchy::ChildOf>(host.top_slot)
+        .map(bevy_ecs::hierarchy::ChildOf::parent);
+    let top_slot_memberships = host_children
+        .iter()
+        .filter(|child| **child == host.top_slot)
+        .count();
+    if (top_slot_parent == Some(host.host) && top_slot_memberships != 1)
+        || (top_slot_parent != Some(host.host) && top_slot_memberships != 0)
+    {
+        return AuthoritySettlementBeginOutcome::ProtocolContradiction {
+            active,
+            pending,
+            kind: BeginAuthoritySettlementErrorKind::InvalidManifest,
+        };
+    }
+
+    let isolation =
+        match prepare_normal_authority_isolation(world, &active, &pending.branch, Some(host)) {
+            AuthorityIsolationPreparation::Ready(isolation) => isolation,
+            AuthorityIsolationPreparation::RetryableCapacity => {
+                return AuthoritySettlementBeginOutcome::RetryablePreparation { active, pending };
+            }
+            AuthorityIsolationPreparation::PermanentContradiction {
+                contradiction,
+                fail_closed,
+            } => {
+                return AuthoritySettlementBeginOutcome::IsolationContradiction {
+                    active,
+                    pending,
+                    contradiction,
+                    isolation: fail_closed,
+                };
+            }
+        };
+
+    let HostBinding {
+        version,
+        slot_id,
+        host: host_entity,
+        top_slot,
+        top_slot_claim,
+        candidate,
+        lease,
+    } = entry
+        .host
+        .take()
+        .expect("authority settlement retains its exact host binding");
+    let logical_roots = authority_settlement_logical_roots(&pending.branch, &active);
+    let retired_host = RetiredHostBinding {
+        version: version.clone(),
+        slot_id,
+        host: host_entity,
+        top_slot,
+        top_slot_claim: top_slot_claim.clone(),
+        candidate: candidate.clone(),
+    };
+    let mut settlement_owner = Some((reserved, active, pending, retired_host));
+    let engine = &mut entry.engine;
+    let cleanup_ledger = &mut entry.cleanup_ledger;
+    match engine.begin_authority_settlement_retaining(
+        lease,
+        CleanupManifest::new(logical_roots, manifest_digest, obligation_count),
+        |batch| {
+            isolation.apply(world);
+            let (reserved, active, pending, owner) = settlement_owner
+                .take()
+                .expect("authority publication consumes its composed owner once");
+            *cleanup_ledger = Some(CleanupLedger::activate_authority_settlement(
+                reserved.bind_batch(batch),
+                active,
+                FailedPreparedBranch::new(pending.branch),
+                owner,
+                host_children,
+            ));
+        },
+    ) {
+        Ok(_) => AuthoritySettlementBeginOutcome::Begun,
+        Err(error) => {
+            let kind = error.kind();
+            entry.host = Some(HostBinding {
+                version,
+                slot_id,
+                host: host_entity,
+                top_slot,
+                top_slot_claim,
+                candidate,
+                lease: error.into_owner(),
+            });
+            let (_, active, pending, _) = settlement_owner
+                .take()
+                .expect("rejected publication returns its composed owner");
+            return match kind {
+                BeginAuthoritySettlementErrorKind::RetryablePreparation => {
+                    AuthoritySettlementBeginOutcome::RetryablePreparation { active, pending }
+                }
+                BeginAuthoritySettlementErrorKind::Foreign
+                | BeginAuthoritySettlementErrorKind::Stale
+                | BeginAuthoritySettlementErrorKind::WrongPhase
+                | BeginAuthoritySettlementErrorKind::InvalidManifest => {
+                    AuthoritySettlementBeginOutcome::ProtocolContradiction {
+                        active,
+                        pending,
+                        kind,
+                    }
+                }
+            };
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthorityIsolationComponent {
+    Visibility,
+    Pickable,
+    RouterInputBarrier,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthorityIsolationPredicate {
+    PresentForHiddenWrite,
+    PresentForIgnoreWrite,
+    PresentForDenyWrite,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AuthorityIsolationViolation {
+    entity: bevy_ecs::entity::Entity,
+    component: AuthorityIsolationComponent,
+    predicate: AuthorityIsolationPredicate,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthorityIsolationContradiction {
+    violations: Vec<AuthorityIsolationViolation>,
+}
+
+struct PreparedAuthorityEntityIsolation {
+    entity: bevy_ecs::entity::Entity,
+    visibility: bool,
+    pickable: bool,
+    barrier: bool,
+}
+
+struct PreparedAuthorityIsolation {
+    entities: Vec<PreparedAuthorityEntityIsolation>,
+    focus: Vec<bevy_ecs::entity::Entity>,
+    gate: PreparedInputGateIsolation,
+}
+
+impl PreparedAuthorityIsolation {
+    fn apply(self, world: &mut World) {
+        self.gate
+            .apply(&mut world.resource_mut::<RouterInputGate>());
+        release_focus_for_closure(world, &self.focus);
+        for entity in self.entities {
+            if entity.visibility {
+                *world
+                    .get_mut::<bevy_camera::visibility::Visibility>(entity.entity)
+                    .expect("prepared authority isolation retains present Visibility") =
+                    bevy_camera::visibility::Visibility::Hidden;
+            }
+            if entity.pickable {
+                *world
+                    .get_mut::<bevy_picking::Pickable>(entity.entity)
+                    .expect("prepared authority isolation retains present Pickable") =
+                    bevy_picking::Pickable::IGNORE;
+            }
+            if entity.barrier {
+                *world
+                    .get_mut::<crate::components::RouterInputBarrier>(entity.entity)
+                    .expect("prepared authority isolation retains present input barrier") =
+                    crate::components::RouterInputBarrier::deny_all();
+            }
+        }
+    }
+}
+
+enum AuthorityIsolationPreparation {
+    Ready(PreparedAuthorityIsolation),
+    RetryableCapacity,
+    PermanentContradiction {
+        contradiction: AuthorityIsolationContradiction,
+        fail_closed: PreparedAuthorityIsolation,
+    },
+}
+
+fn try_push<T>(values: &mut Vec<T>, value: T) -> Result<(), ()> {
+    values.try_reserve(1).map_err(|_| ())?;
+    values.push(value);
+    Ok(())
+}
+
+fn prepare_authority_isolation_targets<'a>(
+    world: &World,
+    stored_claims: impl IntoIterator<Item = &'a ExactRegistryClaim>,
+    gate_targets: impl IntoIterator<Item = bevy_ecs::entity::Entity>,
+) -> AuthorityIsolationPreparation {
+    let mut known = Vec::new();
+    let mut exact = Vec::new();
+    for claim in stored_claims {
+        if !known.contains(&claim.entity()) && try_push(&mut known, claim.entity()).is_err() {
+            return AuthorityIsolationPreparation::RetryableCapacity;
+        }
+        if !exact.contains(&claim.entity())
+            && world
+                .resource::<RouteEntityRegistry>()
+                .record(claim.entity())
+                .is_some_and(|record| record.claim() == *claim)
+            && cleanup_claim_has_exact_authority(world, claim)
+            && try_push(&mut exact, claim.entity()).is_err()
+        {
+            return AuthorityIsolationPreparation::RetryableCapacity;
+        }
+    }
+
+    let mut entities = Vec::new();
+    let mut violations = Vec::new();
+    for entity in exact {
+        let visibility = match world.get::<bevy_camera::visibility::Visibility>(entity) {
+            Some(visibility) => *visibility != bevy_camera::visibility::Visibility::Hidden,
+            None => {
+                if try_push(
+                    &mut violations,
+                    AuthorityIsolationViolation {
+                        entity,
+                        component: AuthorityIsolationComponent::Visibility,
+                        predicate: AuthorityIsolationPredicate::PresentForHiddenWrite,
+                    },
+                )
+                .is_err()
+                {
+                    return AuthorityIsolationPreparation::RetryableCapacity;
+                }
+                false
+            }
+        };
+        let pickable = match world.get::<bevy_picking::Pickable>(entity) {
+            Some(pickable) => *pickable != bevy_picking::Pickable::IGNORE,
+            None => {
+                if try_push(
+                    &mut violations,
+                    AuthorityIsolationViolation {
+                        entity,
+                        component: AuthorityIsolationComponent::Pickable,
+                        predicate: AuthorityIsolationPredicate::PresentForIgnoreWrite,
+                    },
+                )
+                .is_err()
+                {
+                    return AuthorityIsolationPreparation::RetryableCapacity;
+                }
+                false
+            }
+        };
+        let barrier = match world.get::<crate::components::RouterInputBarrier>(entity) {
+            Some(barrier) => !barrier.denies_all(),
+            None => {
+                if try_push(
+                    &mut violations,
+                    AuthorityIsolationViolation {
+                        entity,
+                        component: AuthorityIsolationComponent::RouterInputBarrier,
+                        predicate: AuthorityIsolationPredicate::PresentForDenyWrite,
+                    },
+                )
+                .is_err()
+                {
+                    return AuthorityIsolationPreparation::RetryableCapacity;
+                }
+                false
+            }
+        };
+        if (visibility || pickable || barrier)
+            && try_push(
+                &mut entities,
+                PreparedAuthorityEntityIsolation {
+                    entity,
+                    visibility,
+                    pickable,
+                    barrier,
+                },
+            )
+            .is_err()
+        {
+            return AuthorityIsolationPreparation::RetryableCapacity;
+        }
+    }
+
+    let focus_set = observed_descendant_closure(world, known);
+    let mut focus = Vec::new();
+    if focus.try_reserve_exact(focus_set.len()).is_err() {
+        return AuthorityIsolationPreparation::RetryableCapacity;
+    }
+    focus.extend(focus_set);
+    focus.sort_by_key(|entity| entity.to_bits());
+    let mut gate_targets_vec = Vec::new();
+    for entity in gate_targets {
+        if !gate_targets_vec.contains(&entity) && try_push(&mut gate_targets_vec, entity).is_err() {
+            return AuthorityIsolationPreparation::RetryableCapacity;
+        }
+    }
+    let Ok(gate) =
+        try_prepare_input_gate_isolation(world.resource::<RouterInputGate>(), &gate_targets_vec)
+    else {
+        return AuthorityIsolationPreparation::RetryableCapacity;
+    };
+    let prepared = PreparedAuthorityIsolation {
+        entities,
+        focus,
+        gate,
+    };
+    if violations.is_empty() {
+        AuthorityIsolationPreparation::Ready(prepared)
+    } else {
+        AuthorityIsolationPreparation::PermanentContradiction {
+            contradiction: AuthorityIsolationContradiction { violations },
+            fail_closed: prepared,
+        }
+    }
+}
+
+fn prepare_normal_authority_isolation(
+    world: &World,
+    active: &RealizedBranch,
+    pending: &PreparedBranch,
+    host: Option<&HostBinding>,
+) -> AuthorityIsolationPreparation {
+    prepare_authority_isolation_targets(
+        world,
+        pending
+            .as_realized()
+            .claims()
+            .chain(active.claims())
+            .chain(host.into_iter().map(|host| &host.top_slot_claim)),
+        active
+            .interactive_entities()
+            .into_iter()
+            .chain(pending.as_realized().interactive_entities()),
+    )
+}
+
+fn prepare_failed_authority_isolation(
+    world: &World,
+    active: Option<&RealizedBranch>,
+    failed: &PendingFailedBranch,
+    host: Option<&HostBinding>,
+) -> AuthorityIsolationPreparation {
+    let branch = &failed.branch;
+    let stored_claims = branch
+        .frames()
+        .iter()
+        .flat_map(RealizedFrame::claims)
+        .chain(
+            branch
+                .detached_frames()
+                .iter()
+                .flat_map(RealizedFrame::claims),
+        )
+        .chain(branch.child_slots().iter().map(|slot| slot.slot_claim()))
+        .chain(
+            branch
+                .mount_residuals()
+                .iter()
+                .map(ChildSlotResidual::claim),
+        )
+        .chain(
+            branch
+                .rejected_child_slots()
+                .iter()
+                .map(|rejected| rejected.slot().slot_claim()),
+        )
+        .chain(active.into_iter().flat_map(RealizedBranch::claims))
+        .chain(host.into_iter().map(|host| &host.top_slot_claim));
+    let gate_targets = active
+        .into_iter()
+        .flat_map(RealizedBranch::interactive_entities)
+        .chain(
+            branch
+                .frames()
+                .iter()
+                .chain(branch.detached_frames())
+                .flat_map(RealizedFrame::interactive_entities),
+        )
+        .chain(host.into_iter().map(|host| host.top_slot));
+    prepare_authority_isolation_targets(world, stored_claims, gate_targets)
+}
+
+fn prepare_failed_manifest_protocol_isolation(
+    world: &World,
+    active: Option<&RealizedBranch>,
+    failed: &PendingFailedBranch,
+    host: Option<&HostBinding>,
+) -> AuthorityIsolationPreparation {
+    prepare_failed_authority_isolation(world, active, failed, host)
+}
+
+fn prepare_projectionless_authority_isolation(
+    world: &World,
+    pending: &PreparedBranch,
+    host: Option<&HostBinding>,
+) -> AuthorityIsolationPreparation {
+    prepare_authority_isolation_targets(
+        world,
+        pending
+            .as_realized()
+            .claims()
+            .chain(host.into_iter().map(|host| &host.top_slot_claim)),
+        pending.as_realized().interactive_entities(),
+    )
+}
+
+/*
+    The owner-specific functions above only select stored claims and gate targets. All authority,
+    component-presence, focus, gate, and in-place mutation preparation is shared by
+    `prepare_authority_isolation_targets`.
+*/
+
+fn fail_closed_normal_authority_protocol(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    active: RealizedBranch,
+    pending: PendingCommit,
+    kind: BeginAuthoritySettlementErrorKind,
+) -> Result<(), (RealizedBranch, PendingCommit)> {
+    fail_closed_normal_owner_protocol(
+        world,
+        entry,
+        active,
+        pending,
+        AuthorityProtocolResidualKind::Authority(kind),
+    )
+}
+
+fn fail_closed_normal_owner_protocol(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    active: RealizedBranch,
+    pending: PendingCommit,
+    kind: AuthorityProtocolResidualKind,
+) -> Result<(), (RealizedBranch, PendingCommit)> {
+    let (isolation, isolation_contradiction) = match prepare_normal_authority_isolation(
+        world,
+        &active,
+        &pending.branch,
+        entry.host.as_ref(),
+    ) {
+        AuthorityIsolationPreparation::Ready(isolation) => (isolation, None),
+        AuthorityIsolationPreparation::RetryableCapacity => return Err((active, pending)),
+        AuthorityIsolationPreparation::PermanentContradiction {
+            contradiction,
+            fail_closed,
+        } => (fail_closed, Some(contradiction)),
+    };
+    fail_closed_normal_authority_protocol_prepared(
+        world,
+        entry,
+        active,
+        pending,
+        kind,
+        isolation,
+        isolation_contradiction,
+    )
+}
+
+fn fail_closed_normal_authority_protocol_prepared(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    active: RealizedBranch,
+    pending: PendingCommit,
+    kind: AuthorityProtocolResidualKind,
+    isolation: PreparedAuthorityIsolation,
+    isolation_contradiction: Option<AuthorityIsolationContradiction>,
+) -> Result<(), (RealizedBranch, PendingCommit)> {
+    match fail_closed_pending_owner_protocol_prepared(
+        world,
+        entry,
+        Some(active),
+        pending,
+        kind,
+        isolation,
+        isolation_contradiction,
+    ) {
+        Ok(()) => Ok(()),
+        Err((active, pending)) => Err((
+            active.expect("normal protocol residual retains its active owner"),
+            pending,
+        )),
+    }
+}
+
+fn fail_closed_pending_owner_protocol_prepared(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    active: Option<RealizedBranch>,
+    pending: PendingCommit,
+    kind: AuthorityProtocolResidualKind,
+    isolation: PreparedAuthorityIsolation,
+    isolation_contradiction: Option<AuthorityIsolationContradiction>,
+) -> Result<(), (Option<RealizedBranch>, PendingCommit)> {
+    let (retired_host, lease) = match entry.host.take() {
+        Some(host) => {
+            let (retired, lease) = host.into_retired();
+            (Some(retired), Some(lease))
+        }
+        None => (None, None),
+    };
+    let mut residual = Some(AuthorityProtocolResidualOwner {
+        kind,
+        isolation_contradiction,
+        active,
+        pending: Some(pending),
+        failed: None,
+        host: retired_host,
+    });
+    let protocol_residual = &mut entry.authority_protocol_residual;
+    if let Err(returned_lease) =
+        entry
+            .engine
+            .fail_closed_authority_protocol_retaining(lease, || {
+                isolation.apply(world);
+                *protocol_residual = residual.take();
+            })
+    {
+        let mut owner = residual
+            .take()
+            .expect("rejected normal protocol publication retains its exact owner");
+        match (owner.host.take(), returned_lease) {
+            (Some(retired), Some(lease)) => entry.host = Some(retired.restore(lease)),
+            (None, None) => {}
+            _ => unreachable!("authority fail-closed returns the exact optional host lease"),
+        }
+        return Err((
+            owner.active.take(),
+            owner
+                .pending
+                .take()
+                .expect("normal protocol residual retains pending"),
+        ));
+    }
+    Ok(())
+}
+
+fn fail_closed_failed_manifest_protocol(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    failed: PendingFailedBranch,
+    kind: FailedPreparedTopologyError,
+) -> Result<(), PendingFailedBranch> {
+    fail_closed_failed_owner_protocol(
+        world,
+        entry,
+        failed,
+        AuthorityProtocolResidualKind::FailedManifest(kind),
+    )
+}
+
+fn fail_closed_failed_authority_protocol(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    failed: PendingFailedBranch,
+    kind: BeginAuthoritySettlementErrorKind,
+) -> Result<(), PendingFailedBranch> {
+    fail_closed_failed_owner_protocol(
+        world,
+        entry,
+        failed,
+        AuthorityProtocolResidualKind::Authority(kind),
+    )
+}
+
+fn fail_closed_failed_owner_protocol(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    failed: PendingFailedBranch,
+    kind: AuthorityProtocolResidualKind,
+) -> Result<(), PendingFailedBranch> {
+    let (isolation, isolation_contradiction) = match prepare_failed_manifest_protocol_isolation(
+        world,
+        entry.active.as_ref(),
+        &failed,
+        entry.host.as_ref(),
+    ) {
+        AuthorityIsolationPreparation::Ready(isolation) => (isolation, None),
+        AuthorityIsolationPreparation::RetryableCapacity => return Err(failed),
+        AuthorityIsolationPreparation::PermanentContradiction {
+            contradiction,
+            fail_closed,
+        } => (fail_closed, Some(contradiction)),
+    };
+    fail_closed_failed_owner_protocol_prepared(
+        world,
+        entry,
+        failed,
+        kind,
+        isolation,
+        isolation_contradiction,
+    )
+}
+
+fn fail_closed_failed_owner_protocol_prepared(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    failed: PendingFailedBranch,
+    kind: AuthorityProtocolResidualKind,
+    isolation: PreparedAuthorityIsolation,
+    isolation_contradiction: Option<AuthorityIsolationContradiction>,
+) -> Result<(), PendingFailedBranch> {
+    let active = entry.active.take();
+    let (retired_host, lease) = match entry.host.take() {
+        Some(host) => {
+            let (retired, lease) = host.into_retired();
+            (Some(retired), Some(lease))
+        }
+        None => (None, None),
+    };
+    let mut residual = Some(AuthorityProtocolResidualOwner {
+        kind,
+        isolation_contradiction,
+        active,
+        pending: None,
+        failed: Some(failed),
+        host: retired_host,
+    });
+    let protocol_residual = &mut entry.authority_protocol_residual;
+    if let Err(returned_lease) =
+        entry
+            .engine
+            .fail_closed_authority_protocol_retaining(lease, || {
+                isolation.apply(world);
+                *protocol_residual = residual.take();
+            })
+    {
+        let mut owner = residual
+            .take()
+            .expect("rejected failed-owner publication retains its exact owner");
+        match (owner.host.take(), returned_lease) {
+            (Some(retired), Some(lease)) => entry.host = Some(retired.restore(lease)),
+            (None, None) => {}
+            _ => unreachable!("authority fail-closed returns the exact optional host lease"),
+        }
+        entry.active = owner.active.take();
+        return Err(owner
+            .failed
+            .take()
+            .expect("failed-manifest residual retains pending failed owner"));
+    }
+    Ok(())
+}
+
+fn fail_closed_projectionless_owner_protocol(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    pending: PendingCommit,
+    kind: CleanupLedgerReserveErrorKind,
+) -> Result<(), PendingCommit> {
+    let (isolation, isolation_contradiction) = match prepare_projectionless_authority_isolation(
+        world,
+        &pending.branch,
+        entry.host.as_ref(),
+    ) {
+        AuthorityIsolationPreparation::Ready(isolation) => (isolation, None),
+        AuthorityIsolationPreparation::RetryableCapacity => return Err(pending),
+        AuthorityIsolationPreparation::PermanentContradiction {
+            contradiction,
+            fail_closed,
+        } => (fail_closed, Some(contradiction)),
+    };
+    match fail_closed_pending_owner_protocol_prepared(
+        world,
+        entry,
+        None,
+        pending,
+        AuthorityProtocolResidualKind::CleanupLedger(kind),
+        isolation,
+        isolation_contradiction,
+    ) {
+        Ok(()) => Ok(()),
+        Err((active, pending)) => {
+            debug_assert!(active.is_none());
+            Err(pending)
+        }
+    }
 }
 
 fn commit_projectionless_initial_branch(
@@ -2017,6 +3461,7 @@ fn commit_projectionless_initial_branch(
         entering.entering_mutation_targets(EntityLifecycle::PreparedInert, EntityLifecycle::Active);
     let transitions = entering.lifecycle_transitions(EntityLifecycle::Active, false);
     let mut entering_owner = Some(entering);
+    let mut cleanup_reserve_contradiction = None;
     let committed = world.resource_scope(
         |world, gate: bevy_ecs::change_detection::Mut<RouterInputGate>| {
             world.resource_scope(
@@ -2035,7 +3480,21 @@ fn commit_projectionless_initial_branch(
                                     let frozen_manifest = FrozenCleanupManifest::empty();
                                     let manifest_digest = frozen_manifest.digest();
                                     let obligation_count = frozen_manifest.len();
-                                    let reserved_ledger = CleanupLedger::reserve(frozen_manifest)?;
+                                    let reserved_ledger =
+                                        match CleanupLedger::reserve(frozen_manifest) {
+                                            Ok(reserved) => reserved,
+                                            Err(error) => match error.kind() {
+                                                CleanupLedgerReserveErrorKind::RetryableCapacity => {
+                                                    return None;
+                                                }
+                                                kind @ (CleanupLedgerReserveErrorKind::DomainExhausted
+                                                | CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts) => {
+                                                    let _returned_manifest = error.into_manifest();
+                                                    cleanup_reserve_contradiction = Some(kind);
+                                                    return None;
+                                                }
+                                            },
+                                        };
                                     let gate_plan =
                                         prepare_input_gate_mutation(gate, &[], gate_after)?;
                                     let focus_plan =
@@ -2111,6 +3570,9 @@ fn commit_projectionless_initial_branch(
             .take()
             .expect("failed projectionless commit retains its entering owner");
         pending.branch = PreparedBranch::from_realized(entering);
+        if let Some(kind) = cleanup_reserve_contradiction {
+            return fail_closed_projectionless_owner_protocol(world, entry, pending, kind);
+        }
         return Err(pending);
     };
     Ok(())
@@ -2134,6 +3596,708 @@ fn logical_cleanup_roots(branch: &RealizedBranch) -> Vec<RouteFrameVersion> {
         .rev()
         .map(|frame| frame.frame().clone())
         .collect()
+}
+
+fn authority_settlement_logical_roots(
+    pending: &PreparedBranch,
+    active: &RealizedBranch,
+) -> Vec<RouteFrameVersion> {
+    let mut roots = pending
+        .frames()
+        .iter()
+        .rev()
+        .chain(active.frames().iter().rev())
+        .map(|frame| frame.frame().clone())
+        .collect::<Vec<_>>();
+    let mut unique = Vec::with_capacity(roots.len());
+    for frame in roots.drain(..) {
+        if !unique.contains(&frame) {
+            unique.push(frame);
+        }
+    }
+    roots = unique;
+    roots
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum FailedBoundaryDisposition {
+    CurrentAuthorityLoss(FailedBoundaryDrift),
+    PendingOnlyDrift(FailedBoundaryDrift),
+    AmbiguousInvalidTopology(FailedBoundaryDrift),
+}
+
+enum FailedManifestDisposition {
+    Ready {
+        failed: PendingFailedBranch,
+        manifest: FrozenCleanupManifest,
+    },
+    CurrentAuthorityLoss {
+        failed: PendingFailedBranch,
+        manifest: FrozenCleanupManifest,
+        bindings: Vec<FailedAuthorityBoundaryBinding>,
+    },
+    AmbiguousInvalidTopology {
+        failed: PendingFailedBranch,
+        manifest: FrozenCleanupManifest,
+    },
+}
+
+fn exact_failed_source_obligation<'a>(
+    drift: &FailedBoundaryDrift,
+    failed: &'a FailedPreparedBranch,
+) -> Option<&'a ExactRegistryClaim> {
+    let expected = drift.expected.exact_claim();
+    match &drift.source {
+        FailedBoundarySource::FrameMountSlot {
+            frame,
+            removed_child,
+        } => {
+            let mut matches = failed
+                .frames()
+                .iter()
+                .chain(failed.detached_frames())
+                .filter(|candidate| {
+                    candidate.frame() == frame
+                        && candidate.shell() == *removed_child
+                        && candidate.mount_binding().slot_claim() == expected
+                });
+            let candidate = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            candidate.claims().find(|claim| {
+                claim.entity() == *removed_child
+                    && matches!(
+                        claim.owner(),
+                        RegistryOwner::Committed(EntityOwner::FrameShell(owner))
+                            if owner == frame
+                    )
+            })
+        }
+        FailedBoundarySource::FramePhysicalParent {
+            frame,
+            mount_slot,
+            removed_child,
+        } => {
+            let mut matches = failed
+                .frames()
+                .iter()
+                .chain(failed.detached_frames())
+                .filter(|candidate| {
+                    let (physical_parent, physical_claim) =
+                        candidate.mount_binding().physical_parent();
+                    candidate.frame() == frame
+                        && candidate.shell() == *removed_child
+                        && candidate.mount_binding().slot() == *mount_slot
+                        && physical_parent == expected.entity()
+                        && physical_claim == Some(expected)
+                });
+            let candidate = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            candidate.claims().find(|claim| {
+                claim.entity() == *removed_child
+                    && matches!(
+                        claim.owner(),
+                        RegistryOwner::Committed(EntityOwner::FrameShell(owner))
+                            if owner == frame
+                    )
+            })
+        }
+        FailedBoundarySource::MountedSlotAnchor {
+            parent,
+            outlet,
+            slot,
+            removed_child,
+        } => {
+            let mut matches = failed.child_slots().iter().filter(|candidate| {
+                candidate.parent() == parent
+                    && candidate.outlet() == outlet
+                    && candidate.slot_id() == *slot
+                    && candidate.slot() == *removed_child
+                    && candidate.anchor_claim() == expected
+                    && candidate.anchor() == expected.entity()
+            });
+            let candidate = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            Some(candidate.slot_claim())
+        }
+        FailedBoundarySource::ResidualAnchor {
+            parent,
+            outlet,
+            slot,
+            removed_child,
+        } => {
+            let mut matches = failed.mount_residuals().iter().filter(|candidate| {
+                candidate.parent() == parent
+                    && candidate.outlet() == outlet
+                    && candidate.entity() == *removed_child
+                    && candidate.anchor() == expected.entity()
+                    && candidate.anchor_claim() == expected
+                    && matches!(
+                        candidate.claim().owner(),
+                        RegistryOwner::Committed(EntityOwner::ChildSlot {
+                            parent: owner_parent,
+                            outlet: owner_outlet,
+                            slot: owner_slot,
+                        }) | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
+                            parent: owner_parent,
+                            outlet: owner_outlet,
+                            slot: owner_slot,
+                        }) if owner_parent == parent
+                            && owner_outlet == outlet
+                            && *owner_slot == *slot
+                    )
+            });
+            let candidate = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            Some(candidate.claim())
+        }
+        FailedBoundarySource::RejectedAnchor {
+            parent,
+            outlet,
+            slot,
+            removed_child,
+        } => {
+            let mut matches = failed.rejected_child_slots().iter().filter(|rejected| {
+                let candidate = rejected.slot();
+                candidate.slot() == *removed_child
+                    && rejected.canonical_anchor() == Some(expected.entity())
+                    && rejected.canonical_anchor_claim() == Some(expected)
+                    && matches!(
+                        candidate.slot_claim().owner(),
+                        RegistryOwner::Committed(EntityOwner::ChildSlot {
+                            parent: owner_parent,
+                            outlet: owner_outlet,
+                            slot: owner_slot,
+                        }) if owner_parent == parent
+                            && owner_outlet == outlet
+                            && *owner_slot == *slot
+                    )
+            });
+            let candidate = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            Some(candidate.slot().slot_claim())
+        }
+    }
+}
+
+fn realized_branch_owns_exact_boundary(
+    branch: &RealizedBranch,
+    drift: &FailedBoundaryDrift,
+) -> bool {
+    let claim = drift.expected.exact_claim();
+    match claim.owner() {
+        RegistryOwner::Committed(EntityOwner::ChildSlot {
+            parent,
+            outlet,
+            slot,
+        }) => branch.child_slots().iter().any(|candidate| {
+            candidate.slot_claim() == claim
+                && candidate.parent() == parent
+                && candidate.outlet() == outlet
+                && candidate.slot_id() == *slot
+        }),
+        RegistryOwner::Committed(EntityOwner::FrameOutput {
+            frame, local_index, ..
+        }) => branch.frames().iter().any(|candidate| {
+            candidate.frame() == frame
+                && candidate.claims().any(|candidate| candidate == claim)
+                && match &drift.source {
+                    FailedBoundarySource::FramePhysicalParent { .. } => true,
+                    FailedBoundarySource::MountedSlotAnchor { parent, outlet, .. }
+                    | FailedBoundarySource::ResidualAnchor { parent, outlet, .. }
+                    | FailedBoundarySource::RejectedAnchor { parent, outlet, .. } => {
+                        parent == frame
+                            && candidate.outlet(outlet).is_some_and(|binding| {
+                                binding.anchor() == claim.entity()
+                                    && binding.anchor_claim() == claim
+                                    && matches!(
+                                        claim.owner(),
+                                        RegistryOwner::Committed(EntityOwner::FrameOutput {
+                                            frame: output_frame,
+                                            local_index: output_index,
+                                            ..
+                                        }) if output_frame == frame
+                                            && output_index == local_index
+                                    )
+                            })
+                    }
+                    FailedBoundarySource::FrameMountSlot { .. } => false,
+                }
+        }),
+        _ => false,
+    }
+}
+
+fn failed_branch_owns_exact_boundary(
+    failed: &FailedPreparedBranch,
+    drift: &FailedBoundaryDrift,
+) -> bool {
+    let claim = drift.expected.exact_claim();
+    match claim.owner() {
+        RegistryOwner::Committed(EntityOwner::FrameOutput {
+            frame, local_index, ..
+        }) => failed
+            .frames()
+            .iter()
+            .chain(failed.detached_frames())
+            .any(|candidate| {
+                candidate.frame() == frame
+                    && candidate.claims().any(|candidate| candidate == claim)
+                    && match &drift.source {
+                        FailedBoundarySource::FramePhysicalParent { .. } => true,
+                        FailedBoundarySource::MountedSlotAnchor { parent, outlet, .. }
+                        | FailedBoundarySource::ResidualAnchor { parent, outlet, .. }
+                        | FailedBoundarySource::RejectedAnchor { parent, outlet, .. } => {
+                            parent == frame
+                                && candidate.outlet(outlet).is_some_and(|binding| {
+                                    binding.anchor_claim() == claim
+                                        && binding.anchor() == claim.entity()
+                                        && matches!(
+                                            claim.owner(),
+                                            RegistryOwner::Committed(EntityOwner::FrameOutput {
+                                                frame: output_frame,
+                                                local_index: output_index,
+                                                ..
+                                            }) if output_frame == frame
+                                                && output_index == local_index
+                                        )
+                                })
+                        }
+                        FailedBoundarySource::FrameMountSlot { .. } => false,
+                    }
+            }),
+        RegistryOwner::Committed(EntityOwner::ChildSlot {
+            parent,
+            outlet,
+            slot,
+        })
+        | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
+            parent,
+            outlet,
+            slot,
+        }) => {
+            let exact_primary = failed
+                .child_slots()
+                .iter()
+                .map(|slot| slot.slot_claim())
+                .chain(failed.mount_residuals().iter().map(|slot| slot.claim()))
+                .chain(
+                    failed
+                        .rejected_child_slots()
+                        .iter()
+                        .map(|slot| slot.slot().slot_claim()),
+                )
+                .any(|candidate| candidate == claim);
+            exact_primary
+                || failed
+                    .frames()
+                    .iter()
+                    .chain(failed.detached_frames())
+                    .any(|candidate| {
+                        candidate.frame() == parent
+                            && candidate.outlet(outlet).is_some()
+                            && matches!(
+                                &drift.source,
+                                FailedBoundarySource::FrameMountSlot { frame, .. }
+                                    if failed
+                                        .frames()
+                                        .iter()
+                                        .chain(failed.detached_frames())
+                                        .any(|child| child.frame() == frame
+                                            && child.mount_binding().slot_claim() == claim
+                                            && child.frame().slot() == *slot)
+                            )
+                    })
+        }
+        _ => false,
+    }
+}
+
+fn failed_boundary_source_accepts_owner(drift: &FailedBoundaryDrift) -> bool {
+    use crate::registry::{EntityOwner, RegistryOwner};
+
+    match (&drift.source, drift.expected.exact_claim().owner()) {
+        (
+            FailedBoundarySource::FrameMountSlot { .. },
+            RegistryOwner::Committed(
+                EntityOwner::HostTopSlot { .. } | EntityOwner::ChildSlot { .. },
+            ),
+        ) => true,
+        (
+            FailedBoundarySource::FrameMountSlot { .. },
+            RegistryOwner::Provisional(crate::registry::ProvisionalOwner::ChildSlot { .. }),
+        ) => true,
+        (
+            FailedBoundarySource::FramePhysicalParent { .. }
+            | FailedBoundarySource::MountedSlotAnchor { .. }
+            | FailedBoundarySource::ResidualAnchor { .. }
+            | FailedBoundarySource::RejectedAnchor { .. },
+            RegistryOwner::Committed(EntityOwner::FrameOutput { .. }),
+        ) => true,
+        _ => false,
+    }
+}
+
+fn current_host_owns_failed_boundary(
+    host: Option<&HostBinding>,
+    claim: &ExactRegistryClaim,
+) -> bool {
+    host.is_some_and(|host| {
+        host.top_slot_claim == *claim
+            && matches!(
+                claim.owner(),
+                crate::registry::RegistryOwner::Committed(
+                    crate::registry::EntityOwner::HostTopSlot { host: version, slot }
+                ) if version == &host.version && *slot == host.slot_id
+            )
+            && claim.entity() == host.top_slot
+    })
+}
+
+fn classify_failed_boundary(
+    drift: FailedBoundaryDrift,
+    failed: &FailedPreparedBranch,
+    active: Option<&RealizedBranch>,
+    host: Option<&HostBinding>,
+) -> FailedBoundaryDisposition {
+    let Some(_local_obligation) = exact_failed_source_obligation(&drift, failed) else {
+        return FailedBoundaryDisposition::AmbiguousInvalidTopology(drift);
+    };
+    if !failed_boundary_source_accepts_owner(&drift) {
+        return FailedBoundaryDisposition::AmbiguousInvalidTopology(drift);
+    }
+    let claim = drift.expected.exact_claim();
+    let failed_owns = failed_branch_owns_exact_boundary(failed, &drift);
+    let current_owns = current_host_owns_failed_boundary(host, claim)
+        || active.is_some_and(|active| realized_branch_owns_exact_boundary(active, &drift));
+    match (current_owns, failed_owns) {
+        (true, false) => FailedBoundaryDisposition::CurrentAuthorityLoss(drift),
+        (false, true) => FailedBoundaryDisposition::PendingOnlyDrift(drift),
+        (true, true) | (false, false) => FailedBoundaryDisposition::AmbiguousInvalidTopology(drift),
+    }
+}
+
+fn classify_failed_manifest(
+    manifest: FrozenCleanupManifest,
+    failed: PendingFailedBranch,
+    active: Option<&RealizedBranch>,
+    host: Option<&HostBinding>,
+) -> FailedManifestDisposition {
+    let dispositions = manifest
+        .boundary_drifts()
+        .iter()
+        .cloned()
+        .map(|drift| {
+            let binding =
+                exact_failed_source_obligation(&drift, &failed.branch).map(|obligation| {
+                    PendingBoundaryBinding {
+                        source: drift.source.clone(),
+                        obligation: obligation.clone(),
+                    }
+                });
+            (
+                classify_failed_boundary(drift, &failed.branch, active, host),
+                binding,
+            )
+        })
+        .collect::<Vec<_>>();
+    if dispositions.iter().any(|disposition| {
+        matches!(
+            disposition.0,
+            FailedBoundaryDisposition::AmbiguousInvalidTopology(_)
+        )
+    }) {
+        return FailedManifestDisposition::AmbiguousInvalidTopology { failed, manifest };
+    }
+    if dispositions.iter().any(|disposition| {
+        matches!(
+            disposition.0,
+            FailedBoundaryDisposition::CurrentAuthorityLoss(_)
+        )
+    }) {
+        let bindings = dispositions
+            .into_iter()
+            .map(|(disposition, pending)| match disposition {
+                FailedBoundaryDisposition::CurrentAuthorityLoss(drift) => {
+                    FailedAuthorityBoundaryBinding::Current {
+                        source: drift.source,
+                        authority: drift.expected.exact_claim().clone(),
+                    }
+                }
+                FailedBoundaryDisposition::PendingOnlyDrift(_) => {
+                    FailedAuthorityBoundaryBinding::Pending(
+                        pending.expect("classified pending boundary retains its local obligation"),
+                    )
+                }
+                FailedBoundaryDisposition::AmbiguousInvalidTopology(_) => {
+                    unreachable!("ambiguous failed boundary returned before authority binding")
+                }
+            })
+            .collect();
+        return FailedManifestDisposition::CurrentAuthorityLoss {
+            failed,
+            manifest,
+            bindings,
+        };
+    }
+    let bindings = dispositions
+        .into_iter()
+        .filter_map(|(_, binding)| binding)
+        .collect();
+    match manifest.finalize_pending_only_boundaries(bindings) {
+        Ok(manifest) => FailedManifestDisposition::Ready { failed, manifest },
+        Err((_, manifest)) => {
+            FailedManifestDisposition::AmbiguousInvalidTopology { failed, manifest }
+        }
+    }
+}
+
+enum FailedAuthoritySettlementBeginOutcome {
+    Begun,
+    Retryable(PendingFailedBranch),
+    TriggerContradiction {
+        failed: PendingFailedBranch,
+        kind: FailedAuthorityTriggerError,
+    },
+    ProtocolContradiction {
+        failed: PendingFailedBranch,
+        kind: BeginAuthoritySettlementErrorKind,
+    },
+    IsolationContradiction {
+        failed: PendingFailedBranch,
+        contradiction: AuthorityIsolationContradiction,
+        isolation: PreparedAuthorityIsolation,
+    },
+    LedgerContradiction {
+        failed: PendingFailedBranch,
+        kind: CleanupLedgerReserveErrorKind,
+    },
+}
+
+fn failed_branch_logical_roots(branch: &FailedPreparedBranch) -> Vec<RouteFrameVersion> {
+    let mut roots = Vec::new();
+    for frame in branch.frames().iter().rev() {
+        if !roots.contains(frame.frame()) {
+            roots.push(frame.frame().clone());
+        }
+    }
+    roots
+}
+
+fn failed_authority_logical_roots(
+    failed: &PendingFailedBranch,
+    manifest: &FrozenCleanupManifest,
+) -> Vec<RouteFrameVersion> {
+    match &failed.terminal {
+        PendingFailedBranchTerminal::Request(request) => request.logical_roots().to_vec(),
+        PendingFailedBranchTerminal::RegistrationBegin(_) => {
+            failed_branch_logical_roots(&failed.branch)
+        }
+        PendingFailedBranchTerminal::Task { task, .. }
+        | PendingFailedBranchTerminal::TaskWithPhysicalResidual { task, .. } => {
+            let mut current = failed_branch_logical_roots(&failed.branch);
+            if manifest.contains_frame_obligation(task.frame()) {
+                current.retain(|frame| frame != task.frame());
+                current.insert(0, task.frame().clone());
+            }
+            current
+        }
+    }
+}
+
+fn mint_failed_authority_trigger(
+    world: &mut World,
+    engine: &mut RouterEngine,
+    terminal: &PendingFailedBranchTerminal,
+) -> Result<FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError> {
+    #[cfg(test)]
+    if world
+        .get_resource_mut::<FailedAuthorityTriggerExhaustion>()
+        .is_some_and(|mut fault| {
+            if fault.remaining == 0 {
+                return false;
+            }
+            fault.remaining -= 1;
+            true
+        })
+    {
+        return Err(FailedAuthorityTriggerError::Exhausted);
+    }
+    #[cfg(not(test))]
+    let _ = world;
+    match terminal {
+        PendingFailedBranchTerminal::Task { task, .. }
+        | PendingFailedBranchTerminal::TaskWithPhysicalResidual { task, .. } => {
+            engine.failed_authority_trigger_for_task(task)
+        }
+        PendingFailedBranchTerminal::Request(request) => {
+            engine.failed_authority_trigger_for_cleanup(request)
+        }
+        PendingFailedBranchTerminal::RegistrationBegin(error) => {
+            engine.failed_authority_trigger_for_registration_begin(error)
+        }
+    }
+}
+
+fn begin_failed_authority_settlement(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    failed: PendingFailedBranch,
+    manifest: FrozenCleanupManifest,
+    bindings: Vec<FailedAuthorityBoundaryBinding>,
+) -> FailedAuthoritySettlementBeginOutcome {
+    let Some(host) = entry.host.as_ref() else {
+        return FailedAuthoritySettlementBeginOutcome::ProtocolContradiction {
+            failed,
+            kind: BeginAuthoritySettlementErrorKind::Stale,
+        };
+    };
+    let frozen = {
+        let registry = world.resource::<RouteEntityRegistry>();
+        match manifest.finalize_failed_authority_settlement(
+            world,
+            registry,
+            entry.active.as_ref(),
+            host,
+            bindings,
+        ) {
+            Ok(frozen) => frozen,
+            Err(AuthoritySettlementManifestError::RetryableCapacity) => {
+                return FailedAuthoritySettlementBeginOutcome::Retryable(failed);
+            }
+            Err(
+                AuthoritySettlementManifestError::InvalidAuthority
+                | AuthoritySettlementManifestError::InvalidTopology,
+            ) => {
+                return FailedAuthoritySettlementBeginOutcome::ProtocolContradiction {
+                    failed,
+                    kind: BeginAuthoritySettlementErrorKind::InvalidManifest,
+                };
+            }
+        }
+    };
+    let mut logical_roots = failed_authority_logical_roots(&failed, &frozen);
+    let manifest_digest = frozen.digest();
+    let obligation_count = frozen.len();
+    let reserved = match CleanupLedger::reserve(frozen) {
+        Ok(reserved) => reserved,
+        Err(error) => match error.kind() {
+            CleanupLedgerReserveErrorKind::RetryableCapacity => {
+                return FailedAuthoritySettlementBeginOutcome::Retryable(failed);
+            }
+            kind @ (CleanupLedgerReserveErrorKind::DomainExhausted
+            | CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts) => {
+                let _returned_manifest = error.into_manifest();
+                return FailedAuthoritySettlementBeginOutcome::LedgerContradiction { failed, kind };
+            }
+        },
+    };
+    let host_children = world
+        .get::<bevy_ecs::hierarchy::Children>(host.host)
+        .map(|children| children.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let top_slot_parent = world
+        .get::<bevy_ecs::hierarchy::ChildOf>(host.top_slot)
+        .map(bevy_ecs::hierarchy::ChildOf::parent);
+    let top_slot_memberships = host_children
+        .iter()
+        .filter(|child| **child == host.top_slot)
+        .count();
+    if (top_slot_parent == Some(host.host) && top_slot_memberships != 1)
+        || (top_slot_parent != Some(host.host) && top_slot_memberships != 0)
+    {
+        return FailedAuthoritySettlementBeginOutcome::ProtocolContradiction {
+            failed,
+            kind: BeginAuthoritySettlementErrorKind::InvalidManifest,
+        };
+    }
+    let isolation = match prepare_failed_manifest_protocol_isolation(
+        world,
+        entry.active.as_ref(),
+        &failed,
+        entry.host.as_ref(),
+    ) {
+        AuthorityIsolationPreparation::Ready(isolation) => isolation,
+        AuthorityIsolationPreparation::RetryableCapacity => {
+            return FailedAuthoritySettlementBeginOutcome::Retryable(failed);
+        }
+        AuthorityIsolationPreparation::PermanentContradiction {
+            contradiction,
+            fail_closed,
+        } => {
+            return FailedAuthoritySettlementBeginOutcome::IsolationContradiction {
+                failed,
+                contradiction,
+                isolation: fail_closed,
+            };
+        }
+    };
+    let trigger = match mint_failed_authority_trigger(world, &mut entry.engine, &failed.terminal) {
+        Ok(trigger) => trigger,
+        Err(kind) => {
+            return FailedAuthoritySettlementBeginOutcome::TriggerContradiction { failed, kind };
+        }
+    };
+    inject_failed_authority_begin_manifest_rejection(world, &mut logical_roots);
+
+    let (retired_host, lease) = entry
+        .host
+        .take()
+        .expect("failed authority publication retains its exact host")
+        .into_retired();
+    let active = entry.active.take();
+    let mut settlement_owner = Some((reserved, active, failed, retired_host));
+    let engine = &mut entry.engine;
+    let cleanup_ledger = &mut entry.cleanup_ledger;
+    match engine.begin_failed_authority_settlement_retaining(
+        lease,
+        trigger,
+        CleanupManifest::new(logical_roots, manifest_digest, obligation_count),
+        |batch| {
+            isolation.apply(world);
+            let (reserved, active, failed, retired_host) = settlement_owner
+                .take()
+                .expect("failed authority publication consumes its composed owner once");
+            *cleanup_ledger = Some(CleanupLedger::activate_failed_authority_settlement(
+                reserved.bind_batch(batch),
+                active,
+                failed,
+                retired_host,
+                host_children,
+            ));
+        },
+    ) {
+        Ok(_) => FailedAuthoritySettlementBeginOutcome::Begun,
+        Err(error) => {
+            let kind = error.kind();
+            let (reserved, active, failed, retired_host) = settlement_owner
+                .take()
+                .expect("rejected failed authority publication returns its composed owner");
+            drop(reserved);
+            entry.host = Some(retired_host.restore(error.into_owner()));
+            entry.active = active;
+            match kind {
+                BeginAuthoritySettlementErrorKind::RetryablePreparation => {
+                    FailedAuthoritySettlementBeginOutcome::Retryable(failed)
+                }
+                BeginAuthoritySettlementErrorKind::Foreign
+                | BeginAuthoritySettlementErrorKind::Stale
+                | BeginAuthoritySettlementErrorKind::WrongPhase
+                | BeginAuthoritySettlementErrorKind::InvalidManifest => {
+                    FailedAuthoritySettlementBeginOutcome::ProtocolContradiction { failed, kind }
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn settle_cleanup_system(world: &mut World) {
@@ -2170,22 +4334,171 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                             &failed.branch,
                         )
                     };
-                    let Some(manifest) = manifest else {
+                    let manifest = match manifest {
+                        Ok(manifest) => manifest,
+                        Err(FailedManifestBuildError::InvalidTopology(kind)) => {
+                            if let Err(failed) =
+                                fail_closed_failed_manifest_protocol(world, entry, failed, kind)
+                            {
+                                entry.pending_failed_branch = Some(failed);
+                            }
+                            continue;
+                        }
+                        Err(FailedManifestBuildError::MountParentFreeze(_typed_error)) => {
+                            if let Err(failed) = fail_closed_failed_manifest_protocol(
+                                world,
+                                entry,
+                                failed,
+                                FailedPreparedTopologyError::AmbiguousBoundaryOwnership,
+                            ) {
+                                entry.pending_failed_branch = Some(failed);
+                            }
+                            continue;
+                        }
+                        Err(FailedManifestBuildError::RetryableCapacity) => {
+                            entry.pending_failed_branch = Some(failed);
+                            continue;
+                        }
+                    };
+                    let (failed, manifest) = match classify_failed_manifest(
+                        manifest,
+                        failed,
+                        entry.active.as_ref(),
+                        entry.host.as_ref(),
+                    ) {
+                        FailedManifestDisposition::Ready { failed, manifest } => {
+                            (failed, manifest)
+                        }
+                        FailedManifestDisposition::CurrentAuthorityLoss {
+                            failed,
+                            manifest,
+                            bindings,
+                        } => {
+                            match begin_failed_authority_settlement(
+                                world, entry, failed, manifest, bindings,
+                            ) {
+                                FailedAuthoritySettlementBeginOutcome::Begun => {}
+                                FailedAuthoritySettlementBeginOutcome::Retryable(failed) => {
+                                    entry.pending_failed_branch = Some(failed);
+                                }
+                                FailedAuthoritySettlementBeginOutcome::TriggerContradiction {
+                                    failed,
+                                    kind,
+                                } => {
+                                    if let Err(failed) = fail_closed_failed_owner_protocol(
+                                        world,
+                                        entry,
+                                        failed,
+                                        AuthorityProtocolResidualKind::AuthorityTrigger(kind),
+                                    ) {
+                                        entry.pending_failed_branch = Some(failed);
+                                    }
+                                }
+                                FailedAuthoritySettlementBeginOutcome::ProtocolContradiction {
+                                    failed,
+                                    kind,
+                                } => {
+                                    if let Err(failed) = fail_closed_failed_authority_protocol(
+                                        world, entry, failed, kind,
+                                    ) {
+                                        entry.pending_failed_branch = Some(failed);
+                                    }
+                                }
+                                FailedAuthoritySettlementBeginOutcome::IsolationContradiction {
+                                    failed,
+                                    contradiction,
+                                    isolation,
+                                } => {
+                                    if let Err(failed) =
+                                        fail_closed_failed_owner_protocol_prepared(
+                                            world,
+                                            entry,
+                                            failed,
+                                            AuthorityProtocolResidualKind::AuthorityIsolation(
+                                                contradiction.clone(),
+                                            ),
+                                            isolation,
+                                            Some(contradiction),
+                                        )
+                                    {
+                                        entry.pending_failed_branch = Some(failed);
+                                    }
+                                }
+                                FailedAuthoritySettlementBeginOutcome::LedgerContradiction {
+                                    failed,
+                                    kind,
+                                } => {
+                                    if let Err(failed) = fail_closed_failed_owner_protocol(
+                                        world,
+                                        entry,
+                                        failed,
+                                        AuthorityProtocolResidualKind::CleanupLedger(kind),
+                                    ) {
+                                        entry.pending_failed_branch = Some(failed);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        FailedManifestDisposition::AmbiguousInvalidTopology {
+                            failed,
+                            manifest,
+                        } => {
+                            let _bounded_contradiction_evidence = manifest;
+                            if let Err(failed) = fail_closed_failed_manifest_protocol(
+                                world,
+                                entry,
+                                failed,
+                                FailedPreparedTopologyError::AmbiguousBoundaryOwnership,
+                            ) {
+                                entry.pending_failed_branch = Some(failed);
+                            }
+                            continue;
+                        }
+                    };
+                    let preflight_before_isolation = manifest.preflight(world);
+                    if !preflight_before_isolation {
                         entry.pending_failed_branch = Some(failed);
                         continue;
-                    };
-                    if !manifest.preflight(world)
-                        || !isolate_failed_prepared_branch(world, &failed.branch)
-                        || !manifest.preflight(world)
-                    {
+                    }
+                    let isolated = isolate_failed_prepared_branch(
+                        world,
+                        &failed.branch,
+                        &manifest,
+                        entry.active.as_ref(),
+                    );
+                    if !isolated {
+                        entry.pending_failed_branch = Some(failed);
+                        continue;
+                    }
+                    let preflight_after_isolation = manifest.preflight(world);
+                    if !preflight_after_isolation {
                         entry.pending_failed_branch = Some(failed);
                         continue;
                     }
                     let manifest_digest = manifest.digest();
                     let obligation_count = manifest.len();
-                    let Some(reserved) = CleanupLedger::reserve(manifest) else {
-                        entry.pending_failed_branch = Some(failed);
-                        continue;
+                    let reserved = match CleanupLedger::reserve(manifest) {
+                        Ok(reserved) => reserved,
+                        Err(error) => match error.kind() {
+                            CleanupLedgerReserveErrorKind::RetryableCapacity => {
+                                entry.pending_failed_branch = Some(failed);
+                                continue;
+                            }
+                            kind @ (CleanupLedgerReserveErrorKind::DomainExhausted
+                            | CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts) => {
+                                let _returned_manifest = error.into_manifest();
+                                if let Err(failed) = fail_closed_failed_owner_protocol(
+                                    world,
+                                    entry,
+                                    failed,
+                                    AuthorityProtocolResidualKind::CleanupLedger(kind),
+                                ) {
+                                    entry.pending_failed_branch = Some(failed);
+                                }
+                                continue;
+                            }
+                        },
                     };
                     let PendingFailedBranch { terminal, branch } = failed;
                     let request = match terminal {
@@ -2278,6 +4591,19 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                 let completion = ledger
                     .pending_completion()
                     .expect("successful settlement has a completion");
+                if ledger.is_authority_settlement() {
+                    match entry.engine.complete_authority_cleanup(completion, || {
+                        drop(
+                            ledger
+                                .take_authority_settlement_owner()
+                                .expect("authority publication retains its composed owner"),
+                        );
+                    }) {
+                        Ok(()) => {}
+                        Err(_) => entry.cleanup_ledger = Some(ledger),
+                    }
+                    continue;
+                }
                 match entry.engine.complete_cleanup(completion) {
                     Ok(()) | Err(IntegrationError::Duplicate) => {}
                     Err(_) => entry.cleanup_ledger = Some(ledger),
@@ -2327,7 +4653,11 @@ pub(crate) mod tests {
     use super::*;
     use crate::{
         app_ext::{AppRouterExt, RouterConfig, RouterHostRegistration},
-        cleanup::{CleanupPostcheckDrift, CleanupPostcheckPhase},
+        cleanup::{
+            AuthorityLostResidualPhysicalRestoreDrift, AuthorityLostResidualPostwriteDrift,
+            AuthorityRemovalRegistryPostwriteDrift, AuthorityResidualPostwriteDrift,
+            CleanupPostcheckDrift, CleanupPostcheckPhase, FailedBoundaryExpectation,
+        },
         components::{
             ChildSlotAuthorityProbe, ChildSlotBarrierProbe, ChildSlotLifecycle,
             ProvisionalPostWriteProbe, ProvisionalSlotLifecycle, RouteOwnershipSeal,
@@ -2339,12 +4669,16 @@ pub(crate) mod tests {
         input::{RouteFocusState, RouterInputGate},
         plugin::{BevyUiRouterPlugin, RouterScheduleSet},
         presentation::{
-            FrameOutput, TestCommitMutation, arm_test_commit_mutation_trace,
+            FrameLifecycle, FrameOutput, TestCommitMutation, arm_test_commit_mutation_trace,
             take_test_commit_mutation_trace,
         },
         registry::{
             ComponentManifest, EntityOwner, ProvisionalOwner, ProvisionalTopSlotOwner,
-            QuarantineLeaseTable, RegistryOwner, fail_next_verified_preparation_for_test,
+            QuarantineLeaseTable, RegistryOwner,
+            fail_next_authority_publication_capacity_reservation_for_test,
+            fail_next_verified_preparation_for_test,
+            take_authority_postmutation_manifest_materializations_for_test,
+            take_authority_postmutation_reservation_attempts_for_test,
         },
     };
     use bevy_app::{App, PostUpdate, PreUpdate, Update};
@@ -2376,8 +4710,9 @@ pub(crate) mod tests {
     use bevy_ui::{ComputedNode, Node, UiGlobalTransform, Val};
     use bevy_ui_router_core::integration::ViewReportIdentity;
     use bevy_ui_router_core::prelude::{
-        FrameOrigin, NavigationFailureKind, NavigationPhase, NavigationTraceEventKind,
-        RequestStatus, RouteNodeOptions, RoutePattern, RouteTree, RouteViewKey,
+        ActivePresentationKind, FrameOrigin, NavigationFailureKind, NavigationPhase,
+        NavigationTraceEventKind, RequestStatus, RouteNodeOptions, RoutePattern, RouteTree,
+        RouteViewKey, RouterAvailability, RouterUnavailableReason,
     };
     use bevy_ui_router_view::{
         RouteViewDescriptor, RouteViewRegistry, ViewBuildEffect, ViewDriverKey,
@@ -2480,6 +4815,12 @@ pub(crate) mod tests {
         key: ViewDriverKey,
     }
 
+    struct FailDeepPendingDriver {
+        key: ViewDriverKey,
+        calls: usize,
+        fail_on: usize,
+    }
+
     impl EcsViewDriver for NestedDriver {
         fn key(&self) -> ViewDriverKey {
             self.key.clone()
@@ -2522,6 +4863,45 @@ pub(crate) mod tests {
             if effect.view() == &RouteViewKey::new("deep-layout").unwrap()
                 || effect.view() == &RouteViewKey::new("deep-section").unwrap()
             {
+                let anchor = content.spawn_empty().unwrap();
+                content
+                    .declare_outlet(anchor, bevy_ui_router_core::slot::RouteSlotKey::default())
+                    .unwrap();
+            } else {
+                content
+                    .spawn_solid_rect(
+                        SolidRect::new(24, 16, ContentColor::srgba8(1, 2, 3, 255)).unwrap(),
+                    )
+                    .unwrap();
+            }
+            report.applied()
+        }
+    }
+
+    impl EcsViewDriver for FailDeepPendingDriver {
+        fn key(&self) -> ViewDriverKey {
+            self.key.clone()
+        }
+
+        fn apply(
+            &mut self,
+            effect: &ViewBuildEffect,
+            content: &mut FrameContentWriter<'_>,
+            report: EcsViewReportSession<'_>,
+        ) -> ViewBuildReport {
+            let call = self.calls;
+            self.calls += 1;
+            if call == self.fail_on {
+                return report.build_failed("expected pending deep failure");
+            }
+            if effect.view() == &RouteViewKey::new("fail-deep-layout").unwrap()
+                || effect.view() == &RouteViewKey::new("fail-deep-section").unwrap()
+            {
+                content
+                    .spawn_solid_rect(
+                        SolidRect::new(17, 13, ContentColor::srgba8(9, 8, 7, 255)).unwrap(),
+                    )
+                    .unwrap();
                 let anchor = content.spawn_empty().unwrap();
                 content
                     .declare_outlet(anchor, bevy_ui_router_core::slot::RouteSlotKey::default())
@@ -2895,6 +5275,60 @@ pub(crate) mod tests {
             .route_with_options(
                 section_route,
                 RoutePattern::path("items/:id").unwrap(),
+                RouteNodeOptions::new().with_view(item),
+            )
+            .unwrap();
+        let router = app
+            .add_ui_router(RouterConfig::new(builder.build().unwrap(), views, fallback))
+            .unwrap();
+        app.world_mut()
+            .spawn((Node::default(), RouterHostRegistration::new(router)));
+        router
+    }
+
+    fn install_failing_deep_pending_router(app: &mut App) -> RouterHandle {
+        let key = ViewDriverKey::new("fail-deep-pending-driver").unwrap();
+        app.register_ui_view_driver(FailDeepPendingDriver {
+            key: key.clone(),
+            calls: 0,
+            fail_on: 3,
+        })
+        .unwrap();
+        let layout = RouteViewKey::new("fail-deep-layout").unwrap();
+        let section = RouteViewKey::new("fail-deep-section").unwrap();
+        let item = RouteViewKey::new("fail-deep-item").unwrap();
+        let fallback = RouteViewKey::new("fail-deep-fallback").unwrap();
+        let mut views = RouteViewRegistry::new();
+        for view in [&layout, &section, &item, &fallback] {
+            views
+                .insert(view.clone(), RouteViewDescriptor::new(key.clone()))
+                .unwrap();
+        }
+        let mut builder = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(layout),
+            )
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let section_route = builder
+            .route_with_options(
+                root,
+                RoutePattern::path("sections/:section").unwrap(),
+                RouteNodeOptions::new().with_view(section),
+            )
+            .unwrap();
+        let item_route = builder
+            .route_with_options(
+                section_route,
+                RoutePattern::path("items/:id").unwrap(),
+                RouteNodeOptions::new().with_view(item.clone()),
+            )
+            .unwrap();
+        builder
+            .route_with_options(
+                item_route,
+                RoutePattern::path("detail").unwrap(),
                 RouteNodeOptions::new().with_view(item),
             )
             .unwrap();
@@ -3297,6 +5731,1981 @@ pub(crate) mod tests {
             )
         };
         (app, branch, child_entities, child_slot, parent_entities)
+    }
+
+    pub(crate) fn failed_deep_nested_branch_fixture() -> (App, FailedPreparedBranch) {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_deep_nested_router(&mut app);
+        observe_authority_system(app.world_mut());
+        prepare_deep_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/sections/a/items/1"),
+        );
+        let branch = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            FailedPreparedBranch::new(navigation.entries[0].pending_commit.take().unwrap().branch)
+        };
+        (app, branch)
+    }
+
+    #[test]
+    fn failed_boundary_classifier_binds_exact_current_host_and_pending_slot_output() {
+        let (app, branch) = failed_deep_nested_branch_fixture();
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let host = entry.host.as_ref().unwrap();
+        let active = branch.realized_for_test();
+
+        let host_fact = FailedBoundaryDrift {
+            source: FailedBoundarySource::FrameMountSlot {
+                frame: active.frames()[0].frame().clone(),
+                removed_child: active.frames()[0].shell(),
+            },
+            expected: FailedBoundaryExpectation::ExactClaim(host.top_slot_claim.clone()),
+            state: crate::cleanup::FailedManifestClaimState::Replaced,
+            predicate: crate::cleanup::FailedMountParentFreezePredicate::ClaimAuthority,
+        };
+        assert!(matches!(
+            classify_failed_boundary(host_fact, &branch, None, Some(host),),
+            FailedBoundaryDisposition::CurrentAuthorityLoss(_)
+        ));
+
+        let child_slot = &active.child_slots()[0];
+        let child_frame = active
+            .frames()
+            .iter()
+            .find(|frame| frame.mount_binding().matches_mounted_child_slot(child_slot))
+            .unwrap();
+        let child_slot_fact = FailedBoundaryDrift {
+            source: FailedBoundarySource::FrameMountSlot {
+                frame: child_frame.frame().clone(),
+                removed_child: child_frame.shell(),
+            },
+            expected: FailedBoundaryExpectation::ExactClaim(child_slot.slot_claim().clone()),
+            state: crate::cleanup::FailedManifestClaimState::PhysicalDrift,
+            predicate: crate::cleanup::FailedMountParentFreezePredicate::ClaimAuthority,
+        };
+        assert!(matches!(
+            classify_failed_boundary(child_slot_fact, &branch, None, Some(host),),
+            FailedBoundaryDisposition::PendingOnlyDrift(_)
+        ));
+
+        let output = active.frames()[0]
+            .claims()
+            .find(|claim| {
+                matches!(
+                    claim.owner(),
+                    RegistryOwner::Committed(EntityOwner::FrameOutput { .. })
+                )
+            })
+            .unwrap();
+        let output_fact = FailedBoundaryDrift {
+            source: FailedBoundarySource::MountedSlotAnchor {
+                parent: active.frames()[0].frame().clone(),
+                outlet: active.frames()[0].outlets()[0].key().clone(),
+                slot: child_slot.slot_id(),
+                removed_child: child_slot.slot(),
+            },
+            expected: FailedBoundaryExpectation::ExactClaim(output.clone()),
+            state: crate::cleanup::FailedManifestClaimState::Missing,
+            predicate: crate::cleanup::FailedMountParentFreezePredicate::ClaimAuthority,
+        };
+        assert!(matches!(
+            classify_failed_boundary(output_fact, &branch, None, Some(host),),
+            FailedBoundaryDisposition::PendingOnlyDrift(_)
+        ));
+    }
+
+    #[test]
+    fn failed_boundary_classifier_distinguishes_pending_only_and_simultaneous_ownership() {
+        let (app, branch) = failed_deep_nested_branch_fixture();
+        let host = app.world().resource::<RouterNavigation>().entries[0]
+            .host
+            .as_ref()
+            .unwrap();
+        let active = branch.realized_for_test();
+        let child_slot = &active.child_slots()[0];
+        let child_frame = active
+            .frames()
+            .iter()
+            .find(|frame| frame.mount_binding().matches_mounted_child_slot(child_slot))
+            .unwrap();
+        let fact = FailedBoundaryDrift {
+            source: FailedBoundarySource::FrameMountSlot {
+                frame: child_frame.frame().clone(),
+                removed_child: child_frame.shell(),
+            },
+            expected: FailedBoundaryExpectation::ExactClaim(child_slot.slot_claim().clone()),
+            state: crate::cleanup::FailedManifestClaimState::Replaced,
+            predicate: crate::cleanup::FailedMountParentFreezePredicate::ClaimAuthority,
+        };
+
+        assert!(matches!(
+            classify_failed_boundary(fact.clone(), &branch, None, Some(host)),
+            FailedBoundaryDisposition::PendingOnlyDrift(_)
+        ));
+        assert!(matches!(
+            classify_failed_boundary(fact, &branch, Some(active), Some(host)),
+            FailedBoundaryDisposition::AmbiguousInvalidTopology(_)
+        ));
+    }
+
+    #[test]
+    fn failed_boundary_classifier_rejects_wrong_source_tuple_for_same_frame_output_owner() {
+        let (app, branch) = failed_deep_nested_branch_fixture();
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let active = branch.realized_for_test();
+        let parent = &active.frames()[0];
+        let child_slot = &active.child_slots()[0];
+        let output = parent
+            .claims()
+            .find(|claim| {
+                matches!(
+                    claim.owner(),
+                    RegistryOwner::Committed(EntityOwner::FrameOutput { frame, .. })
+                        if frame == parent.frame()
+                )
+            })
+            .unwrap()
+            .clone();
+        let wrong_outlet =
+            bevy_ui_router_core::slot::RouteSlotKey::named("review-wrong-outlet").unwrap();
+        let wrong_output = active.frames()[1]
+            .claims()
+            .find(|claim| {
+                matches!(
+                    claim.owner(),
+                    RegistryOwner::Committed(EntityOwner::FrameOutput { .. })
+                )
+            })
+            .unwrap()
+            .clone();
+        let wrong_local_index = match output.owner() {
+            RegistryOwner::Committed(EntityOwner::FrameOutput {
+                frame,
+                output: output_id,
+                local_index,
+            }) => output.with_owner_for_test(RegistryOwner::Committed(EntityOwner::FrameOutput {
+                frame: frame.clone(),
+                output: *output_id,
+                local_index: local_index + 1,
+            })),
+            _ => unreachable!(),
+        };
+        let exact_outlet = parent.outlets()[0].key().clone();
+        let wrong_slot = active.child_slots()[1].slot_id();
+        let facts = [
+            FailedBoundaryDrift {
+                source: FailedBoundarySource::MountedSlotAnchor {
+                    parent: parent.frame().clone(),
+                    outlet: wrong_outlet,
+                    slot: child_slot.slot_id(),
+                    removed_child: child_slot.slot(),
+                },
+                expected: FailedBoundaryExpectation::ExactClaim(output.clone()),
+                state: crate::cleanup::FailedManifestClaimState::Missing,
+                predicate: crate::cleanup::FailedMountParentFreezePredicate::ClaimAuthority,
+            },
+            FailedBoundaryDrift {
+                source: FailedBoundarySource::MountedSlotAnchor {
+                    parent: parent.frame().clone(),
+                    outlet: exact_outlet.clone(),
+                    slot: wrong_slot,
+                    removed_child: child_slot.slot(),
+                },
+                expected: FailedBoundaryExpectation::ExactClaim(output.clone()),
+                state: crate::cleanup::FailedManifestClaimState::Missing,
+                predicate: crate::cleanup::FailedMountParentFreezePredicate::ClaimAuthority,
+            },
+            FailedBoundaryDrift {
+                source: FailedBoundarySource::MountedSlotAnchor {
+                    parent: parent.frame().clone(),
+                    outlet: exact_outlet.clone(),
+                    slot: child_slot.slot_id(),
+                    removed_child: parent.shell(),
+                },
+                expected: FailedBoundaryExpectation::ExactClaim(output.clone()),
+                state: crate::cleanup::FailedManifestClaimState::Missing,
+                predicate: crate::cleanup::FailedMountParentFreezePredicate::ClaimAuthority,
+            },
+            FailedBoundaryDrift {
+                source: FailedBoundarySource::MountedSlotAnchor {
+                    parent: parent.frame().clone(),
+                    outlet: exact_outlet.clone(),
+                    slot: child_slot.slot_id(),
+                    removed_child: child_slot.slot(),
+                },
+                expected: FailedBoundaryExpectation::ExactClaim(wrong_output),
+                state: crate::cleanup::FailedManifestClaimState::Missing,
+                predicate: crate::cleanup::FailedMountParentFreezePredicate::ClaimAuthority,
+            },
+            FailedBoundaryDrift {
+                source: FailedBoundarySource::MountedSlotAnchor {
+                    parent: parent.frame().clone(),
+                    outlet: exact_outlet,
+                    slot: child_slot.slot_id(),
+                    removed_child: child_slot.slot(),
+                },
+                expected: FailedBoundaryExpectation::ExactClaim(wrong_local_index),
+                state: crate::cleanup::FailedManifestClaimState::Missing,
+                predicate: crate::cleanup::FailedMountParentFreezePredicate::ClaimAuthority,
+            },
+        ];
+
+        for fact in facts {
+            assert!(matches!(
+                classify_failed_boundary(
+                    fact,
+                    &FailedPreparedBranch::new(PreparedBranch::empty()),
+                    Some(active),
+                    entry.host.as_ref(),
+                ),
+                FailedBoundaryDisposition::AmbiguousInvalidTopology(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn ambiguous_boundary_owner_is_fail_closed_once_with_exact_owner_retained() {
+        let mut app = App::new();
+        let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = &mut navigation.entries[0];
+                let failed = entry.pending_failed_branch.take().unwrap();
+                let frame = &failed.branch.frames()[0];
+                let output = frame
+                    .claims()
+                    .find(|claim| {
+                        matches!(
+                            claim.owner(),
+                            RegistryOwner::Committed(EntityOwner::FrameOutput { .. })
+                        )
+                    })
+                    .unwrap()
+                    .clone();
+                let mut manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                    world,
+                    world.resource::<RouteEntityRegistry>(),
+                    &failed.branch,
+                )
+                .unwrap();
+                manifest.replace_boundary_drifts_for_test(vec![FailedBoundaryDrift {
+                    source: FailedBoundarySource::FrameMountSlot {
+                        frame: frame.frame().clone(),
+                        removed_child: frame.shell(),
+                    },
+                    expected: FailedBoundaryExpectation::ExactClaim(output),
+                    state: crate::cleanup::FailedManifestClaimState::Replaced,
+                    predicate: crate::cleanup::FailedMountParentFreezePredicate::ClaimAuthority,
+                }]);
+                let FailedManifestDisposition::AmbiguousInvalidTopology { failed, manifest } =
+                    classify_failed_manifest(
+                        manifest,
+                        failed,
+                        entry.active.as_ref(),
+                        entry.host.as_ref(),
+                    )
+                else {
+                    panic!("source/owner-kind contradiction must retain an ambiguous owner")
+                };
+                assert_eq!(manifest.boundary_drifts().len(), 1);
+                assert!(
+                    fail_closed_failed_manifest_protocol(
+                        world,
+                        entry,
+                        failed,
+                        FailedPreparedTopologyError::AmbiguousBoundaryOwnership,
+                    )
+                    .is_ok()
+                );
+            },
+        );
+
+        let trace_len = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let residual = entry.authority_protocol_residual.as_ref().unwrap();
+            assert!(matches!(
+                residual.kind,
+                AuthorityProtocolResidualKind::FailedManifest(
+                    FailedPreparedTopologyError::AmbiguousBoundaryOwnership
+                )
+            ));
+            assert!(residual.failed.is_some());
+            assert!(residual.host.is_some());
+            assert!(entry.host.is_none());
+            assert!(entry.pending_failed_branch.is_none());
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::Unavailable(
+                    RouterUnavailableReason::RegistryInvariantViolation
+                )
+            );
+            entry.engine.request(request).unwrap().trace().len()
+        };
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace().len(),
+            trace_len
+        );
+        assert!(entry.authority_protocol_residual.is_some());
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+    }
+
+    #[test]
+    fn current_authority_loss_host_top_slot_enters_unique_authority_publisher() {
+        let mut app = App::new();
+        let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+        let (host, top_slot, host_children_before) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let host = entry.host.as_ref().unwrap();
+            (
+                host.host,
+                host.top_slot,
+                app.world()
+                    .get::<bevy_ecs::hierarchy::Children>(host.host)
+                    .map(|children| children.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            )
+        };
+        let stale_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(top_slot)
+            .insert(RouteOwnershipSeal::new(stale_seal));
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::RecoveringAuthority
+        );
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::Recovering)
+        ));
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.active.is_none());
+        assert!(entry.host.is_none());
+        assert!(
+            entry
+                .cleanup_ledger
+                .as_ref()
+                .is_some_and(CleanupLedger::is_authority_settlement),
+            "current authority loss must enter the one authority cleanup ledger"
+        );
+        assert!(entry.authority_protocol_residual.is_none());
+        assert_eq!(
+            app.world()
+                .get::<bevy_ecs::hierarchy::ChildOf>(top_slot)
+                .map(bevy_ecs::hierarchy::ChildOf::parent),
+            Some(host)
+        );
+        assert_eq!(
+            app.world()
+                .get::<bevy_ecs::hierarchy::Children>(host)
+                .map(|children| children.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            host_children_before
+        );
+
+        for _ in 0..8 {
+            settle_cleanup_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .is_none()
+            {
+                break;
+            }
+        }
+
+        let trace_len = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(app.world().get_entity(top_slot).is_ok());
+            assert_eq!(
+                app.world()
+                    .get::<bevy_ecs::hierarchy::ChildOf>(top_slot)
+                    .map(bevy_ecs::hierarchy::ChildOf::parent),
+                Some(host)
+            );
+            assert_eq!(
+                app.world()
+                    .get::<bevy_ecs::hierarchy::Children>(host)
+                    .map(|children| children.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                host_children_before
+            );
+            assert!(
+                app.world()
+                    .resource::<QuarantineLeaseTable>()
+                    .authority_lost_tombstone(top_slot)
+                    .is_some()
+            );
+            entry.engine.request(request).unwrap().trace().len()
+        };
+        settle_cleanup_system(app.world_mut());
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace().len(),
+            trace_len
+        );
+        assert!(entry.cleanup_ledger.is_none());
+    }
+
+    #[test]
+    fn failed_task_missing_pickable_after_current_boundary_loss_fail_closes_once() {
+        let mut app = App::new();
+        let (request, _router) = prepare_reconciliation_stale_failure_with_active(&mut app);
+        let (current_boundary, target, focused, stored_claims, history_before) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let active = entry
+                .active
+                .as_ref()
+                .expect("fixture retains an exact current active owner");
+            let failed = entry.pending_failed_branch.as_ref().unwrap();
+            assert!(matches!(
+                &failed.terminal,
+                PendingFailedBranchTerminal::Task { .. }
+            ));
+            let current_boundary = failed.branch.frames()[0]
+                .mount_binding()
+                .physical_parent()
+                .1
+                .expect("failed frame mounts below one exact current boundary")
+                .clone();
+            let focused = *active
+                .interactive_entities()
+                .first()
+                .expect("active branch has one current interactive focus target");
+            let target = active
+                .claims()
+                .find(|claim| {
+                    claim.entity() != current_boundary.entity()
+                        && app.world().get::<Pickable>(claim.entity()).is_some()
+                })
+                .expect("active branch has one exact non-boundary isolation target")
+                .entity();
+            let mut stored_claims = failed_branch_primary_claims(&failed.branch)
+                .into_iter()
+                .cloned()
+                .chain(active.claims().cloned())
+                .collect::<Vec<_>>();
+            stored_claims.push(entry.host.as_ref().unwrap().top_slot_claim.clone());
+            (
+                current_boundary,
+                target,
+                focused,
+                stored_claims,
+                entry.engine.history().clone(),
+            )
+        };
+        assert_eq!(app.world().get::<Pickable>(target).is_some(), true);
+        assert!(stored_claims.iter().any(|claim| claim.entity() == target));
+
+        let stale_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(current_boundary.entity())
+            .insert(RouteOwnershipSeal::new(stale_seal));
+        app.world_mut().entity_mut(target).remove::<Pickable>();
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(focused);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(focused));
+        assert!(
+            app.world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(focused)
+        );
+
+        let exact_entities = stored_claims
+            .iter()
+            .filter(|claim| {
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(claim.entity())
+                    .is_some_and(|record| record.claim() == **claim)
+                    && cleanup_claim_has_exact_authority(app.world(), claim)
+            })
+            .map(ExactRegistryClaim::entity)
+            .collect::<Vec<_>>();
+        assert!(exact_entities.contains(&target));
+        assert!(!exact_entities.contains(&current_boundary.entity()));
+        let mut relationship_entities = stored_claims
+            .iter()
+            .map(ExactRegistryClaim::entity)
+            .collect::<Vec<_>>();
+        relationship_entities.push(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .host
+                .as_ref()
+                .unwrap()
+                .host,
+        );
+        relationship_entities.sort_by_key(|entity| entity.to_bits());
+        relationship_entities.dedup();
+        let relationships_before = relationship_entities
+            .iter()
+            .map(|entity| {
+                (
+                    *entity,
+                    app.world().get::<ChildOf>(*entity).map(ChildOf::parent),
+                    app.world()
+                        .get::<Children>(*entity)
+                        .map(|children| children.iter().copied().collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+
+        settle_cleanup_system(app.world_mut());
+
+        let trace_len = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let residual = entry
+                .authority_protocol_residual
+                .as_ref()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing exact isolation capability is terminal: pending_failed={} active={} host={} cleanup={} status={:?} availability={:?}",
+                        entry.pending_failed_branch.is_some(),
+                        entry.active.is_some(),
+                        entry.host.is_some(),
+                        entry.cleanup_ledger.is_some(),
+                        entry.engine.request(request).unwrap().status(),
+                        entry.engine.snapshot().availability(),
+                    )
+                });
+            let expected_violation = AuthorityIsolationViolation {
+                entity: target,
+                component: AuthorityIsolationComponent::Pickable,
+                predicate: AuthorityIsolationPredicate::PresentForIgnoreWrite,
+            };
+            assert!(matches!(
+                &residual.kind,
+                AuthorityProtocolResidualKind::AuthorityIsolation(contradiction)
+                    if contradiction.violations.contains(&expected_violation)
+            ));
+            assert!(
+                residual
+                    .isolation_contradiction
+                    .as_ref()
+                    .is_some_and(|contradiction| {
+                        contradiction.violations.contains(&expected_violation)
+                    })
+            );
+            assert!(residual.active.is_some());
+            assert!(residual.failed.is_some());
+            assert!(residual.host.is_some());
+            assert!(entry.active.is_none());
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.host.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert_eq!(entry.engine.history(), &history_before);
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            entry.engine.request(request).unwrap().trace().len()
+        };
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        let gate = app.world().resource::<RouterInputGate>();
+        assert!(!gate.allows_pointer(focused));
+        assert!(!gate.allows_keyboard(focused));
+        assert!(!gate.allows_gamepad(focused));
+        assert_eq!(app.world().get::<Pickable>(target), None);
+        assert!(exact_entities.iter().all(|entity| {
+            app.world()
+                .get::<Visibility>(*entity)
+                .is_none_or(|visibility| *visibility == Visibility::Hidden)
+                && app
+                    .world()
+                    .get::<Pickable>(*entity)
+                    .is_none_or(|pickable| *pickable == Pickable::IGNORE)
+                && app
+                    .world()
+                    .get::<RouterInputBarrier>(*entity)
+                    .is_none_or(RouterInputBarrier::denies_all)
+        }));
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        let relationships_after = relationship_entities
+            .iter()
+            .map(|entity| {
+                (
+                    *entity,
+                    app.world().get::<ChildOf>(*entity).map(ChildOf::parent),
+                    app.world()
+                        .get::<Children>(*entity)
+                        .map(|children| children.iter().copied().collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(relationships_after, relationships_before);
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace().len(),
+            trace_len
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert!(entry.authority_protocol_residual.is_some());
+        assert!(entry.cleanup_ledger.is_none());
+    }
+
+    fn assert_failed_authority_reserve_contradiction_fail_closes_once(
+        expected: CleanupLedgerReserveErrorKind,
+        inject: fn(),
+    ) {
+        let mut app = App::new();
+        let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+        let top_slot = app.world().resource::<RouterNavigation>().entries[0]
+            .host
+            .as_ref()
+            .unwrap()
+            .top_slot;
+        let stale_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(top_slot)
+            .insert(RouteOwnershipSeal::new(stale_seal));
+        crate::cleanup::reset_ledger_domain_allocations_for_test();
+        inject();
+
+        settle_cleanup_system(app.world_mut());
+
+        let trace_len = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let residual = entry
+                .authority_protocol_residual
+                .as_ref()
+                .expect("permanent ledger reserve contradiction must fail closed once");
+            assert!(matches!(
+                residual.kind,
+                AuthorityProtocolResidualKind::CleanupLedger(kind) if kind == expected
+            ));
+            assert!(residual.failed.is_some());
+            assert!(residual.host.is_some());
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.host.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            entry.engine.request(request).unwrap().trace().len()
+        };
+        assert_eq!(crate::cleanup::ledger_domain_allocations_for_test(), 0);
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace().len(),
+            trace_len
+        );
+        assert!(entry.authority_protocol_residual.is_some());
+        assert!(entry.cleanup_ledger.is_none());
+    }
+
+    #[test]
+    fn failed_authority_ledger_domain_exhaustion_fail_closes_once_without_replay() {
+        assert_failed_authority_reserve_contradiction_fail_closes_once(
+            CleanupLedgerReserveErrorKind::DomainExhausted,
+            crate::cleanup::fail_next_ledger_domain_for_test,
+        );
+    }
+
+    #[test]
+    fn failed_authority_unfinalized_ledger_facts_fail_close_once_without_replay() {
+        assert_failed_authority_reserve_contradiction_fail_closes_once(
+            CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts,
+            crate::cleanup::fail_next_unfinalized_ledger_for_test,
+        );
+    }
+
+    #[test]
+    fn normal_authority_missing_visibility_fail_closes_full_owner_once() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "normal-missing-visibility");
+        observe_authority_system(app.world_mut());
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/").with_fragment("missing-visibility"),
+            )
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+
+        let (boundary, target, target_claim, focused, history_before) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let active = entry.active.as_ref().expect("fixture retains active owner");
+            let boundary = entry
+                .host
+                .as_ref()
+                .expect("fixture retains host owner")
+                .top_slot_claim
+                .clone();
+            let target_claim = active
+                .claims()
+                .find(|claim| {
+                    claim.entity() != boundary.entity()
+                        && app.world().get::<Visibility>(claim.entity()).is_some()
+                })
+                .expect("active owner has one exact non-boundary Visibility target")
+                .clone();
+            let focused = *active
+                .interactive_entities()
+                .first()
+                .expect("active owner has an interactive focus target");
+            (
+                boundary,
+                target_claim.entity(),
+                target_claim,
+                focused,
+                entry.engine.history().clone(),
+            )
+        };
+        assert!(cleanup_claim_has_exact_authority(
+            app.world(),
+            &target_claim
+        ));
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(target)
+                .is_some_and(|record| record.claim() == target_claim)
+        );
+
+        let stale_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(boundary.entity())
+            .insert(RouteOwnershipSeal::new(stale_seal));
+        app.world_mut().entity_mut(target).remove::<Visibility>();
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(focused);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(focused));
+        assert!(
+            app.world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(focused)
+        );
+
+        commit_presentation_system(app.world_mut());
+
+        let trace_len = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let residual = entry
+                .authority_protocol_residual
+                .as_ref()
+                .expect("normal missing isolation capability must fail closed once");
+            let expected_violation = AuthorityIsolationViolation {
+                entity: target,
+                component: AuthorityIsolationComponent::Visibility,
+                predicate: AuthorityIsolationPredicate::PresentForHiddenWrite,
+            };
+            assert!(matches!(
+                &residual.kind,
+                AuthorityProtocolResidualKind::AuthorityIsolation(contradiction)
+                    if contradiction.violations.contains(&expected_violation)
+            ));
+            assert!(
+                residual
+                    .isolation_contradiction
+                    .as_ref()
+                    .is_some_and(|contradiction| contradiction
+                        .violations
+                        .contains(&expected_violation))
+            );
+            assert!(residual.active.is_some());
+            assert!(residual.pending.is_some());
+            assert!(residual.host.is_some());
+            assert!(entry.active.is_none());
+            assert!(entry.pending_commit.is_none());
+            assert!(entry.host.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert_eq!(entry.engine.history(), &history_before);
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            entry.engine.request(request).unwrap().trace().len()
+        };
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        let gate = app.world().resource::<RouterInputGate>();
+        assert!(!gate.allows_pointer(focused));
+        assert!(!gate.allows_keyboard(focused));
+        assert!(!gate.allows_gamepad(focused));
+        assert_eq!(app.world().get::<Visibility>(target), None);
+        assert_eq!(app.world().get::<Pickable>(target), Some(&Pickable::IGNORE));
+        assert!(
+            app.world()
+                .get::<RouterInputBarrier>(target)
+                .is_some_and(RouterInputBarrier::denies_all)
+        );
+
+        commit_presentation_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace().len(),
+            trace_len
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert!(entry.authority_protocol_residual.is_some());
+        assert!(entry.cleanup_ledger.is_none());
+    }
+
+    #[test]
+    fn normal_commit_ledger_domain_exhaustion_fail_closes_full_owner_once() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "normal-ledger-domain-exhausted");
+        observe_authority_system(app.world_mut());
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/").with_fragment("domain-exhausted"),
+            )
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        crate::cleanup::reset_ledger_domain_allocations_for_test();
+        crate::cleanup::fail_next_ledger_domain_for_test();
+
+        commit_presentation_system(app.world_mut());
+
+        let trace_len = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let residual = entry
+                .authority_protocol_residual
+                .as_ref()
+                .expect("normal permanent ledger exhaustion must fail closed");
+            assert!(matches!(
+                residual.kind,
+                AuthorityProtocolResidualKind::CleanupLedger(
+                    CleanupLedgerReserveErrorKind::DomainExhausted
+                )
+            ));
+            assert!(residual.active.is_some());
+            assert!(residual.pending.is_some());
+            assert!(residual.host.is_some());
+            assert!(entry.active.is_none());
+            assert!(entry.pending_commit.is_none());
+            assert!(entry.host.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            entry.engine.request(request).unwrap().trace().len()
+        };
+        assert_eq!(crate::cleanup::ledger_domain_allocations_for_test(), 0);
+
+        commit_presentation_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace().len(),
+            trace_len
+        );
+        assert!(entry.authority_protocol_residual.is_some());
+        assert!(entry.cleanup_ledger.is_none());
+    }
+
+    fn assert_failed_terminal_missing_component_fail_closes_once(
+        mut app: App,
+        request: NavigationRequestId,
+        component: AuthorityIsolationComponent,
+    ) {
+        let (boundary, target, target_claim, focused, had_active) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let failed = entry.pending_failed_branch.as_ref().unwrap();
+            let boundary = failed
+                .branch
+                .frames()
+                .iter()
+                .find_map(|frame| frame.mount_binding().physical_parent().1.cloned())
+                .filter(|claim| {
+                    entry
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| active.claims().any(|current| current == claim))
+                })
+                .unwrap_or_else(|| entry.host.as_ref().unwrap().top_slot_claim.clone());
+            let target_claim = failed_branch_primary_claims(&failed.branch)
+                .into_iter()
+                .chain(entry.active.iter().flat_map(RealizedBranch::claims))
+                .find(|claim| {
+                    claim.entity() != boundary.entity()
+                        && cleanup_claim_has_exact_authority(app.world(), claim)
+                        && match component {
+                            AuthorityIsolationComponent::Visibility => {
+                                app.world().get::<Visibility>(claim.entity()).is_some()
+                            }
+                            AuthorityIsolationComponent::Pickable => {
+                                app.world().get::<Pickable>(claim.entity()).is_some()
+                            }
+                            AuthorityIsolationComponent::RouterInputBarrier => app
+                                .world()
+                                .get::<RouterInputBarrier>(claim.entity())
+                                .is_some(),
+                        }
+                })
+                .expect("fixture retains an exact non-boundary isolation target")
+                .clone();
+            let focused = entry
+                .active
+                .as_ref()
+                .into_iter()
+                .flat_map(RealizedBranch::interactive_entities)
+                .chain(
+                    failed
+                        .branch
+                        .frames()
+                        .iter()
+                        .chain(failed.branch.detached_frames())
+                        .flat_map(RealizedFrame::interactive_entities),
+                )
+                .next()
+                .unwrap_or(target_claim.entity());
+            (
+                boundary,
+                target_claim.entity(),
+                target_claim,
+                focused,
+                entry.active.is_some(),
+            )
+        };
+        let stale_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(boundary.entity())
+            .insert(RouteOwnershipSeal::new(stale_seal));
+        match component {
+            AuthorityIsolationComponent::Visibility => {
+                app.world_mut().entity_mut(target).remove::<Visibility>();
+            }
+            AuthorityIsolationComponent::Pickable => {
+                app.world_mut().entity_mut(target).remove::<Pickable>();
+            }
+            AuthorityIsolationComponent::RouterInputBarrier => {
+                app.world_mut()
+                    .entity_mut(target)
+                    .remove::<RouterInputBarrier>();
+            }
+        }
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(target)
+                .is_some_and(|record| record.claim() == target_claim)
+        );
+        assert!(cleanup_claim_has_exact_authority(
+            app.world(),
+            &target_claim
+        ));
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(focused);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(focused));
+
+        settle_cleanup_system(app.world_mut());
+
+        let predicate = match component {
+            AuthorityIsolationComponent::Visibility => {
+                AuthorityIsolationPredicate::PresentForHiddenWrite
+            }
+            AuthorityIsolationComponent::Pickable => {
+                AuthorityIsolationPredicate::PresentForIgnoreWrite
+            }
+            AuthorityIsolationComponent::RouterInputBarrier => {
+                AuthorityIsolationPredicate::PresentForDenyWrite
+            }
+        };
+        let expected = AuthorityIsolationViolation {
+            entity: target,
+            component,
+            predicate,
+        };
+        let trace_len = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let residual = entry
+                .authority_protocol_residual
+                .as_ref()
+                .expect("missing exact component must fail closed through the formal caller");
+            assert!(matches!(
+                &residual.kind,
+                AuthorityProtocolResidualKind::AuthorityIsolation(contradiction)
+                    if contradiction.violations.contains(&expected)
+            ));
+            assert!(
+                residual
+                    .isolation_contradiction
+                    .as_ref()
+                    .is_some_and(|contradiction| contradiction.violations.contains(&expected))
+            );
+            assert_eq!(residual.active.is_some(), had_active);
+            assert!(residual.failed.is_some());
+            assert!(residual.host.is_some());
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.active.is_none());
+            assert!(entry.host.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            entry.engine.request(request).unwrap().trace().len()
+        };
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        let gate = app.world().resource::<RouterInputGate>();
+        assert!(!gate.allows_pointer(focused));
+        assert!(!gate.allows_keyboard(focused));
+        assert!(!gate.allows_gamepad(focused));
+        match component {
+            AuthorityIsolationComponent::Visibility => {
+                assert_eq!(app.world().get::<Visibility>(target), None);
+                assert_eq!(app.world().get::<Pickable>(target), Some(&Pickable::IGNORE));
+                assert!(
+                    app.world()
+                        .get::<RouterInputBarrier>(target)
+                        .is_some_and(RouterInputBarrier::denies_all)
+                );
+            }
+            AuthorityIsolationComponent::Pickable => {
+                assert_eq!(app.world().get::<Pickable>(target), None);
+                assert_eq!(
+                    app.world().get::<Visibility>(target),
+                    Some(&Visibility::Hidden)
+                );
+                assert!(
+                    app.world()
+                        .get::<RouterInputBarrier>(target)
+                        .is_some_and(RouterInputBarrier::denies_all)
+                );
+            }
+            AuthorityIsolationComponent::RouterInputBarrier => {
+                assert_eq!(app.world().get::<RouterInputBarrier>(target), None);
+                assert_eq!(
+                    app.world().get::<Visibility>(target),
+                    Some(&Visibility::Hidden)
+                );
+                assert_eq!(app.world().get::<Pickable>(target), Some(&Pickable::IGNORE));
+            }
+        }
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace().len(),
+            trace_len
+        );
+        assert!(entry.authority_protocol_residual.is_some());
+        assert!(entry.cleanup_ledger.is_none());
+    }
+
+    #[test]
+    fn failed_physical_task_missing_visibility_fail_closes_once() {
+        let mut app = App::new();
+        let (request, _router) = prepare_exact_child_physical_residual_failure(&mut app);
+        assert!(matches!(
+            &app.world().resource::<RouterNavigation>().entries[0]
+                .pending_failed_branch
+                .as_ref()
+                .unwrap()
+                .terminal,
+            PendingFailedBranchTerminal::TaskWithPhysicalResidual { .. }
+        ));
+        assert_failed_terminal_missing_component_fail_closes_once(
+            app,
+            request,
+            AuthorityIsolationComponent::Visibility,
+        );
+    }
+
+    #[test]
+    fn failed_cleanup_request_missing_input_barrier_fail_closes_once() {
+        let mut app = App::new();
+        let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            let failed = entry.pending_failed_branch.take().unwrap();
+            let PendingFailedBranch {
+                terminal:
+                    PendingFailedBranchTerminal::Task {
+                        task,
+                        failure,
+                        message,
+                    },
+                branch,
+            } = failed
+            else {
+                panic!("request fixture starts from a task terminal")
+            };
+            let cleanup = entry
+                .engine
+                .report_failed(task, failure, message)
+                .unwrap()
+                .expect("task failure issues its exact cleanup request");
+            entry.pending_failed_branch = Some(PendingFailedBranch {
+                terminal: PendingFailedBranchTerminal::Request(cleanup),
+                branch,
+            });
+        }
+        assert_failed_terminal_missing_component_fail_closes_once(
+            app,
+            request,
+            AuthorityIsolationComponent::RouterInputBarrier,
+        );
+    }
+
+    #[test]
+    fn failed_registration_begin_missing_pickable_fail_closes_once() {
+        let mut app = App::new();
+        let (request, _router) = prepare_registration_begin_failure(&mut app);
+        assert!(matches!(
+            &app.world().resource::<RouterNavigation>().entries[0]
+                .pending_failed_branch
+                .as_ref()
+                .unwrap()
+                .terminal,
+            PendingFailedBranchTerminal::RegistrationBegin(_)
+        ));
+        assert_failed_terminal_missing_component_fail_closes_once(
+            app,
+            request,
+            AuthorityIsolationComponent::Pickable,
+        );
+    }
+
+    #[test]
+    fn failed_authority_begin_rejection_restores_owner_and_fresh_trigger_can_publish() {
+        let mut app = App::new();
+        let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+        let (host_version, host_slot, host_entity, top_slot, top_slot_claim, failed_entities) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let host = entry.host.as_ref().unwrap();
+            (
+                host.version.clone(),
+                host.slot_id,
+                host.host,
+                host.top_slot,
+                host.top_slot_claim.clone(),
+                failed_branch_primary_claims(&entry.pending_failed_branch.as_ref().unwrap().branch)
+                    .into_iter()
+                    .map(ExactRegistryClaim::entity)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let stale_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(top_slot)
+            .insert(RouteOwnershipSeal::new(stale_seal));
+        let before = failed_entities
+            .iter()
+            .map(|entity| {
+                (
+                    *entity,
+                    app.world().get::<Visibility>(*entity).copied(),
+                    app.world()
+                        .get::<Pickable>(*entity)
+                        .map(|pickable| (pickable.should_block_lower, pickable.is_hoverable)),
+                    app.world().get::<RouterInputBarrier>(*entity).copied(),
+                    (
+                        app.world()
+                            .resource::<RouterInputGate>()
+                            .allows_pointer(*entity),
+                        app.world()
+                            .resource::<RouterInputGate>()
+                            .allows_keyboard(*entity),
+                        app.world()
+                            .resource::<RouterInputGate>()
+                            .allows_gamepad(*entity),
+                    ),
+                    app.world()
+                        .resource::<RouteEntityRegistry>()
+                        .record(*entity)
+                        .map(|record| record.claim()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let focus_before = (
+            app.world().resource::<InputFocus>().get(),
+            app.world().resource::<RouteFocusState>().focused(),
+        );
+        let trace_len = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .request(request)
+            .unwrap()
+            .trace()
+            .len();
+        app.world_mut()
+            .insert_resource(FailedAuthorityBeginManifestRejection { remaining: 1 });
+        crate::cleanup::reset_ledger_domain_allocations_for_test();
+
+        let first = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = &mut navigation.entries[0];
+                let failed = entry.pending_failed_branch.take().unwrap();
+                let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                    world,
+                    world.resource::<RouteEntityRegistry>(),
+                    &failed.branch,
+                )
+                .unwrap();
+                let FailedManifestDisposition::CurrentAuthorityLoss {
+                    failed,
+                    manifest,
+                    bindings,
+                } = classify_failed_manifest(
+                    manifest,
+                    failed,
+                    entry.active.as_ref(),
+                    entry.host.as_ref(),
+                )
+                else {
+                    panic!("rejection fixture must classify current authority loss")
+                };
+                begin_failed_authority_settlement(world, entry, failed, manifest, bindings)
+            },
+        );
+        let FailedAuthoritySettlementBeginOutcome::ProtocolContradiction { failed, kind } = first
+        else {
+            panic!("one-shot invalid roots must reject before publication")
+        };
+        assert_eq!(kind, BeginAuthoritySettlementErrorKind::InvalidManifest);
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let host = entry
+                .host
+                .as_ref()
+                .expect("rejection restores exact host owner");
+            assert_eq!(host.version, host_version);
+            assert_eq!(host.slot_id, host_slot);
+            assert_eq!(host.host, host_entity);
+            assert_eq!(host.top_slot, top_slot);
+            assert_eq!(host.top_slot_claim, top_slot_claim);
+            assert!(entry.active.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::Ready
+            );
+            assert_eq!(
+                entry.engine.request(request).unwrap().trace().len(),
+                trace_len
+            );
+        }
+        let after = failed_entities
+            .iter()
+            .map(|entity| {
+                (
+                    *entity,
+                    app.world().get::<Visibility>(*entity).copied(),
+                    app.world()
+                        .get::<Pickable>(*entity)
+                        .map(|pickable| (pickable.should_block_lower, pickable.is_hoverable)),
+                    app.world().get::<RouterInputBarrier>(*entity).copied(),
+                    (
+                        app.world()
+                            .resource::<RouterInputGate>()
+                            .allows_pointer(*entity),
+                        app.world()
+                            .resource::<RouterInputGate>()
+                            .allows_keyboard(*entity),
+                        app.world()
+                            .resource::<RouterInputGate>()
+                            .allows_gamepad(*entity),
+                    ),
+                    app.world()
+                        .resource::<RouteEntityRegistry>()
+                        .record(*entity)
+                        .map(|record| record.claim()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(after, before);
+        assert_eq!(
+            crate::cleanup::ledger_domain_allocations_for_test(),
+            1,
+            "a rejected begin burns its already allocated ledger domain"
+        );
+        assert_eq!(
+            (
+                app.world().resource::<InputFocus>().get(),
+                app.world().resource::<RouteFocusState>().focused(),
+            ),
+            focus_before
+        );
+
+        let second = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = &mut navigation.entries[0];
+                let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                    world,
+                    world.resource::<RouteEntityRegistry>(),
+                    &failed.branch,
+                )
+                .unwrap();
+                let FailedManifestDisposition::CurrentAuthorityLoss {
+                    failed,
+                    manifest,
+                    bindings,
+                } = classify_failed_manifest(
+                    manifest,
+                    failed,
+                    entry.active.as_ref(),
+                    entry.host.as_ref(),
+                )
+                else {
+                    panic!("restored owner must remain classifiable")
+                };
+                begin_failed_authority_settlement(world, entry, failed, manifest, bindings)
+            },
+        );
+        assert!(matches!(
+            second,
+            FailedAuthoritySettlementBeginOutcome::Begun
+        ));
+        assert_eq!(
+            crate::cleanup::ledger_domain_allocations_for_test(),
+            2,
+            "the fresh begin allocates a distinct domain instead of reusing the rejected one"
+        );
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::RecoveringAuthority
+        );
+        assert!(
+            entry
+                .cleanup_ledger
+                .as_ref()
+                .is_some_and(CleanupLedger::is_authority_settlement)
+        );
+    }
+
+    #[test]
+    fn failed_authority_begin_contradiction_fail_closes_once_through_settle_caller() {
+        let mut app = App::new();
+        let (request, _router) = prepare_reconciliation_stale_failure_with_active(&mut app);
+        let (current_boundary, active_targets, history_before) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let active = entry
+                .active
+                .as_ref()
+                .expect("fixture retains current active UI");
+            let failed = entry.pending_failed_branch.as_ref().unwrap();
+            let current_boundary = failed.branch.frames()[0]
+                .mount_binding()
+                .physical_parent()
+                .1
+                .expect("entering reconciliation frame mounts below current active output")
+                .clone();
+            assert!(active.claims().any(|claim| claim == &current_boundary));
+            assert!(
+                !failed_branch_primary_claims(&failed.branch)
+                    .into_iter()
+                    .any(|claim| claim == &current_boundary)
+            );
+            (
+                current_boundary,
+                active.interactive_entities(),
+                entry.engine.history().clone(),
+            )
+        };
+        let focused = *active_targets
+            .first()
+            .expect("committed active branch has an interactive target");
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(focused);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(focused));
+        let stale_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(current_boundary.entity())
+            .insert(RouteOwnershipSeal::new(stale_seal));
+        app.world_mut()
+            .insert_resource(FailedAuthorityBeginManifestRejection { remaining: 1 });
+
+        settle_cleanup_system(app.world_mut());
+
+        let trace_len = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let residual = entry
+                .authority_protocol_residual
+                .as_ref()
+                .expect("caller fail-closes the returned composed owner exactly once");
+            assert!(matches!(
+                residual.kind,
+                AuthorityProtocolResidualKind::Authority(
+                    BeginAuthoritySettlementErrorKind::InvalidManifest
+                )
+            ));
+            assert!(residual.active.is_some());
+            assert!(residual.failed.is_some());
+            assert!(residual.host.is_some());
+            assert!(entry.active.is_none());
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.host.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert_eq!(entry.engine.history(), &history_before);
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            assert_eq!(app.world().resource::<InputFocus>().get(), None);
+            assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+            let gate = app.world().resource::<RouterInputGate>();
+            assert!(active_targets.iter().all(|entity| {
+                !gate.allows_pointer(*entity)
+                    && !gate.allows_keyboard(*entity)
+                    && !gate.allows_gamepad(*entity)
+            }));
+            entry.engine.request(request).unwrap().trace().len()
+        };
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace().len(),
+            trace_len
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert!(entry.authority_protocol_residual.is_some());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(entry.pending_failed_branch.is_none());
+    }
+
+    #[test]
+    fn failed_authority_trigger_exhaustion_fail_closes_once_with_full_owner() {
+        let mut app = App::new();
+        let (request, _router) = prepare_reconciliation_stale_failure_with_active(&mut app);
+        let (current_boundary, history_before) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let active = entry
+                .active
+                .as_ref()
+                .expect("fixture retains current active UI");
+            let failed = entry.pending_failed_branch.as_ref().unwrap();
+            let current_boundary = failed.branch.frames()[0]
+                .mount_binding()
+                .physical_parent()
+                .1
+                .expect("entering reconciliation frame mounts below current active output")
+                .clone();
+            assert!(active.claims().any(|claim| claim == &current_boundary));
+            assert!(
+                !failed_branch_primary_claims(&failed.branch)
+                    .into_iter()
+                    .any(|claim| claim == &current_boundary)
+            );
+            (current_boundary, entry.engine.history().clone())
+        };
+        let stale_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(current_boundary.entity())
+            .insert(RouteOwnershipSeal::new(stale_seal));
+        app.world_mut()
+            .insert_resource(FailedAuthorityTriggerExhaustion { remaining: 1 });
+
+        settle_cleanup_system(app.world_mut());
+
+        let trace_len = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let residual = entry
+                .authority_protocol_residual
+                .as_ref()
+                .expect("permanent trigger exhaustion must fail closed once");
+            assert!(matches!(
+                residual.kind,
+                AuthorityProtocolResidualKind::AuthorityTrigger(
+                    FailedAuthorityTriggerError::Exhausted
+                )
+            ));
+            assert!(residual.active.is_some());
+            assert!(residual.failed.is_some());
+            assert!(residual.host.is_some());
+            assert!(entry.active.is_none());
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.host.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert_eq!(entry.engine.history(), &history_before);
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            entry.engine.request(request).unwrap().trace().len()
+        };
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace().len(),
+            trace_len
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert!(entry.authority_protocol_residual.is_some());
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+    }
+
+    #[test]
+    fn failed_authority_physical_task_target_selects_target_and_current_roots() {
+        let mut app = App::new();
+        let (request, _router) = prepare_exact_child_physical_residual_failure(&mut app);
+        let (target, top_slot) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let failed = entry.pending_failed_branch.as_ref().unwrap();
+            let PendingFailedBranchTerminal::TaskWithPhysicalResidual { task, .. } =
+                &failed.terminal
+            else {
+                panic!("fixture must retain the physical-residual task terminal")
+            };
+            let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                app.world(),
+                app.world().resource::<RouteEntityRegistry>(),
+                &failed.branch,
+            )
+            .unwrap();
+            assert!(manifest.contains_frame_obligation(task.frame()));
+            let roots = failed_authority_logical_roots(failed, &manifest);
+            assert_eq!(roots.first(), Some(task.frame()));
+            (task.frame().clone(), entry.host.as_ref().unwrap().top_slot)
+        };
+        let stale_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(top_slot)
+            .insert(RouteOwnershipSeal::new(stale_seal));
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::RecoveringAuthority
+        );
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::Recovering)
+        ));
+        assert!(
+            entry
+                .cleanup_ledger
+                .as_ref()
+                .is_some_and(CleanupLedger::is_authority_settlement)
+        );
+        assert!(
+            entry
+                .cleanup_ledger
+                .as_ref()
+                .unwrap()
+                .failed_prepared_frames()
+                .iter()
+                .any(|frame| frame.frame() == &target)
+        );
+    }
+
+    #[test]
+    fn failed_authority_cleanup_request_uses_its_exact_sealed_roots() {
+        let mut app = App::new();
+        let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+        let top_slot = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            let failed = entry.pending_failed_branch.take().unwrap();
+            let PendingFailedBranch {
+                terminal:
+                    PendingFailedBranchTerminal::Task {
+                        task,
+                        failure,
+                        message,
+                    },
+                branch,
+            } = failed
+            else {
+                panic!("cleanup-request fixture starts from an exact task terminal")
+            };
+            let cleanup = entry
+                .engine
+                .report_failed(task, failure, message)
+                .expect("task terminal remains reportable")
+                .expect("nested task failure retains an exact cleanup request");
+            entry.pending_failed_branch = Some(PendingFailedBranch {
+                terminal: PendingFailedBranchTerminal::Request(cleanup),
+                branch,
+            });
+            entry.host.as_ref().unwrap().top_slot
+        };
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let failed = entry.pending_failed_branch.as_ref().unwrap();
+            let PendingFailedBranchTerminal::Request(cleanup) = &failed.terminal else {
+                panic!("fixture retains the cleanup request terminal")
+            };
+            let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                app.world(),
+                app.world().resource::<RouteEntityRegistry>(),
+                &failed.branch,
+            )
+            .unwrap();
+            assert_eq!(
+                failed_authority_logical_roots(failed, &manifest),
+                cleanup.logical_roots()
+            );
+        }
+        let stale_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(top_slot)
+            .insert(RouteOwnershipSeal::new(stale_seal));
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::RecoveringAuthority
+        );
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::Recovering)
+        ));
+        assert!(
+            entry
+                .cleanup_ledger
+                .as_ref()
+                .is_some_and(CleanupLedger::is_authority_settlement)
+        );
+    }
+
+    #[test]
+    fn failed_authority_registration_begin_uses_current_branch_roots() {
+        let mut app = App::new();
+        let (request, _router) = prepare_registration_begin_failure(&mut app);
+        let top_slot = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let failed = entry.pending_failed_branch.as_ref().unwrap();
+            let PendingFailedBranchTerminal::RegistrationBegin(error) = &failed.terminal else {
+                panic!("fixture retains the exact registration-begin terminal")
+            };
+            assert!(error.validate_rejection(&entry.engine).is_ok());
+            let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                app.world(),
+                app.world().resource::<RouteEntityRegistry>(),
+                &failed.branch,
+            )
+            .unwrap();
+            assert_eq!(
+                failed_authority_logical_roots(failed, &manifest),
+                failed_branch_logical_roots(&failed.branch)
+            );
+            entry.host.as_ref().unwrap().top_slot
+        };
+        let stale_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(top_slot)
+            .insert(RouteOwnershipSeal::new(stale_seal));
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::RecoveringAuthority
+        );
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::Recovering)
+        ));
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(
+            entry
+                .cleanup_ledger
+                .as_ref()
+                .is_some_and(CleanupLedger::is_authority_settlement)
+        );
+    }
+
+    #[test]
+    fn failed_authority_composed_owner_isolates_optional_active_branch() {
+        let mut app = App::new();
+        let (request, _router) = prepare_reconciliation_stale_failure_with_active(&mut app);
+        let (
+            current_boundary,
+            active_targets,
+            active_frame_count,
+            failed_frame_count,
+            retired_host,
+            history_before,
+        ) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let active = entry
+                .active
+                .as_ref()
+                .expect("fixture retains committed active UI");
+            let failed = entry.pending_failed_branch.as_ref().unwrap();
+            let host = entry.host.as_ref().unwrap();
+            let current_boundary = failed.branch.frames()[0]
+                .mount_binding()
+                .physical_parent()
+                .1
+                .expect("reconciliation entering frame mounts below an active output")
+                .clone();
+            assert!(active.claims().any(|claim| claim == &current_boundary));
+            assert!(
+                !failed_branch_primary_claims(&failed.branch)
+                    .into_iter()
+                    .any(|claim| claim == &current_boundary)
+            );
+            (
+                current_boundary,
+                active.interactive_entities(),
+                active.frames().len(),
+                failed.branch.frames().len(),
+                (
+                    host.version.clone(),
+                    host.slot_id,
+                    host.host,
+                    host.top_slot,
+                    host.top_slot_claim.clone(),
+                ),
+                entry.engine.history().clone(),
+            )
+        };
+        let focused = *active_targets
+            .first()
+            .expect("committed active branch has an interactive target");
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(focused);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(focused));
+        let stale_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(current_boundary.entity())
+            .insert(RouteOwnershipSeal::new(stale_seal));
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::RecoveringAuthority
+        );
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::Recovering)
+        ));
+        assert!(entry.active.is_none());
+        assert!(entry.host.is_none());
+        let ledger = entry.cleanup_ledger.as_ref().unwrap();
+        assert!(ledger.is_authority_settlement());
+        assert_eq!(ledger.leaving_frames().len(), active_frame_count);
+        assert_eq!(ledger.failed_prepared_frames().len(), failed_frame_count);
+        let retained_host = ledger
+            .authority_settlement_host()
+            .expect("the same authority ledger retains the retired host owner");
+        assert_eq!(
+            (
+                &retained_host.version,
+                retained_host.slot_id,
+                retained_host.host,
+                retained_host.top_slot,
+                &retained_host.top_slot_claim,
+            ),
+            (
+                &retired_host.0,
+                retired_host.1,
+                retired_host.2,
+                retired_host.3,
+                &retired_host.4,
+            )
+        );
+        let batch = ledger.batch().unwrap();
+        let stream = (batch.manifest_digest(), batch.obligation_count());
+        let mut receipt_count = ledger.receipt_count();
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        let gate = app.world().resource::<RouterInputGate>();
+        assert!(active_targets.iter().all(|entity| {
+            !gate.allows_pointer(*entity)
+                && !gate.allows_keyboard(*entity)
+                && !gate.allows_gamepad(*entity)
+        }));
+
+        for _ in 0..8 {
+            settle_cleanup_system(app.world_mut());
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let Some(ledger) = entry.cleanup_ledger.as_ref() else {
+                break;
+            };
+            assert!(ledger.is_authority_settlement());
+            assert_eq!(ledger.leaving_frames().len(), active_frame_count);
+            assert_eq!(ledger.failed_prepared_frames().len(), failed_frame_count);
+            assert_eq!(
+                ledger.authority_settlement_host().map(|host| (
+                    &host.version,
+                    host.slot_id,
+                    host.host,
+                    host.top_slot,
+                    &host.top_slot_claim,
+                )),
+                Some((
+                    &retired_host.0,
+                    retired_host.1,
+                    retired_host.2,
+                    retired_host.3,
+                    &retired_host.4,
+                ))
+            );
+            let batch = ledger.batch().unwrap();
+            assert_eq!((batch.manifest_digest(), batch.obligation_count()), stream);
+            assert!(ledger.receipt_count() >= receipt_count);
+            receipt_count = ledger.receipt_count();
+        }
+
+        let trace_len = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(entry.active.is_none());
+            assert!(entry.host.is_none());
+            assert!(entry.authority_protocol_residual.is_none());
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            assert_eq!(entry.engine.history(), &history_before);
+            let request_record = entry.engine.request(request).unwrap();
+            let trace = request_record.trace();
+            assert_eq!(
+                trace
+                    .iter()
+                    .filter(|event| event.cleanup_disposition().is_some())
+                    .count(),
+                stream.1
+            );
+            assert_eq!(
+                trace
+                    .iter()
+                    .filter(|event| {
+                        event.kind() == NavigationTraceEventKind::CleanupSettled
+                            && event.cleanup_disposition().is_none()
+                    })
+                    .count(),
+                1
+            );
+            assert_eq!(
+                trace
+                    .iter()
+                    .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                    .count(),
+                1
+            );
+            trace.len()
+        };
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace().len(),
+            trace_len
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert!(entry.cleanup_ledger.is_none());
     }
 
     #[cfg(feature = "test-support")]
@@ -4716,6 +9125,290 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn eager_failed_isolation_revalidates_relationships_before_releasing_focus() {
+        #[derive(Resource)]
+        struct ReparentAfterBarrierInsert {
+            target: Entity,
+            active_parent: Entity,
+        }
+
+        let mut app = App::new();
+        app.world_mut()
+            .register_component_hooks::<RouterInputBarrier>()
+            .on_insert(|mut world, HookContext { entity, .. }| {
+                let Some(drift) = world.get_resource::<ReparentAfterBarrierInsert>() else {
+                    return;
+                };
+                if drift.target == entity {
+                    let active_parent = drift.active_parent;
+                    world.commands().entity(active_parent).add_child(entity);
+                }
+            });
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        commit_initial_nested_branch(&mut app, router);
+        let active_parent = app.world().resource::<RouterNavigation>().entries[0]
+            .active
+            .as_ref()
+            .unwrap()
+            .frames()[0]
+            .shell();
+        prepare_nested_branch_for_commit(&mut app, router, RouteLocation::new("/items/2"));
+        let target = app.world().resource::<RouterNavigation>().entries[0]
+            .pending_commit
+            .as_ref()
+            .unwrap()
+            .branch
+            .frames()[0]
+            .interactive_entities()[0];
+        app.world_mut().entity_mut(target).insert((
+            Visibility::Visible,
+            Pickable {
+                should_block_lower: true,
+                is_hoverable: true,
+            },
+        ));
+        app.world_mut()
+            .entity_mut(target)
+            .remove::<RouterInputBarrier>();
+        app.world_mut().insert_resource(ReparentAfterBarrierInsert {
+            target,
+            active_parent,
+        });
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(target);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(target));
+
+        commit_presentation_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.pending_failed_branch.is_some());
+        assert!(entry.cleanup_ledger.is_none());
+        assert_eq!(app.world().resource::<InputFocus>().get(), Some(target));
+        assert_eq!(
+            app.world().resource::<RouteFocusState>().focused(),
+            Some(target)
+        );
+        assert_eq!(
+            app.world().get::<ChildOf>(target).map(ChildOf::parent),
+            Some(active_parent)
+        );
+    }
+
+    #[test]
+    fn failed_settle_revalidates_active_descendants_before_releasing_focus() {
+        #[derive(Resource)]
+        struct ReparentFailedRootDuringSettle {
+            target: Entity,
+            active_descendant: Entity,
+        }
+
+        let mut app = App::new();
+        app.world_mut()
+            .register_component_hooks::<RouterInputBarrier>()
+            .on_insert(|mut world, HookContext { entity, .. }| {
+                let Some(drift) = world.get_resource::<ReparentFailedRootDuringSettle>() else {
+                    return;
+                };
+                if drift.target == entity {
+                    let active_descendant = drift.active_descendant;
+                    world.commands().entity(active_descendant).add_child(entity);
+                }
+            });
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_failing_deep_pending_router(&mut app);
+        observe_authority_system(app.world_mut());
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        for _ in 0..5 {
+            drive_navigation_system(app.world_mut());
+        }
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/sections/a/items/1/detail"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        for _ in 0..10 {
+            drive_navigation_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .pending_failed_branch
+                .is_some()
+            {
+                break;
+            }
+        }
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            let PendingFailedBranch { terminal, branch } = entry
+                .pending_failed_branch
+                .take()
+                .expect("driver failure owner");
+            let mut realized = branch.into_realized_for_test();
+            realized.retain_last_frame_for_test();
+            for frame in realized.frames_mut_for_test() {
+                frame.mark_prewrite_incomplete_for_test();
+            }
+            entry.pending_failed_branch = Some(PendingFailedBranch {
+                terminal,
+                branch: FailedPreparedBranch::new(PreparedBranch::from_realized(realized)),
+            });
+        }
+        let (active_root, failed_root) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            (
+                entry.active.as_ref().unwrap().frames()[0].shell(),
+                entry
+                    .pending_failed_branch
+                    .as_ref()
+                    .unwrap()
+                    .branch
+                    .frames()
+                    .iter()
+                    .chain(
+                        entry
+                            .pending_failed_branch
+                            .as_ref()
+                            .unwrap()
+                            .branch
+                            .detached_frames(),
+                    )
+                    .flat_map(RealizedFrame::claims)
+                    .find(|claim| failed_cleanup_claim_is_current(app.world(), claim))
+                    .expect("failed branch must retain an exact frame isolation target")
+                    .entity(),
+            )
+        };
+        let active_descendant = app.world_mut().spawn(ChildOf(active_root)).id();
+        let active_closure_before = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            validate_branch_descendants(app.world(), entry.active.as_ref().unwrap()).unwrap()
+        };
+        assert!(
+            !active_closure_before.contains(&failed_root),
+            "the hook fixture needs a failed root outside the active closure before isolation"
+        );
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let active_claims = entry
+                .active
+                .as_ref()
+                .unwrap()
+                .claims()
+                .cloned()
+                .collect::<Vec<_>>();
+            let failed_claims =
+                failed_branch_primary_claims(&entry.pending_failed_branch.as_ref().unwrap().branch)
+                    .into_iter()
+                    .filter(|claim| failed_cleanup_claim_is_current(app.world(), claim))
+                    .filter(|claim| !active_claims.contains(claim))
+                    .cloned()
+                    .collect::<Vec<_>>();
+            let failed_closure = failed_branch_focus_closure(app.world(), &failed_claims);
+            assert!(
+                failed_closure
+                    .iter()
+                    .all(|entity| !active_closure_before.contains(entity)),
+                "the complete failed closure must be disjoint before isolation"
+            );
+        }
+        app.world_mut()
+            .entity_mut(failed_root)
+            .remove::<RouterInputBarrier>();
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let registry = app.world().resource::<RouteEntityRegistry>();
+            let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                app.world(),
+                registry,
+                &entry.pending_failed_branch.as_ref().unwrap().branch,
+            )
+            .expect("formal settle fixture must freeze");
+            assert!(
+                manifest.preflight(app.world()),
+                "formal settle fixture must pass manifest preflight before isolation"
+            );
+            assert!(
+                failed_prepared_branch_roots_are_exact(
+                    app.world(),
+                    &entry.pending_failed_branch.as_ref().unwrap().branch,
+                    &manifest,
+                ),
+                "formal settle fixture must reach the isolation write path"
+            );
+        }
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = &mut navigation.entries[0];
+                let failed = entry
+                    .pending_failed_branch
+                    .take()
+                    .expect("formal settle fixture owner");
+                let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                    world,
+                    world.resource::<RouteEntityRegistry>(),
+                    &failed.branch,
+                )
+                .expect("formal settle fixture must freeze for classification");
+                match classify_failed_manifest(
+                    manifest,
+                    failed,
+                    entry.active.as_ref(),
+                    entry.host.as_ref(),
+                ) {
+                    FailedManifestDisposition::Ready { failed, .. } => {
+                        entry.pending_failed_branch = Some(failed);
+                    }
+                    FailedManifestDisposition::CurrentAuthorityLoss { failed, .. } => {
+                        entry.pending_failed_branch = Some(failed);
+                        panic!("formal settle fixture classified current authority loss");
+                    }
+                    FailedManifestDisposition::AmbiguousInvalidTopology { failed, .. } => {
+                        entry.pending_failed_branch = Some(failed);
+                        panic!("formal settle fixture classified ambiguous topology");
+                    }
+                }
+            },
+        );
+        app.world_mut()
+            .insert_resource(ReparentFailedRootDuringSettle {
+                target: failed_root,
+                active_descendant,
+            });
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(failed_root);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(failed_root));
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.pending_failed_branch.is_some());
+        assert!(entry.cleanup_ledger.is_none());
+        assert_eq!(
+            app.world().resource::<InputFocus>().get(),
+            Some(failed_root)
+        );
+        assert_eq!(
+            app.world().resource::<RouteFocusState>().focused(),
+            Some(failed_root)
+        );
+        assert_eq!(
+            app.world().get::<ChildOf>(failed_root).map(ChildOf::parent),
+            Some(active_descendant)
+        );
+    }
+
+    #[test]
     fn nested_missing_outlet_rejects_before_slot_or_registry_write() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
@@ -5721,6 +10414,556 @@ pub(crate) mod tests {
         (request, router)
     }
 
+    fn prepare_exact_child_physical_residual_failure(
+        app: &mut App,
+    ) -> (NavigationRequestId, RouterHandle) {
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(app, observed, true);
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let (task, mut pending, host_candidate, top_slot, top_slot_claim) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            let task = entry
+                .pending_mount_frame_task
+                .take()
+                .expect("confirmed child mount must own its issued task");
+            let host = entry.host.as_ref().unwrap();
+            (
+                task,
+                entry.pending_commit.take().unwrap(),
+                host.candidate.clone(),
+                host.top_slot,
+                host.top_slot_claim.clone(),
+            )
+        };
+        let (plan, report) = applied_report_with_identity(task.report_identity());
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = &mut navigation.entries[0];
+                let realized = match apply_applied_driver_report_to_branch(
+                    world,
+                    &mut entry.engine,
+                    host_candidate,
+                    top_slot,
+                    top_slot_claim,
+                    Some(&pending.branch),
+                    None,
+                    &task,
+                    &report,
+                    plan,
+                ) {
+                    Ok(realized) => realized,
+                    Err(_) => {
+                        panic!("physical-residual fixture must realize the unreported task target")
+                    }
+                };
+                pending
+                    .branch
+                    .push_frame(realized)
+                    .expect("physical-residual target extends the prepared branch");
+                entry.pending_failed_branch = Some(PendingFailedBranch {
+                    terminal: PendingFailedBranchTerminal::TaskWithPhysicalResidual {
+                        task,
+                        failure: ViewFailureKind::Apply,
+                        message: "test retains an unreported physical task target",
+                    },
+                    branch: failed_prepared_branch(pending, None),
+                });
+            },
+        );
+        (request, router)
+    }
+
+    fn foreign_mount_receipt_proof() -> MountReceiptProof {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        observe_authority_system(app.world_mut());
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = &mut navigation.entries[0];
+                let pending = entry
+                    .pending_commit
+                    .take()
+                    .expect("foreign proof fixture retains its prepared parent");
+                let EngineAction::MountRequest(mount) = entry.engine.action().unwrap() else {
+                    panic!("foreign proof fixture requires a mount request")
+                };
+                let outlet = mount.outlet().clone();
+                let grant = entry.engine.resolve_mount(mount).unwrap();
+                let staged =
+                    stage_child_slot(world, pending.branch.last_frame().unwrap(), &outlet, &grant)
+                        .unwrap();
+                let (_, proof) = grant.attest_receipt_with_proof(staged.receipt().digest());
+                proof
+            },
+        )
+    }
+
+    fn prepare_registration_begin_failure(app: &mut App) -> (NavigationRequestId, RouterHandle) {
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(app, observed, true);
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let foreign_proof = foreign_mount_receipt_proof();
+
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = &mut navigation.entries[0];
+                let pending = entry
+                    .pending_commit
+                    .take()
+                    .expect("registration-begin fixture retains its prepared parent");
+                let EngineAction::MountRequest(mount) = entry
+                    .engine
+                    .action()
+                    .expect("prepared parent retains its exact mount request")
+                else {
+                    panic!("registration-begin fixture requires a mount request")
+                };
+                let outlet = mount.outlet().clone();
+                let grant = entry
+                    .engine
+                    .resolve_mount(mount)
+                    .expect("exact mount request resolves once");
+                let parent = pending
+                    .branch
+                    .last_frame()
+                    .expect("prepared parent remains owned");
+                let staged = stage_child_slot(world, parent, &outlet, &grant)
+                    .expect("registration-begin fixture stages one inert slot");
+                let (receipt, _proof) = grant.attest_receipt_with_proof(staged.receipt().digest());
+                let permit = entry
+                    .engine
+                    .accept_mount_receipt(receipt)
+                    .expect("exact receipt yields one registration permit");
+
+                let begin = match entry
+                    .engine
+                    .begin_mount_registration(permit, &foreign_proof)
+                {
+                    Err(error) => error,
+                    Ok(_) => panic!("foreign proof must retain the current registration permit"),
+                };
+                assert!(begin.validate_rejection(&entry.engine).is_ok());
+                let residual = staged.into_residual(world);
+                entry.pending_failed_branch = Some(PendingFailedBranch {
+                    terminal: PendingFailedBranchTerminal::RegistrationBegin(begin),
+                    branch: failed_prepared_branch(pending, Some(residual)),
+                });
+            },
+        );
+        (request, router)
+    }
+
+    fn prepare_reconciliation_stale_failure_with_active(
+        app: &mut App,
+    ) -> (NavigationRequestId, RouterHandle) {
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(app, observed, true);
+        observe_authority_system(app.world_mut());
+        commit_initial_nested_branch(app, router);
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/2"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let (task, pending, host_candidate, top_slot, top_slot_claim) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            let mut pending = entry.pending_commit.take().unwrap();
+            let task = pending
+                .final_task
+                .take()
+                .or_else(|| entry.pending_mount_frame_task.take())
+                .expect("reconciliation pending branch must retain its exact issued task");
+            let host = entry.host.as_ref().unwrap();
+            (
+                task,
+                pending,
+                host.candidate.clone(),
+                host.top_slot,
+                host.top_slot_claim.clone(),
+            )
+        };
+        let (plan, report) = applied_report_with_identity(task.report_identity());
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = &mut navigation.entries[0];
+                let result = apply_applied_driver_report_to_branch(
+                    world,
+                    &mut entry.engine,
+                    host_candidate,
+                    top_slot,
+                    top_slot_claim,
+                    None,
+                    None,
+                    &task,
+                    &report,
+                    plan,
+                );
+                assert!(matches!(result, Err(DriverReportApplicationError::Stale)));
+                entry.pending_failed_branch = Some(stale_driver_report_owner(pending, task));
+            },
+        );
+        (request, router)
+    }
+
+    pub(crate) fn failed_mount_residual_fixture() -> (App, FailedPreparedBranch) {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        observe_authority_system(app.world_mut());
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        app.world_mut()
+            .register_component_hooks::<ChildSlotBarrierProbe>()
+            .on_insert(|mut world, HookContext { entity, .. }| {
+                world
+                    .commands()
+                    .entity(entity)
+                    .remove::<RouterInputBarrier>();
+            });
+        drive_navigation_system(app.world_mut());
+        let branch = app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+            .pending_failed_branch
+            .take()
+            .expect("observer drift retains one failed residual owner")
+            .branch;
+        (app, branch)
+    }
+
+    #[test]
+    fn invalid_failed_manifest_topology_is_bounded_unavailable_without_physical_write() {
+        let mut app = App::new();
+        let (request, router) = prepare_exact_child_stale_failure(&mut app);
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            navigation.entries[0]
+                .pending_failed_branch
+                .as_mut()
+                .unwrap()
+                .branch
+                .duplicate_first_child_slot_for_test();
+        }
+        let (top_slot, failed_owned, focus) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let failed = entry.pending_failed_branch.as_ref().unwrap();
+            let mut owned = failed
+                .branch
+                .frames()
+                .iter()
+                .chain(failed.branch.detached_frames())
+                .flat_map(RealizedFrame::claims)
+                .map(ExactRegistryClaim::entity)
+                .chain(failed.branch.child_slots().iter().map(|slot| slot.slot()))
+                .collect::<Vec<_>>();
+            owned.sort_by_key(|entity| entity.to_bits());
+            owned.dedup();
+            (
+                entry.host.as_ref().unwrap().top_slot,
+                owned,
+                failed.branch.frames()[0].shell(),
+            )
+        };
+        *app.world_mut().get_mut::<Visibility>(top_slot).unwrap() = Visibility::Visible;
+        *app.world_mut().get_mut::<Pickable>(top_slot).unwrap() = Pickable::default();
+        *app.world_mut()
+            .get_mut::<RouterInputBarrier>(top_slot)
+            .unwrap() = RouterInputBarrier::allow_all();
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(top_slot);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(focus));
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let physical_before = app
+            .world()
+            .iter_entities()
+            .map(|entity| {
+                (
+                    entity.id(),
+                    entity.archetype().components().to_vec(),
+                    app.world().get::<ChildOf>(entity.id()).map(ChildOf::parent),
+                    app.world()
+                        .get::<Children>(entity.id())
+                        .map(|children| children.iter().copied().collect::<Vec<_>>()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        settle_cleanup_system(app.world_mut());
+
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(entry.active.is_none());
+            assert!(entry.host.is_none());
+            let residual = entry.authority_protocol_residual.as_ref().unwrap();
+            assert!(matches!(
+                residual.kind,
+                AuthorityProtocolResidualKind::FailedManifest(
+                    FailedPreparedTopologyError::DuplicateEntity
+                )
+            ));
+            assert_eq!(
+                residual.failed.as_ref().unwrap().branch.child_slots().len(),
+                2
+            );
+            assert!(residual.host.is_some());
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::Unavailable(
+                    RouterUnavailableReason::RegistryInvariantViolation
+                )
+            );
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+        }
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        let physical_after = app
+            .world()
+            .iter_entities()
+            .map(|entity| {
+                (
+                    entity.id(),
+                    entity.archetype().components().to_vec(),
+                    app.world().get::<ChildOf>(entity.id()).map(ChildOf::parent),
+                    app.world()
+                        .get::<Children>(entity.id())
+                        .map(|children| children.iter().copied().collect::<Vec<_>>()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(physical_after, physical_before);
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        assert_eq!(
+            app.world().get::<Pickable>(top_slot),
+            Some(&Pickable::IGNORE)
+        );
+        assert!(
+            app.world()
+                .get::<RouterInputBarrier>(top_slot)
+                .is_some_and(RouterInputBarrier::denies_all)
+        );
+        let gate = app.world().resource::<RouterInputGate>();
+        assert!(failed_owned.iter().all(|entity| {
+            app.world().get::<Visibility>(*entity) == Some(&Visibility::Hidden)
+                && app.world().get::<Pickable>(*entity) == Some(&Pickable::IGNORE)
+                && app
+                    .world()
+                    .get::<RouterInputBarrier>(*entity)
+                    .is_some_and(RouterInputBarrier::denies_all)
+                && !gate.allows_pointer(*entity)
+                && !gate.allows_keyboard(*entity)
+                && !gate.allows_gamepad(*entity)
+        }));
+
+        settle_cleanup_system(app.world_mut());
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.authority_protocol_residual.is_some());
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert_eq!(
+            entry
+                .engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .filter(|event| event.cleanup_disposition().is_some())
+                .count(),
+            0
+        );
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new("/blocked"))
+                .unwrap_err()
+                .kind(),
+            NavigationEnqueueErrorKind::HostUnavailable
+        );
+    }
+
+    #[test]
+    fn invalid_failed_manifest_topology_isolates_retired_top_and_active_owner() {
+        let mut app = App::new();
+        let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            entry
+                .pending_failed_branch
+                .as_mut()
+                .unwrap()
+                .branch
+                .duplicate_first_child_slot_for_test();
+            let PendingFailedBranch { terminal, branch } =
+                entry.pending_failed_branch.take().unwrap();
+            let mut realized = branch.into_realized_for_test();
+            let active = RealizedBranch::from_single_frame(
+                realized
+                    .pop_frame_for_test()
+                    .expect("stored owner supplies one exact active frame"),
+            );
+            entry.active = Some(active);
+            entry.pending_failed_branch = Some(PendingFailedBranch {
+                terminal,
+                branch: FailedPreparedBranch::new(PreparedBranch::from_realized(realized)),
+            });
+        }
+        let (top_slot, active_targets) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            (
+                entry.host.as_ref().unwrap().top_slot,
+                entry.active.as_ref().unwrap().interactive_entities(),
+            )
+        };
+        for target in active_targets
+            .iter()
+            .copied()
+            .chain(std::iter::once(top_slot))
+        {
+            *app.world_mut().get_mut::<Visibility>(target).unwrap() = Visibility::Visible;
+            *app.world_mut().get_mut::<Pickable>(target).unwrap() = Pickable::default();
+            *app.world_mut()
+                .get_mut::<RouterInputBarrier>(target)
+                .unwrap() = RouterInputBarrier::allow_all();
+        }
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(top_slot);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(active_targets.first().copied());
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let structure_before = app
+            .world()
+            .iter_entities()
+            .map(|entity| {
+                (
+                    entity.id(),
+                    entity.archetype().components().to_vec(),
+                    app.world().get::<ChildOf>(entity.id()).map(ChildOf::parent),
+                    app.world()
+                        .get::<Children>(entity.id())
+                        .map(|children| children.iter().copied().collect::<Vec<_>>()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.active.is_none());
+        assert!(entry.host.is_none());
+        assert!(
+            matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ),
+            "status={:?} ledger={:?}",
+            entry.engine.request(request).unwrap().status(),
+            entry
+                .cleanup_ledger
+                .as_ref()
+                .map(|ledger| (ledger.receipt_count(), ledger.is_settled()))
+        );
+        let residual = entry.authority_protocol_residual.as_ref().unwrap();
+        assert!(residual.active.is_some());
+        assert!(matches!(
+            residual.kind,
+            AuthorityProtocolResidualKind::FailedManifest(
+                FailedPreparedTopologyError::DuplicateEntity
+            )
+        ));
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        let structure_after = app
+            .world()
+            .iter_entities()
+            .map(|entity| {
+                (
+                    entity.id(),
+                    entity.archetype().components().to_vec(),
+                    app.world().get::<ChildOf>(entity.id()).map(ChildOf::parent),
+                    app.world()
+                        .get::<Children>(entity.id())
+                        .map(|children| children.iter().copied().collect::<Vec<_>>()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(structure_after, structure_before);
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        let gate = app.world().resource::<RouterInputGate>();
+        assert!(
+            active_targets
+                .iter()
+                .copied()
+                .chain(std::iter::once(top_slot))
+                .all(|target| {
+                    app.world().get::<Visibility>(target) == Some(&Visibility::Hidden)
+                        && app.world().get::<Pickable>(target) == Some(&Pickable::IGNORE)
+                        && app
+                            .world()
+                            .get::<RouterInputBarrier>(target)
+                            .is_some_and(RouterInputBarrier::denies_all)
+                        && !gate.allows_pointer(target)
+                        && !gate.allows_keyboard(target)
+                        && !gate.allows_gamepad(target)
+                })
+        );
+    }
+
     #[test]
     fn nested_pending_clean_removal_releases_child_slot_focus() {
         let mut app = App::new();
@@ -5745,11 +10988,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stale_external_parent_is_world_zero_and_preserves_foreign_descendant_focus() {
+    fn stale_current_host_parent_settles_without_mutating_app_relationships() {
         let mut app = App::new();
         let (request, _router) = prepare_exact_child_stale_failure(&mut app);
-        let (frame_shell, top_slot_claim) = {
+        let (
+            frame_shell,
+            top_slot_claim,
+            host,
+            top_slot,
+            host_children_before,
+            host_manifest_before,
+            history_before,
+        ) = {
             let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let host = entry.host.as_ref().unwrap();
             (
                 entry
                     .pending_failed_branch
@@ -5758,10 +11010,19 @@ pub(crate) mod tests {
                     .branch
                     .frames()[0]
                     .shell(),
-                entry.host.as_ref().unwrap().top_slot_claim.clone(),
+                host.top_slot_claim.clone(),
+                host.host,
+                host.top_slot,
+                app.world()
+                    .get::<Children>(host.host)
+                    .map(|children| children.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                ComponentManifest::from_world(app.world(), host.host).unwrap(),
+                entry.engine.history().clone(),
             )
         };
         let foreign = app.world_mut().spawn(ChildOf(frame_shell)).id();
+        let foreign_manifest_before = ComponentManifest::from_world(app.world(), foreign).unwrap();
         *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(foreign);
         app.world_mut()
             .resource_mut::<RouteFocusState>()
@@ -5770,21 +11031,59 @@ pub(crate) mod tests {
             .resource_mut::<RouteEntityRegistry>()
             .compare_exchange_lifecycle(&top_slot_claim, EntityLifecycle::Quarantined)
             .unwrap();
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = &mut navigation.entries[0];
+                let failed = entry.pending_failed_branch.take().unwrap();
+                let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                    world,
+                    world.resource::<RouteEntityRegistry>(),
+                    &failed.branch,
+                )
+                .unwrap();
+                match classify_failed_manifest(
+                    manifest,
+                    failed,
+                    entry.active.as_ref(),
+                    entry.host.as_ref(),
+                ) {
+                    FailedManifestDisposition::CurrentAuthorityLoss {
+                        failed, bindings, ..
+                    } => {
+                        assert!(bindings.iter().any(|binding| {
+                            matches!(
+                                binding,
+                                FailedAuthorityBoundaryBinding::Current { authority, .. }
+                                    if authority == &top_slot_claim
+                            )
+                        }));
+                        entry.pending_failed_branch = Some(failed);
+                    }
+                    FailedManifestDisposition::Ready { failed, .. }
+                    | FailedManifestDisposition::AmbiguousInvalidTopology { failed, .. } => {
+                        entry.pending_failed_branch = Some(failed);
+                        panic!("stale HostTopSlot claim must classify as current authority loss")
+                    }
+                }
+            },
+        );
 
         settle_cleanup_system(app.world_mut());
 
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
-        assert!(entry.pending_failed_branch.is_some());
-        assert!(entry.cleanup_ledger.is_none());
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(
+            entry
+                .cleanup_ledger
+                .as_ref()
+                .is_some_and(CleanupLedger::is_authority_settlement)
+        );
         assert!(matches!(
             entry.engine.request(request).unwrap().status(),
-            RequestStatus::Running(_)
+            RequestStatus::Running(NavigationPhase::Recovering)
         ));
-        assert_eq!(app.world().resource::<InputFocus>().get(), Some(foreign));
-        assert_eq!(
-            app.world().resource::<RouteFocusState>().focused(),
-            Some(foreign)
-        );
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
         assert_eq!(
             app.world().get::<Visibility>(frame_shell),
             Some(&Visibility::Hidden)
@@ -5798,6 +11097,89 @@ pub(crate) mod tests {
                 .get::<RouterInputBarrier>(frame_shell)
                 .is_some_and(RouterInputBarrier::denies_all)
         );
+        assert!(app.world().get_entity(host).is_ok());
+        assert!(app.world().get_entity(foreign).is_ok());
+        assert_eq!(
+            ComponentManifest::from_world(app.world(), host).as_ref(),
+            Some(&host_manifest_before)
+        );
+        assert_eq!(
+            ComponentManifest::from_world(app.world(), foreign).as_ref(),
+            Some(&foreign_manifest_before)
+        );
+        assert_eq!(
+            app.world().get::<ChildOf>(top_slot).map(ChildOf::parent),
+            Some(host)
+        );
+        assert_eq!(
+            app.world()
+                .get::<Children>(host)
+                .map(|children| children.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            host_children_before
+        );
+        assert_eq!(
+            app.world().get::<ChildOf>(foreign).map(ChildOf::parent),
+            Some(frame_shell)
+        );
+
+        for _ in 0..8 {
+            settle_cleanup_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .is_none()
+            {
+                break;
+            }
+        }
+
+        let trace_len = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(entry.authority_protocol_residual.is_none());
+            assert_eq!(entry.engine.history(), &history_before);
+            assert!(app.world().get_entity(host).is_ok());
+            assert!(app.world().get_entity(foreign).is_ok());
+            assert_eq!(
+                ComponentManifest::from_world(app.world(), host).as_ref(),
+                Some(&host_manifest_before)
+            );
+            assert_eq!(
+                ComponentManifest::from_world(app.world(), foreign).as_ref(),
+                Some(&foreign_manifest_before)
+            );
+            assert_eq!(
+                app.world().get::<ChildOf>(top_slot).map(ChildOf::parent),
+                Some(host)
+            );
+            assert_eq!(
+                app.world()
+                    .get::<Children>(host)
+                    .map(|children| children.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                host_children_before
+            );
+            assert_eq!(
+                app.world().get::<ChildOf>(foreign).map(ChildOf::parent),
+                Some(frame_shell)
+            );
+            entry.engine.request(request).unwrap().trace().len()
+        };
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace().len(),
+            trace_len
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert!(entry.cleanup_ledger.is_none());
     }
 
     #[test]
@@ -5827,6 +11209,39 @@ pub(crate) mod tests {
             .resource_mut::<RouteEntityRegistry>()
             .compare_exchange_lifecycle(&claim, EntityLifecycle::Quarantined)
             .unwrap();
+        let root_before = nested_protected_fingerprint(app.world(), root);
+        let replacement_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(root)
+            .map(|record| record.claim());
+        let failed = app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+            .pending_failed_branch
+            .take()
+            .unwrap();
+        assert!(!isolate_exact_failed_prepared_branch(
+            app.world_mut(),
+            &failed.branch,
+            None,
+        ));
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0].pending_failed_branch =
+            Some(failed);
+        assert_eq!(nested_protected_fingerprint(app.world(), root), root_before);
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(root)
+                .map(|record| record.claim()),
+            replacement_before
+        );
+        assert_eq!(
+            app.world().resource::<InputFocus>().get(),
+            Some(app_descendant)
+        );
+        assert_eq!(
+            app.world().resource::<RouteFocusState>().focused(),
+            Some(app_descendant)
+        );
 
         settle_cleanup_system(app.world_mut());
 
@@ -5848,91 +11263,530 @@ pub(crate) mod tests {
     }
 
     #[test]
-    pub(crate) fn failed_branch_relationship_cycle_is_world_zero_and_retains_focus() {
+    fn pending_only_missing_and_replaced_boundaries_use_ordinary_failed_cleanup() {
+        for replaced in [false, true] {
+            let mut app = App::new();
+            let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+            let (boundary, host_version, history_before) = {
+                let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+                let entry = &mut navigation.entries[0];
+                let mut failed = entry.pending_failed_branch.take().unwrap();
+                let mut realized = failed.branch.into_realized_for_test();
+                let boundary = realized.child_slots()[0].slot_claim().clone();
+                realized.clear_child_slots_for_test();
+                failed.branch = FailedPreparedBranch::new(PreparedBranch::from_realized(realized));
+                entry.pending_failed_branch = Some(failed);
+                let host = entry.host.as_ref().unwrap();
+                (
+                    boundary,
+                    host.version.clone(),
+                    entry.engine.history().clone(),
+                )
+            };
+            let foreign_focus = app.world_mut().spawn_empty().id();
+            *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(foreign_focus);
+            app.world_mut()
+                .resource_mut::<RouteFocusState>()
+                .set_focused(Some(foreign_focus));
+            if replaced {
+                app.world_mut()
+                    .resource_mut::<RouteEntityRegistry>()
+                    .compare_exchange_lifecycle(&boundary, EntityLifecycle::Quarantined)
+                    .unwrap();
+            } else {
+                assert!(
+                    app.world_mut()
+                        .resource_mut::<RouteEntityRegistry>()
+                        .remove_exact(&boundary)
+                );
+            }
+
+            settle_cleanup_system(app.world_mut());
+
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(entry.authority_protocol_residual.is_none());
+            assert_eq!(entry.host.as_ref().unwrap().version, host_version);
+            assert!(entry.active.is_none());
+            assert_eq!(entry.engine.history(), &history_before);
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(_)
+            ));
+            assert_ne!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::RecoveringAuthority
+            );
+            assert_eq!(
+                app.world().resource::<InputFocus>().get(),
+                Some(foreign_focus)
+            );
+            assert_eq!(
+                app.world().resource::<RouteFocusState>().focused(),
+                Some(foreign_focus)
+            );
+        }
+    }
+
+    #[test]
+    fn active_pending_only_boundary_is_built_and_settled_without_touching_active() {
+        for replaced in [false, true] {
+            let mut app = App::new();
+            app.add_plugins(BevyUiRouterPlugin::default());
+            let router = install_failing_deep_pending_router(&mut app);
+            observe_authority_system(app.world_mut());
+
+            app.world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new("/"))
+                .unwrap();
+            collect_navigation_system(app.world_mut());
+            for _ in 0..5 {
+                drive_navigation_system(app.world_mut());
+            }
+            commit_presentation_system(app.world_mut());
+            settle_cleanup_system(app.world_mut());
+            assert!(
+                app.world().resource::<RouterNavigation>().entries[0]
+                    .active
+                    .is_some()
+            );
+
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new("/sections/a/items/1/detail"))
+                .unwrap();
+            collect_navigation_system(app.world_mut());
+            for _ in 0..10 {
+                drive_navigation_system(app.world_mut());
+                if app.world().resource::<RouterNavigation>().entries[0]
+                    .pending_failed_branch
+                    .is_some()
+                {
+                    break;
+                }
+            }
+
+            let (slot_boundary, physical_parent_boundary) = {
+                let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+                let entry = &mut navigation.entries[0];
+                let PendingFailedBranch { terminal, branch } = entry
+                    .pending_failed_branch
+                    .take()
+                    .expect("driver failure owner");
+                let mut realized = branch.into_realized_for_test();
+                assert!(realized.frames().len() >= 2);
+                assert!(!realized.child_slots().is_empty());
+                let failed_frames = realized
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>();
+                let boundary_frame = realized
+                    .frames()
+                    .iter()
+                    .find(|frame| {
+                        let claim = frame.mount_binding().slot_claim();
+                        matches!(
+                            claim.owner(),
+                            RegistryOwner::Committed(EntityOwner::ChildSlot { parent, .. })
+                                if failed_frames.iter().any(|frame| frame == parent)
+                        )
+                    })
+                    .expect("failed-only child frame retains its internal mount boundary");
+                let slot_boundary = boundary_frame.mount_binding().slot_claim().clone();
+                let physical_parent_boundary = boundary_frame
+                    .mount_binding()
+                    .physical_parent()
+                    .1
+                    .expect("failed-only child frame has an owned physical parent")
+                    .clone();
+                realized.clear_child_slots_for_test();
+                entry.pending_failed_branch = Some(PendingFailedBranch {
+                    terminal,
+                    branch: FailedPreparedBranch::new(PreparedBranch::from_realized(realized)),
+                });
+                (slot_boundary, physical_parent_boundary)
+            };
+            for boundary in [&slot_boundary, &physical_parent_boundary] {
+                if replaced {
+                    app.world_mut()
+                        .resource_mut::<RouteEntityRegistry>()
+                        .compare_exchange_lifecycle(boundary, EntityLifecycle::Quarantined)
+                        .unwrap();
+                } else {
+                    assert!(
+                        app.world_mut()
+                            .resource_mut::<RouteEntityRegistry>()
+                            .remove_exact(boundary)
+                    );
+                }
+            }
+
+            let (
+                active_claims,
+                active_fingerprint,
+                active_focus,
+                host_version,
+                history_before,
+                lost_boundary_fingerprint,
+                lost_boundary_registry,
+            ) = {
+                let entry = &app.world().resource::<RouterNavigation>().entries[0];
+                let active = entry.active.as_ref().unwrap();
+                let active_claims = active.claims().cloned().collect::<Vec<_>>();
+                let active_fingerprint = active_claims
+                    .iter()
+                    .map(|claim| {
+                        (
+                            claim.entity(),
+                            nested_protected_fingerprint(app.world(), claim.entity()),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let active_focus = *active.interactive_entities().first().unwrap();
+                let failed = entry.pending_failed_branch.as_ref().unwrap();
+                let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                    app.world(),
+                    app.world().resource::<RouteEntityRegistry>(),
+                    &failed.branch,
+                )
+                .unwrap();
+                assert!(manifest.boundary_drifts().iter().any(|drift| {
+                    drift.expected.exact_claim() == &slot_boundary
+                        && matches!(drift.source, FailedBoundarySource::FrameMountSlot { .. })
+                }));
+                assert!(manifest.boundary_drifts().iter().any(|drift| {
+                    drift.expected.exact_claim() == &physical_parent_boundary
+                        && matches!(
+                            drift.source,
+                            FailedBoundarySource::FramePhysicalParent { .. }
+                        )
+                }));
+                for boundary in [&slot_boundary, &physical_parent_boundary] {
+                    let drift = manifest
+                        .boundary_drifts()
+                        .iter()
+                        .find(|drift| drift.expected.exact_claim() == boundary)
+                        .expect("both stable boundary facts are frozen");
+                    assert!(matches!(
+                        classify_failed_boundary(
+                            drift.clone(),
+                            &failed.branch,
+                            entry.active.as_ref(),
+                            entry.host.as_ref(),
+                        ),
+                        FailedBoundaryDisposition::PendingOnlyDrift(_)
+                    ));
+                }
+                (
+                    active_claims,
+                    active_fingerprint,
+                    active_focus,
+                    entry.host.as_ref().unwrap().version.clone(),
+                    entry.engine.history().clone(),
+                    nested_protected_fingerprint(app.world(), physical_parent_boundary.entity()),
+                    app.world()
+                        .resource::<RouteEntityRegistry>()
+                        .record(physical_parent_boundary.entity())
+                        .map(|record| record.claim()),
+                )
+            };
+            *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(active_focus);
+            app.world_mut()
+                .resource_mut::<RouteFocusState>()
+                .set_focused(Some(active_focus));
+            let gate_before = {
+                let gate = app.world().resource::<RouterInputGate>();
+                (
+                    gate.allows_pointer(active_focus),
+                    gate.allows_keyboard(active_focus),
+                    gate.allows_gamepad(active_focus),
+                )
+            };
+
+            settle_cleanup_system(app.world_mut());
+
+            {
+                let entry = &app.world().resource::<RouterNavigation>().entries[0];
+                assert!(entry.pending_failed_branch.is_none());
+                let ledger = entry
+                    .cleanup_ledger
+                    .as_ref()
+                    .expect("ordinary cleanup retains its partial receipt owner");
+                assert!(ledger.receipt_count() > 0);
+                assert!(!ledger.is_settled());
+                assert!(matches!(
+                    entry.engine.request(request).unwrap().status(),
+                    RequestStatus::Running(_)
+                ));
+            }
+            for (entity, before) in &active_fingerprint {
+                assert_eq!(&nested_protected_fingerprint(app.world(), *entity), before);
+            }
+            assert_eq!(
+                nested_protected_fingerprint(app.world(), physical_parent_boundary.entity(),),
+                lost_boundary_fingerprint
+            );
+            assert_eq!(
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(physical_parent_boundary.entity())
+                    .map(|record| record.claim()),
+                lost_boundary_registry
+            );
+            assert_eq!(
+                app.world().resource::<InputFocus>().get(),
+                Some(active_focus)
+            );
+            assert_eq!(
+                app.world().resource::<RouteFocusState>().focused(),
+                Some(active_focus)
+            );
+
+            settle_cleanup_system(app.world_mut());
+
+            let trace_len = {
+                let entry = &app.world().resource::<RouterNavigation>().entries[0];
+                assert!(entry.pending_failed_branch.is_none());
+                assert!(entry.cleanup_ledger.is_none());
+                assert!(entry.authority_protocol_residual.is_none());
+                assert_eq!(entry.host.as_ref().unwrap().version, host_version);
+                assert_eq!(entry.engine.history(), &history_before);
+                assert_eq!(
+                    entry.active.as_ref().unwrap().claims().collect::<Vec<_>>(),
+                    active_claims.iter().collect::<Vec<_>>()
+                );
+                assert!(matches!(
+                    entry.engine.request(request).unwrap().status(),
+                    RequestStatus::Failed(_)
+                ));
+                assert_ne!(
+                    entry.engine.snapshot().availability(),
+                    &RouterAvailability::RecoveringAuthority
+                );
+                entry.engine.request(request).unwrap().trace().len()
+            };
+            for (entity, before) in &active_fingerprint {
+                assert_eq!(&nested_protected_fingerprint(app.world(), *entity), before);
+            }
+            assert_eq!(
+                nested_protected_fingerprint(app.world(), physical_parent_boundary.entity(),),
+                lost_boundary_fingerprint
+            );
+            assert_eq!(
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(physical_parent_boundary.entity())
+                    .map(|record| record.claim()),
+                lost_boundary_registry
+            );
+            let gate = app.world().resource::<RouterInputGate>();
+            assert_eq!(
+                (
+                    gate.allows_pointer(active_focus),
+                    gate.allows_keyboard(active_focus),
+                    gate.allows_gamepad(active_focus),
+                ),
+                gate_before
+            );
+            assert_eq!(
+                app.world().resource::<InputFocus>().get(),
+                Some(active_focus)
+            );
+            assert_eq!(
+                app.world().resource::<RouteFocusState>().focused(),
+                Some(active_focus)
+            );
+
+            settle_cleanup_system(app.world_mut());
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert_eq!(
+                entry.engine.request(request).unwrap().trace().len(),
+                trace_len
+            );
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert_eq!(
+                nested_protected_fingerprint(app.world(), physical_parent_boundary.entity(),),
+                lost_boundary_fingerprint
+            );
+            assert_eq!(
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(physical_parent_boundary.entity())
+                    .map(|record| record.claim()),
+                lost_boundary_registry
+            );
+        }
+    }
+
+    #[test]
+    fn active_ambiguous_residual_boundary_is_built_and_fails_closed_once() {
         let mut app = App::new();
-        let (request, _router) = prepare_exact_child_stale_failure(&mut app);
-        let (cycle_child, cycle_parent, claims) = {
-            let failed = app.world().resource::<RouterNavigation>().entries[0]
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_failing_deep_pending_router(&mut app);
+        observe_authority_system(app.world_mut());
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        for _ in 0..5 {
+            drive_navigation_system(app.world_mut());
+        }
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/sections/a/items/1/detail"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        for _ in 0..10 {
+            drive_navigation_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
                 .pending_failed_branch
-                .as_ref()
-                .unwrap();
-            let frame = &failed.branch.frames()[0];
-            let cycle_child = frame.outlets()[0].anchor();
-            let cycle_parent = app
-                .world()
-                .get::<ChildOf>(cycle_child)
-                .map(ChildOf::parent)
-                .unwrap();
+                .is_some()
+            {
+                break;
+            }
+        }
+
+        let (mut failed, active_frame, active_focus) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            let active = entry.active.as_ref().unwrap();
+            let active_frame = active.frames()[0].frame().clone();
+            let active_focus = *active.interactive_entities().first().unwrap();
             (
-                cycle_child,
-                cycle_parent,
-                frame.claims().cloned().collect::<Vec<_>>(),
+                entry.pending_failed_branch.take().unwrap(),
+                active_frame,
+                active_focus,
             )
         };
-        app.world_mut()
-            .entity_mut(cycle_parent)
-            .insert(ChildOf(cycle_child));
-        app.world_mut().flush();
-        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(cycle_child);
+        let source_slot = failed
+            .branch
+            .child_slots()
+            .iter()
+            .find(|slot| slot.parent() != &active_frame)
+            .expect("real failed staging retains one failed-parent internal slot");
+        let source_parent = source_slot.parent().clone();
+        let failed_parent = failed
+            .branch
+            .frames()
+            .iter()
+            .find(|frame| frame.frame() == &source_parent)
+            .unwrap();
+        let exact_outlet_claim = failed_parent
+            .outlet(source_slot.outlet())
+            .unwrap()
+            .anchor_claim();
+        let wrong_boundary = failed_parent
+            .claims()
+            .find(|claim| {
+                claim != &exact_outlet_claim
+                    && matches!(
+                        claim.owner(),
+                        RegistryOwner::Committed(EntityOwner::FrameOutput { frame, .. })
+                            if frame == &source_parent
+                    )
+            })
+            .expect("failed parent retains a second exact FrameOutput")
+            .clone();
+        let residual = ChildSlotResidual::from_mounted_with_boundary_for_test(
+            app.world(),
+            source_slot,
+            wrong_boundary.entity(),
+            wrong_boundary.clone(),
+        );
+        let terminal = failed.terminal;
+        let mut realized = failed.branch.into_realized_for_test();
+        while realized.frames().len() > 1 {
+            realized.pop_frame_for_test().unwrap();
+        }
+        assert_eq!(realized.frames()[0].frame(), &source_parent);
+        realized.clear_child_slots_for_test();
+        failed = PendingFailedBranch {
+            terminal,
+            branch: FailedPreparedBranch::with_mount_residual(
+                PreparedBranch::from_realized(realized),
+                residual,
+            ),
+        };
+        assert!(
+            app.world_mut()
+                .resource_mut::<RouteEntityRegistry>()
+                .remove_exact(&wrong_boundary)
+        );
+        {
+            let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                app.world(),
+                app.world().resource::<RouteEntityRegistry>(),
+                &failed.branch,
+            )
+            .unwrap();
+            assert_eq!(manifest.boundary_drifts().len(), 1);
+            assert!(matches!(
+                manifest.boundary_drifts()[0].source,
+                FailedBoundarySource::ResidualAnchor { .. }
+            ));
+            assert_eq!(
+                manifest.boundary_drifts()[0].expected.exact_claim(),
+                &wrong_boundary
+            );
+        }
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0].pending_failed_branch =
+            Some(failed);
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(active_focus);
         app.world_mut()
             .resource_mut::<RouteFocusState>()
-            .set_focused(Some(cycle_child));
-        let registry_before = app
-            .world()
-            .resource::<RouteEntityRegistry>()
-            .records()
-            .to_vec();
-        let values_before = claims
-            .iter()
-            .map(|claim| {
-                (
-                    claim.entity(),
-                    *app.world().get::<Visibility>(claim.entity()).unwrap(),
-                    *app.world().get::<Pickable>(claim.entity()).unwrap(),
-                    *app.world()
-                        .get::<RouterInputBarrier>(claim.entity())
-                        .unwrap(),
+            .set_focused(Some(active_focus));
+
+        settle_cleanup_system(app.world_mut());
+
+        let trace_len = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let residual = entry.authority_protocol_residual.as_ref().unwrap();
+            assert!(matches!(
+                residual.kind,
+                AuthorityProtocolResidualKind::FailedManifest(
+                    FailedPreparedTopologyError::AmbiguousBoundaryOwnership
                 )
-            })
-            .collect::<Vec<_>>();
+            ));
+            assert!(residual.failed.is_some());
+            assert!(residual.active.is_some());
+            assert!(residual.host.is_some());
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.active.is_none());
+            assert!(entry.host.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(entry.pending_commit.is_none());
+            assert!(entry.pending_frame_drive.is_none());
+            assert!(entry.pending_mount_frame_task.is_none());
+            assert!(entry.pending_mount_request.is_none());
+            entry.engine.request(request).unwrap().trace().len()
+        };
 
         settle_cleanup_system(app.world_mut());
 
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
-        assert!(entry.pending_failed_branch.is_some());
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace().len(),
+            trace_len
+        );
+        assert!(entry.authority_protocol_residual.is_some());
         assert!(entry.cleanup_ledger.is_none());
-        assert!(matches!(
-            entry.engine.request(request).unwrap().status(),
-            RequestStatus::Running(_)
-        ));
-        assert_eq!(
-            app.world().resource::<RouteEntityRegistry>().records(),
-            registry_before
-        );
-        assert_eq!(
-            app.world().resource::<InputFocus>().get(),
-            Some(cycle_child)
-        );
-        assert_eq!(
-            app.world().resource::<RouteFocusState>().focused(),
-            Some(cycle_child)
-        );
-        assert_eq!(
-            claims
-                .iter()
-                .map(|claim| {
-                    (
-                        claim.entity(),
-                        *app.world().get::<Visibility>(claim.entity()).unwrap(),
-                        *app.world().get::<Pickable>(claim.entity()).unwrap(),
-                        *app.world()
-                            .get::<RouterInputBarrier>(claim.entity())
-                            .unwrap(),
-                    )
-                })
-                .collect::<Vec<_>>(),
-            values_before
-        );
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.pending_commit.is_none());
+    }
+
+    #[test]
+    pub(crate) fn failed_branch_relationship_cycle_quarantines_exact_set_and_releases_focus() {
+        reconciliation_entering_cycle_is_rejected_without_retiring_active_branch();
     }
 
     #[test]
@@ -6962,7 +12816,7 @@ pub(crate) mod tests {
                     .is_some()
         }));
 
-        for _ in 0..4 {
+        for _ in 0..16 {
             app.update();
         }
         assert!(matches!(
@@ -6973,6 +12827,2651 @@ pub(crate) mod tests {
                 .status(),
             RequestStatus::Succeeded | RequestStatus::Failed(_)
         ));
+    }
+
+    #[test]
+    fn reconciliation_authority_loss_app_despawned_host_settles_and_readmits_without_replay() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "authority-loss-despawned-host");
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+
+        let (host, history_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            (
+                entry.host.as_ref().unwrap().host,
+                entry.engine.history().clone(),
+            )
+        };
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/").with_fragment("despawned-host"),
+            )
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let frozen_obligation_count = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let pending = entry.pending_commit.as_ref().unwrap();
+            let active = entry.active.as_ref().unwrap();
+            let binding = entry.host.as_ref().unwrap();
+            FrozenCleanupManifest::from_authority_settlement(
+                app.world(),
+                app.world().resource::<RouteEntityRegistry>(),
+                &pending.branch,
+                active,
+                binding,
+            )
+            .unwrap()
+            .len()
+        };
+
+        assert!(app.world_mut().despawn(host));
+        assert!(app.world().get_entity(host).is_err());
+        commit_presentation_system(app.world_mut());
+
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::RecoveringAuthority
+            );
+            assert_eq!(
+                entry.engine.request(request).unwrap().status(),
+                &RequestStatus::Running(NavigationPhase::Recovering)
+            );
+            assert!(entry.active.is_none());
+            assert!(entry.host.is_none());
+            assert!(
+                entry
+                    .cleanup_ledger
+                    .as_ref()
+                    .is_some_and(CleanupLedger::is_authority_settlement)
+            );
+        }
+
+        for _ in 0..16 {
+            settle_cleanup_system(app.world_mut());
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            if entry.cleanup_ledger.is_none()
+                && matches!(
+                    entry.engine.request(request).unwrap().status(),
+                    RequestStatus::Failed(_)
+                )
+            {
+                break;
+            }
+        }
+
+        let terminal_trace_shape = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(
+                entry.cleanup_ledger.is_none(),
+                "despawned-host authority cleanup remained nonterminal: status={:?}, ledger={:?}",
+                entry.engine.request(request).unwrap().status(),
+                entry
+                    .cleanup_ledger
+                    .as_ref()
+                    .map(|ledger| (ledger.is_settled(), ledger.receipt_count()))
+            );
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            assert!(entry.active.is_none());
+            assert!(entry.host.is_none());
+            assert_eq!(
+                entry.engine.snapshot().active().kind(),
+                ActivePresentationKind::None
+            );
+            assert_eq!(entry.engine.history(), &history_before);
+            let request_inspection = entry.engine.request(request).unwrap();
+            let trace = request_inspection.trace();
+            let receipts = trace
+                .iter()
+                .filter(|event| event.cleanup_disposition().is_some())
+                .count();
+            let terminals = trace
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                .count();
+            assert_eq!(receipts, frozen_obligation_count);
+            assert_eq!(terminals, 1);
+            (trace.len(), receipts, terminals)
+        };
+        assert!(app.world().get_entity(host).is_err());
+
+        for _ in 0..3 {
+            collect_navigation_system(app.world_mut());
+            drive_navigation_system(app.world_mut());
+            commit_presentation_system(app.world_mut());
+            settle_cleanup_system(app.world_mut());
+        }
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let request_inspection = entry.engine.request(request).unwrap();
+            let trace = request_inspection.trace();
+            assert_eq!(
+                (
+                    trace.len(),
+                    trace
+                        .iter()
+                        .filter(|event| event.cleanup_disposition().is_some())
+                        .count(),
+                    trace
+                        .iter()
+                        .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                        .count(),
+                ),
+                terminal_trace_shape
+            );
+            assert_eq!(entry.engine.history(), &history_before);
+        }
+        assert!(app.world().get_entity(host).is_err());
+
+        let replacement_host = app
+            .world_mut()
+            .spawn((Node::default(), RouterHostRegistration::new(router)))
+            .id();
+        assert_ne!(replacement_host, host);
+        for _ in 0..4 {
+            observe_authority_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .host
+                .as_ref()
+                .is_some_and(|binding| binding.host == replacement_host)
+            {
+                break;
+            }
+        }
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.host.as_ref().map(|binding| binding.host),
+            Some(replacement_host)
+        );
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::Ready
+        );
+        assert_eq!(
+            entry.engine.snapshot().active().kind(),
+            ActivePresentationKind::None
+        );
+        assert!(entry.active.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert_eq!(entry.engine.history(), &history_before);
+        assert!(entry.engine.snapshot().running_request().is_none());
+        let request_inspection = entry.engine.request(request).unwrap();
+        let trace = request_inspection.trace();
+        assert_eq!(
+            (
+                trace.len(),
+                trace
+                    .iter()
+                    .filter(|event| event.cleanup_disposition().is_some())
+                    .count(),
+                trace
+                    .iter()
+                    .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                    .count(),
+            ),
+            terminal_trace_shape
+        );
+        assert!(
+            app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+                .engine
+                .action()
+                .is_none()
+        );
+        assert!(app.world().get_entity(host).is_err());
+    }
+
+    #[test]
+    fn reconciliation_authority_loss_host_drift_settles_and_readmits_without_replay() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "authority-loss-host-drift");
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+
+        let (host, history_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            (
+                entry.host.as_ref().unwrap().host,
+                entry.engine.history().clone(),
+            )
+        };
+        let current = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/").with_fragment("authority-loss-current"),
+            )
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let queued = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/").with_fragment("authority-loss-queued"),
+            )
+            .unwrap();
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .unwrap();
+        app.world_mut().entity_mut(host).insert(registration);
+
+        commit_presentation_system(app.world_mut());
+
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::RecoveringAuthority
+            );
+            assert_eq!(
+                entry.engine.request(current).unwrap().status(),
+                &RequestStatus::Running(NavigationPhase::Recovering)
+            );
+            assert!(matches!(
+                entry.engine.request(queued).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            assert!(entry.active.is_none());
+            assert!(
+                !entry
+                    .cleanup_ledger
+                    .as_ref()
+                    .unwrap()
+                    .leaving_frames()
+                    .is_empty()
+            );
+        }
+
+        for _ in 0..8 {
+            settle_cleanup_system(app.world_mut());
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            if entry.cleanup_ledger.is_none()
+                && matches!(
+                    entry.engine.request(current).unwrap().status(),
+                    RequestStatus::Failed(_)
+                )
+            {
+                break;
+            }
+        }
+
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert!(
+                entry.cleanup_ledger.is_none(),
+                "authority cleanup did not settle: status={:?}, ledger={:?}",
+                entry.engine.request(current).unwrap().status(),
+                entry
+                    .cleanup_ledger
+                    .as_ref()
+                    .map(|ledger| (ledger.is_settled(), ledger.receipt_count()))
+            );
+            let request = entry.engine.request(current).unwrap();
+            let trace = request.trace();
+            let receipts = trace
+                .iter()
+                .enumerate()
+                .filter_map(|(index, event)| event.cleanup_disposition().is_some().then_some(index))
+                .collect::<Vec<_>>();
+            let cleanup_settled = trace
+                .iter()
+                .rposition(|event| {
+                    event.kind() == NavigationTraceEventKind::CleanupSettled
+                        && event.cleanup_disposition().is_none()
+                })
+                .unwrap();
+            let terminal = trace
+                .iter()
+                .position(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                .unwrap();
+            assert!(!receipts.is_empty());
+            assert!(receipts.iter().all(|receipt| *receipt < cleanup_settled));
+            assert!(cleanup_settled < terminal);
+            assert!(matches!(
+                entry.engine.request(current).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            assert!(entry.active.is_none());
+            assert!(entry.host.is_none());
+            assert_eq!(
+                entry.engine.snapshot().active().kind(),
+                ActivePresentationKind::None
+            );
+            assert_eq!(entry.engine.history(), &history_before);
+            assert!(entry.cleanup_ledger.is_none());
+        }
+
+        observe_authority_system(app.world_mut());
+
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert!(entry.host.is_some());
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::Ready
+            );
+            assert_eq!(
+                entry.engine.snapshot().active().kind(),
+                ActivePresentationKind::None
+            );
+            assert!(entry.active.is_none());
+            assert_eq!(entry.engine.history(), &history_before);
+            assert!(entry.engine.snapshot().running_request().is_none());
+        }
+        assert!(
+            app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+                .engine
+                .action()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reconciliation_authority_loss_cycle_settles_top_slot_without_touching_app_host() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        commit_initial_nested_branch(&mut app, router);
+        let (host, top_slot, cycle_child, cycle_parent) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let host = entry.host.as_ref().unwrap();
+            let frame = &entry.active.as_ref().unwrap().frames()[0];
+            let cycle_child = frame.outlets()[0].anchor();
+            (
+                host.host,
+                host.top_slot,
+                cycle_child,
+                app.world()
+                    .get::<ChildOf>(cycle_child)
+                    .map(ChildOf::parent)
+                    .unwrap(),
+            )
+        };
+        app.world_mut()
+            .entity_mut(host)
+            .insert(NestedAppHostSentinel(0x5eed));
+        let sibling_a = app.world_mut().spawn(NestedAppHostSentinel(1)).id();
+        let sibling_b = app.world_mut().spawn(NestedAppHostSentinel(2)).id();
+        app.world_mut().entity_mut(host).add_child(sibling_a);
+        app.world_mut().entity_mut(host).add_child(sibling_b);
+        let host_children_before = app.world().get::<Children>(host).unwrap().to_vec();
+
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/items/2").with_fragment("authority-cycle"),
+            )
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Running(_)
+            ));
+            assert!(entry.pending_commit.is_some());
+        }
+        app.world_mut()
+            .entity_mut(cycle_parent)
+            .insert(ChildOf(cycle_child));
+        app.world_mut().flush();
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .unwrap();
+        app.world_mut().entity_mut(host).insert(registration);
+        commit_presentation_system(app.world_mut());
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::RecoveringAuthority
+            );
+            assert!(
+                entry
+                    .cleanup_ledger
+                    .as_ref()
+                    .is_some_and(crate::cleanup::CleanupLedger::is_authority_settlement)
+            );
+        }
+
+        for _ in 0..8 {
+            settle_cleanup_system(app.world_mut());
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            if entry.cleanup_ledger.is_none()
+                && matches!(
+                    entry.engine.request(request).unwrap().status(),
+                    RequestStatus::Failed(_)
+                )
+            {
+                break;
+            }
+        }
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(
+            matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ),
+            "status={:?}, availability={:?}, ledger={:?}, protocol_residual={}",
+            entry.engine.request(request).unwrap().status(),
+            entry.engine.snapshot().availability(),
+            entry
+                .cleanup_ledger
+                .as_ref()
+                .map(|ledger| (ledger.is_settled(), ledger.receipt_count())),
+            entry.authority_protocol_residual.is_some(),
+        );
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(entry
+            .engine
+            .request(request)
+            .unwrap()
+            .trace()
+            .iter()
+            .any(|event| {
+                event.cleanup_disposition()
+                    == Some(
+                        bevy_ui_router_core::prelude::CleanupDisposition::QuarantinedForeignDescendant,
+                    )
+            }));
+        assert!(app.world().get_entity(top_slot).is_err());
+        assert!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .authority_lost_tombstone(top_slot)
+                .is_none()
+        );
+        let quarantine = app.world().resource::<QuarantineLeaseTable>();
+        assert!(quarantine.record(cycle_child).is_some());
+        assert!(quarantine.record(cycle_parent).is_some());
+        assert_eq!(
+            quarantine
+                .leases()
+                .iter()
+                .filter(|lease| lease.owned_entities().contains(&cycle_child))
+                .count(),
+            1
+        );
+        assert_eq!(
+            quarantine
+                .leases()
+                .iter()
+                .filter(|lease| lease.owned_entities().contains(&cycle_parent))
+                .count(),
+            1
+        );
+        assert!(quarantine.authority_lost_tombstone(cycle_child).is_none());
+        assert!(quarantine.authority_lost_tombstone(cycle_parent).is_none());
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(cycle_child)
+                .is_none()
+        );
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(cycle_parent)
+                .is_none()
+        );
+        assert_eq!(
+            app.world().get::<NestedAppHostSentinel>(host),
+            Some(&NestedAppHostSentinel(0x5eed))
+        );
+        assert_eq!(
+            app.world().get::<NestedAppHostSentinel>(sibling_a),
+            Some(&NestedAppHostSentinel(1))
+        );
+        assert_eq!(
+            app.world().get::<NestedAppHostSentinel>(sibling_b),
+            Some(&NestedAppHostSentinel(2))
+        );
+        let host_children = app.world().get::<Children>(host).unwrap();
+        let expected_host_children = host_children_before
+            .into_iter()
+            .filter(|child| *child != top_slot)
+            .collect::<Vec<_>>();
+        assert_eq!(host_children.to_vec(), expected_host_children);
+        assert!(app.world().get::<ChildOf>(top_slot).is_none());
+        let sibling_a_index = host_children
+            .iter()
+            .position(|child| *child == sibling_a)
+            .unwrap();
+        let sibling_b_index = host_children
+            .iter()
+            .position(|child| *child == sibling_b)
+            .unwrap();
+        assert!(sibling_a_index < sibling_b_index);
+    }
+
+    #[test]
+    fn reconciliation_entering_cycle_is_rejected_without_retiring_active_branch() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        commit_initial_nested_branch(&mut app, router);
+        let (active_frames, active_claims, active_values, history_before) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let active = entry.active.as_ref().unwrap();
+            let claims = active
+                .frames()
+                .iter()
+                .flat_map(RealizedFrame::claims)
+                .cloned()
+                .collect::<Vec<_>>();
+            let values = claims
+                .iter()
+                .map(|claim| {
+                    (
+                        claim.entity(),
+                        *app.world().get::<Visibility>(claim.entity()).unwrap(),
+                        *app.world().get::<Pickable>(claim.entity()).unwrap(),
+                        *app.world()
+                            .get::<RouterInputBarrier>(claim.entity())
+                            .unwrap(),
+                        *app.world().get::<FrameLifecycle>(claim.entity()).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                claims,
+                values,
+                entry.engine.history().clone(),
+            )
+        };
+        let _request = prepare_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/items/2").with_fragment("entering-cycle"),
+        );
+        let (cycle_child, cycle_parent, failed_claims, mount, mount_claim) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let frame = &entry.pending_commit.as_ref().unwrap().branch.frames()[0];
+            let owned = frame
+                .claims()
+                .map(|claim| claim.entity())
+                .collect::<std::collections::HashSet<_>>();
+            let (cycle_child, cycle_parent) = frame
+                .cleanup_members()
+                .find_map(|(claim, parent)| {
+                    owned.contains(&parent).then_some((claim.entity(), parent))
+                })
+                .unwrap();
+            let (mount, mount_claim) = frame.mount_binding().physical_parent();
+            (
+                cycle_child,
+                cycle_parent,
+                frame.claims().cloned().collect::<Vec<_>>(),
+                mount,
+                mount_claim.cloned(),
+            )
+        };
+        assert_eq!(
+            app.world().get::<ChildOf>(cycle_child).map(ChildOf::parent),
+            Some(cycle_parent)
+        );
+        app.world_mut()
+            .entity_mut(cycle_parent)
+            .insert(ChildOf(cycle_child));
+        app.world_mut().flush();
+        let mount_children = app
+            .world()
+            .get::<Children>(mount)
+            .map(|children| children.to_vec())
+            .unwrap_or_default();
+        let mount_record = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(mount)
+            .cloned()
+            .unwrap();
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(cycle_child);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(cycle_child));
+
+        commit_presentation_system(app.world_mut());
+
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::Ready
+            );
+            assert!(entry.pending_failed_branch.is_some());
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(!matches!(
+                entry.engine.request(_request).unwrap().status(),
+                RequestStatus::Succeeded
+            ));
+            assert_eq!(entry.engine.history(), &history_before);
+            assert_eq!(
+                entry
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                active_frames
+            );
+        }
+        assert!(app.world().get_entity(cycle_child).is_ok());
+        assert!(app.world().get_entity(cycle_parent).is_ok());
+        for _ in 0..12 {
+            settle_cleanup_system(app.world_mut());
+            if matches!(
+                app.world().resource::<RouterNavigation>().entries[0]
+                    .engine
+                    .request(_request)
+                    .unwrap()
+                    .status(),
+                RequestStatus::Failed(_)
+            ) {
+                break;
+            }
+        }
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(
+            matches!(
+                entry.engine.request(_request).unwrap().status(),
+                RequestStatus::Failed(_)
+            ),
+            "status={:?}, pending_failed={}, ledger={:?}",
+            entry.engine.request(_request).unwrap().status(),
+            entry.pending_failed_branch.is_some(),
+            entry
+                .cleanup_ledger
+                .as_ref()
+                .map(|ledger| (ledger.is_settled(), ledger.receipt_count()))
+        );
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::Ready
+        );
+        assert_eq!(
+            entry
+                .active
+                .as_ref()
+                .unwrap()
+                .frames()
+                .iter()
+                .map(|frame| frame.frame().clone())
+                .collect::<Vec<_>>(),
+            active_frames
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        let registry = app.world().resource::<RouteEntityRegistry>();
+        let quarantine = app.world().resource::<QuarantineLeaseTable>();
+        for claim in &failed_claims {
+            assert!(app.world().get_entity(claim.entity()).is_ok());
+            assert_eq!(
+                app.world().get::<Visibility>(claim.entity()),
+                Some(&Visibility::Hidden)
+            );
+            assert_eq!(
+                app.world().get::<Pickable>(claim.entity()),
+                Some(&Pickable::IGNORE)
+            );
+            assert!(
+                app.world()
+                    .get::<RouterInputBarrier>(claim.entity())
+                    .is_some_and(RouterInputBarrier::denies_all)
+            );
+            assert_eq!(
+                app.world().get::<FrameLifecycle>(claim.entity()),
+                Some(&FrameLifecycle(EntityLifecycle::Quarantined))
+            );
+            assert!(registry.record(claim.entity()).is_none());
+            assert!(quarantine.record(claim.entity()).is_some());
+            assert_eq!(
+                quarantine
+                    .leases()
+                    .iter()
+                    .filter(|lease| lease.owned_entities().contains(&claim.entity()))
+                    .count(),
+                1
+            );
+            assert!(
+                quarantine
+                    .authority_lost_tombstone(claim.entity())
+                    .is_none()
+            );
+        }
+        for claim in &active_claims {
+            assert!(
+                registry
+                    .record(claim.entity())
+                    .is_some_and(|record| record.claim() == *claim)
+            );
+            assert!(quarantine.record(claim.entity()).is_none());
+        }
+        assert_eq!(
+            active_claims
+                .iter()
+                .map(|claim| {
+                    (
+                        claim.entity(),
+                        *app.world().get::<Visibility>(claim.entity()).unwrap(),
+                        *app.world().get::<Pickable>(claim.entity()).unwrap(),
+                        *app.world()
+                            .get::<RouterInputBarrier>(claim.entity())
+                            .unwrap(),
+                        *app.world().get::<FrameLifecycle>(claim.entity()).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            active_values
+        );
+        assert_eq!(
+            app.world()
+                .get::<Children>(mount)
+                .map(|children| children.to_vec())
+                .unwrap_or_default(),
+            mount_children
+        );
+        assert_eq!(registry.record(mount), Some(&mount_record));
+        if let Some(mount_claim) = mount_claim {
+            assert_eq!(mount_record.claim(), mount_claim);
+        }
+        let terminal_trace_len = entry.engine.request(_request).unwrap().trace().len();
+        let terminal_lease_count = quarantine.leases().len();
+        for _ in 0..3 {
+            settle_cleanup_system(app.world_mut());
+        }
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(_request).unwrap().trace().len(),
+            terminal_trace_len
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .leases()
+                .len(),
+            terminal_lease_count
+        );
+        assert_eq!(
+            app.world()
+                .get::<Children>(mount)
+                .map(|children| children.to_vec())
+                .unwrap_or_default(),
+            mount_children
+        );
+    }
+
+    #[test]
+    fn reconciliation_authority_loss_retention_fixed_point_preserves_foreign_exact_child() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        commit_initial_nested_branch(&mut app, router);
+        let (host, child, parent) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let frame = &entry.active.as_ref().unwrap().frames()[0];
+            let child = frame.outlets()[0].anchor();
+            let parent = app
+                .world()
+                .get::<ChildOf>(child)
+                .map(ChildOf::parent)
+                .unwrap();
+            assert!(frame.claims().any(|claim| claim.entity() == parent));
+            (entry.host.as_ref().unwrap().host, child, parent)
+        };
+        let request = prepare_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/items/2").with_fragment("retention-fixed-point"),
+        );
+        app.world_mut()
+            .entity_mut(child)
+            .insert(NestedAppHostSentinel(0xc1));
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .unwrap();
+        app.world_mut().entity_mut(host).insert(registration);
+        commit_presentation_system(app.world_mut());
+
+        for _ in 0..12 {
+            settle_cleanup_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .is_none()
+            {
+                break;
+            }
+        }
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(
+            matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ),
+            "status={:?}, availability={:?}, ledger={:?}",
+            entry.engine.request(request).unwrap().status(),
+            entry.engine.snapshot().availability(),
+            entry
+                .cleanup_ledger
+                .as_ref()
+                .map(|ledger| (ledger.is_settled(), ledger.receipt_count()))
+        );
+        assert!(entry.cleanup_ledger.is_none());
+        assert_eq!(
+            app.world().get::<NestedAppHostSentinel>(child),
+            Some(&NestedAppHostSentinel(0xc1))
+        );
+        assert!(app.world().get_entity(parent).is_ok());
+        let registry = app.world().resource::<RouteEntityRegistry>();
+        assert!(registry.record(child).is_none());
+        assert!(registry.record(parent).is_none());
+        let quarantine = app.world().resource::<QuarantineLeaseTable>();
+        assert!(quarantine.record(child).is_some());
+        assert!(quarantine.record(parent).is_some());
+        assert_eq!(
+            quarantine
+                .leases()
+                .iter()
+                .filter(|lease| lease.owned_entities().contains(&child))
+                .count(),
+            1
+        );
+        assert_eq!(
+            quarantine
+                .leases()
+                .iter()
+                .filter(|lease| lease.owned_entities().contains(&parent))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn reconciliation_authority_loss_disjoint_quarantine_closures_keep_separate_facts() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        commit_initial_nested_branch(&mut app, router);
+        let request = prepare_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/items/2").with_fragment("disjoint-quarantine"),
+        );
+        let (host, top_slot, first, second, third) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let mut candidates = entry
+                .active
+                .as_ref()
+                .unwrap()
+                .claims()
+                .map(|claim| claim.entity())
+                .filter(|entity| app.world().get::<ChildOf>(*entity).is_some());
+            let first = candidates.next().unwrap();
+            let second = candidates.find(|entity| *entity != first).unwrap();
+            let third = candidates
+                .find(|entity| *entity != first && *entity != second)
+                .unwrap();
+            (
+                entry.host.as_ref().unwrap().host,
+                entry.host.as_ref().unwrap().top_slot,
+                first,
+                second,
+                third,
+            )
+        };
+        app.world_mut().entity_mut(first).remove::<ChildOf>();
+        app.world_mut().entity_mut(second).remove::<ChildOf>();
+        app.world_mut().entity_mut(third).remove::<ChildOf>();
+        app.world_mut().flush();
+        app.world_mut()
+            .entity_mut(first)
+            .insert(NestedAppHostSentinel(0xd1));
+        app.world_mut()
+            .entity_mut(second)
+            .insert(NestedAppHostSentinel(0xd2));
+        app.world_mut()
+            .entity_mut(third)
+            .insert(NestedAppHostSentinel(0xd3));
+        let foreign = app.world_mut().spawn(NestedAppHostSentinel(0xdf)).id();
+        app.world_mut().entity_mut(first).add_child(foreign);
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .unwrap();
+        app.world_mut().entity_mut(host).insert(registration);
+        commit_presentation_system(app.world_mut());
+
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let top_parent_before = app.world().get::<ChildOf>(top_slot).map(ChildOf::parent);
+        let presentation_before = [first, second, third].map(|entity| {
+            (
+                app.world().get::<Visibility>(entity).copied(),
+                app.world().get::<Pickable>(entity).copied(),
+                app.world().get::<RouterInputBarrier>(entity).copied(),
+            )
+        });
+        let trace_before = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .request(request)
+            .unwrap()
+            .trace()
+            .len();
+        fail_next_authority_publication_capacity_reservation_for_test();
+        settle_cleanup_system(app.world_mut());
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert_eq!(entry.cleanup_ledger.as_ref().unwrap().receipt_count(), 0);
+            assert_eq!(
+                entry.engine.request(request).unwrap().trace().len(),
+                trace_before
+            );
+        }
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .leases()
+                .is_empty()
+        );
+        assert_eq!(
+            app.world().get::<ChildOf>(top_slot).map(ChildOf::parent),
+            top_parent_before
+        );
+        assert_eq!(
+            [first, second, third].map(|entity| {
+                (
+                    app.world().get::<Visibility>(entity).copied(),
+                    app.world().get::<Pickable>(entity).copied(),
+                    app.world().get::<RouterInputBarrier>(entity).copied(),
+                )
+            }),
+            presentation_before
+        );
+
+        for _ in 0..16 {
+            settle_cleanup_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .is_none()
+            {
+                break;
+            }
+        }
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(
+            matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ),
+            "status={:?} ledger={:?}",
+            entry.engine.request(request).unwrap().status(),
+            entry
+                .cleanup_ledger
+                .as_ref()
+                .map(|ledger| (ledger.receipt_count(), ledger.is_settled()))
+        );
+        let quarantine = app.world().resource::<QuarantineLeaseTable>();
+        let first_lease = quarantine
+            .leases()
+            .iter()
+            .find(|lease| lease.owned_entities().contains(&first))
+            .unwrap();
+        let second_lease = quarantine
+            .leases()
+            .iter()
+            .find(|lease| lease.owned_entities().contains(&second))
+            .unwrap();
+        let third_lease = quarantine
+            .leases()
+            .iter()
+            .find(|lease| lease.owned_entities().contains(&third))
+            .unwrap();
+        assert!(!std::ptr::eq(first_lease, second_lease));
+        assert!(!std::ptr::eq(first_lease, third_lease));
+        assert!(!std::ptr::eq(second_lease, third_lease));
+        let first_owned = first_lease
+            .owned_entities()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let second_owned = second_lease
+            .owned_entities()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let third_owned = third_lease
+            .owned_entities()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert!(first_owned.is_disjoint(&second_owned));
+        assert!(first_owned.is_disjoint(&third_owned));
+        assert!(second_owned.is_disjoint(&third_owned));
+        assert!(first_lease.foreign_descendants().contains(&foreign));
+        assert!(!second_lease.foreign_descendants().contains(&foreign));
+        assert!(!third_lease.foreign_descendants().contains(&foreign));
+        assert_eq!(
+            app.world().get::<NestedAppHostSentinel>(first),
+            Some(&NestedAppHostSentinel(0xd1))
+        );
+        assert_eq!(
+            app.world().get::<NestedAppHostSentinel>(second),
+            Some(&NestedAppHostSentinel(0xd2))
+        );
+        assert_eq!(
+            app.world().get::<NestedAppHostSentinel>(third),
+            Some(&NestedAppHostSentinel(0xd3))
+        );
+        assert_eq!(
+            app.world().get::<ChildOf>(foreign).map(ChildOf::parent),
+            Some(first)
+        );
+        assert_eq!(
+            take_authority_postmutation_reservation_attempts_for_test(),
+            0,
+            "an exact-capacity authority tail must not reserve or grow after mutation starts"
+        );
+        assert_eq!(
+            take_authority_postmutation_manifest_materializations_for_test(),
+            0,
+            "verified closure checkpoints must not materialize, collect, sort, or deduplicate manifests after mutation starts"
+        );
+    }
+
+    #[test]
+    fn reconciliation_authority_first_residual_drift_preserves_receipts_and_burns_unused_ids() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        commit_initial_nested_branch(&mut app, router);
+        let request = prepare_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/items/2").with_fragment("aggregate-first-closure-drift"),
+        );
+        let (host, first, second, third) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let mut candidates = entry
+                .active
+                .as_ref()
+                .unwrap()
+                .claims()
+                .map(|claim| claim.entity())
+                .filter(|entity| app.world().get::<ChildOf>(*entity).is_some());
+            let first = candidates.next().unwrap();
+            let second = candidates.find(|entity| *entity != first).unwrap();
+            let third = candidates
+                .find(|entity| *entity != first && *entity != second)
+                .unwrap();
+            (entry.host.as_ref().unwrap().host, first, second, third)
+        };
+        for (entity, marker) in [(first, 0xe1), (second, 0xe2), (third, 0xe3)] {
+            app.world_mut().entity_mut(entity).remove::<ChildOf>();
+            app.world_mut()
+                .entity_mut(entity)
+                .insert(NestedAppHostSentinel(marker));
+        }
+        app.world_mut().flush();
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .unwrap();
+        app.world_mut().entity_mut(host).insert(registration);
+        commit_presentation_system(app.world_mut());
+        app.world_mut().insert_resource(
+            AuthorityResidualPostwriteDrift::invalidate_after_first_closure([first, second, third]),
+        );
+
+        for _ in 0..16 {
+            settle_cleanup_system(app.world_mut());
+            if !app
+                .world()
+                .resource::<QuarantineLeaseTable>()
+                .leases()
+                .is_empty()
+            {
+                break;
+            }
+        }
+
+        let (first_receipts, first_burn_end, first_lease_sequences) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let table = app.world().resource::<QuarantineLeaseTable>();
+            (
+                entry.cleanup_ledger.as_ref().unwrap().receipt_count(),
+                table.next_sequence_for_test(),
+                table
+                    .leases()
+                    .iter()
+                    .map(|lease| lease.id_for_test().sequence_for_test())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert!(first_receipts > 0);
+        assert_eq!(first_lease_sequences.len(), 1);
+        assert!(first_burn_end > first_lease_sequences[0]);
+
+        for _ in 0..16 {
+            settle_cleanup_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .is_none()
+            {
+                break;
+            }
+        }
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let fixed_receipts = entry.cleanup_ledger.as_ref().unwrap().receipt_count();
+        assert!(fixed_receipts >= first_receipts);
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::Recovering)
+        ));
+        let table = app.world().resource::<QuarantineLeaseTable>();
+        let sequences = table
+            .leases()
+            .iter()
+            .map(|lease| lease.id_for_test().sequence_for_test())
+            .collect::<Vec<_>>();
+        assert!(
+            sequences
+                .iter()
+                .filter(|sequence| !first_lease_sequences.contains(sequence))
+                .all(|sequence| *sequence > first_burn_end)
+        );
+        assert!(table.next_sequence_for_test() > sequences.len() as u64);
+        settle_cleanup_system(app.world_mut());
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.cleanup_ledger.as_ref().unwrap().receipt_count(),
+            fixed_receipts,
+            "the stopped attempt must not replay already completed receipts"
+        );
+    }
+
+    #[test]
+    fn reconciliation_authority_three_lost_closures_revalidate_later_facts_and_burn_unused_ids() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        commit_initial_nested_branch(&mut app, router);
+        let request = prepare_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/items/2").with_fragment("three-lost-closure-drift"),
+        );
+        let (host, lost) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let mut candidates = entry
+                .active
+                .as_ref()
+                .unwrap()
+                .claims()
+                .map(|claim| claim.entity())
+                .filter(|entity| app.world().get::<ChildOf>(*entity).is_some());
+            let first = candidates.next().unwrap();
+            let second = candidates.find(|entity| *entity != first).unwrap();
+            let third = candidates
+                .find(|entity| *entity != first && *entity != second)
+                .unwrap();
+            (entry.host.as_ref().unwrap().host, [first, second, third])
+        };
+        for entity in lost {
+            app.world_mut().entity_mut(entity).remove::<ChildOf>();
+            let stale_seal = app
+                .world_mut()
+                .resource_mut::<RouteEntityRegistry>()
+                .issue_seal();
+            app.world_mut()
+                .entity_mut(entity)
+                .insert(RouteOwnershipSeal::new(stale_seal));
+        }
+        app.world_mut().flush();
+        let drift_parent = app.world_mut().spawn(NestedAppHostSentinel(0xef)).id();
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .unwrap();
+        app.world_mut().entity_mut(host).insert(registration);
+        commit_presentation_system(app.world_mut());
+        app.world_mut().insert_resource(
+            AuthorityLostResidualPostwriteDrift::reparent_after_first_closure(lost, drift_parent),
+        );
+
+        settle_cleanup_system(app.world_mut());
+
+        let first_tombstones = lost
+            .iter()
+            .filter_map(|entity| {
+                app.world()
+                    .resource::<QuarantineLeaseTable>()
+                    .authority_lost_tombstone(*entity)
+                    .map(|tombstone| (*entity, tombstone.id()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first_tombstones.len(),
+            1,
+            "the old attempt must stop before publishing stale later lost facts"
+        );
+        let burn_end = app
+            .world()
+            .resource::<QuarantineLeaseTable>()
+            .next_residual_sequence_for_test();
+        assert!(first_tombstones[0].1.sequence_for_test() < burn_end);
+        assert!(matches!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .unwrap()
+                .status(),
+            RequestStatus::Running(NavigationPhase::Recovering)
+        ));
+        let fixed_receipts = app.world().resource::<RouterNavigation>().entries[0]
+            .cleanup_ledger
+            .as_ref()
+            .unwrap()
+            .receipt_count();
+        settle_cleanup_system(app.world_mut());
+        let table = app.world().resource::<QuarantineLeaseTable>();
+        assert_eq!(
+            table
+                .authority_lost_tombstone(first_tombstones[0].0)
+                .map(|tombstone| tombstone.id()),
+            Some(first_tombstones[0].1),
+            "a truthful completed lost receipt must not replay"
+        );
+        for entity in lost
+            .iter()
+            .filter(|entity| **entity != first_tombstones[0].0)
+        {
+            assert!(
+                table.authority_lost_tombstone(*entity).is_none(),
+                "the stopped attempt must not publish a later stale tombstone"
+            );
+        }
+        assert!(table.next_residual_sequence_for_test() >= burn_end);
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .as_ref()
+                .unwrap()
+                .receipt_count(),
+            fixed_receipts,
+            "the stopped attempt must not replay or add a stale receipt"
+        );
+    }
+
+    #[test]
+    fn reconciliation_authority_later_lost_closure_restored_exact_stops_stale_tombstone() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        commit_initial_nested_branch(&mut app, router);
+        let request = prepare_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/items/2").with_fragment("later-lost-restored-exact"),
+        );
+        let (host, lost_claims) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let mut claims = entry
+                .active
+                .as_ref()
+                .unwrap()
+                .claims()
+                .filter(|claim| {
+                    app.world().get::<ChildOf>(claim.entity()).is_some()
+                        && app.world().get::<FrameLifecycle>(claim.entity()).is_some()
+                })
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(claims.len(), 3);
+            let obligation_order =
+                crate::cleanup::FrozenCleanupManifest::from_authority_settlement(
+                    app.world(),
+                    app.world().resource::<RouteEntityRegistry>(),
+                    &entry.pending_commit.as_ref().unwrap().branch,
+                    entry.active.as_ref().unwrap(),
+                    entry.host.as_ref().unwrap(),
+                )
+                .expect("three lost frame claims must freeze into one authority manifest")
+                .entities()
+                .to_vec();
+            claims.sort_by_key(|claim| {
+                obligation_order
+                    .iter()
+                    .position(|entity| *entity == claim.entity())
+                    .unwrap()
+            });
+            (entry.host.as_ref().unwrap().host, claims)
+        };
+        for claim in &lost_claims {
+            app.world_mut()
+                .entity_mut(claim.entity())
+                .remove::<ChildOf>();
+            let stale_seal = app
+                .world_mut()
+                .resource_mut::<RouteEntityRegistry>()
+                .issue_seal();
+            app.world_mut().entity_mut(claim.entity()).insert((
+                RouteOwnershipSeal::new(stale_seal),
+                FrameLifecycle(EntityLifecycle::Leaving),
+            ));
+        }
+        app.world_mut().flush();
+        let later_claim = lost_claims[1].clone();
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .unwrap();
+        app.world_mut().entity_mut(host).insert(registration);
+        commit_presentation_system(app.world_mut());
+        app.world_mut().insert_resource(
+            AuthorityLostResidualPhysicalRestoreDrift::restore_after_first_closure(
+                later_claim.clone(),
+            ),
+        );
+
+        settle_cleanup_system(app.world_mut());
+
+        let first_tombstones = lost_claims
+            .iter()
+            .filter_map(|claim| {
+                app.world()
+                    .resource::<QuarantineLeaseTable>()
+                    .authority_lost_tombstone(claim.entity())
+                    .map(|tombstone| (claim.entity(), tombstone.id()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first_tombstones.len(),
+            1,
+            "the old attempt must stop when a later lost claim becomes physically exact"
+        );
+        let table = app.world().resource::<QuarantineLeaseTable>();
+        let burn_end = table.next_residual_sequence_for_test();
+        assert!(first_tombstones[0].1.sequence_for_test() < burn_end);
+        assert!(
+            table
+                .authority_lost_tombstone(later_claim.entity())
+                .is_none()
+        );
+        assert!(table.record(later_claim.entity()).is_none());
+        assert!(app.world().get_entity(later_claim.entity()).is_ok());
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(later_claim.entity())
+                .map(|record| record.claim()),
+            Some(later_claim.clone())
+        );
+        assert_eq!(
+            app.world().get::<RouteOwnershipSeal>(later_claim.entity()),
+            Some(&RouteOwnershipSeal::new(later_claim.seal()))
+        );
+        assert_eq!(
+            app.world().get::<FrameLifecycle>(later_claim.entity()),
+            Some(&FrameLifecycle(later_claim.lifecycle()))
+        );
+        assert!(matches!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .unwrap()
+                .status(),
+            RequestStatus::Running(NavigationPhase::Recovering)
+        ));
+        let fixed_receipts = app.world().resource::<RouterNavigation>().entries[0]
+            .cleanup_ledger
+            .as_ref()
+            .unwrap()
+            .receipt_count();
+        settle_cleanup_system(app.world_mut());
+        let table = app.world().resource::<QuarantineLeaseTable>();
+        assert_eq!(
+            table
+                .authority_lost_tombstone(first_tombstones[0].0)
+                .map(|tombstone| tombstone.id()),
+            Some(first_tombstones[0].1),
+            "the truthful first receipt must not replay"
+        );
+        assert!(
+            table
+                .authority_lost_tombstone(later_claim.entity())
+                .is_none()
+        );
+        assert!(table.next_residual_sequence_for_test() >= burn_end);
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .as_ref()
+                .unwrap()
+                .receipt_count(),
+            fixed_receipts,
+            "the stopped attempt must not add a stale later receipt"
+        );
+        assert!(app.world().get_entity(later_claim.entity()).is_ok());
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(later_claim.entity())
+                .map(|record| record.claim()),
+            Some(later_claim)
+        );
+    }
+
+    #[test]
+    fn reconciliation_authority_mixed_verified_lost_closure_revalidates_both_local_sides() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_deep_nested_router(&mut app);
+        app.update();
+        commit_initial_deep_nested_branch(&mut app, router);
+        let request = prepare_deep_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/sections/a/items/2").with_fragment("mixed-verified-lost-drift"),
+        );
+        let (host, first_verified, mixed_verified, mixed_lost) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let active = entry.active.as_ref().unwrap();
+            let first_verified = active.frames()[2]
+                .claims()
+                .map(|claim| claim.entity())
+                .find(|entity| {
+                    *entity != active.frames()[2].shell()
+                        && app.world().get::<ChildOf>(*entity).is_some()
+                })
+                .unwrap();
+            let mixed_verified = active.frames()[0].shell();
+            let mixed_lost = active.frames()[0]
+                .claims()
+                .map(|claim| claim.entity())
+                .find(|entity| {
+                    app.world().get::<ChildOf>(*entity).map(ChildOf::parent) == Some(mixed_verified)
+                })
+                .unwrap();
+            (
+                entry.host.as_ref().unwrap().host,
+                first_verified,
+                mixed_verified,
+                mixed_lost,
+            )
+        };
+        app.world_mut()
+            .entity_mut(first_verified)
+            .remove::<ChildOf>();
+        app.world_mut()
+            .entity_mut(first_verified)
+            .insert(NestedAppHostSentinel(0xf1));
+        app.world_mut()
+            .entity_mut(mixed_verified)
+            .insert(NestedAppHostSentinel(0xf2));
+        let stable_mixed_child = app.world_mut().spawn(NestedAppHostSentinel(0xf3)).id();
+        app.world_mut()
+            .entity_mut(mixed_verified)
+            .add_child(stable_mixed_child);
+        let stale_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(mixed_lost)
+            .insert(RouteOwnershipSeal::new(stale_seal));
+        app.world_mut().flush();
+        let drift_parent = app.world_mut().spawn(NestedAppHostSentinel(0xff)).id();
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .unwrap();
+        app.world_mut().entity_mut(host).insert(registration);
+        commit_presentation_system(app.world_mut());
+        app.world_mut().insert_resource(
+            AuthorityLostResidualPostwriteDrift::reparent_after_first_closure(
+                [mixed_lost, mixed_lost, mixed_lost],
+                drift_parent,
+            ),
+        );
+        take_authority_postmutation_manifest_materializations_for_test();
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::Recovering)
+        ));
+        let table = app.world().resource::<QuarantineLeaseTable>();
+        assert!(table.record(first_verified).is_some());
+        assert!(
+            table.record(mixed_verified).is_none(),
+            "the later mixed closure's verified lease must stay closure-local and unpublished"
+        );
+        assert!(
+            table.authority_lost_tombstone(mixed_lost).is_none(),
+            "the later mixed closure's drifted lost fact must stay unpublished"
+        );
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(mixed_verified)
+                .is_some(),
+            "stopping on the lost side must preserve the verified side's exact current claim"
+        );
+        assert_eq!(
+            take_authority_postmutation_manifest_materializations_for_test(),
+            0,
+            "mixed closure checkpoints must use only frozen no-allocation manifest evidence"
+        );
+    }
+
+    #[test]
+    fn reconciliation_authority_loss_postwrite_reparent_stops_old_revision_after_one_receipt() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        commit_initial_nested_branch(&mut app, router);
+        let request = prepare_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/items/2").with_fragment("postwrite-reparent"),
+        );
+        let (host, top_slot) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let host = entry.host.as_ref().unwrap();
+            (host.host, host.top_slot)
+        };
+        let sentinel = app.world_mut().spawn(NestedAppHostSentinel(0xc2)).id();
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .unwrap();
+        app.world_mut().entity_mut(host).insert(registration);
+        commit_presentation_system(app.world_mut());
+        app.world_mut().insert_resource(
+            crate::cleanup::AuthorityRemovalPostwriteDrift::reparent_after_first_removal(
+                sentinel, top_slot,
+            ),
+        );
+
+        settle_cleanup_system(app.world_mut());
+
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let ledger = entry.cleanup_ledger.as_ref().unwrap();
+            assert_eq!(ledger.receipt_count(), 1);
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::RecoveringAuthority
+            );
+        }
+        assert_eq!(
+            app.world().get::<ChildOf>(sentinel).map(ChildOf::parent),
+            Some(top_slot)
+        );
+        assert!(app.world().get_entity(top_slot).is_ok());
+
+        for _ in 0..16 {
+            settle_cleanup_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .is_none()
+            {
+                break;
+            }
+        }
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(app.world().get_entity(top_slot).is_ok());
+        assert!(app.world().get_entity(sentinel).is_ok());
+        assert_eq!(
+            app.world().get::<ChildOf>(sentinel).map(ChildOf::parent),
+            Some(top_slot)
+        );
+        assert!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .record(top_slot)
+                .is_some()
+        );
+        let terminal_trace_len = entry.engine.request(request).unwrap().trace().len();
+        for _ in 0..3 {
+            settle_cleanup_system(app.world_mut());
+        }
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .len(),
+            terminal_trace_len
+        );
+    }
+
+    #[test]
+    fn reconciliation_authority_first_removal_registry_replacement_preserves_later_entity_and_claim()
+     {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        commit_initial_nested_branch(&mut app, router);
+        let request = prepare_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/items/2").with_fragment("postwrite-registry-replacement"),
+        );
+        let (host, top_slot, old_claim) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let host = entry.host.as_ref().unwrap();
+            let claim = app
+                .world()
+                .resource::<RouteEntityRegistry>()
+                .record(host.top_slot)
+                .unwrap()
+                .claim();
+            (host.host, host.top_slot, claim)
+        };
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .unwrap();
+        app.world_mut().entity_mut(host).insert(registration);
+        commit_presentation_system(app.world_mut());
+        app.world_mut().insert_resource(
+            AuthorityRemovalRegistryPostwriteDrift::replace_after_first_removal(top_slot),
+        );
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(entry.cleanup_ledger.as_ref().unwrap().receipt_count(), 1);
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::Recovering)
+        ));
+        assert!(app.world().get_entity(top_slot).is_ok());
+        let replacement = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(top_slot)
+            .expect("later removal's replacement claim must remain current")
+            .claim();
+        assert_ne!(replacement, old_claim);
+
+        assert_eq!(entry.cleanup_ledger.as_ref().unwrap().receipt_count(), 1);
+    }
+
+    #[test]
+    fn reconciliation_authority_loss_top_slot_reattach_drift_stays_nonterminal() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "authority-top-slot-reattach");
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/").with_fragment("top-slot-reattach"),
+            )
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let (host, top_slot) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let binding = navigation.entries[0].host.as_ref().unwrap();
+            (binding.host, binding.top_slot)
+        };
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .unwrap();
+        app.world_mut().entity_mut(host).insert(registration);
+        commit_presentation_system(app.world_mut());
+        app.world_mut()
+            .insert_resource(crate::cleanup::AuthorityHostEdgePostwriteDrift::reattach(
+                top_slot, host,
+            ));
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::RecoveringAuthority,
+            "status={:?}, ledger={:?}, top_parent={:?}",
+            entry.engine.request(request).unwrap().status(),
+            entry
+                .cleanup_ledger
+                .as_ref()
+                .map(|ledger| (ledger.is_settled(), ledger.receipt_count())),
+            app.world().get::<ChildOf>(top_slot).map(ChildOf::parent),
+        );
+        assert!(entry.cleanup_ledger.is_some());
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::Recovering)
+        ));
+        assert_eq!(
+            app.world().get::<ChildOf>(top_slot).map(ChildOf::parent),
+            Some(host)
+        );
+        assert!(
+            app.world()
+                .get::<Children>(host)
+                .unwrap()
+                .contains(&top_slot)
+        );
+
+        for _ in 0..16 {
+            settle_cleanup_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .is_none()
+            {
+                break;
+            }
+        }
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .is_none(),
+            "status={:?} ledger={:?} parent={:?}",
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .unwrap()
+                .status(),
+            app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .as_ref()
+                .map(|ledger| (ledger.receipt_count(), ledger.is_settled())),
+            app.world().get::<ChildOf>(top_slot).map(ChildOf::parent)
+        );
+    }
+
+    #[test]
+    fn reconciliation_authority_loss_top_slot_protected_parent_is_zero_relationship_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "authority-top-slot-protected");
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/").with_fragment("top-slot-protected"),
+            )
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let (host, top_slot) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let binding = navigation.entries[0].host.as_ref().unwrap();
+            (binding.host, binding.top_slot)
+        };
+        let protected_parent = app.world_mut().spawn(NestedAppHostSentinel(0xa11)).id();
+        let sibling = app.world_mut().spawn(NestedAppHostSentinel(0xa12)).id();
+        app.world_mut()
+            .entity_mut(protected_parent)
+            .add_child(sibling);
+        app.world_mut()
+            .entity_mut(protected_parent)
+            .add_child(top_slot);
+        let protected_children = app
+            .world()
+            .get::<Children>(protected_parent)
+            .unwrap()
+            .to_vec();
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .unwrap();
+        app.world_mut().entity_mut(host).insert(registration);
+        commit_presentation_system(app.world_mut());
+        for _ in 0..6 {
+            settle_cleanup_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .is_none()
+            {
+                break;
+            }
+        }
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        assert_eq!(
+            app.world().get::<ChildOf>(top_slot).map(ChildOf::parent),
+            Some(protected_parent)
+        );
+        assert_eq!(
+            app.world()
+                .get::<Children>(protected_parent)
+                .unwrap()
+                .to_vec(),
+            protected_children
+        );
+        assert!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .record(top_slot)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn reconciliation_authority_loss_retains_lost_top_slot_edge_without_host_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "authority-top-slot-lost");
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/").with_fragment("top-slot-lost"),
+            )
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let (host, top_slot, host_children_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let binding = navigation.entries[0].host.as_ref().unwrap();
+            (
+                binding.host,
+                binding.top_slot,
+                app.world().get::<Children>(binding.host).unwrap().to_vec(),
+            )
+        };
+        let stale_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(top_slot)
+            .insert(RouteOwnershipSeal::new(stale_seal));
+        commit_presentation_system(app.world_mut());
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        assert!(entry.cleanup_ledger.is_none());
+        assert_eq!(
+            app.world().get::<ChildOf>(top_slot).map(ChildOf::parent),
+            Some(host)
+        );
+
+        for _ in 0..4 {
+            settle_cleanup_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .is_none()
+            {
+                break;
+            }
+        }
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        assert!(app.world().get_entity(top_slot).is_ok());
+        assert_eq!(
+            app.world().get::<ChildOf>(top_slot).map(ChildOf::parent),
+            Some(host)
+        );
+        assert_eq!(
+            app.world().get::<Children>(host).unwrap().to_vec(),
+            host_children_before
+        );
+        assert!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .authority_lost_tombstone(top_slot)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn reconciliation_authority_loss_detaches_old_top_when_registration_is_absent() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        commit_initial_nested_branch(&mut app, router);
+        let request = prepare_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/items/2").with_fragment("registration-absent"),
+        );
+        let (host, top_slot) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let host = entry.host.as_ref().unwrap();
+            (host.host, host.top_slot)
+        };
+        app.world_mut()
+            .entity_mut(host)
+            .insert(NestedAppHostSentinel(0xc3));
+        let sibling = app.world_mut().spawn(NestedAppHostSentinel(0xc4)).id();
+        app.world_mut().entity_mut(host).add_child(sibling);
+        let children_before = app.world().get::<Children>(host).unwrap().to_vec();
+        app.world_mut()
+            .entity_mut(host)
+            .remove::<RouterHostRegistration>();
+        commit_presentation_system(app.world_mut());
+
+        for _ in 0..16 {
+            settle_cleanup_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .is_none()
+            {
+                break;
+            }
+        }
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(app.world().get_entity(top_slot).is_err());
+        assert_eq!(
+            app.world().get::<NestedAppHostSentinel>(host),
+            Some(&NestedAppHostSentinel(0xc3))
+        );
+        assert_eq!(
+            app.world().get::<NestedAppHostSentinel>(sibling),
+            Some(&NestedAppHostSentinel(0xc4))
+        );
+        let expected = children_before
+            .into_iter()
+            .filter(|child| *child != top_slot)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            app.world().get::<Children>(host).unwrap().to_vec(),
+            expected
+        );
+        assert!(app.world().get::<RouterHostRegistration>(host).is_none());
+    }
+
+    #[test]
+    fn reconciliation_authority_loss_preserved_seal_drift_clears_authority_without_crossing_it() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        commit_initial_nested_branch(&mut app, router);
+        let (preserved_shell, history_before) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            (
+                entry.active.as_ref().unwrap().frames()[0].shell(),
+                entry.engine.history().clone(),
+            )
+        };
+        let current = prepare_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/items/2").with_fragment("preserved-seal-drift"),
+        );
+        let queued = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/items/3").with_fragment("queued-after-seal-drift"),
+            )
+            .unwrap();
+        let stale_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(preserved_shell)
+            .insert(RouteOwnershipSeal::new(stale_seal));
+
+        commit_presentation_system(app.world_mut());
+
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::RecoveringAuthority
+            );
+            assert!(matches!(
+                entry.engine.request(queued).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            assert_eq!(entry.engine.history(), &history_before);
+        }
+
+        for _ in 0..8 {
+            settle_cleanup_system(app.world_mut());
+            if matches!(
+                app.world().resource::<RouterNavigation>().entries[0]
+                    .engine
+                    .request(current)
+                    .unwrap()
+                    .status(),
+                RequestStatus::Failed(_)
+            ) {
+                break;
+            }
+        }
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(matches!(
+            entry.engine.request(current).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        assert!(entry.active.is_none());
+        assert!(entry.host.is_none());
+        assert_eq!(entry.engine.history(), &history_before);
+        assert!(app.world().get_entity(preserved_shell).is_ok());
+        assert_eq!(
+            app.world().get::<RouteOwnershipSeal>(preserved_shell),
+            Some(&RouteOwnershipSeal::new(stale_seal))
+        );
+    }
+
+    #[test]
+    fn reconciliation_authority_loss_inner_content_seal_drift_retires_claim_without_despawn() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        commit_initial_nested_branch(&mut app, router);
+        let (inner_content, history_before) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let frame = &entry.active.as_ref().unwrap().frames()[0];
+            (
+                frame
+                    .claims()
+                    .find(|claim| claim.entity() != frame.shell())
+                    .unwrap()
+                    .entity(),
+                entry.engine.history().clone(),
+            )
+        };
+        let current = prepare_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/items/2").with_fragment("inner-content-seal-drift"),
+        );
+        let stale_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(inner_content)
+            .insert(RouteOwnershipSeal::new(stale_seal));
+
+        commit_presentation_system(app.world_mut());
+        for _ in 0..8 {
+            settle_cleanup_system(app.world_mut());
+            if matches!(
+                app.world().resource::<RouterNavigation>().entries[0]
+                    .engine
+                    .request(current)
+                    .unwrap()
+                    .status(),
+                RequestStatus::Failed(_)
+            ) {
+                break;
+            }
+        }
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(matches!(
+            entry.engine.request(current).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        assert!(entry.active.is_none());
+        assert!(entry.host.is_none());
+        assert_eq!(entry.engine.history(), &history_before);
+        assert!(app.world().get_entity(inner_content).is_ok());
+        assert_eq!(
+            app.world().get::<RouteOwnershipSeal>(inner_content),
+            Some(&RouteOwnershipSeal::new(stale_seal))
+        );
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(inner_content)
+                .is_none()
+        );
+        assert!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .authority_lost_tombstone(inner_content)
+                .is_some()
+        );
+        let former_owner = app
+            .world()
+            .resource::<QuarantineLeaseTable>()
+            .authority_lost_tombstone(inner_content)
+            .unwrap()
+            .former_claim()
+            .owner()
+            .clone();
+        let manifest = ComponentManifest::from_world(app.world(), inner_content).unwrap();
+        app.world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .register(
+                inner_content,
+                former_owner,
+                stale_seal,
+                manifest,
+                EntityLifecycle::Active,
+            )
+            .unwrap();
+        assert!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .authority_lost_tombstone(inner_content)
+                .is_some()
+        );
+        assert_eq!(
+            crate::registry::observed_owned_state(app.world(), inner_content),
+            crate::registry::AuditEntityState::PresentOwned
+        );
+    }
+
+    #[test]
+    fn reconciliation_protocol_contradiction_is_unavailable_residual_without_new_staging() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "authority-protocol-contradiction");
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/").with_fragment("protocol-contradiction"),
+            )
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let (host_entity, old_targets) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let mut targets = entry.active.as_ref().unwrap().interactive_entities();
+            targets.extend(
+                entry
+                    .pending_commit
+                    .as_ref()
+                    .unwrap()
+                    .branch
+                    .as_realized()
+                    .interactive_entities(),
+            );
+            targets.sort_by_key(|entity| entity.to_bits());
+            targets.dedup();
+            (entry.host.as_ref().unwrap().host, targets)
+        };
+        let focus = old_targets[0];
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(focus);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(focus));
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            let foreign_owner = entry
+                .active
+                .as_ref()
+                .unwrap()
+                .claims()
+                .next()
+                .unwrap()
+                .owner()
+                .clone();
+            let host = entry.host.as_mut().unwrap();
+            host.top_slot_claim = host.top_slot_claim.with_owner_for_test(foreign_owner);
+        }
+        let registration = app
+            .world_mut()
+            .entity_mut(host_entity)
+            .take::<RouterHostRegistration>()
+            .unwrap();
+        app.world_mut().entity_mut(host_entity).insert(registration);
+
+        commit_presentation_system(app.world_mut());
+
+        let entity_count = app.world().iter_entities().count();
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::Unavailable(
+                    RouterUnavailableReason::RegistryInvariantViolation
+                )
+            );
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            assert!(entry.active.is_none());
+            assert!(entry.pending_commit.is_none());
+            assert!(entry.host.is_none());
+            assert!(entry.authority_protocol_residual.is_some());
+        }
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        let gate = app.world().resource::<RouterInputGate>();
+        assert!(old_targets.iter().all(|entity| {
+            !gate.allows_pointer(*entity)
+                && !gate.allows_keyboard(*entity)
+                && !gate.allows_gamepad(*entity)
+        }));
+        observe_authority_system(app.world_mut());
+        assert_eq!(app.world().iter_entities().count(), entity_count);
+        let error = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/blocked"))
+            .unwrap_err();
+        assert_eq!(error.kind(), NavigationEnqueueErrorKind::HostUnavailable);
+        assert_eq!(app.world().iter_entities().count(), entity_count);
+    }
+
+    #[test]
+    fn reconciliation_protocol_host_absent_is_bounded_unavailable_without_owner_loss() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "authority-protocol-host-absent");
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/").with_fragment("host-absent"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let dropped_host = app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+            .host
+            .take()
+            .expect("test begins with the exact linear host owner");
+        drop(dropped_host);
+
+        commit_presentation_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::Unavailable(RouterUnavailableReason::RegistryInvariantViolation)
+        );
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        let residual = entry.authority_protocol_residual.as_ref().unwrap();
+        assert!(residual.host.is_none());
+        assert!(!residual.active.as_ref().unwrap().frames().is_empty());
+        assert!(
+            !residual
+                .pending
+                .as_ref()
+                .unwrap()
+                .branch
+                .frames()
+                .is_empty()
+        );
+        let error = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/blocked"))
+            .unwrap_err();
+        assert_eq!(error.kind(), NavigationEnqueueErrorKind::HostUnavailable);
+    }
+
+    #[test]
+    fn authority_lost_parent_replacement_preserves_exact_child_and_new_parent_claim() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        commit_initial_nested_branch(&mut app, router);
+        let (parent, parent_claim, child, child_claim, children_before) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let frame = &entry.active.as_ref().unwrap().frames()[0];
+            let parent = frame.shell();
+            let parent_claim = frame
+                .claims()
+                .find(|claim| claim.entity() == parent)
+                .unwrap()
+                .clone();
+            let child_claim = frame
+                .claims()
+                .find(|claim| {
+                    app.world()
+                        .get::<ChildOf>(claim.entity())
+                        .map(ChildOf::parent)
+                        == Some(parent)
+                })
+                .unwrap()
+                .clone();
+            let child = child_claim.entity();
+            let children = app.world().get::<Children>(parent).unwrap().to_vec();
+            (parent, parent_claim, child, child_claim, children)
+        };
+        let request = prepare_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/items/2").with_fragment("parent-claim-replaced"),
+        );
+        let (new_seal, manifest) = {
+            let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
+            let manifest = registry.record(parent).unwrap().manifest().clone();
+            let new_seal = registry.issue_seal();
+            assert!(registry.remove_exact(&parent_claim));
+            registry
+                .register(
+                    parent,
+                    parent_claim.owner().clone(),
+                    new_seal,
+                    manifest.clone(),
+                    EntityLifecycle::Active,
+                )
+                .unwrap();
+            (new_seal, manifest)
+        };
+        app.world_mut()
+            .entity_mut(parent)
+            .insert(RouteOwnershipSeal::new(new_seal));
+        let child_is_obligated = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            crate::cleanup::FrozenCleanupManifest::from_authority_settlement(
+                app.world(),
+                app.world().resource::<RouteEntityRegistry>(),
+                &entry.pending_commit.as_ref().unwrap().branch,
+                entry.active.as_ref().unwrap(),
+                entry.host.as_ref().unwrap(),
+            )
+            .expect("parent claim replacement must still produce a terminal settlement manifest")
+            .entities()
+            .contains(&child)
+        };
+
+        commit_presentation_system(app.world_mut());
+        for _ in 0..8 {
+            settle_cleanup_system(app.world_mut());
+            if matches!(
+                app.world().resource::<RouterNavigation>().entries[0]
+                    .engine
+                    .request(request)
+                    .unwrap()
+                    .status(),
+                RequestStatus::Failed(_)
+            ) {
+                break;
+            }
+        }
+
+        assert!(app.world().get_entity(child).is_ok());
+        assert_eq!(
+            app.world().get::<ChildOf>(child).map(ChildOf::parent),
+            Some(parent)
+        );
+        assert_eq!(
+            app.world().get::<Children>(parent).unwrap().to_vec(),
+            children_before
+        );
+        let parent_record = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(parent)
+            .unwrap();
+        assert_eq!(parent_record.seal(), new_seal);
+        assert_eq!(parent_record.manifest(), &manifest);
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        let registry_current_exact = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(child)
+            .is_some_and(|record| record.claim() == child_claim);
+        let table = app.world().resource::<QuarantineLeaseTable>();
+        let verified = table.record(child).is_some();
+        let unresolved = table.unresolved_record(child).is_some();
+        let authority_lost = table.authority_lost_tombstone(child).is_some();
+        assert!(
+            child_is_obligated,
+            "an exact child below a replaced parent must remain in the frozen settlement"
+        );
+        assert!(!registry_current_exact);
+        assert!(verified);
+        assert!(!unresolved && !authority_lost);
+    }
+
+    #[test]
+    fn authority_completion_transfers_owner_and_does_not_replay_receipts() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "authority-completion-error");
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+        let host = app.world().resource::<RouterNavigation>().entries[0]
+            .host
+            .as_ref()
+            .unwrap()
+            .host;
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/").with_fragment("completion-error"),
+            )
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .unwrap();
+        app.world_mut().entity_mut(host).insert(registration);
+        commit_presentation_system(app.world_mut());
+
+        settle_cleanup_system(app.world_mut());
+
+        let receipt_events = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(
+                entry.cleanup_ledger.is_none(),
+                "status={:?} ledger={:?}",
+                entry.engine.request(request).unwrap().status(),
+                entry
+                    .cleanup_ledger
+                    .as_ref()
+                    .map(|ledger| (ledger.receipt_count(), ledger.is_settled()))
+            );
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            entry
+                .engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .filter(|event| event.cleanup_disposition().is_some())
+                .count()
+        };
+        settle_cleanup_system(app.world_mut());
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        assert_eq!(
+            entry
+                .engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .filter(|event| event.cleanup_disposition().is_some())
+                .count(),
+            receipt_events
+        );
     }
 
     #[test]
@@ -8373,6 +16872,7 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         before_entities.sort_unstable();
 
+        crate::cleanup::reset_ledger_domain_allocations_for_test();
         crate::cleanup::fail_next_reservation_for_test();
         commit_presentation_system(app.world_mut());
 
@@ -8393,9 +16893,19 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         after_entities.sort_unstable();
         assert_eq!(after_entities, before_entities);
+        assert_eq!(
+            crate::cleanup::ledger_domain_allocations_for_test(),
+            0,
+            "retryable receipt capacity must not consume a ledger domain"
+        );
 
         commit_presentation_system(app.world_mut());
         settle_cleanup_system(app.world_mut());
+        assert_eq!(
+            crate::cleanup::ledger_domain_allocations_for_test(),
+            1,
+            "the single successful retry publishes exactly one fresh ledger domain"
+        );
         assert!(matches!(
             app.world().resource::<RouterNavigation>().entries[0]
                 .engine
@@ -10091,7 +18601,8 @@ pub(crate) mod tests {
             .spawn((Node::default(), RouterHostRegistration::new(router)))
             .id();
         observe_authority_system(app.world_mut());
-        app.world_mut()
+        let request = app
+            .world_mut()
             .resource_mut::<RouterNavigation>()
             .push(router, RouteLocation::new("/"))
             .unwrap();
@@ -10135,11 +18646,23 @@ pub(crate) mod tests {
                 .len(),
             0
         );
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.pending_commit.is_none());
+        assert!(entry.active.is_none());
         assert!(
-            app.world().resource::<RouterNavigation>().entries[0]
-                .pending_commit
-                .is_some()
+            entry
+                .cleanup_ledger
+                .as_ref()
+                .is_some_and(CleanupLedger::is_authority_settlement)
         );
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::RecoveringAuthority
+        );
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::Recovering)
+        ));
         assert!(app.world().get_entity(host).is_ok());
     }
 
@@ -10315,7 +18838,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stale_cleanup_mount_parent_claim_is_zero_write_and_retains_the_owner() {
+    fn current_host_boundary_loss_with_missing_pickable_fail_closes_typed_zero_write() {
         let mut app = App::new();
         app.world_mut()
             .register_component_hooks::<Pickable>()
@@ -10354,19 +18877,27 @@ pub(crate) mod tests {
 
         drive_navigation_system(app.world_mut());
 
-        let (top_slot, top_slot_claim, frame_claims) = {
+        let (top_slot, top_slot_claim, frame_claims, gate_targets, host_entity) = {
             let navigation = app.world().resource::<RouterNavigation>();
-            let failure = navigation.entries[0]
-                .pending_failed_branch
-                .as_ref()
-                .unwrap();
+            let entry = &navigation.entries[0];
+            let failure = entry.pending_failed_branch.as_ref().unwrap();
             let frame = &failure.branch.frames()[0];
             (
                 frame.top_slot(),
                 frame.mount_binding().slot_claim().clone(),
                 frame.claims().cloned().collect::<Vec<_>>(),
+                frame.interactive_entities(),
+                entry.host.as_ref().unwrap().host,
             )
         };
+        let missing_pickable = frame_claims
+            .iter()
+            .find(|claim| app.world().get::<Pickable>(claim.entity()).is_none())
+            .expect("fixture leaves one exact frame claim without Pickable")
+            .entity();
+        let focused = *gate_targets
+            .first()
+            .expect("failed frame retains one interactive gate target");
         let parent_manifest = app
             .world()
             .resource::<RouteEntityRegistry>()
@@ -10380,13 +18911,137 @@ pub(crate) mod tests {
             .compare_exchange_lifecycle(&top_slot_claim, EntityLifecycle::Quarantined)
             .unwrap();
 
+        let manifest = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let failed = entry.pending_failed_branch.as_ref().unwrap();
+            let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                app.world(),
+                app.world().resource::<RouteEntityRegistry>(),
+                &failed.branch,
+            )
+            .unwrap();
+            assert_eq!(manifest.boundary_drifts().len(), 1);
+            let drift = &manifest.boundary_drifts()[0];
+            assert!(matches!(
+                drift.source,
+                FailedBoundarySource::FrameMountSlot { .. }
+            ));
+            assert_eq!(drift.expected.exact_claim(), &top_slot_claim);
+            assert!(matches!(
+                top_slot_claim.owner(),
+                RegistryOwner::Committed(EntityOwner::HostTopSlot { .. })
+            ));
+            assert!(!failed_branch_owns_exact_boundary(&failed.branch, drift));
+            assert!(current_host_owns_failed_boundary(
+                entry.host.as_ref(),
+                &top_slot_claim
+            ));
+            assert!(matches!(
+                classify_failed_boundary(
+                    drift.clone(),
+                    &failed.branch,
+                    entry.active.as_ref(),
+                    entry.host.as_ref(),
+                ),
+                FailedBoundaryDisposition::CurrentAuthorityLoss(_)
+            ));
+            manifest
+        };
+        assert!(!manifest.boundary_drifts().is_empty());
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let mut relationship_entities = frame_claims
+            .iter()
+            .map(ExactRegistryClaim::entity)
+            .chain([top_slot, host_entity])
+            .collect::<Vec<_>>();
+        relationship_entities.sort_by_key(|entity| entity.to_bits());
+        relationship_entities.dedup();
+        let relationships_before = relationship_entities
+            .iter()
+            .map(|entity| {
+                (
+                    *entity,
+                    app.world().get::<ChildOf>(*entity).map(ChildOf::parent),
+                    app.world()
+                        .get::<Children>(*entity)
+                        .map(|children| children.iter().copied().collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(focused);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(focused));
+
         settle_cleanup_system(app.world_mut());
 
-        let navigation = app.world().resource::<RouterNavigation>();
-        let entry = &navigation.entries[0];
-        let failed = entry.pending_failed_branch.as_ref().unwrap();
-        assert_eq!(failed.branch.frames().len(), 1);
-        assert!(entry.cleanup_ledger.is_none());
+        let trace_len = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let residual = entry
+                .authority_protocol_residual
+                .as_ref()
+                .expect("current authority loss plus missing capability is terminal");
+            let expected_violation = AuthorityIsolationViolation {
+                entity: missing_pickable,
+                component: AuthorityIsolationComponent::Pickable,
+                predicate: AuthorityIsolationPredicate::PresentForIgnoreWrite,
+            };
+            assert!(matches!(
+                &residual.kind,
+                AuthorityProtocolResidualKind::AuthorityIsolation(contradiction)
+                    if contradiction.violations.contains(&expected_violation)
+            ));
+            assert!(
+                residual
+                    .isolation_contradiction
+                    .as_ref()
+                    .is_some_and(|contradiction| contradiction
+                        .violations
+                        .contains(&expected_violation))
+            );
+            assert!(residual.active.is_none());
+            assert!(residual.failed.is_some());
+            assert!(residual.host.is_some());
+            assert!(entry.active.is_none());
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.host.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            entry.engine.request(request).unwrap().trace().len()
+        };
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        let gate = app.world().resource::<RouterInputGate>();
+        assert!(gate_targets.iter().all(|entity| {
+            !gate.allows_pointer(*entity)
+                && !gate.allows_keyboard(*entity)
+                && !gate.allows_gamepad(*entity)
+        }));
+        assert_eq!(app.world().get::<Pickable>(missing_pickable), None);
+        assert!(frame_claims.iter().all(|claim| {
+            app.world()
+                .get::<Visibility>(claim.entity())
+                .is_none_or(|visibility| *visibility == Visibility::Hidden)
+                && app
+                    .world()
+                    .get::<Pickable>(claim.entity())
+                    .is_none_or(|pickable| *pickable == Pickable::IGNORE)
+                && app
+                    .world()
+                    .get::<RouterInputBarrier>(claim.entity())
+                    .is_none_or(RouterInputBarrier::denies_all)
+        }));
         assert!(frame_claims.iter().all(|claim| {
             app.world().get_entity(claim.entity()).is_ok()
                 && app
@@ -10403,11 +19058,34 @@ pub(crate) mod tests {
         assert_eq!(parent_record.claim(), stale_parent_claim);
         assert_eq!(parent_record.manifest(), &parent_manifest);
         assert!(parent_manifest.matches(app.world(), top_slot));
-        assert!(matches!(
-            entry.engine.request(request).unwrap().status(),
-            RequestStatus::Running(_)
-        ));
-        assert!(entry.active.is_none());
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        let relationships_after = relationship_entities
+            .iter()
+            .map(|entity| {
+                (
+                    *entity,
+                    app.world().get::<ChildOf>(*entity).map(ChildOf::parent),
+                    app.world()
+                        .get::<Children>(*entity)
+                        .map(|children| children.iter().copied().collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(relationships_after, relationships_before);
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace().len(),
+            trace_len
+        );
+        assert!(entry.authority_protocol_residual.is_some());
+        assert!(entry.cleanup_ledger.is_none());
     }
 
     #[test]

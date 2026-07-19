@@ -258,6 +258,11 @@ impl CleanupCompletion {
     pub(crate) fn testing_set_binding(&mut self, binding: u64) {
         self.binding = binding;
     }
+
+    #[cfg(test)]
+    pub(crate) fn testing_invalidate_binding(&mut self) {
+        self.binding = self.binding.wrapping_add(1);
+    }
 }
 
 #[cfg(test)]

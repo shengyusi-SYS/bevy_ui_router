@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 
 use crate::admission::{
     AdmissionError, HostAdmissionConfirmation, HostAdmissionIssuer, HostAdmissionToken, HostGrant,
+    HostLease, RetiredHostAuthority,
 };
 use crate::branch::{MatchedBranch, MatchedRoute, RouteParams};
 use crate::cleanup::{CleanupBatchToken, CleanupCompletion, CleanupManifestSeal};
@@ -325,6 +326,122 @@ enum PendingFailureKind {
 enum FailureCleanupContinuation {
     Terminal,
     BeginFallback,
+    AuthoritySettlement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BeginAuthoritySettlementErrorKind {
+    Foreign,
+    Stale,
+    WrongPhase,
+    InvalidManifest,
+    RetryablePreparation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FailedAuthorityTriggerError {
+    Foreign,
+    Stale,
+    WrongPhase,
+    Exhausted,
+}
+
+#[derive(Debug)]
+pub(crate) struct BeginAuthoritySettlementError {
+    kind: BeginAuthoritySettlementErrorKind,
+    owner: HostLease,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FailedAuthoritySettlementTerminal {
+    Task {
+        identity: FrameTaskIdentity,
+        current_roots: Vec<RouteFrameVersion>,
+        target_and_current_roots: Option<Vec<RouteFrameVersion>>,
+    },
+    FailureCleanup(FailureCleanupRequest),
+    RegistrationBegin {
+        identity: FrameTaskIdentity,
+        permit: MountRegistrationPermit,
+        logical_roots: Vec<RouteFrameVersion>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct FailedAuthoritySettlementTrigger {
+    router: RouterIdentity,
+    revision: u64,
+    terminal: FailedAuthoritySettlementTerminal,
+}
+
+#[cfg(test)]
+impl FailedAuthoritySettlementTrigger {
+    pub(crate) fn testing_duplicate(&self) -> Self {
+        Self {
+            router: self.router,
+            revision: self.revision,
+            terminal: self.terminal.clone(),
+        }
+    }
+}
+
+enum FailedAuthoritySettlementTerminalRef<'a> {
+    Task(&'a FrameTaskIdentity),
+    FailureCleanup(&'a FailureCleanupRequest),
+    RegistrationBegin(&'a MountRegistrationPermit),
+}
+
+struct FailedAuthoritySettlementSource {
+    identity: FrameTaskIdentity,
+    logical_roots: FailedAuthoritySettlementLogicalRoots,
+}
+
+enum FailedAuthoritySettlementLogicalRoots {
+    Exact(Vec<RouteFrameVersion>),
+    Task {
+        current: Vec<RouteFrameVersion>,
+        target_and_current: Option<Vec<RouteFrameVersion>>,
+    },
+}
+
+impl FailedAuthoritySettlementSource {
+    fn select_logical_roots(
+        self,
+        seal: &CleanupManifestSeal,
+    ) -> Option<(FrameTaskIdentity, Vec<RouteFrameVersion>)> {
+        let selected = match self.logical_roots {
+            FailedAuthoritySettlementLogicalRoots::Exact(roots) => {
+                (roots.as_slice() == seal.logical_roots()).then_some(roots)
+            }
+            FailedAuthoritySettlementLogicalRoots::Task {
+                current,
+                target_and_current,
+            } => {
+                if current.as_slice() == seal.logical_roots() {
+                    Some(current)
+                } else {
+                    target_and_current.filter(|roots| {
+                        roots.as_slice() == seal.logical_roots() && seal.obligation_count() > 0
+                    })
+                }
+            }
+        }?;
+        (selected.is_empty() || seal.obligation_count() > 0).then_some((self.identity, selected))
+    }
+}
+
+impl BeginAuthoritySettlementError {
+    const fn new(kind: BeginAuthoritySettlementErrorKind, owner: HostLease) -> Self {
+        Self { kind, owner }
+    }
+
+    pub(crate) const fn kind(&self) -> BeginAuthoritySettlementErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn into_owner(self) -> HostLease {
+        self.owner
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -496,6 +613,7 @@ pub(crate) enum EngineInstallError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PushError {
     AwaitingHost,
+    AuthorityRecovering,
     IdExhausted,
 }
 
@@ -578,6 +696,7 @@ struct CurrentWork {
     cleanup_roots: Vec<RouteFrameVersion>,
     attempt: AttemptKind,
     reconciliation: Option<RouteReconciliationProjection>,
+    retired_host: Option<RetiredHostAuthority>,
 }
 
 #[derive(Clone, Debug)]
@@ -654,6 +773,8 @@ pub(crate) struct RouterEngine {
     report_dispositions: Vec<ReportDispositionRecord>,
     router_diagnostics: Vec<DiagnosticEvent>,
     completed_cleanup: Vec<CompletedCleanupTombstone>,
+    next_failed_authority_trigger_revision: u64,
+    live_failed_authority_trigger_revision: Option<u64>,
 }
 
 impl RouterEngine {
@@ -685,6 +806,8 @@ impl RouterEngine {
             report_dispositions: Vec::new(),
             router_diagnostics: Vec::new(),
             completed_cleanup: Vec::new(),
+            next_failed_authority_trigger_revision: 1,
+            live_failed_authority_trigger_revision: None,
         })
     }
 
@@ -692,7 +815,9 @@ impl RouterEngine {
         &mut self,
         issuer: &mut HostAdmissionIssuer,
     ) -> Result<HostAdmissionToken, AdmissionError> {
-        if self.state.host().is_some() {
+        if self.state.availability() != &crate::presentation::RouterAvailability::AwaitingHost
+            || self.state.host().is_some()
+        {
             return Err(AdmissionError::AuthorityExists);
         }
         issuer.issue(self.router)
@@ -714,6 +839,515 @@ impl RouterEngine {
         self.state.confirm_host(issuer, confirmation)
     }
 
+    pub(crate) fn begin_authority_settlement_retaining<F>(
+        &mut self,
+        issuer: &mut HostAdmissionIssuer,
+        lease: HostLease,
+        seal: CleanupManifestSeal,
+        authority_mutation: F,
+    ) -> Result<CleanupBatchToken, BeginAuthoritySettlementError>
+    where
+        F: FnOnce(&Self, CleanupBatchToken),
+    {
+        self.begin_authority_settlement_publication(issuer, lease, seal, None, authority_mutation)
+    }
+
+    pub(crate) fn failed_authority_trigger_for_task(
+        &mut self,
+        identity: &FrameTaskIdentity,
+    ) -> Result<FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError> {
+        self.mint_failed_authority_trigger(FailedAuthoritySettlementTerminalRef::Task(identity))
+    }
+
+    pub(crate) fn failed_authority_trigger_for_cleanup(
+        &mut self,
+        request: &FailureCleanupRequest,
+    ) -> Result<FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError> {
+        self.mint_failed_authority_trigger(FailedAuthoritySettlementTerminalRef::FailureCleanup(
+            request,
+        ))
+    }
+
+    pub(crate) fn failed_authority_trigger_for_registration_begin(
+        &mut self,
+        permit: &MountRegistrationPermit,
+    ) -> Result<FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError> {
+        self.mint_failed_authority_trigger(FailedAuthoritySettlementTerminalRef::RegistrationBegin(
+            permit,
+        ))
+    }
+
+    fn mint_failed_authority_trigger(
+        &mut self,
+        terminal: FailedAuthoritySettlementTerminalRef<'_>,
+    ) -> Result<FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError> {
+        let terminal = self.freeze_failed_authority_terminal(terminal)?;
+        let revision = self.next_failed_authority_trigger_revision;
+        self.next_failed_authority_trigger_revision = revision
+            .checked_add(1)
+            .ok_or(FailedAuthorityTriggerError::Exhausted)?;
+        self.live_failed_authority_trigger_revision = Some(revision);
+        Ok(FailedAuthoritySettlementTrigger {
+            router: self.router,
+            revision,
+            terminal,
+        })
+    }
+
+    fn freeze_failed_authority_terminal(
+        &self,
+        terminal: FailedAuthoritySettlementTerminalRef<'_>,
+    ) -> Result<FailedAuthoritySettlementTerminal, FailedAuthorityTriggerError> {
+        if self.state.availability() != &crate::presentation::RouterAvailability::Ready
+            || self.state.host().is_none()
+            || self.state.top_slot().is_none()
+        {
+            return Err(FailedAuthorityTriggerError::WrongPhase);
+        }
+        let Some(current) = self.current.as_ref() else {
+            return Err(FailedAuthorityTriggerError::Stale);
+        };
+        if current.retired_host.is_some() {
+            return Err(FailedAuthorityTriggerError::WrongPhase);
+        }
+        match terminal {
+            FailedAuthoritySettlementTerminalRef::Task(identity) => {
+                if identity.router_identity() != self.router {
+                    return Err(FailedAuthorityTriggerError::Foreign);
+                }
+                if current.stage != WorkStage::Applying || current.identity != *identity {
+                    return Err(FailedAuthorityTriggerError::Stale);
+                }
+                let current_roots = current
+                    .applied_frames
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let task_target = RouteFrameVersion::new(
+                    identity.router,
+                    identity.host,
+                    identity.slot,
+                    identity.origin.clone(),
+                    identity.frame,
+                    identity.generation,
+                );
+                let target_and_current_roots = if current.applied_frames.contains(&task_target) {
+                    None
+                } else {
+                    let mut roots = Vec::with_capacity(current_roots.len() + 1);
+                    roots.push(task_target);
+                    roots.extend(current_roots.iter().cloned());
+                    Some(roots)
+                };
+                Ok(FailedAuthoritySettlementTerminal::Task {
+                    identity: identity.clone(),
+                    current_roots,
+                    target_and_current_roots,
+                })
+            }
+            FailedAuthoritySettlementTerminalRef::FailureCleanup(request) => {
+                if request.identity.router_identity() != self.router {
+                    return Err(FailedAuthorityTriggerError::Foreign);
+                }
+                if !matches!(
+                    &current.stage,
+                    WorkStage::FailureCleanupManifestPending { expected }
+                        if expected == request
+                ) {
+                    return Err(FailedAuthorityTriggerError::Stale);
+                }
+                Ok(FailedAuthoritySettlementTerminal::FailureCleanup(
+                    request.clone(),
+                ))
+            }
+            FailedAuthoritySettlementTerminalRef::RegistrationBegin(permit) => {
+                self.validate_mount_registration_rejection(permit).map_err(
+                    |error| match error {
+                        MountError::Foreign => FailedAuthorityTriggerError::Foreign,
+                        MountError::Stale => FailedAuthorityTriggerError::Stale,
+                        MountError::WrongPhase => FailedAuthorityTriggerError::WrongPhase,
+                        MountError::Exhausted => FailedAuthorityTriggerError::Exhausted,
+                    },
+                )?;
+                Ok(FailedAuthoritySettlementTerminal::RegistrationBegin {
+                    identity: current.identity.clone(),
+                    permit: permit.clone(),
+                    logical_roots: current.applied_frames.iter().rev().cloned().collect(),
+                })
+            }
+        }
+    }
+
+    pub(crate) fn begin_failed_authority_settlement_retaining<F>(
+        &mut self,
+        issuer: &mut HostAdmissionIssuer,
+        lease: HostLease,
+        trigger: FailedAuthoritySettlementTrigger,
+        seal: CleanupManifestSeal,
+        authority_mutation: F,
+    ) -> Result<CleanupBatchToken, BeginAuthoritySettlementError>
+    where
+        F: FnOnce(&Self, CleanupBatchToken),
+    {
+        let source = match self.consume_failed_authority_trigger(trigger) {
+            Ok(source) => source,
+            Err(kind) => return Err(BeginAuthoritySettlementError::new(kind, lease)),
+        };
+        self.begin_authority_settlement_publication(
+            issuer,
+            lease,
+            seal,
+            Some(source),
+            authority_mutation,
+        )
+    }
+
+    fn consume_failed_authority_trigger(
+        &mut self,
+        trigger: FailedAuthoritySettlementTrigger,
+    ) -> Result<FailedAuthoritySettlementSource, BeginAuthoritySettlementErrorKind> {
+        if trigger.router != self.router {
+            return Err(BeginAuthoritySettlementErrorKind::Foreign);
+        }
+        if self.live_failed_authority_trigger_revision != Some(trigger.revision) {
+            return Err(BeginAuthoritySettlementErrorKind::Stale);
+        }
+        self.live_failed_authority_trigger_revision = None;
+        let terminal_ref = match &trigger.terminal {
+            FailedAuthoritySettlementTerminal::Task { identity, .. } => {
+                FailedAuthoritySettlementTerminalRef::Task(identity)
+            }
+            FailedAuthoritySettlementTerminal::FailureCleanup(request) => {
+                FailedAuthoritySettlementTerminalRef::FailureCleanup(request)
+            }
+            FailedAuthoritySettlementTerminal::RegistrationBegin { permit, .. } => {
+                FailedAuthoritySettlementTerminalRef::RegistrationBegin(permit)
+            }
+        };
+        let refrozen = self
+            .freeze_failed_authority_terminal(terminal_ref)
+            .map_err(|error| match error {
+                FailedAuthorityTriggerError::Foreign => BeginAuthoritySettlementErrorKind::Foreign,
+                FailedAuthorityTriggerError::Stale => BeginAuthoritySettlementErrorKind::Stale,
+                FailedAuthorityTriggerError::WrongPhase => {
+                    BeginAuthoritySettlementErrorKind::WrongPhase
+                }
+                FailedAuthorityTriggerError::Exhausted => {
+                    BeginAuthoritySettlementErrorKind::RetryablePreparation
+                }
+            })?;
+        if refrozen != trigger.terminal {
+            return Err(BeginAuthoritySettlementErrorKind::Stale);
+        }
+        let (identity, logical_roots) = match trigger.terminal {
+            FailedAuthoritySettlementTerminal::Task {
+                identity,
+                current_roots,
+                target_and_current_roots,
+            } => (
+                identity,
+                FailedAuthoritySettlementLogicalRoots::Task {
+                    current: current_roots,
+                    target_and_current: target_and_current_roots,
+                },
+            ),
+            FailedAuthoritySettlementTerminal::RegistrationBegin {
+                identity,
+                logical_roots,
+                ..
+            } => (
+                identity,
+                FailedAuthoritySettlementLogicalRoots::Exact(logical_roots),
+            ),
+            FailedAuthoritySettlementTerminal::FailureCleanup(request) => (
+                request.identity,
+                FailedAuthoritySettlementLogicalRoots::Exact(request.logical_roots),
+            ),
+        };
+        Ok(FailedAuthoritySettlementSource {
+            identity,
+            logical_roots,
+        })
+    }
+
+    fn begin_authority_settlement_publication<F>(
+        &mut self,
+        issuer: &mut HostAdmissionIssuer,
+        lease: HostLease,
+        seal: CleanupManifestSeal,
+        failed: Option<FailedAuthoritySettlementSource>,
+        authority_mutation: F,
+    ) -> Result<CleanupBatchToken, BeginAuthoritySettlementError>
+    where
+        F: FnOnce(&Self, CleanupBatchToken),
+    {
+        let Some(version) = self.state.host().cloned() else {
+            return Err(BeginAuthoritySettlementError::new(
+                BeginAuthoritySettlementErrorKind::Stale,
+                lease,
+            ));
+        };
+        let Some(top_slot) = self.state.top_slot() else {
+            return Err(BeginAuthoritySettlementError::new(
+                BeginAuthoritySettlementErrorKind::Stale,
+                lease,
+            ));
+        };
+        if !lease.matches(self.router, &version, top_slot) {
+            return Err(BeginAuthoritySettlementError::new(
+                BeginAuthoritySettlementErrorKind::Foreign,
+                lease,
+            ));
+        }
+        let valid_common_phase = self.current.as_ref().is_some_and(|current| {
+            current.reconciliation.is_some() && current.retired_host.is_none()
+        }) && self.action.is_none()
+            && self.current_reconciliation_matches_active();
+        let valid_source_phase = match &failed {
+            Some(source) => self
+                .current
+                .as_ref()
+                .is_some_and(|current| current.identity == source.identity),
+            None => self.current.as_ref().is_some_and(|current| {
+                matches!(
+                    current.stage,
+                    WorkStage::Applying | WorkStage::ReadyToCommit
+                )
+            }),
+        };
+        if !valid_common_phase || !valid_source_phase {
+            return Err(BeginAuthoritySettlementError::new(
+                BeginAuthoritySettlementErrorKind::WrongPhase,
+                lease,
+            ));
+        }
+
+        let (current_identity, logical_roots) = match failed {
+            Some(source) => {
+                let Some((identity, logical_roots)) = source.select_logical_roots(&seal) else {
+                    return Err(BeginAuthoritySettlementError::new(
+                        BeginAuthoritySettlementErrorKind::InvalidManifest,
+                        lease,
+                    ));
+                };
+                (identity, logical_roots)
+            }
+            None => {
+                let identity = self
+                    .current
+                    .as_ref()
+                    .expect("authority settlement phase was preflighted")
+                    .identity
+                    .clone();
+                (identity, self.authority_settlement_logical_roots())
+            }
+        };
+        let failure = NavigationFailure::new(
+            NavigationFailureKind::AuthorityLost,
+            "physical reconciliation authority was lost",
+        );
+        let request = FailureCleanupRequest {
+            identity: current_identity,
+            expected: PendingFailureKind::AuthorityLost,
+            logical_roots,
+            failure,
+            continuation: FailureCleanupContinuation::AuthoritySettlement,
+        };
+        if request.logical_roots != seal.logical_roots()
+            || (!request.logical_roots.is_empty() && seal.obligation_count() == 0)
+        {
+            return Err(BeginAuthoritySettlementError::new(
+                BeginAuthoritySettlementErrorKind::InvalidManifest,
+                lease,
+            ));
+        }
+        let cleanup = CleanupBatchToken::sealed(
+            request.identity.clone(),
+            self.current
+                .as_ref()
+                .expect("authority settlement phase was preflighted")
+                .cleanup_batch,
+            &request.logical_roots,
+            seal.manifest_digest(),
+            seal.obligation_count(),
+        );
+        let mut recovering_record = self
+            .request(request.request())
+            .expect("authority settlement request remains retained")
+            .clone();
+        recovering_record
+            .transition(RequestStatus::Running(NavigationPhase::Recovering))
+            .expect("authority settlement request is running");
+        recovering_record
+            .append_trace(NavigationTraceEvent::request_phase_changed(
+                NavigationPhase::Recovering,
+            ))
+            .expect("authority settlement trace is open");
+        let mut queued_records = Vec::new();
+        if queued_records.try_reserve_exact(self.queue.len()).is_err() {
+            return Err(BeginAuthoritySettlementError::new(
+                BeginAuthoritySettlementErrorKind::RetryablePreparation,
+                lease,
+            ));
+        }
+        for queued in &self.queue {
+            let mut record = self
+                .request(queued.request)
+                .expect("queued authority-loss request remains retained")
+                .clone();
+            record
+                .transition(RequestStatus::Failed(NavigationFailure::new(
+                    NavigationFailureKind::AuthorityLost,
+                    "router authority was lost before request start",
+                )))
+                .expect("queued request is not terminal");
+            record
+                .append_trace(NavigationTraceEvent::request_terminal())
+                .expect("queued failure terminal event is last");
+            queued_records.push((queued.request, record));
+        }
+        let retired = match issuer.retire_current(lease) {
+            Ok(retired) => retired,
+            Err(error) => {
+                return Err(BeginAuthoritySettlementError::new(
+                    BeginAuthoritySettlementErrorKind::Stale,
+                    error.into_owner(),
+                ));
+            }
+        };
+        assert!(retired.matches(self.router, &version, top_slot));
+        authority_mutation(self, cleanup.clone());
+        assert!(self.state.begin_authority_recovery(&version, top_slot));
+        let current = self
+            .current
+            .as_mut()
+            .expect("authority settlement phase was preflighted");
+        current.pending_mount = None;
+        current.retired_host = Some(retired);
+        current.stage = WorkStage::FailureCleanupPrepared {
+            outstanding: cleanup.clone(),
+            failure: request.failure.clone(),
+            continuation: FailureCleanupContinuation::AuthoritySettlement,
+        };
+        self.action = None;
+        *self
+            .record_mut(request.request())
+            .expect("authority settlement request remains retained") = recovering_record;
+        for (queued, record) in queued_records {
+            *self
+                .record_mut(queued)
+                .expect("queued authority-loss request remains retained") = record;
+        }
+        self.queue.clear();
+        self.state
+            .set_request(Some(RequestStatus::Running(NavigationPhase::Recovering)));
+        self.retain_terminal_records();
+        Ok(cleanup)
+    }
+
+    pub(crate) fn fail_closed_authority_protocol_retaining<F>(
+        &mut self,
+        issuer: &mut HostAdmissionIssuer,
+        lease: Option<HostLease>,
+        authority_mutation: F,
+    ) -> Result<(), Option<HostLease>>
+    where
+        F: FnOnce(),
+    {
+        let mut owner = lease;
+        if self.fail_closed_authority_protocol(|| match owner.take() {
+            Some(lease) => match issuer.retire_current(lease) {
+                Ok(retired) => {
+                    authority_mutation();
+                    drop(retired);
+                    true
+                }
+                Err(error) => {
+                    owner = Some(error.into_owner());
+                    false
+                }
+            },
+            None => {
+                authority_mutation();
+                true
+            }
+        }) {
+            Ok(())
+        } else {
+            Err(owner)
+        }
+    }
+
+    fn fail_closed_authority_protocol<F>(&mut self, authority_mutation: F) -> bool
+    where
+        F: FnOnce() -> bool,
+    {
+        let Some(request) = self
+            .current
+            .as_ref()
+            .map(|current| current.identity.request)
+        else {
+            return false;
+        };
+        let failure = NavigationFailure::new(
+            NavigationFailureKind::AuthorityLost,
+            "authority settlement protocol invariant was violated",
+        );
+        let mut terminal = self
+            .request(request)
+            .expect("current protocol-failure request remains retained")
+            .clone();
+        if terminal
+            .transition(RequestStatus::Failed(failure.clone()))
+            .is_err()
+            || terminal
+                .append_trace(NavigationTraceEvent::request_terminal())
+                .is_err()
+        {
+            return false;
+        }
+        let mut queued_records = Vec::new();
+        if queued_records.try_reserve_exact(self.queue.len()).is_err() {
+            return false;
+        }
+        for queued in &self.queue {
+            let mut record = self
+                .request(queued.request)
+                .expect("queued protocol-failure request remains retained")
+                .clone();
+            record
+                .transition(RequestStatus::Failed(failure.clone()))
+                .expect("queued protocol-failure request is not terminal");
+            record
+                .append_trace(NavigationTraceEvent::request_terminal())
+                .expect("queued protocol-failure terminal event is last");
+            queued_records.push((queued.request, record));
+        }
+
+        if !authority_mutation() {
+            return false;
+        }
+        *self
+            .record_mut(request)
+            .expect("current protocol-failure request remains retained") = terminal;
+        for (queued, record) in queued_records {
+            *self
+                .record_mut(queued)
+                .expect("queued protocol-failure request remains retained") = record;
+        }
+        self.queue.clear();
+        self.current = None;
+        self.action = None;
+        self.active_branch = None;
+        self.active_child_slots.clear();
+        self.state.fail_closed_unavailable(
+            crate::presentation::RouterUnavailableReason::RegistryInvariantViolation,
+        );
+        self.retain_terminal_records();
+        true
+    }
+
     pub(crate) fn push(
         &mut self,
         location: RouteLocation,
@@ -727,6 +1361,11 @@ impl RouterEngine {
         &mut self,
         location: RouteLocation,
     ) -> Result<NavigationRequestId, PushError> {
+        if self.state.availability()
+            == &crate::presentation::RouterAvailability::RecoveringAuthority
+        {
+            return Err(PushError::AuthorityRecovering);
+        }
         if self.state.host().is_none() {
             return Err(PushError::AwaitingHost);
         }
@@ -1639,6 +2278,46 @@ impl RouterEngine {
         &mut self,
         completion: CleanupCompletion,
     ) -> Result<(), CleanupError> {
+        if self.authority_settlement_cleanup_pending() {
+            return Err(CleanupError::Invalid);
+        }
+        self.complete_cleanup_impl(completion, || {})
+    }
+
+    pub(crate) fn complete_cleanup_with_authority_mutation<F>(
+        &mut self,
+        completion: CleanupCompletion,
+        authority_mutation: F,
+    ) -> Result<(), CleanupError>
+    where
+        F: FnOnce(),
+    {
+        if !self.authority_settlement_cleanup_pending() {
+            return Err(CleanupError::Invalid);
+        }
+        self.complete_cleanup_impl(completion, authority_mutation)
+    }
+
+    fn authority_settlement_cleanup_pending(&self) -> bool {
+        self.current.as_ref().is_some_and(|current| {
+            matches!(
+                current.stage,
+                WorkStage::FailureCleanupPrepared {
+                    continuation: FailureCleanupContinuation::AuthoritySettlement,
+                    ..
+                }
+            )
+        })
+    }
+
+    fn complete_cleanup_impl<F>(
+        &mut self,
+        completion: CleanupCompletion,
+        authority_mutation: F,
+    ) -> Result<(), CleanupError>
+    where
+        F: FnOnce(),
+    {
         let outstanding = self
             .current
             .as_ref()
@@ -1696,9 +2375,52 @@ impl RouterEngine {
             self.begin_fallback(request, failure);
             return Ok(());
         }
+        if let Some((failure, FailureCleanupContinuation::AuthoritySettlement)) = &failure {
+            let retired = current.retired_host.as_ref().ok_or(CleanupError::Stale)?;
+            let version = self.state.host().cloned().ok_or(CleanupError::Stale)?;
+            let top_slot = self.state.top_slot().ok_or(CleanupError::Stale)?;
+            if !retired.matches(self.router, &version, top_slot)
+                || self.state.availability()
+                    != &crate::presentation::RouterAvailability::RecoveringAuthority
+            {
+                return Err(CleanupError::Stale);
+            }
+            let mut terminal_record = self
+                .request(request)
+                .expect("authority settlement request remains retained")
+                .clone();
+            terminal_record
+                .append_trace(NavigationTraceEvent::cleanup_settled(None))
+                .expect("authority settlement trace remains open");
+            terminal_record
+                .transition(RequestStatus::Failed(failure.clone()))
+                .expect("authority settlement request is running");
+            terminal_record
+                .append_trace(NavigationTraceEvent::request_terminal())
+                .expect("authority settlement terminal event is last");
+            if self.completed_cleanup.try_reserve(1).is_err() {
+                return Err(CleanupError::Stale);
+            }
+            authority_mutation();
+            *self
+                .record_mut(request)
+                .expect("authority settlement request remains retained") = terminal_record;
+            self.completed_cleanup.push(CompletedCleanupTombstone {
+                request,
+                token: completed_token,
+            });
+            assert!(self.state.complete_authority_settlement(&version, top_slot));
+            self.active_branch = None;
+            self.active_child_slots.clear();
+            self.current = None;
+            self.state.set_request(None);
+            self.retain_terminal_records();
+            return Ok(());
+        }
         let terminal_status = match failure {
             Some((failure, FailureCleanupContinuation::Terminal)) => RequestStatus::Failed(failure),
             Some((_, FailureCleanupContinuation::BeginFallback)) => unreachable!(),
+            Some((_, FailureCleanupContinuation::AuthoritySettlement)) => unreachable!(),
             None => match &current.attempt {
                 AttemptKind::Normal => RequestStatus::Succeeded,
                 AttemptKind::Fallback { original_failure } => {
@@ -2046,6 +2768,7 @@ impl RouterEngine {
                 cleanup_roots,
                 attempt: AttemptKind::Normal,
                 reconciliation: Some(reconciliation),
+                retired_host: None,
             });
             self.transition_with_trace(request, NavigationPhase::ReadyToSwitch);
             self.action = Some(EngineAction::Commit(CommitTicket { identity }));
@@ -2105,6 +2828,7 @@ impl RouterEngine {
                 cleanup_roots,
                 attempt: AttemptKind::Normal,
                 reconciliation: Some(reconciliation),
+                retired_host: None,
             });
             self.transition_with_trace(request, NavigationPhase::ResolvingMount);
             let token = match self.mount.issue(
@@ -2210,6 +2934,7 @@ impl RouterEngine {
             cleanup_roots,
             attempt: AttemptKind::Normal,
             reconciliation: Some(reconciliation),
+            retired_host: None,
         });
         let record = self
             .record_mut(request)
@@ -2257,6 +2982,25 @@ impl RouterEngine {
         failure: NavigationFailure,
         continuation: FailureCleanupContinuation,
     ) -> FailureCleanupRequest {
+        let logical_roots = self
+            .current
+            .as_ref()
+            .expect("a nested failure belongs to current work")
+            .applied_frames
+            .iter()
+            .rev()
+            .cloned()
+            .collect();
+        self.begin_failure_cleanup_with_roots(expected, failure, continuation, logical_roots)
+    }
+
+    fn begin_failure_cleanup_with_roots(
+        &mut self,
+        expected: PendingFailureKind,
+        failure: NavigationFailure,
+        continuation: FailureCleanupContinuation,
+        logical_roots: Vec<RouteFrameVersion>,
+    ) -> FailureCleanupRequest {
         let current = self
             .current
             .as_ref()
@@ -2264,7 +3008,7 @@ impl RouterEngine {
         let request = FailureCleanupRequest {
             identity: current.identity.clone(),
             expected,
-            logical_roots: current.applied_frames.iter().rev().cloned().collect(),
+            logical_roots,
             failure,
             continuation,
         };
@@ -2284,6 +3028,30 @@ impl RouterEngine {
         self.action = None;
         self.transition_with_trace(request.identity.request, phase);
         request
+    }
+
+    fn authority_settlement_logical_roots(&self) -> Vec<RouteFrameVersion> {
+        let current = self
+            .current
+            .as_ref()
+            .expect("authority settlement phase was preflighted");
+        let projection = current
+            .reconciliation
+            .as_ref()
+            .expect("authority settlement requires reconciliation");
+        let mut roots = projection
+            .entering()
+            .iter()
+            .rev()
+            .filter_map(|entering| current.target_frames.get(entering.branch_index()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for active in self.state.active().frames().iter().rev() {
+            if !roots.contains(active) {
+                roots.push(active.clone());
+            }
+        }
+        roots
     }
 
     fn begin_fallback(
@@ -2388,6 +3156,7 @@ impl RouterEngine {
             cleanup_roots,
             attempt: AttemptKind::Fallback { original_failure },
             reconciliation: None,
+            retired_host: None,
         });
         self.action = None;
         self.record_mut(request)
@@ -3223,10 +3992,10 @@ pub(crate) struct EngineSnapshot {
 mod tests {
     use super::{
         ActionSnapshot, CleanupError, CommitError, EngineAction, MountError, PrivateRequestLookup,
-        ROUTER_DIAGNOSTIC_RETENTION, ReportError, RootTaskIdentity, RouterEngine,
+        PushError, ROUTER_DIAGNOSTIC_RETENTION, ReportError, RootTaskIdentity, RouterEngine,
         TERMINAL_RETENTION, WorkStage, occupied_child_slots,
     };
-    use crate::admission::HostAdmissionIssuer;
+    use crate::admission::{AdmissionError, HostAdmissionIssuer};
     use crate::cleanup::{
         CleanupBatchToken, CleanupCompletion, CleanupCompletionDigest, CleanupManifestDigest,
         CleanupManifestSeal,
@@ -6917,6 +7686,263 @@ mod tests {
             &cleanup,
             NavigationFailureKind::AuthorityLost,
         );
+    }
+
+    #[test]
+    fn reconciliation_authority_loss_rejects_queue_settles_then_readmits_without_replay() {
+        let mut engine = RouterEngine::install(
+            reconciliation_tree(),
+            RouteViewKey::new("fallback").unwrap(),
+        )
+        .unwrap();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+        let token = engine.request_host_admission(&mut issuer).unwrap();
+        let grant = engine.grant_host_admission(&mut issuer, &token).unwrap();
+        let confirmation = issuer.confirm(&grant).unwrap();
+        engine.confirm_host(&issuer, &confirmation).unwrap();
+        let lease = confirmation.into_lease();
+        engine.push(RouteLocation::new("/items")).unwrap();
+        settle_current(&mut engine);
+        let history_before = engine.history().clone();
+
+        let current = engine.push(RouteLocation::new("/items/1")).unwrap();
+        let action = engine.action().unwrap();
+        let _ticket = drive_to_commit(&mut engine, action);
+        let queued_first = engine.enqueue_push(RouteLocation::new("/items/2")).unwrap();
+        let queued_second = engine.enqueue_push(RouteLocation::new("/items/3")).unwrap();
+
+        let roots = engine.authority_settlement_logical_roots();
+        let obligation_count = usize::from(!roots.is_empty());
+        let cleanup = engine
+            .begin_authority_settlement_retaining(
+                &mut issuer,
+                lease,
+                CleanupManifestSeal::new(roots, manifest_digest(0x515), obligation_count),
+                |engine, _| {
+                    assert_eq!(
+                        engine.availability(),
+                        &crate::presentation::RouterAvailability::Ready
+                    );
+                    assert!(engine.host().is_some());
+                    assert!(matches!(
+                        engine.request(current).unwrap().status(),
+                        RequestStatus::Running(_)
+                    ));
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            engine.availability(),
+            &crate::presentation::RouterAvailability::RecoveringAuthority
+        );
+        assert_eq!(
+            engine.request(current).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::Recovering)
+        );
+        for queued in [queued_first, queued_second] {
+            assert!(matches!(
+                engine.request(queued).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            assert_eq!(
+                engine
+                    .request(queued)
+                    .unwrap()
+                    .trace()
+                    .last()
+                    .map(NavigationTraceEvent::kind),
+                Some(NavigationTraceEventKind::RequestTerminal)
+            );
+        }
+
+        let ids_before_rejected_push = engine.ids.snapshot();
+        assert_eq!(
+            engine.enqueue_push(RouteLocation::new("/items/4")),
+            Err(PushError::AuthorityRecovering)
+        );
+        assert_eq!(engine.ids.snapshot(), ids_before_rejected_push);
+        if obligation_count != 0 {
+            engine
+                .observe_cleanup_receipt(&cleanup, crate::trace::CleanupDisposition::Removed)
+                .unwrap();
+        }
+        let receipt_events = engine
+            .request(current)
+            .unwrap()
+            .trace()
+            .iter()
+            .filter(|event| event.cleanup_disposition().is_some())
+            .count();
+        let mut invalid_completion = valid_completion(&cleanup);
+        invalid_completion.testing_invalidate_binding();
+        let mutation_ran = std::cell::Cell::new(false);
+        assert_eq!(
+            engine.complete_cleanup_with_authority_mutation(invalid_completion, || {
+                mutation_ran.set(true)
+            }),
+            Err(CleanupError::Invalid)
+        );
+        assert!(!mutation_ran.get());
+        assert_eq!(
+            engine.availability(),
+            &crate::presentation::RouterAvailability::RecoveringAuthority
+        );
+        assert_eq!(
+            engine
+                .request(current)
+                .unwrap()
+                .trace()
+                .iter()
+                .filter(|event| event.cleanup_disposition().is_some())
+                .count(),
+            receipt_events
+        );
+        engine
+            .complete_cleanup_with_authority_mutation(valid_completion(&cleanup), || {})
+            .unwrap();
+
+        let trace = engine.request(current).unwrap().trace();
+        let receipt = trace.iter().position(|event| {
+            event.kind() == NavigationTraceEventKind::CleanupSettled
+                && event.cleanup_disposition().is_some()
+        });
+        let settled = trace
+            .iter()
+            .rposition(|event| event.kind() == NavigationTraceEventKind::CleanupSettled)
+            .unwrap();
+        let terminal = trace
+            .iter()
+            .position(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+            .unwrap();
+        if let Some(receipt) = receipt {
+            assert!(receipt < settled);
+        }
+        assert!(settled < terminal);
+        assert!(matches!(
+            engine.request(current).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        assert_eq!(engine.active().kind(), ActivePresentationKind::None);
+        assert!(engine.host().is_none());
+        assert_eq!(engine.history(), &history_before);
+        assert!(engine.action().is_none());
+
+        let token = engine.request_host_admission(&mut issuer).unwrap();
+        let grant = engine.grant_host_admission(&mut issuer, &token).unwrap();
+        let confirmation = issuer.confirm(&grant).unwrap();
+        engine.confirm_host(&issuer, &confirmation).unwrap();
+
+        assert_eq!(
+            engine.availability(),
+            &crate::presentation::RouterAvailability::Ready
+        );
+        assert_eq!(engine.active().kind(), ActivePresentationKind::None);
+        assert_eq!(engine.history(), &history_before);
+        assert!(engine.running_request().is_none());
+        assert!(engine.action().is_none());
+    }
+
+    #[test]
+    fn authority_protocol_failure_retires_lease_and_rejects_readmission_before_issue() {
+        let mut engine = RouterEngine::install(
+            reconciliation_tree(),
+            RouteViewKey::new("fallback").unwrap(),
+        )
+        .unwrap();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+        let token = engine.request_host_admission(&mut issuer).unwrap();
+        let grant = engine.grant_host_admission(&mut issuer, &token).unwrap();
+        let confirmation = issuer.confirm(&grant).unwrap();
+        engine.confirm_host(&issuer, &confirmation).unwrap();
+        let lease = confirmation.into_lease();
+        engine.push(RouteLocation::new("/items")).unwrap();
+        settle_current(&mut engine);
+        let request = engine.push(RouteLocation::new("/items/1")).unwrap();
+        let action = engine.action().unwrap();
+        let _ticket = drive_to_commit(&mut engine, action);
+        let isolated = std::cell::Cell::new(false);
+
+        engine
+            .fail_closed_authority_protocol_retaining(&mut issuer, Some(lease), || {
+                isolated.set(true)
+            })
+            .unwrap();
+
+        assert!(isolated.get());
+        assert!(!issuer.has_current());
+        assert_eq!(
+            engine.availability(),
+            &crate::presentation::RouterAvailability::Unavailable(
+                crate::presentation::RouterUnavailableReason::RegistryInvariantViolation,
+            )
+        );
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        let ids_before = engine.ids.snapshot();
+        assert_eq!(
+            engine.request_host_admission(&mut issuer),
+            Err(AdmissionError::AuthorityExists)
+        );
+        assert_eq!(engine.ids.snapshot(), ids_before);
+    }
+
+    #[test]
+    fn failed_authority_trigger_requires_an_exact_refrozen_terminal_snapshot() {
+        let mut engine = RouterEngine::install(
+            reconciliation_tree(),
+            RouteViewKey::new("fallback").unwrap(),
+        )
+        .unwrap();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+        let token = engine.request_host_admission(&mut issuer).unwrap();
+        let grant = engine.grant_host_admission(&mut issuer, &token).unwrap();
+        let confirmation = issuer.confirm(&grant).unwrap();
+        engine.confirm_host(&issuer, &confirmation).unwrap();
+        let lease = confirmation.into_lease();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("failed terminal fixture requires one exact frame task")
+        };
+        let trigger = engine
+            .failed_authority_trigger_for_task(task.identity())
+            .unwrap();
+
+        engine
+            .current
+            .as_mut()
+            .expect("task retains current work")
+            .applied_frames
+            .push(task.frame_version().clone());
+        let before = engine.snapshot();
+        let mutation_ran = std::cell::Cell::new(false);
+        let error = engine
+            .begin_failed_authority_settlement_retaining(
+                &mut issuer,
+                lease,
+                trigger,
+                CleanupManifestSeal::new(
+                    vec![task.frame_version().clone()],
+                    manifest_digest(0xFA16),
+                    1,
+                ),
+                |_, _| mutation_ran.set(true),
+            )
+            .expect_err("a merely valid but different refrozen snapshot is stale");
+
+        assert_eq!(
+            error.kind(),
+            super::BeginAuthoritySettlementErrorKind::Stale
+        );
+        let _lease = error.into_owner();
+        assert!(!mutation_ran.get());
+        assert!(issuer.has_current());
+        assert_eq!(engine.snapshot(), before);
     }
 
     #[test]
