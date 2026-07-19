@@ -435,28 +435,52 @@ git commit -m "feat: settle reconciliation authority loss"
 - Modify: `crates/bevy_ui_router_ecs/src/cleanup.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/audit.rs`
 
-- [ ] **Step 1: Add fixed physical scenarios**
+Owner mapping: navigation 负责 scheduled journey、slot role 与 classification，presentation 负责 DefaultPlugins evidence，cleanup 负责 attempt、receipt、ledger 与 quarantine matrix，audit 负责独立 World/registry removal mapping
+
+- [ ] **Step 1: Inventory and add fixed physical scenarios**
+
+Evidence discipline
+
+- 先把现有测试逐项映射到下列 required regressions，直接复用已有证据且不添加重复测试
+- 至少一个新增或扩展的 physical journey 使用 official `App::update` schedule，从 producer 运行到 settlement，再多运行一次 update 证明不重放
+- direct preflight、finalizer 或 ledger injection 仅作 supplemental evidence，不能替代 scheduled journey
+- private ECS 测试保存并断言 exact Entity、claim、owner、seal、lifecycle、relationship 与 World facts，snapshot 或 fingerprint 只用于校验，不能作为事实替身
+- production behavior change 先得到 failing regression，若 coverage-only 测试证明的是已有行为，执行记录必须如实标为 evidence addition 而非 behavioral RED
+- navigation、presentation、cleanup、audit 四组新增或扩展证据统一使用 `reconciliation_` 前缀，四条 focused commands 各至少命中一项，出现 0 tests 即失败
+- 不新增 authority catalogue name，catalogue 保持 `23/23/23`
 
 Required regressions
 
-- Journey B preserves exact layout shell/content/outlet/slot and relationships
-- append、truncate、suffix replace、fragment exercise every slot role
-- every slot role proves exact registry/slot lifecycle、visibility、picking、direct gate、focus与audit mapping invariants
-- fragment uses same leaf frame id、generation `+1` and one effect
-- old leaf is hidden/gate-denied/focus-free before new leaf activation
-- normal cleanup produces only `Removed` receipts and no orphan slot
-- leaving foreign/protected partitions quarantine without crossing authority
-- preserved/current unauthorized inbound parent and active cycle fail `AuthorityLost`，entering equivalents fail `PendingRejected`
-- leaving child slot quarantines independently and never mutates a protected parent
-- host components、existing child identities与relative order remain intact
-- DefaultPlugins layout/picking reaches only new active primitives
-- zero-obligation、partial settlement、duplicate receipt、wrong batch/request/epoch、superseded attempt与completion replay remain sealed
-- `CommitPublished -> SettleCleanup` drift supersedes the old physical attempt without duplicating obligations or touching app-owned state
+- operation×role 按合同映射共同覆盖，suffix replace/fragment occupied slot 对应 `PreservedActive`，truncate 对应 `RetainEmpty`，append reused empty slot 对应 `ActivateExisting`，append without empty slot 对应 `MountNew`，leaving parent 对应 `Leaving`
+- 每个映射到的 slot role 保存 exact registry/slot lifecycle、visibility、picking、pointer/keyboard/gamepad direct gate、focus 与 private audit mapping
+- equivalent 证明 zero entering、zero leaving、zero effect，以及 Entity、relationship、presentation registry、slot lifecycle 与 cleanup ledger physical zero write，同时允许正常 request/history publication
+- fragment 只消费 Core sealed 的同 frame id、generation `+1` identity，恰好物理应用一次 effect，ECS 不得重新分类或分配该 identity
+- Journey B 保存 preserved layout shell/content/outlet/slot 的 exact identity 与 relationships，在 schedule boundary 上证明 old leaf isolation 与 focus release 早于 new leaf activation，正常 cleanup 的每个 receipt 均为 `Removed`，old exact entities 与 registry claims 均不存在且无 orphan slot
+- private audit 不依赖 cleanup receipt，独立以 exact World absence 加 registry absence 推导 old leaf `Removed`，公开 `AuditEntityId` evidence 留给 Task 7
+- target-first matrix 覆盖 missing、owner、seal、required component manifest、foreign descendant/component、protected inbound parent 与 cycle 的 role-sensitive 分类
+- authorized leaving owned target 可因 foreign descendant/component 或 protected inbound parent 把 owned residual 转交 quarantine，foreign/protected non-target Entity、component 与 edge 保持不变
+- preserved、leaving 与 non-target current 的 missing Entity/claim、owner/seal/required component manifest 或 cycle drift 依合同分类 `AuthorityLost`，preserved foreign additions 保持 `Ready` 且 zero mutation
+- entering identity/foreign/protected/cycle failure 分类 `PendingRejected` 并保留 old active
+- mutation 限于 allowed write set，authorized leaving/entering targets 与每个 preserved、non-target current、protected non-target closure 均不相交
+- leaving child-slot 仅在 owned sets 不相交时独立 quarantine，重叠集合通过 removal DAG 提升或合并
+- app-owned host components、pre-existing child identity、relationship 与 relative order 全部不变
+- entering staging 的 hook/observer writes 与 post-write validation 在 read-only switch preflight 前完成，以 schedule-boundary World evidence 和 counters 证明 preflight zero mutation，`Ready` atomic tail 无 insert/remove/despawn/relationship write/hook/observer，也无 refreeze、query、fallible validation 或 reclassification
+- post-commit cleanup 覆盖 foreign child、foreign component、protected parent 与 cleanup hook/observer reentry
+- 每次 cleanup hook/observer-capable mutation 后逐次重建 observed relationship closure 与 target/protected partition 并复验，drift 以更高 revision attempt supersede old versioned attempt，old attempt 只保留已完成且可验证的 receipts，不得继续 mutation 或 settle new attempt，也不得重复 obligation/receipt 或改写 app-owned state
+- Task 6 明确排除 post-commit host/registration loss、ledger transfer 与 severe Recovery terminal
+- cleanup identity matrix 覆盖 zero obligation、partial settlement、duplicate receipt、wrong batch/request/transaction/epoch、unknown obligation、unknown token、superseded attempt 与 completion replay
+- Core token/completion 复用既有证据，不重复新增同层测试
+- ECS table matrix 对 attempt、receipt、obligation 与 binding 的接受和拒绝逐项作证，每种拒绝均为 ledger 与 World zero mutation
+- 至少一个 scheduled cross-layer request-to-settler journey 证明 batch/request/epoch binding，错误 binding 下 request/history 不推进，settlement 后额外 update 不重放
+- 扩展现有 nested DefaultPlugins fixture，证明 new active primitive 有 reachable Node layout，最终 hover 与 target-event delivery 只到 new active primitive，不要求 raw backend hits 排除 pending 或 leaving candidates
+
+Focused commands
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib navigation::tests::reconciliation_ -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib presentation::tests::reconciliation_ -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib cleanup::tests::reconciliation_ -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --all-features --lib audit::tests::reconciliation_ -j 1
 ```
 
 - [ ] **Step 2: Run affected crate gates and review**
@@ -468,9 +492,15 @@ cargo fmt --all -- --check
 git diff --check
 ```
 
-Expected: physical tests pass，authority仍为23/23/23
+Expected: physical tests pass，authority 仍为 `23/23/23`
 
-Review gate: real World evidence覆盖每个slot role与三closure，不用snapshot替代exact Entity事实
+Review gate
+
+- real World evidence 分别覆盖每个 slot role、preserved protected closure、authorized leaving/entering target 与其他 protected non-target partition
+- authorized targets 与 preserved protected closure、其他 protected non-target partition 保持不相交，所有 mutation 都在 allowed write set 内
+- read-only preflight 为 zero mutation，`Ready` atomic publication tail 仅有 no-hook in-place mutation，且无 refreeze、query、fallible validation 或 reclassification
+- versioned cleanup attempts 正确 supersede，scheduled binding 与 cleanup rejection 均无重复或越权 mutation
+- independent audit mapping 由 exact World 与 registry facts 推导，不由 receipt 或 snapshot 代替
 
 ```powershell
 git add -- crates/bevy_ui_router_ecs/src/navigation.rs crates/bevy_ui_router_ecs/src/presentation.rs crates/bevy_ui_router_ecs/src/cleanup.rs crates/bevy_ui_router_ecs/src/audit.rs
@@ -602,7 +632,7 @@ Expected: Reconciliation PASS与未完成的 History、Recovery、Authority clos
 ## Plan review checklist
 
 - [ ] profile `47da839` tracked and plan committed before Task 1
-- [ ] every task has RED、GREEN、review gate and exact commit boundary
+- [ ] production behavior change has RED/GREEN，coverage-only/docs use evidence/gate，every task still has a review gate and exact commit boundary
 - [ ] logical frame/slot roles remain Core-owned
 - [ ] exact Entity、manifest、ledger与receipt remain ECS-owned
 - [ ] empty slot survives truncate and can be reactivated without identity reuse
