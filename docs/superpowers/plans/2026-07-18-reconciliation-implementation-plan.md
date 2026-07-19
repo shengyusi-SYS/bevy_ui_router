@@ -93,7 +93,7 @@ Expected: contract与plan均已单独提交，worktree clean，workspace check e
 - running-time active baseline validation
 - ordinary、fragment、equivalent、append、truncate、suffix replace分类
 
-- [ ] **Step 1: Write RED tests**
+- [x] **Step 1: Write RED tests**
 
 Add Core tests for
 
@@ -113,7 +113,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core -
 
 Expected RED: new assertions fail because runtime still schedules from branch index 0 and does not retain empty slot bindings
 
-- [ ] **Step 2: Implement the private projection**
+- [x] **Step 2: Implement the private projection**
 
 Requirements
 
@@ -125,7 +125,7 @@ Requirements
 - fragment delta overrides all-preserved `BranchDiff` result at deepest leaf
 - fail active baseline drift before issuing a task or commit ticket
 
-- [ ] **Step 3: Verify and review**
+- [x] **Step 3: Verify and review**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib engine::tests::reconciliation_projection_ -j 1
@@ -162,7 +162,7 @@ git commit -m "feat(core): plan slot-aware reconciliation"
 - leaving-only logical cleanup roots
 - exact failure and history ordering
 
-- [ ] **Step 1: Write RED tests**
+- [x] **Step 1: Write RED tests**
 
 Add tests for
 
@@ -182,7 +182,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core -
 
 Expected RED: current engine cannot issue a task directly into a preserved registered slot and still replaces the full branch
 
-- [ ] **Step 2: Implement scheduling**
+- [x] **Step 2: Implement scheduling**
 
 Requirements
 
@@ -194,7 +194,7 @@ Requirements
 - publish complete spliced active branch through the existing prepared commit
 - equivalent and truncate still consume a sealed commit ticket
 
-- [ ] **Step 3: Verify and review**
+- [x] **Step 3: Verify and review**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib engine::tests::reconciliation_ -j 1
@@ -229,7 +229,7 @@ git commit -m "feat(core): schedule reconciled suffixes"
 - exact slot-role lifecycle plans
 - infallible branch splice after preflight
 
-- [ ] **Step 1: Write data-structure RED tests**
+- [x] **Step 1: Write data-structure RED tests**
 
 Cover
 
@@ -246,7 +246,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 
 Expected RED: `RealizedBranch` and `PendingCommit` still model whole-active replacement only
 
-- [ ] **Step 2: Implement sealed splice structures**
+- [x] **Step 2: Implement sealed splice structures**
 
 Requirements
 
@@ -256,7 +256,7 @@ Requirements
 - precompute lifecycle transitions and claim rebinds
 - splice consumes validated plans once
 
-- [ ] **Step 3: Verify and review**
+- [x] **Step 3: Verify and review**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib branch_transaction::tests:: -j 1
@@ -298,7 +298,7 @@ git commit -m "feat(ecs): model preserved branch splices"
 - consuming rejection that restores old active and pending entering owners
 - role-sensitive claim rebind for frames and registered child slots
 
-- [ ] **Step 1: Write RED tests**
+- [x] **Step 1: Write RED tests**
 
 Cover Journey B commit schedule and each slot role
 
@@ -315,7 +315,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 
 Expected RED: commit currently takes the whole active branch and rebases a whole entering branch
 
-- [ ] **Step 2: Implement apply and preflight**
+- [x] **Step 2: Implement apply and preflight**
 
 Preflight must verify
 
@@ -335,7 +335,7 @@ Commit order
 4. atomically splice registry/branch/gate state
 5. invoke the existing Core prepared publication
 
-- [ ] **Step 3: Verify and review**
+- [x] **Step 3: Verify and review**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib navigation::tests::reconciliation_commit_ -j 1
@@ -376,7 +376,7 @@ git commit -m "feat(ecs): commit reconciled suffixes atomically"
 - `RecoveringAuthority` settlement with exact terminal order
 - active clear and existing full admission rerun without navigation replay
 
-- [ ] **Step 1: Write RED tests**
+- [x] **Step 1: Write RED tests**
 
 Cover
 
@@ -396,7 +396,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 
 Expected RED: current active preflight failure only restores pending work and retries
 
-- [ ] **Step 2: Implement the narrow settlement**
+- [x] **Step 2: Implement the narrow settlement**
 
 Requirements
 
@@ -406,7 +406,7 @@ Requirements
 - map invalid registration/topology/admission failure to existing `Unavailable` reasons
 - keep complete Recovery behavior out of scope
 
-- [ ] **Step 3: Verify and review**
+- [x] **Step 3: Verify and review**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib engine::tests::reconciliation_authority_loss_ -j 1
