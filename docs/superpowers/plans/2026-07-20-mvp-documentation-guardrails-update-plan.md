@@ -2,7 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** executing，Tasks 1–2 complete，Task 3 review fixes in progress
+**Status:** Complete
+
+**Implementation commits:** `bcef428`、`bb4fabe`、`7eefc02`、`a737923`
+
+**Final reviews:** 规范质量 PASS、事实一致性 PASS、跨模块架构 PASS
 
 **Goal:** 沉淀后续 MVP 切片可复用的 authority 与验收护栏，并把 tracked 文档更新到 Reconciliation Task 5 的真实 checkpoint
 
@@ -210,11 +214,11 @@ Expected: checkpoint 与剩余顺序在四份文档一致；`Reconciliation PASS
 架构审查: 是否保持单一 publisher、Core/ECS authority 分层且未提前实现 Recovery
 ```
 
-- [ ] **Step 2: 修正全部 Critical 与 Important finding**
+- [x] **Step 2: 修正全部 Critical 与 Important finding**
 
 只修改计划列出的文档，修正后由原职责 reviewer 复审
 
-- [ ] **Step 3: 运行最终文档门禁**
+- [x] **Step 3: 运行最终文档门禁**
 
 Run:
 
@@ -226,13 +230,12 @@ git diff --name-only
 
 Expected: 只出现计划列出的 tracked Markdown 文件，无 staged 文件，无 whitespace error
 
-- [ ] **Step 4: 精确暂存并提交**
+- [x] **Step 4: 精确暂存并提交已分步完成**
 
-```powershell
-git add -- AGENTS.md docs/implementation-goals.md docs/authority-transition-matrix.md docs/current-architecture.md docs/roadmap.md docs/reconciliation-contract-profile.md docs/superpowers/plans/2026-07-18-reconciliation-implementation-plan.md docs/superpowers/plans/2026-07-20-mvp-documentation-guardrails-update-plan.md
-git diff --cached --name-only
-git diff --cached --check
-git commit -m "docs: refresh reconciliation execution guardrails"
-```
+提交边界
 
-Expected: staged 集合与上述八份文件完全一致，commit 成功，worktree clean
+- `bcef428`：通用 lifecycle evidence 护栏
+- `bb4fabe`：Reconciliation Task 5 事实 checkpoint
+- `7eefc02`：Tasks 1–5 checkbox 一致性修正
+- `a737923`：target partition、atomic-tail 与非规范记录修正
+- 本文状态由其所在 closeout commit 闭合
