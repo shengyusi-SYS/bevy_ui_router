@@ -516,6 +516,7 @@ git commit -m "test(ecs): prove reconciliation physical lifecycle"
 **Files**
 
 - Modify: `crates/bevy_ui_router_core/src/engine.rs`
+- Modify: `crates/bevy_ui_router_core/src/integration.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/branch_transaction.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/authority_regression_tests.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/navigation.rs`
@@ -541,6 +542,8 @@ The full public journey target exposed an implementation gap in the current base
 - correct the conflicting Core tests and add focused ECS regressions proving
   - official-schedule fallback commit、old-branch cleanup、terminal ordering and no replay
   - an existing-active normal `MatchedRoute` task cannot enter projectionless replacement and leaves active/registry/input/history/Core publication unchanged
+  - a real fallback task mount-target host/slot mismatch is rejected through the actual admission comparison; any test-support seam may alter only the task target and must not bypass the production predicate
+  - that seam is `#[doc(hidden)]` plus `#[cfg(any(test, feature = "test-support"))]`, can replace only a `RootFrameTask` mount target, cannot alter request、frame、origin、generation、identity or capability, and is never called by production code
   - permanent fallback replacement drift enters one fail-closed residual without publication、out-of-scope writes or replay
   - a valid active branch containing retained-empty slots preserves their exact `PreparedInert -> Leaving` transition before exact receipt removal
   - fallback entering drift publishes no fallback, settles only pending receipts, preserves old active/history/registry/World exactly and reaches one `RecoveryFailed` terminal
@@ -577,7 +580,7 @@ git diff --check
 Commit the prerequisite separately before continuing Task 7 evidence
 
 ```powershell
-git add -- crates/bevy_ui_router_core/src/engine.rs crates/bevy_ui_router_ecs/src/branch_transaction.rs crates/bevy_ui_router_ecs/src/authority_regression_tests.rs crates/bevy_ui_router_ecs/src/navigation.rs
+git add -- crates/bevy_ui_router_core/src/engine.rs crates/bevy_ui_router_core/src/integration.rs crates/bevy_ui_router_ecs/src/branch_transaction.rs crates/bevy_ui_router_ecs/src/authority_regression_tests.rs crates/bevy_ui_router_ecs/src/navigation.rs
 git diff --cached --name-only
 git diff --cached --check
 git commit -m "fix: preserve root fallback after failure cleanup"
