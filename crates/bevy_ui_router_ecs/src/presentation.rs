@@ -4029,7 +4029,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn nested_node_ancestry_runs_real_layout_and_picking_pipeline() {
+    fn reconciliation_nested_default_plugins_reaches_layout_hover_and_target_delivery() {
         let mut app = App::new();
         app.add_plugins(DefaultPlugins);
         app.add_plugins(BevyUiRouterPlugin::default());

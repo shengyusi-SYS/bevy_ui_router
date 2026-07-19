@@ -2139,7 +2139,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_retains_removed_state_after_real_root_cleanup() {
+    fn reconciliation_audit_derives_removed_from_exact_world_and_registry_absence() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
         let driver = ViewDriverKey::new("audit-cleanup-driver").unwrap();

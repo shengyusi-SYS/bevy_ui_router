@@ -4651,6 +4651,8 @@ fn refresh_authority_audits(_world: &mut World) {}
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[cfg(feature = "test-support")]
+    use crate::audit::RouterAuthorityAudits;
     use crate::{
         app_ext::{AppRouterExt, RouterConfig, RouterHostRegistration},
         cleanup::{
@@ -4659,7 +4661,7 @@ pub(crate) mod tests {
             CleanupPostcheckDrift, CleanupPostcheckPhase, FailedBoundaryExpectation,
         },
         components::{
-            ChildSlotAuthorityProbe, ChildSlotBarrierProbe, ChildSlotLifecycle,
+            ChildSlotAuthority, ChildSlotAuthorityProbe, ChildSlotBarrierProbe, ChildSlotLifecycle,
             ProvisionalPostWriteProbe, ProvisionalSlotLifecycle, RouteOwnershipSeal,
             RouterInputBarrier,
         },
@@ -5098,6 +5100,12 @@ pub(crate) mod tests {
         order: Vec<NestedCommitOrder>,
     }
 
+    #[derive(Resource, Default)]
+    struct MountNewRoleScheduleProbe {
+        armed: bool,
+        roles: Option<Vec<bevy_ui_router_core::integration::ReconciliationChildSlotRoleKind>>,
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum NestedCleanupUnit {
         ChildFrame,
@@ -5429,6 +5437,100 @@ pub(crate) mod tests {
         assert!(entry.cleanup_ledger.is_none());
     }
 
+    fn run_updates_until_succeeded(app: &mut App, request: NavigationRequestId) {
+        for _ in 0..8 {
+            app.update();
+            if app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .any(|entry| {
+                    entry
+                        .engine
+                        .request(request)
+                        .is_some_and(|request| matches!(request.status(), RequestStatus::Succeeded))
+                })
+            {
+                return;
+            }
+        }
+        panic!("scheduled navigation request did not succeed within eight updates");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_reconciliation_child_slot_state(
+        world: &World,
+        child_slot: &crate::mount::MountedChildSlot,
+        baseline: &ExactRegistryClaim,
+        logical_parent: &RouteFrameVersion,
+        anchor: Entity,
+        physical_parent: Entity,
+        parent_children: &[Entity],
+        lifecycle: EntityLifecycle,
+        slot_lifecycle: ChildSlotLifecycle,
+        visibility: Visibility,
+    ) -> ExactRegistryClaim {
+        assert_eq!(child_slot.slot(), baseline.entity());
+        assert_eq!(child_slot.parent(), logical_parent);
+        assert_eq!(child_slot.anchor(), anchor);
+        let claim = child_slot.slot_claim().clone();
+        assert_eq!(claim.entity(), baseline.entity());
+        assert_eq!(claim.owner(), baseline.owner());
+        assert_eq!(claim.seal(), baseline.seal());
+        assert_eq!(claim.lifecycle(), lifecycle);
+        assert_eq!(
+            world
+                .get::<RouteOwnershipSeal>(claim.entity())
+                .copied()
+                .map(RouteOwnershipSeal::seal),
+            Some(claim.seal())
+        );
+        let authority = world
+            .get::<ChildSlotAuthority>(claim.entity())
+            .expect("mounted child slot retains its exact authority binding");
+        assert_eq!(authority.parent(), child_slot.parent());
+        assert_eq!(authority.outlet(), child_slot.outlet());
+        assert_eq!(authority.slot(), child_slot.slot_id());
+        assert_eq!(
+            world
+                .resource::<RouteEntityRegistry>()
+                .record(claim.entity())
+                .map(|record| record.claim()),
+            Some(claim.clone())
+        );
+        assert_eq!(
+            world.get::<ChildSlotLifecycle>(claim.entity()),
+            Some(&slot_lifecycle)
+        );
+        assert_eq!(world.get::<Visibility>(claim.entity()), Some(&visibility));
+        assert_eq!(
+            world.get::<Pickable>(claim.entity()),
+            Some(&Pickable::IGNORE)
+        );
+        assert!(
+            world
+                .get::<RouterInputBarrier>(claim.entity())
+                .is_some_and(RouterInputBarrier::denies_all)
+        );
+        let gate = world.resource::<RouterInputGate>();
+        assert!(!gate.allows_pointer(claim.entity()));
+        assert!(!gate.allows_keyboard(claim.entity()));
+        assert!(!gate.allows_gamepad(claim.entity()));
+        assert_eq!(
+            world.get::<ChildOf>(claim.entity()).map(ChildOf::parent),
+            Some(physical_parent)
+        );
+        assert_eq!(
+            world
+                .get::<Children>(physical_parent)
+                .map(|children| children.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            parent_children
+        );
+        claim
+    }
+
     #[derive(Clone, Copy)]
     enum ChildSlotBoundaryDrift {
         ForeignComponent,
@@ -5497,7 +5599,7 @@ pub(crate) mod tests {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
         let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let router = install_nested_router(&mut app, observed, true);
+        let router = install_nested_router(&mut app, observed.clone(), true);
         observe_authority_system(app.world_mut());
         app.world_mut()
             .resource_mut::<RouterNavigation>()
@@ -7984,12 +8086,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn nested_commit_schedule_probe_is_old_then_atomic_suffix_splice() {
-        let source = include_str!("navigation.rs");
-        assert!(!source.contains(concat!(
-            "old_shells.into_iter().rev()",
-            ".map(NestedCommitOrder::Leaving)"
-        )));
+    fn reconciliation_journey_b_schedule_probe_is_old_then_atomic_suffix_splice() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default())
             .init_resource::<NestedCommitScheduleProbe>()
@@ -8124,6 +8221,445 @@ pub(crate) mod tests {
                 .current(),
             Some(&new_location)
         );
+    }
+
+    #[test]
+    fn reconciliation_journey_b_official_schedule_preserves_prefix_and_settles_once() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        let host = app
+            .world()
+            .iter_entities()
+            .find(|entity| {
+                entity
+                    .get::<RouterHostRegistration>()
+                    .is_some_and(|registration| registration.router() == router)
+            })
+            .unwrap()
+            .id();
+        app.world_mut()
+            .entity_mut(host)
+            .insert(NestedAppHostSentinel(0xB));
+        let sentinel = app.world_mut().spawn(NestedAppHostSentinel(0xB1)).id();
+        app.world_mut().entity_mut(host).add_child(sentinel);
+
+        app.update();
+        let initial = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        run_updates_until_succeeded(&mut app, initial);
+
+        let (
+            preserved_frame,
+            preserved_shell,
+            preserved_claims,
+            preserved_relationships,
+            preserved_outlet_anchor,
+            preserved_slot,
+            _preserved_slot_id,
+            preserved_slot_claim,
+            preserved_slot_parent,
+            _preserved_slot_outlet,
+            preserved_slot_anchor,
+            preserved_slot_child_of,
+            preserved_slot_parent_children,
+            old_leaf_claims,
+            old_leaf_focus,
+            host_before,
+            sentinel_before,
+        ) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let active = navigation.entries[0].active.as_ref().unwrap();
+            let preserved = &active.frames()[0];
+            let slot = &active.child_slots()[0];
+            let slot_parent = app
+                .world()
+                .get::<ChildOf>(slot.slot())
+                .expect("active child slot has an exact physical parent")
+                .parent();
+            let claims = preserved.claims().cloned().collect::<Vec<_>>();
+            let relationships = claims
+                .iter()
+                .map(|claim| {
+                    (
+                        claim.entity(),
+                        app.world()
+                            .get::<ChildOf>(claim.entity())
+                            .map(ChildOf::parent),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (
+                preserved.frame().clone(),
+                preserved.shell(),
+                claims,
+                relationships,
+                preserved.outlets()[0].anchor(),
+                slot.slot(),
+                slot.slot_id(),
+                slot.slot_claim().clone(),
+                slot.parent().clone(),
+                slot.outlet().clone(),
+                slot.anchor(),
+                Some(slot_parent),
+                app.world()
+                    .get::<Children>(slot_parent)
+                    .map(|children| children.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                active.frames()[1].claims().cloned().collect::<Vec<_>>(),
+                active.frames()[1].interactive_entities()[0],
+                nested_protected_fingerprint(app.world(), host),
+                nested_protected_fingerprint(app.world(), sentinel),
+            )
+        };
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(old_leaf_focus);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(old_leaf_focus));
+
+        let replacement = RouteLocation::new("/items/2");
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, replacement.clone())
+            .unwrap();
+        run_updates_until_succeeded(&mut app, request);
+
+        #[cfg(feature = "test-support")]
+        {
+            observe_authority_system(app.world_mut());
+            let audits = app.world().resource::<RouterAuthorityAudits>();
+            let audit = audits.get(router).unwrap();
+            assert!(audit.orphan_slots().is_empty());
+            let slot = audit
+                .slots()
+                .iter()
+                .find(|slot| slot.id() == _preserved_slot_id)
+                .expect("preserved child slot remains in the private authority audit");
+            assert_eq!(slot.parent_frame(), Some(&preserved_slot_parent));
+            assert_eq!(slot.outlet(), Some(&_preserved_slot_outlet));
+        }
+
+        let (trace_after, history_after, active_claims_after, active_facts_after) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let request_view = entry.engine.request(request).unwrap();
+            assert!(matches!(request_view.status(), RequestStatus::Succeeded));
+            let active = entry.active.as_ref().unwrap();
+            assert_eq!(active.frames().len(), 2);
+            assert_eq!(active.child_slots().len(), 1);
+            assert_eq!(active.frames()[0].frame(), &preserved_frame);
+            assert_eq!(active.frames()[0].shell(), preserved_shell);
+            assert_eq!(
+                active.frames()[0].outlets()[0].anchor(),
+                preserved_outlet_anchor
+            );
+            assert_eq!(active.child_slots()[0].slot(), preserved_slot);
+            assert_eq!(active.child_slots()[0].slot_claim(), &preserved_slot_claim);
+            assert_eq!(active.child_slots()[0].parent(), &preserved_slot_parent);
+            assert_eq!(active.child_slots()[0].anchor(), preserved_slot_anchor);
+            assert_eq!(
+                app.world()
+                    .get::<ChildOf>(preserved_slot)
+                    .map(ChildOf::parent),
+                preserved_slot_child_of
+            );
+            assert_eq!(
+                app.world()
+                    .get::<Children>(preserved_slot_child_of.unwrap())
+                    .map(|children| children.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                preserved_slot_parent_children
+            );
+            assert!(preserved_claims.iter().all(|claim| {
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(claim.entity())
+                    .is_some_and(|record| record.claim() == *claim)
+            }));
+            assert_eq!(
+                preserved_relationships,
+                preserved_claims
+                    .iter()
+                    .map(|claim| {
+                        (
+                            claim.entity(),
+                            app.world()
+                                .get::<ChildOf>(claim.entity())
+                                .map(ChildOf::parent),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            );
+            assert!(old_leaf_claims.iter().all(|claim| {
+                app.world().get_entity(claim.entity()).is_err()
+                    && app
+                        .world()
+                        .resource::<RouteEntityRegistry>()
+                        .record(claim.entity())
+                        .is_none()
+            }));
+            assert_eq!(
+                request_view
+                    .trace()
+                    .iter()
+                    .filter_map(|event| event.cleanup_disposition())
+                    .collect::<Vec<_>>(),
+                vec![
+                    bevy_ui_router_core::prelude::CleanupDisposition::Removed;
+                    old_leaf_claims.len()
+                ]
+            );
+            assert_eq!(entry.engine.history().len(), 2);
+            assert_eq!(entry.engine.history().current(), Some(&replacement));
+            assert!(entry.cleanup_ledger.is_none());
+            assert_eq!(app.world().resource::<InputFocus>().get(), None);
+            assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+            assert_eq!(nested_protected_fingerprint(app.world(), host), host_before);
+            assert_eq!(
+                nested_protected_fingerprint(app.world(), sentinel),
+                sentinel_before
+            );
+            let active_claims = active.claims().cloned().collect::<Vec<_>>();
+            let mut related = active_claims
+                .iter()
+                .map(ExactRegistryClaim::entity)
+                .collect::<Vec<_>>();
+            if !related.contains(&preserved_slot) {
+                related.push(preserved_slot);
+            }
+            let active_facts = related
+                .into_iter()
+                .map(|entity| {
+                    (
+                        entity,
+                        app.world()
+                            .resource::<RouteEntityRegistry>()
+                            .record(entity)
+                            .map(|record| record.claim()),
+                        nested_protected_fingerprint(app.world(), entity),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (
+                request_view.trace().to_vec(),
+                entry.engine.history().clone(),
+                active_claims,
+                active_facts,
+            )
+        };
+
+        app.update();
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(entry.engine.request(request).unwrap().trace(), trace_after);
+        assert_eq!(entry.engine.history(), &history_after);
+        assert_eq!(
+            entry
+                .active
+                .as_ref()
+                .unwrap()
+                .claims()
+                .cloned()
+                .collect::<Vec<_>>(),
+            active_claims_after
+        );
+        assert_eq!(
+            active_facts_after,
+            active_facts_after
+                .iter()
+                .map(|(entity, _, _)| {
+                    (
+                        *entity,
+                        app.world()
+                            .resource::<RouteEntityRegistry>()
+                            .record(*entity)
+                            .map(|record| record.claim()),
+                        nested_protected_fingerprint(app.world(), *entity),
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(old_leaf_claims.iter().all(|claim| {
+            app.world().get_entity(claim.entity()).is_err()
+                && app
+                    .world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(claim.entity())
+                    .is_none()
+        }));
+        assert_eq!(nested_protected_fingerprint(app.world(), host), host_before);
+        assert_eq!(
+            nested_protected_fingerprint(app.world(), sentinel),
+            sentinel_before
+        );
+    }
+
+    #[test]
+    fn reconciliation_scheduled_mount_new_retain_empty_and_activate_existing_reuse_exact_slot() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default())
+            .init_resource::<MountNewRoleScheduleProbe>()
+            .add_systems(
+                Update,
+                observe_mount_new_role_before_commit
+                    .after(RouterScheduleSet::DriveNavigation)
+                    .before(RouterScheduleSet::CommitPresentation),
+            );
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+
+        let prefix = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        run_updates_until_succeeded(&mut app, prefix);
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let active = entry.active.as_ref().unwrap();
+            assert_eq!(active.frames().len(), 1);
+            assert!(active.child_slots().is_empty());
+        }
+        app.world_mut()
+            .resource_mut::<MountNewRoleScheduleProbe>()
+            .armed = true;
+
+        let mounted = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        run_updates_until_succeeded(&mut app, mounted);
+        assert_eq!(
+            app.world().resource::<MountNewRoleScheduleProbe>().roles,
+            Some(vec![
+                bevy_ui_router_core::integration::ReconciliationChildSlotRoleKind::MountNew
+            ])
+        );
+        let (
+            slot,
+            mounted_claim,
+            logical_parent,
+            anchor,
+            physical_parent,
+            parent_children,
+            leaf_focus,
+        ) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let active = entry.active.as_ref().unwrap();
+            let child_slot = &active.child_slots()[0];
+            let mounted_claim = child_slot.slot_claim().clone();
+            let logical_parent = child_slot.parent().clone();
+            let anchor = child_slot.anchor();
+            let physical_parent = app
+                .world()
+                .get::<ChildOf>(child_slot.slot())
+                .unwrap()
+                .parent();
+            let parent_children = app
+                .world()
+                .get::<Children>(physical_parent)
+                .map(|children| children.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let mounted_claim = assert_reconciliation_child_slot_state(
+                app.world(),
+                child_slot,
+                &mounted_claim,
+                &logical_parent,
+                anchor,
+                physical_parent,
+                &parent_children,
+                EntityLifecycle::Active,
+                ChildSlotLifecycle::Active,
+                Visibility::Visible,
+            );
+            (
+                child_slot.slot(),
+                mounted_claim,
+                logical_parent,
+                anchor,
+                physical_parent,
+                parent_children,
+                active.frames()[1].interactive_entities()[0],
+            )
+        };
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(leaf_focus);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(leaf_focus));
+
+        let truncated = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        run_updates_until_succeeded(&mut app, truncated);
+        let retained_claim = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let active = entry.active.as_ref().unwrap();
+            let child_slot = &active.child_slots()[0];
+            let claim = assert_reconciliation_child_slot_state(
+                app.world(),
+                child_slot,
+                &mounted_claim,
+                &logical_parent,
+                anchor,
+                physical_parent,
+                &parent_children,
+                EntityLifecycle::PreparedInert,
+                ChildSlotLifecycle::RegisteredInert,
+                Visibility::Hidden,
+            );
+            assert_eq!(app.world().resource::<InputFocus>().get(), None);
+            assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+            assert!(entry.cleanup_ledger.is_none());
+            claim
+        };
+
+        let activated = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/2"))
+            .unwrap();
+        run_updates_until_succeeded(&mut app, activated);
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let active = entry.active.as_ref().unwrap();
+        let child_slot = &active.child_slots()[0];
+        assert_reconciliation_child_slot_state(
+            app.world(),
+            child_slot,
+            &retained_claim,
+            &logical_parent,
+            anchor,
+            physical_parent,
+            &parent_children,
+            EntityLifecycle::Active,
+            ChildSlotLifecycle::Active,
+            Visibility::Visible,
+        );
+        let child_shell = active.frames()[1].shell();
+        assert_eq!(
+            app.world().get::<ChildOf>(child_shell).map(ChildOf::parent),
+            Some(slot)
+        );
+        assert_eq!(
+            app.world().get::<Children>(slot).map(|children| children
+                .iter()
+                .filter(|entity| **entity == child_shell)
+                .count()),
+            Some(1)
+        );
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        assert!(entry.cleanup_ledger.is_none());
     }
 
     #[test]
@@ -8506,7 +9042,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn nested_replacement_switches_the_whole_branch_and_releases_child_focus() {
+    fn reconciliation_suffix_replace_preserves_prefix_and_releases_child_focus() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
         let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -8673,11 +9209,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn nested_fragment_push_splices_only_the_projected_suffix() {
+    fn reconciliation_fragment_splices_once_with_same_frame_and_next_generation() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
         let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let router = install_nested_router(&mut app, observed, true);
+        let router = install_nested_router(&mut app, observed.clone(), true);
         app.update();
         commit_initial_nested_branch(&mut app, router);
         let (
@@ -8687,6 +9223,7 @@ pub(crate) mod tests {
             leaving_frame,
             preserved_slot_claim,
             history_len_before,
+            effect_count_before,
         ) = {
             let navigation = app.world().resource::<RouterNavigation>();
             let entry = &navigation.entries[0];
@@ -8701,20 +9238,49 @@ pub(crate) mod tests {
                 old.frames()[1].frame().clone(),
                 old.child_slots()[0].slot_claim().clone(),
                 entry.engine.history().len(),
+                observed.lock().unwrap().len(),
             )
         };
         let replacement = RouteLocation::new("/items/1").with_fragment("details");
 
         let request = prepare_nested_branch_for_commit(&mut app, router, replacement.clone());
-        let entering_claims = app.world().resource::<RouterNavigation>().entries[0]
-            .pending_commit
-            .as_ref()
-            .unwrap()
-            .branch
-            .as_realized()
-            .claims()
-            .cloned()
-            .collect::<Vec<_>>();
+        let (entering_claims, sealed_entering, pending_entering) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let pending = entry.pending_commit.as_ref().unwrap();
+            let projection = match (pending.ticket.as_ref(), pending.final_task.as_ref()) {
+                (Some(ticket), _) => entry
+                    .engine
+                    .reconciliation_projection_for_commit(ticket)
+                    .unwrap(),
+                (None, Some(task)) => entry
+                    .engine
+                    .reconciliation_projection_for_task(task)
+                    .unwrap(),
+                (None, None) => panic!("fragment request retains a sealed projection"),
+            };
+            assert_eq!(projection.entering().len(), 1);
+            let entering = projection.entering().next().unwrap();
+            let sealed = (entering.frame(), entering.generation(), entering.slot());
+            let pending_identity = pending.branch.frames()[0].frame().clone();
+            assert_eq!(pending_identity.frame(), sealed.0);
+            assert_eq!(pending_identity.generation(), sealed.1);
+            assert_eq!(
+                sealed.2,
+                bevy_ui_router_core::integration::ReconciliationEnteringSlotKind::Existing(
+                    pending_identity.slot()
+                )
+            );
+            (
+                pending
+                    .branch
+                    .as_realized()
+                    .claims()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                sealed,
+                pending_identity,
+            )
+        };
         commit_presentation_system(app.world_mut());
 
         {
@@ -8723,6 +9289,20 @@ pub(crate) mod tests {
             let active = entry.active.as_ref().unwrap();
             assert_eq!(active.frames()[0].shell(), old_frames[0]);
             assert_ne!(active.frames()[1].shell(), old_frames[1]);
+            assert_eq!(active.frames()[1].frame(), &pending_entering);
+            assert_eq!(active.frames()[1].frame().frame(), sealed_entering.0);
+            assert_eq!(active.frames()[1].frame().generation(), sealed_entering.1);
+            assert_eq!(
+                sealed_entering.2,
+                bevy_ui_router_core::integration::ReconciliationEnteringSlotKind::Existing(
+                    active.frames()[1].frame().slot()
+                )
+            );
+            assert_eq!(active.frames()[1].frame().frame(), leaving_frame.frame());
+            assert_eq!(
+                active.frames()[1].frame().generation().raw(),
+                leaving_frame.generation().raw() + 1
+            );
             assert_eq!(
                 active.child_slots()[0].slot(),
                 preserved_slot_claim.entity()
@@ -8818,10 +9398,15 @@ pub(crate) mod tests {
         );
         assert_eq!(entry.engine.history().len(), history_len_before + 1);
         assert_eq!(entry.engine.history().current(), Some(&replacement));
+        assert_eq!(observed.lock().unwrap().len(), effect_count_before + 1);
+        assert_eq!(
+            observed.lock().unwrap().last(),
+            Some(&RouteViewKey::new("item").unwrap())
+        );
     }
 
     #[test]
-    fn nested_truncate_retain_empty_commits_once_without_retry() {
+    fn reconciliation_truncate_retain_empty_commits_once_without_retry() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
         let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -8863,11 +9448,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn repeated_nested_truncate_is_a_sealed_retain_empty_no_op() {
+    fn reconciliation_equivalent_retained_empty_is_physical_no_op() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
         let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let router = install_nested_router(&mut app, observed, true);
+        let router = install_nested_router(&mut app, observed.clone(), true);
         app.update();
         commit_initial_nested_branch(&mut app, router);
         let truncated = RouteLocation::new("/");
@@ -8876,7 +9461,18 @@ pub(crate) mod tests {
         commit_presentation_system(app.world_mut());
         settle_cleanup_system(app.world_mut());
 
-        let (frame_before, shell_before, slot_before, claims_before, history_len_before) = {
+        let (
+            frame_before,
+            shell_before,
+            slot_before,
+            claims_before,
+            exact_claims_before,
+            physical_facts_before,
+            input_focus_before,
+            route_focus_before,
+            effect_count_before,
+            history_len_before,
+        ) = {
             let entry = &app.world().resource::<RouterNavigation>().entries[0];
             assert!(matches!(
                 entry.engine.request(first).unwrap().status(),
@@ -8889,16 +9485,58 @@ pub(crate) mod tests {
                 active.child_slots()[0].slot_claim().lifecycle(),
                 EntityLifecycle::PreparedInert
             );
+            let claims = active.claims().cloned().collect::<Vec<_>>();
+            let entities = claims
+                .iter()
+                .map(ExactRegistryClaim::entity)
+                .collect::<Vec<_>>();
             (
                 active.frames()[0].frame().clone(),
                 active.frames()[0].shell(),
                 active.child_slots()[0].clone_for_test(),
-                active.claims().cloned().collect::<Vec<_>>(),
+                claims,
+                entities
+                    .iter()
+                    .map(|entity| {
+                        (
+                            *entity,
+                            app.world()
+                                .resource::<RouteEntityRegistry>()
+                                .record(*entity)
+                                .map(|record| record.claim()),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                entities
+                    .iter()
+                    .map(|entity| nested_protected_fingerprint(app.world(), *entity))
+                    .collect::<Vec<_>>(),
+                app.world().resource::<InputFocus>().get(),
+                app.world().resource::<RouteFocusState>().focused(),
+                observed.lock().unwrap().len(),
                 entry.engine.history().len(),
             )
         };
 
         let repeated = prepare_nested_branch_for_commit(&mut app, router, truncated.clone());
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let pending = entry.pending_commit.as_ref().unwrap();
+            let projection = match (pending.ticket.as_ref(), pending.final_task.as_ref()) {
+                (Some(ticket), _) => entry
+                    .engine
+                    .reconciliation_projection_for_commit(ticket)
+                    .unwrap(),
+                (None, Some(task)) => entry
+                    .engine
+                    .reconciliation_projection_for_task(task)
+                    .unwrap(),
+                (None, None) => panic!("equivalent request retains a sealed projection"),
+            };
+            assert_eq!(projection.entering().len(), 0);
+            assert_eq!(projection.leaving().len(), 0);
+            assert!(entry.cleanup_ledger.is_none());
+        }
         arm_test_commit_mutation_trace();
         commit_presentation_system(app.world_mut());
         assert_eq!(
@@ -8942,6 +9580,38 @@ pub(crate) mod tests {
                 EntityLifecycle::PreparedInert,
             )),
         );
+        assert_eq!(
+            exact_claims_before,
+            exact_claims_before
+                .iter()
+                .map(|(entity, _)| {
+                    (
+                        *entity,
+                        app.world()
+                            .resource::<RouteEntityRegistry>()
+                            .record(*entity)
+                            .map(|record| record.claim()),
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            physical_facts_before,
+            exact_claims_before
+                .iter()
+                .map(|(entity, _)| nested_protected_fingerprint(app.world(), *entity))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            app.world().resource::<InputFocus>().get(),
+            input_focus_before
+        );
+        assert_eq!(
+            app.world().resource::<RouteFocusState>().focused(),
+            route_focus_before
+        );
+        assert_eq!(observed.lock().unwrap().len(), effect_count_before);
+        assert!(entry.cleanup_ledger.is_none());
     }
 
     #[test]
@@ -12682,6 +13352,39 @@ pub(crate) mod tests {
         probe.armed = false;
     }
 
+    fn observe_mount_new_role_before_commit(world: &mut World) {
+        if !world.resource::<MountNewRoleScheduleProbe>().armed {
+            return;
+        }
+        let roles = {
+            let navigation = world.resource::<RouterNavigation>();
+            let Some(entry) = navigation.entries.first() else {
+                return;
+            };
+            let Some(pending) = entry.pending_commit.as_ref() else {
+                return;
+            };
+            let projection = match (pending.ticket.as_ref(), pending.final_task.as_ref()) {
+                (Some(ticket), _) => entry.engine.reconciliation_projection_for_commit(ticket),
+                (None, Some(task)) => entry.engine.reconciliation_projection_for_task(task),
+                (None, None) => return,
+            };
+            let Ok(projection) = projection else {
+                return;
+            };
+            projection
+                .child_slots()
+                .map(|role| role.kind())
+                .collect::<Vec<_>>()
+        };
+        if roles.is_empty() {
+            return;
+        }
+        let mut probe = world.resource_mut::<MountNewRoleScheduleProbe>();
+        probe.roles = Some(roles);
+        probe.armed = false;
+    }
+
     fn install_nested_leaving_cleanup_trace(app: &mut App) {
         app.init_resource::<NestedLeavingCleanupTrace>();
         app.world_mut()
@@ -15475,7 +16178,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn leaving_foreign_descendant_does_not_block_root_commit_and_is_quarantined() {
+    fn reconciliation_leaving_foreign_descendant_commits_and_quarantines_owned_target() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
         let router = install_atomic_router(&mut app, "leaving-foreign-descendant");
@@ -15539,7 +16242,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn leaving_foreign_component_is_terminal_and_quarantined_without_hooks() {
+    fn reconciliation_leaving_foreign_component_quarantines_without_app_hooks() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
         install_foreign_component_hooks(&mut app);

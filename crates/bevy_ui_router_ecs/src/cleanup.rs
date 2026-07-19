@@ -7437,6 +7437,153 @@ pub(crate) mod tests {
     #[derive(Component)]
     struct ForeignBoundaryMarker;
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum CleanupOwnerSnapshot {
+        None,
+        Leaving {
+            claims: Vec<ExactRegistryClaim>,
+        },
+        FailedPrepared {
+            claims: Vec<ExactRegistryClaim>,
+        },
+        AuthoritySettlement {
+            active_claims: Vec<ExactRegistryClaim>,
+            pending_claims: Vec<ExactRegistryClaim>,
+            host: Entity,
+            top_slot: Entity,
+            top_slot_claim: ExactRegistryClaim,
+        },
+    }
+
+    fn cleanup_owner_snapshot(owner: Option<&CleanupOwner>) -> CleanupOwnerSnapshot {
+        let claims = |branch: &RealizedBranch| branch.claims().cloned().collect::<Vec<_>>();
+        match owner {
+            None => CleanupOwnerSnapshot::None,
+            Some(CleanupOwner::Leaving(branch)) => CleanupOwnerSnapshot::Leaving {
+                claims: claims(branch),
+            },
+            Some(CleanupOwner::FailedPrepared(branch)) => CleanupOwnerSnapshot::FailedPrepared {
+                claims: claims(branch.realized()),
+            },
+            Some(CleanupOwner::AuthoritySettlement(owner)) => {
+                CleanupOwnerSnapshot::AuthoritySettlement {
+                    active_claims: owner.active.as_ref().map(&claims).unwrap_or_default(),
+                    pending_claims: claims(owner.pending.branch().realized()),
+                    host: owner.host.host,
+                    top_slot: owner.host.top_slot,
+                    top_slot_claim: owner.host.top_slot_claim.clone(),
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct CleanupRejectionSnapshot {
+        owner: CleanupOwnerSnapshot,
+        receipts: Vec<Option<CleanupReceipt>>,
+        next_attempt: u64,
+        issued_attempt: Option<CleanupAttempt>,
+        completion_digest: Option<u64>,
+        quarantine_event_observed: bool,
+        post_settlement_focus: Vec<PostSettlementFocusRoot>,
+        authority_host_children: Option<Vec<Entity>>,
+        quarantine_sequences: Option<(u64, u64, usize)>,
+        entity_claim: Option<ExactRegistryClaim>,
+        entity_seal: Option<RouteOwnershipSeal>,
+        entity_quarantine_claim: Option<ExactRegistryClaim>,
+        entity_unresolved_claim: Option<ExactRegistryClaim>,
+        entity_manifest: Option<ComponentManifest>,
+        entity_parent: Option<Entity>,
+        entity_parent_children: Option<Vec<Entity>>,
+        parent_claim: Option<ExactRegistryClaim>,
+        parent_seal: Option<RouteOwnershipSeal>,
+        parent_quarantine_claim: Option<ExactRegistryClaim>,
+        parent_unresolved_claim: Option<ExactRegistryClaim>,
+        parent_manifest: Option<ComponentManifest>,
+        parent_parent: Option<Entity>,
+        parent_parent_children: Option<Vec<Entity>>,
+    }
+
+    fn cleanup_rejection_snapshot(
+        world: &World,
+        ledger: &CleanupLedger,
+        entity: Entity,
+        parent: Entity,
+    ) -> CleanupRejectionSnapshot {
+        let physical = |entity| {
+            let parent = world.get::<ChildOf>(entity).map(ChildOf::parent);
+            (
+                world
+                    .resource::<RouteEntityRegistry>()
+                    .record(entity)
+                    .map(|record| record.claim()),
+                ComponentManifest::from_world(world, entity),
+                parent,
+                parent.map(|parent| {
+                    world
+                        .get::<bevy_ecs::hierarchy::Children>(parent)
+                        .map(|children| children.iter().copied().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                }),
+            )
+        };
+        let entity_physical = physical(entity);
+        let parent_physical = physical(parent);
+        let quarantine = world.get_resource::<QuarantineLeaseTable>();
+        CleanupRejectionSnapshot {
+            owner: cleanup_owner_snapshot(ledger.owner.as_ref()),
+            receipts: ledger.receipts.clone(),
+            next_attempt: ledger.next_attempt,
+            issued_attempt: ledger.issued_attempt.clone(),
+            completion_digest: ledger.completion_digest,
+            quarantine_event_observed: ledger.quarantine_event_observed,
+            post_settlement_focus: ledger.post_settlement_focus.clone(),
+            authority_host_children: ledger.authority_host_children.clone(),
+            quarantine_sequences: quarantine.map(|table| {
+                (
+                    table.next_sequence_for_test(),
+                    table.next_residual_sequence_for_test(),
+                    table.leases().len(),
+                )
+            }),
+            entity_claim: entity_physical.0,
+            entity_seal: world.get::<RouteOwnershipSeal>(entity).copied(),
+            entity_quarantine_claim: quarantine
+                .and_then(|table| table.record(entity))
+                .map(|record| record.claim()),
+            entity_unresolved_claim: quarantine
+                .and_then(|table| table.unresolved_record(entity))
+                .map(|record| record.claim()),
+            entity_manifest: entity_physical.1,
+            entity_parent: entity_physical.2,
+            entity_parent_children: entity_physical.3,
+            parent_claim: parent_physical.0,
+            parent_seal: world.get::<RouteOwnershipSeal>(parent).copied(),
+            parent_quarantine_claim: quarantine
+                .and_then(|table| table.record(parent))
+                .map(|record| record.claim()),
+            parent_unresolved_claim: quarantine
+                .and_then(|table| table.unresolved_record(parent))
+                .map(|record| record.claim()),
+            parent_manifest: parent_physical.1,
+            parent_parent: parent_physical.2,
+            parent_parent_children: parent_physical.3,
+        }
+    }
+
+    fn assert_cleanup_rejection_is_zero(
+        world: &World,
+        ledger: &CleanupLedger,
+        entity: Entity,
+        parent: Entity,
+        before: &CleanupRejectionSnapshot,
+    ) {
+        assert_eq!(
+            cleanup_rejection_snapshot(world, ledger, entity, parent),
+            *before
+        );
+    }
+
     fn published_empty_batch() -> (RouterEngine, CleanupBatch) {
         let view = RouteViewKey::new("root").unwrap();
         let tree = RouteTree::builder()
@@ -9356,7 +9503,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn settled_completion_remains_replayable_until_core_acknowledges_it() {
+    fn reconciliation_zero_obligation_completion_is_exact_once() {
         let (mut engine, batch) = published_empty_batch();
         let prepared = CleanupLedger::prepare(batch, FrozenCleanupManifest::empty()).unwrap();
         let ledger = CleanupLedger::activate(prepared, None);
@@ -9367,7 +9514,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn sealed_batch_must_match_the_frozen_ecs_manifest() {
+    fn reconciliation_sealed_batch_must_match_the_frozen_ecs_manifest() {
         let (_engine, batch) = published_empty_batch();
         assert!(cleanup_batch_matches(&batch, 0, 0));
         assert!(!cleanup_batch_matches(&batch, 1, 0));
@@ -9645,7 +9792,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn old_and_foreign_attempts_are_world_zero() {
+    fn reconciliation_superseded_and_foreign_attempts_are_world_zero() {
         let mut world = World::new();
         world.insert_resource(RouteEntityRegistry::new());
         world.insert_resource(QuarantineLeaseTable::new());
@@ -9656,9 +9803,12 @@ pub(crate) mod tests {
         let current = ledger.attempt(&world).unwrap();
         let mut foreign = current.clone();
         foreign.ledger_domain = foreign.ledger_domain.wrapping_add(1);
+        let before_rejections = cleanup_rejection_snapshot(&world, &ledger, entity, parent);
 
         assert!(!ledger.settle(&mut world, old));
+        assert_cleanup_rejection_is_zero(&world, &ledger, entity, parent, &before_rejections);
         assert!(!ledger.settle(&mut world, foreign));
+        assert_cleanup_rejection_is_zero(&world, &ledger, entity, parent, &before_rejections);
         assert!(world.get_entity(entity).is_ok());
         assert_eq!(ledger.receipt_count(), 0);
 
@@ -9666,7 +9816,6 @@ pub(crate) mod tests {
         assert!(world.get_entity(entity).is_err());
     }
 
-    #[test]
     pub(crate) fn foreign_and_replayed_receipts_are_ledger_zero() {
         let mut world = World::new();
         world.insert_resource(RouteEntityRegistry::new());
@@ -9683,9 +9832,36 @@ pub(crate) mod tests {
             CleanupDisposition::Removed,
             &ledger.obligations[0],
         );
+        let unknown_obligation = CleanupReceipt::new(
+            ledger.ledger_domain,
+            attempt.revision,
+            1,
+            CleanupDisposition::Removed,
+            &ledger.obligations[0],
+        );
+        let registry_before = world.resource::<RouteEntityRegistry>().records().to_vec();
+        let world_before = world
+            .iter_entities()
+            .map(|entity| (entity.id(), entity.archetype().components().to_vec()))
+            .collect::<Vec<_>>();
+        let before = cleanup_rejection_snapshot(&world, &ledger, entity, parent);
 
         assert!(!ledger.accept_receipt(&attempt, foreign));
+        assert_cleanup_rejection_is_zero(&world, &ledger, entity, parent, &before);
+        assert!(!ledger.accept_receipt(&attempt, unknown_obligation));
+        assert_cleanup_rejection_is_zero(&world, &ledger, entity, parent, &before);
         assert_eq!(ledger.receipt_count(), 0);
+        assert_eq!(
+            world.resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(
+            world
+                .iter_entities()
+                .map(|entity| (entity.id(), entity.archetype().components().to_vec()))
+                .collect::<Vec<_>>(),
+            world_before
+        );
 
         assert!(ledger.settle(&mut world, attempt.clone()));
         let replay = ledger.receipts[0].clone().unwrap();
@@ -9695,7 +9871,9 @@ pub(crate) mod tests {
             .iter_entities()
             .map(|entity| (entity.id(), entity.archetype().components().to_vec()))
             .collect::<Vec<_>>();
+        let before = cleanup_rejection_snapshot(&world, &ledger, entity, parent);
         assert!(!ledger.accept_receipt(&attempt, replay));
+        assert_cleanup_rejection_is_zero(&world, &ledger, entity, parent, &before);
         assert_eq!(ledger.receipts, receipts_before);
         assert_eq!(ledger.receipt_count(), 1);
         assert_eq!(
@@ -9712,7 +9890,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cleanup_receipt_observation_is_exact_once() {
+    fn reconciliation_foreign_unknown_and_replayed_receipts_are_world_zero() {
+        foreign_and_replayed_receipts_are_ledger_zero();
+    }
+
+    #[test]
+    fn reconciliation_cleanup_receipt_observation_is_exact_once() {
         let mut world = World::new();
         world.insert_resource(RouteEntityRegistry::new());
         world.insert_resource(QuarantineLeaseTable::new());
@@ -9728,11 +9911,13 @@ pub(crate) mod tests {
 
         assert!(ledger.mark_receipt_observed(obligation, disposition));
         assert!(ledger.next_unobserved_receipt().is_none());
+        let before_duplicate = cleanup_rejection_snapshot(&world, &ledger, entity, parent);
         assert!(!ledger.mark_receipt_observed(obligation, disposition));
+        assert_cleanup_rejection_is_zero(&world, &ledger, entity, parent, &before_duplicate);
     }
 
     #[test]
-    fn partial_receipt_remains_observable_before_aggregate_completion() {
+    fn reconciliation_partial_receipt_precedes_aggregate_completion() {
         let mut world = World::new();
         world.insert_resource(RouteEntityRegistry::new());
         world.insert_resource(QuarantineLeaseTable::new());
