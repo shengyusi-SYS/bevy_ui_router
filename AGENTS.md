@@ -35,9 +35,12 @@
 - 延迟执行或 one-shot lifecycle action 必须冻结完整 source projection，消费前从当前 authority 重建并要求 exact equality，逐元素仍有效不足以授权 mutation 或 publication
 - boundary evidence 在 freeze、classify、settle 间不得降为 Entity、bool、空值或通用错误，必须保留 source、exact expectation、observed state、关联 obligation 与 owner
 - 只有可证明未来可完成的容量或前置事实不足可以 retry，永久矛盾必须有界 fail closed
-- isolation、cleanup 与 recovery 的 mutation/focus closure 必须来自完整 observed relationship closure
-- 首写前冻结 current/protected 两类 closure 与 mutation/focus closure，并证明 mutation/focus closure 分别不与 current closure、protected closure 相交
-- 可能触发 hook/observer 的写入后重建三者，并再次证明前述不相交关系
+- lifecycle mutation/focus set 必须来自完整 observed relationship closure 和显式 role classification
+- exact entering、leaving、pending cleanup 或 authority-invalid current 可以按 active plan 成为 authorized target
+- role classification 先确定 authorized target，剩余 preserved、non-target current、app-owned、foreign 与 other-authority non-target closure 必须保持为 protected，non-target current 只包含 authorized target role 之外的 current Entity
+- authorized target closure 必须与每个 non-target protected closure 不相交，且 mutation 只能落在 allowed write set 内
+- 可能触发 hook/observer 的 staging、cleanup 或 recovery 写入后，必须重建并复验 target/protected partition
+- atomic publication tail 不得包含会触发 hook/observer 的写入、query 或可失败 validation
 - 不持有 `&mut World` 跨 `await`。
 - 异步结果 apply 前必须执行 stale check；身份不匹配必须丢弃，不能产生可见状态变化。
 - pending scene 不能视为 active UI；active UI 只能来自已完成 resolve/apply 且通过身份校验的结果。
@@ -80,8 +83,9 @@
 - 涉及 lifecycle capability 时，验证拒绝、重试与 completion error 后 capability 仍唯一可追踪
 - 涉及延迟 action 时，验证消费时对完整 source projection exact refreeze
 - 涉及 boundary evidence 时，验证永久 drift 不进入无界 retry，typed evidence 与 owner 不在 helper 边界丢失
-- 涉及 isolation、cleanup 或 recovery 时，验证重入写入后重建 current/protected 两类 closure 与 mutation/focus closure，并再次证明 mutation/focus closure 分别不与前两者相交
-- 涉及 atomic publication 时，验证 publication 后没有分配、排序、owner 安装、可失败校验或结构写入
+- 涉及 isolation、cleanup 或 recovery 时，验证 lifecycle mutation/focus set 来自完整 observed relationship closure 和显式 role classification，authorized target 与 non-target protected partition 正确且 mutation 保持在 allowed write set 内
+- 涉及可能触发 hook/observer 的 staging、cleanup 或 recovery 写入时，验证每次写入后重建并复验 target/protected partition
+- 涉及 atomic publication 时，验证 `Ready` 前完成全部 preparation，atomic publication tail 没有 hook/observer-triggering write、query、可失败 validation 或结构写入
 - 涉及异步逻辑时，验证 stale check 覆盖 router、frame、generation 和 task 身份。
 - 涉及 hidden/retained subtree 时，验证输入隔离与 focus 释放。
 - 涉及 resolve/apply 时，验证失败会清理 router-owned 局部状态，且不触碰 app-owned host。

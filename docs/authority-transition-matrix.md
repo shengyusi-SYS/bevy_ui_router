@@ -128,24 +128,29 @@ Inbound parent 与上表 ownership/descendant 分类正交：
 
 ## 6. CommitMutationPlan Closure
 
-`Ready` 前必须把以下事实全部解析为不可失败 mutation：
+switch 进入 `Ready(CommitMutationPlan)` 前必须完成：
 
-- current host version、top slot 与 registry partition。
-- preserved、leaving、entering 的每个 root/slot/content/output Entity。
-- `EntityOwner`、Entity generation、seal、actual component-id manifest、actual inbound parent classification、ancestry、frame generation 与 branch index。
-- entering `PreparedInert`、visibility、preinserted `Pickable::IGNORE`、gate keyboard/gamepad deny 与 focus barrier。
-- leaving normal cleanup 或 quarantine partition。
-- entering activation order、leaving isolation order、registry replacement 和 sealed core commit ticket。
-- old/new `RouterInputGate` active/blocked snapshot、prebuilt `Pickable` values 与原子 replacement。
+- current host version、top slot 与 registry partition
+- preserved、leaving、entering 的每个 root/slot/content/output Entity
+- `EntityOwner`、Entity generation、seal、actual component-id manifest、actual inbound parent classification、ancestry、frame generation 与 branch index
+- entering `PreparedInert`、visibility、preinserted `Pickable::IGNORE`、gate keyboard/gamepad deny 与 focus barrier
+- leaving normal cleanup 或 quarantine partition
+- entering activation order、leaving isolation order、registry replacement 和 sealed core commit ticket
+- old/new `RouterInputGate` active/blocked snapshot、prebuilt `Pickable` values 与原子 replacement
+- entering staging 中每个可能触发 hook/observer 的写入均已在此前完成，并逐次通过 post-write validation
+- 随后的 switch preflight 保持只读并冻结显式 role partition，先确定 exact leaving 与 entering lifecycle value 是 authorized switch target
+- 剩余 preserved、non-target current 与 protected non-target closure 均与 authorized switch target 不相交，non-target current 只包含 authorized switch target role 之外的 current Entity
+- 任何 preflight drift 都阻止进入 `Ready` 并转入适用的 reclassification 或 settlement 路径
 
-进入执行前：
+cleanup 与 authority settlement 的 hookful mutation 和 post-write revalidation 不属于 `CommitMutationPlan`，由 §7 的 versioned cleanup/settlement attempt 处理
 
-- 首写前冻结 current/protected 两类 closure 与 mutation/focus closure
-- mutation/focus closure 分别不与 current closure、protected closure 相交
-- 每个可能触发 hook 或 observer 的写入后重建三者，并再次证明前述不相交关系
-- 任何漂移都使剩余写入停止并回到适用的重新分类或 settlement 路径
+`Ready(CommitMutationPlan)` 后：
 
-`CommitMutationPlan` 生成后不再 query、不再分配、不再做可失败验证。执行顺序为 leaving isolate/focus release、entering activate、registry swap、input-gate + preinserted `Pickable` value swap、core publish；不 add/remove `InteractionDisabled` 等 marker。任何 closure corruption 在 plan 生成前分类为 `PendingRejected` 或 `AuthorityLost`。
+- `CommitMutationPlan` 只应用 Target Architecture 所述已经准备好的 no-hook in-place values
+- atomic publication tail 中不发生 refreeze、query、可失败 validation 或 reclassification
+- 执行顺序为 leaving isolate/focus release、entering activate、registry swap、input-gate + preinserted `Pickable` value swap、core publish
+- 不 add/remove `InteractionDisabled` 等 marker
+- 任何 closure corruption 都在 plan 生成前分类为 `PendingRejected` 或 `AuthorityLost`
 
 ## 7. Cleanup Obligation Ledger
 

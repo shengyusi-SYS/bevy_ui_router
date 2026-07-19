@@ -2,9 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** executing，Tasks 1–2 complete，Task 3 review fixes in progress
+
 **Goal:** 沉淀后续 MVP 切片可复用的 authority 与验收护栏，并把 tracked 文档更新到 Reconciliation Task 5 的真实 checkpoint
 
-**Architecture:** 长期不变量进入 `AGENTS.md` 与 Authority Matrix，阶段计划纪律进入 `implementation-goals.md`，当前事实只进入 architecture、roadmap、contract 与 active plan。Task 5 的私有类型、排错过程和测试数字不进入长期规范
+**Architecture:** 长期不变量进入 `AGENTS.md` 与 Authority Matrix，阶段计划纪律进入 `implementation-goals.md`，当前摘要进入 architecture、roadmap、contract 与 active plan。Authority Matrix 只可携带窄范围 implementation checkpoint，用于区分 target semantics 与 implemented scope。Task 5 的私有类型、排错过程和测试数字不进入长期规范
 
 **Tech Stack:** Markdown、Git、PowerShell、`rg`
 
@@ -32,7 +34,7 @@
 - Consumes: `docs/superpowers/specs/2026-07-20-mvp-documentation-guardrails-design.md`
 - Produces: History、Recovery、Authority closure 可直接引用的 owner、projection、evidence、closure 与 journey 约束
 
-- [ ] **Step 1: 更新 `AGENTS.md` 核心硬约束**
+- [x] **Step 1: 更新 `AGENTS.md` 核心硬约束**
 
 在现有 identity、typed preflight 与 publication-last 条款附近加入以下语义，允许为消除重复而合并相邻原句
 
@@ -40,10 +42,15 @@
 lifecycle capability 必须线性持有并单次移动或消费；snapshot、fingerprint 与 projection 只能校验，不能重建 owner，拒绝路径必须返还原 owner
 延迟执行或 one-shot lifecycle action 必须冻结完整 source projection，消费前从当前 authority 重建并要求 exact equality，逐元素仍有效不足以授权 mutation 或 publication
 boundary evidence 在 freeze、classify、settle 间不得降为 Entity、bool、空值或通用错误，必须保留 source、exact expectation、observed state、关联 obligation 与 owner；只有可证明未来可完成的容量或前置事实不足可以 retry，永久矛盾必须有界 fail closed
-isolation、cleanup 与 recovery 的 mutation/focus closure 必须来自完整 observed relationship closure，首写前与 current/protected closure 互斥，可能触发 hook/observer 的写入后复验双方 closure 与互斥性
+lifecycle mutation/focus set 必须来自完整 observed relationship closure 和显式 role classification
+exact entering、leaving、pending cleanup 或 authority-invalid current 可以按 active plan 成为 authorized target
+role classification 先确定 authorized target，剩余 preserved、non-target current、app-owned、foreign 与 other-authority non-target closure 保持为 protected，non-target current 只包含 authorized target role 之外的 current Entity
+authorized target closure 与每个 non-target protected closure 不相交，mutation 只能落在 allowed write set 内
+可能触发 hook/observer 的 staging、cleanup 或 recovery 写入后重建并复验 target/protected partition
+atomic publication tail 不包含会触发 hook/observer 的写入、query 或可失败 validation
 ```
 
-- [ ] **Step 2: 更新 `AGENTS.md` 验证要求**
+- [x] **Step 2: 更新 `AGENTS.md` 验证要求**
 
 加入与 Step 1 一一对应的最小验证条款
 
@@ -51,10 +58,12 @@ isolation、cleanup 与 recovery 的 mutation/focus closure 必须来自完整 o
 拒绝、重试与 completion error 后 capability 仍唯一可追踪
 延迟 action 的完整 source projection 在消费时 exact refreeze
 永久 drift 不进入无界 retry，typed evidence 与 owner 不在 helper 边界丢失
-重入写入后 current/protected 与 mutation/focus closure 仍各自稳定且互斥
+role classification 允许 exact lifecycle target，同时保持 authorized target 与 non-target protected closure 不相交
+每个 hook/observer-triggering staging、cleanup 或 recovery 写入后都重建并复验 target/protected partition
+Ready 前完成 preparation，atomic publication tail 不做 refreeze、query、可失败 validation 或 reclassification
 ```
 
-- [ ] **Step 3: 更新阶段计划与完成证据规则**
+- [x] **Step 3: 更新阶段计划与完成证据规则**
 
 在 `docs/implementation-goals.md` 的执行与质量门槛加入
 
@@ -65,18 +74,26 @@ Task PASS 前除 focused RED/GREEN 外，还必须通过受影响完整 crate �
 阶段完成后同步 current architecture、roadmap、authority matrix 与阶段记录，只有 completion gate 通过后才能标记阶段 PASS
 ```
 
-- [ ] **Step 4: 补充 Authority Matrix 共通语义**
+- [x] **Step 4: 补充 Authority Matrix 共通语义**
 
 在文档标头增加 `ddce26d` checkpoint，明确仅最小 pre-commit settlement 已实现，post-commit Recovery 仍待完成
 
-在状态轴或 token 共通规则中加入完整 source projection、线性 capability 与 typed evidence 要求；在 CommitMutationPlan closure 中明确 mutation/focus closure 与 current/protected closure 的首写前及 post-write 互斥复验
+在状态轴或 token 共通规则中加入完整 source projection、线性 capability 与 typed evidence 要求
 
-- [ ] **Step 5: 验证规范不重复、不越界**
+switch 进入 `Ready` 前，entering staging 已完成全部 hook/observer-triggering write 并逐次 post-write validated，随后的只读 switch preflight 冻结 role partition，并先确定 exact leaving 与 entering lifecycle value 作为 authorized switch target
+
+剩余 preserved、non-target current 与 protected non-target closure 与 authorized switch target 不相交，non-target current 只包含 authorized switch target role 之外的 current Entity
+
+cleanup 与 authority settlement 的 hookful mutation 和 post-write revalidation 不属于 `CommitMutationPlan`，由 §7 versioned cleanup/settlement attempt 处理
+
+在 `Ready` 后的 `CommitMutationPlan` 只应用已准备的 no-hook in-place values，atomic publication tail 不做 refreeze、query、可失败 validation 或 reclassification
+
+- [x] **Step 5: 验证规范不重复、不越界**
 
 Run:
 
 ```powershell
-rg -n "source projection|boundary evidence|producer|no-replay|current/protected|pre-commit checkpoint" AGENTS.md docs/implementation-goals.md docs/authority-transition-matrix.md
+rg -n "source projection|boundary evidence|producer|no-replay|authorized target|non-target protected|pre-commit checkpoint" AGENTS.md docs/implementation-goals.md docs/authority-transition-matrix.md
 rg -n "RetainedLost|PreparedAuthorityHostEdge|RetryableCapacity|六个生产|377" AGENTS.md docs/implementation-goals.md docs/authority-transition-matrix.md
 git diff --check
 ```
@@ -99,7 +116,7 @@ Expected: 第一条命令能定位通用规则；第二条无输出；`git diff 
 - Consumes: tracked commits `228c5bf`、`c627a9e`、`6f8e734`、`9415d03`、`4f4e4dc`、`ddce26d`
 - Produces: Task 6–8 编写 brief、执行与 completion review 使用的唯一 tracked checkpoint
 
-- [ ] **Step 1: 更新 Current Architecture**
+- [x] **Step 1: 更新 Current Architecture**
 
 将标头改为
 
@@ -119,7 +136,7 @@ Task 6 私有物理回归、Task 7 公共 Journey B/fragment、Task 8 completion
 
 不得把 Task 5 focused gate 写成完整 workspace nextest PASS
 
-- [ ] **Step 2: 更新 Roadmap**
+- [x] **Step 2: 更新 Roadmap**
 
 将状态更新为 Reconciliation 执行中，`Now` 只列 Task 6–8
 
@@ -131,7 +148,7 @@ Task 8: Reconciliation completion gate 与 factual records
 
 新增 `Next`，顺序保持 History → Recovery → Authority closure → MVP gate
 
-- [ ] **Step 3: 更新阶段 contract checkpoint**
+- [x] **Step 3: 更新阶段 contract checkpoint**
 
 在 `docs/reconciliation-contract-profile.md` 标头增加
 
@@ -141,7 +158,7 @@ Task 8: Reconciliation completion gate 与 factual records
 
 在最小 pre-commit settlement 段落说明它复用既有唯一 ledger/receipt stream，终态后可重新 admission，但不会重放导航；不改变完整 Recovery 非目标
 
-- [ ] **Step 4: 更新 active implementation plan**
+- [x] **Step 4: 更新 active implementation plan**
 
 将状态改为 executing，并在标头增加进度表
 
@@ -156,7 +173,7 @@ Tasks 6–8 pending
 
 保留 Task 6–8 checkbox 与“只有 Task 8 后 Complete”的原门禁
 
-- [ ] **Step 5: 验证跨文档一致性**
+- [x] **Step 5: 验证跨文档一致性**
 
 Run:
 
@@ -183,7 +200,7 @@ Expected: checkpoint 与剩余顺序在四份文档一致；`Reconciliation PASS
 - Consumes: 两个任务的实现报告与完整 diff
 - Produces: 可提交的规范、事实基线与审查结论
 
-- [ ] **Step 1: 运行三项独立只读审查**
+- [x] **Step 1: 运行三项独立只读审查**
 
 审查职责
 

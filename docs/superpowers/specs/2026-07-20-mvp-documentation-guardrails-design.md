@@ -1,8 +1,10 @@
 # MVP 后续文档与验收护栏设计
 
-**状态**: 执行基线
+**状态**: 已实施的非规范设计记录
 
 **事实基线**: Reconciliation Task 5，`ddce26d`
+
+**规范归属**: canonical requirements 由 `AGENTS.md`、`docs/implementation-goals.md`、Authority Matrix 与当前阶段文档持有，本文件只记录已实施设计，不是规范来源
 
 ## 目标
 
@@ -27,7 +29,12 @@
 1. lifecycle capability 必须线性持有，snapshot 或 fingerprint 只能作为 evidence，不能重建 owner
 2. 延迟执行的 lifecycle action 必须冻结完整 source projection，消费前从当前 authority 重建并要求 exact equality
 3. boundary evidence 在 freeze、classify、settle 间必须保留 source、expectation、observed state、obligation 与 owner，永久矛盾不得退化为通用 retry
-4. isolation、cleanup 与 recovery 的 mutation/focus closure 必须与 current/protected closure 保持互斥，并在可能重入的写入后复验
+4. lifecycle mutation/focus set 必须来自完整 observed relationship closure 和显式 role classification
+   - exact entering、leaving、pending cleanup 或 authority-invalid current 可以按 active plan 成为 authorized target
+   - role classification 先确定 authorized target，剩余 preserved、non-target current、app-owned、foreign 与 other-authority non-target closure 保持为 protected，non-target current 只包含 authorized target role 之外的 current Entity
+   - authorized target closure 与每个 non-target protected closure 不相交，mutation 只能落在 allowed write set 内
+   - 可能触发 hook/observer 的 staging、cleanup 或 recovery 写入后重建并复验 target/protected partition
+   - atomic publication tail 不包含会触发 hook/observer 的写入、query 或可失败 validation
 5. lifecycle 终态至少由一条真实 producer 经正式 schedule 到 settler 的旅程证明，并覆盖多轮收敛与额外一轮 no-replay
 
 ## 阶段计划与验收
