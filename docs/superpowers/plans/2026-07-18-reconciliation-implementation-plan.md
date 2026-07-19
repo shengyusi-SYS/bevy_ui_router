@@ -518,31 +518,58 @@ git commit -m "test(ecs): prove reconciliation physical lifecycle"
 - Modify: `crates/bevy_ui_router/tests/public_navigation_journeys.rs`
 - Modify: `crates/bevy_ui_router/tests/public_navigation_authority_audit.rs`
 
-- [ ] **Step 1: Write public RED tests**
+- [ ] **Step 1: Add public evidence tests**
 
-Journey B must assert
+Current reconciliation behavior is the expected baseline, so this step is coverage-only unless a new assertion fails and exposes an implementation gap
 
-- layout frame version/root/outlet anchor/child slot unchanged
-- app-owned host components、children identities与relative order unchanged
-- after clearing change trackers，host sentinel/metadata/Node/Children与既有child `ChildOf`/components均非added/changed，app-owned lifecycle observer write counter保持零
-- old leaf isolated before new leaf activation
-- public audit payload binds `FrameIsolated` to the old leaf and `FrameActivated` to the new leaf，with no phase containing two interactive leaves
-- receipt is `Removed` and precedes terminal
-- old leaf audit id independently becomes `Removed`
-- history entries/cursor are exactly `/items/1`, `/items/2`
+Evidence discipline
 
-Fragment must assert preserved ancestors/slot、same leaf frame id、generation `+1`、one effect with new fragment and the exact pushed history entry/cursor
+- drive all three public evidence tests only through `RouterNavigation::push` and the official `App::update` schedule
+- a test-local read-only sampler may be placed at the `DriveNavigation` → `CommitPresentation` and `CommitPresentation` → `SettleCleanup` boundaries, but may read only `World` and `RouterInputGate`
+- opaque audit events and identities may be read only after `RouterScheduleSet::PublishSnapshots` completes
+- do not call lifecycle systems directly or add a public API, mutation seam or `RouterInputProbes`
+- Task 7 proves boundary-visible state and event ordering
+- Task 6 retains the private evidence for atomic-tail internal microsteps
+
+The ecs-only `reconciliation_journey_b_preserves_layout_and_replaces_leaf` must assert
+
+- the preserved layout `RouteFrameVersion` and public logical parent/slot continuity remain exact
+- the app-owned host exact Entity, components, child identities and relative order remain unchanged
+- after clearing change trackers, host sentinel, metadata, `Node`, `Children`, existing child `ChildOf` and components are neither added nor changed, and the app-owned lifecycle observer write counter remains zero
+- cleanup receipts are all `Removed`, retain their required order before terminal publication, and are not used as the source of an audit identity
+- history entries and cursor are exactly `/items/1`, `/items/2`
+
+The test-support `reconciliation_authority_is_preserved_and_old_leaf_is_removed` must independently assert
+
+- save the old leaf `AuditEntityId` before push, without deriving or binding it from a cleanup receipt
+- the preserved layout root, outlet anchor and child-slot opaque `AuditEntityId` values and relationships remain exact
+- opaque event payloads show old-leaf isolation before new-leaf activation
+- at each of the two adjacent schedule boundaries, the interactive leaf count is at most one
+- the saved old leaf audit identity independently reaches `Removed`
+- after the fragment push, compare the layout root, outlet anchor and child-slot opaque `AuditEntityId` values again and require the same exact identities
+
+The ecs-only `reconciliation_nested_fragment_preserves_ancestors_and_advances_leaf_generation` must assert
+
+- ancestor `RouteFrameVersion` values and public logical slot continuity remain exact
+- the leaf keeps the same frame id and advances generation exactly once
+- exactly one effect is applied with fragment `details`
+- the complete history entries and cursor match the expected pre-fragment and fragment locations
+
+- [ ] **Step 2: Run the three focused public evidence tests**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features ecs --test public_navigation_journeys reconciliation_journey_b_preserves_layout_and_replaces_leaf -- --exact
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features test-support --test public_navigation_authority_audit reconciliation_authority_is_preserved_and_old_leaf_is_removed -- --exact
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features ecs --test public_navigation_journeys reconciliation_nested_fragment_preserves_ancestors_and_advances_leaf_generation -- --exact
 ```
 
-Expected RED: current public path replaces the whole branch
+Expected for each command
 
-- [ ] **Step 2: Close public evidence and facade gates**
+- output contains `running 1 test`
+- result contains `1 passed`
+- `0 tests` is a gate failure
 
-Do not add public methods or test-support mutation seams
+- [ ] **Step 3: Close public evidence and facade gates**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features ecs --test public_navigation_journeys -j 1
@@ -553,7 +580,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-authori
 git diff --check
 ```
 
-Review gate:现有facade足以证明全部事实，replace/back/Recovery/InputProbes仍未解锁，authority为23/23/23
+Review gate
+
+- existing facade and read-only test evidence remain sufficient
+- authority catalogue stays 23/23/23
+- Task 8, History `replace`/`back`, Recovery and `RouterInputProbes` remain out of scope
 
 ```powershell
 git add -- crates/bevy_ui_router/tests/public_navigation_journeys.rs crates/bevy_ui_router/tests/public_navigation_authority_audit.rs
