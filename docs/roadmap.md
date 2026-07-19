@@ -1,8 +1,8 @@
 # Roadmap
 
-**状态**: Phase 3B.1 `Nested Push PASS`
+**状态**: Phase 3B.1 `Reconciliation 实施中`
 
-**更新时间**: 2026-07-18
+**更新时间**: 2026-07-20
 
 ## 已完成
 
@@ -22,19 +22,22 @@
 
 ## Now
 
-1. **Reconciliation**
-   - leaf replacement 与 common-prefix preservation
-   - leaving input/focus isolation 与 cleanup receipt
-2. **History**
-   - replace、back、zero-entering 与成功后提交
-3. **Recovery**
-   - view/mount failure、error presentation、host loss 与 stale replay
-4. **Authority closure**
-   - multi-router stress、完整 opaque audit、lease authority、background reaper 与 cleanup replay
-5. **MVP gate**
-   - facade journeys、authority regressions、feature matrix、workspace tests 与独立 factual review
+1. **Task 6: private physical reconciliation regressions**
+2. **Task 7: public Journey B、fragment 与 facade evidence**
+3. **Task 8: Reconciliation completion gate 与 factual records**
 
 每个切片仍须从公开 facade 命令经过真实 `App::update` 到稳定 snapshot，不新增第二条 lifecycle publisher
+
+## Next
+
+1. **History**
+   - replace、back、zero-entering 与成功后提交
+2. **Recovery**
+   - view/mount failure、error presentation、host loss 与 stale replay
+3. **Authority closure**
+   - multi-router stress、完整 opaque audit、lease authority、background reaper 与 cleanup replay
+4. **MVP gate**
+   - facade journeys、authority regressions、feature matrix、workspace tests 与独立 factual review
 
 ## MVP 后
 

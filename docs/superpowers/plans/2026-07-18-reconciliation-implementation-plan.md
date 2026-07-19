@@ -4,7 +4,18 @@
 >
 > Use TDD for every Rust behavior change
 
-**Status:** reviewed, ready for execution
+**Status:** executing
+
+**Progress**
+
+| 进度 | 提交 |
+| --- | --- |
+| Task 1 complete | `228c5bf` |
+| Task 2 complete | `c627a9e` |
+| Task 3 complete | `6f8e734` |
+| Task 4 complete | `9415d03` + `4f4e4dc` |
+| Task 5 complete | `ddce26d` |
+| Tasks 6–8 pending | — |
 
 **Stage contract:** `docs/reconciliation-contract-profile.md`
 

@@ -1,6 +1,8 @@
 # Reconciliation 阶段合同 Profile
 
-**状态**: Reconciliation 设计基线
+**状态**: Reconciliation 实施中
+
+**实现 checkpoint**: Tasks 1–5 complete，`ddce26d`，Tasks 6–8 pending
 
 **设计基线**: `a977bd0`
 
@@ -165,6 +167,7 @@ commit tail 不再 query、分配、插入组件、改 relationship或执行可�
 
 physical `AuthorityLost` 执行本切片最小 pre-commit settlement
 
+- 复用既有唯一 lifecycle publisher、ledger 与 receipt stream，不创建第二套 ledger 或重复 receipt
 - availability 先进入 `RecoveringAuthority`，current running request 进入 `Running(Recovering)`
 - queued requests 立即 `Failed(AuthorityLost)`，不执行 switch、fallback 或重放
 - 隔离并 settlement 已知 exact owned closure，history 不推进
@@ -172,7 +175,7 @@ physical `AuthorityLost` 执行本切片最小 pre-commit settlement
 - `CleanupSettled` 早于 current request 最后的 `RequestTerminal`
 - current request 精确终结为 `Failed(AuthorityLost)`
 
-若原 host registration 仍 exact 且 topology 合法，settlement 后重跑既有 full admission，成功稳定为 `availability=Ready, active=None`
+若原 host registration 仍 exact 且 topology 合法，终态后可重跑既有 full admission，成功稳定为 `availability=Ready, active=None`，但不重放 navigation
 
 registration 或 host 无效、admission 失败时使用既有 `Unavailable` reason，绝不静默重放旧 request
 

@@ -2,9 +2,9 @@
 
 **文档类型**: 当前事实
 
-**状态**: Nested Push PASS
+**状态**: Reconciliation 实施中，Tasks 1–5 complete
 
-**as_of**: Nested Push Task 9 completion gate，`702e36e`
+**as_of**: Reconciliation Task 5，`ddce26d`
 
 **事实来源**: workspace manifest、实现、固定测试、公开旅程与独立复审
 
@@ -83,11 +83,20 @@ Update: ObserveAuthority
 - Authority gate：catalogue 23、registered 23、passed 23
 - Workspace gate：nextest 659/659、0 skipped，doctest 28，fmt/check/diff green
 
-## 6 后续边界
+## 6 Reconciliation 实施 checkpoint
+
+Root 与 Nested PASS 事实保持不变，Reconciliation 当前已完成 Tasks 1–5
+
+- Core 已完成 slot-aware projection、preserved suffix splice 与 sealed logical publication
+- ECS 已完成 role-sensitive physical preflight、原子 splice、exact cleanup 与最小 pre-commit authority settlement
+- authority loss 复用既有唯一 publisher、ledger 与 receipt stream，清空失效的 Core/ECS active，不 fallback、不 replay、不推进 history
+- Task 6 private physical reconciliation regressions、Task 7 public Journey B/fragment facade evidence 与 Task 8 Reconciliation completion gate 尚未完成
+
+## 7 后续边界
 
 尚未完成
 
-- Journey B 与 common-prefix Reconciliation
+- Reconciliation 的 private physical regressions、public Journey B/fragment evidence 与 completion gate
 - replace/back History
 - host-loss 与 stale replay Recovery
 - background reaper、完整 audit 与多 router 压测的 Authority closure
