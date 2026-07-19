@@ -516,6 +516,7 @@ git commit -m "test(ecs): prove reconciliation physical lifecycle"
 **Files**
 
 - Modify: `crates/bevy_ui_router_core/src/engine.rs`
+- Modify: `crates/bevy_ui_router_ecs/src/branch_transaction.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/authority_regression_tests.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/navigation.rs`
 - Modify: `crates/bevy_ui_router/tests/public_navigation_journeys.rs`
@@ -529,15 +530,21 @@ The full public journey target exposed an implementation gap in the current base
 - normal branch-index-zero Build/Apply failure preserves the old active presentation while pending outputs settle, then begins the mandatory RouterFallback regardless of whether an active presentation already exists
 - add an ECS projectionless RouterFallback replacement path for existing active UI: old active is the complete leaving owner and the fallback branch is the entering owner
 - admit that path only for the exact current `RouterFallback` task bound to the registered top slot; normal route tasks with existing active still require a sealed reconciliation projection
+- preserve the exact current lifecycle of every leaving claim, including legal retained-empty `PreparedInert` child slots, while transitioning the complete old branch to `Leaving`
+- classify exact admission, role validation and every fallible projectionless preparation with typed outcomes: foreign/stale task evidence is returned without writes, pending/entering shape、identity、relationship or component drift rejects and cleans only the fallback branch, host/current/leaving drift enters authority settlement, and only explicit preparation shortage retries
 - finish host、registry、ownership、relationship、input/focus、manifest and cleanup-ledger preparation before Core validates the logical roots through the fallback commit ticket and `prepare_commit`
 - generalize and reuse the existing projectionless `engine.publish` call site to atomically isolate the old active owner、activate fallback、swap registry/input/presentation ownership and publish Core, then settle the old branch through the existing cleanup ledger
-- retry only bounded preparation shortages; permanent host/registry/ownership/relationship contradiction enters the existing fail-closed authority residual path without fallback publication、unauthorized mutation or unbounded replay
+- retry only bounded preparation shortages; permanent host/current/leaving registry、ownership or relationship contradiction enters the existing fail-closed authority residual path, while permanent pending/entering contradiction enters bounded pending cleanup; neither path may publish fallback、perform unauthorized mutation or replay without bound
+- if Core report consumption precedes a later contradiction, retain a typed continuation that can finish fail-close after retryable preparation shortage without replaying or stranding the consumed capability
 - do not fabricate a matched-route reconciliation projection or let ECS recompute common-prefix roles
 - fallback attempt、nested branch-index-greater-than-zero handling and full Recovery remain unchanged
 - correct the conflicting Core tests and add focused ECS regressions proving
   - official-schedule fallback commit、old-branch cleanup、terminal ordering and no replay
   - an existing-active normal `MatchedRoute` task cannot enter projectionless replacement and leaves active/registry/input/history/Core publication unchanged
   - permanent fallback replacement drift enters one fail-closed residual without publication、out-of-scope writes or replay
+  - a valid active branch containing retained-empty slots preserves their exact `PreparedInert -> Leaving` transition before exact receipt removal
+  - fallback entering drift publishes no fallback, settles only pending receipts, preserves old active/history/registry/World exactly and reaches one `RecoveryFailed` terminal
+  - a post-report contradiction consumes the report/capability once, preserves a typed continuation through one retryable fail-close preparation shortage, then converges without `CommitPublished`, report replay or a stuck ticket
 - update the existing pending-cycle authority regression to observe the mandatory fallback attempt and `RecoveryFailed` terminal while retaining its old-active、history、registry and World zero-change assertions
 - retain the existing public fallback success/failure journeys as the highest downstream gate
 
@@ -553,6 +560,9 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core -
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib navigation::tests::root_fallback_existing_active_commits_projectionlessly_and_settles_old_branch -- --exact
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib navigation::tests::root_fallback_existing_active_rejects_non_fallback_projectionless_task -- --exact
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib navigation::tests::root_fallback_existing_active_permanent_drift_fail_closes_without_retry -- --exact
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib navigation::tests::root_fallback_existing_active_retained_empty_slot_commits_and_cleans -- --exact
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib navigation::tests::root_fallback_entering_drift_rejects_pending_and_preserves_active -- --exact
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib navigation::tests::root_fallback_post_report_contradiction_retries_fail_close_without_stuck_ticket -- --exact
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib authority_regression_tests::pending_cycle_rejects_without_touching_active -- --exact
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features ecs --test public_navigation_journeys root_push_build_and_apply_failures_preserve_match_and_commit_error_presentation -- --exact
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features ecs --test public_navigation_journeys root_push_fallback_failure_preserves_old_state_and_does_not_poison_the_queue -- --exact
@@ -567,7 +577,7 @@ git diff --check
 Commit the prerequisite separately before continuing Task 7 evidence
 
 ```powershell
-git add -- crates/bevy_ui_router_core/src/engine.rs crates/bevy_ui_router_ecs/src/authority_regression_tests.rs crates/bevy_ui_router_ecs/src/navigation.rs
+git add -- crates/bevy_ui_router_core/src/engine.rs crates/bevy_ui_router_ecs/src/branch_transaction.rs crates/bevy_ui_router_ecs/src/authority_regression_tests.rs crates/bevy_ui_router_ecs/src/navigation.rs
 git diff --cached --name-only
 git diff --cached --check
 git commit -m "fix: preserve root fallback after failure cleanup"
