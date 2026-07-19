@@ -516,6 +516,7 @@ git commit -m "test(ecs): prove reconciliation physical lifecycle"
 **Files**
 
 - Modify: `crates/bevy_ui_router_core/src/engine.rs`
+- Modify: `crates/bevy_ui_router_ecs/src/navigation.rs`
 - Modify: `crates/bevy_ui_router/tests/public_navigation_journeys.rs`
 - Modify: `crates/bevy_ui_router/tests/public_navigation_authority_audit.rs`
 
@@ -525,22 +526,37 @@ The full public journey target exposed an implementation gap in the current base
 
 - classify cleanup target/logical roots independently from the post-cleanup continuation
 - normal branch-index-zero Build/Apply failure preserves the old active presentation while pending outputs settle, then begins the mandatory RouterFallback regardless of whether an active presentation already exists
+- add an ECS projectionless RouterFallback replacement path for existing active UI: old active is the complete leaving owner and the fallback branch is the entering owner
+- admit that path only for the exact current `RouterFallback` task bound to the registered top slot; normal route tasks with existing active still require a sealed reconciliation projection
+- finish host、registry、ownership、relationship、input/focus、manifest and cleanup-ledger preparation before Core validates the logical roots through the fallback commit ticket and `prepare_commit`
+- generalize and reuse the existing projectionless `engine.publish` call site to atomically isolate the old active owner、activate fallback、swap registry/input/presentation ownership and publish Core, then settle the old branch through the existing cleanup ledger
+- retry only bounded preparation shortages; permanent host/registry/ownership/relationship contradiction enters the existing fail-closed authority residual path without fallback publication、unauthorized mutation or unbounded replay
+- do not fabricate a matched-route reconciliation projection or let ECS recompute common-prefix roles
 - fallback attempt、nested branch-index-greater-than-zero handling and full Recovery remain unchanged
-- correct the conflicting Core tests and retain the existing public fallback success/failure journeys as the highest downstream gate
+- correct the conflicting Core tests and add focused ECS regressions proving
+  - official-schedule fallback commit、old-branch cleanup、terminal ordering and no replay
+  - an existing-active normal `MatchedRoute` task cannot enter projectionless replacement and leaves active/registry/input/history/Core publication unchanged
+  - permanent fallback replacement drift enters one fail-closed residual without publication、out-of-scope writes or replay
+- retain the existing public fallback success/failure journeys as the highest downstream gate
 
 Before changing production code, record both exact public fallback journeys failing as RED
 
-After the correction, run the focused Core fallback tests, the two exact public fallback journeys, the full Core crate and the full `public_navigation_journeys` target as GREEN before continuing
+After the correction, run the focused Core/ECS tests, the two exact public fallback journeys, the full Core/ECS crates and the full `public_navigation_journeys` target as GREEN before continuing
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib engine::tests::reconciliation_schedule_prefix_zero_ -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib engine::tests::failed_normal_view_report_issues_fresh_router_fallback_without_publishing -- --exact
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib engine::tests::root_apply_failure_still_issues_router_fallback -- --exact
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib engine::tests::root_partial_failure_waits_for_cleanup_completion_before_fallback -- --exact
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib navigation::tests::root_fallback_existing_active_commits_projectionlessly_and_settles_old_branch -- --exact
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib navigation::tests::root_fallback_existing_active_rejects_non_fallback_projectionless_task -- --exact
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib navigation::tests::root_fallback_existing_active_permanent_drift_fail_closes_without_retry -- --exact
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features ecs --test public_navigation_journeys root_push_build_and_apply_failures_preserve_match_and_commit_error_presentation -- --exact
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features ecs --test public_navigation_journeys root_push_fallback_failure_preserves_old_state_and_does_not_poison_the_queue -- --exact
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --all-features -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --all-features -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features ecs --test public_navigation_journeys -j 1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-authority-regressions.ps1
 cargo fmt --all -- --check
 git diff --check
 ```
@@ -548,10 +564,10 @@ git diff --check
 Commit the prerequisite separately before continuing Task 7 evidence
 
 ```powershell
-git add -- crates/bevy_ui_router_core/src/engine.rs
+git add -- crates/bevy_ui_router_core/src/engine.rs crates/bevy_ui_router_ecs/src/navigation.rs
 git diff --cached --name-only
 git diff --cached --check
-git commit -m "fix(core): preserve root fallback after failure cleanup"
+git commit -m "fix: preserve root fallback after failure cleanup"
 ```
 
 - [ ] **Step 1: Add public evidence tests**
