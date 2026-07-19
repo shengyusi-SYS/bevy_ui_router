@@ -25,7 +25,7 @@
 - 用于 admission 或 authority 的 revision 必须绑定显式实例身份，不能只依赖 change tick、查询时序或可复用数值
 - ownership seal 和 authority ID 一经消费，不得因失败、删除或 quarantine 而复用；registry 变更必须校验当前 exact Entity、owner、seal 和预期 lifecycle
 - lifecycle 或角色转换必须分别冻结并校验 current 与 next；不得从提交后的结构反推 current，`next=None` 是合法 no-op，只参与校验，不得进入 mutation plan
-- retained-empty、slot-only 或其他稀疏拓扑不得用 frame/slot 数量关系或数组位置推导 authority、ownership 或 cleanup obligation；必须使用 parent、outlet、slot identity、mount binding 和 exact claim
+- retained-empty、slot-only 或其他稀疏拓扑不得用 frame/slot 数量关系或数组位置推导 authority、ownership 或 cleanup obligation；必须使用 parent、outlet、slot identity、mount binding 和 exact claim；允许 lifecycle 必须按 Entity 自身 role 与 binding 分别判定，不能取关联 frame/slot 的宽泛并集
 - Router-created Entity 必须先登记 ownership，再写 component 或 relationship；可能触发 hook/observer 的写入完成后必须复验，drift 时保持 inert 并 fail closed
 - authority preflight 必须用携带原 owner 的类型化结果区分 ready、pending rejection、authority loss 和可重试准备失败，不能用同一个空值或 retry 分支混合不同生命周期语义
 - 可见状态切换必须在 publication 前完成全部校验、分配、排序、owner 组合、claim rebind 和 cleanup reservation；publication 是最后语义步骤，执行阶段只允许预备好的不可失败原位 mutation，返回后不得再安装 owner 或执行可失败工作
@@ -79,15 +79,16 @@
 - 涉及 ownership 时，验证 Router、host、slot、frame identity 和 generation 标记完整。
 - 涉及 admission、registry 或 staging 时，验证同 tick identity 变化、历史 seal/stale claim 拒绝和 post-write observer drift 不会越权写入
 - 涉及 lifecycle 或角色转换时，验证 current 与 next 独立绑定，且 no-op 不产生 presentation、registry、cleanup 或其他物理 mutation
-- 涉及 retained-empty、slot-only 或稀疏分支时，验证 exact binding，不以集合数量或数组位置代替拓扑事实
+- 涉及 retained-empty、slot-only 或稀疏分支时，验证 exact binding 与各 Entity 自身 role 的允许 lifecycle，不以集合数量或数组位置代替拓扑事实，也不共享关联 frame/slot 的 lifecycle 联合集合
 - 涉及 authority preflight 时，验证各类结果保持独立语义并返还原 owner，永久 drift 不会退化为无界 retry
-- 涉及 lifecycle capability 时，验证拒绝、重试与 completion error 后 capability 仍唯一可追踪
+- 涉及 lifecycle capability 或 terminal evidence 时，验证拒绝、重试与 completion error 后 capability 仍唯一可追踪，terminal 后同一 scope 不再持有 outstanding action、ticket、capability 或 lifecycle owner
 - 涉及延迟 action 时，验证消费时对完整 source projection exact refreeze
 - 涉及 boundary evidence 时，验证永久 drift 不进入无界 retry，typed evidence 与 owner 不在 helper 边界丢失
 - 涉及 isolation、cleanup 或 recovery 时，验证 lifecycle mutation/focus set 来自完整 observed relationship closure 和显式 role classification，authorized target 与 non-target protected partition 正确且 mutation 保持在 allowed write set 内
 - 涉及可能触发 hook/observer 的 staging、cleanup 或 recovery 写入时，验证每次写入后重建并复验 target/protected partition
 - 涉及 failure cleanup 或 continuation 时，分别验证 cleanup scope 与 settlement 后 lifecycle branch，覆盖 preserved active 与 zero/nonzero obligations
 - 涉及 lifecycle、failure 或 terminal 分类变化时，除 focused 与完整 crate 验证外，必须重跑受影响且已闭合的最高层 public journey、facade 或 consumer gate；局部分类测试不得改写既有公共合同
+- 涉及 test-only fault seam 时，seam 只能改变生产 predicate 的真实输入事实；测试必须经该 predicate 导出结果，并在移除或短路该判定时失效，不能直接注入 classification、terminal 或 lifecycle 结果
 - 涉及 atomic publication 时，验证 `Ready` 前完成全部 preparation，atomic publication tail 没有 hook/observer-triggering write、query、可失败 validation 或结构写入
 - 涉及异步逻辑时，验证 stale check 覆盖 router、frame、generation 和 task 身份。
 - 涉及 hidden/retained subtree 时，验证输入隔离与 focus 释放。

@@ -116,6 +116,8 @@ Token reject/cancel is sealed and terminal。Grant 后允许 tracked inert provi
 
 因此，leaving foreign descendant 不阻止新 presentation 提交：preflight 生成不可失败的 quarantine plan，switch 先隔离 leaving lease root，再激活 entering。Preserved foreign descendant 不属于 Router mutation 范围。Entering foreign descendant 不允许激活，按 pending failure 回退。
 
+混合 drift 的只读 preflight 必须先按每个 source 已封存的 exact role 独立验证并冻结分类结果，再合并整体 outcome；任一 source 的 `AuthorityLost` 不得被 entering 或 pending 的 `PendingRejected` 覆盖，也不得因先命中后者而跳过其余 source 验证
+
 任何 actual relationship traversal 都使用 exact-Entity visited set；plan/session-local cycle 在 World mutation 前 `PendingRejected(RelationshipCycle)`，pending/entering external cycle 为 `PendingRejected`，preserved/leaving/current active cycle 为 `AuthorityLost`。分类后 settlement 依据 registry immutable exact set，不沿 cyclic descendants 递归 despawn。
 
 Inbound parent 与上表 ownership/descendant 分类正交：
@@ -231,6 +233,8 @@ Foreground request 在 lease 创建 receipt 时已经 terminal；reaper 的关�
 | stale report/token | old output cleanup receipt 后 | current request unchanged |
 
 任何 terminal request 都满足 foreground cleanup 已结束；quarantine receipt 视为 foreground 已结束，但 background lease 可继续存在。
+
+terminal evidence 还必须证明该 request/settlement scope 不再持有 outstanding action、ticket、capability 或 lifecycle owner；独立 quarantine lease 只能以自身 owner 存续，且不得回写该 terminal
 
 ## 10. Required Regressions
 
