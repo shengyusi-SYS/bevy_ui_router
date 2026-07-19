@@ -165,13 +165,15 @@ CleanupAttempt = batch id + attempt revision + unsettled obligation digest + fre
 
 协议固定为：
 
+Cleanup target/manifest 与 post-cleanup continuation 正交；前者描述必须 settle 的 exact obligations，后者由 engine 在 cleanup 前依据原始 failure/authority classification 与 attempt/branch role 封存，completion 不能根据 active presentation、obligation count 或 disposition 重新分类
+
 1. ECS 根据已经通过的preflight/settlement plan生成确定顺序、不可变的entity obligation identity manifest，并向engine提交逻辑mounted roots、digest与count；manifest冻结“哪些exact owned records必须前景收敛”，不冻结未来物理`Removed/Quarantined/...` disposition，Entity不进入core。
 2. Engine 验证 roots 属于当前 request/transaction/host epoch 后签发 opaque token；ECS 只接受 digest/count 与本地 manifest 完全相同的 token，并以 token 建立唯一 ledger。
 3. 每次执行从当前未结算obligations生成递增revision的`CleanupAttempt`，先只读重做inbound parent、component manifest、descendant partition、cycle/visited与exact generation分类，再产生本attempt的物理plan。跨set app drift不能复用commit时的旧plan。
 4. 每个可能触发relationship/component/despawn hook或observer的mutation后立即post-write validation。若证据变化使剩余plan失效，当前attempt只保留已完成且可验证的receipts，其余未结算obligations由更高revision attempt重新分类；旧attempt不能继续mutation，也不能结算新attempt。
 5. 每个obligation只能由同batch、同exact Entity/owner的**实际**terminal disposition receipt结算一次。`Removed`、`RemovedDetached`、`AlreadyAbsent`、`RejectedProtected`、`QuarantinedForeignDescendant`、`QuarantinedProtectedParent`和`QuarantinedForeignComponent`都可终结前景obligation；quarantine receipt原子转交当时仍存在的immutable exact residual set给独立lease，因此持久drift不会让request永久nonterminal。
 6. 完全相同的重复receipt返回`DuplicateRejected`；错误batch、旧epoch、错误request/transaction、未知obligation、未知token或superseded attempt revision返回`StaleDiscarded`/`InvalidRejected`，均无ledger、presentation、history或request状态变化。
-7. 全部obligations恰好结算一次后，ECS把原token与completion digest交回engine。Engine只接受当前outstanding batch，随后request/settlement才可terminal；completion replay无副作用。Host/authority loss只能转交同一批未结算obligation identity，不能复制ledger或receipt。
+7. 全部obligations恰好结算一次后，ECS把原token与completion digest交回engine。Engine只接受当前outstanding batch，随后才可消费预先封存的continuation或进入terminal；completion replay无副作用。Host/authority loss只能转交同一批未结算obligation identity，不能复制ledger或receipt。
 8. obligation count为零时，batch在同一阶段签发并立即完成，仍留下batch trace；不得用“没有receipt”绕过terminal gate。
 
 Core 只签发/验证 batch identity 和逻辑 roots，ECS 独占 Entity manifest 与 receipt authority，因此不存在 core 读取 World 或 ECS 自行终结 request 的反向依赖。

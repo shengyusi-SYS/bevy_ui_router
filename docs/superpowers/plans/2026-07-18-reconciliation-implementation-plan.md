@@ -515,12 +515,48 @@ git commit -m "test(ecs): prove reconciliation physical lifecycle"
 
 **Files**
 
+- Modify: `crates/bevy_ui_router_core/src/engine.rs`
 - Modify: `crates/bevy_ui_router/tests/public_navigation_journeys.rs`
 - Modify: `crates/bevy_ui_router/tests/public_navigation_authority_audit.rs`
 
+- [ ] **Step 0: Restore the closed Root fallback contract exposed by the public gate**
+
+The full public journey target exposed an implementation gap in the current baseline, so close it as a prerequisite rather than weakening Task 7 evidence
+
+- classify cleanup target/logical roots independently from the post-cleanup continuation
+- normal branch-index-zero Build/Apply failure preserves the old active presentation while pending outputs settle, then begins the mandatory RouterFallback regardless of whether an active presentation already exists
+- fallback attempt、nested branch-index-greater-than-zero handling and full Recovery remain unchanged
+- correct the conflicting Core tests and retain the existing public fallback success/failure journeys as the highest downstream gate
+
+Before changing production code, record both exact public fallback journeys failing as RED
+
+After the correction, run the focused Core fallback tests, the two exact public fallback journeys, the full Core crate and the full `public_navigation_journeys` target as GREEN before continuing
+
+```powershell
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib engine::tests::reconciliation_schedule_prefix_zero_ -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib engine::tests::failed_normal_view_report_issues_fresh_router_fallback_without_publishing -- --exact
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib engine::tests::root_apply_failure_still_issues_router_fallback -- --exact
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib engine::tests::root_partial_failure_waits_for_cleanup_completion_before_fallback -- --exact
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features ecs --test public_navigation_journeys root_push_build_and_apply_failures_preserve_match_and_commit_error_presentation -- --exact
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features ecs --test public_navigation_journeys root_push_fallback_failure_preserves_old_state_and_does_not_poison_the_queue -- --exact
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --all-features -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features ecs --test public_navigation_journeys -j 1
+cargo fmt --all -- --check
+git diff --check
+```
+
+Commit the prerequisite separately before continuing Task 7 evidence
+
+```powershell
+git add -- crates/bevy_ui_router_core/src/engine.rs
+git diff --cached --name-only
+git diff --cached --check
+git commit -m "fix(core): preserve root fallback after failure cleanup"
+```
+
 - [ ] **Step 1: Add public evidence tests**
 
-Current reconciliation behavior is the expected baseline, so this step is coverage-only unless a new assertion fails and exposes an implementation gap
+After Step 0 closes the exposed Root regression, the reconciliation assertions remain coverage-only unless another new assertion fails and exposes an implementation gap
 
 Evidence discipline
 

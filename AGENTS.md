@@ -40,6 +40,7 @@
 - role classification 先确定 authorized target，剩余 preserved、non-target current、app-owned、foreign 与 other-authority non-target closure 必须保持为 protected，non-target current 只包含 authorized target role 之外的 current Entity
 - authorized target closure 必须与每个 non-target protected closure 不相交，且 mutation 只能落在 allowed write set 内
 - 可能触发 hook/observer 的 staging、cleanup 或 recovery 写入后，必须重建并复验 target/protected partition
+- failure cleanup 的 target/obligation manifest 与 completion 后 lifecycle continuation 必须独立冻结和校验；continuation 只来自原始 failure/authority、attempt 与 branch 分类，不能由 preserved active、obligation 数量或物理 disposition 反推
 - atomic publication tail 不得包含会触发 hook/observer 的写入、query 或可失败 validation
 - 不持有 `&mut World` 跨 `await`。
 - 异步结果 apply 前必须执行 stale check；身份不匹配必须丢弃，不能产生可见状态变化。
@@ -85,6 +86,8 @@
 - 涉及 boundary evidence 时，验证永久 drift 不进入无界 retry，typed evidence 与 owner 不在 helper 边界丢失
 - 涉及 isolation、cleanup 或 recovery 时，验证 lifecycle mutation/focus set 来自完整 observed relationship closure 和显式 role classification，authorized target 与 non-target protected partition 正确且 mutation 保持在 allowed write set 内
 - 涉及可能触发 hook/observer 的 staging、cleanup 或 recovery 写入时，验证每次写入后重建并复验 target/protected partition
+- 涉及 failure cleanup 或 continuation 时，分别验证 cleanup scope 与 settlement 后 lifecycle branch，覆盖 preserved active 与 zero/nonzero obligations
+- 涉及 lifecycle、failure 或 terminal 分类变化时，除 focused 与完整 crate 验证外，必须重跑受影响且已闭合的最高层 public journey、facade 或 consumer gate；局部分类测试不得改写既有公共合同
 - 涉及 atomic publication 时，验证 `Ready` 前完成全部 preparation，atomic publication tail 没有 hook/observer-triggering write、query、可失败 validation 或结构写入
 - 涉及异步逻辑时，验证 stale check 覆盖 router、frame、generation 和 task 身份。
 - 涉及 hidden/retained subtree 时，验证输入隔离与 focus 释放。
