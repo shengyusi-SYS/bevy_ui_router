@@ -24,10 +24,17 @@
 
 - 每个阶段先形成可审查的详细实施计划，再按 TDD 小步实现；阶段产物必须独立可测试、可提交、可回退。
 - 每份阶段计划必须映射其权威规范、覆盖的 facade journey/authority regression/feature gate，并预先定义能够证明完成的测试输出、审查结论与提交范围。
+- History、Recovery 与 Authority closure 的阶段 spec/plan 必须先列出角色、拓扑、物理漂移与终态矩阵，每个格明确 exact owner、允许写集、receipt/terminal 与 retry 条件
+- lifecycle/authority 终态至少由一条真实 producer 经正式 system schedule 到 settler 的旅程证明，并覆盖多轮收敛与额外一轮 no-replay
+- 注入 fact、直接 finalizer 与私有分类测试只能补充该证据
+- `Task PASS` 前除 focused RED/GREEN 外，还必须通过受影响完整 crate 与相关 facade/consumer gate
+- 未运行门禁只能记录为待完成，不能据此标记通过
 - 实施按垂直切片推进，不先堆积未接入真实运行链路的横向协议；每片都从公开 facade 命令贯通到稳定 snapshot 或明确失败终态。
 - 并行工作只用于边界清晰、写入范围互不冲突的任务；共享生命周期、公共 API 与 authority 变更由负责人串行整合。
 - 所有冻结合同与项目硬约束都必须满足；评估审查结论时，将阻塞项归并到所有权安全、生命周期唯一语义、facade 能力泄露或 MVP journey 不可证明四类共同根因，版本细节和局部实现优化进入对应任务计划。
 - `Task PASS`、`Journey PASS` 与 `MVP PASS` 分开记录。只有全部验收旅程、负向回归和事实性门禁均有实际成功输出，才能宣布 MVP 完成。
+- 阶段完成后同步 current architecture、roadmap、authority matrix 与阶段记录
+- 只有对应 completion gate 通过后才能标记该阶段 `PASS`
 
 ## 范围控制
 

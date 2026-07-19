@@ -4,6 +4,8 @@
 **状态**: Phase 3B.1 `Plan PASS`
 **架构上位规范**: [Target Architecture](target-architecture.md)
 
+**`ddce26d` pre-commit checkpoint**：仅最小 pre-commit settlement 已实现，post-commit Recovery 仍待完成
+
 Target Architecture 拥有架构边界与不变量；本文拥有 token、closure、cleanup、quarantine 与 request terminal 的详细转换语义。本文不得改变 Target 的 ownership/依赖边界；若两者在生命周期细节上冲突，以本文为准。
 
 ## 1. 状态轴
@@ -28,6 +30,16 @@ Ready(CommitMutationPlan)
 PendingRejected(PendingCleanupPlan)
 AuthorityLost(AuthoritySettlementPlan)
 ```
+
+跨状态轴的 token 与证据规则：
+
+- lifecycle capability 线性持有，只能单次移动或消费
+- 完整 source projection、snapshot 与 fingerprint 只能验证，不能重建 owner
+- 拒绝路径返还原 owner
+- 延迟或 one-shot action 在消费前从当前 authority 重建完整 source projection 并要求 exact equality
+- 逐元素有效不构成 mutation 或 publication 授权
+- boundary evidence 在 freeze、classify、settle 间保留 source、exact expectation、observed state、obligation 与 owner 的类型化关联
+- 只有可证明未来可完成的容量或前置事实不足可以 retry，永久矛盾必须有界 fail closed
 
 ## 2. Host Admission
 
@@ -125,6 +137,13 @@ Inbound parent 与上表 ownership/descendant 分类正交：
 - leaving normal cleanup 或 quarantine partition。
 - entering activation order、leaving isolation order、registry replacement 和 sealed core commit ticket。
 - old/new `RouterInputGate` active/blocked snapshot、prebuilt `Pickable` values 与原子 replacement。
+
+进入执行前：
+
+- 首写前冻结 current/protected 两类 closure 与 mutation/focus closure
+- mutation/focus closure 分别不与 current closure、protected closure 相交
+- 每个可能触发 hook 或 observer 的写入后重建三者，并再次证明前述不相交关系
+- 任何漂移都使剩余写入停止并回到适用的重新分类或 settlement 路径
 
 `CommitMutationPlan` 生成后不再 query、不再分配、不再做可失败验证。执行顺序为 leaving isolate/focus release、entering activate、registry swap、input-gate + preinserted `Pickable` value swap、core publish；不 add/remove `InteractionDisabled` 等 marker。任何 closure corruption 在 plan 生成前分类为 `PendingRejected` 或 `AuthorityLost`。
 
