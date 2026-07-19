@@ -437,7 +437,7 @@ git commit -m "feat: settle reconciliation authority loss"
 
 Owner mapping: navigation 负责 scheduled journey、slot role 与 classification，presentation 负责 DefaultPlugins evidence，cleanup 负责 attempt、receipt、ledger 与 quarantine matrix，audit 负责独立 World/registry removal mapping
 
-- [ ] **Step 1: Inventory and add fixed physical scenarios**
+- [x] **Step 1: Inventory and add fixed physical scenarios**
 
 Evidence discipline
 
@@ -483,7 +483,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --all-features --lib audit::tests::reconciliation_ -j 1
 ```
 
-- [ ] **Step 2: Run affected crate gates and review**
+- [x] **Step 2: Run affected crate gates and review**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --all-features -j 1
