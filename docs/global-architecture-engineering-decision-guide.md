@@ -32,7 +32,7 @@
 2. **Canonical invariant**：Router 只管理 router-owned subtree；app-owned host、protected 和 foreign closure 不得因局部便利被改写或销毁。
 3. **Canonical invariant**：authority、retry、terminal 和 publication 必须保留 exact identity、线性 owner/capability 与 role-sensitive evidence。
 4. **Dated fact**：当前 Reconciliation plan 把 Task 7 Steps 1–3 定为 coverage-only public evidence；只有新增断言产生真实 RED，才先修订计划并进入最小生产修复。
-5. **Future design hypothesis**：History、Recovery、Authority closure 可分别形成独立 spec/plan；本文只提供候选问题清单。
+5. **Canonical invariant**：History、Recovery、Authority closure 在任何 runtime 实现前都必须分别形成并复审独立 spec/plan 及完整矩阵；本文第 8 节只能提供设计输入，不能替代这些阶段文档。
 6. **Canonical invariant**：验证声明必须绑定实际成功输出和 exact observed code state；dirty worktree 结果不能归因到 `HEAD`。
 7. **Candidate optimization**：机器状态源、本地 validator 和 CI provenance 值得评估，但不自动阻塞 History。
 8. **Candidate optimization**：机械拆分只在热点冲突、owner 调用链或评审成本可测地阻碍交付时启动；若启动，先处理内联 tests。
@@ -152,7 +152,9 @@ publication 后不得从 World 反推 current，也不得补装 registry/owner�
 
 ## 8. 未来 spec 的待回答问题
 
-以下均为 **Future design hypothesis**，不是实现规格。
+**Canonical invariant**：History、Recovery、Authority closure 在任何 runtime 实现前都必须分别形成并复审独立 stage spec/plan，先列出 role、topology、physical drift 与 terminal matrix，并为每个分支明确 exact owner、allowed writes、receipt/terminal 和 retry 条件。
+
+以下待回答问题均为 **Future design hypothesis**，只作为上述阶段文档的设计输入，不是实现规格，也不能替代独立 spec/plan 或授权 runtime。
 
 ### 8.1 History
 
@@ -181,7 +183,7 @@ publication 后不得从 World 反推 current，也不得补装 registry/owner�
 - opaque audit 能证明什么、不能授权什么；
 - stress、public journey、private World evidence 如何绑定同一 tree。
 
-这些问题清单建议未来 spec 显式覆盖 role、topology、physical drift、owner、allowed writes、receipt、terminal 和 retry producer。
+这些问题清单用于发现缺口和降低返工风险；正式范围、实现任务与验收门槛仍只能由各阶段独立 spec/plan 采用并定义。
 
 ## 9. Exact-tree 证据与候选工具
 
