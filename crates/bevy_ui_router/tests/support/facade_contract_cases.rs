@@ -11,6 +11,383 @@ use syn::visit::Visit;
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct TableRow(pub Vec<String>);
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StagedProfileRow {
+    pub item: String,
+    pub owning_slice: String,
+    pub state: String,
+    pub claim_boundary: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryContractProfile {
+    pub exclusions: Vec<TableRow>,
+    pub contract_deltas: Vec<StagedProfileRow>,
+    pub authority_additions: Vec<StagedProfileRow>,
+}
+
+impl HistoryContractProfile {
+    fn parse(source: &str) -> Self {
+        let exclusions = strict_history_table(
+            source,
+            "### 10.1 Public contract and stage exclusions",
+            &["Kind", "Canonical path or normalized item", "First slice"],
+        );
+        let contract_deltas = strict_history_table(
+            source,
+            "### 10.2 Contract delta activation",
+            &["Item", "Owning slice", "State", "Claim boundary"],
+        )
+        .into_iter()
+        .map(|row| StagedProfileRow {
+            item: row.0[0].clone(),
+            owning_slice: row.0[1].clone(),
+            state: row.0[2].clone(),
+            claim_boundary: Some(row.0[3].clone()),
+        })
+        .collect::<Vec<_>>();
+        let authority_additions = strict_history_table(
+            source,
+            "### 10.3 History authority regression additions",
+            &["Test function", "Owning slice", "State"],
+        )
+        .into_iter()
+        .map(|row| StagedProfileRow {
+            item: row.0[0].clone(),
+            owning_slice: row.0[1].clone(),
+            state: row.0[2].clone(),
+            claim_boundary: None,
+        })
+        .collect::<Vec<_>>();
+        let profile = Self {
+            exclusions,
+            contract_deltas,
+            authority_additions,
+        };
+        profile.validate();
+        profile
+    }
+
+    pub fn assert_disjoint_keys(&self) {
+        let exclusions = self
+            .exclusions
+            .iter()
+            .map(|row| row.0[1].as_str())
+            .collect::<BTreeSet<_>>();
+        let contract_deltas = self
+            .contract_deltas
+            .iter()
+            .map(|row| row.item.as_str())
+            .collect::<BTreeSet<_>>();
+        let authority_additions = self
+            .authority_additions
+            .iter()
+            .map(|row| row.item.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            exclusions.len(),
+            self.exclusions.len(),
+            "History exclusion keys must be unique"
+        );
+        assert_eq!(
+            contract_deltas.len(),
+            self.contract_deltas.len(),
+            "History contract-delta keys must be unique"
+        );
+        assert_eq!(
+            authority_additions.len(),
+            self.authority_additions.len(),
+            "History authority-addition keys must be unique"
+        );
+        assert!(
+            exclusions.is_disjoint(&contract_deltas),
+            "History exclusions and contract deltas must be disjoint"
+        );
+        assert!(
+            exclusions.is_disjoint(&authority_additions),
+            "History exclusions and authority additions must be disjoint"
+        );
+        assert!(
+            contract_deltas.is_disjoint(&authority_additions),
+            "History contract deltas and authority additions must be disjoint"
+        );
+    }
+
+    fn validate(&self) {
+        validate_exclusion_vocabulary(&self.exclusions);
+        self.assert_disjoint_keys();
+        validate_staged_rows(&self.contract_deltas, true);
+        validate_staged_rows(&self.authority_additions, false);
+        for row in self
+            .contract_deltas
+            .iter()
+            .filter(|row| row.state == "active")
+        {
+            assert_active_contract_delta_is_evidenced(row);
+        }
+        validate_active_history_authority_rows(&self.authority_additions);
+    }
+}
+
+pub fn history_contract_profile() -> HistoryContractProfile {
+    let source = read_workspace("docs/superpowers/specs/2026-07-20-history-design.md");
+    HistoryContractProfile::parse(&source)
+}
+
+fn strict_history_table(input: &str, heading: &str, expected_header: &[&str]) -> Vec<TableRow> {
+    let lines = input.lines().collect::<Vec<_>>();
+    let headings = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (*line == heading).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        headings.len(),
+        1,
+        "History table heading {heading} must occur exactly once"
+    );
+
+    let heading_level = markdown_heading_level(heading).expect("History heading must be valid");
+    let section_end = (headings[0] + 1..lines.len())
+        .find(|index| {
+            markdown_heading_level(lines[*index]).is_some_and(|level| level <= heading_level)
+        })
+        .unwrap_or(lines.len());
+    let section = &lines[headings[0] + 1..section_end];
+    let table_start = section
+        .iter()
+        .position(|line| line.starts_with('|'))
+        .unwrap_or_else(|| panic!("History table {heading} must exist in its own section"));
+    let table_end = table_start
+        + section[table_start..]
+            .iter()
+            .take_while(|line| line.starts_with('|'))
+            .count();
+    assert!(
+        !section[table_end..]
+            .iter()
+            .any(|line| line.starts_with('|')),
+        "History section {heading} must contain one contiguous pipe-table block"
+    );
+    let table = &section[table_start..table_end];
+
+    let columns = expected_header.len();
+    let expected_header = format!("| {} |", expected_header.join(" | "));
+    let expected_separator = format!(
+        "| {} |",
+        std::iter::repeat("---")
+            .take(columns)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    assert_eq!(
+        table.first().copied(),
+        Some(expected_header.as_str()),
+        "History table {heading} must use its exact header"
+    );
+    assert_eq!(
+        table.get(1).copied(),
+        Some(expected_separator.as_str()),
+        "History table {heading} must use its exact separator"
+    );
+
+    let mut rows = Vec::new();
+    for line in &table[2..] {
+        let cells = parse_pipe_row(line);
+        assert_eq!(
+            cells.len(),
+            columns,
+            "History table {heading} row width drifted"
+        );
+        rows.push(TableRow(cells));
+    }
+    assert!(
+        !rows.is_empty(),
+        "History table {heading} must not be empty"
+    );
+    let unique = rows.iter().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(
+        unique.len(),
+        rows.len(),
+        "History table {heading} must not contain duplicate rows"
+    );
+    rows
+}
+
+fn markdown_heading_level(line: &str) -> Option<usize> {
+    let level = line
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
+    (level > 0 && line.chars().nth(level) == Some(' ')).then_some(level)
+}
+
+fn validate_staged_rows(rows: &[StagedProfileRow], requires_claim_boundary: bool) {
+    let owning_slices = BTreeSet::from(["Replace", "Back execution", "Back failure"]);
+    for row in rows {
+        assert!(
+            !row.item.is_empty(),
+            "staged profile item must not be empty"
+        );
+        assert!(
+            owning_slices.contains(row.owning_slice.as_str()),
+            "unknown History owning slice: {}",
+            row.owning_slice
+        );
+        assert!(
+            matches!(row.state.as_str(), "planned" | "active"),
+            "unknown History stage state: {}",
+            row.state
+        );
+        assert_eq!(
+            row.claim_boundary.is_some(),
+            requires_claim_boundary,
+            "staged profile claim-boundary shape drifted for {}",
+            row.item
+        );
+        if let Some(boundary) = &row.claim_boundary {
+            assert!(
+                !boundary.is_empty(),
+                "staged profile claim boundary must not be empty for {}",
+                row.item
+            );
+        }
+    }
+}
+
+fn assert_active_contract_delta_is_evidenced(row: &StagedProfileRow) {
+    let fixture = read_workspace("docs/facade-contract-fixture.md");
+    let golden = read_workspace("docs/facade-associated-api-golden.txt");
+    let journeys = read_workspace("docs/mvp-acceptance-journeys.md");
+    for (evidence, label) in [(&fixture, "fixture"), (&golden, "golden")] {
+        assert!(
+            evidence.contains(&row.item),
+            "active contract delta `{}` is absent from {label}",
+            row.item
+        );
+    }
+    let claim_boundary = row
+        .claim_boundary
+        .as_deref()
+        .expect("contract delta must retain its claim boundary");
+    assert_claim_boundary_and_item_share_section(&journeys, &row.item, claim_boundary);
+}
+
+fn assert_claim_boundary_and_item_share_section(markdown: &str, item: &str, claim_boundary: &str) {
+    let occurrences = markdown.match_indices(claim_boundary).collect::<Vec<_>>();
+    assert_eq!(
+        occurrences.len(),
+        1,
+        "claim boundary `{claim_boundary}` must occur exactly once"
+    );
+    let claim_line = markdown[..occurrences[0].0]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    let lines = markdown.lines().collect::<Vec<_>>();
+    let heading = (0..=claim_line)
+        .rev()
+        .find(|index| lines[*index].starts_with('#'))
+        .unwrap_or_else(|| {
+            panic!("claim boundary `{claim_boundary}` must belong to a markdown heading section")
+        });
+    let section_end = (heading + 1..lines.len())
+        .find(|index| lines[*index].starts_with('#'))
+        .unwrap_or(lines.len());
+    let section = lines[heading..section_end].join("\n");
+    assert!(
+        section.contains(item),
+        "claim boundary `{claim_boundary}` and active item `{item}` must share one markdown evidence section"
+    );
+}
+
+fn validate_active_history_authority_rows(rows: &[StagedProfileRow]) {
+    let active = rows
+        .iter()
+        .filter(|row| row.state == "active")
+        .collect::<Vec<_>>();
+    if active.is_empty() {
+        return;
+    }
+    let final_mvp = final_mvp_authority_vocabulary();
+    let root = markdown_table(
+        &read_workspace("docs/root-push-contract-profile.md"),
+        "### 3.2 Root Authority Regression Catalogue",
+        &["Test function"],
+    );
+    let nested = markdown_table(
+        &read_workspace("docs/nested-push-contract-profile.md"),
+        "### 7.1 Nested Authority Regression Additions",
+        &["Test function"],
+    );
+    let existing = root
+        .into_iter()
+        .chain(nested)
+        .map(|row| row.0[0].clone())
+        .collect::<BTreeSet<_>>();
+    for row in active {
+        assert!(
+            final_mvp.contains(&row.item),
+            "active History authority row `{}` is absent from the final MVP vocabulary",
+            row.item
+        );
+        assert!(
+            !existing.contains(&row.item),
+            "active History authority row `{}` overlaps Root/Nested",
+            row.item
+        );
+    }
+}
+
+fn final_mvp_authority_vocabulary() -> BTreeSet<String> {
+    let source = read_workspace("docs/mvp-acceptance-journeys.md");
+    final_mvp_authority_vocabulary_from_source(&source)
+}
+
+fn final_mvp_authority_vocabulary_from_source(source: &str) -> BTreeSet<String> {
+    let marker = "MVP gate必须精确等于以下完整集合：";
+    assert_eq!(
+        source.matches(marker).count(),
+        1,
+        "final MVP catalogue marker must occur exactly once"
+    );
+    let tail = source
+        .split_once(marker)
+        .expect("final MVP catalogue marker must exist")
+        .1
+        .trim_start_matches(|character| matches!(character, '\r' | '\n'));
+    let fence = char::from(96).to_string().repeat(3);
+    let opening = format!("{fence}text");
+    let block = tail
+        .strip_prefix(&opening)
+        .expect("final MVP text code block must immediately follow its marker");
+    let block = block
+        .strip_prefix("\r\n")
+        .or_else(|| block.strip_prefix('\n'))
+        .expect("final MVP text code block must start on its own line");
+    let block = block
+        .split_once(&fence)
+        .expect("final MVP text code block must terminate")
+        .0;
+    let ordered = block
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert!(
+        !ordered.is_empty(),
+        "final MVP authority vocabulary must not be empty"
+    );
+    let names = ordered.iter().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(
+        names.len(),
+        ordered.len(),
+        "final MVP authority vocabulary must not contain duplicates"
+    );
+    names
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SymbolRow {
     pub symbol: String,
@@ -4363,6 +4740,88 @@ mod mutation_tests {
 
     static RUSTC_FIXTURE_RUN: AtomicU64 = AtomicU64::new(1);
 
+    #[test]
+    fn history_profile_rejects_a_10_3_table_moved_to_the_next_section() {
+        let heading = "### 10.3 History authority regression additions";
+        let source = read_workspace("docs/superpowers/specs/2026-07-20-history-design.md");
+        let source = source.replacen(
+            heading,
+            &format!("{heading}\n\n## 11 Canonical amendments before runtime"),
+            1,
+        );
+        assert!(
+            std::panic::catch_unwind(|| HistoryContractProfile::parse(&source)).is_err(),
+            "History profile must not search across the next heading for the 10.3 table"
+        );
+    }
+
+    #[test]
+    fn history_profile_rejects_a_wrong_first_10_3_table() {
+        let header = "| Test function | Owning slice | State |";
+        let source = read_workspace("docs/superpowers/specs/2026-07-20-history-design.md");
+        let source = source.replacen(
+            header,
+            &format!(
+                "| Wrong | Owning slice | State |\n| --- | --- | --- |\n| wrong | Back failure | planned |\n\n{header}"
+            ),
+            1,
+        );
+        assert!(
+            std::panic::catch_unwind(|| HistoryContractProfile::parse(&source)).is_err(),
+            "History profile must not skip a wrong first table for a later compatible table"
+        );
+    }
+
+    #[test]
+    fn history_profile_rejects_a_duplicate_10_3_heading() {
+        let heading = "### 10.3 History authority regression additions";
+        let source = read_workspace("docs/superpowers/specs/2026-07-20-history-design.md");
+        let source = format!("{source}\n{heading}\n");
+        assert!(
+            std::panic::catch_unwind(|| HistoryContractProfile::parse(&source)).is_err(),
+            "History profile headings must be unique"
+        );
+    }
+
+    #[test]
+    fn final_mvp_vocabulary_rejects_an_unmarked_text_block() {
+        let fence = char::from(96).to_string().repeat(3);
+        let source = format!("{fence}text\ncase\n{fence}");
+        assert!(
+            std::panic::catch_unwind(|| final_mvp_authority_vocabulary_from_source(&source))
+                .is_err(),
+            "only the marker-bound final MVP text block may define authority vocabulary"
+        );
+    }
+
+    #[test]
+    fn final_mvp_vocabulary_ignores_a_later_unbound_text_block() {
+        let fence = char::from(96).to_string().repeat(3);
+        let source = format!(
+            "MVP gate必须精确等于以下完整集合：\n\n{fence}text\nmarker_case\n{fence}\n\n# Other\n\n{fence}text\nother_case\n{fence}"
+        );
+        assert_eq!(
+            final_mvp_authority_vocabulary_from_source(&source),
+            BTreeSet::from(["marker_case".to_owned()])
+        );
+    }
+
+    #[test]
+    fn claim_boundary_evidence_rejects_an_item_in_a_different_section() {
+        let journeys = "# Claim\nclaim boundary\n\n# Item\ncontract item\n";
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_claim_boundary_and_item_share_section(
+                    journeys,
+                    "contract item",
+                    "claim boundary",
+                )
+            })
+            .is_err(),
+            "claim boundary and item must be bound to one markdown evidence section"
+        );
+    }
+
     fn rustc_fixture_output_root() -> PathBuf {
         let run = RUSTC_FIXTURE_RUN.fetch_add(1, Ordering::Relaxed);
         let root = workspace_dir()
@@ -4535,17 +4994,12 @@ mod mutation_tests {
 
     fn contract_rows() -> (Vec<SymbolRow>, Vec<TableRow>) {
         let allowlist = read_workspace("docs/facade-export-allowlist.md");
-        let profile = read_workspace("docs/nested-push-contract-profile.md");
         let symbols = markdown_table(
             &allowlist,
             "## 3. Allowed Type/Value/Trait Symbols",
             &["Symbol", "Module path", "Prelude", "Required feature"],
         );
-        let exclusions = markdown_table(
-            &profile,
-            "## 7 Public contract 与阶段 exclusions",
-            &["Kind", "Canonical path or normalized item", "First slice"],
-        );
+        let exclusions = history_contract_profile().exclusions;
         (root_symbols(&symbols, &exclusions), exclusions)
     }
 

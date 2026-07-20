@@ -3,15 +3,42 @@ mod facade_contract_cases;
 
 use facade_contract_cases::{
     assert_consumer_case_files, assert_devtools_adds_no_public_symbols, assert_facade_exports,
-    assert_golden_covers_symbols, assert_owner_source_matches_golden, facade_dir, markdown_table,
-    parse_golden, positive_consumer_cases, prepare_consumer_cases, public_facade_source_violations,
-    read_workspace, root_symbols, run_positive_consumer,
+    assert_golden_covers_symbols, assert_owner_source_matches_golden, facade_dir,
+    history_contract_profile, markdown_table, parse_golden, positive_consumer_cases,
+    prepare_consumer_cases, public_facade_source_violations, read_workspace, root_symbols,
+    run_positive_consumer,
 };
 
 const BEVY_GIT: &str = "https://github.com/shengyusi-SYS/bevy.git";
 const BEVY_REV: &str = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7";
 const BEVY_VERSION: &str = "0.19.0";
 const DEPENDENCY_SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+
+#[test]
+fn history_profile_has_exact_initial_machine_state() {
+    let profile = history_contract_profile();
+    assert_eq!(profile.exclusions.len(), 12);
+    assert_eq!(profile.contract_deltas.len(), 3);
+    assert!(
+        profile
+            .contract_deltas
+            .iter()
+            .all(|row| row.state == "planned")
+    );
+    assert_eq!(profile.authority_additions.len(), 1);
+    assert!(
+        profile
+            .authority_additions
+            .iter()
+            .all(|row| row.state == "planned")
+    );
+}
+
+#[test]
+fn history_profile_keys_are_disjoint() {
+    let profile = history_contract_profile();
+    profile.assert_disjoint_keys();
+}
 
 fn assert_table_keys(table: &toml::Table, expected: &[&str], label: &str) {
     use std::collections::BTreeSet;
@@ -495,9 +522,9 @@ fn facade_manifest_is_closed_world() {
 }
 
 #[test]
-fn nested_profile_tables_and_curated_facade_source_are_closed_world() {
+fn history_profile_tables_and_curated_facade_source_are_closed_world() {
     let allowlist = read_workspace("docs/facade-export-allowlist.md");
-    let profile = read_workspace("docs/nested-push-contract-profile.md");
+    let profile = history_contract_profile();
     let modules = markdown_table(
         &allowlist,
         "## 2. Allowed Modules",
@@ -508,11 +535,7 @@ fn nested_profile_tables_and_curated_facade_source_are_closed_world() {
         "## 3. Allowed Type/Value/Trait Symbols",
         &["Symbol", "Module path", "Prelude", "Required feature"],
     );
-    let exclusions = markdown_table(
-        &profile,
-        "## 7 Public contract 与阶段 exclusions",
-        &["Kind", "Canonical path or normalized item", "First slice"],
-    );
+    let exclusions = profile.exclusions;
     assert_eq!(modules.len(), 7);
     assert!(symbols.len() > 100);
     assert_eq!(exclusions.len(), 12);
@@ -535,9 +558,9 @@ fn nested_profile_tables_and_curated_facade_source_are_closed_world() {
 }
 
 #[test]
-fn isolated_positive_consumers_cover_the_nested_feature_matrix() {
+fn isolated_positive_consumers_cover_the_history_feature_matrix() {
     let allowlist = read_workspace("docs/facade-export-allowlist.md");
-    let profile = read_workspace("docs/nested-push-contract-profile.md");
+    let profile = history_contract_profile();
     let modules = markdown_table(
         &allowlist,
         "## 2. Allowed Modules",
@@ -548,11 +571,7 @@ fn isolated_positive_consumers_cover_the_nested_feature_matrix() {
         "## 3. Allowed Type/Value/Trait Symbols",
         &["Symbol", "Module path", "Prelude", "Required feature"],
     );
-    let exclusions = markdown_table(
-        &profile,
-        "## 7 Public contract 与阶段 exclusions",
-        &["Kind", "Canonical path or normalized item", "First slice"],
-    );
+    let exclusions = profile.exclusions;
     let symbols = root_symbols(&symbols, &exclusions);
     let golden = parse_golden(
         &read_workspace("docs/facade-associated-api-golden.txt"),

@@ -152,6 +152,143 @@ fn parse_final_mvp_catalogue(markdown: &str) -> BTreeSet<String> {
     names
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HistoryAuthorityRow {
+    test_function: String,
+    state: String,
+}
+
+fn parse_history_authority_rows(markdown: &str) -> Vec<HistoryAuthorityRow> {
+    let lines = markdown.lines().collect::<Vec<_>>();
+    let heading = "### 10.3 History authority regression additions";
+    let headings = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (*line == heading).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        headings.len(),
+        1,
+        "History authority additions heading must occur exactly once"
+    );
+    let mut rows = lines[headings[0] + 1..]
+        .iter()
+        .skip_while(|line| line.trim().is_empty());
+    assert_eq!(
+        rows.next().map(|line| line.trim()),
+        Some("| Test function | Owning slice | State |"),
+        "History authority additions must use the exact header"
+    );
+    assert_eq!(
+        rows.next().map(|line| line.trim()),
+        Some("| --- | --- | --- |"),
+        "History authority additions must use the exact separator"
+    );
+    let rows = rows
+        .take_while(|line| line.trim_start().starts_with('|'))
+        .map(|row| {
+            let cells = row
+                .trim()
+                .trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().trim_matches(char::from(96)).to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                cells.len(),
+                3,
+                "History authority additions rows must have exactly three columns"
+            );
+            assert!(
+                !cells[0].is_empty(),
+                "History authority test function must not be empty"
+            );
+            assert!(
+                matches!(
+                    cells[1].as_str(),
+                    "Replace" | "Back execution" | "Back failure"
+                ),
+                "unknown History authority owning slice: {}",
+                cells[1]
+            );
+            assert!(
+                matches!(cells[2].as_str(), "planned" | "active"),
+                "unknown History authority state: {}",
+                cells[2]
+            );
+            HistoryAuthorityRow {
+                test_function: cells[0].clone(),
+                state: cells[2].clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !rows.is_empty(),
+        "History authority additions table must not be empty"
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.test_function.as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        rows.len(),
+        "History authority additions must not have duplicate test functions"
+    );
+
+    let active = rows
+        .iter()
+        .filter(|row| row.state == "active")
+        .collect::<Vec<_>>();
+    if !active.is_empty() {
+        let final_mvp =
+            fs::read_to_string(workspace_root().join("docs/mvp-acceptance-journeys.md"))
+                .expect("MVP journeys must be readable");
+        let final_names = parse_final_mvp_catalogue(&final_mvp);
+        let root_profile =
+            fs::read_to_string(workspace_root().join("docs/root-push-contract-profile.md"))
+                .expect("Root profile must be readable");
+        let nested_profile =
+            fs::read_to_string(workspace_root().join("docs/nested-push-contract-profile.md"))
+                .expect("Nested profile must be readable");
+        let existing =
+            parse_one_column_table(&root_profile, "### 3.2 Root Authority Regression Catalogue")
+                .into_iter()
+                .chain(parse_one_column_table(
+                    &nested_profile,
+                    "### 7.1 Nested Authority Regression Additions",
+                ))
+                .collect::<BTreeSet<_>>();
+        for row in active {
+            assert!(
+                final_names.contains(&row.test_function),
+                "active History authority row {} is absent from the final MVP vocabulary",
+                row.test_function
+            );
+            assert!(
+                !existing.contains(&row.test_function),
+                "active History authority row {} overlaps Root/Nested",
+                row.test_function
+            );
+        }
+    }
+    rows
+}
+
+#[test]
+fn history_authority_parser_requires_a_line_exact_heading() {
+    let source = "prefix ### 10.3 History authority regression additions\n\n| Test function | Owning slice | State |\n| --- | --- | --- |\n| active_cycle_enters_authority_settlement | Back failure | planned |\n";
+    assert!(
+        std::panic::catch_unwind(|| parse_history_authority_rows(source)).is_err(),
+        "a substring heading must not authorize History authority parsing"
+    );
+}
+
+#[test]
+fn history_authority_parser_ignores_later_tables_in_the_same_section() {
+    let source = "### 10.3 History authority regression additions\n\n| Test function | Owning slice | State |\n| --- | --- | --- |\n| active_cycle_enters_authority_settlement | Back failure | planned |\n\nOther content\n\n| Test function | Owning slice | State |\n| --- | --- | --- |\n| another_authority_case | Back failure | planned |\n";
+    let rows = parse_history_authority_rows(source);
+    assert_eq!(rows.len(), 1);
+}
+
 fn direct_tests(file: &syn::File) -> Vec<&ItemFn> {
     file.items
         .iter()
@@ -163,7 +300,7 @@ fn direct_tests(file: &syn::File) -> Vec<&ItemFn> {
 }
 
 #[test]
-fn catalogue_matches_root_and_nested_profiles_and_final_mvp_vocabulary() {
+fn catalogue_matches_root_nested_and_active_history_profiles_and_final_mvp_vocabulary() {
     let root_profile =
         fs::read_to_string(workspace_root().join("docs/root-push-contract-profile.md"))
             .expect("Root profile must be readable");
@@ -178,6 +315,17 @@ fn catalogue_matches_root_and_nested_profiles_and_final_mvp_vocabulary() {
         &nested_profile,
         "### 7.1 Nested Authority Regression Additions",
     );
+    let history_profile = fs::read_to_string(
+        workspace_root().join("docs/superpowers/specs/2026-07-20-history-design.md"),
+    )
+    .expect("History profile must be readable");
+    let history_names = parse_history_authority_rows(&history_profile)
+        .into_iter()
+        .filter_map(|row| (row.state == "active").then_some(row.test_function))
+        .collect::<Vec<_>>();
+    let mut expected = root_names.clone();
+    expected.extend(nested_names.clone());
+    expected.extend(history_names.clone());
     assert_eq!(
         root_names.len(),
         20,
@@ -190,25 +338,48 @@ fn catalogue_matches_root_and_nested_profiles_and_final_mvp_vocabulary() {
         "the Rust Root prefix must preserve the profile table order"
     );
     assert_eq!(
-        AUTHORITY_REGRESSION_CATALOGUE[20..],
+        AUTHORITY_REGRESSION_CATALOGUE[20..23],
         nested_names,
         "the Rust Nested suffix must preserve the profile table order"
     );
+    assert_eq!(
+        AUTHORITY_REGRESSION_CATALOGUE[23..],
+        history_names,
+        "the Rust active History suffix must preserve the profile table order"
+    );
+    assert_eq!(
+        AUTHORITY_REGRESSION_CATALOGUE, expected,
+        "Rust catalogue must preserve the Root, Nested, and active History profile union order"
+    );
     let root_set = root_names.into_iter().collect::<BTreeSet<_>>();
     let nested_set = nested_names.into_iter().collect::<BTreeSet<_>>();
+    let history_set = history_names.into_iter().collect::<BTreeSet<_>>();
     let overlap = root_set.intersection(&nested_set).collect::<Vec<_>>();
     assert!(
         overlap.is_empty(),
         "Root and Nested catalogue tables must not overlap: {overlap:?}"
     );
-    let mut expected = root_set;
-    expected.extend(nested_set);
-    assert_eq!(expected.len(), 23, "Nested cumulative catalogue must be 23");
+    let root_history_overlap = root_set.intersection(&history_set).collect::<Vec<_>>();
+    assert!(
+        root_history_overlap.is_empty(),
+        "Root and active History catalogue tables must not overlap: {root_history_overlap:?}"
+    );
+    let nested_history_overlap = nested_set.intersection(&history_set).collect::<Vec<_>>();
+    assert!(
+        nested_history_overlap.is_empty(),
+        "Nested and active History catalogue tables must not overlap: {nested_history_overlap:?}"
+    );
+    let expected_set = expected.into_iter().collect::<BTreeSet<_>>();
+    assert_eq!(
+        expected_set.len(),
+        23,
+        "active History cumulative catalogue must be 23"
+    );
     let catalogue = catalogue_set();
     assert_eq!(catalogue.len(), 23, "Rust catalogue must stay locked at 23");
     assert_eq!(
-        catalogue, expected,
-        "Rust catalogue must match the Root and Nested profile union"
+        catalogue, expected_set,
+        "Rust catalogue must match the Root, Nested, and active History profile union"
     );
     let final_names = parse_final_mvp_catalogue(&final_mvp);
     let unknown = catalogue
@@ -217,7 +388,7 @@ fn catalogue_matches_root_and_nested_profiles_and_final_mvp_vocabulary() {
         .collect::<Vec<_>>();
     assert!(
         unknown.is_empty(),
-        "Nested catalogue contains non-final-MVP names: {unknown:?}"
+        "active profile union contains non-final-MVP names: {unknown:?}"
     );
 }
 

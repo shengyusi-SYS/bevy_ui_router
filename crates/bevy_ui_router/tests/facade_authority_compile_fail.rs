@@ -5,15 +5,16 @@ use std::collections::BTreeSet;
 
 use facade_contract_cases::{
     assert_consumer_case_files, feature_disabled_cases, forbidden_capability_cases,
-    forbidden_module_cases, forbidden_name_cases, is_forbidden_capability, markdown_table,
-    markdown_table_by_header, opaque_struct_cases, parse_golden, prepare_consumer_cases,
-    profile_exclusion_cases, read_workspace, root_symbols, run_negative_consumer,
+    forbidden_module_cases, forbidden_name_cases, history_contract_profile,
+    is_forbidden_capability, markdown_table, markdown_table_by_header, opaque_struct_cases,
+    parse_golden, prepare_consumer_cases, profile_exclusion_cases, read_workspace, root_symbols,
+    run_negative_consumer,
 };
 
 #[test]
-fn nested_profile_forbidden_consumers_fail_with_expected_rustc_categories() {
+fn history_profile_forbidden_consumers_fail_with_expected_rustc_categories() {
     let allowlist = read_workspace("docs/facade-export-allowlist.md");
-    let profile = read_workspace("docs/nested-push-contract-profile.md");
+    let profile = history_contract_profile();
     let modules = markdown_table(
         &allowlist,
         "## 2. Allowed Modules",
@@ -31,11 +32,7 @@ fn nested_profile_forbidden_consumers_fail_with_expected_rustc_categories() {
     );
     let forbidden_modules =
         markdown_table_by_header(&allowlist, &["Module path", "Negative assertion"], 0);
-    let exclusions = markdown_table(
-        &profile,
-        "## 7 Public contract 与阶段 exclusions",
-        &["Kind", "Canonical path or normalized item", "First slice"],
-    );
+    let exclusions = profile.exclusions;
     let symbols = root_symbols(&symbols, &exclusions);
     let golden = parse_golden(
         &read_workspace("docs/facade-associated-api-golden.txt"),
