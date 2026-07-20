@@ -386,9 +386,15 @@ Preflight 只有三种结果：
 
 ## 10. History、error recovery 与 cleanup
 
+以下是 runtime 前已确认的 History canonical contract，不表示 runtime 已实现。Core 是唯一 history publisher：immutable command 不等于 resolved target。push/replace 在 enqueue 冻结 canonical command target，request snapshot 的 `requested` 为 `Some`；back enqueue 只冻结 relative intent 与 admission evidence，`requested` 为 `None`，成为 running 时从 Core live history 一次性解析并冻结 resolved target 后才可进入 `Matching`。resolved-target back 此后保持该 `Some` 值；resolved-no-target back 不签发 history capability。
+
+History identity 仅由 Core 私有持有：每个 history 有不可复用 incarnation，每个 entry 有不可复用 identity，revision 绑定 incarnation 并在每次成功 push、replace 或 back publication 由该 request 推进。history publication capability 是绑定 router、request、attempt、transaction、intent、exact source、destination 与 prepared presentation 的 non-Clone single-use owner；snapshot、fingerprint、cursor 或 location 都只能验证，不能重建它。
+
 push/replace/back 先创建 history intent；只有正常 route presentation 原子提交成功才应用。back 先预览，UI commit 成功后才移动 cursor。
 
-`back()` 的同步 admission 只读取上一轮 published history snapshot：snapshot 已无前项时返回 `NavigationEnqueueErrorKind::NoBackEntry` 且不创建 request。已入队 back 在成为 running 时必须重新预览权威 history；前序 queued command 可能已移动 cursor。若此时仍有前项，就以当时的目标继续；若已无前项，则该 request 以 `Failed(BackTargetUnavailable)` 终结，active/history 不变、不渲染 fallback，并通过零 obligation cleanup batch 收敛。前序 back 失败不会移动 cursor，因此后续 queued back 可以重新预览同一目标。
+`back()` 的同步 admission 只读取上一轮 published history snapshot：router identity 与 availability 先于 `NoBackEntry` 检查，`NoBackEntry` 又先于 capacity 申请。若无前项则返回 `NavigationEnqueueErrorKind::NoBackEntry` 且不创建 request。随后先取得 manifest-neutral `EcsCleanupCapacityReservation`，它只预留 identity、domain 与 capacity，不声明 manifest、count 或 zero；再预留 Core request/transaction/cleanup/normal-branch identities。永久 identity/domain 耗尽返回 `NavigationEnqueueErrorKind::IdentityExhausted`：无 request id、公开 queue/request/World 零变化、已消费 private identity 只烧毁不复用，且不得映射为 `AuthorityRecovering`。
+
+已入队 back 在成为 running 时必须重新预览权威 history；前序 queued command 可能已移动 cursor。若此时仍有前项，就以当时的目标继续。若已无前项，ECS 必须从 exact host/active claims、owner inventory、registry mappings、完整 observed closure 与 role partition 得到 `ProvenEmptyProjection`，其中所有 existing current 都受保护且 target 为空。只有 authority 仍有效时，reservation 才能转换为 canonical-empty manifest/ledger 并以零 completion 收敛到 `Failed(BackTargetUnavailable)`；不渲染 fallback，active/history 不变。前序 back 失败不会移动 cursor，因此后续 queued back 可以重新预览同一目标。
 
 ```text
 ActivePresentation::Route { location, frames }
@@ -431,7 +437,7 @@ Top-slot quarantine 在 transfer 前还有强制 detach gate：旧 `HostLease` �
 
 ## 11. Diagnostics 与验收观察面
 
-`RouterSnapshot::requested/matched/pending_phase/running_request`只汇总当前running request：没有running request时四者均为`None`，queued、active或last-terminal request不得占用这些字段。每个`NavigationRequestSnapshot`永久保存自身canonical requested location；match成功后保存immutable fingerprint，match失败或尚未完成match时为`None`，具体阶段由status/trace区分。`ActivePresentation`单独暴露已提交route location或error requested/matched、frames与failure，不能从router running摘要推断。其余router snapshot包含availability、history cursor/can-back、最早保留request sequence、cleanup summary和router-scoped diagnostics；request snapshot另含request-scoped diagnostics。`RequestStatus::Failed`携带可分类的只读failure。精确签名以Facade Contract Fixture为准。
+`RouterSnapshot::requested/matched/pending_phase/running_request`只汇总当前running request：没有running request时四者均为`None`，queued、active或last-terminal request不得占用这些字段。每个`NavigationRequestSnapshot`永久保存自身 optional requested projection：push/replace 在 enqueue 即为 canonical location，back 在 running 一次性 resolution 前为`None`，resolved-target back 后为 immutable canonical location，resolved no-target back 保持`None`。match成功后保存immutable fingerprint，match失败或尚未完成match时为`None`，具体阶段由status/trace区分。`ActivePresentation`单独暴露已提交route location或error requested/matched、frames与failure，不能从router running摘要推断。其余router snapshot包含availability、history cursor/can-back、最早保留request sequence、cleanup summary和router-scoped diagnostics；request snapshot另含request-scoped diagnostics。`RequestStatus::Failed`携带可分类的只读failure。精确签名以Facade Contract Fixture为准。
 
 `NavigationRequestSnapshot` 保存只读 lifecycle trace：request phase changed、history intent rejected、mount requested/resolved/granted/rejected、shell prepared、view applied、outlet registered、frame isolated/activated、commit published、cleanup disposition 和 request terminal。mount rejection 结构化区分 `MissingOutlet`、`InvalidOutlet`、`ParentAuthorityLost` 与 `RejectedAfterMutation`；事件只在语义转移时追加，不记录 polling。即使一次 update 完成多个阶段，也保留顺序证据。`Running(CleanupPending|Recovering|PostCommitCleanup)` 必须先于对应 cleanup settled，terminal 事件必须最后追加，因此消费者不依赖 update 间恰好可见的中间 snapshot。
 

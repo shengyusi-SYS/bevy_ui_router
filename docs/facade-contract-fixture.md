@@ -193,7 +193,7 @@ pub enum ViewBuildReportKind {
 }
 
 impl NavigationRequestSnapshot {
-    pub fn requested(&self) -> &RouteLocation;
+    pub fn requested(&self) -> Option<&RouteLocation>;
     pub fn matched(&self) -> Option<&RouteBranchFingerprint>;
     pub fn status(&self) -> &RequestStatus;
     pub fn trace(&self) -> &[NavigationTraceEvent];
@@ -288,6 +288,7 @@ pub enum NavigationEnqueueErrorKind {
     HostUnavailable,
     AuthorityRecovering,
     NoBackEntry,
+    IdentityExhausted,
 }
 
 impl RouterInstallError {
@@ -631,6 +632,16 @@ pub enum RouterLifecycleAuditEventKind {
     QuarantineReaped,
 }
 ```
+
+`NavigationRequestSnapshot::requested -> Option`
+
+`NavigationEnqueueErrorKind::IdentityExhausted`
+
+`late-bound back complete evidence`
+
+上述三个标签是 future active contract-delta harness 的规范化 item 文本，不表示当前 runtime 已通过其 owning slice。push/replace 在 enqueue 后的 request projection 是 `Some(canonical target)`。back 在 enqueue 时为 `None`，只在 running 的一次性 live resolution 找到 target 后冻结为 `Some(resolved canonical target)`，并保持至成功或 resolved-target failure terminal；resolved no-target back 以 `None + BackTargetUnavailable` 终结。`RouterSnapshot::requested()` 只镜像当前 running request 的 resolved target。所有这些观察只通过既有 `RouterNavigation`、`RouterSnapshots` 与 request lookup 提供，不新增 public authority API，也不允许 consumers 构造 history entry、revision、incarnation 或 capability。
+
+`IdentityExhausted` 由真实 allocator/domain predicate 导出，表示永久容量耗尽：不产生 request id，公开 queue/request/World 状态零变化，已消费 private identity 不复用。back 必须按 `UnknownRouter -> availability -> NoBackEntry -> IdentityExhausted` 判断，不能把该错误改写为 `AuthorityRecovering`。
 
 `ContentEntity` 是 `Clone + Copy + Debug + Eq + Hash`、带 writer-session identity 的不透明句柄，不是裸 `Entity`。它可以由测试 driver 暂存以验证跨 session 拒绝，但不能用于 World 查询或 mutation。`RouteViewInput` 只读，不包含 authority identity。
 

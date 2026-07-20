@@ -48,19 +48,27 @@ Facade journey 的“稳定”只依赖生产观察面：该 router 没有 runni
 
 - **Given**：当前 history 为 `/items/1`, `/items/2`。
 - **When**：执行 `replace(RouteLocation::new("/items/3"))`，成功后执行 `back()`。
-- **Then**：两次命令都经过 match、plan、staged apply 和 atomic switch；replace 后 history 为 `/items/1`, `/items/3`；back 成功后 active/history current 均为 `/items/1`；每次都保留 layout、替换 leaf。
+- **Then**：两次命令都经过 match、plan、staged apply 和 atomic switch；replace 的 request snapshot 从 enqueue 起为 `requested=Some(/items/3)`；back 在 running resolution 后冻结为 `requested=Some(/items/1)`。replace 后 history 为 `/items/1`, `/items/3`；back 成功后 active/history current 均为 `/items/1`；每次都保留 layout、替换 leaf。
+
+`NavigationRequestSnapshot::requested -> Option` — Back execution public contract PASS
 
 ### Journey C2：失败 back
 
 - **Given**：独立 fixture 的 history 为 `/items/1`, `/items/3`，当前 active 为 `/items/3`，并为 `/items/1` 注入 build failure。
 - **When**：执行 `back()`。
-- **Then**：request 为 `Failed`；recovery 成功时 presentation 为 `Error`，否则 `/items/3` 保持 active；两种情况 cursor 都不移动，不能出现 history-only back。
+- **Then**：back queued 时 `requested=None`，running resolution 后冻结为 `requested=Some(/items/1)`，即使 route failure 或 fallback 后也保持该 resolved value。request 为 `Failed`；recovery 成功时 presentation 为 `Error`，否则 `/items/3` 保持 active；两种情况 cursor 都不移动，不能出现 history-only back。
 
 ### Journey C3：排队 back 的执行期重检
 
 - **Given**：history 只有 `/items/1`, `/items/2`，同步 admission snapshot 允许 back。
 - **When**：在一次 `App::update` 前连续入队两个 `back()`。
-- **Then**：第一个成功后 cursor 到 `/items/1`；第二个成为 running 时重新预览，因没有前项而以 `Failed(BackTargetUnavailable)` 终结，不渲染 fallback，不改变 active/history，并留下 `HistoryIntentRejected` trace。若第一个 back 因 view failure 失败，cursor 不动，第二个可重新预览并独立尝试 `/items/1`。
+- **Then**：两个 queued request 均可观察 `requested=None`。第一个成功后 cursor 到 `/items/1`；第二个成为 running 时重新预览，因没有前项而以 `requested=None + Failed(BackTargetUnavailable)` 终结，不渲染 fallback，不改变 active/history，并留下 `HistoryIntentRejected` trace。该 no-target terminal 必须由 `ProvenEmptyProjection`、canonical zero manifest 与 exact zero completion 证明，不能由空 logical roots 推导。若第一个 back 因 view failure 失败，cursor 不动，第二个可重新预览并独立冻结 `requested=Some(/items/1)` 后尝试。
+
+`late-bound back complete evidence` — complete C3 two-branch PASS
+
+`NavigationEnqueueErrorKind::IdentityExhausted` — allocator-derived public RED/GREEN PASS
+
+该标签是 future active contract-delta harness 的规范化 item 文本，不表示 runtime 已通过。独立 facade consumer gate 还必须从真实 allocator/domain capacity predicate 导出 `IdentityExhausted`；test seam 只能改变该 predicate 的输入事实。该错误不创建 request、request id、公开 queue/request/World 变化或 terminal，已消费 private identity 不复用。back 的 enqueue precedence 精确为 `UnknownRouter -> availability -> NoBackEntry -> IdentityExhausted`。
 
 ### Journey D：view、mount 与 error recovery
 

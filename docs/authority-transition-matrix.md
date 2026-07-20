@@ -167,7 +167,7 @@ CleanupAttempt = batch id + attempt revision + unsettled obligation digest + fre
 
 协议固定为：
 
-Cleanup target/manifest 与 post-cleanup continuation 正交；前者描述必须 settle 的 exact obligations，后者由 engine 在 cleanup 前依据原始 failure/authority classification 与 attempt/branch role 封存，completion 不能根据 active presentation、obligation count 或 disposition 重新分类
+Cleanup scope/manifest 与 post-cleanup continuation 必须分别冻结并持有：前者描述必须 settle 的 exact obligations，后者由 engine 在 cleanup 前依据原始 failure/authority classification 与 attempt/branch role 封存。completion 不能根据 active presentation、obligation count 或 disposition 重新分类
 
 1. ECS 根据已经通过的preflight/settlement plan生成确定顺序、不可变的entity obligation identity manifest，并向engine提交逻辑mounted roots、digest与count；manifest冻结“哪些exact owned records必须前景收敛”，不冻结未来物理`Removed/Quarantined/...` disposition，Entity不进入core。
 2. Engine 验证 roots 属于当前 request/transaction/host epoch 后签发 opaque token；ECS 只接受 digest/count 与本地 manifest 完全相同的 token，并以 token 建立唯一 ledger。
@@ -176,7 +176,7 @@ Cleanup target/manifest 与 post-cleanup continuation 正交；前者描述必�
 5. 每个obligation只能由同batch、同exact Entity/owner的**实际**terminal disposition receipt结算一次。`Removed`、`RemovedDetached`、`AlreadyAbsent`、`RejectedProtected`、`QuarantinedForeignDescendant`、`QuarantinedProtectedParent`和`QuarantinedForeignComponent`都可终结前景obligation；quarantine receipt原子转交当时仍存在的immutable exact residual set给独立lease，因此持久drift不会让request永久nonterminal。
 6. 完全相同的重复receipt返回`DuplicateRejected`；错误batch、旧epoch、错误request/transaction、未知obligation、未知token或superseded attempt revision返回`StaleDiscarded`/`InvalidRejected`，均无ledger、presentation、history或request状态变化。
 7. 全部obligations恰好结算一次后，ECS把原token与completion digest交回engine。Engine只接受当前outstanding batch，随后才可消费预先封存的continuation或进入terminal；completion replay无副作用。Host/authority loss只能转交同一批未结算obligation identity，不能复制ledger或receipt。
-8. obligation count为零时，batch在同一阶段签发并立即完成，仍留下batch trace；不得用“没有receipt”绕过terminal gate。
+8. obligation count为零时，batch在同一阶段签发并立即完成，仍留下batch trace；不得用“没有receipt”绕过terminal gate。History no-target back 的零 batch 只能来自 `ProvenEmptyProjection`，并使用 canonical zero manifest，不能从 logical roots、空数组或未证明的 empty manifest 推导。
 
 Core 只签发/验证 batch identity 和逻辑 roots，ECS 独占 Entity manifest 与 receipt authority，因此不存在 core 读取 World 或 ECS 自行终结 request 的反向依赖。
 
@@ -235,6 +235,19 @@ Foreground request 在 lease 创建 receipt 时已经 terminal；reaper 的关�
 任何 terminal request 都满足 foreground cleanup 已结束；quarantine receipt 视为 foreground 已结束，但 background lease 可继续存在。
 
 terminal evidence 还必须证明该 request/settlement scope 不再持有 outstanding action、ticket、capability 或 lifecycle owner；独立 quarantine lease 只能以自身 owner 存续，且不得回写该 terminal
+
+### 9.1 History request and cleanup boundary
+
+以下是 runtime 前冻结的 History contract，不表示当前 runtime 已完成。pre-commit 的 host、current、preserved 或 leaving authority loss 优先于 resolved target、pending rejection、route failure 与 no-target；它取消或消费原 history owner、history 保持旧值，并进入既有 scoped authority settlement。`CommitPublished` 后 capability 已消费，History 只冻结不回滚边界；ordinary drift 保持原 immutable ledger，authority loss 或不能按 receipt/quarantine 收敛的异常属于 Recovery 的 compound settlement。
+
+| Case | Cleanup scope | Continuation | requested / terminal |
+| --- | --- | --- | --- |
+| push/replace or resolved-target back | exact pending/entering failure obligations，或 publication 后 immutable leaving batch | original failure，或 normal success | push/replace enqueue 为 `Some`；resolved-target back running 后为 `Some` 并保持至 terminal |
+| resolved no-target back | `ProvenEmptyProjection` 后的 canonical zero manifest/ledger | rejected-back，独立于 zero count/disposition | queued 为 `None`；正常同一 schedule 内不发布 running `None`，terminal 为 `None + BackTargetUnavailable` |
+| proven-empty 前的 pre-commit authority takeover | existing scoped authority settlement，不建立 no-target ledger | authority failure | 唯一可公开的 no-target `Running(CleanupPending/Recovering) + None` 窗口，settlement 后 `Failed(HostLost/AuthorityLost)` |
+| typed retryable no-target preparation shortage | no new ledger；原 candidate、reservation 与 evidence 完整返还 | unchanged | 可公开 `Running(CleanupPending) + None`，只可由 named retry producer 继续 |
+
+`NavigationEnqueueErrorKind::IdentityExhausted` 是 allocator/domain predicate 的永久 fail-closed 结果：不创建 request、没有 request terminal、公开 queue/request/World 零变化、不映射为 recovering。back 的 enqueue precedence 固定为 `UnknownRouter -> availability -> NoBackEntry -> IdentityExhausted`，其中 `NoBackEntry` 仅优先于后续 capacity 申请。
 
 ## 10. Required Regressions
 
