@@ -1,6 +1,6 @@
 # Roadmap
 
-**状态**: Phase 3B.1 `Reconciliation 实施中`
+**状态**: Phase 3B.1 `Reconciliation PASS`
 
 **更新时间**: 2026-07-20
 
@@ -20,24 +20,28 @@
 
 详细边界见 [Nested Push Contract Profile](nested-push-contract-profile.md) 与 [Nested Push Implementation Plan](superpowers/plans/2026-07-16-nested-push-implementation-plan.md)
 
+- [x] **Reconciliation**
+  - Core logical roles、ECS physical splice、exact cleanup 与 scoped pre-commit authority settlement
+  - Journey B、nested fragment、equivalent physical no-op 与 common-prefix-preserving suffix splice
+  - Task 7 prerequisite `2e5cb3d`，public evidence `5806c59`，Task 8 focused/full gates 与四路独立复审
+
 ## Now
 
-1. **Task 6: private physical reconciliation regressions**
-2. **Task 7: public Journey B、fragment 与 facade evidence**
-3. **Task 8: Reconciliation completion gate 与 factual records**
-
-每个切片仍须从公开 facade 命令经过真实 `App::update` 到稳定 snapshot，不新增第二条 lifecycle publisher
+1. **History stage spec/plan and complete matrix**
+   - 定义 `replace`、`back`、zero-entering、成功后 history commit 与失败保持语义
+   - 在同一阶段 spec/plan 中冻结完整 role/topology/physical-drift/terminal matrix，不新增第二份状态源
+   - spec/plan 与该完整 matrix 分别通过独立复审后，才开始 History runtime implementation
 
 ## Next
 
-1. **History**
-   - replace、back、zero-entering 与成功后提交
-2. **Recovery**
-   - view/mount failure、error presentation、host loss 与 stale replay
-3. **Authority closure**
+1. **Recovery**
+   - view/mount failure、error presentation、post-commit host loss 与 stale replay
+2. **Authority closure**
    - multi-router stress、完整 opaque audit、lease authority、background reaper 与 cleanup replay
-4. **MVP gate**
+3. **MVP gate**
    - facade journeys、authority regressions、feature matrix、workspace tests 与独立 factual review
+
+完整 History runtime、Recovery、Authority closure、`RouterInputProbes` 与 MVP 均仍未完成；Reconciliation PASS 不等于 MVP PASS
 
 ## MVP 后
 

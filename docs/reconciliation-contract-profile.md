@@ -1,14 +1,14 @@
 # Reconciliation 阶段合同 Profile
 
-**状态**: Reconciliation 实施中
+**状态**: Complete — Reconciliation PASS
 
-**实现 checkpoint**: Tasks 1–5 complete，`ddce26d`，Tasks 6–8 pending
+**实现 checkpoint**: Tasks 1–8 已闭合；Task 8 focused/full workspace 门禁精确归因于 clean `5806c59`，四路独立复审均通过
 
 **设计基线**: `a977bd0`
 
 **前置状态**: Nested Push PASS，最终实现 `702e36e`
 
-**目标状态**: Reconciliation PASS
+**阶段结论**: Reconciliation PASS
 
 **适用规范**: [Target Architecture](target-architecture.md)、[Authority Transition Matrix](authority-transition-matrix.md)、[MVP Acceptance Journeys](mvp-acceptance-journeys.md)、[Facade Contract Fixture](facade-contract-fixture.md)、[Nested Push Contract Profile](nested-push-contract-profile.md)
 
@@ -47,14 +47,20 @@ Authority Transition Matrix 对 post-commit host/registration loss 的最终语�
 
 | Owner | 本切片职责 | 禁止越界 |
 | --- | --- | --- |
-| Core | 决定 `Preserved | Leaving | Entering` roles、frame identity、generation、sealed commit 与 publication | 读取 Entity、物理 manifest 或 receipt |
-| ECS | 消费 sealed roles，验证 exact closure、分类 physical outcome、执行 splice、cleanup 与 audit | 改写逻辑 roles、route matching、history publication或第二套 lifecycle |
+| Core | 决定 `Preserved | Leaving | Entering` roles、逻辑 router/host/slot/frame/request/transaction/task IDs、与 exact frame identity 绑定的 generation、sealed commit 与 publication | 读取 Entity、物理 authority identity、manifest 或 receipt |
+| ECS | 消费 sealed roles，签发 ownership seal、cleanup ledger domain 与 attempt revision，验证 exact closure、分类 physical outcome、执行 splice、cleanup 与 audit | 改写逻辑 roles/IDs/generation、route matching、history/terminal publication或第二套 lifecycle |
 | View | 根据 sealed frame task 生成受限 `ContentPlan` | 判断 preservation、构造 slot/frame identity或提交 active |
-| Facade | 公开 push、snapshot、trace 与 opaque audit 观察面 | 暴露 engine、registry、Entity或 authority constructor |
+| Facade | 公开 push、snapshot、trace、opaque audit、renderer-neutral `RouteViewRegistry` 与 `RouterInputGate`/test-support host mapping 等有限 app-side Bevy Entity 输入 | 暴露 `RouterEngine`、ECS physical `RouteEntityRegistry`、router-owned raw Entity/World/registry conversion/accessor 或 authority/mutation constructor |
 
-Core 保持唯一 lifecycle publisher，ECS 只能交回 sealed report、digest、count 与 completion evidence，不能自行发布 active 或终结 request
+Core 保持唯一逻辑 lifecycle publisher
 
-不得新增 reconciliation runtime、第二个 publisher、ID allocator 或 adapter authority
+- Core prepared commit capability 发布 logical active、push history 与 commit trace
+- Core 在匹配的 cleanup/authority-settlement completion evidence 完成后独占发布 request terminal；pre-mutation logical failure 可在 Core 内直接 terminalize，不需要 commit publication capability
+- ECS 永不发布或重建 logical active、history 或 request terminal
+- ECS-owned `ViewBuildReport` 与 `EcsViewReportSession` 是 facade-reachable public types。`ViewBuildReport` 是只读 kind/message DTO，只有 ECS-issued one-shot session terminal method 可以构造；raw report identity/fields、direct constructors 与 session constructor/seal 保持 private
+- 与 public view-driver report 分离，ECS exact physical `FrozenCleanupManifest`、`CleanupLedger`、`CleanupReceipt` 与对应 exact Entity facts 保持 ECS-crate-private。`CleanupManifest`、`CleanupBatch`、`CleanupCompletion` 及相关 integration methods 是 Core `#[doc(hidden)] pub mod integration` 内的 `pub` items；部分 individual methods 可另带 item-level `#[doc(hidden)]`，不得泛化为每个 wrapper/method 都带该 attribute。Facade 不 re-export 该 integration module 或这些 items；它们绑定 opaque Core batch/completion identity 与 metadata。Core 验证 logical roots、exact batch/completion binding、count 与 required empty/non-empty shape，但不从物理事实重建或认证 ECS exact physical owner、manifest、ledger 或 receipt
+
+不得新增 reconciliation runtime、第二个 publisher、逻辑 route/lifecycle allocator 或 adapter authority
 
 ## 4 Core 分类与私有 projection
 
@@ -92,9 +98,11 @@ provenance 或 raw search 改变时 common prefix 固定为 0，整支 branch �
 
 nested fragment 使用 deepest leaf 原 frame id 与 `checked_next` generation，恰产生一次携带新 fragment 的 deepest effect
 
+generation 只与 exact frame identity 一起解释，裸 generation 数值不要求跨不同 frame 全局唯一
+
 未使用的 reserved frame/task IDs 永久 burn，不因 preservation、失败或等价路径复用
 
-完全等价 push 保持 zero entering、zero leaving、zero view effect，但仍按正常 push intent publication history
+完全等价 push 是 physical no-op：zero entering、zero leaving、zero view effect 与 zero physical mutation，但仍按正常 request 与 push intent publication history
 
 fragment commit 前 active/history 不变，成功 push 后 history 才推进到新 fragment
 
@@ -142,6 +150,8 @@ preserved closure 只验证且不产生 mutation，leaving closure 预生成隔�
 
 entering closure 必须已完整 `PreparedInert`，所有 activation values 在 preflight 前建立
 
+allowed write set 只包含 exact Router-owned authorized target。isolation、quarantine 与 receipt mutation 不得落到 foreign descendant/component、protected 或 other-authority parent 及其 component/relationship；protected parent 本身不接收 quarantine receipt 或 mutation
+
 preflight 成功后生成一个不可失败的 `CommitMutationPlan`
 
 执行顺序固定为
@@ -162,7 +172,7 @@ commit tail 不再 query、分配、插入组件、改 relationship或执行可�
 | --- | --- |
 | host、current 或 preserved authority drift | `AuthorityLost`，禁止 switch |
 | leaving owner、seal、required component manifest 或 cycle corruption | `AuthorityLost`，禁止 switch |
-| leaving foreign descendant/component 或 protected parent，可安全隔离 | 允许 commit，以实际 quarantine receipt 收敛 |
+| leaving authorized target 遇到 foreign descendant/component 或 protected inbound parent，且 target 可安全隔离 | 只隔离 exact Router-owned target并以该 owned residual 的实际 quarantine receipt 收敛；foreign/protected non-target 与 edge 零写 |
 | entering drift | `PendingRejected`，只 cleanup pending |
 
 physical `AuthorityLost` 执行本切片最小 pre-commit settlement
@@ -170,8 +180,9 @@ physical `AuthorityLost` 执行本切片最小 pre-commit settlement
 - 复用既有唯一 lifecycle publisher、ledger 与 receipt stream，不创建第二套 ledger 或重复 receipt
 - availability 先进入 `RecoveringAuthority`，current running request 进入 `Running(Recovering)`
 - queued requests 立即 `Failed(AuthorityLost)`，不执行 switch、fallback 或重放
-- 隔离并 settlement 已知 exact owned closure，history 不推进
-- 全部 settlement receipts 完成后 Core/ECS active 同时变为 `None`
+- settlement 开始时，ECS active/pending/host owner 单次移动进 authority-settlement cleanup ledger，ECS active 立即变为 `None`，history 不推进
+- receipts 未完成时，该 ledger 唯一持有 physical residual，request 保持 `Running(Recovering)`
+- 全部 settlement receipts 完成后消费 ledger owner，Core 清空 logical active，terminal state 不再持有 active/lifecycle owner
 - `CleanupSettled` 早于 current request 最后的 `RequestTerminal`
 - current request 精确终结为 `Failed(AuthorityLost)`
 
@@ -211,32 +222,55 @@ receipt 与 audit tombstone 是两条独立证据，不能相互推导
 | Journey B cleanup | old leaf 正常 `Removed` receipt，稳定 audit tombstone 为 `Removed` |
 | Journey B safety | 任一 phase 不存在两个可交互 leaf，app-owned host 零越权写入 |
 | nested fragment | ancestors/root/outlet/slot 保留，deepest leaf frame id相同、generation `+1`、恰一次新 fragment effect |
-| equivalent | zero entering、zero leaving、zero effect，active identity 不变且 push history 正常 publication |
+| equivalent physical no-op | zero entering、zero leaving、zero effect 与 zero physical mutation，active identity 不变且 request/push history 正常 publication |
 | append | preserved prefix不变，只从首个新 index逐层 mount |
 | truncate | 只清理多余 suffix，retained parent 的 empty registered inert slot 与 audit mapping 保留 |
 | suffix replace | leaving leaf-to-root、entering root-to-leaf，一次 splice与一次 Core publication |
 | authority drift | preserved/current drift为 `AuthorityLost`，无 fallback、无 history推进 |
 
-公开 facade journey 证明 consumer 可见事实，ECS crate-private regression 证明 exact Entity 与物理 mutation，Core regression 证明分类、identity、sealed ticket 与唯一 publication
+Journey B navigation 只通过推荐 facade `push` 与真实 `App::update` 驱动。稳定 consumer 事实由 snapshot、trace 与 opaque audit 证明；commit-boundary interactive-leaf cardinality 另由 test-local、只读、非权威的 `World + RouterInputGate` sampler 验证。ECS crate-private regression 证明 exact Entity 与物理 mutation，Core regression 证明分类、logical identity、sealed ticket 与唯一 publication
 
-## 9 门禁与 PASS 定义
+## 9 已执行门禁与目标状态定义
 
-完成前必须通过
+以下门禁已在精确干净 `5806c59` 树执行并通过
 
-- Core running-time projection、reservation burn、classification、fragment generation 与 publisher uniqueness 回归
-- ECS slot ownership、四类 splice、role-sensitive drift、settlement 与 exact cleanup 回归
-- Journey B public journey、authority audit 与 facade contract gate
-- Root、Nested 既有旅程与 authority catalogue 无回退
-- workspace fmt、check、nextest、doctest 与 diff check
-- Core lifecycle、ECS physical authority、public facade evidence 独立复审
+- Core complete target：286 unit tests、28 doctests
+- View complete target：8 unit、6 dependency-boundary、1 public API
+- ECS all-features complete target：401 unit tests 与全部 integration targets
+- public navigation journeys 7/7，public authority audit 3/3
+- facade export allowlist 46/46，facade authority compile-fail 40/40
+- authority catalogue 23/23/23
+- workspace fmt 与 all-target/all-feature check
+- workspace nextest 838/838，0 skipped
+- workspace all-feature doctest 28/28
+- `git diff --check`，且 tracked tree 保持干净并指向 `5806c59`
 
-Reconciliation PASS 只在以下条件同时成立时记录
+实现与证据 checkpoints
 
-- Journey B 全部稳定态和中间态事实可由公开 facade 观察
+- Reconciliation contract start / implementation-plan commit：`0201d49`
+- Implementation/evidence range：`228c5bf..5806c59`
+- Tasks 1–5：`228c5bf`、`c627a9e`、`6f8e734`、`9415d03` + `4f4e4dc`、`ddce26d`
+- Task 6 plan gate：`9d7d2f0`；implementation：`e5a26e6`
+- Task 7 plan/public gate：`a694acb`；cleanup guardrail：`9307d2f`
+- Root fallback plans：`10dc5f4..81d2657`
+- Task 7 prerequisite：`2e5cb3d`；public evidence：`5806c59`
+
+最终独立复审结果
+
+- Specification coverage and pending-slice honesty：PASS，no Critical/Important/Minor
+- Core lifecycle、single publisher、logical IDs/generation 与 terminal ordering：PASS after review fixes，no remaining Critical/Important/Minor
+- ECS ownership、slot lifecycle、physical preflight、cleanup 与 authority settlement：PASS after review fixes through draft5，no remaining Critical/Important/Minor
+- Public facade、Journey B、fragment 与 audit evidence：PASS after review fixes，no remaining Critical/Important/Minor
+
+四路职责全部通过且无 remaining Critical/Important/Minor，Profile 状态为 Complete
+
+本次 Reconciliation PASS 由以下闭合事实共同支持
+
+- Journey B 稳定 consumer 事实可由公开 facade snapshot/trace/opaque audit 观察，commit-boundary interactive-leaf cardinality 由 test-local read-only sampler 补充证明
 - nested fragment 的 ancestor preservation 与 deepest-leaf generation 语义闭合
 - append、truncate、suffix replace、equivalent 四类内部回归闭合
 - 生产代码仍只有 Core 一个 lifecycle publisher
 - preserved/current drift 全部 fail closed 为 `AuthorityLost`
-- 最小 pre-commit authority settlement 清空失效 Core/ECS active且无 fallback/history 推进
+- 最小 pre-commit authority settlement 在开始时把 ECS owner 单次移动进 ledger并清空 ECS active，在 completion 时消费 ledger owner、清空 Core logical active，且无 fallback/history 推进
 - cleanup receipt 与独立 audit tombstone 均证明旧 leaf 已移除
-- 文档仍明确 History、Recovery、Authority closure、MVP 与 BSN 未完成
+- 文档仍明确 History、Recovery、Authority closure、`RouterInputProbes`、MVP 与 BSN 未完成

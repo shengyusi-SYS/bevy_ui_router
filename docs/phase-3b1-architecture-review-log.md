@@ -1,7 +1,7 @@
 # Phase 3B.1 Architecture Review Log
 
-**状态**: Phase 3B.1 `Nested Push PASS`；结构重写评估为 `NO REWRITE`
-**审查日期**: 2026-07-10；Nested completion 2026-07-18
+**状态**: Phase 3B.1 `Reconciliation PASS`；结构重写评估为 `NO REWRITE`
+**审查日期**: 2026-07-10；Nested completion 2026-07-18；Reconciliation completion 2026-07-20
 
 ## Round 1
 
@@ -574,3 +574,66 @@ Facade 审查为 `PASS`；架构与事实审查均为 `NEEDS REVISION`，共同�
 - Nested Push：PASS
 - Authority catalogue：Root 20 + Nested 3 = 23
 - 仍未完成：Journey B/common-prefix Reconciliation、History replace/back、Recovery、Authority closure、MVP gate
+
+## Reconciliation Task 8 completion
+
+### 提交与实现 checkpoints
+
+- Reconciliation contract start / implementation-plan commit：`0201d49`
+- Implementation/evidence range：`228c5bf..5806c59`
+- Task 1：`228c5bf`
+- Task 2：`c627a9e`
+- Task 3：`6f8e734`
+- Task 4：`9415d03`，review fix `4f4e4dc`
+- Task 5：`ddce26d`
+- Task 6 plan gate：`9d7d2f0`，implementation `e5a26e6`
+- Task 7 plan/public gate：`a694acb`，cleanup guardrail `9307d2f`
+- Root fallback plans：`10dc5f4..81d2657`
+- Task 7 prerequisite：`2e5cb3d`
+- Task 7 public evidence：`5806c59`
+
+Root Push 与 Nested Push 继续保持闭合，Reconciliation Tasks 1–8 已闭合
+
+### Task 8 已执行门禁
+
+以下结果全部来自精确干净 `5806c59` 树
+
+- Core complete target：286 unit tests、28 doctests
+- View complete target：8 unit、6 dependency-boundary、1 public API
+- ECS all-features complete target：401 unit tests 与全部 integration targets
+- public navigation journeys：7/7
+- public authority audit：3/3
+- facade export allowlist：46/46
+- facade authority compile-fail：40/40
+- authority catalogue：23/23/23
+- workspace fmt 与 all-target/all-feature check 已通过
+- workspace nextest：838/838，0 skipped
+- workspace all-feature doctest：28/28
+- `git diff --check` 已通过，tracked tree 保持干净并指向 `5806c59`
+
+### 当前事实边界
+
+- Core 仍是唯一逻辑 lifecycle publisher，独占 sealed logical frame/slot roles、request ordering、逻辑 router/host/slot/frame/request/transaction/task IDs、与 exact frame identity 绑定的 generation 及 terminal ordering；裸 generation 不要求跨 frame 全局唯一，ordinary new frame 使用 initial generation，fragment remount 对同一 active frame 使用 `checked_next`
+- Core prepared commit capability 发布 logical active、push history 与 commit trace；matching cleanup/authority-settlement completion evidence 完成后由 Core 独占发布 request terminal，pre-mutation logical failure 可在 Core 内直接 terminalize。ECS 永不发布或重建 logical active/history/request terminal
+- ECS-owned `ViewBuildReport` 与 `EcsViewReportSession` 是 facade-reachable public types；前者是只读 kind/message DTO，只有 ECS-issued one-shot session terminal method 可以构造，raw report identity/fields、direct constructors 与 session constructor/seal 保持 private
+- 与 public view-driver report 分离，ECS exact physical `FrozenCleanupManifest`、`CleanupLedger`、`CleanupReceipt` 与对应 exact Entity facts 保持 ECS-crate-private。`CleanupManifest`、`CleanupBatch`、`CleanupCompletion` 及相关 integration methods 是 Core `#[doc(hidden)] pub mod integration` 内的 `pub` items；部分 individual methods 可另带 item-level `#[doc(hidden)]`，不得泛化为每个 wrapper/method 都带该 attribute。Facade 不 re-export 该 integration module 或这些 items；它们绑定 opaque Core batch/completion identity 与 metadata。ECS 独占 exact Entity validation、manifest、ownership seal、cleanup ledger domain、attempt revision、receipt、physical splice、cleanup 与最小 pre-commit authority settlement；Core 不重建或认证 ECS exact physical owner/manifest/ledger/receipt
+- Facade 有意暴露 renderer-neutral `RouteViewRegistry`，`RouterInputGate` 与 test-support host mapping 等有限 API 接受 app-side Bevy Entity；封闭边界是 `RouterEngine`、ECS physical `RouteEntityRegistry`、router-owned raw Entity/World/registry conversion/accessor 与 authority/mutation constructor
+- Journey B navigation 只经推荐 facade `push` 与真实 `App::update`；稳定 consumer 事实由 snapshot/trace/opaque audit 证明，commit-boundary interactive-leaf cardinality 另由 test-local、只读、非权威的 `World + RouterInputGate` sampler 验证
+- Journey B、nested fragment、equivalent physical no-op、exact physical cleanup 与 scoped pre-commit authority-loss settlement 已有实现、集成与相应公开/私有证据；equivalent 为 zero entering/leaving/effect 与 zero physical mutation，但正常发布 request/push history
+- authority settlement 开始时 ECS active/pending/host owner 单次移动进 cleanup ledger且 ECS active 清空；ledger 在 receipts 未完成时唯一持有 physical residual，completion 消费 ledger owner后 Core 清空 logical active，terminal state 无 active/lifecycle owner
+- isolation、quarantine 与 receipt mutation 仅落在 exact Router-owned authorized target；foreign descendant/component、protected 或 other-authority parent 及其 component/relationship 全部零写，protected parent 本身不接收 quarantine receipt 或 mutation
+- `replace`/`back`、完整 History、完整 Recovery、Authority closure、`RouterInputProbes` 与 MVP 仍未完成
+
+### 最终独立复审
+
+- Specification coverage and pending-slice honesty：PASS，no Critical/Important/Minor
+- Core lifecycle、single publisher、logical IDs/generation 与 terminal ordering：PASS after review fixes，no remaining Critical/Important/Minor
+- ECS ownership、slot lifecycle、physical preflight、cleanup 与 authority settlement：PASS after review fixes through draft5，no remaining Critical/Important/Minor
+- Public facade、Journey B、fragment 与 audit evidence：PASS after review fixes，no remaining Critical/Important/Minor
+
+### 阶段结论
+
+- Task 8：complete
+- Reconciliation：PASS
+- 所有 implementation verification 继续精确归因于 clean `5806c59`
+- 完整 History、Recovery、Authority closure、`RouterInputProbes` 与 MVP 仍未完成，未记录 MVP PASS

@@ -4,7 +4,7 @@
 >
 > Use TDD for every Rust behavior change
 
-**Status:** executing
+**Status:** Complete
 
 **Progress**
 
@@ -15,7 +15,13 @@
 | Task 3 complete | `6f8e734` |
 | Task 4 complete | `9415d03` + `4f4e4dc` |
 | Task 5 complete | `ddce26d` |
-| Tasks 6–8 pending | — |
+| Task 6 complete | plan gate `9d7d2f0`，implementation `e5a26e6` |
+| Task 7 complete | plan/public gate `a694acb`，cleanup guardrail `9307d2f`，fallback plans `10dc5f4..81d2657`，prerequisite `2e5cb3d`，public evidence `5806c59` |
+| Task 8 complete | focused/full gates on exact clean `5806c59`；four independent review responsibilities PASS |
+
+**Reconciliation contract start / implementation-plan commit:** `0201d49`
+
+**Implementation/evidence range:** `228c5bf..5806c59`
 
 **Stage contract:** `docs/reconciliation-contract-profile.md`
 
@@ -31,26 +37,30 @@ preserved、leaving、entering 只经过一次 preflight 与一次不可失败 c
 
 ## Global constraints
 
-- `RouterEngine` 继续独占 route classification、frame/slot identity、generation、commit、history 与 terminal publication
+- `RouterEngine` 继续独占 route classification、sealed logical frame/slot roles、request ordering、逻辑 router/host/slot/frame/request/transaction/task IDs、与 exact frame identity 绑定的 generation、commit 与 terminal ordering
 - ECS 只消费 Core sealed roles并分类 physical outcome，不得重算 common prefix或发布 active
 - 不原样接入旧单 `RouteFrameScope` 的 `FrameReconciliationPlan`
 - match 与全 branch reservation 在 enqueue 时冻结，projection 在 request 成为 running 时使用当时 active
 - 未使用的 reserved frame/task IDs 与任何已签发 slot authority ID 永久 burn
-- ordinary entering 使用新 frame id 与 initial generation
-- nested fragment 只 remount deepest leaf，复用 frame id并 `checked_next` generation
+- generation 只与 exact frame identity 一起解释，不要求裸数值跨 frame 全局唯一；ordinary entering 使用新 frame id 与 initial generation
+- nested fragment 只 remount deepest leaf，复用同一 active frame id并 `checked_next` generation
 - Core active state必须保留 parent-owned empty logical child-slot binding
 - ECS slot lifecycle严格执行 `PreservedActive | RetainEmpty | ActivateExisting | MountNew | Leaving`
 - Router-created Entity 继续 registry-first、inert write、relationship write、post-write exact validation
 - preserved closure zero mutation，leaving/entering mutation全部在 preflight 前解析
 - commit tail禁止 query、分配、组件插入、relationship写入或可失败验证
-- Core cleanup只验证 logical roots、batch、digest/count与completion digest
-- ECS独占 exact Entity manifest、attempt、ledger、receipt与quarantine lease
+- Core prepared commit capability发布 logical active、push history与commit trace；Core在matching cleanup/authority-settlement completion evidence后独占发布request terminal，pre-mutation logical failure可在Core内直接terminalize
+- Core cleanup只验证 logical roots、exact batch/completion binding、count与required empty/non-empty shape，不从物理事实重建或认证exact Entity owner、manifest、ledger或receipt
+- ECS-owned `ViewBuildReport`与`EcsViewReportSession`是facade-reachable public types；`ViewBuildReport`是只读kind/message DTO，只有ECS-issued one-shot session terminal method可以构造，raw report identity/fields、direct constructors与session constructor/seal保持private
+- 与public view-driver report分离，ECS exact physical `FrozenCleanupManifest`、`CleanupLedger`、`CleanupReceipt`与对应exact Entity facts保持ECS-crate-private；`CleanupManifest`、`CleanupBatch`、`CleanupCompletion`及相关integration methods是Core `#[doc(hidden)] pub mod integration`内的`pub` items，部分individual methods可另带item-level `#[doc(hidden)]`，不得泛化为每个wrapper/method都带该attribute。Facade不re-export该integration module或这些items；它们绑定opaque Core batch/completion identity与metadata。ECS独占 exact Entity manifest、ownership seal、cleanup ledger domain、attempt revision、receipt与quarantine lease，Core不重建或认证ECS exact physical owner/manifest/ledger/receipt，ECS永不发布或重建logical active/history/request terminal
 - normal Journey B 必须得到 `Removed` receipt与独立 `Removed` tombstone，不接受 quarantine 代替
 - physical `AuthorityLost` 纳入最小 pre-commit settlement，不实现完整 Recovery
 - generation overflow保持特殊 pre-mutation `Failed(AuthorityLost)`，旧 active/history不变
 - 不解锁 `replace`、`back`、完整 Recovery、Authority closure、`RouterInputProbes`、MVP或BSN
 - `CommitPublished` 后的 host/registration loss 与 authority-loss transfer 仍归后续 Recovery
 - authority catalogue保持 Root 20 + Nested 3 = 23，不新增最终 vocabulary 外的名称
+- isolation、quarantine与receipt mutation只允许落在exact Router-owned authorized target；foreign descendant/component、protected或other-authority parent及其component/relationship保持零写，protected parent本身不接收quarantine receipt或mutation
+- facade有意暴露renderer-neutral `RouteViewRegistry`，且`RouterInputGate`/test-support host mapping等有限API接受app-side Bevy Entity；不得暴露`RouterEngine`、ECS physical `RouteEntityRegistry`、router-owned raw Entity/World/registry conversion/accessor或authority/mutation constructor
 - app-owned host 与 foreign Entity继续零越权写入
 - 不依赖 query iteration order，不持有 `&mut World` 跨 `await`
 
@@ -382,11 +392,11 @@ Cover
 
 - preserved/current/host corruption enters `Running(Recovering)` and rejects queued requests
 - leaving authority corruption blocks commit
-- isolatable leaving foreign/protected drift commits with quarantine receipt
+- isolatable leaving drift只隔离exact Router-owned authorized target并以该owned residual的quarantine receipt收敛；foreign/protected non-target与edge零写
 - entering drift only settles pending and preserves old active/history
 - entering foreign/protected parent/cycle and missing exact claims remain `PendingRejected` with old active/history unchanged
 - receipts precede `CleanupSettled` and final `RequestTerminal`
-- current request ends `Failed(AuthorityLost)` and Core/ECS active are both `None`
+- settlement begin将ECS active/pending/host owner单次移动进cleanup ledger并立即清空ECS active；receipt pending期间ledger唯一持有physical residual，completion消费ledger owner后Core清空logical active，terminal state无active/lifecycle owner
 - exact valid registration re-admits to `Ready + None` without replay
 - authority settlement transfers the same immutable outstanding obligations without a second ledger or duplicate receipt
 
@@ -453,7 +463,7 @@ Required regressions
 
 - operation×role 按合同映射共同覆盖，suffix replace/fragment occupied slot 对应 `PreservedActive`，truncate 对应 `RetainEmpty`，append reused empty slot 对应 `ActivateExisting`，append without empty slot 对应 `MountNew`，leaving parent 对应 `Leaving`
 - 每个映射到的 slot role 保存 exact registry/slot lifecycle、visibility、picking、pointer/keyboard/gamepad direct gate、focus 与 private audit mapping
-- equivalent 证明 zero entering、zero leaving、zero effect，以及 Entity、relationship、presentation registry、slot lifecycle 与 cleanup ledger physical zero write，同时允许正常 request/history publication
+- equivalent physical no-op 证明 zero entering、zero leaving、zero effect，以及 Entity、relationship、presentation registry、slot lifecycle 与 cleanup ledger physical zero write，同时允许正常 request/history publication
 - fragment 只消费 Core sealed 的同 frame id、generation `+1` identity，恰好物理应用一次 effect，ECS 不得重新分类或分配该 identity
 - Journey B 保存 preserved layout shell/content/outlet/slot 的 exact identity 与 relationships，在 schedule boundary 上证明 old leaf isolation 与 focus release 早于 new leaf activation，正常 cleanup 的每个 receipt 均为 `Removed`，old exact entities 与 registry claims 均不存在且无 orphan slot
 - private audit 不依赖 cleanup receipt，独立以 exact World absence 加 registry absence 推导 old leaf `Removed`，公开 `AuditEntityId` evidence 留给 Task 7
@@ -465,7 +475,7 @@ Required regressions
 - leaving child-slot 仅在 owned sets 不相交时独立 quarantine，重叠集合通过 removal DAG 提升或合并
 - app-owned host components、pre-existing child identity、relationship 与 relative order 全部不变
 - entering staging 的 hook/observer writes 与 post-write validation 在 read-only switch preflight 前完成，以 schedule-boundary World evidence 和 counters 证明 preflight zero mutation，`Ready` atomic tail 无 insert/remove/despawn/relationship write/hook/observer，也无 refreeze、query、fallible validation 或 reclassification
-- post-commit cleanup 覆盖 foreign child、foreign component、protected parent 与 cleanup hook/observer reentry
+- post-commit cleanup 覆盖含 foreign child、foreign component、protected parent evidence 的 target classification 与 cleanup hook/observer reentry，但 foreign/protected non-target及其component/relationship始终零写
 - 每次 cleanup hook/observer-capable mutation 后逐次重建 observed relationship closure 与 target/protected partition 并复验，drift 以更高 revision attempt supersede old versioned attempt，old attempt 只保留已完成且可验证的 receipts，不得继续 mutation 或 settle new attempt，也不得重复 obligation/receipt 或改写 app-owned state
 - Task 6 明确排除 post-commit host/registration loss、ledger transfer 与 severe Recovery terminal
 - cleanup identity matrix 覆盖 zero obligation、partial settlement、duplicate receipt、wrong batch/request/transaction/epoch、unknown obligation、unknown token、superseded attempt 与 completion replay
@@ -523,7 +533,7 @@ git commit -m "test(ecs): prove reconciliation physical lifecycle"
 - Modify: `crates/bevy_ui_router/tests/public_navigation_journeys.rs`
 - Modify: `crates/bevy_ui_router/tests/public_navigation_authority_audit.rs`
 
-- [ ] **Step 0: Restore the closed Root fallback contract exposed by the public gate**
+- [x] **Step 0: Restore the closed Root fallback contract exposed by the public gate**
 
 The full public journey target exposed an implementation gap in the current baseline, so close it as a prerequisite rather than weakening Task 7 evidence
 
@@ -586,7 +596,7 @@ git diff --cached --check
 git commit -m "fix: preserve root fallback after failure cleanup"
 ```
 
-- [ ] **Step 1: Add public evidence tests**
+- [x] **Step 1: Add public evidence tests**
 
 After Step 0 closes the exposed Root regression, the reconciliation assertions remain coverage-only unless another new assertion fails and exposes an implementation gap
 
@@ -594,6 +604,7 @@ Evidence discipline
 
 - drive all three public evidence tests only through `RouterNavigation::push` and the official `App::update` schedule
 - a test-local read-only sampler may be placed at the `DriveNavigation` → `CommitPresentation` and `CommitPresentation` → `SettleCleanup` boundaries, but may read only `World` and `RouterInputGate`
+- stable consumer facts use facade snapshot、trace与opaque audit；the sampler only verifies commit-boundary interactive-leaf cardinality and remains test-only、read-only、non-authoritative
 - opaque audit events and identities may be read only after `RouterScheduleSet::PublishSnapshots` completes
 - do not call lifecycle systems directly or add a public API, mutation seam or `RouterInputProbes`
 - Task 7 proves boundary-visible state and event ordering
@@ -623,7 +634,7 @@ The ecs-only `reconciliation_nested_fragment_preserves_ancestors_and_advances_le
 - exactly one effect is applied with fragment `details`
 - the complete history entries and cursor match the expected pre-fragment and fragment locations
 
-- [ ] **Step 2: Run the three focused public evidence tests**
+- [x] **Step 2: Run the three focused public evidence tests**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features ecs --test public_navigation_journeys reconciliation_journey_b_preserves_layout_and_replaces_leaf -- --exact
@@ -637,7 +648,7 @@ Expected for each command
 - result contains `1 passed`
 - `0 tests` is a gate failure
 
-- [ ] **Step 3: Close public evidence and facade gates**
+- [x] **Step 3: Close public evidence and facade gates**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features ecs --test public_navigation_journeys -j 1
@@ -673,7 +684,7 @@ git commit -m "test: prove reconciliation public journeys"
 - Modify: `docs/reconciliation-contract-profile.md`
 - Modify: `docs/superpowers/plans/2026-07-18-reconciliation-implementation-plan.md`
 
-- [ ] **Step 1: Run focused gates**
+- [x] **Step 1: Run focused gates**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core -j 1
@@ -686,7 +697,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-authority-regressions.ps1
 ```
 
-- [ ] **Step 2: Run full workspace gate serially**
+- [x] **Step 2: Run full workspace gate serially**
 
 ```powershell
 cargo fmt --all -- --check
@@ -697,24 +708,36 @@ git diff --check
 git status --short
 ```
 
-- [ ] **Step 3: Update factual record drafts**
+Observed on the exact clean `5806c59` tree
 
-Record exact plan commit、implementation range、actual counts、review outcomes placeholder and remaining History/Recovery/Authority/MVP work
+- Core complete target：286 unit tests、28 doctests
+- View complete target：8 unit、6 dependency-boundary、1 public API
+- ECS all-features complete target：401 unit tests 与全部 integration targets
+- public navigation journeys 7/7，public authority audit 3/3
+- facade export allowlist 46/46，facade authority compile-fail 40/40
+- authority catalogue 23/23/23
+- workspace nextest 838/838，0 skipped；workspace all-feature doctest 28/28
+- fmt、workspace all-target/all-feature check 与 `git diff --check` 通过
+- tracked tree remained clean at `5806c59`
 
-- [ ] **Step 4: Run four independent read-only reviews and commit**
+- [x] **Step 3: Update factual records**
+
+Record exact plan commit、implementation range、actual counts、final review outcomes and remaining History/Recovery/Authority/MVP work
+
+- [x] **Step 4: Run four independent read-only reviews and finalize factual docs**
 
 Review responsibilities
 
-1. specification coverage and pending-slice honesty
-2. Core lifecycle、single publisher、ID/generation与terminal ordering
-3. ECS ownership、slot lifecycle、physical preflight、cleanup与authority settlement
-4. public facade、Journey B、fragment与audit evidence
+1. specification coverage and pending-slice honesty：PASS，no Critical/Important/Minor
+2. Core lifecycle、single publisher、logical IDs/generation与terminal ordering：PASS after review fixes，no remaining Critical/Important/Minor
+3. ECS ownership、slot lifecycle、physical preflight、cleanup与authority settlement：PASS after review fixes through draft5，no remaining Critical/Important/Minor
+4. public facade、Journey B、fragment与audit evidence：PASS after review fixes，no remaining Critical/Important/Minor
 
-Resolve all Critical and Important findings，rerun affected gates and responsible reviews until PASS
+All four responsibilities passed after the recorded fixes，with no remaining Critical/Important/Minor
 
-Write final review outcomes into the drafts，then run one factual docs re-review before staging
+Final review outcomes are recorded in the factual documents
 
-Mark profile and plan `Complete` only after all gates and reviews pass
+Profile and plan were marked `Complete` only after all gates and reviews passed
 
 ```powershell
 git add -- docs/current-architecture.md docs/roadmap.md docs/phase-3b1-architecture-review-log.md docs/reconciliation-contract-profile.md docs/superpowers/plans/2026-07-18-reconciliation-implementation-plan.md
@@ -730,13 +753,13 @@ Expected: Reconciliation PASS与未完成的 History、Recovery、Authority clos
 
 ## Plan review checklist
 
-- [ ] profile `47da839` tracked and plan committed before Task 1
-- [ ] production behavior change has RED/GREEN，coverage-only/docs use evidence/gate，every task still has a review gate and exact commit boundary
-- [ ] logical frame/slot roles remain Core-owned
-- [ ] exact Entity、manifest、ledger与receipt remain ECS-owned
-- [ ] empty slot survives truncate and can be reactivated without identity reuse
-- [ ] fragment preserves ancestors and advances only deepest generation
-- [ ] physical AuthorityLost terminal is closed without implementing full Recovery
-- [ ] normal Journey B proves both Removed receipt and independent tombstone
-- [ ] authority catalogue remains exactly 23
-- [ ] replace/back、Recovery、Authority closure、MVP and BSN remain pending
+- [x] profile `47da839` tracked and plan committed before Task 1
+- [x] production behavior change has RED/GREEN，coverage-only/docs use evidence/gate，every task still has a review gate and exact commit boundary
+- [x] logical frame/slot roles remain Core-owned
+- [x] exact Entity、manifest、ledger与receipt remain ECS-owned
+- [x] empty slot survives truncate and can be reactivated without identity reuse
+- [x] fragment preserves ancestors and advances only deepest generation
+- [x] physical AuthorityLost terminal is closed without implementing full Recovery
+- [x] normal Journey B proves both Removed receipt and independent tombstone
+- [x] authority catalogue remains exactly 23
+- [x] replace/back、Recovery、Authority closure、MVP and BSN remain pending
