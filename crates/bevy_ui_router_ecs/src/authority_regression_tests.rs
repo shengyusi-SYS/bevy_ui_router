@@ -9,8 +9,8 @@ use bevy_ecs::{
 use bevy_picking::Pickable;
 use bevy_ui::{Node, Val};
 use bevy_ui_router_core::prelude::{
-    NavigationPhase, NavigationRequestId, RequestStatus, RouteLocation, RouteNodeOptions,
-    RoutePattern, RouteSlotKey, RouteTree, RouteViewKey,
+    FrameOrigin, NavigationPhase, NavigationRequestId, NavigationTraceEventKind, RequestStatus,
+    RouteLocation, RouteNodeOptions, RoutePattern, RouteSlotKey, RouteTree, RouteViewKey,
 };
 use bevy_ui_router_view::{RouteViewDescriptor, RouteViewRegistry, ViewBuildEffect, ViewDriverKey};
 
@@ -671,6 +671,54 @@ fn pending_cycle_rejects_without_touching_active() {
     collect_navigation_system(app.world_mut());
     drive_navigation_system(app.world_mut());
 
+    {
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        let active = entry.active.as_ref().unwrap();
+        assert_eq!(
+            (
+                active.first_frame().unwrap().frame().clone(),
+                active.first_frame().unwrap().shell(),
+                active.interactive_entities(),
+                active.claims().cloned().collect::<Vec<_>>(),
+            ),
+            active_before
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(
+            entry.engine.request(request).unwrap().status(),
+            &RequestStatus::Running(bevy_ui_router_core::prelude::NavigationPhase::Recovering)
+        );
+        assert!(
+            entry
+                .engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .any(|event| {
+                    event.kind() == NavigationTraceEventKind::FrameTaskIssued
+                        && event
+                            .frame()
+                            .is_some_and(|frame| frame.origin() == &FrameOrigin::RouterFallback)
+                })
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .records()
+                .iter()
+                .map(|record| record.claim())
+                .collect::<Vec<_>>(),
+            registry_before
+        );
+        assert_eq!(world_entity_snapshot(&app), world_before);
+    }
+
+    drive_navigation_system(app.world_mut());
+    commit_presentation_system(app.world_mut());
+    settle_cleanup_system(app.world_mut());
+
     let navigation = app.world().resource::<RouterNavigation>();
     let entry = &navigation.entries[0];
     let active = entry.active.as_ref().unwrap();
@@ -684,12 +732,11 @@ fn pending_cycle_rejects_without_touching_active() {
         active_before
     );
     assert_eq!(entry.engine.history(), &history_before);
-    // A pending relationship-cycle rejection is entering-local, not an authority loss. Its
-    // zero-physical cleanup terminates the request while retaining the exact old active branch.
     assert!(matches!(
         entry.engine.request(request).unwrap().status(),
         RequestStatus::Failed(failure)
-            if failure.kind() == bevy_ui_router_core::prelude::NavigationFailureKind::Apply
+            if failure.kind()
+                == bevy_ui_router_core::prelude::NavigationFailureKind::RecoveryFailed
     ));
     assert_eq!(
         app.world()

@@ -214,6 +214,19 @@ impl FrameTask {
         &self.target
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_replace_top_slot_mount_target(
+        &mut self,
+        host: HostVersion,
+        slot: RouteSlotId,
+    ) -> bool {
+        if !matches!(&self.target, FrameMountTarget::TopSlot { .. }) {
+            return false;
+        }
+        self.target = FrameMountTarget::TopSlot { host, slot };
+        true
+    }
+
     #[cfg(test)]
     pub(crate) fn testing_duplicate(&self) -> Self {
         Self {
@@ -2224,6 +2237,25 @@ impl RouterEngine {
         })
     }
 
+    pub(crate) fn inspect_commit_identity(&self, ticket: &CommitTicket) -> Result<(), CommitError> {
+        self.current
+            .as_ref()
+            .filter(|current| {
+                current.stage == WorkStage::ReadyToCommit && current.identity == ticket.identity
+            })
+            .map(|_| ())
+            .ok_or(CommitError::Stale)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_invalidate_commit_action(&mut self) {
+        if let Some(current) = self.current.as_mut()
+            && current.stage == WorkStage::ReadyToCommit
+        {
+            current.stage = WorkStage::Applying;
+        }
+    }
+
     pub(crate) fn prepare_publication(
         &mut self,
         sealed: SealedCommit,
@@ -3821,7 +3853,6 @@ impl ViewReportSession<'_> {
     pub(crate) fn failed(self, failure: NavigationFailure) -> Option<FailureCleanupRequest> {
         let request = self.identity.request;
         let branch_index = self.identity.branch_index;
-        let has_existing_active = self.engine.state.active().kind() != ActivePresentationKind::None;
         let attempt = self
             .engine
             .current
@@ -3848,7 +3879,7 @@ impl ViewReportSession<'_> {
         );
 
         match attempt {
-            AttemptKind::Normal if branch_index > 0 || has_existing_active => {
+            AttemptKind::Normal if branch_index > 0 => {
                 let expected = match failure.kind() {
                     NavigationFailureKind::Build => PendingFailureKind::Build,
                     NavigationFailureKind::Apply => PendingFailureKind::Apply,
@@ -3929,7 +3960,7 @@ impl ViewReportSession<'_> {
             _ => PendingFailureKind::Apply,
         };
         let (failure, continuation) = match attempt {
-            AttemptKind::Normal if branch_index == 0 && !has_existing_active => {
+            AttemptKind::Normal if branch_index == 0 => {
                 (failure, FailureCleanupContinuation::BeginFallback)
             }
             AttemptKind::Normal => (failure, FailureCleanupContinuation::Terminal),
@@ -6628,7 +6659,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_schedule_prefix_zero_failure_preserves_old_active_without_fallback() {
+    fn reconciliation_schedule_prefix_zero_failure_starts_fallback_with_existing_active() {
         let mut engine = ready_engine_with_tree(reconciliation_tree());
         engine
             .push(RouteLocation::new("/items/1").with_search("?tab=one"))
@@ -6644,32 +6675,34 @@ mod tests {
             panic!("prefix-zero replacement root effect expected")
         };
         assert_eq!(task.identity().branch_index(), 0);
-        let failure = engine
-            .begin_view_report(task.identity())
-            .unwrap()
-            .failed(NavigationFailure::new(
-                NavigationFailureKind::Apply,
-                "replacement root effect rejected",
-            ))
-            .expect("an existing active route must settle the replacement failure directly");
+        let failure_cleanup =
+            engine
+                .begin_view_report(task.identity())
+                .unwrap()
+                .failed(NavigationFailure::new(
+                    NavigationFailureKind::Apply,
+                    "replacement root effect rejected",
+                ));
 
-        assert!(failure.logical_roots().is_empty());
+        assert!(failure_cleanup.is_none());
         assert_eq!(engine.active(), &active_before);
         assert_eq!(engine.history(), &history_before);
-        assert!(matches!(
-            engine.action(),
-            Some(EngineAction::FailureCleanup(_)) | None
-        ));
+        let Some(EngineAction::FrameTask(fallback)) = engine.action() else {
+            panic!("prefix-zero root failure must retain mandatory fallback")
+        };
+        assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
     }
 
     #[test]
-    fn reconciliation_schedule_prefix_zero_residual_cleans_only_new_root() {
+    fn reconciliation_schedule_prefix_zero_residual_cleans_new_root_before_fallback() {
         let mut engine = ready_engine_with_tree(reconciliation_tree());
         engine
             .push(RouteLocation::new("/items/1").with_search("?tab=one"))
             .unwrap();
         settle_current(&mut engine);
         let old = engine.active().frames().to_vec();
+        let active_before = engine.active().clone();
+        let history_before = engine.history().clone();
 
         engine
             .push(RouteLocation::new("/items/2").with_search("?tab=two"))
@@ -6686,7 +6719,7 @@ mod tests {
                 "replacement root left a physical residual",
             ));
 
-        assert_eq!(failure.logical_roots(), &[new_root]);
+        assert_eq!(failure.logical_roots(), &[new_root.clone()]);
         assert!(
             failure
                 .logical_roots()
@@ -6695,8 +6728,29 @@ mod tests {
         );
         assert!(matches!(
             failure.continuation,
-            super::FailureCleanupContinuation::Terminal
+            super::FailureCleanupContinuation::BeginFallback
         ));
+        assert_eq!(engine.active(), &active_before);
+        assert_eq!(engine.history(), &history_before);
+
+        let cleanup = engine
+            .prepare_failure_cleanup(
+                failure,
+                CleanupManifestSeal::new(
+                    vec![new_root],
+                    manifest_digest(0x915),
+                    NONZERO_OBLIGATION_COUNT,
+                ),
+            )
+            .unwrap();
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        assert_eq!(engine.active(), &active_before);
+        assert_eq!(engine.history(), &history_before);
+        let Some(EngineAction::FrameTask(fallback)) = engine.action() else {
+            panic!("prefix-zero residual cleanup must continue into fallback")
+        };
+        assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
     }
 
     #[test]

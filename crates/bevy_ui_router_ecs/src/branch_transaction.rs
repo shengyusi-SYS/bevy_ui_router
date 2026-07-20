@@ -1840,7 +1840,7 @@ fn sort_child_slots(branch: &mut RealizedBranch) {
 pub(crate) struct PreparedBranchClaimRebind {
     frame_claims: Vec<Vec<ExactRegistryClaim>>,
     all_claims: Vec<ExactRegistryClaim>,
-    expected_current: EntityLifecycle,
+    expected_current: Vec<(bevy_ecs::prelude::Entity, EntityLifecycle)>,
     expected_next: EntityLifecycle,
 }
 
@@ -2165,22 +2165,39 @@ impl RealizedBranch {
             + self.child_slots.len()
     }
 
-    pub(crate) fn leaving_mutation_targets(
+    pub(crate) fn active_sparse_leaving_mutation_targets(
         &self,
-        current: EntityLifecycle,
         next: EntityLifecycle,
-    ) -> Vec<FrameMutationTarget> {
+    ) -> Option<Vec<FrameMutationTarget>> {
+        let legal_slot = |lifecycle| {
+            matches!(
+                lifecycle,
+                EntityLifecycle::Active | EntityLifecycle::PreparedInert
+            )
+        };
         let mut targets = Vec::new();
         for frame_index in (0..self.frames.len()).rev() {
-            targets.extend(
-                self.child_slots
-                    .iter()
-                    .filter(|slot| slot.parent() == self.frames[frame_index].frame())
-                    .map(|slot| child_slot_mutation_target(slot, current, next, false)),
-            );
-            targets.extend(self.frames[frame_index].mutation_targets(current, next, false));
+            for slot in self
+                .child_slots
+                .iter()
+                .filter(|slot| slot.parent() == self.frames[frame_index].frame())
+            {
+                let current = slot.slot_claim().lifecycle();
+                if !legal_slot(current) {
+                    return None;
+                }
+                targets.push(child_slot_mutation_target(slot, current, next, false));
+            }
+            let frame = &self.frames[frame_index];
+            let current = frame.claims().next()?.lifecycle();
+            if current != EntityLifecycle::Active
+                || frame.claims().any(|claim| claim.lifecycle() != current)
+            {
+                return None;
+            }
+            targets.extend(frame.mutation_targets(current, next, false));
         }
-        targets
+        (targets.len() == self.obligation_count()).then_some(targets)
     }
 
     pub(crate) fn entering_mutation_targets(
@@ -2302,7 +2319,91 @@ impl RealizedBranch {
         Some(PreparedBranchClaimRebind {
             frame_claims,
             all_claims: claims.to_vec(),
-            expected_current,
+            expected_current: self
+                .claims()
+                .map(|claim| (claim.entity(), expected_current))
+                .collect(),
+            expected_next,
+        })
+    }
+
+    pub(crate) fn prepare_active_sparse_claim_rebind(
+        &self,
+        claims: &[ExactRegistryClaim],
+        expected_next: EntityLifecycle,
+    ) -> Option<PreparedBranchClaimRebind> {
+        let legal_slot = |lifecycle| {
+            matches!(
+                lifecycle,
+                EntityLifecycle::Active | EntityLifecycle::PreparedInert
+            )
+        };
+        if claims.len() != self.obligation_count()
+            || claims.iter().enumerate().any(|(index, claim)| {
+                claims[index + 1..]
+                    .iter()
+                    .any(|other| other.entity() == claim.entity())
+            })
+        {
+            return None;
+        }
+        let exact_next = |current: &ExactRegistryClaim, next: &ExactRegistryClaim| {
+            current.entity() == next.entity()
+                && current.owner() == next.owner()
+                && current.seal() == next.seal()
+                && next.lifecycle() == expected_next
+        };
+        let frame_claims = self
+            .frames
+            .iter()
+            .map(|frame| {
+                frame
+                    .claims()
+                    .map(|current| {
+                        claims
+                            .iter()
+                            .find(|next| next.entity() == current.entity())
+                            .filter(|next| {
+                                current.lifecycle() == EntityLifecycle::Active
+                                    && exact_next(current, next)
+                            })
+                            .cloned()
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        for (frame, next) in self.frames.iter().zip(&frame_claims) {
+            if frame
+                .claims()
+                .any(|claim| claim.lifecycle() != EntityLifecycle::Active)
+                || !frame.claims_can_rebind(next, claims, EntityLifecycle::Active, expected_next)
+            {
+                return None;
+            }
+        }
+        for slot in &self.child_slots {
+            let next = claims
+                .iter()
+                .find(|claim| claim.entity() == slot.slot_claim().entity())?;
+            if !legal_slot(slot.slot_claim().lifecycle()) || !exact_next(slot.slot_claim(), next) {
+                return None;
+            }
+            let next_anchor = claims
+                .iter()
+                .find(|claim| claim.entity() == slot.anchor_claim().entity())?;
+            if slot.anchor_claim().lifecycle() != EntityLifecycle::Active
+                || !exact_next(slot.anchor_claim(), next_anchor)
+            {
+                return None;
+            }
+        }
+        Some(PreparedBranchClaimRebind {
+            frame_claims,
+            all_claims: claims.to_vec(),
+            expected_current: self
+                .claims()
+                .map(|claim| (claim.entity(), claim.lifecycle()))
+                .collect(),
             expected_next,
         })
     }
@@ -2589,6 +2690,57 @@ mod tests {
         let root = branch.frames().first().expect("fixture has a root").frame();
         ReconciliationAuthorityIdentity::from_frame(root, root.host(), root.slot())
             .expect("root binds its own host and top slot")
+    }
+
+    fn active_sparse_branch_fixture() -> RealizedBranch {
+        let (mut app, branch, _, _, _) = failed_nested_branch_fixture();
+        let mut branch = branch.into_realized_for_test();
+        activate_branch(&mut app, &mut branch);
+        branch.pop_frame_for_test();
+        transition_slot_claims(&mut branch, EntityLifecycle::PreparedInert);
+        branch
+    }
+
+    #[test]
+    fn active_sparse_leaving_accepts_active_frames_and_prepared_empty_slots() {
+        let branch = active_sparse_branch_fixture();
+        let targets = branch
+            .active_sparse_leaving_mutation_targets(EntityLifecycle::Leaving)
+            .expect("active sparse branch must retain its mixed frame and empty-slot roles");
+        assert_eq!(targets.len(), branch.obligation_count());
+
+        let resulting = branch
+            .lifecycle_transitions(EntityLifecycle::Leaving, true)
+            .into_iter()
+            .map(|(claim, next)| claim.with_lifecycle_for_test(next))
+            .collect::<Vec<_>>();
+        assert!(
+            branch
+                .prepare_active_sparse_claim_rebind(&resulting, EntityLifecycle::Leaving)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn active_sparse_leaving_rejects_prepared_frame_authority() {
+        let mut branch = active_sparse_branch_fixture();
+        transition_frame_claims(&mut branch, EntityLifecycle::PreparedInert);
+        assert!(
+            branch
+                .active_sparse_leaving_mutation_targets(EntityLifecycle::Leaving)
+                .is_none()
+        );
+
+        let resulting = branch
+            .lifecycle_transitions(EntityLifecycle::Leaving, true)
+            .into_iter()
+            .map(|(claim, next)| claim.with_lifecycle_for_test(next))
+            .collect::<Vec<_>>();
+        assert!(
+            branch
+                .prepare_active_sparse_claim_rebind(&resulting, EntityLifecycle::Leaving)
+                .is_none()
+        );
     }
 
     fn activate_branch(app: &mut bevy_app::App, branch: &mut RealizedBranch) {

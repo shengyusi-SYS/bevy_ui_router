@@ -16,6 +16,7 @@ use crate::{
     components::{ChildSlotAuthority, ChildSlotLifecycle, RouteOwnershipSeal, RouterInputBarrier},
     mount::{validate_leaving_mounted_child_slot, validate_mounted_child_slot},
     presentation::{
+        validate_active_frame_local_values,
         validate_active_frame_with_child_slots_and_entering_shells,
         validate_leaving_frame_with_child_slots, validate_realized_frame_with_child_slots,
         validate_reconciliation_entering_frame_with_child_slots,
@@ -270,6 +271,76 @@ pub(crate) fn validate_active_branch_for_splice(
     )
 }
 
+pub(crate) fn validate_preserved_branch_local(
+    world: &World,
+    preserved: &RealizedBranch,
+    slot_roles: &[SealedReconciliationSlotRole],
+    entering_boundaries: &[Entity],
+) -> Result<Vec<Entity>, FrameLocalError> {
+    validate_branch_structure(preserved)?;
+    for slot in preserved.child_slots() {
+        if !validate_sealed_existing_slot_role(world, slot, slot_roles, false) {
+            return Err(FrameLocalError::OwnershipDrift(slot.slot()));
+        }
+    }
+    if let Some(role) = slot_roles.iter().find(|role| {
+        matches!(
+            role.kind(),
+            ReconciliationSlotRoleKind::PreservedActive
+                | ReconciliationSlotRoleKind::RetainEmpty
+                | ReconciliationSlotRoleKind::ActivateExisting
+        ) && preserved
+            .child_slots()
+            .iter()
+            .filter(|slot| sealed_existing_role_matches_slot(role, slot))
+            .count()
+            != 1
+    }) {
+        return Err(FrameLocalError::OwnershipDrift(role.entity()));
+    }
+    for frame in preserved.frames() {
+        if !validate_active_frame_local_values(world, frame) {
+            return Err(FrameLocalError::OwnershipDrift(frame.shell()));
+        }
+    }
+    validate_branch_descendants_with_boundaries(world, preserved, entering_boundaries)
+}
+
+pub(crate) fn validate_active_branch_local(
+    world: &World,
+    active: &RealizedBranch,
+    entering_boundaries: &[Entity],
+) -> Result<Vec<Entity>, FrameLocalError> {
+    validate_branch_structure(active)?;
+    for slot in active.child_slots() {
+        let occupied = active
+            .frames()
+            .iter()
+            .any(|frame| frame.mount_binding().matches_mounted_child_slot(slot));
+        let valid = match slot.slot_claim().lifecycle() {
+            EntityLifecycle::Active if occupied => {
+                validate_leaving_mounted_child_slot(world, slot, EntityLifecycle::Active)
+            }
+            EntityLifecycle::PreparedInert if !occupied => {
+                validate_mounted_child_slot(world, slot, EntityLifecycle::PreparedInert)
+            }
+            EntityLifecycle::Active
+            | EntityLifecycle::PreparedInert
+            | EntityLifecycle::Leaving
+            | EntityLifecycle::Quarantined => false,
+        };
+        if !valid {
+            return Err(FrameLocalError::OwnershipDrift(slot.slot()));
+        }
+    }
+    for frame in active.frames() {
+        if !validate_active_frame_local_values(world, frame) {
+            return Err(FrameLocalError::OwnershipDrift(frame.shell()));
+        }
+    }
+    validate_branch_descendants_with_boundaries(world, active, entering_boundaries)
+}
+
 pub(crate) fn validate_leaving_branch_for_splice(
     world: &World,
     leaving: &RealizedBranch,
@@ -465,7 +536,7 @@ fn validate_committed_branch_with_entering(
             &external_boundaries,
         )?;
     }
-    validate_branch_descendants_allowing_entering(world, branch, &sealed_entering_shells)
+    validate_branch_descendants_allowing_entering(world, branch, &sealed_entering_shells, &[])
 }
 
 fn validate_sealed_existing_slot_role(
@@ -762,13 +833,22 @@ pub(crate) fn validate_branch_descendants(
     world: &World,
     branch: &RealizedBranch,
 ) -> Result<Vec<Entity>, FrameLocalError> {
-    validate_branch_descendants_allowing_entering(world, branch, &[])
+    validate_branch_descendants_allowing_entering(world, branch, &[], &[])
+}
+
+fn validate_branch_descendants_with_boundaries(
+    world: &World,
+    branch: &RealizedBranch,
+    opaque_boundaries: &[Entity],
+) -> Result<Vec<Entity>, FrameLocalError> {
+    validate_branch_descendants_allowing_entering(world, branch, &[], opaque_boundaries)
 }
 
 fn validate_branch_descendants_allowing_entering(
     world: &World,
     branch: &RealizedBranch,
     sealed_entering_shells: &[crate::registry::ExactRegistryClaim],
+    opaque_boundaries: &[Entity],
 ) -> Result<Vec<Entity>, FrameLocalError> {
     if branch.frames().is_empty() {
         return Ok(Vec::new());
@@ -779,7 +859,13 @@ fn validate_branch_descendants_allowing_entering(
     let mut ordered = Vec::new();
     let mut branch_seen = HashSet::new();
     for frame in branch.frames() {
-        let local = collect_frame_focus_unit(world, frame.frame(), frame.shell(), registry)?;
+        let local = collect_frame_focus_unit(
+            world,
+            frame.frame(),
+            frame.shell(),
+            registry,
+            opaque_boundaries,
+        )?;
         extend_focus_closure(&mut ordered, &mut branch_seen, local)?;
     }
     for slot in branch.child_slots() {
@@ -797,6 +883,7 @@ fn validate_branch_descendants_allowing_entering(
             child.shell(),
             registry,
             sealed_entering_shells,
+            opaque_boundaries,
         )?;
         extend_focus_closure(&mut ordered, &mut branch_seen, foreign)?;
     }
@@ -808,6 +895,7 @@ fn collect_frame_focus_unit(
     frame: &RouteFrameVersion,
     root: Entity,
     registry: &RouteEntityRegistry,
+    opaque_boundaries: &[Entity],
 ) -> Result<Vec<Entity>, FrameLocalError> {
     if world.get_entity(root).is_err() || registry.record(root).is_none() {
         return Err(FrameLocalError::MissingRoot(root));
@@ -838,6 +926,7 @@ fn collect_frame_focus_unit(
             .get::<Children>(entity)
             .map(|children| children.iter().copied().collect::<Vec<_>>())
             .unwrap_or_default();
+        children.retain(|child| !opaque_boundaries.contains(child));
         for child in &children {
             if world.get::<ChildOf>(*child).map(ChildOf::parent) != Some(entity) {
                 return Err(FrameLocalError::OwnershipDrift(*child));
@@ -861,6 +950,7 @@ fn collect_child_slot_foreign_focus(
     child_root: Entity,
     registry: &RouteEntityRegistry,
     sealed_entering_shells: &[crate::registry::ExactRegistryClaim],
+    opaque_boundaries: &[Entity],
 ) -> Result<Vec<Entity>, FrameLocalError> {
     if world.get::<ChildOf>(child_root).map(ChildOf::parent) != Some(slot)
         || !matches!(
@@ -874,6 +964,7 @@ fn collect_child_slot_foreign_focus(
         .get::<Children>(slot)
         .map(|children| children.iter().copied().collect::<Vec<_>>())
         .unwrap_or_default();
+    pending.retain(|child| !opaque_boundaries.contains(child));
     for child in &pending {
         if world.get::<ChildOf>(*child).map(ChildOf::parent) != Some(slot) {
             return Err(FrameLocalError::OwnershipDrift(*child));
@@ -885,7 +976,7 @@ fn collect_child_slot_foreign_focus(
     let mut visited = HashSet::new();
     let mut ordered = Vec::new();
     while let Some(entity) = pending.pop() {
-        if entity == child_root {
+        if entity == child_root || opaque_boundaries.contains(&entity) {
             continue;
         }
         if !visited.insert(entity) {
@@ -905,6 +996,7 @@ fn collect_child_slot_foreign_focus(
             .get::<Children>(entity)
             .map(|children| children.iter().copied().collect::<Vec<_>>())
             .unwrap_or_default();
+        children.retain(|child| !opaque_boundaries.contains(child));
         for child in &children {
             if world.get::<ChildOf>(*child).map(ChildOf::parent) != Some(entity) {
                 return Err(FrameLocalError::OwnershipDrift(*child));

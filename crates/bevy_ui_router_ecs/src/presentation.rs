@@ -2417,6 +2417,41 @@ pub(crate) fn validate_active_frame(world: &World, frame: &RealizedFrame) -> boo
     validate_active_frame_with_child_slots(world, frame, &[])
 }
 
+pub(crate) fn validate_active_frame_local_values(world: &World, frame: &RealizedFrame) -> bool {
+    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+        return false;
+    };
+    frame.entities.iter().all(|realized| {
+        let interactive = realized.role == RealizedRole::SolidRect;
+        registry.record(realized.entity).is_some_and(|record| {
+            record.claim() == realized.claim
+                && record.lifecycle() == EntityLifecycle::Active
+                && manifest_contains_expected(world, realized.entity, record.manifest())
+        }) && world.get::<RouteOwnershipSeal>(realized.entity)
+            == Some(&RouteOwnershipSeal::new(realized.claim.seal()))
+            && world.get::<Visibility>(realized.entity) == Some(&Visibility::Visible)
+            && world.get::<Pickable>(realized.entity)
+                == Some(if interactive {
+                    &ACTIVE_PICKABLE
+                } else {
+                    &Pickable::IGNORE
+                })
+            && world
+                .get::<RouterInputBarrier>(realized.entity)
+                .is_some_and(|barrier| {
+                    if interactive {
+                        barrier.allows_all()
+                    } else {
+                        barrier.denies_all()
+                    }
+                })
+            && world.get::<FrameLifecycle>(realized.entity)
+                == Some(&FrameLifecycle(EntityLifecycle::Active))
+            && world.get::<ChildOf>(realized.entity).map(ChildOf::parent) == Some(realized.parent)
+            && realized_values_match(world, realized, frame.frame())
+    })
+}
+
 pub(crate) fn validate_active_frame_with_child_slots(
     world: &World,
     frame: &RealizedFrame,

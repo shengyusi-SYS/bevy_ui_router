@@ -592,6 +592,16 @@ impl FrameTask {
             }
         }
     }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_replace_top_slot_mount_target(
+        &mut self,
+        host: crate::HostVersion,
+        slot: RouteSlotId,
+    ) -> bool {
+        self.inner.testing_replace_top_slot_mount_target(host, slot)
+    }
 }
 
 pub struct MountRequest {
@@ -663,6 +673,15 @@ pub enum ViewFailureKind {
 
 pub struct CommitTicket {
     inner: CoreCommitTicket,
+}
+
+impl CommitTicket {
+    #[doc(hidden)]
+    pub fn report_identity(&self) -> ViewReportIdentity {
+        ViewReportIdentity {
+            inner: self.inner.identity().clone(),
+        }
+    }
 }
 
 pub struct CleanupManifest {
@@ -1710,6 +1729,19 @@ impl RouterEngine {
         })
     }
 
+    #[doc(hidden)]
+    pub fn inspect_commit_identity(&self, ticket: &CommitTicket) -> Result<(), IntegrationError> {
+        self.inner
+            .inspect_commit_identity(&ticket.inner)
+            .map_err(map_commit_error)
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_invalidate_commit_action(&mut self) {
+        self.inner.testing_invalidate_commit_action();
+    }
+
     pub fn publish<F>(&mut self, prepared: PreparedCommit, mutation: F)
     where
         F: FnOnce(),
@@ -2255,6 +2287,75 @@ mod tests {
         assert_eq!(projection.preserved().len(), 1);
         assert_eq!(projection.entering().len(), 0);
         assert_eq!(projection.leaving().len(), 0);
+    }
+
+    #[test]
+    fn test_support_mount_target_replacement_changes_only_the_detached_task() {
+        let mut engine = confirmed_engine();
+        engine.push(RouteLocation::new("/")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(mut task) = engine.action().unwrap() else {
+            panic!("first engine must issue one root task")
+        };
+        let identity = task.report_identity();
+        let engine_before = engine.snapshot();
+
+        let mut foreign = confirmed_engine();
+        foreign.push(RouteLocation::new("/")).unwrap();
+        foreign.collect();
+        let EngineAction::FrameTask(foreign_task) = foreign.action().unwrap() else {
+            panic!("foreign engine must issue one root task")
+        };
+        let FrameMountTarget::TopSlot { host, slot } = foreign_task.mount_target() else {
+            panic!("root task must target a top slot")
+        };
+
+        assert!(task.testing_replace_top_slot_mount_target(host.clone(), slot));
+
+        assert!(task.report_identity() == identity);
+        assert_eq!(
+            task.mount_target(),
+            FrameMountTarget::TopSlot { host, slot }
+        );
+        assert_eq!(engine.snapshot(), engine_before);
+        assert_eq!(engine.inspect_report_identity(&task), Ok(()));
+    }
+
+    #[test]
+    fn test_support_top_slot_replacement_rejects_nested_task_without_mutation() {
+        let mut engine = confirmed_nested_engine();
+        let (_, _, _, permit, proof) = pending_mount_registration(&mut engine, "/items/1", 307);
+        engine
+            .begin_mount_registration(permit, &proof)
+            .unwrap()
+            .complete(309);
+        let EngineAction::FrameTask(mut task) = engine.action().unwrap() else {
+            panic!("completed registration must issue the child task")
+        };
+        let target_before = task.mount_target();
+        assert!(matches!(
+            target_before,
+            FrameMountTarget::ChildOutlet { .. }
+        ));
+        let identity_before = task.report_identity();
+        let engine_before = engine.snapshot();
+
+        let mut foreign = confirmed_engine();
+        foreign.push(RouteLocation::new("/")).unwrap();
+        foreign.collect();
+        let EngineAction::FrameTask(foreign_task) = foreign.action().unwrap() else {
+            panic!("foreign engine must issue one root task")
+        };
+        let FrameMountTarget::TopSlot { host, slot } = foreign_task.mount_target() else {
+            panic!("root task must target a top slot")
+        };
+
+        assert!(!task.testing_replace_top_slot_mount_target(host, slot));
+
+        assert!(task.report_identity() == identity_before);
+        assert_eq!(task.mount_target(), target_before);
+        assert_eq!(engine.snapshot(), engine_before);
+        assert_eq!(engine.inspect_report_identity(&task), Ok(()));
     }
 
     fn pending_nested_receipt(engine: &mut RouterEngine, digest: u64) -> MountReceiptAttestation {
