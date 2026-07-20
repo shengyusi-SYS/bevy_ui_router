@@ -2,15 +2,21 @@
 
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use bevy_app::App;
 use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
+    change_detection::Tick,
     component::ComponentId,
     entity::Entity,
     hierarchy::{ChildOf, Children},
+    lifecycle::Insert,
+    observer::On,
     prelude::Component,
 };
 use bevy_picking::Pickable;
@@ -532,10 +538,15 @@ fn assert_succeeded(snapshot: &NavigationRequestSnapshot) {
 }
 
 fn assert_failed(snapshot: &NavigationRequestSnapshot, expected: NavigationFailureKind) {
-    assert!(matches!(
+    assert!(
+        matches!(
+            snapshot.status(),
+            RequestStatus::Failed(failure) if failure.kind() == expected
+        ),
+        "expected {expected:?}, got {:?}: {:?}",
         snapshot.status(),
-        RequestStatus::Failed(failure) if failure.kind() == expected
-    ));
+        snapshot.trace()
+    );
     assert_eq!(
         snapshot.trace().last().map(NavigationTraceEvent::kind),
         Some(NavigationTraceEventKind::RequestTerminal)
@@ -577,7 +588,7 @@ fn assert_cleanup_trace_is_ordered(snapshot: &NavigationRequestSnapshot, expect_
     let commit = trace
         .iter()
         .position(|event| event.kind() == NavigationTraceEventKind::CommitPublished)
-        .expect("commit must be traced");
+        .unwrap_or_else(|| panic!("commit must be traced: {trace:?}"));
     let cleanup_phase = trace
         .iter()
         .enumerate()
@@ -598,20 +609,27 @@ fn assert_cleanup_trace_is_ordered(snapshot: &NavigationRequestSnapshot, expect_
             .then_some(index)
         })
         .expect("aggregate cleanup settlement must be traced");
-    let receipts = trace[cleanup_phase + 1..aggregate]
+    let receipts = trace
         .iter()
-        .filter(|event| {
-            event.kind() == NavigationTraceEventKind::CleanupSettled
-                && event.cleanup_disposition().is_some()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            (event.kind() == NavigationTraceEventKind::CleanupSettled
+                && event.cleanup_disposition().is_some())
+            .then_some(index)
         })
-        .count();
+        .collect::<Vec<_>>();
     let terminal = trace
         .iter()
         .position(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
         .expect("terminal transition must be traced");
 
     assert!(commit < cleanup_phase);
-    assert_eq!(receipts > 0, expect_receipts);
+    assert!(
+        receipts
+            .iter()
+            .all(|receipt| cleanup_phase < *receipt && *receipt < aggregate)
+    );
+    assert_eq!(!receipts.is_empty(), expect_receipts);
     assert!(cleanup_phase < aggregate && aggregate < terminal);
     assert_eq!(terminal + 1, trace.len());
 }
@@ -713,6 +731,32 @@ fn assert_host_intact(app: &App, fingerprint: &HostBoundaryFingerprint) {
         .expect("existing sibling Node must remain");
     assert_eq!(sibling_node.width, Val::Px(19.0));
     assert_eq!(sibling_node.height, Val::Px(29.0));
+}
+
+fn observe_app_owned_inserts<T: Component>(
+    app: &mut App,
+    entities: &[Entity],
+    writes: Arc<AtomicUsize>,
+) {
+    let entities = entities.iter().copied().collect::<HashSet<_>>();
+    app.world_mut().add_observer(move |event: On<Insert, T>| {
+        if entities.contains(&event.entity) {
+            writes.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+fn assert_manifest_not_added_or_changed(app: &App, entity: Entity, last_run: Tick) {
+    let world = app.world();
+    let this_run = world.read_change_tick();
+    let entity_ref = world.entity(entity);
+    for component in entity_ref.archetype().components() {
+        let ticks = entity_ref
+            .get_change_ticks_by_id(*component)
+            .expect("manifest component has change ticks");
+        assert!(!ticks.is_added(last_run, this_run));
+        assert!(!ticks.is_changed(last_run, this_run));
+    }
 }
 
 fn entity_set(app: &App) -> HashSet<Entity> {
@@ -935,6 +979,171 @@ fn nested_push_journey_a() {
         |_| true,
     );
     assert_eq!(terminal + 1, trace.len());
+}
+
+#[test]
+fn reconciliation_journey_b_preserves_layout_and_replaces_leaf() {
+    let mut fixture = nested_fixture();
+    let first_location = RouteLocation::new("/items/1");
+    let first_request = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        first_location.clone(),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(
+        &fixture.app,
+        fixture.router,
+        first_request,
+    ));
+    let first_router = router_snapshot(&fixture.app, fixture.router);
+    let first_frames = first_router.active().frames();
+    assert_eq!(first_frames.len(), 2);
+    let preserved_layout = first_frames[0].clone();
+    let old_leaf = first_frames[1].clone();
+
+    let host = fixture.host_fingerprint.host;
+    let existing_child = fixture.host_fingerprint.existing_children[0];
+    let existing_sibling = fixture.host_fingerprint.existing_children[1];
+    let writes = Arc::new(AtomicUsize::new(0));
+    observe_app_owned_inserts::<HostSentinel>(&mut fixture.app, &[host], writes.clone());
+    observe_app_owned_inserts::<HostMetadata>(&mut fixture.app, &[host], writes.clone());
+    observe_app_owned_inserts::<RouterHostRegistration>(&mut fixture.app, &[host], writes.clone());
+    observe_app_owned_inserts::<Node>(
+        &mut fixture.app,
+        &[host, existing_child, existing_sibling],
+        writes.clone(),
+    );
+    observe_app_owned_inserts::<Children>(&mut fixture.app, &[host], writes.clone());
+    observe_app_owned_inserts::<ExistingChild>(&mut fixture.app, &[existing_child], writes.clone());
+    observe_app_owned_inserts::<ExistingSibling>(
+        &mut fixture.app,
+        &[existing_sibling],
+        writes.clone(),
+    );
+    observe_app_owned_inserts::<ChildOf>(
+        &mut fixture.app,
+        &[existing_child, existing_sibling],
+        writes.clone(),
+    );
+    fixture.app.world_mut().clear_trackers();
+    let app_owned_change_baseline = fixture.app.world().last_change_tick();
+
+    let second_location = RouteLocation::new("/items/2");
+    let second_request = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        second_location.clone(),
+        None,
+        None,
+    );
+    let second_request = request_snapshot(&fixture.app, fixture.router, second_request);
+    assert_succeeded(&second_request);
+    assert_cleanup_trace_is_ordered(&second_request, true);
+    let receipts = second_request
+        .trace()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            (event.kind() == NavigationTraceEventKind::CleanupSettled)
+                .then(|| {
+                    event
+                        .cleanup_disposition()
+                        .map(|disposition| (index, disposition))
+                })
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    assert!(!receipts.is_empty());
+    assert!(
+        receipts
+            .iter()
+            .all(|(_, disposition)| *disposition == CleanupDisposition::Removed)
+    );
+    let terminal = second_request
+        .trace()
+        .iter()
+        .position(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+        .expect("successful journey has a terminal event");
+    assert!(receipts.iter().all(|(index, _)| *index < terminal));
+
+    let second_router = router_snapshot(&fixture.app, fixture.router);
+    let second_frames = second_router.active().frames();
+    assert_eq!(second_frames.len(), 2);
+    assert_eq!(second_frames[0], preserved_layout);
+    assert_eq!(second_frames[1].slot(), old_leaf.slot());
+    assert_ne!(second_frames[1].frame(), old_leaf.frame());
+    assert_eq!(
+        second_router.history().entries(),
+        &[first_location, second_location]
+    );
+    assert_eq!(second_router.history().cursor(), Some(1));
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+    assert_eq!(writes.load(Ordering::Relaxed), 0);
+    assert_manifest_not_added_or_changed(&fixture.app, host, app_owned_change_baseline);
+    assert_manifest_not_added_or_changed(&fixture.app, existing_child, app_owned_change_baseline);
+    assert_manifest_not_added_or_changed(&fixture.app, existing_sibling, app_owned_change_baseline);
+}
+
+#[test]
+fn reconciliation_nested_fragment_preserves_ancestors_and_advances_leaf_generation() {
+    let mut fixture = nested_fixture();
+    let first_location = RouteLocation::new("/items/1");
+    let first_request = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        first_location.clone(),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(
+        &fixture.app,
+        fixture.router,
+        first_request,
+    ));
+    let first_router = router_snapshot(&fixture.app, fixture.router);
+    let first_frames = first_router.active().frames();
+    assert_eq!(first_frames.len(), 2);
+    let preserved_layout = first_frames[0].clone();
+    let first_leaf = first_frames[1].clone();
+    let effects_before_fragment = fixture.control.effects().len();
+
+    let fragment_location = RouteLocation::new("/items/1").with_fragment("details");
+    let fragment_request = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        fragment_location.clone(),
+        None,
+        None,
+    );
+    let fragment_request = request_snapshot(&fixture.app, fixture.router, fragment_request);
+    assert_succeeded(&fragment_request);
+    assert_cleanup_trace_is_ordered(&fragment_request, true);
+
+    let fragment_router = router_snapshot(&fixture.app, fixture.router);
+    let fragment_frames = fragment_router.active().frames();
+    assert_eq!(fragment_frames.len(), 2);
+    assert_eq!(fragment_frames[0], preserved_layout);
+    assert_eq!(fragment_frames[1].slot(), first_leaf.slot());
+    assert_eq!(fragment_frames[1].frame(), first_leaf.frame());
+    assert_eq!(
+        fragment_frames[1].generation().raw(),
+        first_leaf.generation().raw() + 1
+    );
+
+    let effects = fixture.control.effects();
+    assert_eq!(effects.len(), effects_before_fragment + 1);
+    let fragment_effect = effects.last().expect("fragment applies one leaf effect");
+    assert_eq!(fragment_effect.view, fixture.leaf);
+    assert_eq!(fragment_effect.fragment.as_deref(), Some("details"));
+    assert_eq!(fragment_effect.location, fragment_location);
+    assert_eq!(
+        fragment_router.history().entries(),
+        &[first_location, fragment_location]
+    );
+    assert_eq!(fragment_router.history().cursor(), Some(1));
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
 }
 
 #[test]

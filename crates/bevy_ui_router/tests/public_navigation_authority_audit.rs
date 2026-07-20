@@ -1,6 +1,19 @@
-use bevy_app::App;
-use bevy_ui::Node;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+
+use bevy_app::{App, Update};
+use bevy_camera::visibility::Visibility;
+use bevy_ecs::{schedule::IntoScheduleConfigs, world::World};
+use bevy_picking::Pickable;
+use bevy_ui::{Node, Val};
+use bevy_ui_router::ecs::RouterScheduleSet;
 use bevy_ui_router::prelude::*;
+
+const ROOT_RECT_WIDTH: u16 = 37;
+const LAYOUT_RECT_WIDTH: u16 = 39;
+const LEAF_RECT_WIDTH: u16 = 41;
 
 struct AuditDriver {
     key: ViewDriverKey,
@@ -18,10 +31,15 @@ impl EcsViewDriver for AuditDriver {
         content: &mut FrameContentWriter<'_>,
         report: EcsViewReportSession<'_>,
     ) -> ViewBuildReport {
+        let width = match self.outlet_view.as_ref() {
+            Some(layout) if layout == effect.view() => LAYOUT_RECT_WIDTH,
+            Some(_) => LEAF_RECT_WIDTH,
+            None => ROOT_RECT_WIDTH,
+        };
         let root = content.spawn_empty().expect("root content should stage");
         let rect = content
             .spawn_solid_rect(
-                SolidRect::new(37, 19, ContentColor::srgba8(11, 23, 47, 255)).unwrap(),
+                SolidRect::new(width, 19, ContentColor::srgba8(11, 23, 47, 255)).unwrap(),
             )
             .expect("solid rectangle should stage");
         content
@@ -34,6 +52,100 @@ impl EcsViewDriver for AuditDriver {
         }
         report.applied()
     }
+}
+
+fn push_and_publish(
+    app: &mut App,
+    router: RouterHandle,
+    location: RouteLocation,
+) -> NavigationRequestId {
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, location)
+        .expect("public audit navigation should enqueue");
+    for _ in 0..16 {
+        app.update();
+        match app
+            .world()
+            .resource::<RouterSnapshots>()
+            .request(router, request)
+        {
+            RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded => {
+                return request;
+            }
+            RequestLookup::Found(snapshot)
+                if matches!(snapshot.status(), RequestStatus::Failed(_)) =>
+            {
+                panic!("public audit navigation failed: {:?}", snapshot.status());
+            }
+            RequestLookup::Found(_) | RequestLookup::NotRetained | RequestLookup::Unknown => {}
+        }
+    }
+    panic!("public audit navigation did not settle within 16 App::update calls")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Boundary {
+    BeforeCommit,
+    AfterCommit,
+}
+
+#[derive(Default)]
+struct BoundaryProbe {
+    armed: AtomicBool,
+    samples: Mutex<Vec<(Boundary, usize)>>,
+}
+
+fn interactive_leaf_count(world: &World) -> usize {
+    let gate = world.resource::<RouterInputGate>();
+    world
+        .iter_entities()
+        .filter(|entity| {
+            entity
+                .get::<Node>()
+                .is_some_and(|node| node.width == Val::Px(f32::from(LEAF_RECT_WIDTH)))
+                && entity.get::<Visibility>() != Some(&Visibility::Hidden)
+                && entity
+                    .get::<Pickable>()
+                    .is_some_and(|pickable| pickable.should_block_lower && pickable.is_hoverable)
+                && gate.allows_pointer(entity.id())
+                && gate.allows_keyboard(entity.id())
+                && gate.allows_gamepad(entity.id())
+        })
+        .count()
+}
+
+fn install_boundary_probe(app: &mut App, probe: Arc<BoundaryProbe>) {
+    let before = probe.clone();
+    app.add_systems(
+        Update,
+        (move |world: &mut World| {
+            if before.armed.load(Ordering::Acquire) {
+                before
+                    .samples
+                    .lock()
+                    .expect("boundary sample lock must not be poisoned")
+                    .push((Boundary::BeforeCommit, interactive_leaf_count(world)));
+            }
+        })
+        .after(RouterScheduleSet::DriveNavigation)
+        .before(RouterScheduleSet::CommitPresentation),
+    );
+    app.add_systems(
+        Update,
+        (move |world: &mut World| {
+            if probe.armed.load(Ordering::Acquire) {
+                probe
+                    .samples
+                    .lock()
+                    .expect("boundary sample lock must not be poisoned")
+                    .push((Boundary::AfterCommit, interactive_leaf_count(world)));
+            }
+        })
+        .after(RouterScheduleSet::CommitPresentation)
+        .before(RouterScheduleSet::SettleCleanup),
+    );
 }
 
 #[test]
@@ -257,4 +369,239 @@ fn nested_outlet_authority_is_opaque_and_exact() {
         AuditEntityState::PresentOwned
     );
     assert!(audit.orphan_slots().is_empty());
+}
+
+#[test]
+fn reconciliation_authority_is_preserved_and_old_leaf_is_removed() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let probe = Arc::new(BoundaryProbe::default());
+    install_boundary_probe(&mut app, probe.clone());
+
+    let layout = RouteViewKey::new("reconciliation-audit-layout").unwrap();
+    let leaf = RouteViewKey::new("reconciliation-audit-leaf").unwrap();
+    let fallback = RouteViewKey::new("reconciliation-audit-fallback").unwrap();
+    let driver = app
+        .register_ui_view_driver(AuditDriver {
+            key: ViewDriverKey::new("reconciliation-audit-driver").unwrap(),
+            outlet_view: Some(layout.clone()),
+        })
+        .unwrap();
+    let mut routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::pathless(),
+            RouteNodeOptions::new().with_view(layout.clone()),
+        )
+        .unwrap();
+    let layout_route = routes.root_id().unwrap();
+    routes
+        .route_with_options(
+            layout_route,
+            RoutePattern::path("items/:id").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(leaf.clone())
+                .with_slot(RouteSlotKey::default()),
+        )
+        .unwrap();
+    let routes = routes.build().unwrap();
+    let mut views = RouteViewRegistry::new();
+    for view in [layout, leaf, fallback.clone()] {
+        views
+            .insert(view, RouteViewDescriptor::new(driver.clone()))
+            .unwrap();
+    }
+    let router = app
+        .add_ui_router(RouterConfig::new(routes, views, fallback))
+        .unwrap();
+    app.world_mut()
+        .spawn((Node::default(), RouterHostRegistration::new(router)));
+    app.update();
+
+    push_and_publish(&mut app, router, RouteLocation::new("/items/1"));
+    let initial_frames = app
+        .world()
+        .resource::<RouterSnapshots>()
+        .get(router)
+        .expect("installed router has a snapshot")
+        .active()
+        .frames()
+        .to_vec();
+    assert_eq!(initial_frames.len(), 2);
+    let preserved_layout = initial_frames[0].clone();
+    let old_leaf = initial_frames[1].clone();
+    let (
+        preserved_layout_root,
+        preserved_layout_slot,
+        preserved_outlet_anchor,
+        preserved_child_slot,
+        preserved_child_slot_id,
+        preserved_child_slot_host,
+        old_leaf_root,
+    ) = {
+        let audits = app.world().resource::<RouterAuthorityAudits>();
+        let audit = audits.get(router).expect("installed router has an audit");
+        let layout_mapping = audit
+            .frames()
+            .iter()
+            .find(|mapping| mapping.frame() == &preserved_layout)
+            .expect("layout mapping is published");
+        let old_leaf_mapping = audit
+            .frames()
+            .iter()
+            .find(|mapping| mapping.frame() == &old_leaf)
+            .expect("old leaf mapping is published");
+        let outlet = audit
+            .outlets()
+            .iter()
+            .find(|outlet| {
+                outlet.parent() == &preserved_layout && outlet.key() == &RouteSlotKey::default()
+            })
+            .expect("layout outlet mapping is published");
+        let child_slot = outlet.child_slot().expect("layout outlet has a child slot");
+        let slot_mapping = audit
+            .slots()
+            .iter()
+            .find(|slot| slot.entity() == child_slot)
+            .expect("child slot mapping is published");
+        assert_eq!(slot_mapping.kind(), AuthoritySlotKind::ChildOutlet);
+        assert_eq!(slot_mapping.parent_frame(), Some(&preserved_layout));
+        assert_eq!(slot_mapping.outlet(), Some(&RouteSlotKey::default()));
+        (
+            layout_mapping.root(),
+            layout_mapping.slot_entity(),
+            outlet.anchor(),
+            child_slot,
+            slot_mapping.id(),
+            slot_mapping.host().clone(),
+            old_leaf_mapping.root(),
+        )
+    };
+
+    probe.armed.store(true, Ordering::Release);
+    push_and_publish(&mut app, router, RouteLocation::new("/items/2"));
+    probe.armed.store(false, Ordering::Release);
+
+    let journey_frames = app
+        .world()
+        .resource::<RouterSnapshots>()
+        .get(router)
+        .expect("installed router has a snapshot")
+        .active()
+        .frames()
+        .to_vec();
+    assert_eq!(journey_frames.len(), 2);
+    assert_eq!(journey_frames[0], preserved_layout);
+    let new_leaf = journey_frames[1].clone();
+    let audits = app.world().resource::<RouterAuthorityAudits>();
+    let audit = audits.get(router).expect("installed router has an audit");
+    let layout_mapping = audit
+        .frames()
+        .iter()
+        .find(|mapping| mapping.frame() == &preserved_layout)
+        .expect("preserved layout mapping remains published");
+    assert_eq!(layout_mapping.root(), preserved_layout_root);
+    assert_eq!(layout_mapping.slot_entity(), preserved_layout_slot);
+    let outlet = audit
+        .outlets()
+        .iter()
+        .find(|outlet| {
+            outlet.parent() == &preserved_layout && outlet.key() == &RouteSlotKey::default()
+        })
+        .expect("preserved layout outlet remains published");
+    assert_eq!(outlet.anchor(), preserved_outlet_anchor);
+    assert_eq!(outlet.child_slot(), Some(preserved_child_slot));
+    let child_slot = audit
+        .slots()
+        .iter()
+        .find(|slot| slot.entity() == preserved_child_slot)
+        .expect("preserved child slot remains published");
+    assert_eq!(child_slot.id(), preserved_child_slot_id);
+    assert_eq!(child_slot.host(), &preserved_child_slot_host);
+    assert_eq!(child_slot.kind(), AuthoritySlotKind::ChildOutlet);
+    assert_eq!(child_slot.parent_frame(), Some(&preserved_layout));
+    assert_eq!(child_slot.outlet(), Some(&RouteSlotKey::default()));
+    assert_eq!(
+        audit.owned_entity_state(old_leaf_root),
+        AuditEntityState::Removed
+    );
+
+    let isolated = audit
+        .events()
+        .iter()
+        .position(|event| {
+            event.kind() == RouterLifecycleAuditEventKind::FrameIsolated
+                && event.frame() == Some(&old_leaf)
+                && event.entity() == Some(old_leaf_root)
+        })
+        .expect("old leaf isolation is published");
+    let activated = audit
+        .events()
+        .iter()
+        .position(|event| {
+            event.kind() == RouterLifecycleAuditEventKind::FrameActivated
+                && event.frame() == Some(&new_leaf)
+        })
+        .expect("new leaf activation is published");
+    assert!(isolated < activated);
+    let isolation = &audit.events()[isolated];
+    assert!(isolation.visibility_hidden());
+    assert!(!isolation.accepts_pointer());
+    assert!(!isolation.accepts_keyboard());
+    assert!(!isolation.accepts_gamepad());
+    assert!(!isolation.focused());
+    let activation = &audit.events()[activated];
+    assert!(!activation.visibility_hidden());
+    assert!(activation.accepts_pointer());
+    assert!(activation.accepts_keyboard());
+    assert!(activation.accepts_gamepad());
+
+    let samples = probe
+        .samples
+        .lock()
+        .expect("boundary sample lock must not be poisoned")
+        .clone();
+    assert!(samples.iter().any(|(boundary, interactive)| {
+        *boundary == Boundary::BeforeCommit && *interactive == 1
+    }));
+    assert!(samples.iter().any(|(boundary, interactive)| {
+        *boundary == Boundary::AfterCommit && *interactive == 1
+    }));
+    assert!(samples.iter().all(|(_, interactive)| *interactive <= 1));
+
+    push_and_publish(
+        &mut app,
+        router,
+        RouteLocation::new("/items/2").with_fragment("details"),
+    );
+    let audits = app.world().resource::<RouterAuthorityAudits>();
+    let audit = audits.get(router).expect("installed router has an audit");
+    let layout_mapping = audit
+        .frames()
+        .iter()
+        .find(|mapping| mapping.frame() == &preserved_layout)
+        .expect("fragment preserves the layout mapping");
+    assert_eq!(layout_mapping.root(), preserved_layout_root);
+    assert_eq!(layout_mapping.slot_entity(), preserved_layout_slot);
+    let outlet = audit
+        .outlets()
+        .iter()
+        .find(|outlet| {
+            outlet.parent() == &preserved_layout && outlet.key() == &RouteSlotKey::default()
+        })
+        .expect("fragment preserves the layout outlet");
+    assert_eq!(outlet.anchor(), preserved_outlet_anchor);
+    assert_eq!(outlet.child_slot(), Some(preserved_child_slot));
+    let child_slot = audit
+        .slots()
+        .iter()
+        .find(|slot| slot.entity() == preserved_child_slot)
+        .expect("fragment preserves the child slot mapping");
+    assert_eq!(child_slot.id(), preserved_child_slot_id);
+    assert_eq!(child_slot.host(), &preserved_child_slot_host);
+    assert_eq!(child_slot.parent_frame(), Some(&preserved_layout));
+    assert_eq!(child_slot.outlet(), Some(&RouteSlotKey::default()));
+    assert_eq!(
+        audit.owned_entity_state(old_leaf_root),
+        AuditEntityState::Removed
+    );
 }
