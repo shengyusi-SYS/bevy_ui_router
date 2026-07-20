@@ -49,6 +49,7 @@
 
 ## 参考资料
 
+- [全局架构与工程决策指导](global-architecture-engineering-decision-guide.md) 是带日期、非规范的宏观纠偏与资源决策参考；它可以提出 canonical amendment，但不定义当前范围、顺序、状态或完成门槛。
 - [01 BSN scene authoring boundaries](01-BSN-scene-authoring-boundaries.md) 与 [02 Web router patterns for Bevy](02-Web-router-patterns-for-Bevy.md) 是研究参考，不是当前实现事实。
 - [03 Core architecture and MVP](03-Core-architecture-and-MVP.md)、[04 Risks, tests and handoff](04-Risks-tests-and-handoff.md) 与 [05 Non-MVP capabilities](05-Non-MVP-capabilities-in-Bevy.md) 是早期设计基线；其中与当前权威文档冲突的内容已被取代。
 
