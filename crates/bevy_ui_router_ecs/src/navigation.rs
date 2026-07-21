@@ -48,6 +48,10 @@ use crate::{
         PreparedInputGateIsolation, RouteFocusState, RouterInputGate, observed_descendant_closure,
         prepare_focus_mutation, prepare_input_gate_mutation, try_prepare_input_gate_isolation,
     },
+    lifecycle_preparation::{
+        LifecyclePreflightEvidence, LifecyclePreflightExpectation, LifecyclePreflightObserved,
+        LifecyclePreflightSource, RequiredResourceSet,
+    },
     mount::{
         ChildSlotResidual, StagedChildSlot, confirm_child_slot, mounted_child_slot_is_isolated,
         mounted_child_slot_local_is_isolated, mounted_child_slot_structure_is_isolated,
@@ -2321,121 +2325,6 @@ enum ReconciliationPreflightOutcome {
         splice: SealedReconciliationSplice,
         evidence: LifecyclePreflightEvidence,
     },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LifecyclePreflightSource {
-    RequiredResources(RequiredResourceSet),
-    HostBinding,
-    PreservedCurrent,
-    LeavingCurrent,
-    PendingAdmission,
-    PendingEntering,
-    CrossRoleRebase,
-    TargetPartition,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct RequiredResourceSet(u8);
-
-impl RequiredResourceSet {
-    const ROUTE_ENTITY_REGISTRY: Self = Self(1 << 0);
-    const ROUTER_INPUT_GATE: Self = Self(1 << 1);
-    const INPUT_FOCUS: Self = Self(1 << 2);
-    const ROUTE_FOCUS_STATE: Self = Self(1 << 3);
-
-    fn missing_from(world: &World) -> Self {
-        let mut missing = Self::default();
-        if !world.contains_resource::<RouteEntityRegistry>() {
-            missing.0 |= Self::ROUTE_ENTITY_REGISTRY.0;
-        }
-        if !world.contains_resource::<RouterInputGate>() {
-            missing.0 |= Self::ROUTER_INPUT_GATE.0;
-        }
-        if !world.contains_resource::<InputFocus>() {
-            missing.0 |= Self::INPUT_FOCUS.0;
-        }
-        if !world.contains_resource::<RouteFocusState>() {
-            missing.0 |= Self::ROUTE_FOCUS_STATE.0;
-        }
-        missing
-    }
-
-    const fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LifecyclePreflightExpectation {
-    ResourcePresent,
-    ExactAuthority,
-    ExactTaskShape,
-    ExactRelationshipClosure,
-    RebaseCompatible,
-    DisjointClosure,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LifecyclePreflightObserved {
-    Missing,
-    Drifted,
-    Contradictory,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LifecyclePreflightEvidence {
-    source: LifecyclePreflightSource,
-    expectation: LifecyclePreflightExpectation,
-    observed: LifecyclePreflightObserved,
-}
-
-impl LifecyclePreflightEvidence {
-    const fn new(
-        source: LifecyclePreflightSource,
-        expectation: LifecyclePreflightExpectation,
-        observed: LifecyclePreflightObserved,
-    ) -> Self {
-        Self {
-            source,
-            expectation,
-            observed,
-        }
-    }
-
-    const fn pending_message(self) -> &'static str {
-        match self.source {
-            LifecyclePreflightSource::PendingAdmission => {
-                "projectionless fallback admission became stale"
-            }
-            LifecyclePreflightSource::PendingEntering => {
-                "projectionless fallback entering branch drifted"
-            }
-            LifecyclePreflightSource::CrossRoleRebase => {
-                "projectionless fallback entering branch cannot rebase"
-            }
-            LifecyclePreflightSource::TargetPartition => {
-                "projectionless fallback target overlaps current authority"
-            }
-            LifecyclePreflightSource::RequiredResources(_)
-            | LifecyclePreflightSource::HostBinding
-            | LifecyclePreflightSource::PreservedCurrent
-            | LifecyclePreflightSource::LeavingCurrent => {
-                "projectionless fallback current authority drifted"
-            }
-        }
-    }
-
-    const fn is_missing_resource(self) -> bool {
-        matches!(
-            (self.source, self.expectation, self.observed),
-            (
-                LifecyclePreflightSource::RequiredResources(resources),
-                LifecyclePreflightExpectation::ResourcePresent,
-                LifecyclePreflightObserved::Missing
-            ) if !resources.is_empty()
-        )
-    }
 }
 
 fn current_host_binding_is_exact(world: &World, host: &HostBinding) -> bool {
@@ -20081,7 +19970,7 @@ pub(crate) mod tests {
             residual.kind,
             AuthorityProtocolResidualKind::PreflightAuthorityLost(evidence)
                 if evidence.is_missing_resource()
-                    && evidence.source == LifecyclePreflightSource::RequiredResources(
+                    && evidence.source() == LifecyclePreflightSource::RequiredResources(
                         RequiredResourceSet::ROUTE_ENTITY_REGISTRY,
                     )
         ));
@@ -20143,12 +20032,12 @@ pub(crate) mod tests {
             panic!("missing input gate must retain typed preflight evidence")
         };
         assert_eq!(
-            evidence.expectation,
+            evidence.expectation(),
             LifecyclePreflightExpectation::ResourcePresent
         );
-        assert_eq!(evidence.observed, LifecyclePreflightObserved::Missing);
+        assert_eq!(evidence.observed(), LifecyclePreflightObserved::Missing);
         assert_eq!(
-            evidence.source,
+            evidence.source(),
             LifecyclePreflightSource::RequiredResources(RequiredResourceSet::ROUTER_INPUT_GATE,)
         );
         assert!(

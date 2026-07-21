@@ -13,6 +13,7 @@ mod driver;
 mod frame_local;
 mod host;
 mod input;
+mod lifecycle_preparation;
 mod mount;
 mod navigation;
 mod plugin;
