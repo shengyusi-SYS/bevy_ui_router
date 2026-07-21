@@ -7609,7 +7609,8 @@ pub(crate) mod tests {
             .prepare_commit(&ticket, CleanupManifest::empty())
             .unwrap();
         let batch = prepared.cleanup().clone();
-        engine.publish(prepared, || {});
+        let validated = engine.validate_publication(prepared).unwrap();
+        validated.publish(|| {});
         (engine, batch)
     }
 

@@ -21,6 +21,8 @@ use bevy_ecs::{
 };
 use bevy_picking::Pickable;
 use bevy_ui::{BackgroundColor, Node, Val};
+#[cfg(feature = "test-support")]
+use bevy_ui_router::ecs::RouterAuthorityAudits;
 use bevy_ui_router::prelude::*;
 
 const NORMAL_RECT_WIDTH: u16 = 31;
@@ -509,6 +511,64 @@ fn push_and_settle(
     panic!("fixture request did not settle within 16 App::update calls")
 }
 
+fn replace_and_settle(
+    app: &mut App,
+    router: RouterHandle,
+    location: RouteLocation,
+    forbidden_rect_width: Option<u16>,
+) -> NavigationRequestId {
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .replace(router, location)
+        .expect("fixture replace should enqueue");
+    for _ in 0..16 {
+        app.update();
+        if let Some(width) = forbidden_rect_width {
+            assert!(
+                node_entities_with_width(app, width).is_empty(),
+                "a rejected replace ContentPlan must remain World-zero"
+            );
+        }
+        let terminal = {
+            let snapshots = app.world().resource::<RouterSnapshots>();
+            matches!(
+                snapshots.request(router, request),
+                RequestLookup::Found(snapshot)
+                    if matches!(
+                        snapshot.status(),
+                        RequestStatus::Succeeded | RequestStatus::Failed(_)
+                    )
+            )
+        };
+        if terminal {
+            return request;
+        }
+    }
+    panic!("fixture replace did not settle within 16 App::update calls")
+}
+
+fn drive_request_to_terminal(
+    app: &mut App,
+    router: RouterHandle,
+    request: NavigationRequestId,
+) -> NavigationRequestSnapshot {
+    for _ in 0..16 {
+        app.update();
+        let snapshots = app.world().resource::<RouterSnapshots>();
+        let RequestLookup::Found(snapshot) = snapshots.request(router, request) else {
+            continue;
+        };
+        if matches!(
+            snapshot.status(),
+            RequestStatus::Succeeded | RequestStatus::Failed(_)
+        ) {
+            return snapshot.clone();
+        }
+    }
+    panic!("fixture request did not settle within 16 App::update calls")
+}
+
 fn request_snapshot(
     app: &App,
     router: RouterHandle,
@@ -814,6 +874,186 @@ fn next_trace_event(
         .skip(after.map_or(0, |index| index + 1))
         .find_map(|(index, event)| (event.kind() == kind && predicate(event)).then_some(index))
         .unwrap_or_else(|| panic!("missing ordered {kind:?} event after {after:?}: {trace:?}"))
+}
+
+#[test]
+fn history_replace_facade_replaces_empty_history() {
+    let mut fixture = root_fixture("/items/:id");
+    let request = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .replace(fixture.router, RouteLocation::new("/items/2"))
+        .expect("replace must enqueue");
+
+    let terminal = drive_request_to_terminal(&mut fixture.app, fixture.router, request);
+    assert_eq!(terminal.status(), &RequestStatus::Succeeded);
+    assert_eq!(
+        router_snapshot(&fixture.app, fixture.router)
+            .history()
+            .entries(),
+        [RouteLocation::new("/items/2")]
+    );
+    assert_eq!(
+        router_snapshot(&fixture.app, fixture.router)
+            .history()
+            .cursor(),
+        Some(0)
+    );
+}
+
+#[test]
+fn history_replace_f1_equivalent_is_physical_zero_write() {
+    let mut fixture = root_fixture("/items/:id");
+    let target = RouteLocation::new("/items/1");
+    let first = push_and_settle(&mut fixture.app, fixture.router, target.clone(), None, None);
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, first));
+    let before = router_snapshot(&fixture.app, fixture.router);
+    let frames_before = before.active().frames().to_vec();
+    let entities_before = entity_set(&fixture.app);
+    let effects_before = fixture.control.effects();
+    #[cfg(feature = "test-support")]
+    let authority_before = fixture
+        .app
+        .world()
+        .resource::<RouterAuthorityAudits>()
+        .get(fixture.router)
+        .expect("published router has one authority audit")
+        .clone();
+
+    let replacement = replace_and_settle(&mut fixture.app, fixture.router, target.clone(), None);
+    let request = request_snapshot(&fixture.app, fixture.router, replacement);
+    assert_succeeded(&request);
+    assert_cleanup_trace_is_ordered(&request, false);
+    assert_eq!(
+        request
+            .trace()
+            .iter()
+            .filter(|event| event.kind() == NavigationTraceEventKind::CommitPublished)
+            .count(),
+        1
+    );
+
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after.active().frames(), frames_before);
+    assert_eq!(after.history().entries(), [target]);
+    assert_eq!(after.history().cursor(), Some(0));
+    assert_eq!(entity_set(&fixture.app), entities_before);
+    assert_eq!(fixture.control.effects(), effects_before);
+    #[cfg(feature = "test-support")]
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .resource::<RouterAuthorityAudits>()
+            .get(fixture.router)
+            .expect("equivalent replace retains one authority audit"),
+        &authority_before
+    );
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
+fn history_replace_f2_fragment_remounts_only_deepest_leaf() {
+    let mut fixture = nested_fixture();
+    let first_location = RouteLocation::new("/items/1");
+    let first = push_and_settle(&mut fixture.app, fixture.router, first_location, None, None);
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, first));
+    let before = router_snapshot(&fixture.app, fixture.router);
+    let layout = before.active().frames()[0].clone();
+    let leaf = before.active().frames()[1].clone();
+    let effects_before = fixture.control.effects().len();
+
+    let target = RouteLocation::new("/items/1").with_fragment("details");
+    let replacement = replace_and_settle(&mut fixture.app, fixture.router, target.clone(), None);
+    let request = request_snapshot(&fixture.app, fixture.router, replacement);
+    assert_succeeded(&request);
+    assert_cleanup_trace_is_ordered(&request, true);
+
+    let after = router_snapshot(&fixture.app, fixture.router);
+    let frames = after.active().frames();
+    assert_eq!(frames[0], layout);
+    assert_eq!(frames[1].slot(), leaf.slot());
+    assert_eq!(frames[1].frame(), leaf.frame());
+    assert_eq!(frames[1].generation().raw(), leaf.generation().raw() + 1);
+    assert_eq!(after.history().entries(), [target.clone()]);
+    assert_eq!(after.history().cursor(), Some(0));
+    let effects = fixture.control.effects();
+    assert_eq!(effects.len(), effects_before + 1);
+    assert_eq!(effects.last().unwrap().view, fixture.leaf);
+    assert_eq!(effects.last().unwrap().location, target);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
+fn history_replace_f3_canonical_path_preserves_search_and_fragment() {
+    let mut fixture = root_fixture("/items/:id");
+    let target = RouteLocation::new("items//2/")
+        .with_search("?tag=a&tag=b")
+        .with_fragment("#details");
+    let replacement = replace_and_settle(&mut fixture.app, fixture.router, target.clone(), None);
+    let request = request_snapshot(&fixture.app, fixture.router, replacement);
+    assert_succeeded(&request);
+    assert_eq!(request.requested(), &target);
+    assert_eq!(request.requested().path(), "/items/2");
+    assert_eq!(request.requested().search(), Some("?tag=a&tag=b"));
+    assert_eq!(request.requested().fragment(), Some("#details"));
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after.active().location(), Some(&target));
+    assert_eq!(after.history().current(), Some(&target));
+}
+
+#[test]
+fn history_replace_failure_preserves_published_history() {
+    let mut fixture = root_fixture("/known/:id");
+    let first = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        RouteLocation::new("/known/one"),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, first));
+    let before = router_snapshot(&fixture.app, fixture.router);
+    let old_active = before.active().clone();
+    let old_history = before.history().clone();
+    let old_entities = entity_set(&fixture.app);
+
+    fixture
+        .control
+        .set_mode(&fixture.normal, FixtureMode::ApplyFailure);
+    fixture
+        .control
+        .set_mode(&fixture.fallback, FixtureMode::BuildFailure);
+    let failed = replace_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        RouteLocation::new("/known/two"),
+        Some(PARTIAL_RECT_WIDTH),
+    );
+    let request = request_snapshot(&fixture.app, fixture.router, failed);
+    assert_failed(&request, NavigationFailureKind::RecoveryFailed);
+    assert!(
+        request
+            .trace()
+            .iter()
+            .any(|event| event.kind() == NavigationTraceEventKind::HistoryIntentRejected)
+    );
+    assert_eq!(
+        fixture.control.effects().last().unwrap().origin,
+        FrameOrigin::RouterFallback
+    );
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after.active(), &old_active);
+    assert_eq!(after.history(), &old_history);
+    assert!(
+        !after
+            .history()
+            .entries()
+            .contains(&RouteLocation::new("/known/two"))
+    );
+    assert_eq!(entity_set(&fixture.app), old_entities);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
 }
 
 #[test]

@@ -246,7 +246,7 @@ impl ReservedAttemptIds {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReservationCounter {
     Request,
@@ -493,7 +493,7 @@ impl CoreIdAllocator {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn testing_exhaust_reservation_counter(
         &mut self,
         router: RouterIdentity,

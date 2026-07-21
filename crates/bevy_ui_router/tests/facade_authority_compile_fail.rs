@@ -4,11 +4,11 @@ mod facade_contract_cases;
 use std::collections::BTreeSet;
 
 use facade_contract_cases::{
-    assert_consumer_case_files, feature_disabled_cases, forbidden_capability_cases,
-    forbidden_module_cases, forbidden_name_cases, history_contract_profile,
-    is_forbidden_capability, markdown_table, markdown_table_by_header, opaque_struct_cases,
-    parse_golden, prepare_consumer_cases, profile_exclusion_cases, read_workspace, root_symbols,
-    run_negative_consumer,
+    ConsumerCase, NegativeCase, assert_consumer_case_files, feature_disabled_cases,
+    forbidden_capability_cases, forbidden_module_cases, forbidden_name_cases,
+    history_contract_profile, is_forbidden_capability, markdown_table, markdown_table_by_header,
+    opaque_struct_cases, parse_golden, prepare_consumer_cases, profile_exclusion_cases,
+    read_workspace, root_symbols, run_negative_consumer,
 };
 
 #[test]
@@ -66,6 +66,28 @@ fn history_profile_forbidden_consumers_fail_with_expected_rustc_categories() {
     assert!(!disabled_cases.is_empty());
     let opaque_cases = opaque_struct_cases(&golden);
     assert!(!opaque_cases.is_empty());
+    let history_authority_cases = [
+        (
+            "history-execution-binding-view-not-facade-exported",
+            "pub use bevy_ui_router::core::HistoryExecutionBindingView as Probe;",
+        ),
+        (
+            "testing-reservation-counter-not-facade-exported",
+            "pub use bevy_ui_router::core::TestingReservationCounter as Probe;",
+        ),
+    ]
+    .into_iter()
+    .map(|(slug, source)| NegativeCase {
+        consumer: ConsumerCase {
+            kind: "fail",
+            feature_set: "test-support",
+            slug: slug.to_owned(),
+            default_features: false,
+            features: vec!["test-support".to_owned()],
+            source: source.to_owned(),
+        },
+        expected_codes: vec!["E0432", "E0433", "E0603"],
+    });
 
     let cases = opaque_cases
         .into_iter()
@@ -74,6 +96,7 @@ fn history_profile_forbidden_consumers_fail_with_expected_rustc_categories() {
         .chain(module_cases)
         .chain(profile_cases)
         .chain(disabled_cases)
+        .chain(history_authority_cases)
         .collect::<Vec<_>>();
     assert!(
         !cases.is_empty(),

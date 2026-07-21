@@ -271,7 +271,8 @@ mod tests {
             .prepare_commit(&ticket, CleanupManifest::empty())
             .unwrap();
         let cleanup = prepared.cleanup().clone();
-        engine.publish(prepared, || {});
+        let validated = engine.validate_publication(prepared).unwrap();
+        validated.publish(|| {});
         engine.complete_cleanup(cleanup.complete_empty()).unwrap();
         request
     }

@@ -831,15 +831,53 @@ impl RouterNavigation {
                 NavigationEnqueueErrorKind::HostUnavailable,
             ));
         }
-        let request = entry.engine.push(location).map_err(|error| match error {
-            IntegrationError::AwaitingHost => {
-                NavigationEnqueueError::new(NavigationEnqueueErrorKind::HostUnavailable)
-            }
-            _ => NavigationEnqueueError::new(NavigationEnqueueErrorKind::AuthorityRecovering),
-        })?;
+        let request = entry
+            .engine
+            .push(location)
+            .map_err(map_navigation_enqueue_error)?;
         entry.requests.push(request);
         Ok(request)
     }
+
+    pub fn replace(
+        &mut self,
+        router: RouterHandle,
+        location: RouteLocation,
+    ) -> Result<NavigationRequestId, NavigationEnqueueError> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handle == router)
+            .ok_or_else(|| {
+                NavigationEnqueueError::new(NavigationEnqueueErrorKind::UnknownRouter)
+            })?;
+        if entry.authority_protocol_residual.is_some() {
+            return Err(NavigationEnqueueError::new(
+                NavigationEnqueueErrorKind::HostUnavailable,
+            ));
+        }
+        let request = entry
+            .engine
+            .replace(location)
+            .map_err(map_navigation_enqueue_error)?;
+        entry.requests.push(request);
+        Ok(request)
+    }
+}
+
+fn map_navigation_enqueue_error(error: IntegrationError) -> NavigationEnqueueError {
+    let kind = match error {
+        IntegrationError::AwaitingHost => NavigationEnqueueErrorKind::HostUnavailable,
+        IntegrationError::Exhausted => NavigationEnqueueErrorKind::IdentityExhausted,
+        IntegrationError::OutstandingAdmission
+        | IntegrationError::AuthorityExists
+        | IntegrationError::ForeignRouter
+        | IntegrationError::Duplicate
+        | IntegrationError::Stale
+        | IntegrationError::Invalid
+        | IntegrationError::InvalidManifest => NavigationEnqueueErrorKind::AuthorityRecovering,
+    };
+    NavigationEnqueueError::new(kind)
 }
 
 #[cfg(test)]
@@ -885,6 +923,7 @@ pub enum NavigationEnqueueErrorKind {
     HostUnavailable,
     AuthorityRecovering,
     NoBackEntry,
+    IdentityExhausted,
 }
 
 #[derive(Debug)]
@@ -909,6 +948,9 @@ impl std::fmt::Display for NavigationEnqueueError {
             NavigationEnqueueErrorKind::HostUnavailable => "router host is unavailable",
             NavigationEnqueueErrorKind::AuthorityRecovering => "router authority is recovering",
             NavigationEnqueueErrorKind::NoBackEntry => "router history has no back entry",
+            NavigationEnqueueErrorKind::IdentityExhausted => {
+                "router navigation identity capacity is exhausted"
+            }
         })
     }
 }
@@ -2842,6 +2884,7 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                 };
                 let mut splice_owner = Some(splice);
                 let mut cleanup_reserve_contradiction = None;
+                let mut commit_authority_contradiction = None;
                 let committed = world.resource_scope(
                     |world, gate: bevy_ecs::change_detection::Mut<RouterInputGate>| {
                         world.resource_scope(
@@ -2934,9 +2977,54 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                                                     .prepare_commit(ticket, manifest)
                                                 {
                                                     Ok(prepared) => prepared,
-                                                    Err(_) => return None,
+                                                    Err(error) => {
+                                                        commit_authority_contradiction = Some(
+                                                            match error {
+                                                                IntegrationError::InvalidManifest => {
+                                                                    BeginAuthoritySettlementErrorKind::InvalidManifest
+                                                                }
+                                                                IntegrationError::Exhausted
+                                                                | IntegrationError::AwaitingHost
+                                                                | IntegrationError::OutstandingAdmission
+                                                                | IntegrationError::AuthorityExists
+                                                                | IntegrationError::ForeignRouter
+                                                                | IntegrationError::Duplicate
+                                                                | IntegrationError::Stale
+                                                                | IntegrationError::Invalid => {
+                                                                    BeginAuthoritySettlementErrorKind::Stale
+                                                                }
+                                                            },
+                                                        );
+                                                        return None;
+                                                    }
                                                 };
-                                                let cleanup = prepared.cleanup().clone();
+                                                let engine = match entry
+                                                    .engine
+                                                    .validate_publication(prepared)
+                                                {
+                                                    Ok(validated) => validated,
+                                                    Err(error) => {
+                                                        commit_authority_contradiction = Some(
+                                                            match error {
+                                                                IntegrationError::InvalidManifest => {
+                                                                    BeginAuthoritySettlementErrorKind::InvalidManifest
+                                                                }
+                                                                IntegrationError::Exhausted
+                                                                | IntegrationError::AwaitingHost
+                                                                | IntegrationError::OutstandingAdmission
+                                                                | IntegrationError::AuthorityExists
+                                                                | IntegrationError::ForeignRouter
+                                                                | IntegrationError::Duplicate
+                                                                | IntegrationError::Stale
+                                                                | IntegrationError::Invalid => {
+                                                                    BeginAuthoritySettlementErrorKind::Stale
+                                                                }
+                                                            },
+                                                        );
+                                                        return None;
+                                                    }
+                                                };
+                                                let cleanup = engine.cleanup().clone();
                                                 let cleanup_ledger =
                                                     reserved_ledger.bind_batch(cleanup);
                                                 pending.ticket.take();
@@ -2960,10 +3048,9 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                                                         .then_some(leaving),
                                                     ),
                                                 );
-                                                let engine = &mut entry.engine;
                                                 let active_owner = &mut entry.active;
                                                 let cleanup_owner = &mut entry.cleanup_ledger;
-                                                engine.publish(prepared, || {
+                                                engine.publish(|| {
                                                     presentation_plan.apply_staged(
                                                         |_| focus_plan.apply(),
                                                         |_| registry_plan.apply(&mut registry),
@@ -2987,6 +3074,19 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                         .expect("failed commit retains its sealed splice owner");
                     let (active, entering, _roles) = splice.reject().into_parts();
                     pending.branch = entering;
+                    if let Some(kind) = commit_authority_contradiction {
+                        if let Err((active, pending)) = fail_closed_normal_owner_protocol(
+                            world,
+                            entry,
+                            active,
+                            pending,
+                            AuthorityProtocolResidualKind::Authority(kind),
+                        ) {
+                            entry.active = had_active.then_some(active);
+                            entry.pending_commit = Some(pending);
+                        }
+                        continue;
+                    }
                     if let Some(kind) = cleanup_reserve_contradiction {
                         if let Err((active, pending)) = fail_closed_normal_owner_protocol(
                             world,
@@ -4659,7 +4759,38 @@ fn commit_projectionless_branch(
                                             return None;
                                         }
                                     };
-                                    let cleanup = prepared.cleanup().clone();
+                                    let engine = match entry
+                                        .engine
+                                        .validate_publication(prepared)
+                                    {
+                                        Ok(validated) => validated,
+                                        Err(error) => {
+                                            failure = Some(
+                                                ProjectionlessCommitFailure::PostReportAuthorityLost {
+                                                    admission: admission.clone().expect(
+                                                        "fallback replacement owns frozen admission",
+                                                    ),
+                                                    reason: match error {
+                                                        IntegrationError::InvalidManifest => {
+                                                            BeginAuthoritySettlementErrorKind::InvalidManifest
+                                                        }
+                                                        IntegrationError::Exhausted
+                                                        | IntegrationError::AwaitingHost
+                                                        | IntegrationError::OutstandingAdmission
+                                                        | IntegrationError::AuthorityExists
+                                                        | IntegrationError::ForeignRouter
+                                                        | IntegrationError::Duplicate
+                                                        | IntegrationError::Stale
+                                                        | IntegrationError::Invalid => {
+                                                            BeginAuthoritySettlementErrorKind::Stale
+                                                        }
+                                                    },
+                                                },
+                                            );
+                                            return None;
+                                        }
+                                    };
+                                    let cleanup = engine.cleanup().clone();
                                     let cleanup_ledger = reserved_ledger.bind_batch(cleanup);
                                     pending.ticket.take();
                                     let (mut leaving, mut entering) = branch_owners.take().expect(
@@ -4681,10 +4812,9 @@ fn commit_projectionless_branch(
                                             leaving,
                                         ),
                                     );
-                                    let engine = &mut entry.engine;
                                     let active_owner = &mut entry.active;
                                     let cleanup_owner = &mut entry.cleanup_ledger;
-                                    engine.publish(prepared, || {
+                                    engine.publish(|| {
                                         presentation_plan.apply_staged(
                                             |_| focus_plan.apply(),
                                             |_| registry_plan.apply(&mut registry),
@@ -5862,7 +5992,7 @@ pub(crate) mod tests {
     use bevy_picking::Pickable;
     use bevy_picking::events::{Over, Pointer};
     use bevy_ui::{ComputedNode, Node, UiGlobalTransform, Val};
-    use bevy_ui_router_core::integration::ViewReportIdentity;
+    use bevy_ui_router_core::integration::{TestingReservationCounter, ViewReportIdentity};
     use bevy_ui_router_core::prelude::{
         ActivePresentationKind, FrameOrigin, NavigationFailureKind, NavigationPhase,
         NavigationTraceEventKind, RequestStatus, RouteNodeOptions, RoutePattern, RouteTree,
@@ -6386,6 +6516,10 @@ pub(crate) mod tests {
     }
 
     fn install_atomic_router(app: &mut App, label: &str) -> RouterHandle {
+        install_atomic_router_at_pattern(app, label, "/")
+    }
+
+    fn install_atomic_router_at_pattern(app: &mut App, label: &str, pattern: &str) -> RouterHandle {
         let driver = ViewDriverKey::new(format!("{label}-driver")).unwrap();
         app.register_ui_view_driver(AtomicDriver {
             key: driver.clone(),
@@ -6394,7 +6528,7 @@ pub(crate) mod tests {
         let view = RouteViewKey::new(format!("{label}-view")).unwrap();
         let routes = RouteTree::builder()
             .root_with_options(
-                RoutePattern::path("/").unwrap(),
+                RoutePattern::path(pattern).unwrap(),
                 RouteNodeOptions::new().with_view(view.clone()),
             )
             .unwrap()
@@ -6689,6 +6823,28 @@ pub(crate) mod tests {
         request
     }
 
+    fn prepare_deep_nested_replace_for_commit(
+        app: &mut App,
+        router: RouterHandle,
+        location: RouteLocation,
+    ) -> NavigationRequestId {
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .replace(router, location)
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        for _ in 0..5 {
+            drive_navigation_system(app.world_mut());
+        }
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .pending_commit
+                .is_some()
+        );
+        request
+    }
+
     fn commit_initial_deep_nested_branch(app: &mut App, router: RouterHandle) {
         prepare_deep_nested_branch_for_commit(
             app,
@@ -6743,6 +6899,38 @@ pub(crate) mod tests {
                 })
                 .count()
         );
+        request
+    }
+
+    fn prepare_nested_replace_for_commit(
+        app: &mut App,
+        router: RouterHandle,
+        location: RouteLocation,
+    ) -> NavigationRequestId {
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .replace(router, location)
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        for _ in 0..3 {
+            drive_navigation_system(app.world_mut());
+        }
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        let pending = entry.pending_commit.as_ref().unwrap();
+        let projection = match (pending.ticket.as_ref(), pending.final_task.as_ref()) {
+            (Some(ticket), _) => entry
+                .engine
+                .reconciliation_projection_for_commit(ticket)
+                .expect("pending replace ticket retains its sealed projection"),
+            (None, Some(final_task)) => entry
+                .engine
+                .reconciliation_projection_for_task(final_task)
+                .expect("pending replace leaf retains its sealed projection"),
+            (None, None) => panic!("pending replace retains a ticket or final task"),
+        };
+        assert_eq!(pending.branch.frames().len(), projection.entering().len());
         request
     }
 
@@ -10767,7 +10955,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn reconciliation_equivalent_retained_empty_is_physical_no_op() {
+    fn replace_equivalent_retained_empty_is_physical_no_op() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
         let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -10837,7 +11025,7 @@ pub(crate) mod tests {
             )
         };
 
-        let repeated = prepare_nested_branch_for_commit(&mut app, router, truncated.clone());
+        let repeated = prepare_nested_replace_for_commit(&mut app, router, truncated.clone());
         {
             let entry = &app.world().resource::<RouterNavigation>().entries[0];
             let pending = entry.pending_commit.as_ref().unwrap();
@@ -10872,7 +11060,7 @@ pub(crate) mod tests {
             entry.engine.request(repeated).unwrap().status(),
             RequestStatus::Succeeded
         ));
-        assert_eq!(entry.engine.history().len(), history_len_before + 1);
+        assert_eq!(entry.engine.history().len(), history_len_before);
         assert_eq!(entry.engine.history().current(), Some(&truncated));
         let active = entry.active.as_ref().unwrap();
         assert_eq!(active.frames().len(), 1);
@@ -10976,7 +11164,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn replacement_cleans_terminal_retained_empty_slot_by_exact_binding() {
+    fn replace_cleans_terminal_retained_empty_slot_by_exact_binding() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
         let router = install_deep_nested_router(&mut app);
@@ -11019,7 +11207,7 @@ pub(crate) mod tests {
         };
 
         let replacement =
-            prepare_deep_nested_branch_for_commit(&mut app, router, RouteLocation::new("/"));
+            prepare_deep_nested_replace_for_commit(&mut app, router, RouteLocation::new("/"));
         commit_presentation_system(app.world_mut());
 
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
@@ -11968,6 +12156,55 @@ pub(crate) mod tests {
         assert_eq!(pending.branch.frames().len(), 1);
         assert!(pending.branch.child_slots().is_empty());
         assert!(pending.final_task.is_none());
+    }
+
+    #[test]
+    fn replace_facade_identity_exhaustion_comes_from_real_allocator_predicate() {
+        for counter in TestingReservationCounter::ALL {
+            let mut app = App::new();
+            app.add_plugins(BevyUiRouterPlugin::default());
+            let router =
+                install_atomic_router_at_pattern(&mut app, "replace-exhaustion", "/items/:id");
+            app.update();
+            {
+                let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+                navigation.entries[0]
+                    .engine
+                    .testing_exhaust_reservation_counter(counter);
+            }
+            let world_before = authority_world_fingerprint(app.world());
+            let snapshots_before = app
+                .world()
+                .resource::<RouterSnapshots>()
+                .get(router)
+                .expect("the installed router has a published snapshot")
+                .clone();
+            let requests_before = app.world().resource::<RouterNavigation>().entries[0]
+                .requests
+                .len();
+
+            let error = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .replace(router, RouteLocation::new("/items/2"))
+                .expect_err("the real allocator predicate is exhausted");
+
+            assert_eq!(error.kind(), NavigationEnqueueErrorKind::IdentityExhausted);
+            assert_eq!(
+                app.world().resource::<RouterNavigation>().entries[0]
+                    .requests
+                    .len(),
+                requests_before,
+            );
+            assert_eq!(authority_world_fingerprint(app.world()), world_before);
+            assert_eq!(
+                app.world()
+                    .resource::<RouterSnapshots>()
+                    .get(router)
+                    .expect("the router snapshot remains published"),
+                &snapshots_before,
+            );
+        }
     }
 
     fn authority_world_fingerprint(
@@ -19029,6 +19266,7 @@ pub(crate) mod tests {
             NavigationEnqueueErrorKind::HostUnavailable,
             NavigationEnqueueErrorKind::AuthorityRecovering,
             NavigationEnqueueErrorKind::NoBackEntry,
+            NavigationEnqueueErrorKind::IdentityExhausted,
         ] {
             assert_eq!(NavigationEnqueueError::new(kind).kind(), kind);
         }
@@ -20744,8 +20982,15 @@ pub(crate) mod tests {
             .0;
 
         assert!(!commit.contains("cleanup_batch_matches"));
+        assert_eq!(
+            commit
+                .match_indices(".validate_publication(prepared)")
+                .count(),
+            2,
+            "splice and projectionless paths exact-refreeze before consuming ECS owners"
+        );
         let publish_tails = commit
-            .match_indices("engine.publish(prepared, || {")
+            .match_indices("engine.publish(|| {")
             .map(|(start, _)| {
                 let tail = &commit[start..];
                 let end = tail

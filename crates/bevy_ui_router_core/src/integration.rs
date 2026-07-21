@@ -19,6 +19,7 @@ use crate::engine::{
     MountMutationArtifact as CoreMountMutationArtifact, PreparedPublication, PrivateRequestLookup,
     PushError as CorePushError, ReportError as CoreReportError,
     ResolveMountOwner as CoreResolveMountOwner, RouterEngine as CoreRouterEngine,
+    ValidatedPublication as CoreValidatedPublication,
 };
 use crate::frame::{
     LogicalChildSlotBinding, ProjectedChildSlotRole, ProjectedChildSlotRoleKind,
@@ -26,6 +27,7 @@ use crate::frame::{
     RouteReconciliationProjection,
 };
 use crate::history::{HistorySnapshot, MemoryHistory};
+use crate::history_authority::HistoryExecutionBindingProjection;
 use crate::ids::{NavigationRequestId, RouteSlotId, RouterIdentity};
 use crate::location::RouteLocation;
 use crate::meta::ErrorBoundaryKey;
@@ -63,6 +65,28 @@ pub enum IntegrationError {
     Stale,
     Invalid,
     InvalidManifest,
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TestingReservationCounter {
+    Request,
+    Transaction,
+    FrameTask,
+    CandidateFrame,
+    CleanupBatch,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl TestingReservationCounter {
+    pub const ALL: [Self; 5] = [
+        Self::Request,
+        Self::Transaction,
+        Self::FrameTask,
+        Self::CandidateFrame,
+        Self::CleanupBatch,
+    ];
 }
 
 #[doc(hidden)]
@@ -774,8 +798,37 @@ impl PreparedCommit {
     }
 }
 
+pub struct ValidatedCommit<'a> {
+    publication: CoreValidatedPublication<'a>,
+    cleanup: CleanupBatch,
+}
+
+impl ValidatedCommit<'_> {
+    pub fn cleanup(&self) -> &CleanupBatch {
+        &self.cleanup
+    }
+
+    pub fn publish<F>(self, mutation: F)
+    where
+        F: FnOnce(),
+    {
+        let Self {
+            publication,
+            cleanup,
+        } = self;
+        drop(cleanup);
+        publication.publish(mutation);
+    }
+}
+
 pub struct NavigationRequestView<'a> {
     record: &'a NavigationRequestRecord,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryExecutionBindingView {
+    inner: HistoryExecutionBindingProjection,
 }
 
 #[doc(hidden)]
@@ -1387,6 +1440,28 @@ impl RouterEngine {
         self.inner.enqueue_push(location).map_err(map_push_error)
     }
 
+    pub fn replace(
+        &mut self,
+        location: RouteLocation,
+    ) -> Result<NavigationRequestId, IntegrationError> {
+        self.inner.enqueue_replace(location).map_err(map_push_error)
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_exhaust_reservation_counter(&mut self, counter: TestingReservationCounter) {
+        let counter = match counter {
+            TestingReservationCounter::Request => crate::ids::ReservationCounter::Request,
+            TestingReservationCounter::Transaction => crate::ids::ReservationCounter::Transaction,
+            TestingReservationCounter::FrameTask => crate::ids::ReservationCounter::FrameTask,
+            TestingReservationCounter::CandidateFrame => {
+                crate::ids::ReservationCounter::CandidateFrame
+            }
+            TestingReservationCounter::CleanupBatch => crate::ids::ReservationCounter::CleanupBatch,
+        };
+        self.inner.testing_exhaust_reservation_counter(counter);
+    }
+
     pub fn collect(&mut self) {
         self.inner.collect();
     }
@@ -1742,11 +1817,22 @@ impl RouterEngine {
         self.inner.testing_invalidate_commit_action();
     }
 
-    pub fn publish<F>(&mut self, prepared: PreparedCommit, mutation: F)
-    where
-        F: FnOnce(),
-    {
-        self.inner.publish_prepared(prepared.publication, mutation)
+    pub fn validate_publication(
+        &mut self,
+        prepared: PreparedCommit,
+    ) -> Result<ValidatedCommit<'_>, IntegrationError> {
+        let PreparedCommit {
+            publication,
+            cleanup,
+        } = prepared;
+        let publication = self
+            .inner
+            .validate_publication(publication)
+            .map_err(map_commit_error)?;
+        Ok(ValidatedCommit {
+            publication,
+            cleanup,
+        })
     }
 
     pub fn complete_cleanup(
@@ -2127,7 +2213,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_authority_task_target_root_requires_a_physical_obligation() {
+    fn failed_authority_task_target_logical_root_allows_zero_physical_obligations() {
         let (mut engine, lease) = confirmed_nested_engine_with_lease();
         engine.push(RouteLocation::new("/items/1")).unwrap();
         engine.collect();
@@ -2135,21 +2221,22 @@ mod tests {
             panic!("failed terminal fixture requires one exact frame task")
         };
         let trigger = engine.failed_authority_trigger_for_task(&task).unwrap();
-        let error = match engine.begin_failed_authority_settlement_retaining(
-            lease,
-            trigger,
-            CleanupManifest::new(vec![task.frame().clone()], 0xFA13, 0),
-            |_| panic!("target roots without obligations must not publish"),
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("the target-bearing root set requires a physical obligation"),
-        };
+        let authority_mutation_ran = std::cell::Cell::new(false);
+        let cleanup = engine
+            .begin_failed_authority_settlement_retaining(
+                lease,
+                trigger,
+                CleanupManifest::new(vec![task.frame().clone()], 0xFA13, 0),
+                |_| authority_mutation_ran.set(true),
+            )
+            .expect("exact logical roots are independent of physical obligation count");
 
+        assert!(authority_mutation_ran.get());
+        assert_eq!(cleanup.obligation_count(), 0);
         assert_eq!(
-            error.kind(),
-            BeginAuthoritySettlementErrorKind::InvalidManifest
+            engine.snapshot().availability(),
+            &RouterAvailability::RecoveringAuthority
         );
-        assert_eq!(engine.snapshot().availability(), &RouterAvailability::Ready);
     }
 
     #[test]
@@ -2451,7 +2538,8 @@ mod tests {
             .prepare_commit(&ticket, CleanupManifest::empty())
             .unwrap();
         let cleanup = prepared.cleanup().clone();
-        engine.publish(prepared, || {});
+        let validated = engine.validate_publication(prepared).unwrap();
+        validated.publish(|| {});
         engine.complete_cleanup(cleanup.complete_empty()).unwrap();
 
         let (request, _parent, _, permit, _) =
@@ -3395,7 +3483,8 @@ mod tests {
             .prepare_commit(&ticket, CleanupManifest::empty())
             .unwrap();
         let cleanup = prepared.cleanup().clone();
-        engine.publish(prepared, || {});
+        let validated = engine.validate_publication(prepared).unwrap();
+        validated.publish(|| {});
         engine.complete_cleanup(cleanup.complete_empty()).unwrap();
         request
     }
@@ -3546,7 +3635,8 @@ mod tests {
             .prepare_commit(&ticket, CleanupManifest::empty())
             .unwrap();
         let cleanup = prepared.cleanup().clone();
-        engine.publish(prepared, || {});
+        let validated = engine.validate_publication(prepared).unwrap();
+        validated.publish(|| {});
         engine.complete_cleanup(cleanup.complete_empty()).unwrap();
 
         let terminal = engine.snapshot();
@@ -3581,7 +3671,8 @@ mod tests {
             .unwrap();
         let cleanup = prepared.cleanup().clone();
         let stale = cleanup.clone();
-        engine.publish(prepared, || {});
+        let validated = engine.validate_publication(prepared).unwrap();
+        validated.publish(|| {});
 
         engine
             .observe_cleanup_receipt(&cleanup, CleanupDisposition::Removed)
@@ -3684,7 +3775,8 @@ mod tests {
         let malformed = cleanup.clone().complete(7, 0);
         let mut mutation_ran = false;
 
-        engine.publish(prepared, || mutation_ran = true);
+        let validated = engine.validate_publication(prepared).unwrap();
+        validated.publish(|| mutation_ran = true);
 
         assert!(mutation_ran);
         assert_eq!(engine.active().location(), Some(&RouteLocation::new("/")));
@@ -3707,6 +3799,63 @@ mod tests {
         assert_eq!(
             engine.request(request).unwrap().status(),
             &RequestStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn prepared_replace_ticket_cannot_revive_fail_closed_integration_state() {
+        let (mut engine, grant) = ready_engine();
+        engine.record_top_slot_registered(&grant).unwrap();
+        let lease = engine.confirm_host(grant);
+        settle_push(&mut engine, RouteLocation::new("/"));
+        let leaving = engine.active().frames()[0].clone();
+        let request = engine
+            .replace(RouteLocation::new("/").with_fragment("details"))
+            .unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("fragment replace issues the real replacement task")
+        };
+        let ticket = engine.report_applied(task).unwrap();
+        let prepared = engine
+            .prepare_commit(
+                &ticket,
+                CleanupManifest::new(vec![leaving], 0x5354_414c_45, 1),
+            )
+            .expect("replace prepares before authority loss");
+
+        match engine.fail_closed_authority_protocol_retaining(Some(lease), || {}) {
+            Ok(()) => {}
+            Err(_) => panic!("the live lease must enter the real fail-closed terminal"),
+        }
+        let terminal_snapshot = engine.snapshot();
+        let terminal_status = engine.request(request).unwrap().status().clone();
+        let terminal_trace = engine.request(request).unwrap().trace().to_vec();
+        let terminal_owner = engine.inner.testing_history_capability_snapshot();
+        assert!(!terminal_owner.has_owner());
+
+        let mutation_ran = std::cell::Cell::new(false);
+        assert!(matches!(
+            engine.validate_publication(prepared),
+            Err(IntegrationError::Stale)
+        ));
+
+        assert_eq!(
+            (
+                mutation_ran.get(),
+                engine.snapshot(),
+                engine.request(request).unwrap().status().clone(),
+                engine.request(request).unwrap().trace().to_vec(),
+                engine.inner.testing_history_capability_snapshot(),
+            ),
+            (
+                false,
+                terminal_snapshot,
+                terminal_status,
+                terminal_trace,
+                terminal_owner,
+            ),
+            "the integration ticket is non-authorizing after terminal and cannot restore host/state/current/history"
         );
     }
 
@@ -3785,15 +3934,18 @@ mod tests {
         let EngineAction::FrameTask(task) = engine.action().unwrap() else {
             panic!("first root push should produce one frame task")
         };
+        let non_cleanup_root = task.frame().clone();
         let ticket = engine.report_applied(task).unwrap();
 
-        let rejected = engine.prepare_commit(&ticket, CleanupManifest::new(Vec::new(), 17, 1));
+        let rejected =
+            engine.prepare_commit(&ticket, CleanupManifest::new(vec![non_cleanup_root], 17, 1));
         assert!(matches!(rejected, Err(IntegrationError::InvalidManifest)));
 
         let prepared = engine
             .prepare_commit(&ticket, CleanupManifest::empty())
             .unwrap();
-        engine.publish(prepared, || {});
+        let validated = engine.validate_publication(prepared).unwrap();
+        validated.publish(|| {});
         assert_eq!(engine.history().len(), 1);
     }
 

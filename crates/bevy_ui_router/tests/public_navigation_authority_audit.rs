@@ -85,6 +85,37 @@ fn push_and_publish(
     panic!("public audit navigation did not settle within 16 App::update calls")
 }
 
+fn replace_and_publish(
+    app: &mut App,
+    router: RouterHandle,
+    location: RouteLocation,
+) -> NavigationRequestId {
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .replace(router, location)
+        .expect("public audit replace should enqueue");
+    for _ in 0..16 {
+        app.update();
+        match app
+            .world()
+            .resource::<RouterSnapshots>()
+            .request(router, request)
+        {
+            RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded => {
+                return request;
+            }
+            RequestLookup::Found(snapshot)
+                if matches!(snapshot.status(), RequestStatus::Failed(_)) =>
+            {
+                panic!("public audit replace failed: {:?}", snapshot.status());
+            }
+            RequestLookup::Found(_) | RequestLookup::NotRetained | RequestLookup::Unknown => {}
+        }
+    }
+    panic!("public audit replace did not settle within 16 App::update calls")
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Boundary {
     BeforeCommit,
@@ -369,6 +400,186 @@ fn nested_outlet_authority_is_opaque_and_exact() {
         AuditEntityState::PresentOwned
     );
     assert!(audit.orphan_slots().is_empty());
+}
+
+#[test]
+fn history_replace_f2_fragment_authority_binds_exact_old_generation_and_receipts() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let layout = RouteViewKey::new("history-replace-audit-layout").unwrap();
+    let leaf = RouteViewKey::new("history-replace-audit-leaf").unwrap();
+    let fallback = RouteViewKey::new("history-replace-audit-fallback").unwrap();
+    let driver = app
+        .register_ui_view_driver(AuditDriver {
+            key: ViewDriverKey::new("history-replace-audit-driver").unwrap(),
+            outlet_view: Some(layout.clone()),
+        })
+        .unwrap();
+    let mut routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::pathless(),
+            RouteNodeOptions::new().with_view(layout.clone()),
+        )
+        .unwrap();
+    let layout_route = routes.root_id().unwrap();
+    routes
+        .route_with_options(
+            layout_route,
+            RoutePattern::path("items/:id").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(leaf.clone())
+                .with_slot(RouteSlotKey::default()),
+        )
+        .unwrap();
+    let mut views = RouteViewRegistry::new();
+    for view in [layout, leaf, fallback.clone()] {
+        views
+            .insert(view, RouteViewDescriptor::new(driver.clone()))
+            .unwrap();
+    }
+    let router = app
+        .add_ui_router(RouterConfig::new(routes.build().unwrap(), views, fallback))
+        .unwrap();
+    app.world_mut()
+        .spawn((Node::default(), RouterHostRegistration::new(router)));
+    app.update();
+
+    push_and_publish(&mut app, router, RouteLocation::new("/items/1"));
+    let before_frames = app
+        .world()
+        .resource::<RouterSnapshots>()
+        .get(router)
+        .unwrap()
+        .active()
+        .frames()
+        .to_vec();
+    let before_authority = {
+        let audit = app.world().resource::<RouterAuthorityAudits>();
+        let audit = audit.get(router).unwrap();
+        let outlet = audit
+            .outlets()
+            .iter()
+            .find(|outlet| outlet.parent() == &before_frames[0])
+            .unwrap();
+        let child_slot = outlet.child_slot().unwrap();
+        let slot = audit
+            .slots()
+            .iter()
+            .find(|slot| slot.entity() == child_slot)
+            .unwrap();
+        (
+            audit
+                .frames()
+                .iter()
+                .find(|frame| frame.frame() == &before_frames[0])
+                .unwrap()
+                .root(),
+            outlet.anchor(),
+            child_slot,
+            slot.id(),
+            audit
+                .frames()
+                .iter()
+                .find(|frame| frame.frame() == &before_frames[1])
+                .unwrap()
+                .root(),
+        )
+    };
+
+    let target = RouteLocation::new("/items/1").with_fragment("details");
+    let request = replace_and_publish(&mut app, router, target.clone());
+    let snapshots = app.world().resource::<RouterSnapshots>();
+    let router_snapshot = snapshots.get(router).unwrap();
+    let RequestLookup::Found(request_snapshot) = snapshots.request(router, request) else {
+        panic!("replace request remains retained")
+    };
+    assert_eq!(router_snapshot.active().frames()[0], before_frames[0]);
+    assert_eq!(router_snapshot.history().entries(), [target]);
+    let entity_receipts = request_snapshot
+        .trace()
+        .iter()
+        .filter(|event| {
+            event.kind() == NavigationTraceEventKind::CleanupSettled
+                && event.cleanup_disposition().is_some()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !entity_receipts.is_empty(),
+        "the old leaf exact manifest produces entity receipts"
+    );
+    assert!(
+        entity_receipts
+            .iter()
+            .all(|event| event.cleanup_disposition() == Some(CleanupDisposition::Removed)),
+        "every exact Entity obligation is removed"
+    );
+    let batch_completions = request_snapshot
+        .trace()
+        .iter()
+        .filter(|event| {
+            event.kind() == NavigationTraceEventKind::CleanupSettled
+                && event.cleanup_disposition().is_none()
+        })
+        .count();
+    assert_eq!(batch_completions, 1, "cleanup batch completes exactly once");
+    let new_leaf = &router_snapshot.active().frames()[1];
+    assert_eq!(new_leaf.slot(), before_frames[1].slot());
+    assert_eq!(new_leaf.frame(), before_frames[1].frame());
+    assert_eq!(
+        new_leaf.generation().raw(),
+        before_frames[1].generation().raw() + 1
+    );
+
+    let audits = app.world().resource::<RouterAuthorityAudits>();
+    let audit = audits.get(router).unwrap();
+    let layout_mapping = audit
+        .frames()
+        .iter()
+        .find(|frame| frame.frame() == &before_frames[0])
+        .unwrap();
+    assert_eq!(layout_mapping.root(), before_authority.0);
+    let outlet = audit
+        .outlets()
+        .iter()
+        .find(|outlet| outlet.parent() == &before_frames[0])
+        .unwrap();
+    assert_eq!(outlet.anchor(), before_authority.1);
+    assert_eq!(outlet.child_slot(), Some(before_authority.2));
+    let child_slot = audit
+        .slots()
+        .iter()
+        .find(|slot| slot.entity() == before_authority.2)
+        .unwrap();
+    assert_eq!(child_slot.id(), before_authority.3);
+    assert_eq!(
+        audit.owned_entity_state(before_authority.4),
+        AuditEntityState::Removed
+    );
+    assert!(
+        audit
+            .frames()
+            .iter()
+            .all(|mapping| mapping.frame() != &before_frames[1])
+    );
+    let isolated = audit
+        .events()
+        .iter()
+        .filter(|event| {
+            event.kind() == RouterLifecycleAuditEventKind::FrameIsolated
+                && event.frame() == Some(&before_frames[1])
+                && event.entity() == Some(before_authority.4)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        isolated.len(),
+        1,
+        "the exact old leaf root is isolated once"
+    );
+    assert!(isolated[0].visibility_hidden());
+    assert!(!isolated[0].accepts_pointer());
+    assert!(!isolated[0].accepts_keyboard());
+    assert!(!isolated[0].accepts_gamepad());
+    assert!(!isolated[0].focused());
 }
 
 #[test]

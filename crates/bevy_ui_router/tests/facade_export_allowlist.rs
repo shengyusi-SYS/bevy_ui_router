@@ -15,15 +15,21 @@ const BEVY_VERSION: &str = "0.19.0";
 const DEPENDENCY_SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
 
 #[test]
-fn history_profile_has_exact_initial_machine_state() {
+fn history_profile_has_exact_replace_slice_machine_state() {
     let profile = history_contract_profile();
-    assert_eq!(profile.exclusions.len(), 12);
+    assert_eq!(profile.exclusions.len(), 11);
     assert_eq!(profile.contract_deltas.len(), 3);
-    assert!(
+    assert_eq!(
         profile
             .contract_deltas
             .iter()
-            .all(|row| row.state == "planned")
+            .map(|row| (row.item.as_str(), row.state.as_str()))
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            ("NavigationRequestSnapshot::requested -> Option", "planned",),
+            ("NavigationEnqueueErrorKind::IdentityExhausted", "active",),
+            ("late-bound back complete evidence", "planned"),
+        ])
     );
     assert_eq!(profile.authority_additions.len(), 1);
     assert!(
@@ -538,7 +544,7 @@ fn history_profile_tables_and_curated_facade_source_are_closed_world() {
     let exclusions = profile.exclusions;
     assert_eq!(modules.len(), 7);
     assert!(symbols.len() > 100);
-    assert_eq!(exclusions.len(), 12);
+    assert_eq!(exclusions.len(), 11);
 
     let source = std::fs::read_to_string(facade_dir().join("src/lib.rs")).unwrap();
     assert_eq!(

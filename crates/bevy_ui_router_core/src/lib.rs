@@ -16,6 +16,7 @@ pub mod error;
 pub mod fingerprint;
 pub mod frame;
 pub mod history;
+mod history_authority;
 pub mod ids;
 pub mod location;
 pub mod matcher;

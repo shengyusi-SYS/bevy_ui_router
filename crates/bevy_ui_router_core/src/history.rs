@@ -42,21 +42,6 @@ impl HistorySnapshot {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum HistoryIntent {
-    Push(RouteLocation),
-}
-
-#[allow(dead_code)]
-impl HistoryIntent {
-    pub(crate) fn publish(self, history: &mut MemoryHistory) {
-        match self {
-            Self::Push(location) => history.push(location),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HistoryError {
     Empty,

@@ -13,7 +13,16 @@ use crate::frame::{
     FrameOrigin, LogicalChildSlotBinding, ProjectedChildSlotRoleKind, ProjectedEnteringSlot,
     ReconciliationProjectionError, RouteFrameVersion, RouteReconciliationProjection,
 };
-use crate::history::{HistoryIntent, MemoryHistory};
+use crate::history::MemoryHistory;
+use crate::history_authority::{
+    CanonicalHistory, HistoryCommitCapability, HistoryEffect, HistoryExecutionBinding,
+    HistoryExecutionBindingProjection, HistoryPreparationError, HistoryRevision,
+    NormalAttemptIdentity, PreparedHistoryPublication, PreparedPresentationBinding,
+};
+#[cfg(test)]
+use crate::history_authority::{
+    HistoryAuthoritySnapshot, HistoryCapabilitySnapshot, HistoryDriftEvidenceSnapshot,
+};
 use crate::ids::{
     CoreIdAllocator, FrameTaskId, NavigationRequestId, ReservedBranchAttempt, ReservedFrameAttempt,
     RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId, RouterIdentity, TransactionId,
@@ -433,13 +442,11 @@ impl FailedAuthoritySettlementSource {
                 if current.as_slice() == seal.logical_roots() {
                     Some(current)
                 } else {
-                    target_and_current.filter(|roots| {
-                        roots.as_slice() == seal.logical_roots() && seal.obligation_count() > 0
-                    })
+                    target_and_current.filter(|roots| roots.as_slice() == seal.logical_roots())
                 }
             }
         }?;
-        (selected.is_empty() || seal.obligation_count() > 0).then_some((self.identity, selected))
+        Some((self.identity, selected))
     }
 }
 
@@ -572,11 +579,12 @@ impl CommitTicket {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct SealedCommit {
     identity: FrameTaskIdentity,
     cleanup: CleanupBatchToken,
     publication: PublicationPlan,
+    evidence: SealedCommitEvidence,
+    source: PreparedPublicationObservation,
 }
 
 impl SealedCommit {
@@ -585,28 +593,23 @@ impl SealedCommit {
     }
 
     #[cfg(test)]
-    fn testing_duplicate(&self) -> Self {
-        Self {
-            identity: self.identity.clone(),
-            cleanup: self.cleanup.clone(),
-            publication: self.publication.clone(),
-        }
-    }
-
-    #[cfg(test)]
-    fn testing_with_identity(&self, identity: RootTaskIdentity) -> Self {
-        Self {
-            identity,
-            cleanup: self.cleanup.clone(),
-            publication: self.publication.clone(),
-        }
+    pub(crate) fn evidence(&self) -> &SealedCommitEvidence {
+        &self.evidence
     }
 }
 
-#[derive(Clone, Debug)]
+impl std::fmt::Debug for SealedCommit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SealedCommit")
+            .field("evidence", &self.evidence)
+            .finish_non_exhaustive()
+    }
+}
+
 struct PublicationPlan {
     state: RouterNavigationState,
-    history: MemoryHistory,
+    history: Option<PreparedHistoryPublication>,
     active_branch: Option<MatchedBranch>,
     active_child_slots: Vec<LogicalChildSlotBinding>,
     record_index: usize,
@@ -615,7 +618,183 @@ struct PublicationPlan {
 }
 
 pub(crate) struct PreparedPublication {
-    sealed: SealedCommit,
+    evidence: SealedCommitEvidence,
+}
+
+pub(crate) struct ValidatedPublication<'a> {
+    engine: &'a mut RouterEngine,
+    prepared: PreparedPublication,
+}
+
+impl ValidatedPublication<'_> {
+    pub(crate) fn publish<F>(self, mutation: F)
+    where
+        F: FnOnce(),
+    {
+        let Self { engine, prepared } = self;
+        drop(prepared);
+        engine.publish_validated(mutation);
+    }
+}
+
+enum PreparedPublicationAuthority {
+    Ready(SealedCommit),
+    Rejected(PreparedPublicationRejection),
+}
+
+impl PreparedPublicationAuthority {
+    const fn owner(&self) -> &SealedCommit {
+        match self {
+            Self::Ready(owner) => owner,
+            Self::Rejected(rejection) => &rejection.owner,
+        }
+    }
+}
+
+struct PreparedPublicationRejection {
+    owner: SealedCommit,
+    error: CommitError,
+    observed: PreparedPublicationObservation,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedPublicationObservation {
+    identity: Option<FrameTaskIdentity>,
+    stage: Option<WorkStage>,
+    record: Option<NavigationRequestRecord>,
+    history_revision: HistoryRevision,
+    history_execution: Option<HistoryExecutionBindingProjection>,
+    current_location: Option<RouteLocation>,
+    current_branch: Option<MatchedBranch>,
+    current_target_frames: Vec<RouteFrameVersion>,
+    current_reconciliation: Option<RouteReconciliationProjection>,
+    state: RouterNavigationState,
+    host: Option<HostVersion>,
+    top_slot: Option<RouteSlotId>,
+    active: ActivePresentation,
+    active_branch: Option<MatchedBranch>,
+    active_child_slots: Vec<LogicalChildSlotBinding>,
+}
+
+impl PreparedPublicationObservation {
+    fn branch_fingerprint(
+        branch: Option<&MatchedBranch>,
+    ) -> Option<&crate::fingerprint::RouteBranchFingerprint> {
+        branch.map(MatchedBranch::branch_fingerprint)
+    }
+
+    fn same_source(&self, expected: &Self) -> bool {
+        self.identity == expected.identity
+            && self.stage == expected.stage
+            && self.record == expected.record
+            && self.history_revision == expected.history_revision
+            && self.history_execution == expected.history_execution
+            && self.current_location == expected.current_location
+            && Self::branch_fingerprint(self.current_branch.as_ref())
+                == Self::branch_fingerprint(expected.current_branch.as_ref())
+            && self.current_target_frames == expected.current_target_frames
+            && self.current_reconciliation == expected.current_reconciliation
+            && self.state == expected.state
+            && self.host == expected.host
+            && self.top_slot == expected.top_slot
+            && self.active == expected.active
+            && Self::branch_fingerprint(self.active_branch.as_ref())
+                == Self::branch_fingerprint(expected.active_branch.as_ref())
+            && self.active_child_slots == expected.active_child_slots
+    }
+
+    fn accepts(&self, owner: &SealedCommit) -> bool {
+        let history_matches = match (
+            owner.publication.history.as_ref(),
+            owner.evidence.history_execution.as_ref(),
+            owner.evidence.source_revision,
+        ) {
+            (Some(history), Some(execution), Some(source_revision)) => {
+                let Some(location) = self.current_location.as_ref() else {
+                    return false;
+                };
+                let Some(branch) = self.current_branch.as_ref() else {
+                    return false;
+                };
+                history.matches_sealed_projection(
+                    execution,
+                    source_revision,
+                    location,
+                    owner.publication.state.active(),
+                    branch.branch_fingerprint(),
+                    &self.current_target_frames,
+                    &owner.cleanup,
+                )
+            }
+            (None, None, None) => true,
+            _ => false,
+        };
+        let reconciliation_matches = match owner.publication.current.reconciliation.as_ref() {
+            Some(projection) => {
+                let Some(host) = self.host.as_ref() else {
+                    return false;
+                };
+                let Some(top_slot) = self.top_slot else {
+                    return false;
+                };
+                projection.matches_active(
+                    owner.identity.router,
+                    host.host(),
+                    host.epoch(),
+                    top_slot,
+                    self.active.location(),
+                    self.active_branch.as_ref(),
+                    self.active.frames(),
+                    &self.active_child_slots,
+                )
+            }
+            None => true,
+        };
+        self.identity.as_ref() == Some(&owner.identity)
+            && matches!(
+                self.stage.as_ref(),
+                Some(WorkStage::CommitSealed { token }) if token == &owner.cleanup
+            )
+            && self.record.as_ref().map(NavigationRequestRecord::id) == Some(owner.identity.request)
+            && owner
+                .evidence
+                .source_revision
+                .is_none_or(|revision| self.history_revision == revision)
+            && self.history_execution == owner.evidence.history_execution
+            && history_matches
+            && reconciliation_matches
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SealedCommitEvidence {
+    identity: FrameTaskIdentity,
+    cleanup_batch: crate::ids::CleanupBatchId,
+    history_execution: Option<crate::history_authority::HistoryExecutionBindingProjection>,
+    source_revision: Option<HistoryRevision>,
+}
+
+impl SealedCommitEvidence {
+    #[cfg(test)]
+    pub(crate) fn testing_with_observed_router_and_request(
+        &self,
+        router: RouterIdentity,
+        request: NavigationRequestId,
+    ) -> Self {
+        let mut observed = self.clone();
+        observed.identity.router = router;
+        observed.identity.request = request;
+        if let Some(execution) = observed.history_execution.as_mut() {
+            *execution = execution.testing_with_router_and_request(router, request);
+        }
+        observed
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConsumedPublicationEvidence {
+    evidence: SealedCommitEvidence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -689,7 +868,7 @@ enum WorkStage {
 
 #[derive(Clone, Debug)]
 enum AttemptKind {
-    Normal,
+    Normal(NavigationCommandKind),
     Fallback { original_failure: NavigationFailure },
 }
 
@@ -703,7 +882,6 @@ struct CurrentWork {
     applied_frames: Vec<RouteFrameVersion>,
     current_target: FrameMountTarget,
     pending_mount: Option<PendingMount>,
-    history_intent: Option<HistoryIntent>,
     stage: WorkStage,
     cleanup_batch: crate::ids::CleanupBatchId,
     cleanup_roots: Vec<RouteFrameVersion>,
@@ -741,8 +919,43 @@ enum QueuedMatchOutcome {
 }
 
 #[derive(Clone, Debug)]
-struct QueuedPush {
+enum NavigationCommand {
+    Push(RouteLocation),
+    Replace(RouteLocation),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NavigationCommandKind {
+    Push,
+    Replace,
+}
+
+impl NavigationCommand {
+    const fn kind(&self) -> NavigationCommandKind {
+        match self {
+            Self::Push(_) => NavigationCommandKind::Push,
+            Self::Replace(_) => NavigationCommandKind::Replace,
+        }
+    }
+
+    fn location(&self) -> &RouteLocation {
+        match self {
+            Self::Push(location) | Self::Replace(location) => location,
+        }
+    }
+
+    fn history_effect(&self) -> HistoryEffect {
+        match self {
+            Self::Push(location) => HistoryEffect::Push(location.clone()),
+            Self::Replace(location) => HistoryEffect::Replace(location.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct QueuedNavigation {
     request: NavigationRequestId,
+    command: NavigationCommand,
     outcome: QueuedMatchOutcome,
     reservation: Option<ReservedBranchAttempt>,
 }
@@ -772,14 +985,17 @@ pub(crate) struct RouterEngine {
     router: RouterIdentity,
     fallback: RouteViewKey,
     state: RouterNavigationState,
-    history: MemoryHistory,
+    history: CanonicalHistory,
     active_branch: Option<MatchedBranch>,
     active_child_slots: Vec<LogicalChildSlotBinding>,
     records: VecDeque<NavigationRequestRecord>,
     evicted_through: Option<u64>,
     highest_issued: Option<u64>,
-    queue: VecDeque<QueuedPush>,
+    queue: VecDeque<QueuedNavigation>,
     current: Option<CurrentWork>,
+    current_history_capability: Option<HistoryCommitCapability>,
+    pending_history_preparation_error: Option<HistoryPreparationError>,
+    prepared_publication_authority: Option<PreparedPublicationAuthority>,
     action: Option<EngineAction>,
     issued_view_tasks: Vec<FrameTaskIdentity>,
     mount: MountIssuer,
@@ -805,7 +1021,7 @@ impl RouterEngine {
             router,
             fallback,
             state: RouterNavigationState::new(router),
-            history: MemoryHistory::new(),
+            history: CanonicalHistory::new(router),
             active_branch: None,
             active_child_slots: Vec::new(),
             records: VecDeque::new(),
@@ -813,6 +1029,9 @@ impl RouterEngine {
             highest_issued: None,
             queue: VecDeque::new(),
             current: None,
+            current_history_capability: None,
+            pending_history_preparation_error: None,
+            prepared_publication_authority: None,
             action: None,
             issued_view_tasks: Vec::new(),
             mount: MountIssuer::new(router),
@@ -1125,7 +1344,7 @@ impl RouterEngine {
             None => self.current.as_ref().is_some_and(|current| {
                 matches!(
                     current.stage,
-                    WorkStage::Applying | WorkStage::ReadyToCommit
+                    WorkStage::Applying | WorkStage::ReadyToCommit | WorkStage::CommitSealed { .. }
                 )
             }),
         };
@@ -1167,9 +1386,7 @@ impl RouterEngine {
             failure,
             continuation: FailureCleanupContinuation::AuthoritySettlement,
         };
-        if request.logical_roots != seal.logical_roots()
-            || (!request.logical_roots.is_empty() && seal.obligation_count() == 0)
-        {
+        if request.logical_roots != seal.logical_roots() {
             return Err(BeginAuthoritySettlementError::new(
                 BeginAuthoritySettlementErrorKind::InvalidManifest,
                 lease,
@@ -1256,6 +1473,7 @@ impl RouterEngine {
         self.state
             .set_request(Some(RequestStatus::Running(NavigationPhase::Recovering)));
         self.retain_terminal_records();
+        self.retire_history_authority();
         Ok(cleanup)
     }
 
@@ -1341,6 +1559,7 @@ impl RouterEngine {
         if !authority_mutation() {
             return false;
         }
+        self.retire_history_authority();
         *self
             .record_mut(request)
             .expect("current protocol-failure request remains retained") = terminal;
@@ -1370,9 +1589,32 @@ impl RouterEngine {
         Ok(request)
     }
 
+    pub(crate) fn replace(
+        &mut self,
+        location: RouteLocation,
+    ) -> Result<NavigationRequestId, PushError> {
+        let request = self.enqueue_replace(location)?;
+        self.collect();
+        Ok(request)
+    }
+
     pub(crate) fn enqueue_push(
         &mut self,
         location: RouteLocation,
+    ) -> Result<NavigationRequestId, PushError> {
+        self.enqueue_navigation(NavigationCommand::Push(location))
+    }
+
+    pub(crate) fn enqueue_replace(
+        &mut self,
+        location: RouteLocation,
+    ) -> Result<NavigationRequestId, PushError> {
+        self.enqueue_navigation(NavigationCommand::Replace(location))
+    }
+
+    fn enqueue_navigation(
+        &mut self,
+        command: NavigationCommand,
     ) -> Result<NavigationRequestId, PushError> {
         if self.state.availability()
             == &crate::presentation::RouterAvailability::RecoveringAuthority
@@ -1382,6 +1624,7 @@ impl RouterEngine {
         if self.state.host().is_none() {
             return Err(PushError::AwaitingHost);
         }
+        let location = command.location().clone();
         let matched = self.matcher.match_location(&location);
         let (request, outcome, reservation) = match matched {
             Ok(branch) => {
@@ -1413,8 +1656,9 @@ impl RouterEngine {
         self.records
             .push_back(NavigationRequestRecord::new(request, location));
         self.highest_issued = Some(request.sequence());
-        self.queue.push_back(QueuedPush {
+        self.queue.push_back(QueuedNavigation {
             request,
+            command,
             outcome,
             reservation,
         });
@@ -2038,9 +2282,7 @@ impl RouterEngine {
                 request,
             ));
         }
-        if request.logical_roots != seal.logical_roots()
-            || (!request.logical_roots.is_empty() && seal.obligation_count() == 0)
-        {
+        if request.logical_roots != seal.logical_roots() {
             return Err(FailureCleanupPrepareError::new(
                 FailureCleanupError::InvalidManifest,
                 request,
@@ -2210,9 +2452,7 @@ impl RouterEngine {
             .current
             .as_ref()
             .expect("commit identity was validated");
-        if current.cleanup_roots != seal.logical_roots()
-            || current.cleanup_roots.is_empty() != (seal.obligation_count() == 0)
-        {
+        if current.cleanup_roots != seal.logical_roots() {
             return Err(CommitError::InvalidManifest);
         }
 
@@ -2223,17 +2463,60 @@ impl RouterEngine {
             seal.manifest_digest(),
             seal.obligation_count(),
         );
-        let publication = self.precompute_publication(cleanup.clone());
+        let is_normal = self
+            .current
+            .as_ref()
+            .is_some_and(|current| matches!(&current.attempt, AttemptKind::Normal(_)));
+        let history_capability = if is_normal {
+            match self.current_history_capability.take() {
+                Some(capability) => Some(capability),
+                None => return Err(CommitError::Stale),
+            }
+        } else {
+            debug_assert!(self.current_history_capability.is_none());
+            None
+        };
+        let publication = match self.precompute_publication(cleanup.clone(), history_capability) {
+            Ok(publication) => publication,
+            Err(error) => {
+                debug_assert!(error.evidence_is_consistent_for(ticket.identity.request));
+                self.pending_history_preparation_error = Some(error);
+                let failure = self.begin_failure_cleanup(
+                    PendingFailureKind::AuthorityLost,
+                    NavigationFailure::new(
+                        NavigationFailureKind::AuthorityLost,
+                        "canonical history source or execution binding drifted",
+                    ),
+                );
+                self.action = Some(EngineAction::FailureCleanup(failure));
+                return Err(CommitError::Stale);
+            }
+        };
+        let evidence = SealedCommitEvidence {
+            identity: ticket.identity.clone(),
+            cleanup_batch: cleanup.batch(),
+            history_execution: publication
+                .history
+                .as_ref()
+                .map(PreparedHistoryPublication::execution_projection),
+            source_revision: publication
+                .history
+                .as_ref()
+                .map(PreparedHistoryPublication::source_revision),
+        };
         self.current
             .as_mut()
             .expect("current work was validated")
             .stage = WorkStage::CommitSealed {
             token: cleanup.clone(),
         };
+        let source = self.observe_prepared_publication_source(publication.record_index);
         Ok(SealedCommit {
             identity: ticket.identity.clone(),
             cleanup,
             publication,
+            evidence,
+            source,
         })
     }
 
@@ -2260,6 +2543,27 @@ impl RouterEngine {
         &mut self,
         sealed: SealedCommit,
     ) -> Result<PreparedPublication, CommitError> {
+        assert!(
+            self.prepared_publication_authority.is_none(),
+            "a prepared publication authority must be settled before another is installed"
+        );
+        if let Err(error) = self.validate_prepared_publication_owner(&sealed) {
+            return Err(self.retain_rejected_publication(sealed, error));
+        }
+        let evidence = sealed.evidence.clone();
+        self.prepared_publication_authority = Some(PreparedPublicationAuthority::Ready(sealed));
+        Ok(PreparedPublication { evidence })
+    }
+
+    fn validate_prepared_publication_owner(
+        &self,
+        sealed: &SealedCommit,
+    ) -> Result<(), CommitError> {
+        self.validate_sealed_commit_evidence(&sealed.evidence)?;
+        let observed = self.observe_prepared_publication_source(sealed.publication.record_index);
+        if !observed.same_source(&sealed.source) {
+            return Err(CommitError::Stale);
+        }
         let valid = self.current.as_ref().is_some_and(|current| {
             current.identity == sealed.identity
                 && matches!(
@@ -2276,18 +2580,221 @@ impl RouterEngine {
         if record_slot.id() != sealed.identity.request {
             return Err(CommitError::Stale);
         }
-        Ok(PreparedPublication { sealed })
+        let history_owner_matches = match (
+            sealed.publication.history.as_ref(),
+            sealed.evidence.history_execution.as_ref(),
+            sealed.evidence.source_revision,
+        ) {
+            (Some(history), Some(execution), Some(source_revision)) => {
+                let Some(current) = self.current.as_ref() else {
+                    return Err(CommitError::Stale);
+                };
+                let Some(matched) = current.branch.as_ref() else {
+                    return Err(CommitError::Stale);
+                };
+                history.matches_sealed_projection(
+                    execution,
+                    source_revision,
+                    &current.location,
+                    sealed.publication.state.active(),
+                    matched.branch_fingerprint(),
+                    &current.target_frames,
+                    &sealed.cleanup,
+                )
+            }
+            (None, None, None) => true,
+            _ => false,
+        };
+        if !history_owner_matches {
+            return Err(CommitError::Stale);
+        }
+        if sealed
+            .publication
+            .history
+            .as_ref()
+            .is_some_and(|publication| !publication.matches_canonical_source(&self.history))
+        {
+            return Err(CommitError::Stale);
+        }
+        if !self.current_reconciliation_matches_active() {
+            return Err(CommitError::Stale);
+        }
+        Ok(())
     }
 
-    pub(crate) fn publish_prepared<F>(&mut self, prepared: PreparedPublication, mutation: F)
+    fn observe_prepared_publication_source(
+        &self,
+        record_index: usize,
+    ) -> PreparedPublicationObservation {
+        let current = self.current.as_ref();
+        PreparedPublicationObservation {
+            identity: current.map(|current| current.identity.clone()),
+            stage: current.map(|current| current.stage.clone()),
+            record: self.records.get(record_index).cloned(),
+            history_revision: self.history.revision(),
+            history_execution: current.and_then(|current| match &current.attempt {
+                AttemptKind::Normal(_) => Some(self.current_history_execution_projection(current)),
+                AttemptKind::Fallback { .. } => None,
+            }),
+            current_location: current.map(|current| current.location.clone()),
+            current_branch: current.and_then(|current| current.branch.clone()),
+            current_target_frames: current
+                .map(|current| current.target_frames.clone())
+                .unwrap_or_default(),
+            current_reconciliation: current.and_then(|current| current.reconciliation.clone()),
+            state: self.state.clone(),
+            host: self.state.host().cloned(),
+            top_slot: self.state.top_slot(),
+            active: self.state.active().clone(),
+            active_branch: self.active_branch.clone(),
+            active_child_slots: self.active_child_slots.clone(),
+        }
+    }
+
+    fn retain_rejected_publication(
+        &mut self,
+        sealed: SealedCommit,
+        error: CommitError,
+    ) -> CommitError {
+        let observed = self.observe_prepared_publication_source(sealed.publication.record_index);
+        debug_assert!(
+            !observed.same_source(&sealed.source) || !observed.accepts(&sealed),
+            "rejected publication evidence must describe a real authority mismatch"
+        );
+        self.prepared_publication_authority = Some(PreparedPublicationAuthority::Rejected(
+            PreparedPublicationRejection {
+                owner: sealed,
+                error,
+                observed,
+            },
+        ));
+        error
+    }
+
+    fn validate_sealed_commit_evidence(
+        &self,
+        evidence: &SealedCommitEvidence,
+    ) -> Result<(), CommitError> {
+        let valid = self.current.as_ref().is_some_and(|current| {
+            let execution_matches = match (
+                &evidence.history_execution,
+                evidence.source_revision,
+                &current.attempt,
+            ) {
+                (Some(execution), Some(_), AttemptKind::Normal(_)) => {
+                    self.current_history_execution_projection(current) == *execution
+                }
+                (None, None, AttemptKind::Fallback { .. }) => true,
+                _ => false,
+            };
+            current.identity == evidence.identity
+                && matches!(
+                    &current.stage,
+                    WorkStage::CommitSealed { token }
+                        if token.batch() == evidence.cleanup_batch
+                )
+                && evidence
+                    .source_revision
+                    .is_none_or(|revision| revision == self.history.revision())
+                && execution_matches
+        });
+        valid.then_some(()).ok_or(CommitError::Stale)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn probe_sealed_commit_evidence(
+        &self,
+        evidence: &SealedCommitEvidence,
+    ) -> Result<(), CommitError> {
+        self.validate_sealed_commit_evidence(evidence)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn probe_consumed_publication_evidence(
+        &self,
+        consumed: &ConsumedPublicationEvidence,
+    ) -> Result<(), CommitError> {
+        self.validate_sealed_commit_evidence(&consumed.evidence)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_prepared_with_evidence<F>(
+        &mut self,
+        prepared: PreparedPublication,
+        mutation: F,
+    ) -> Result<ConsumedPublicationEvidence, CommitError>
     where
         F: FnOnce(),
     {
+        let evidence = prepared.evidence.clone();
+        self.publish_prepared(prepared, mutation)?;
+        Ok(ConsumedPublicationEvidence { evidence })
+    }
+
+    pub(crate) fn validate_publication(
+        &mut self,
+        prepared: PreparedPublication,
+    ) -> Result<ValidatedPublication<'_>, CommitError> {
+        let validation = match self.prepared_publication_authority.as_ref() {
+            Some(PreparedPublicationAuthority::Ready(owner))
+                if owner.evidence == prepared.evidence =>
+            {
+                self.validate_prepared_publication_owner(owner)
+            }
+            Some(PreparedPublicationAuthority::Rejected(rejection))
+                if rejection.owner.evidence == prepared.evidence =>
+            {
+                return Err(rejection.error);
+            }
+            Some(
+                PreparedPublicationAuthority::Ready(_) | PreparedPublicationAuthority::Rejected(_),
+            )
+            | None => return Err(CommitError::Stale),
+        };
+        if let Err(error) = validation {
+            let Some(PreparedPublicationAuthority::Ready(owner)) =
+                self.prepared_publication_authority.take()
+            else {
+                unreachable!("publication validation only runs for a ready owner")
+            };
+            return Err(self.retain_rejected_publication(owner, error));
+        }
+        Ok(ValidatedPublication {
+            engine: self,
+            prepared,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_prepared<F>(
+        &mut self,
+        prepared: PreparedPublication,
+        mutation: F,
+    ) -> Result<(), CommitError>
+    where
+        F: FnOnce(),
+    {
+        let validated = self.validate_publication(prepared)?;
+        validated.publish(mutation);
+        Ok(())
+    }
+
+    fn publish_validated<F>(&mut self, mutation: F)
+    where
+        F: FnOnce(),
+    {
+        let Some(PreparedPublicationAuthority::Ready(owner)) =
+            self.prepared_publication_authority.take()
+        else {
+            unreachable!("validated publication retains its unique ready owner")
+        };
         let SealedCommit {
             identity: _,
             cleanup: _,
             publication,
-        } = prepared.sealed;
+            evidence: _,
+            source: _,
+        } = owner;
         let PublicationPlan {
             state,
             history,
@@ -2300,10 +2807,12 @@ impl RouterEngine {
         mutation();
         self.records[record_index] = published_record;
         self.state = state;
-        self.history = history;
         self.active_branch = active_branch;
         self.active_child_slots = active_child_slots;
         self.current = Some(current);
+        if let Some(history) = history {
+            self.history.publish(history);
+        }
     }
 
     pub(crate) fn complete_cleanup(
@@ -2444,6 +2953,7 @@ impl RouterEngine {
             assert!(self.state.complete_authority_settlement(&version, top_slot));
             self.active_branch = None;
             self.active_child_slots.clear();
+            self.retire_history_authority();
             self.current = None;
             self.state.set_request(None);
             self.retain_terminal_records();
@@ -2454,7 +2964,7 @@ impl RouterEngine {
             Some((_, FailureCleanupContinuation::BeginFallback)) => unreachable!(),
             Some((_, FailureCleanupContinuation::AuthoritySettlement)) => unreachable!(),
             None => match &current.attempt {
-                AttemptKind::Normal => RequestStatus::Succeeded,
+                AttemptKind::Normal(_) => RequestStatus::Succeeded,
                 AttemptKind::Fallback { original_failure } => {
                     RequestStatus::Failed(original_failure.clone())
                 }
@@ -2476,6 +2986,7 @@ impl RouterEngine {
             request,
             token: completed_token,
         });
+        self.retire_history_authority();
         self.current = None;
         self.state.set_request(None);
         self.retain_terminal_records();
@@ -2566,11 +3077,44 @@ impl RouterEngine {
     }
 
     pub(crate) const fn history(&self) -> &MemoryHistory {
-        &self.history
+        self.history.projection()
     }
 
     pub(crate) fn history_snapshot(&self) -> crate::history::HistorySnapshot {
-        crate::history::HistorySnapshot::project(&self.history)
+        self.history.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_history_authority_snapshot(&self) -> HistoryAuthoritySnapshot {
+        self.history.authority_snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_history_capability_snapshot(&self) -> HistoryCapabilitySnapshot {
+        let prepared = self
+            .prepared_publication_authority
+            .as_ref()
+            .and_then(|authority| authority.owner().publication.history.as_ref());
+        match (
+            &self.current_history_capability,
+            &self.pending_history_preparation_error,
+            prepared,
+        ) {
+            (Some(capability), None, None) => capability.snapshot(),
+            (None, Some(error), None) => error.capability_snapshot(),
+            (None, None, Some(publication)) => publication.capability_snapshot(),
+            (None, None, None) => HistoryCapabilitySnapshot::none(),
+            _ => panic!("history authority has more than one live owner"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_history_drift_evidence_snapshot(
+        &self,
+    ) -> Option<HistoryDriftEvidenceSnapshot> {
+        self.pending_history_preparation_error
+            .as_ref()
+            .map(HistoryPreparationError::snapshot)
     }
 
     pub(crate) fn earliest_retained_sequence(&self) -> Option<u64> {
@@ -2632,11 +3176,8 @@ impl RouterEngine {
             return;
         };
         let request = queued.request;
-        let location = self
-            .request(request)
-            .expect("queued record is retained")
-            .requested()
-            .clone();
+        let command = queued.command;
+        let location = command.location().clone();
         let branch = match queued.outcome {
             QueuedMatchOutcome::Matched(branch) => branch,
             QueuedMatchOutcome::MatchFailed(failure) => {
@@ -2720,6 +3261,7 @@ impl RouterEngine {
         );
         self.start_reconciled_request(
             request,
+            command,
             location,
             branch,
             reservation,
@@ -2733,6 +3275,7 @@ impl RouterEngine {
     fn start_reconciled_request(
         &mut self,
         request: NavigationRequestId,
+        command: NavigationCommand,
         location: RouteLocation,
         branch: MatchedBranch,
         reservation: ReservedBranchAttempt,
@@ -2751,6 +3294,46 @@ impl RouterEngine {
             .iter()
             .map(|frame| frame.version().clone())
             .collect::<Vec<_>>();
+        let command_kind = command.kind();
+        let root_frame = reconciliation
+            .preserved()
+            .iter()
+            .find(|frame| frame.branch_index() == 0)
+            .map(|frame| frame.version().clone())
+            .unwrap_or_else(|| {
+                let entering = reconciliation
+                    .entering()
+                    .iter()
+                    .find(|frame| frame.branch_index() == 0)
+                    .expect("a reconciled branch has an exact root frame");
+                RouteFrameVersion::new(
+                    self.router,
+                    host.host(),
+                    top_slot,
+                    FrameOrigin::MatchedRoute(entering.route()),
+                    entering.frame(),
+                    entering.generation(),
+                )
+            });
+        let root_attempt = NormalAttemptIdentity::new(
+            host.host(),
+            host.epoch(),
+            top_slot,
+            reserved_frames[0].frame_task(),
+            root_frame.frame(),
+            root_frame.generation(),
+            root_frame.origin().clone(),
+            0,
+        );
+        let execution = HistoryExecutionBinding::new(
+            self.router,
+            request,
+            root_attempt,
+            reservation.transaction(),
+            reservation.cleanup_batch(),
+        );
+        self.current_history_capability =
+            Some(self.history.freeze(execution, command.history_effect()));
         let Some(entering) = reconciliation.entering().first().cloned() else {
             let leaf_index = target_frames
                 .len()
@@ -2794,11 +3377,10 @@ impl RouterEngine {
                 applied_frames: Vec::new(),
                 current_target: target,
                 pending_mount: None,
-                history_intent: Some(HistoryIntent::Push(location)),
                 stage: WorkStage::ReadyToCommit,
                 cleanup_batch: reservation.cleanup_batch(),
                 cleanup_roots,
-                attempt: AttemptKind::Normal,
+                attempt: AttemptKind::Normal(command_kind),
                 reconciliation: Some(reconciliation),
                 retired_host: None,
             });
@@ -2854,11 +3436,10 @@ impl RouterEngine {
                     outlet: outlet.clone(),
                     from_preserved_parent: true,
                 }),
-                history_intent: Some(HistoryIntent::Push(location)),
                 stage: WorkStage::AwaitingMount,
                 cleanup_batch: reservation.cleanup_batch(),
                 cleanup_roots,
-                attempt: AttemptKind::Normal,
+                attempt: AttemptKind::Normal(command_kind),
                 reconciliation: Some(reconciliation),
                 retired_host: None,
             });
@@ -2960,11 +3541,10 @@ impl RouterEngine {
             applied_frames: Vec::new(),
             current_target: target.clone(),
             pending_mount: None,
-            history_intent: Some(HistoryIntent::Push(location.clone())),
             stage: WorkStage::Applying,
             cleanup_batch: reservation.cleanup_batch(),
             cleanup_roots,
-            attempt: AttemptKind::Normal,
+            attempt: AttemptKind::Normal(command_kind),
             reconciliation: Some(reconciliation),
             retired_host: None,
         });
@@ -3001,11 +3581,18 @@ impl RouterEngine {
         expected: PendingFailureKind,
         failure: NavigationFailure,
     ) -> FailureCleanupRequest {
-        self.begin_failure_cleanup_with_continuation(
-            expected,
-            failure,
-            FailureCleanupContinuation::Terminal,
-        )
+        let continuation = if expected != PendingFailureKind::AuthorityLost
+            && self.current.as_ref().is_some_and(|current| {
+                matches!(
+                    current.attempt,
+                    AttemptKind::Normal(NavigationCommandKind::Replace)
+                )
+            }) {
+            FailureCleanupContinuation::BeginFallback
+        } else {
+            FailureCleanupContinuation::Terminal
+        };
+        self.begin_failure_cleanup_with_continuation(expected, failure, continuation)
     }
 
     fn begin_failure_cleanup_with_continuation(
@@ -3033,6 +3620,7 @@ impl RouterEngine {
         continuation: FailureCleanupContinuation,
         logical_roots: Vec<RouteFrameVersion>,
     ) -> FailureCleanupRequest {
+        self.current_history_capability = None;
         let current = self
             .current
             .as_ref()
@@ -3060,6 +3648,36 @@ impl RouterEngine {
         self.action = None;
         self.transition_with_trace(request.identity.request, phase);
         request
+    }
+
+    fn retire_history_authority(&mut self) {
+        let prepared_history_owner = self
+            .prepared_publication_authority
+            .as_ref()
+            .is_some_and(|authority| authority.owner().publication.history.is_some());
+        debug_assert!(
+            usize::from(self.current_history_capability.is_some())
+                + usize::from(self.pending_history_preparation_error.is_some())
+                + usize::from(prepared_history_owner)
+                <= 1,
+            "history authority must retain a single linear owner"
+        );
+        if let Some(PreparedPublicationAuthority::Rejected(rejection)) =
+            self.prepared_publication_authority.as_ref()
+        {
+            debug_assert!(
+                !rejection.observed.same_source(&rejection.owner.source)
+                    || !rejection.observed.accepts(&rejection.owner),
+                "rejected publication evidence must retain the authority mismatch"
+            );
+            debug_assert!(matches!(
+                rejection.error,
+                CommitError::Stale | CommitError::InvalidManifest
+            ));
+        }
+        self.current_history_capability = None;
+        self.pending_history_preparation_error = None;
+        self.prepared_publication_authority = None;
     }
 
     fn authority_settlement_logical_roots(&self) -> Vec<RouteFrameVersion> {
@@ -3091,6 +3709,7 @@ impl RouterEngine {
         request: NavigationRequestId,
         original_failure: NavigationFailure,
     ) {
+        self.current_history_capability = None;
         let matched = self
             .current
             .as_ref()
@@ -3106,6 +3725,7 @@ impl RouterEngine {
         let reserved = match self.ids.reserve_attempt() {
             Ok(reserved) => reserved,
             Err(_) => {
+                self.retire_history_authority();
                 self.current = None;
                 self.action = None;
                 self.fail_reserved_request(
@@ -3182,7 +3802,6 @@ impl RouterEngine {
             applied_frames: Vec::new(),
             current_target: target.clone(),
             pending_mount: None,
-            history_intent: None,
             stage: WorkStage::Applying,
             cleanup_batch: reserved.cleanup_batch(),
             cleanup_roots,
@@ -3356,7 +3975,7 @@ impl RouterEngine {
             .and_then(|branch| branch.routes().get(identity.branch_index))
             .cloned();
         let (view, failure) = match &current.attempt {
-            AttemptKind::Normal => (
+            AttemptKind::Normal(_) => (
                 self.matcher
                     .view_binding(
                         matched
@@ -3519,7 +4138,11 @@ impl RouterEngine {
         self.retain_terminal_records();
     }
 
-    fn precompute_publication(&self, cleanup: CleanupBatchToken) -> PublicationPlan {
+    fn precompute_publication(
+        &self,
+        cleanup: CleanupBatchToken,
+        history_capability: Option<HistoryCommitCapability>,
+    ) -> Result<PublicationPlan, HistoryPreparationError> {
         let current = self
             .current
             .as_ref()
@@ -3531,14 +4154,9 @@ impl RouterEngine {
             .requested()
             .clone();
 
-        let mut history = self.history.clone();
-        if let Some(intent) = current.history_intent.clone() {
-            intent.publish(&mut history);
-        }
-
         let mut state = self.state.clone();
         let (active, active_branch, active_child_slots) = match &current.attempt {
-            AttemptKind::Normal => {
+            AttemptKind::Normal(_) => {
                 let active_child_slots = reconciled_child_slots(current);
                 (
                     ActivePresentation::route(location, current.target_frames.clone()),
@@ -3560,7 +4178,7 @@ impl RouterEngine {
                 Vec::new(),
             ),
         };
-        state.set_active(active);
+        state.set_active(active.clone());
         state.set_request(Some(RequestStatus::Running(
             NavigationPhase::PostCommitCleanup,
         )));
@@ -3588,13 +4206,33 @@ impl RouterEngine {
             ))
             .expect("running trace is open");
 
+        let history = match history_capability {
+            Some(capability) => {
+                let execution = self.current_history_execution_projection(current);
+                let matched = current
+                    .branch
+                    .as_ref()
+                    .expect("normal publication retains its matched branch")
+                    .branch_fingerprint()
+                    .clone();
+                let presentation = PreparedPresentationBinding::new(
+                    execution,
+                    active,
+                    matched,
+                    current.target_frames.clone(),
+                    cleanup.clone(),
+                );
+                Some(self.history.prepare(capability, presentation)?)
+            }
+            None => None,
+        };
+
         let mut current = current.clone();
-        current.history_intent = None;
         current.stage = WorkStage::PostCommitCleanup {
             outstanding: cleanup,
         };
 
-        PublicationPlan {
+        Ok(PublicationPlan {
             state,
             history,
             active_branch,
@@ -3602,7 +4240,37 @@ impl RouterEngine {
             record_index,
             published_record,
             current,
-        }
+        })
+    }
+
+    fn current_history_execution_projection(
+        &self,
+        current: &CurrentWork,
+    ) -> HistoryExecutionBindingProjection {
+        let root_reservation = current
+            .reservation
+            .first()
+            .expect("normal work retains its root reservation");
+        let root_frame = current
+            .target_frames
+            .first()
+            .expect("normal work retains its root target frame");
+        HistoryExecutionBindingProjection::observed(
+            self.router,
+            current.identity.request,
+            NormalAttemptIdentity::new(
+                root_frame.host(),
+                current.identity.host_epoch,
+                root_frame.slot(),
+                root_reservation.frame_task(),
+                root_frame.frame(),
+                root_frame.generation(),
+                root_frame.origin().clone(),
+                0,
+            ),
+            current.identity.transaction,
+            current.cleanup_batch,
+        )
     }
 
     fn retain_terminal_records(&mut self) {
@@ -3639,7 +4307,7 @@ impl RouterEngine {
         EngineSnapshot {
             state: self.state.snapshot(),
             ids: self.ids.snapshot(),
-            history: self.history.clone(),
+            history: self.history.authority_snapshot(),
             active_branch: self
                 .active_branch
                 .as_ref()
@@ -3688,8 +4356,11 @@ impl RouterEngine {
         };
     }
 
-    #[cfg(test)]
-    fn testing_exhaust_reservation_counter(&mut self, counter: crate::ids::ReservationCounter) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_exhaust_reservation_counter(
+        &mut self,
+        counter: crate::ids::ReservationCounter,
+    ) {
         self.ids
             .testing_exhaust_reservation_counter(self.router, counter);
     }
@@ -3861,7 +4532,7 @@ impl ViewReportSession<'_> {
             .attempt
             .clone();
         let diagnostic_message = match &attempt {
-            AttemptKind::Normal => format!(
+            AttemptKind::Normal(_) => format!(
                 "accepted normal {:?} failure: {}",
                 failure.kind(),
                 failure.message()
@@ -3879,7 +4550,7 @@ impl ViewReportSession<'_> {
         );
 
         match attempt {
-            AttemptKind::Normal if branch_index > 0 => {
+            AttemptKind::Normal(_) if branch_index > 0 => {
                 let expected = match failure.kind() {
                     NavigationFailureKind::Build => PendingFailureKind::Build,
                     NavigationFailureKind::Apply => PendingFailureKind::Apply,
@@ -3887,11 +4558,12 @@ impl ViewReportSession<'_> {
                 };
                 Some(self.engine.begin_failure_cleanup(expected, failure))
             }
-            AttemptKind::Normal => {
+            AttemptKind::Normal(_) => {
                 self.engine.begin_fallback(request, failure);
                 None
             }
             AttemptKind::Fallback { .. } => {
+                self.engine.retire_history_authority();
                 self.engine.current = None;
                 self.engine.action = None;
                 self.engine.fail_reserved_request(
@@ -3921,7 +4593,7 @@ impl ViewReportSession<'_> {
             .attempt
             .clone();
         let diagnostic_message = match &attempt {
-            AttemptKind::Normal => format!(
+            AttemptKind::Normal(_) => format!(
                 "accepted normal {:?} failure with physical residual: {}",
                 failure.kind(),
                 failure.message()
@@ -3960,10 +4632,15 @@ impl ViewReportSession<'_> {
             _ => PendingFailureKind::Apply,
         };
         let (failure, continuation) = match attempt {
-            AttemptKind::Normal if branch_index == 0 => {
+            AttemptKind::Normal(_) if branch_index == 0 => {
                 (failure, FailureCleanupContinuation::BeginFallback)
             }
-            AttemptKind::Normal => (failure, FailureCleanupContinuation::Terminal),
+            AttemptKind::Normal(NavigationCommandKind::Replace) => {
+                (failure, FailureCleanupContinuation::BeginFallback)
+            }
+            AttemptKind::Normal(NavigationCommandKind::Push) => {
+                (failure, FailureCleanupContinuation::Terminal)
+            }
             AttemptKind::Fallback { .. } => (
                 NavigationFailure::new(
                     NavigationFailureKind::RecoveryFailed,
@@ -3975,6 +4652,289 @@ impl ViewReportSession<'_> {
         self.engine
             .begin_failure_cleanup_with_continuation(expected, failure, continuation)
     }
+}
+
+#[cfg(test)]
+pub(crate) struct HistoryAuthorityFixture {
+    engine: RouterEngine,
+}
+
+#[cfg(test)]
+impl HistoryAuthorityFixture {
+    pub(crate) fn new() -> Self {
+        Self {
+            engine: history_fixture_ready_engine(),
+        }
+    }
+
+    pub(crate) fn running_replace(target: &str) -> Self {
+        let mut fixture = Self::new();
+        fixture
+            .engine
+            .push(RouteLocation::new("/items/1"))
+            .expect("fixture initial push reserves");
+        history_fixture_settle_current(&mut fixture.engine);
+        fixture
+            .engine
+            .replace(RouteLocation::new(target))
+            .expect("fixture replace reserves");
+        fixture
+    }
+
+    pub(crate) const fn router_identity(&self) -> RouterIdentity {
+        self.engine.router
+    }
+
+    pub(crate) fn running_request(&self) -> NavigationRequestId {
+        self.engine
+            .running_request()
+            .expect("fixture has one running request")
+    }
+
+    pub(crate) fn next_history_binding(
+        &mut self,
+    ) -> (HistoryExecutionBinding, PreparedPresentationBinding) {
+        let reservation = self
+            .engine
+            .ids
+            .reserve_navigation_branch(self.engine.router, 1)
+            .expect("fixture history binding reserves one identity set");
+        let host = self.engine.state.host().expect("fixture host is ready");
+        let slot = self
+            .engine
+            .state
+            .top_slot()
+            .expect("fixture top slot is ready");
+        let matched = self
+            .engine
+            .matcher
+            .match_location(&RouteLocation::new("/"))
+            .expect("fixture root matches");
+        let origin = FrameOrigin::MatchedRoute(matched.routes()[0].route());
+        let frame = RouteFrameVersion::new(
+            self.engine.router,
+            host.host(),
+            slot,
+            origin.clone(),
+            reservation.frames()[0].frame(),
+            RouteGeneration::initial(),
+        );
+        let identity = FrameTaskIdentity {
+            router: self.engine.router,
+            host: host.host(),
+            host_epoch: host.epoch(),
+            slot,
+            request: reservation.request(),
+            transaction: reservation.transaction(),
+            frame_task: reservation.frames()[0].frame_task(),
+            frame: frame.frame(),
+            generation: frame.generation(),
+            origin: origin.clone(),
+            branch_index: 0,
+        };
+        let execution = HistoryExecutionBinding::new(
+            self.engine.router,
+            reservation.request(),
+            NormalAttemptIdentity::new(
+                host.host(),
+                host.epoch(),
+                slot,
+                reservation.frames()[0].frame_task(),
+                frame.frame(),
+                frame.generation(),
+                origin,
+                0,
+            ),
+            reservation.transaction(),
+            reservation.cleanup_batch(),
+        );
+        let cleanup = CleanupBatchToken::sealed(
+            identity,
+            reservation.cleanup_batch(),
+            &[],
+            crate::cleanup::CleanupManifestDigest::from_opaque(0x4849_5354),
+            0,
+        );
+        let presentation = PreparedPresentationBinding::new(
+            execution.projection(),
+            ActivePresentation::route(RouteLocation::new("/"), vec![frame.clone()]),
+            matched.branch_fingerprint().clone(),
+            vec![frame],
+            cleanup,
+        );
+        (execution, presentation)
+    }
+
+    pub(crate) fn move_canonical_cursor_back(&mut self, history: &mut CanonicalHistory) {
+        history.testing_move_cursor_back();
+    }
+
+    pub(crate) fn seal_current_replace(&mut self) -> SealedCommit {
+        let action = self.engine.action().expect("fixture replace has work");
+        let ticket = history_fixture_drive_to_commit(&mut self.engine, action);
+        history_fixture_seal_current(&mut self.engine, ticket)
+    }
+
+    pub(crate) fn clone_current_work(&self) {
+        let _cloned = self
+            .engine
+            .current
+            .as_ref()
+            .expect("fixture has current work")
+            .clone();
+    }
+
+    pub(crate) fn history_capability_snapshot(&self) -> HistoryCapabilitySnapshot {
+        self.engine.testing_history_capability_snapshot()
+    }
+
+    pub(crate) fn engine_snapshot(&self) -> EngineSnapshot {
+        self.engine.testing_snapshot()
+    }
+
+    pub(crate) fn probe_sealed_commit_evidence(
+        &self,
+        evidence: &SealedCommitEvidence,
+    ) -> Result<(), CommitError> {
+        self.engine.probe_sealed_commit_evidence(evidence)
+    }
+
+    pub(crate) fn prepare_publication(
+        &mut self,
+        sealed: SealedCommit,
+    ) -> Result<PreparedPublication, CommitError> {
+        self.engine.prepare_publication(sealed)
+    }
+
+    pub(crate) fn publish_and_return_consumed_evidence(
+        &mut self,
+        prepared: PreparedPublication,
+    ) -> ConsumedPublicationEvidence {
+        self.engine
+            .publish_prepared_with_evidence(prepared, || {})
+            .expect("fresh fixture publication remains exactly authorized")
+    }
+
+    pub(crate) fn probe_consumed_publication_evidence(
+        &self,
+        consumed: &ConsumedPublicationEvidence,
+    ) -> Result<(), CommitError> {
+        self.engine.probe_consumed_publication_evidence(consumed)
+    }
+
+    pub(crate) fn request_trace(&self) -> &[NavigationTraceEvent] {
+        self.engine
+            .request(self.running_request())
+            .expect("fixture request remains retained")
+            .trace()
+    }
+}
+
+#[cfg(test)]
+fn history_fixture_ready_engine() -> RouterEngine {
+    let mut builder = RouteTree::builder()
+        .root_with_options(
+            crate::pattern::RoutePattern::path("/").unwrap(),
+            crate::route_tree::RouteNodeOptions::new()
+                .with_view(RouteViewKey::new("history-root").unwrap()),
+        )
+        .unwrap();
+    let root = builder.root_id().unwrap();
+    builder
+        .route_with_options(
+            root,
+            crate::pattern::RoutePattern::path("items/:id").unwrap(),
+            crate::route_tree::RouteNodeOptions::new()
+                .with_view(RouteViewKey::new("history-items").unwrap()),
+        )
+        .unwrap();
+    let mut engine = RouterEngine::install(
+        builder.build().unwrap(),
+        RouteViewKey::new("history-fallback").unwrap(),
+    )
+    .unwrap();
+    let mut issuer = HostAdmissionIssuer::new().unwrap();
+    let token = engine.request_host_admission(&mut issuer).unwrap();
+    let grant = engine.grant_host_admission(&mut issuer, &token).unwrap();
+    let confirmation = issuer.confirm(&grant).unwrap();
+    engine.confirm_host(&issuer, &confirmation).unwrap();
+    engine
+}
+
+#[cfg(test)]
+fn history_fixture_drive_to_commit(
+    engine: &mut RouterEngine,
+    mut action: EngineAction,
+) -> CommitTicket {
+    loop {
+        action = match action {
+            EngineAction::FrameTask(task) => {
+                let next_outlet = engine.current.as_ref().and_then(|current| {
+                    current
+                        .branch
+                        .as_ref()
+                        .and_then(|branch| branch.routes().get(task.identity().branch_index() + 1))
+                        .map(|matched| matched.slot().clone())
+                });
+                engine
+                    .accept_applied_report(
+                        task.into_applied_report(next_outlet.into_iter().collect()),
+                    )
+                    .unwrap();
+                engine.action().expect("fixture report advances")
+            }
+            EngineAction::MountRequest(request) => {
+                let grant = engine.resolve_mount(request).unwrap();
+                let receipt =
+                    grant.attest_receipt(crate::mount::MountReceiptDigest::from_opaque(1));
+                let permit = engine.accept_mount_receipt(receipt).unwrap();
+                let completion =
+                    permit.complete(crate::mount::MountRegistrationDigest::from_opaque(2));
+                engine.complete_mount_registration(completion).unwrap();
+                engine.action().expect("fixture mount advances")
+            }
+            EngineAction::FailureCleanup(_) => panic!("fixture success reached failure cleanup"),
+            EngineAction::Commit(ticket) => return ticket,
+        };
+    }
+}
+
+#[cfg(test)]
+fn history_fixture_seal_current(engine: &mut RouterEngine, ticket: CommitTicket) -> SealedCommit {
+    let roots = engine.current.as_ref().unwrap().cleanup_roots.clone();
+    let count = usize::from(!roots.is_empty());
+    engine
+        .seal_commit(
+            &ticket,
+            CleanupManifestSeal::new(
+                roots,
+                crate::cleanup::CleanupManifestDigest::from_opaque(0x4849_5354_5345_414c),
+                count,
+            ),
+        )
+        .unwrap()
+}
+
+#[cfg(test)]
+fn history_fixture_settle_current(engine: &mut RouterEngine) {
+    let action = engine.action().expect("fixture request has work");
+    let ticket = history_fixture_drive_to_commit(engine, action);
+    let sealed = history_fixture_seal_current(engine, ticket);
+    let cleanup = sealed.cleanup().clone();
+    let prepared = engine.prepare_publication(sealed).unwrap();
+    engine.publish_prepared(prepared, || {}).unwrap();
+    let digest = if cleanup.obligation_count() == 0 {
+        crate::cleanup::CleanupCompletionDigest::canonical_empty()
+    } else {
+        crate::cleanup::CleanupCompletionDigest::from_opaque(0x4849_5354_444f_4e45)
+    };
+    engine
+        .complete_cleanup(CleanupCompletion::attest(
+            cleanup.clone(),
+            digest,
+            cleanup.obligation_count(),
+        ))
+        .unwrap();
 }
 
 #[cfg(test)]
@@ -4007,7 +4967,7 @@ impl From<&EngineAction> for ActionSnapshot {
 pub(crate) struct EngineSnapshot {
     state: RouterNavigationState,
     ids: crate::ids::CoreIdAllocatorSnapshot,
-    history: MemoryHistory,
+    history: HistoryAuthoritySnapshot,
     active_branch: Option<String>,
     active_child_slots: Vec<LogicalChildSlotBinding>,
     records: VecDeque<NavigationRequestRecord>,
@@ -4182,8 +5142,7 @@ mod tests {
         F: FnOnce(),
     {
         let prepared = engine.prepare_publication(sealed)?;
-        engine.publish_prepared(prepared, mutation);
-        Ok(())
+        engine.publish_prepared(prepared, mutation)
     }
 
     #[test]
@@ -4244,7 +5203,10 @@ mod tests {
         );
         assert_eq!(engine.state.snapshot(), before_stale.state);
         assert_eq!(engine.ids.snapshot(), before_stale.ids);
-        assert_eq!(engine.history(), &before_stale.history);
+        assert_eq!(
+            engine.testing_history_authority_snapshot(),
+            before_stale.history
+        );
         assert_eq!(
             engine
                 .current
@@ -4311,6 +5273,96 @@ mod tests {
             engine.request(request).unwrap().status(),
             RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::Match
         ));
+    }
+
+    #[test]
+    fn replace_match_failure_and_fallback_failure_preserve_published_history() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let active_before = engine.active().clone();
+        let history_before = engine.testing_history_authority_snapshot();
+
+        let request = engine.replace(RouteLocation::new("/missing")).unwrap();
+        assert!(!engine.testing_history_capability_snapshot().has_owner());
+        let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
+            panic!("replace match failure starts a fresh fallback attempt")
+        };
+        assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
+        engine
+            .begin_view_report(fallback.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Build,
+                "replace match fallback failed",
+            ));
+
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::RecoveryFailed
+        ));
+        assert_eq!(engine.active(), &active_before);
+        assert_eq!(engine.testing_history_authority_snapshot(), history_before);
+        assert!(!engine.testing_history_capability_snapshot().has_owner());
+    }
+
+    #[test]
+    fn replace_mount_failure_after_capability_issue_preserves_history_through_fallback_failure() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/")).unwrap();
+        settle_current(&mut engine);
+        let active_before = engine.active().clone();
+        let history_before = engine.testing_history_authority_snapshot();
+
+        let request = engine.replace(RouteLocation::new("/items/1")).unwrap();
+        assert!(
+            engine
+                .testing_history_capability_snapshot()
+                .has_exactly_one_owner()
+        );
+        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
+            panic!("the preserved root must request the entering child mount")
+        };
+        assert!(
+            engine
+                .testing_history_capability_snapshot()
+                .has_exactly_one_owner()
+        );
+        let failure = engine
+            .reject_mount(mount, crate::trace::MountRejectionKind::MissingOutlet)
+            .unwrap();
+        assert!(!engine.testing_history_capability_snapshot().has_owner());
+        let roots = failure.logical_roots().to_vec();
+        let count = usize::from(!roots.is_empty());
+        let cleanup = engine
+            .prepare_failure_cleanup(
+                failure,
+                CleanupManifestSeal::new(roots, manifest_digest(0xA0F1), count),
+            )
+            .unwrap();
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
+            panic!("replace mount failure continues through a fresh fallback")
+        };
+        assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
+        engine
+            .begin_view_report(fallback.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Build,
+                "replace mount fallback failed",
+            ));
+
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::RecoveryFailed
+        ));
+        assert_eq!(engine.active(), &active_before);
+        assert_eq!(engine.testing_history_authority_snapshot(), history_before);
+        assert!(!engine.testing_history_capability_snapshot().has_owner());
     }
 
     #[test]
@@ -4508,7 +5560,7 @@ mod tests {
         let duplicate_lifecycle = (
             duplicate_engine.state.snapshot(),
             duplicate_engine.ids.snapshot(),
-            duplicate_engine.history.clone(),
+            duplicate_engine.testing_history_authority_snapshot(),
             format!("{:?}", duplicate_engine.current),
             duplicate_engine.action.as_ref().map(ActionSnapshot::from),
         );
@@ -4543,7 +5595,7 @@ mod tests {
             (
                 duplicate_engine.state.snapshot(),
                 duplicate_engine.ids.snapshot(),
-                duplicate_engine.history.clone(),
+                duplicate_engine.testing_history_authority_snapshot(),
                 format!("{:?}", duplicate_engine.current),
                 duplicate_engine.action.as_ref().map(ActionSnapshot::from),
             ),
@@ -4566,7 +5618,7 @@ mod tests {
         let stale_lifecycle = (
             stale_engine.state.snapshot(),
             stale_engine.ids.snapshot(),
-            stale_engine.history.clone(),
+            stale_engine.testing_history_authority_snapshot(),
             format!("{:?}", stale_engine.current),
             stale_engine.action.as_ref().map(ActionSnapshot::from),
         );
@@ -4584,7 +5636,7 @@ mod tests {
             (
                 stale_engine.state.snapshot(),
                 stale_engine.ids.snapshot(),
-                stale_engine.history.clone(),
+                stale_engine.testing_history_authority_snapshot(),
                 format!("{:?}", stale_engine.current),
                 stale_engine.action.as_ref().map(ActionSnapshot::from),
             ),
@@ -4601,7 +5653,7 @@ mod tests {
         let invalid_lifecycle = (
             invalid_engine.state.snapshot(),
             invalid_engine.ids.snapshot(),
-            invalid_engine.history.clone(),
+            invalid_engine.testing_history_authority_snapshot(),
             format!("{:?}", invalid_engine.current),
             invalid_engine.action.as_ref().map(ActionSnapshot::from),
         );
@@ -4632,7 +5684,7 @@ mod tests {
             (
                 invalid_engine.state.snapshot(),
                 invalid_engine.ids.snapshot(),
-                invalid_engine.history.clone(),
+                invalid_engine.testing_history_authority_snapshot(),
                 format!("{:?}", invalid_engine.current),
                 invalid_engine.action.as_ref().map(ActionSnapshot::from),
             ),
@@ -4932,7 +5984,7 @@ mod tests {
             );
             assert_eq!(engine.state.snapshot(), before.state);
             assert_eq!(engine.ids.snapshot(), before.ids);
-            assert_eq!(engine.history(), &before.history);
+            assert_eq!(engine.testing_history_authority_snapshot(), before.history);
             assert_eq!(
                 engine
                     .current
@@ -5860,27 +6912,36 @@ mod tests {
     }
 
     #[test]
-    fn root_count_coherence_is_rejected_before_any_mutation() {
-        let mut engine = ready_engine();
-        engine.push(RouteLocation::new("/items/1")).unwrap();
-        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
-            panic!("expected frame task");
-        };
-        let ticket = drive_to_commit(&mut engine, EngineAction::FrameTask(task));
+    fn logical_roots_and_ecs_obligation_count_seal_independently() {
+        fn ready_to_seal() -> (RouterEngine, super::CommitTicket) {
+            let mut engine = ready_engine();
+            engine.push(RouteLocation::new("/items/1")).unwrap();
+            let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+                panic!("expected frame task");
+            };
+            let ticket = drive_to_commit(&mut engine, EngineAction::FrameTask(task));
+            (engine, ticket)
+        }
 
-        let before = engine.snapshot();
-        assert_eq!(
-            engine
-                .seal_commit(
-                    &ticket.testing_duplicate(),
-                    CleanupManifestSeal::new(vec![], manifest_digest(5), 1),
-                )
-                .unwrap_err(),
-            CommitError::InvalidManifest
+        let (mut empty_roots, empty_ticket) = ready_to_seal();
+        let empty_digest = manifest_digest(5);
+        let empty_expected = CleanupBatchToken::sealed(
+            empty_ticket.identity().clone(),
+            empty_roots.current.as_ref().unwrap().cleanup_batch,
+            &[],
+            empty_digest,
+            1,
         );
-        assert_eq!(engine.snapshot(), before);
+        let empty_sealed = empty_roots
+            .seal_commit(
+                &empty_ticket,
+                CleanupManifestSeal::new(Vec::new(), empty_digest, 1),
+            )
+            .expect("logical roots do not infer the ECS entity obligation count");
+        assert_eq!(empty_sealed.cleanup(), &empty_expected);
 
-        let root = engine
+        let (mut nonempty_roots, nonempty_ticket) = ready_to_seal();
+        let root = nonempty_roots
             .current
             .as_ref()
             .unwrap()
@@ -5888,22 +6949,54 @@ mod tests {
             .last()
             .unwrap()
             .clone();
-        engine.current.as_mut().unwrap().cleanup_roots = vec![root.clone()];
-        let before = engine.snapshot();
-        assert_eq!(
-            engine
-                .seal_commit(
-                    &ticket,
-                    CleanupManifestSeal::new(vec![root], manifest_digest(5), 0),
-                )
-                .unwrap_err(),
-            CommitError::InvalidManifest
+        nonempty_roots.current.as_mut().unwrap().cleanup_roots = vec![root.clone()];
+        let nonempty_digest = manifest_digest(6);
+        let nonempty_expected = CleanupBatchToken::sealed(
+            nonempty_ticket.identity().clone(),
+            nonempty_roots.current.as_ref().unwrap().cleanup_batch,
+            std::slice::from_ref(&root),
+            nonempty_digest,
+            0,
         );
-        assert_eq!(engine.snapshot(), before);
+        let nonempty_sealed = nonempty_roots
+            .seal_commit(
+                &nonempty_ticket,
+                CleanupManifestSeal::new(vec![root], nonempty_digest, 0),
+            )
+            .expect("ECS can prove zero entity obligations for nonempty logical roots");
+        assert_eq!(nonempty_sealed.cleanup(), &nonempty_expected);
     }
 
     #[test]
-    fn duplicate_and_foreign_sealed_commit_capabilities_are_zero_write() {
+    fn coherent_foreign_evidence_is_rejected_by_real_prepare_and_consumed_replay_is_zero_write() {
+        let mut foreign_probe = ready_engine();
+        foreign_probe.push(RouteLocation::new("/items/1")).unwrap();
+        let EngineAction::FrameTask(task) = foreign_probe.action().unwrap() else {
+            panic!("expected frame task");
+        };
+        let ticket = drive_to_commit(&mut foreign_probe, EngineAction::FrameTask(task));
+        let sealed = seal_current(&mut foreign_probe, ticket);
+        let foreign_identity = distinct_identity();
+        let foreign = sealed.evidence().testing_with_observed_router_and_request(
+            foreign_identity.router_identity(),
+            foreign_identity.request(),
+        );
+        let before = foreign_probe.snapshot();
+        let capability_before = foreign_probe.testing_history_capability_snapshot();
+        assert_eq!(
+            foreign_probe.probe_sealed_commit_evidence(&foreign),
+            Err(CommitError::Stale)
+        );
+        assert_eq!(foreign_probe.snapshot(), before);
+        assert_eq!(
+            foreign_probe.testing_history_capability_snapshot(),
+            capability_before
+        );
+        let prepared = foreign_probe
+            .prepare_publication(sealed)
+            .expect("foreign projection probing cannot consume the real sealed owner");
+        foreign_probe.publish_prepared(prepared, || {}).unwrap();
+
         let mut engine = ready_engine();
         engine.push(RouteLocation::new("/items/1")).unwrap();
         let EngineAction::FrameTask(task) = engine.action().unwrap() else {
@@ -5911,36 +7004,402 @@ mod tests {
         };
         let ticket = drive_to_commit(&mut engine, EngineAction::FrameTask(task));
         let sealed = seal_current(&mut engine, ticket);
-        let duplicate = sealed.testing_duplicate();
-        let foreign_identity = distinct_identity();
-        let foreign = sealed.testing_with_identity(foreign_identity);
-
-        for invalid in [foreign] {
-            let before = engine.snapshot();
-            let mut mutated = false;
-            assert_eq!(
-                publish_sealed(&mut engine, invalid, || {
-                    mutated = true;
-                })
-                .unwrap_err(),
-                CommitError::Stale
-            );
-            assert!(!mutated);
-            assert_eq!(engine.snapshot(), before);
-        }
-
-        publish_sealed(&mut engine, sealed, || {}).unwrap();
+        let prepared = engine.prepare_publication(sealed).unwrap();
+        let consumed = engine
+            .publish_prepared_with_evidence(prepared, || {})
+            .unwrap();
         let before = engine.snapshot();
-        let mut mutated = false;
         assert_eq!(
-            publish_sealed(&mut engine, duplicate, || {
-                mutated = true;
-            })
-            .unwrap_err(),
-            CommitError::Stale
+            engine.probe_consumed_publication_evidence(&consumed),
+            Err(CommitError::Stale),
         );
-        assert!(!mutated);
         assert_eq!(engine.snapshot(), before);
+    }
+
+    #[test]
+    fn prepared_replace_keeps_exact_owner_in_core() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        engine.replace(RouteLocation::new("/items/2")).unwrap();
+        let action = engine
+            .action()
+            .expect("replace has one real execution action");
+        let ticket = drive_to_commit(&mut engine, action);
+        let exact_owner = engine.testing_history_capability_snapshot();
+        assert!(exact_owner.has_exactly_one_owner());
+        assert!(exact_owner.execution().is_some());
+        assert!(exact_owner.source().is_some());
+
+        let sealed = seal_current(&mut engine, ticket);
+        let _ticket = engine
+            .prepare_publication(sealed)
+            .expect("the exact replace publication prepares");
+
+        assert_eq!(
+            engine.testing_history_capability_snapshot(),
+            exact_owner,
+            "preparation must leave the one exact authorizing owner in Core; the returned value is only a ticket"
+        );
+    }
+
+    #[test]
+    fn prepare_rejection_retains_exact_owner_without_stage_reconstruction() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        engine.replace(RouteLocation::new("/items/2")).unwrap();
+        let action = engine
+            .action()
+            .expect("replace has one real execution action");
+        let ticket = drive_to_commit(&mut engine, action);
+        let exact_owner = engine.testing_history_capability_snapshot();
+        let sealed = seal_current(&mut engine, ticket);
+        engine.current.as_mut().unwrap().stage = WorkStage::Applying;
+        let history_before = engine.testing_history_authority_snapshot();
+        let state_before = engine.state.snapshot();
+        let ids_before = engine.ids.snapshot();
+
+        assert!(matches!(
+            engine.prepare_publication(sealed),
+            Err(CommitError::Stale)
+        ));
+        assert_eq!(engine.state.snapshot(), state_before);
+        assert_eq!(engine.ids.snapshot(), ids_before);
+        assert_eq!(engine.testing_history_authority_snapshot(), history_before);
+        assert_eq!(engine.current.as_ref().unwrap().stage, WorkStage::Applying);
+        assert_eq!(
+            engine.testing_history_capability_snapshot(),
+            exact_owner,
+            "a real preparation rejection must retain the exact owner independently of WorkStage"
+        );
+    }
+
+    #[test]
+    fn publication_refreeze_rejection_retains_owner_until_bounded_fail_closed() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        engine.replace(RouteLocation::new("/items/2")).unwrap();
+        let action = engine
+            .action()
+            .expect("replace has one real execution action");
+        let ticket = drive_to_commit(&mut engine, action);
+        let sealed = seal_current(&mut engine, ticket);
+        let prepared = engine
+            .prepare_publication(sealed)
+            .expect("replace publication prepares before refreeze drift");
+        let exact_owner = engine.testing_history_capability_snapshot();
+        engine.current.as_mut().unwrap().stage = WorkStage::Applying;
+        let state_before = engine.state.snapshot();
+        let history_before = engine.testing_history_authority_snapshot();
+        let mutation_ran = std::cell::Cell::new(false);
+
+        assert_eq!(
+            engine.publish_prepared(prepared, || mutation_ran.set(true)),
+            Err(CommitError::Stale)
+        );
+        assert!(!mutation_ran.get());
+        assert_eq!(engine.state.snapshot(), state_before);
+        assert_eq!(engine.testing_history_authority_snapshot(), history_before);
+        assert_eq!(engine.testing_history_capability_snapshot(), exact_owner);
+
+        assert!(engine.fail_closed_authority_protocol(|| true));
+        assert!(!engine.testing_history_capability_snapshot().has_owner());
+    }
+
+    #[test]
+    fn prepared_replace_ticket_after_fail_closed_is_exact_zero_write_and_ownerless() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let request = engine.replace(RouteLocation::new("/items/2")).unwrap();
+        let action = engine
+            .action()
+            .expect("replace has one real execution action");
+        let ticket = drive_to_commit(&mut engine, action);
+        let sealed = seal_current(&mut engine, ticket);
+        let prepared = engine
+            .prepare_publication(sealed)
+            .expect("replace publication prepares before authority loss");
+
+        assert!(engine.fail_closed_authority_protocol(|| true));
+        let terminal_state = engine.state.snapshot();
+        let terminal_history = engine.testing_history_authority_snapshot();
+        let terminal_status = engine.request(request).unwrap().status().clone();
+        let terminal_trace = engine.request(request).unwrap().trace().to_vec();
+        let terminal_owner = engine.testing_history_capability_snapshot();
+        assert!(!terminal_owner.has_owner());
+        assert!(engine.current.is_none());
+        assert!(engine.action.is_none());
+
+        let mutation_ran = std::cell::Cell::new(false);
+        assert_eq!(
+            engine.publish_prepared(prepared, || mutation_ran.set(true)),
+            Err(CommitError::Stale)
+        );
+
+        assert_eq!(
+            (
+                mutation_ran.get(),
+                engine.state.snapshot(),
+                engine.testing_history_authority_snapshot(),
+                engine.request(request).unwrap().status().clone(),
+                engine.request(request).unwrap().trace().to_vec(),
+                format!("{:?}", engine.current),
+                engine.action.is_none(),
+                engine.testing_history_capability_snapshot(),
+            ),
+            (
+                false,
+                terminal_state,
+                terminal_history,
+                terminal_status,
+                terminal_trace,
+                "None".to_owned(),
+                true,
+                terminal_owner,
+            ),
+            "a stale prepared ticket cannot run mutation, revive fail-closed state/current, or publish history"
+        );
+    }
+
+    #[test]
+    fn running_replace_stale_report_is_exact_zero_write_for_history_and_owner() {
+        let mut engine = ready_engine_with_tree(reconciliation_tree());
+        let request = engine.replace(RouteLocation::new("/items/1")).unwrap();
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("empty-history replace starts with the real parent frame task")
+        };
+        let stale_parent = parent.identity().clone();
+        let next_outlet = engine
+            .current
+            .as_ref()
+            .unwrap()
+            .branch
+            .as_ref()
+            .unwrap()
+            .routes()[1]
+            .slot()
+            .clone();
+        engine
+            .accept_applied_report(parent.into_applied_report(vec![next_outlet]))
+            .unwrap();
+        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
+            panic!("the accepted parent report yields the real child mount")
+        };
+        let grant = engine.resolve_mount(mount).unwrap();
+        let receipt = grant.attest_receipt(crate::mount::MountReceiptDigest::from_opaque(0x51));
+        let permit = engine.accept_mount_receipt(receipt).unwrap();
+        let completion = permit.complete(crate::mount::MountRegistrationDigest::from_opaque(0x52));
+        engine.complete_mount_registration(completion).unwrap();
+        assert!(matches!(&engine.action, Some(EngineAction::FrameTask(_))));
+
+        let status_before = engine.request(request).unwrap().status().clone();
+        let trace_before = engine.request(request).unwrap().trace().to_vec();
+        let state_before = engine.state.snapshot();
+        let ids_before = engine.ids.snapshot();
+        let history_before = engine.testing_history_authority_snapshot();
+        let owner_before = engine.testing_history_capability_snapshot();
+        let current_before = format!("{:?}", engine.current);
+        let action_before = engine.action.as_ref().map(ActionSnapshot::from);
+
+        assert_eq!(
+            engine.begin_view_report(&stale_parent).map(|_| ()),
+            Err(ReportError::Stale)
+        );
+        assert_eq!(engine.request(request).unwrap().status(), &status_before);
+        assert_eq!(engine.request(request).unwrap().trace(), trace_before);
+        assert_eq!(engine.state.snapshot(), state_before);
+        assert_eq!(engine.ids.snapshot(), ids_before);
+        assert_eq!(engine.testing_history_authority_snapshot(), history_before);
+        assert_eq!(engine.testing_history_capability_snapshot(), owner_before);
+        assert_eq!(format!("{:?}", engine.current), current_before);
+        assert_eq!(
+            engine.action.as_ref().map(ActionSnapshot::from),
+            action_before
+        );
+    }
+
+    #[test]
+    fn running_replace_old_cleanup_replay_is_exact_zero_write_for_history_and_owner() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        let old_cleanup = publish_current(&mut engine);
+        let old_replay = valid_completion(&old_cleanup);
+        engine
+            .complete_cleanup(valid_completion(&old_cleanup))
+            .unwrap();
+
+        let request = engine.replace(RouteLocation::new("/items/2")).unwrap();
+        let status_before = engine.request(request).unwrap().status().clone();
+        let trace_before = engine.request(request).unwrap().trace().to_vec();
+        let state_before = engine.state.snapshot();
+        let ids_before = engine.ids.snapshot();
+        let history_before = engine.testing_history_authority_snapshot();
+        let owner_before = engine.testing_history_capability_snapshot();
+        let current_before = format!("{:?}", engine.current);
+        let action_before = engine.action.as_ref().map(ActionSnapshot::from);
+
+        assert_eq!(
+            engine.complete_cleanup(old_replay),
+            Err(CleanupError::Duplicate)
+        );
+        assert_eq!(engine.request(request).unwrap().status(), &status_before);
+        assert_eq!(engine.request(request).unwrap().trace(), trace_before);
+        assert_eq!(engine.state.snapshot(), state_before);
+        assert_eq!(engine.ids.snapshot(), ids_before);
+        assert_eq!(engine.testing_history_authority_snapshot(), history_before);
+        assert_eq!(engine.testing_history_capability_snapshot(), owner_before);
+        assert_eq!(format!("{:?}", engine.current), current_before);
+        assert_eq!(
+            engine.action.as_ref().map(ActionSnapshot::from),
+            action_before
+        );
+    }
+
+    #[test]
+    fn normal_root_binding_is_independently_refrozen_before_history_prepare() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        engine.replace(RouteLocation::new("/items/2")).unwrap();
+        let action = engine
+            .action()
+            .expect("replace has one real execution action");
+        let ticket = drive_to_commit(&mut engine, action);
+        let capability = engine.testing_history_capability_snapshot();
+        let active_before = engine.active().clone();
+        let history_before = engine.testing_history_authority_snapshot();
+        let alternate = engine.current.as_ref().unwrap().reservation[1].clone();
+        assert_ne!(
+            engine.current.as_ref().unwrap().reservation[0].frame_task(),
+            alternate.frame_task()
+        );
+        engine.current.as_mut().unwrap().reservation[0] = alternate;
+        let roots = engine.current.as_ref().unwrap().cleanup_roots.clone();
+        let count = usize::from(!roots.is_empty());
+
+        assert_eq!(
+            engine
+                .seal_commit(
+                    &ticket,
+                    CleanupManifestSeal::new(roots, manifest_digest(0xB1AD), count),
+                )
+                .map(|_| ()),
+            Err(CommitError::Stale),
+            "the ticket identity cannot substitute for an exact normal-root refreeze"
+        );
+        let evidence = engine
+            .testing_history_drift_evidence_snapshot()
+            .expect("binding drift keeps typed evidence through cleanup");
+        assert_eq!(
+            evidence.kind(),
+            crate::history_authority::HistoryDriftEvidenceKind::Binding
+        );
+        assert_eq!(evidence.capability(), &capability);
+        assert_eq!(evidence.expected_binding(), capability.execution());
+        assert_ne!(evidence.observed_binding(), capability.execution());
+        assert!(evidence.capability().has_exactly_one_owner());
+        assert_eq!(engine.active(), &active_before);
+        assert_eq!(engine.testing_history_authority_snapshot(), history_before);
+
+        let Some(EngineAction::FailureCleanup(failure)) = engine.action() else {
+            panic!("binding drift enters bounded authority-loss cleanup")
+        };
+        let request = failure.request();
+        let roots = failure.logical_roots().to_vec();
+        let count = usize::from(!roots.is_empty());
+        let cleanup = engine
+            .prepare_failure_cleanup(
+                failure,
+                CleanupManifestSeal::new(roots, manifest_digest(0xB1AE), count),
+            )
+            .unwrap();
+        assert!(engine.testing_history_drift_evidence_snapshot().is_some());
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        assert!(!engine.testing_history_capability_snapshot().has_owner());
+        assert!(engine.testing_history_drift_evidence_snapshot().is_none());
+        assert_eq!(engine.active(), &active_before);
+        assert_eq!(engine.testing_history_authority_snapshot(), history_before);
+    }
+
+    #[test]
+    fn source_drift_keeps_exact_owner_and_observed_evidence_until_cleanup_terminal() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        engine.push(RouteLocation::new("/about")).unwrap();
+        settle_current(&mut engine);
+        engine.replace(RouteLocation::new("/items/2")).unwrap();
+        let action = engine
+            .action()
+            .expect("replace has one real execution action");
+        let ticket = drive_to_commit(&mut engine, action);
+        let capability = engine.testing_history_capability_snapshot();
+        engine.history.testing_move_cursor_back();
+        let active_before = engine.active().clone();
+        let history_after_drift = engine.testing_history_authority_snapshot();
+        let roots = engine.current.as_ref().unwrap().cleanup_roots.clone();
+        let count = usize::from(!roots.is_empty());
+
+        assert_eq!(
+            engine
+                .seal_commit(
+                    &ticket,
+                    CleanupManifestSeal::new(roots, manifest_digest(0x50A2), count),
+                )
+                .map(|_| ()),
+            Err(CommitError::Stale)
+        );
+        let evidence = engine
+            .testing_history_drift_evidence_snapshot()
+            .expect("source drift keeps typed evidence through cleanup");
+        assert_eq!(
+            evidence.kind(),
+            crate::history_authority::HistoryDriftEvidenceKind::Source
+        );
+        assert_eq!(evidence.capability(), &capability);
+        assert_eq!(evidence.expected_source(), capability.source());
+        assert_ne!(evidence.observed_source(), capability.source());
+        assert!(evidence.capability().has_exactly_one_owner());
+        assert_eq!(engine.active(), &active_before);
+        assert_eq!(
+            engine.testing_history_authority_snapshot(),
+            history_after_drift
+        );
+
+        let Some(EngineAction::FailureCleanup(failure)) = engine.action() else {
+            panic!("source drift enters bounded authority-loss cleanup")
+        };
+        let request = failure.request();
+        let roots = failure.logical_roots().to_vec();
+        let count = usize::from(!roots.is_empty());
+        let cleanup = engine
+            .prepare_failure_cleanup(
+                failure,
+                CleanupManifestSeal::new(roots, manifest_digest(0x50A3), count),
+            )
+            .unwrap();
+        assert!(engine.testing_history_drift_evidence_snapshot().is_some());
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        assert!(!engine.testing_history_capability_snapshot().has_owner());
+        assert!(engine.testing_history_drift_evidence_snapshot().is_none());
+        assert_eq!(engine.active(), &active_before);
+        assert_eq!(
+            engine.testing_history_authority_snapshot(),
+            history_after_drift
+        );
     }
 
     #[test]
@@ -6905,7 +8364,7 @@ mod tests {
         let lifecycle = (
             unsorted_engine.state.snapshot(),
             unsorted_engine.ids.snapshot(),
-            unsorted_engine.history.clone(),
+            unsorted_engine.testing_history_authority_snapshot(),
             unsorted_engine.records.clone(),
             format!("{:?}", unsorted_engine.current),
         );
@@ -6921,7 +8380,7 @@ mod tests {
             (
                 unsorted_engine.state.snapshot(),
                 unsorted_engine.ids.snapshot(),
-                unsorted_engine.history.clone(),
+                unsorted_engine.testing_history_authority_snapshot(),
                 unsorted_engine.records.clone(),
                 format!("{:?}", unsorted_engine.current),
             ),
@@ -6945,7 +8404,7 @@ mod tests {
         let before = (
             foreign_engine.state.snapshot(),
             foreign_engine.ids.snapshot(),
-            foreign_engine.history.clone(),
+            foreign_engine.testing_history_authority_snapshot(),
             format!("{:?}", foreign_engine.current),
         );
         assert_eq!(
@@ -6956,7 +8415,7 @@ mod tests {
             (
                 foreign_engine.state.snapshot(),
                 foreign_engine.ids.snapshot(),
-                foreign_engine.history.clone(),
+                foreign_engine.testing_history_authority_snapshot(),
                 format!("{:?}", foreign_engine.current),
             ),
             before
@@ -6979,7 +8438,7 @@ mod tests {
         let before = (
             duplicate_engine.state.snapshot(),
             duplicate_engine.ids.snapshot(),
-            duplicate_engine.history.clone(),
+            duplicate_engine.testing_history_authority_snapshot(),
             format!("{:?}", duplicate_engine.current),
             duplicate_engine.action.as_ref().map(ActionSnapshot::from),
         );
@@ -6991,7 +8450,7 @@ mod tests {
             (
                 duplicate_engine.state.snapshot(),
                 duplicate_engine.ids.snapshot(),
-                duplicate_engine.history.clone(),
+                duplicate_engine.testing_history_authority_snapshot(),
                 format!("{:?}", duplicate_engine.current),
                 duplicate_engine.action.as_ref().map(ActionSnapshot::from),
             ),
@@ -7762,6 +9221,11 @@ mod tests {
         let current = engine.push(RouteLocation::new("/items/1")).unwrap();
         let action = engine.action().unwrap();
         let _ticket = drive_to_commit(&mut engine, action);
+        assert!(
+            engine
+                .testing_history_capability_snapshot()
+                .has_exactly_one_owner()
+        );
         let queued_first = engine.enqueue_push(RouteLocation::new("/items/2")).unwrap();
         let queued_second = engine.enqueue_push(RouteLocation::new("/items/3")).unwrap();
 
@@ -7785,6 +9249,9 @@ mod tests {
                 },
             )
             .unwrap();
+
+        assert!(!engine.testing_history_capability_snapshot().has_owner());
+        assert!(engine.testing_history_drift_evidence_snapshot().is_none());
 
         assert_eq!(
             engine.availability(),
@@ -7883,6 +9350,8 @@ mod tests {
         assert!(engine.host().is_none());
         assert_eq!(engine.history(), &history_before);
         assert!(engine.action().is_none());
+        assert!(!engine.testing_history_capability_snapshot().has_owner());
+        assert!(engine.testing_history_drift_evidence_snapshot().is_none());
 
         let token = engine.request_host_admission(&mut issuer).unwrap();
         let grant = engine.grant_host_admission(&mut issuer, &token).unwrap();
@@ -7917,6 +9386,11 @@ mod tests {
         let request = engine.push(RouteLocation::new("/items/1")).unwrap();
         let action = engine.action().unwrap();
         let _ticket = drive_to_commit(&mut engine, action);
+        assert!(
+            engine
+                .testing_history_capability_snapshot()
+                .has_exactly_one_owner()
+        );
         let isolated = std::cell::Cell::new(false);
 
         engine
@@ -7926,6 +9400,8 @@ mod tests {
             .unwrap();
 
         assert!(isolated.get());
+        assert!(!engine.testing_history_capability_snapshot().has_owner());
+        assert!(engine.testing_history_drift_evidence_snapshot().is_none());
         assert!(!issuer.has_current());
         assert_eq!(
             engine.availability(),
@@ -8000,6 +9476,137 @@ mod tests {
     }
 
     #[test]
+    fn failed_authority_source_selection_uses_exact_roots_not_entity_count() {
+        let mut engine = RouterEngine::install(
+            reconciliation_tree(),
+            RouteViewKey::new("fallback").unwrap(),
+        )
+        .unwrap();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+        let token = engine.request_host_admission(&mut issuer).unwrap();
+        let grant = engine.grant_host_admission(&mut issuer, &token).unwrap();
+        let confirmation = issuer.confirm(&grant).unwrap();
+        engine.confirm_host(&issuer, &confirmation).unwrap();
+        let lease = confirmation.into_lease();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("failed source fixture requires one exact frame task")
+        };
+        let trigger = engine
+            .failed_authority_trigger_for_task(task.identity())
+            .unwrap();
+        let roots = vec![task.frame_version().clone()];
+        let digest = manifest_digest(0xA570);
+        let expected = CleanupBatchToken::sealed(
+            task.identity().clone(),
+            engine.current.as_ref().unwrap().cleanup_batch,
+            &roots,
+            digest,
+            0,
+        );
+
+        let cleanup = engine
+            .begin_failed_authority_settlement_retaining(
+                &mut issuer,
+                lease,
+                trigger,
+                CleanupManifestSeal::new(roots, digest, 0),
+                |_, _| {},
+            )
+            .expect("exact logical target selection is independent of ECS entity count");
+
+        assert_eq!(cleanup, expected);
+        assert!(matches!(
+            engine.current.as_ref().map(|current| &current.stage),
+            Some(WorkStage::FailureCleanupPrepared {
+                continuation: super::FailureCleanupContinuation::AuthoritySettlement,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn failure_cleanup_roots_count_and_continuation_are_independent() {
+        fn pending_failure(
+            roots: Vec<RouteFrameVersion>,
+            continuation: super::FailureCleanupContinuation,
+        ) -> (RouterEngine, super::FailureCleanupRequest) {
+            let mut engine = ready_engine();
+            engine.push(RouteLocation::new("/items/1")).unwrap();
+            let request = engine.begin_failure_cleanup_with_roots(
+                super::PendingFailureKind::Apply,
+                NavigationFailure::new(
+                    NavigationFailureKind::Apply,
+                    "independent cleanup manifest fixture",
+                ),
+                continuation,
+                roots,
+            );
+            (engine, request)
+        }
+
+        let (mut empty, empty_request) =
+            pending_failure(Vec::new(), super::FailureCleanupContinuation::Terminal);
+        let empty_digest = manifest_digest(0xC1EA);
+        let empty_expected = CleanupBatchToken::sealed(
+            empty_request.identity.clone(),
+            empty.current.as_ref().unwrap().cleanup_batch,
+            &[],
+            empty_digest,
+            2,
+        );
+        let empty_cleanup = empty
+            .prepare_failure_cleanup(
+                empty_request,
+                CleanupManifestSeal::new(Vec::new(), empty_digest, 2),
+            )
+            .unwrap();
+        assert_eq!(empty_cleanup, empty_expected);
+        assert!(matches!(
+            empty.current.as_ref().map(|current| &current.stage),
+            Some(WorkStage::FailureCleanupPrepared {
+                continuation: super::FailureCleanupContinuation::Terminal,
+                ..
+            })
+        ));
+
+        let mut roots_engine = ready_engine();
+        roots_engine.push(RouteLocation::new("/items/1")).unwrap();
+        let root = roots_engine.current.as_ref().unwrap().target_frames[0].clone();
+        let roots_request = roots_engine.begin_failure_cleanup_with_roots(
+            super::PendingFailureKind::Apply,
+            NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "zero entity obligation fixture",
+            ),
+            super::FailureCleanupContinuation::BeginFallback,
+            vec![root.clone()],
+        );
+        let roots_digest = manifest_digest(0xC1EB);
+        let roots_expected = CleanupBatchToken::sealed(
+            roots_request.identity.clone(),
+            roots_engine.current.as_ref().unwrap().cleanup_batch,
+            std::slice::from_ref(&root),
+            roots_digest,
+            0,
+        );
+        let roots_cleanup = roots_engine
+            .prepare_failure_cleanup(
+                roots_request,
+                CleanupManifestSeal::new(vec![root], roots_digest, 0),
+            )
+            .expect("logical cleanup roots do not imply an ECS entity obligation");
+        assert_eq!(roots_cleanup, roots_expected);
+        assert!(matches!(
+            roots_engine.current.as_ref().map(|current| &current.stage),
+            Some(WorkStage::FailureCleanupPrepared {
+                continuation: super::FailureCleanupContinuation::BeginFallback,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn failure_cleanup_request_stage_manifest_and_replay_are_exact_zero_write() {
         let mut engine = ready_engine();
         let (_request, parent, mount) = begin_nested_mount(&mut engine, Vec::new());
@@ -8008,17 +9615,6 @@ mod tests {
             .unwrap();
         let exact = failure.testing_duplicate();
         let replay = failure.testing_duplicate();
-
-        let incoherent = failure.testing_duplicate();
-        let before = engine.snapshot();
-        assert_eq!(
-            engine.prepare_failure_cleanup(
-                incoherent,
-                CleanupManifestSeal::new(vec![parent.clone()], manifest_digest(133), 0),
-            ),
-            Err(super::FailureCleanupError::InvalidManifest)
-        );
-        assert_eq!(engine.snapshot(), before);
 
         let mut cross_router = failure.testing_duplicate();
         cross_router
@@ -8474,5 +10070,124 @@ mod tests {
                 NavigationTraceEventKind::CleanupSettled,
             ]
         );
+    }
+
+    #[test]
+    fn replace_failure_and_fallback_never_publish_history() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let history_before = engine.testing_history_authority_snapshot();
+
+        let request = engine
+            .replace(RouteLocation::new("/items/2"))
+            .expect("replace must reserve one exact normal attempt");
+        let EngineAction::FrameTask(normal) = engine.action().unwrap() else {
+            panic!("replace must issue its changed frame task")
+        };
+        let failure = engine
+            .begin_view_report(normal.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Build,
+                "replace build failed",
+            ))
+            .expect("replace failure must retain exact cleanup authority");
+        let cleanup = prepare_failure_cleanup(&mut engine, failure, 227, 0);
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
+            panic!("settled replace failure must issue the fallback branch")
+        };
+        engine
+            .begin_view_report(fallback.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Build,
+                "replace fallback failed",
+            ));
+
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::RecoveryFailed
+        ));
+        assert_eq!(engine.testing_history_authority_snapshot(), history_before);
+        assert!(
+            engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .all(|event| event.kind() != NavigationTraceEventKind::CommitPublished)
+        );
+    }
+
+    #[test]
+    fn replace_publication_updates_active_and_history_once() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let active_before = engine.active().clone();
+        let history_before = engine.testing_history_authority_snapshot();
+
+        let request = engine
+            .replace(RouteLocation::new("/items/2"))
+            .expect("replace must enqueue");
+        let action = engine.action().expect("replace must produce work");
+        let ticket = drive_to_commit(&mut engine, action);
+        let sealed = seal_current(&mut engine, ticket);
+        let prepared = engine.prepare_publication(sealed).unwrap();
+
+        assert_eq!(engine.active(), &active_before);
+        assert_eq!(engine.testing_history_authority_snapshot(), history_before);
+
+        engine.publish_prepared(prepared, || {}).unwrap();
+
+        assert_eq!(
+            engine.active().location(),
+            Some(&RouteLocation::new("/items/2"))
+        );
+        assert_eq!(
+            engine.history().current(),
+            Some(&RouteLocation::new("/items/2"))
+        );
+        let history_after = engine.testing_history_authority_snapshot();
+        assert_ne!(history_after.revision(), history_before.revision());
+        assert_eq!(history_after.committed_by(), Some(request));
+        assert_eq!(
+            engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::CommitPublished)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn replace_identity_exhaustion_is_complete_zero_change() {
+        for counter in [
+            ReservationCounter::Request,
+            ReservationCounter::Transaction,
+            ReservationCounter::FrameTask,
+            ReservationCounter::CandidateFrame,
+            ReservationCounter::CleanupBatch,
+        ] {
+            let mut engine = ready_engine();
+            engine.push(RouteLocation::new("/items/1")).unwrap();
+            settle_current(&mut engine);
+            engine.testing_exhaust_reservation_counter(counter);
+            let before = engine.snapshot();
+
+            assert_eq!(
+                engine.replace(RouteLocation::new("/items/2")),
+                Err(PushError::IdExhausted),
+                "counter: {counter:?}"
+            );
+            assert_eq!(engine.snapshot(), before, "counter: {counter:?}");
+        }
     }
 }

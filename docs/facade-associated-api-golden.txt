@@ -830,6 +830,8 @@ ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | var
 ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | variant | HostUnavailable
 ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | variant | AuthorityRecovering
 ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | variant | NoBackEntry
+# active contract delta: NavigationEnqueueErrorKind::IdentityExhausted
+ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | variant | IdentityExhausted
 ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | trait-impl | impl Clone for Self
 ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | trait-impl | impl Copy for Self
 ecs | bevy_ui_router::ecs::NavigationEnqueueErrorKind | bevy_ui_router_ecs | trait-impl | impl Debug for Self

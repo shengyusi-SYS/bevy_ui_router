@@ -636,7 +636,6 @@ History 开始时保留以下 exclusions
 | symbol | `bevy_ui_router::ecs::QuarantineSnapshot` | Authority closure |
 | symbol | `bevy_ui_router::ecs::RouterInputModality` | Authority closure |
 | symbol | `bevy_ui_router::ecs::RouterInputProbes` | Authority closure |
-| associated | `bevy_ui_router::ecs::RouterNavigation::replace` | History |
 | associated | `bevy_ui_router::ecs::RouterNavigation::back` | History |
 | associated | `bevy_ui_router::core::RouteNodeOptions::with_error_boundary` | Recovery |
 | associated | `bevy_ui_router::core::RouteNodeOptions::with_error_view` | Recovery |
@@ -657,7 +656,7 @@ History rows 只能在 owning slice 的真实 RED/GREEN、public journey 与 rev
 | Item | Owning slice | State | Claim boundary |
 | --- | --- | --- | --- |
 | `NavigationRequestSnapshot::requested -> Option` | Back execution | planned | Back execution public contract PASS |
-| `NavigationEnqueueErrorKind::IdentityExhausted` | Replace | planned | allocator-derived public RED/GREEN PASS |
+| `NavigationEnqueueErrorKind::IdentityExhausted` | Replace | active | allocator-derived public RED/GREEN PASS |
 | late-bound back complete evidence | Back failure | planned | complete C3 two-branch PASS |
 
 `State` vocabulary 固定为 `planned | active`

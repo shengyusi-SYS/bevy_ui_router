@@ -811,11 +811,6 @@ fn validate_exclusion_vocabulary(exclusions: &[TableRow]) {
         ),
         (
             "associated",
-            "bevy_ui_router::ecs::RouterNavigation::replace",
-            "History",
-        ),
-        (
-            "associated",
             "bevy_ui_router::ecs::RouterNavigation::back",
             "History",
         ),
@@ -837,7 +832,7 @@ fn validate_exclusion_vocabulary(exclusions: &[TableRow]) {
     ]);
     assert_eq!(
         actual, expected,
-        "Nested profile exclusion path/slice mapping drifted"
+        "History profile exclusion path/slice mapping drifted"
     );
 }
 
