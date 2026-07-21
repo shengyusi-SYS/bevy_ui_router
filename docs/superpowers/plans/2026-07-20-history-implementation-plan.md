@@ -877,73 +877,11 @@ Move the existing `RequiredResourceSet`、`LifecyclePreflightSource`、`Lifecycl
 - update `navigation.rs` imports explicitly; `cleanup.rs` imports the shared types only when Step 8 begins using them
 - do not re-export the types from the crate or facade
 
-Add the shared four-way owner-preserving outcome and exact retry evidence without wiring Back behavior
-
-```rust
-pub(crate) enum LifecyclePreparationOutcome<Ready, Owner> {
-    Ready(Ready),
-    PendingRejected {
-        owner: Owner,
-        evidence: LifecyclePreflightEvidence,
-    },
-    AuthorityLost {
-        owner: Owner,
-        evidence: LifecyclePreflightEvidence,
-    },
-    RetryablePreparationFailure {
-        owner: Owner,
-        evidence: PreparationRetryEvidence,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PreparationCapacityDomain(u64);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PreparationReclaimOwner {
-    domain: PreparationCapacityDomain,
-    identity: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PreparationReleaseGeneration(u64);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PreparationHostEpoch {
-    router: RouterIdentity,
-    host: RouteHostId,
-    epoch: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum OutstandingBoundaryProducer {
-    Action(u64),
-    Ticket(u64),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PreparationRetryEvidence {
-    RetryableCapacity {
-        domain: PreparationCapacityDomain,
-        reclaim_owner: PreparationReclaimOwner,
-        release_generation: PreparationReleaseGeneration,
-    },
-    UnfinalizedBoundaryFacts {
-        request: NavigationRequestId,
-        transaction: TransactionId,
-        host_epoch: PreparationHostEpoch,
-        outstanding: OutstandingBoundaryProducer,
-    },
-}
-```
-
 Expose the module only as crate-private from `lib.rs`
 
-`Owner` must contain the unique opaque Core-issued neutral continuation capacity for every branch once Back wiring begins
+Keep this commit purely mechanical
 
-The capacity binds source scope before physical classification but does not preselect success, failure or authority semantics
-
-The shared outcome never creates a second ECS continuation enum and every retry returns the same owner with its capacity intact
+Do not add `LifecyclePreparationOutcome` or retry evidence until the Step 7 compile scaffold, where they can bind a Core-issued opaque boundary scope rather than naming private `RouterIdentity` or `TransactionId` types from ECS
 
 Run the existing preflight and authority tests before adding any optional-request, admission, capacity or Back RED
 
@@ -1125,6 +1063,12 @@ Rules
 Define the ECS capacity owner before wiring the facade flow
 
 ```rust
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparationCapacityDomain(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparationReleaseGeneration(u64);
+
 pub(crate) struct EcsCleanupCapacityReservation {
     domain: PreparationCapacityDomain,
     owner: BackCapacityOwnerId,
@@ -1292,6 +1236,21 @@ Expected: every command exits `0` before no-target work begins
 
 - [ ] **Step 7: Write manifest-neutral capacity and pure no-target RED tests**
 
+Before adding the test bodies, introduce only the opaque type and function-signature shapes specified in Step 8
+
+- add `PreparationBoundaryScopeView`, `LifecyclePreparationOutcome`, `PreparationReclaimOwner`, `PreparationHostEpoch`, `OutstandingBoundaryProducer` and `PreparationRetryEvidence`
+- add the target/no-target preparation owner and projection shapes referenced by the tests
+- add only fail-closed zero-write bodies for new production predicates required to compile the tests
+- do not wire target/no-target branch behavior, continuation conversion or publication
+
+First prove that the focused RED tests compile
+
+```powershell
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib --no-run -j 1
+```
+
+Missing symbols, test setup failures and injected classifications do not count as semantic RED
+
 Add tests in cleanup/navigation
 
 | Test | Required setup and assertion |
@@ -1320,7 +1279,73 @@ Expected: compilation succeeds; the two capacity shape/burn tests may already pa
 
 - [ ] **Step 8: Implement unified target and no-target preparation ownership**
 
-Use the shared outcome for both resolved-target and no-target preparation
+Complete the previously scaffolded non-authorizing Core integration projection
+
+```rust
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparationBoundaryScopeView {
+    inner: CorePreparationBoundaryScopeProjection,
+}
+```
+
+The private projection binds exact router, request, transaction and either the normal attempt or target-free cleanup batch from `LifecycleContinuationCapacity`
+
+It has no public constructor, raw identity accessor or facade re-export and cannot mint, convert or consume a continuation owner
+
+Complete the previously scaffolded four-way owner-preserving outcome and exact retry evidence
+
+```rust
+pub(crate) enum LifecyclePreparationOutcome<Ready, Owner> {
+    Ready(Ready),
+    PendingRejected {
+        owner: Owner,
+        evidence: LifecyclePreflightEvidence,
+    },
+    AuthorityLost {
+        owner: Owner,
+        evidence: LifecyclePreflightEvidence,
+    },
+    RetryablePreparationFailure {
+        owner: Owner,
+        evidence: PreparationRetryEvidence,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparationReclaimOwner {
+    domain: PreparationCapacityDomain,
+    identity: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparationHostEpoch {
+    scope: PreparationBoundaryScopeView,
+    host: RouteHostId,
+    epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OutstandingBoundaryProducer {
+    Action(u64),
+    Ticket(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreparationRetryEvidence {
+    RetryableCapacity {
+        domain: PreparationCapacityDomain,
+        reclaim_owner: PreparationReclaimOwner,
+        release_generation: PreparationReleaseGeneration,
+    },
+    UnfinalizedBoundaryFacts {
+        host_epoch: PreparationHostEpoch,
+        outstanding: OutstandingBoundaryProducer,
+    },
+}
+```
+
+Implement the shared outcome for both resolved-target and no-target preparation
 
 ```rust
 pub(crate) struct ProvenEmptyProjection {
@@ -1496,8 +1521,10 @@ Required Core/ECS handoff
 - it contains no success, failure, authority or no-target branch selector
 - ECS cannot construct, clone, inspect or infer any converted Core continuation
 - Core conversion methods consume the capacity with the typed outcome, exact current request stage/authority and boundary evidence; Core alone selects and freezes the branch cause
+- before conversion, Core exact-compares the evidence scope with a fresh projection of the consumed capacity; another valid scope is rejected as zero-write cross-scope substitution
 - ECS cannot provide an arbitrary terminal cause
 - every ready, pending, authority-loss or retry branch moves the same capacity; no ECS continuation type exists
+- Core derives `PreparationBoundaryScopeView` from the exact continuation capacity before physical classification; ECS combines it with the exact host epoch and cannot substitute a raw router, request or transaction identity
 - target `Ready` converts capacity into `PreparedPostCommitContinuationOwner`, which remains in the move-only prepared/sealed publication through atomic publish and postcommit cleanup
 - no-target `Ready` converts capacity and stores it in Core `PendingBackNoTargetCompletion` before returning the cleanup action; the action carries no continuation authority
 - ECS binds the exact request reservation to `CleanupOwner::BackNoTarget`
