@@ -13,7 +13,7 @@ use bevy_ui_router_core::prelude::{
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NavigationRequestSnapshot {
-    requested: RouteLocation,
+    requested: Option<RouteLocation>,
     matched: Option<RouteBranchFingerprint>,
     status: RequestStatus,
     trace: Vec<NavigationTraceEvent>,
@@ -22,7 +22,7 @@ pub struct NavigationRequestSnapshot {
 
 impl NavigationRequestSnapshot {
     fn new(
-        requested: RouteLocation,
+        requested: Option<RouteLocation>,
         matched: Option<RouteBranchFingerprint>,
         status: RequestStatus,
         trace: Vec<NavigationTraceEvent>,
@@ -37,8 +37,8 @@ impl NavigationRequestSnapshot {
         }
     }
 
-    pub fn requested(&self) -> &RouteLocation {
-        &self.requested
+    pub fn requested(&self) -> Option<&RouteLocation> {
+        self.requested.as_ref()
     }
 
     pub fn matched(&self) -> Option<&RouteBranchFingerprint> {
@@ -210,7 +210,7 @@ impl RouterSnapshots {
                     router: entry.handle,
                     request: *request,
                     snapshot: NavigationRequestSnapshot::new(
-                        view.requested().clone(),
+                        view.requested().cloned(),
                         view.matched().cloned(),
                         view.status().clone(),
                         view.trace().to_vec(),
@@ -340,14 +340,14 @@ mod tests {
 
         let requested = RouteLocation::new("/settings");
         let snapshot = NavigationRequestSnapshot::new(
-            requested.clone(),
+            Some(requested.clone()),
             None,
             RequestStatus::Queued,
             Vec::new(),
             Vec::new(),
         );
 
-        assert_eq!(snapshot.requested(), &requested);
+        assert_eq!(snapshot.requested(), Some(&requested));
         assert_eq!(snapshot.matched(), None);
         assert_eq!(snapshot.status(), &RequestStatus::Queued);
         assert!(snapshot.trace().is_empty());
@@ -398,7 +398,7 @@ mod tests {
             router,
             request: newest,
             snapshot: NavigationRequestSnapshot::new(
-                newest_view.requested().clone(),
+                newest_view.requested().cloned(),
                 newest_view.matched().cloned(),
                 newest_view.status().clone(),
                 newest_view.trace().to_vec(),

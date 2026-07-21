@@ -1138,7 +1138,7 @@ impl NavigationRequestView<'_> {
         self.record.id()
     }
 
-    pub fn requested(&self) -> &RouteLocation {
+    pub fn requested(&self) -> Option<&RouteLocation> {
         self.record.requested()
     }
 

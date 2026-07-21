@@ -994,10 +994,13 @@ fn history_replace_f3_canonical_path_preserves_search_and_fragment() {
     let replacement = replace_and_settle(&mut fixture.app, fixture.router, target.clone(), None);
     let request = request_snapshot(&fixture.app, fixture.router, replacement);
     assert_succeeded(&request);
-    assert_eq!(request.requested(), &target);
-    assert_eq!(request.requested().path(), "/items/2");
-    assert_eq!(request.requested().search(), Some("?tag=a&tag=b"));
-    assert_eq!(request.requested().fragment(), Some("#details"));
+    assert_eq!(request.requested(), Some(&target));
+    let requested = request
+        .requested()
+        .expect("a replace request retains its canonical target");
+    assert_eq!(requested.path(), "/items/2");
+    assert_eq!(requested.search(), Some("?tag=a&tag=b"));
+    assert_eq!(requested.fragment(), Some("#details"));
     let after = router_snapshot(&fixture.app, fixture.router);
     assert_eq!(after.active().location(), Some(&target));
     assert_eq!(after.history().current(), Some(&target));

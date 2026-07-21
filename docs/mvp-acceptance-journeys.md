@@ -50,7 +50,7 @@ Facade journey 的“稳定”只依赖生产观察面：该 router 没有 runni
 - **When**：执行 `replace(RouteLocation::new("/items/3"))`，成功后执行 `back()`。
 - **Then**：两次命令都经过 match、plan、staged apply 和 atomic switch；replace 的 request snapshot 从 enqueue 起为 `requested=Some(/items/3)`；back 在 running resolution 后冻结为 `requested=Some(/items/1)`。replace 后 history 为 `/items/1`, `/items/3`；back 成功后 active/history current 均为 `/items/1`；每次都保留 layout、替换 leaf。
 
-`NavigationRequestSnapshot::requested -> Option` — PLANNED（Back execution；不计入 Replace PASS）
+`NavigationRequestSnapshot::requested -> Option` — ACTIVE（Back execution；owning boundary 为 `Back execution public contract PASS`，当前不声明 Back execution、History 或 MVP 整体通过）
 
 ### Journey C2：失败 back
 

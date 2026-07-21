@@ -67,19 +67,22 @@ pub enum RequestStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NavigationRequestRecord {
     id: NavigationRequestId,
-    requested: RouteLocation,
+    requested: Option<RouteLocation>,
     matched: Option<RouteBranchFingerprint>,
     status: RequestStatus,
     trace: NavigationTraceLog,
     diagnostics: Vec<DiagnosticEvent>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequestedTargetAlreadyResolved;
+
 impl NavigationRequestRecord {
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn new(id: NavigationRequestId, requested: RouteLocation) -> Self {
+    pub(crate) fn with_resolved_target(id: NavigationRequestId, requested: RouteLocation) -> Self {
         Self {
             id,
-            requested,
+            requested: Some(requested),
             matched: None,
             status: RequestStatus::Queued,
             trace: NavigationTraceLog::new(),
@@ -88,13 +91,37 @@ impl NavigationRequestRecord {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn unresolved_back(id: NavigationRequestId) -> Self {
+        Self {
+            id,
+            requested: None,
+            matched: None,
+            status: RequestStatus::Queued,
+            trace: NavigationTraceLog::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resolve_requested_once(
+        &mut self,
+        requested: RouteLocation,
+    ) -> Result<(), RequestedTargetAlreadyResolved> {
+        if self.requested.is_some() {
+            return Err(RequestedTargetAlreadyResolved);
+        }
+        self.requested = Some(requested);
+        Ok(())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn id(&self) -> NavigationRequestId {
         self.id
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) const fn requested(&self) -> &RouteLocation {
-        &self.requested
+    pub(crate) const fn requested(&self) -> Option<&RouteLocation> {
+        self.requested.as_ref()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -197,12 +224,58 @@ mod tests {
     use crate::trace::NavigationTraceEventKind;
 
     fn record() -> NavigationRequestRecord {
+        NavigationRequestRecord::with_resolved_target(request_id(), RouteLocation::new("/items/7"))
+    }
+
+    fn request_id() -> NavigationRequestId {
         let mut ids = CoreIdAllocator::new().unwrap();
         let router = ids.allocate_router_identity().unwrap();
-        NavigationRequestRecord::new(
-            ids.allocate_request(router).unwrap(),
-            RouteLocation::new("/items/7"),
-        )
+        ids.allocate_request(router).unwrap()
+    }
+
+    #[test]
+    fn queued_back_projects_no_requested_target() {
+        let queued_back = NavigationRequestRecord::unresolved_back(request_id());
+
+        assert_eq!(queued_back.status(), &RequestStatus::Queued);
+        assert_eq!(queued_back.requested(), None);
+    }
+
+    #[test]
+    fn running_back_projects_resolved_requested_target() {
+        let target = RouteLocation::new("/items/1");
+        let mut running_back = NavigationRequestRecord::unresolved_back(request_id());
+        running_back.resolve_requested_once(target.clone()).unwrap();
+        assert_eq!(
+            running_back.resolve_requested_once(RouteLocation::new("/items/2")),
+            Err(RequestedTargetAlreadyResolved)
+        );
+        running_back
+            .transition(RequestStatus::Running(NavigationPhase::Matching))
+            .unwrap();
+
+        assert_eq!(running_back.requested(), Some(&target));
+
+        running_back
+            .transition(RequestStatus::Failed(NavigationFailure::new(
+                NavigationFailureKind::Build,
+                "resolved back target failed",
+            )))
+            .unwrap();
+        assert_eq!(running_back.requested(), Some(&target));
+    }
+
+    #[test]
+    fn terminal_no_target_back_projects_no_requested_target() {
+        let mut terminal_no_target = NavigationRequestRecord::unresolved_back(request_id());
+        terminal_no_target
+            .transition(RequestStatus::Failed(NavigationFailure::new(
+                NavigationFailureKind::BackTargetUnavailable,
+                "no previous history entry",
+            )))
+            .unwrap();
+
+        assert_eq!(terminal_no_target.requested(), None);
     }
 
     #[test]
@@ -222,10 +295,10 @@ mod tests {
     fn request_record_projects_identity_match_status_and_diagnostics() {
         let mut record = record();
         let id = record.id;
-        let requested = record.requested.clone();
+        let requested = record.requested().cloned().unwrap();
 
         assert_eq!(record.id(), id);
-        assert_eq!(record.requested(), &requested);
+        assert_eq!(record.requested(), Some(&requested));
         assert!(record.matched().is_none());
         assert_eq!(record.status(), &RequestStatus::Queued);
         assert!(record.diagnostics().is_empty());

@@ -77,5 +77,5 @@ fn root_push_is_reachable_only_through_the_public_facade() {
     let RequestLookup::Found(snapshot) = snapshots.request(router, request) else {
         panic!("root request should be retained")
     };
-    assert_eq!(snapshot.requested(), &RouteLocation::new("/"));
+    assert_eq!(snapshot.requested(), Some(&RouteLocation::new("/")));
 }

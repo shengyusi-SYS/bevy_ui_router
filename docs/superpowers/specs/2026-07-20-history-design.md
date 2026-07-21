@@ -655,7 +655,7 @@ History rows 只能在 owning slice 的真实 RED/GREEN、public journey 与 rev
 
 | Item | Owning slice | State | Claim boundary |
 | --- | --- | --- | --- |
-| `NavigationRequestSnapshot::requested -> Option` | Back execution | planned | Back execution public contract PASS |
+| `NavigationRequestSnapshot::requested -> Option` | Back execution | active | Back execution public contract PASS |
 | `NavigationEnqueueErrorKind::IdentityExhausted` | Replace | active | allocator-derived public RED/GREEN PASS |
 | late-bound back complete evidence | Back failure | planned | complete C3 two-branch PASS |
 

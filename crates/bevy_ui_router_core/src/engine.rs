@@ -1654,7 +1654,9 @@ impl RouterEngine {
             }
         };
         self.records
-            .push_back(NavigationRequestRecord::new(request, location));
+            .push_back(NavigationRequestRecord::with_resolved_target(
+                request, location,
+            ));
         self.highest_issued = Some(request.sequence());
         self.queue.push_back(QueuedNavigation {
             request,
@@ -3044,7 +3046,7 @@ impl RouterEngine {
     pub(crate) fn requested(&self) -> Option<&RouteLocation> {
         self.running_request()
             .and_then(|request| self.request(request))
-            .map(NavigationRequestRecord::requested)
+            .and_then(NavigationRequestRecord::requested)
     }
 
     pub(crate) fn reconciliation_projection_for(
@@ -3743,7 +3745,8 @@ impl RouterEngine {
             .request(request)
             .expect("recovering request is retained")
             .requested()
-            .clone();
+            .cloned()
+            .expect("a recovering push or replace retains its requested target");
         let host = self
             .state
             .host()
@@ -4152,7 +4155,8 @@ impl RouterEngine {
             .request(request)
             .expect("running record is retained")
             .requested()
-            .clone();
+            .cloned()
+            .expect("a publishable request has resolved its requested target");
 
         let mut state = self.state.clone();
         let (active, active_branch, active_child_slots) = match &current.attempt {
@@ -5945,7 +5949,7 @@ mod tests {
 
         assert_ne!(request, queued);
         assert_eq!(
-            engine.request(request).unwrap().requested().path(),
+            engine.request(request).unwrap().requested().unwrap().path(),
             "/items/1"
         );
         assert_eq!(

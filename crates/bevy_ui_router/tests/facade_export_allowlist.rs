@@ -15,7 +15,7 @@ const BEVY_VERSION: &str = "0.19.0";
 const DEPENDENCY_SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
 
 #[test]
-fn history_profile_has_exact_replace_slice_machine_state() {
+fn history_profile_has_exact_back_execution_slice_machine_state() {
     let profile = history_contract_profile();
     assert_eq!(profile.exclusions.len(), 11);
     assert_eq!(profile.contract_deltas.len(), 3);
@@ -26,7 +26,7 @@ fn history_profile_has_exact_replace_slice_machine_state() {
             .map(|row| (row.item.as_str(), row.state.as_str()))
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from([
-            ("NavigationRequestSnapshot::requested -> Option", "planned",),
+            ("NavigationRequestSnapshot::requested -> Option", "active",),
             ("NavigationEnqueueErrorKind::IdentityExhausted", "active",),
             ("late-bound back complete evidence", "planned"),
         ])
