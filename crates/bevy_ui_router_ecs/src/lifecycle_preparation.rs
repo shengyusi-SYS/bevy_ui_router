@@ -86,14 +86,17 @@ impl LifecyclePreflightEvidence {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn source(self) -> LifecyclePreflightSource {
         self.source
     }
 
+    #[cfg(test)]
     pub(crate) const fn expectation(self) -> LifecyclePreflightExpectation {
         self.expectation
     }
 
+    #[cfg(test)]
     pub(crate) const fn observed(self) -> LifecyclePreflightObserved {
         self.observed
     }
