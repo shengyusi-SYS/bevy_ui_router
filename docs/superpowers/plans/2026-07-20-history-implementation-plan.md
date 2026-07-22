@@ -849,6 +849,7 @@ git commit -m "feat: add exact replace history flow"
 **Files**
 
 - Modify: `crates/bevy_ui_router_core/src/history_authority.rs`
+- Modify: `crates/bevy_ui_router_core/src/ids.rs`
 - Modify: `crates/bevy_ui_router_core/src/route_tree.rs`
 - Modify: `crates/bevy_ui_router_core/src/matcher.rs`
 - Modify: `crates/bevy_ui_router_core/src/request.rs`
@@ -860,10 +861,13 @@ git commit -m "feat: add exact replace history flow"
 - Modify: `crates/bevy_ui_router_ecs/src/app_ext.rs`
 - Create: `crates/bevy_ui_router_ecs/src/lifecycle_preparation.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/lib.rs`
+- Create: `crates/bevy_ui_router_ecs/src/test_support.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/branch_transaction.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/cleanup.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/navigation.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/snapshots.rs`
+- Modify: `crates/bevy_ui_router_ecs/tests/dependency_boundary.rs`
+- Modify: `crates/bevy_ui_router_ecs/tests/authority_regression_catalogue.rs`
 - Modify: `crates/bevy_ui_router/tests/public_navigation_journeys.rs`
 - Modify: `crates/bevy_ui_router/tests/public_navigation_authority_audit.rs`
 - Modify: `crates/bevy_ui_router/tests/support/facade_contract_cases.rs`
@@ -2226,7 +2230,7 @@ Reviewers verify
 - protected sparse topology remains zero-write
 
 ```powershell
-git add -- crates/bevy_ui_router_core/src/history_authority.rs crates/bevy_ui_router_core/src/route_tree.rs crates/bevy_ui_router_core/src/matcher.rs crates/bevy_ui_router_core/src/request.rs crates/bevy_ui_router_core/src/trace.rs crates/bevy_ui_router_core/src/engine.rs crates/bevy_ui_router_core/src/integration.rs crates/bevy_ui_router_core/src/test_support.rs crates/bevy_ui_router_ecs/Cargo.toml crates/bevy_ui_router_ecs/src/lifecycle_preparation.rs crates/bevy_ui_router_ecs/src/lib.rs crates/bevy_ui_router_ecs/src/branch_transaction.rs crates/bevy_ui_router_ecs/src/cleanup.rs crates/bevy_ui_router_ecs/src/navigation.rs crates/bevy_ui_router_ecs/src/snapshots.rs crates/bevy_ui_router_ecs/tests/authority_regression_catalogue.rs crates/bevy_ui_router/tests/public_navigation_journeys.rs crates/bevy_ui_router/tests/public_navigation_authority_audit.rs crates/bevy_ui_router/tests/support/facade_contract_cases.rs docs/facade-associated-api-golden.txt docs/superpowers/specs/2026-07-20-history-design.md
+git add -- crates/bevy_ui_router_core/src/history_authority.rs crates/bevy_ui_router_core/src/ids.rs crates/bevy_ui_router_core/src/route_tree.rs crates/bevy_ui_router_core/src/matcher.rs crates/bevy_ui_router_core/src/request.rs crates/bevy_ui_router_core/src/trace.rs crates/bevy_ui_router_core/src/engine.rs crates/bevy_ui_router_core/src/integration.rs crates/bevy_ui_router_core/src/test_support.rs crates/bevy_ui_router_ecs/Cargo.toml crates/bevy_ui_router_ecs/src/app_ext.rs crates/bevy_ui_router_ecs/src/lifecycle_preparation.rs crates/bevy_ui_router_ecs/src/lib.rs crates/bevy_ui_router_ecs/src/test_support.rs crates/bevy_ui_router_ecs/src/branch_transaction.rs crates/bevy_ui_router_ecs/src/cleanup.rs crates/bevy_ui_router_ecs/src/navigation.rs crates/bevy_ui_router_ecs/src/snapshots.rs crates/bevy_ui_router_ecs/tests/dependency_boundary.rs crates/bevy_ui_router_ecs/tests/authority_regression_catalogue.rs crates/bevy_ui_router/tests/public_navigation_journeys.rs crates/bevy_ui_router/tests/public_navigation_authority_audit.rs crates/bevy_ui_router/tests/support/facade_contract_cases.rs docs/facade-associated-api-golden.txt docs/superpowers/specs/2026-07-20-history-design.md
 git diff --cached --name-only
 git commit -m "feat: add late-bound back execution"
 ```
