@@ -184,6 +184,14 @@ entry install 只由 domain issuer 签发不可复用的 capacity domain，不�
 
 exact retire 烧毁 owner、推进 generation 并把同一 cell 原位归还 `Free`；no-target transfer 把同一 cell 转为 `Leased`，canonical-zero 只在该 cell 内安装安全初始化的 empty ledger。generation 没有后继时，该 cell 永久退出可复用集合，后续 reservation 只能 grow 新 cell。该路径不使用 `unsafe`、未初始化 storage 或 unchecked initialization conversion；`EnqueueRejected` 只属于 unbound retire 参数，bound disposition 不包含 enqueue rejection
 
+allocator failure 或 Core token drift 后的 unbound retire 若理论上返回 `Rejected { owner, rejection, error }`，处理固定为
+
+- outcome 直接返还原 `EnqueueRejected`，不要求该值为 `Copy`，也不允许调用方旁存或重建
+- exact entry 把完整 owner、原 `EnqueueRejected` 与 retire error 移入唯一私有 fail-closed residual
+- 不得 panic、丢弃 owner 或映射为普通 exhaustion
+- residual 非空时当前及后续 Back 均沿用 exact-entry fail-closed gate 的 `HostUnavailable` typed return
+- 正常 allocator failure 成功 exact-retire 后仍返回 `IdentityExhausted`
+
 `BackAcceptedReservationView` 是 pre-resolution lineage，不绑定 normal attempt、eventual host/slot/frame/task/generation、destination 或 execution authority，也不能重建 Core owner
 
 Core 接受后 reservation 与 accepted view 绑定；live Core exact verify 命中 `NoTarget` 时才转为同一 issuer outstanding 的 `NoTargetCapacityPermit`，Core 失败则 identity 烧毁并释放容量
@@ -197,6 +205,30 @@ production issuer install 使用 typed `AlreadyInstalled | Reserve(error)` 结�
 `test-support` 的跨 crate 顺序证据由 Core doc-hidden channel factory 产生 layer-neutral sealed producer。只读 `BackCapacityOrderObserver` 只增加 `observes_same_journal(&self, other: &Self) -> bool`，以 `Arc::ptr_eq` 一类 opaque identity equality 判定 journal relation；它不暴露 raw journal/domain identity 或 producer，不能记录事件或授权 lifecycle work。安装只由 ECS owner test-support module 的 doc-hidden free function `testing_install_back_capacity_order_observer(&mut RouterNavigation, RouterHandle)` 提供，public audit 直接调用该 owner function；它不是 `RouterNavigation` associated API，不由 facade re-export，也不更新 facade golden
 
 installer 顺序唯一且固定：先拒绝 foreign domain；再解析 exact same-domain entry，缺失则拒绝 unknown；然后 preflight Core、issuer 与 facade 三个 producer slot 全部 vacant，任一 occupied 都以 `AlreadyInstalled` 拒绝；之后 Core factory 恰好调用一次，再把三个 sealed producer 不可失败地移动到同一 exact entry，最后返回 observer。factory creation 之后没有 validation、allocation 或其他 fallible installer，因此不引入 rollback。Step 6 micro-slice 3 只安装 empty channel：clone relation 为 true、两个 exact entry 的 independent observer relation 为 false，两个 snapshot 都为空，并且不记录 `Issued | Retired | TransferredNoTarget | BoundCanonicalZero | CoreAllocatorAttempt | CoreAllocatorFailure | FacadeTypedReturn`。这些真实顺序事件及 `RouterNavigation::back` 的 facade return record 全部由 micro-slice 4 实现。foreign/already-installed 由 public audit 证明，legitimately obtained foreign handle 来自第二个 App；same-domain unknown 由 ECS unit 使用既有内部 handle fixture 证明 factory closure 调用次数为零且 entry/producer slots 不变。所有拒绝均 typed、zero-write 且无 partial installation；Core 不命名 ECS type，测试只取得 observer/error，不取得 producer 或 write handle
+
+micro-slice 4 只在真实生产边界记录事件
+
+- `Issued` 位于 successful mint 之后，owner、generation 与 outstanding cell 已同时成立
+- `CoreAllocatorAttempt` 位于 exact admission refreeze 成功之后并紧邻真实 `reserve_navigation_branch`
+- `CoreAllocatorFailure` 只由该真实 reserve 的 `Err` 记录，stale/token drift 不记录 attempt 或 failure
+- `Retired` 只在 exact owner burn、generation advance 与 cell reclaim 全部成功后记录
+- `FacadeTypedReturn` 位于最外层 typed error return，且正常 allocator failure 路径上严格晚于 `Retired`
+
+ECS allocator failure gate 对 `TestingReservationCounter::ALL` 的每个真实 counter
+
+- 使用 fresh App 与 fresh observer
+- 证明 exact 五事件序列 `Issued → CoreAllocatorAttempt → CoreAllocatorFailure → Retired → FacadeTypedReturn`、原 owner 已烧毁、reclaim generation 已推进
+- 证明没有 ECS request、bound/pending reservation、public snapshot 或 World fingerprint 写入
+
+独立 Core private companion gate 同样遍历 `TestingReservationCounter::ALL`，每项使用 fresh engine 与 fresh observer
+
+- fault seam 生效后冻结 production-semantic full private snapshot，包含 allocator、queue、records、history、state/current/action/mount 等字段
+- observer journal 是 test-support 证据通道，不属于该 snapshot，也不得掩盖生产状态变化
+- 证明真实 allocator exhaustion 调用前后 full private snapshot 零写
+- 证明 stale/token drift 在同样零写前提下不产生 allocator attempt/failure
+- ECS 不新增 Core private snapshot accessor
+
+该证据只补全既有 Step 6，不新增路线图、第二 publisher、classification 注入或公共 API
 
 `NoBackEntry` 只优先于后续 `IdentityExhausted`，不能越过 router identity 或 availability gate
 

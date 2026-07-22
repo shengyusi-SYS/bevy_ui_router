@@ -1143,8 +1143,14 @@ pub(crate) struct BackCapacityRetirementEvidence { /* exact non-authorizing reti
 pub(crate) struct BackCapacityRetirementExpectation { /* move-only exact domain/owner/generation expectation; no registry mutation */ }
 pub(crate) struct BackCapacityTransferExpectation { /* move-only exact bound owner expectation; no registry mutation */ }
 pub(crate) struct BackCanonicalZeroExpectation { /* move-only exact permit/slot expectation; no registry mutation */ }
-pub(crate) enum BackCapacityRetireOutcome<Owner> { Retired(BackCapacityRetirementEvidence), Rejected { owner: Owner, error: BackCapacityRetireError } }
+pub(crate) enum BackCapacityRetireOutcome<Owner> { Retired(BackCapacityRetirementEvidence), Rejected { owner: Owner, rejection: EnqueueRejected, error: BackCapacityRetireError } }
 pub(crate) struct NoTargetCapacityPermit { capacity: EcsCleanupCapacityReservation }
+
+struct BackCapacityEnqueueRetireResidual {
+    owner: EcsCleanupCapacityReservation,
+    rejection: EnqueueRejected,
+    retire_error: BackCapacityRetireError,
+}
 
 impl BackCapacityIssuer {
     pub(crate) fn reserve(&mut self) -> Result<EcsCleanupCapacityReservation, BackCapacityReserveError>;
@@ -1228,6 +1234,10 @@ impl BackCapacityCoreProducer { pub fn allocator_attempt(&mut self); pub fn allo
 impl BackCapacityFacadeProducer { pub fn typed_return(&mut self); }
 
 // Production: every exact RouterEntry owns one issuer signed by the World domain issuer.
+struct RouterEntry {
+    /* existing fields + one exact-entry private slot; no parallel table */
+    back_capacity_enqueue_retire_residual: Option<BackCapacityEnqueueRetireResidual>,
+}
 impl RouterEntry {
     pub(crate) fn install_back_capacity_issuer(
         &mut self,
@@ -1286,6 +1296,12 @@ impl AcceptedBackReservation {
 - `reserve` reuses a `Free` cell or performs grow-on-demand. Growth must complete every fallible reservation for one fully initialized vacant cell and its exact outstanding registry entry before owner/generation mint. A real growth failure returns `LedgerSlotUnavailable` before Core allocator reach, with no mint and no semantic state write
 - after mint, bind、exact retire、no-target transfer and canonical-zero perform no allocation. Retire burns the owner、advances generation and returns the same cell to `Free`; no-target keeps the same cell `Leased`. A cell whose generation has no successor is sealed permanently and later reserve grows a fresh cell
 - `retire_unbound(..., EnqueueRejected)` handles Core token drift/allocator failure and preserves the original reservation on foreign/stale/replay; its success burns the identity before facade return
+- if `retire_unbound` theoretically returns `Rejected { owner, rejection, error }`
+  - return the original `EnqueueRejected` in the outcome without requiring `Copy` or caller-side storage/reconstruction
+  - move that owner、the original `EnqueueRejected` and retire error into the exact entry's single private fail-closed residual
+  - never panic、drop the owner or map this residual path to ordinary exhaustion
+  - reuse the exact-entry fail-closed gate's `HostUnavailable` typed return for the current and every later Back while the slot is occupied
+  - keep `IdentityExhausted` for a normal Core allocator failure whose exact retire succeeds
 - bound retirement accepts only target/contradiction/authority/permanent disposition; `EnqueueRejected` remains the separate argument of `retire_unbound`. Bound retirement、no-target transfer、no-target retirement and canonical-zero bind each expose a non-mutating exact preflight plus a locally infallible commit used only by the same helper-local closure; expectation and owner never enter an outcome、field、queue or later helper
 - all retire/transfer rejection variants return the original move-only owner; foreign domain、stale generation and replay cannot become `()`/bool, while success returns only non-authorizing retirement evidence and permanently burns the identity
 - `RouterNavigation` is already the unique ECS World Resource, so it owns the single persistent `back_capacity_domain_issuer` initialized by `RouterNavigation::new`. It owns no per-entry issuer field. During router install, construct the entire `RouterEntry` locally, ask the domain issuer to sign/install its non-reconstructible `BackCapacityIssuer`, and push the entry only after every install step succeeds. Failure maps `BackCapacityIssuerInstallError::Reserve` to existing `IntegrationError::Exhausted` and impossible local-entry `AlreadyInstalled` to existing `IntegrationError::Invalid`; it leaves no ghost entry or partially installed entry
@@ -1328,8 +1344,28 @@ Implement Step 6 as these ordered RED → GREEN micro-slices; do not batch later
 4. **Real Core allocator failure order**
    - RED `back_capacity_precedes_core_reservation_failure_evidence`
    - this is the first micro-slice that records real order events; it must not weaken the empty-channel evidence owned by micro-slice 3
-   - for every real Core request/transaction/batch/frame/task pool counter, record only production boundaries and assert `ECS issue → Core allocator attempt/failure → ECS exact retire → facade typed return`
-   - GREEN requires exact sequence、burned owner identity、advanced reclaim generation、no request/queue/public state and no injectable classification
+   - record production events only at these boundaries
+     - `Issued` after successful mint
+     - `CoreAllocatorAttempt` after exact admission refreeze and immediately before the real `reserve_navigation_branch`
+     - `CoreAllocatorFailure` only when that reserve returns `Err`
+     - `Retired` after exact burn、generation advance and cell reclaim succeed
+     - `FacadeTypedReturn` at the outermost typed return after retirement
+   - RED `back_capacity_retire_rejection_owner_is_retained_fail_closed`
+     - the seam changes only the production retire predicate's real input fact and cannot inject `Rejected`、classification or typed return
+     - assert the residual retains the exact owner、original `EnqueueRejected` and retire error
+     - assert the current Back and every later Back return `HostUnavailable` while the owner remains present、unchanged and never replaced or cleared
+   - RED Core companion `back_core_allocator_failure_is_post_refreeze_private_zero_write`
+     - for every `TestingReservationCounter::ALL` value, use a fresh engine and fresh observer
+     - after applying the real counter seam, freeze the production-semantic full private snapshot including allocator、queue、records、history、state/current/action/mount and prove allocator exhaustion is zero-write across the enqueue call
+     - exclude the test-support observer journal from that snapshot so journal evidence cannot hide production state mutation
+     - prove stale/token drift is also zero-write and records neither allocator attempt nor allocator failure
+     - do not add a Core private snapshot accessor to ECS
+   - for every `TestingReservationCounter::ALL` value
+     - use a fresh App and fresh observer
+     - assert the exact sequence `Issued → CoreAllocatorAttempt → CoreAllocatorFailure → Retired → FacadeTypedReturn`
+     - assert the exact minted owner is burned and the reclaimed cell generation advances
+     - assert ECS request/bound/pending collections remain empty and public snapshot、World fingerprint remain unchanged
+   - GREEN permits only the named real counter-exhaustion seam and real retire-predicate fact seam; each changes only its production predicate input and never injects `Rejected`、classification or typed return, and neither adds a second publisher、public API or later accepted/resolution behavior
 
 5. **Queued accepted-reservation safe stop**
    - wire the accepted view and single Core queue only after micro-slices 1–4 are GREEN
@@ -1438,13 +1474,15 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_capacity_issuer_second_install_preserves_outstanding -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --features test-support --lib back_capacity_order_observer_same_domain_unknown_is_zero_write -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features test-support --test public_navigation_authority_audit back_capacity_order_observer_installs_across_crates_read_only -j 1
-cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_capacity_precedes_core_reservation_failure_evidence -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --features test-support --lib back_capacity_precedes_core_reservation_failure_evidence -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --features test-support --lib back_capacity_retire_rejection_owner_is_retained_fail_closed -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --features test-support --lib back_core_allocator_failure_is_post_refreeze_private_zero_write -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib no_back_entry_precedes_identity_exhaustion -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --test dependency_boundary ecs_manifest_locks_the_dependency_boundary -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_authority_compile_fail -j 1
 ```
 
-Expected: all ten gates exit `0`; admission-target、exact live verify、max-depth prefix/unused burn、duplicate-entry publication and every resolution/physical test remain RED for Step 8
+Expected: all twelve gates exit `0`; admission-target、exact live verify、max-depth prefix/unused burn、duplicate-entry publication and every resolution/physical test remain RED for Step 8
 
 - [ ] **Step 7: Scaffold the complete typed boundary and write RED tests**
 
