@@ -244,8 +244,8 @@ terminal evidence 还必须证明该 request/settlement scope 不再持有 outst
 | --- | --- | --- | --- |
 | push/replace or resolved-target back | exact pending/entering failure obligations，或 publication 后 immutable leaving batch | original failure，或 normal success | push/replace enqueue 为 `Some`；resolved-target back running 后为 `Some` 并保持至 terminal |
 | resolved no-target back | `ProvenEmptyProjection` 后的 canonical zero manifest/ledger | rejected-back，独立于 zero count/disposition | queued 为 `None`；正常同一 schedule 内不发布 running `None`，terminal 为 `None + BackTargetUnavailable` |
-| proven-empty 前的 pre-commit authority takeover | existing scoped authority settlement，不建立 no-target ledger | authority failure | 唯一可公开的 no-target `Running(CleanupPending/Recovering) + None` 窗口，settlement 后 `Failed(HostLost/AuthorityLost)` |
-| typed retryable no-target preparation shortage | no new ledger；原 candidate、reservation 与 evidence 完整返还 | unchanged | 可公开 `Running(CleanupPending) + None`，只可由 named retry producer 继续 |
+| proven-empty 前的 pre-commit authority takeover | existing scoped authority settlement，不建立 normal no-target ledger | authority failure | 只可公开 authority-specific `Running(Recovering) + None`；不得发布 normal `CleanupPending`、`HistoryIntentRejected` 或 rejected-back continuation，settlement 后 `Failed(HostLost/AuthorityLost)` |
+| typed retryable no-target preparation shortage | no new ledger；原 candidate、reservation 与 typed evidence 完整返还 | unchanged | 完全 internal 且 public zero-write；不得发布 running phase/trace，只可由 evidence 绑定的 named producer 在其 trigger 推进后重试 |
 
 `NavigationEnqueueErrorKind::IdentityExhausted` 是 allocator/domain predicate 的永久 fail-closed 结果：不创建 request、没有 request terminal、公开 queue/request/World 零变化、不映射为 recovering。back 的 enqueue precedence 固定为 `UnknownRouter -> availability -> NoBackEntry -> IdentityExhausted`，其中 `NoBackEntry` 仅优先于后续 capacity 申请。
 

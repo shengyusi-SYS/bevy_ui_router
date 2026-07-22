@@ -122,16 +122,17 @@ pub fn requested(&self) -> Option<&RouteLocation>
 
 正常 no-target back 在同一 Router schedule 内完成 proven-empty settlement，因此不发布 `running_request=Some + requested=None`
 
-只有以下 no-target preparation 窗口可以公开该组合
+只有既有 pre-commit authority settlement 接管 no-target 时可以公开该组合；这不是正常 no-target cleanup
 
 | Window | Running status | Eventual terminal | Owner rule |
 | --- | --- | --- | --- |
-| typed retryable preparation shortage | `CleanupPending` | proof成功后`BackTargetUnavailable`，否则按后续exact classification | 原candidate、reservation、evidence与continuation capacity完整返还 |
-| proven-empty返回前被既有pre-commit authority settlement接管 | `CleanupPending / Recovering` | settlement后`Failed(HostLost / AuthorityLost)` | 线性转为authority settlement owner |
+| proven-empty返回前被既有pre-commit authority settlement接管 | `Recovering` | settlement后`Failed(HostLost / AuthorityLost)` | unresolved lifecycle lineage与reservation线性转为authority settlement owner |
 
 settlement 完成前仍是 `Running(...)`，表中的 terminal 只是预封存的 eventual cause
 
-authority takeover 窗口无 fallback、无 history 变化、无 `HistoryIntentRejected`
+normal candidate 与 typed Retry 在 physical proven-empty + Core logical-zero approval + canonical-zero exact-bind 前完全 internal，不发布 `Running(CleanupPending)`、`HistoryIntentRejected`、normal cleanup trace 或 continuation
+
+authority takeover 与 permanent fail-closed 可在 proof 前进入既有 settlement/terminal，但无 fallback、无 history 变化，也不发布正常 no-target 的 `HistoryIntentRejected` 或 `CleanupPending`
 
 这些例外不能扩展到 resolved-target back、push 或 replace
 
@@ -171,13 +172,25 @@ back enqueue 顺序
 2. 执行既有 availability gate，非 `Ready` 分别返回 `HostUnavailable | AuthorityRecovering`
 3. 校验 published admission stamp 的 world、router 与 history incarnation
 4. `can_back=false` 时返回 `NoBackEntry`
-5. ECS 预留 manifest-neutral `EcsCleanupCapacityReservation`
-6. Core 预留 request、transaction、cleanup batch 与 normal branch pool
-7. Core 接受 request 后，ECS 以不可失败步骤把 reservation 绑定 exact router incarnation、request、normal attempt 与 batch
+5. ECS issuer 预留 manifest-neutral unbound ledger slot owner
+6. Core 预留 request、transaction、cleanup batch 与 opaque accepted branch-reservation identity/pool
+7. Core 接受 request 后返回 `BackAcceptedReservationView`，ECS 以不可失败 move 将其与 capacity 绑定；该 view 只绑定 exact Core world seal projection、router/history incarnation、request、transaction、cleanup batch 与 accepted branch-reservation identity/pool
 
-`EcsCleanupCapacityReservation` 只预留唯一 identity、domain 与 capacity，不声明 manifest、count 或 zero
+该 unbound reservation 只预留唯一 identity、domain 与 capacity，不声明 manifest、count 或 zero；Core token drift 或 allocator failure 由 issuer 以 `EnqueueRejected` exact-retire
 
-Core 失败时 ECS reservation 的 identity 烧毁并释放容量
+reservation pool 以一次显式可失败的 bounded allocation 预留 slot；ledger header 使用完全安全的 inline `Vacant | Installed(CleanupLedger)` state，storage 使用普通已初始化的 obligation/receipt vectors，不隐藏 per-header allocation。`LedgerSlotUnavailable` 只来自真实 pool allocation 失败或 free slot 已空。canonical-zero 只把 vacant header 改为 installed 并移动 empty vectors，不分配、不读取未初始化内存；该路径不使用 `unsafe` 或 unchecked initialization conversion。`EnqueueRejected` 只属于 unbound retire 参数，bound disposition 不包含 enqueue rejection
+
+`BackAcceptedReservationView` 是 pre-resolution lineage，不绑定 normal attempt、eventual host/slot/frame/task/generation、destination 或 execution authority，也不能重建 Core owner
+
+Core 接受后 reservation 与 accepted view 绑定；live Core exact verify 命中 `NoTarget` 时才转为同一 issuer outstanding 的 `NoTargetCapacityPermit`，Core 失败则 identity 烧毁并释放容量
+
+`RouterNavigation` 本身是唯一 ECS World Resource，并持有唯一 persistent domain issuer；它没有 per-entry issuer field。`RouterNavigation::new` 初始化 domain issuer。安装 router 时先在 local 构造完整 `RouterEntry`，由 domain issuer 为该 entry 签发并安装不可重建的 `BackCapacityIssuer`，全部成功后才 push；失败 typed map 到既有 install error，不留下 ghost/partial entry。所有 back helper 都先由 exact `RouterHandle` 解析 entry，再借用该 entry 的 issuer
+
+`BackCapacityOwnerId` 必须实现 `Ord + PartialOrd`，但排序能力不授权重建 owner。Core 的 `test-support` 定义与 layer-neutral sealed channel factory 固定在 `crates/bevy_ui_router_core/src/test_support.rs`；ECS 只在自己的 `Cargo.toml` 以 `test-support = ["bevy_ui_router_core/test-support"]` 转发该 feature。`app_ext`、plugin 与 facade 不得重新定义 producer 或扩展 feature authority
+
+production issuer install 使用 typed `AlreadyInstalled | Reserve(error)` 结果。installer 必须先检查 exact entry 的 issuer slot，再允许 domain issuer 签发；second install 在签发新 domain identity 前拒绝，不能替换既有 issuer、消耗 identity 或覆盖其 outstanding state。test journal channel 的 `AlreadyInstalled` 是独立 test-support 语义，不能代替 production issuer install guard
+
+`test-support` 的跨 crate 顺序证据由 Core doc-hidden channel factory 产生 layer-neutral sealed producer；上层 `RouterNavigation` helper 必须接收 exact `RouterHandle`，先解析唯一 `RouterEntry` 再创建 channel，并将 Core producer、issuer producer 与 facade producer 分别单次安装到同一 entry 的 engine、issuer slot 与 facade-return slot，只把只读 `BackCapacityOrderObserver` 交给测试。`RouterNavigation::back` 解析 exact entry 后才通过该 entry 的 facade slot 记录 return。多 router journal 各自独立，unknown/foreign/already-installed 按 entry typed reject 且无 partial installation；Core 不命名 ECS type，测试不取得 producer 或 write handle
 
 `NoBackEntry` 只优先于后续 `IdentityExhausted`，不能越过 router identity 或 availability gate
 
@@ -217,11 +230,27 @@ ECS 只缓存 latest published stamp
 
 push/replace 使用 enqueue 时冻结的 canonical target，成为 running 时冻结 exact history source
 
-back 成为 running 时只执行一次 live preview
+back 成为 running 时，Core 消费 accepted branch reservation owner 并只执行一次 live preview
 
-- 有 target 时先写入 immutable resolved target，再进入 `Matching`
-- 无 target 时形成 typed no-target candidate，不签发 history capability
-- target 深度超过 reserved maximum 属于内部永久矛盾，零 World 写并 fail closed
+- 有 target 时先冻结 exact destination，再完成 matcher/Core logical reconciliation；只有此时才产生 move-only typed target execution owner，绑定 actual host/slot/frame/task/generation、normal attempt 与 exact source/destination
+- 结构一致且无 predecessor 时产生 target-free no-target candidate，不签发 history capability，不合成 normal attempt 或 frame identity
+- cursor/entry/location 不一致、target 深度超过 reserved maximum 或 accepted pool 不匹配产生 typed permanent contradiction
+
+Core 通过 typed resolution handoff 单次移动 `Target(raw target owner) | NoTarget(raw candidate) | Contradiction(raw contradiction owner)` 三个分支之一；ECS 不能读取 `requested`、bool、snapshot 或 reservation projection 推断分支或 execution authority
+
+raw handoff 不能授权后续 Core action。Core 必须消费 exact accepted view + raw handoff 做 lineage verify；Matched 返回 move-only verified wrapper，其唯一 split 是原 accepted view + branch-specific verified target/no-target/contradiction owner，不能拆回 raw handoff。ECS 用该 accepted view 与原 capacity 重组同一个 `BoundBackCapacityReservation`，再与 verified branch owner 配对；resume、source refreeze 与 contradiction consumer 也只接受各自 verified owner。Mismatch 返还原 accepted view、raw handoff 与 evidence，ECS 同样重组完整原 capacity owner
+
+target resume、contradiction terminal 与 no-target transfer/refreeze 都必须在同一个 exact-entry helper borrow 内完成：helper 先对 entry-owned issuer 做全部 non-mutating exact preflight，再把只捕获 helper-local owner/expectation slot 的 locally infallible `FnOnce` 交给 Core exact receiver。Core 先匹配 engine 与 verified owner；Mismatch 调用 closure 零次并返还原 verified owner，ECS 可重组完整 bound branch；Matched 调用 closure 恰好一次，再消费 owner 进入 resume、terminal 或 refreeze。closure 只允许不可失败 owner move/registry commit，不得 query、allocation、validation 或触发 hook/observer；issuer expectation 与 closure 均不得跨出 helper
+
+ECS 的 `LifecyclePreflightEvidence` 保持 crate-private physical/boundary evidence，任何 Core source、`RouterEngine` inherent method 或 Core-owned outcome 都不得命名它。Core exact receiver 只验证 move-only verified owner 与所需的 Core-owned `PreparationBoundaryScopeView`；receiver mismatch 返回单一 opaque、不可构造、不可检查且不授权重建 owner 的 `PreparationReceiverMismatchView`。ECS 将该 mismatch view 仅作 diagnostics，并继续把自身 physical evidence 与完整 ECS owner 绑定
+
+所有 callback-bearing `*_with_*` 方法都是 `#[doc(hidden)]` trusted ECS integration API，不从 facade reexport；facade/adapter 既不能取得 verified/prepared Core owner，也不能通过受支持 API 调用这些方法。该模式沿用既有 `ValidatedCommit::publish(FnOnce())`：closure 本身不是 authority，verified/prepared Core owner 才是 authority；唯一 ECS callsite 与 callback body 由 static/compile gate 审计。这里不引入 attestor、signature 或 second receipt，也不声称 Rust 类型能阻止恶意 direct Core caller
+
+typed handoff 只确定 running execution lineage，后续 `Ready | PendingRejected | AuthorityLost | RetryablePreparationFailure` physical classification 与 owner disposition 仍由 §4.4 独立决定
+
+contradiction handoff 必须 exact-match paired bound capacity，退休 ECS reservation 后由 Core 单次消费 accepted branch、request、transaction 与 cleanup batch owner；request 有界成为既有 `Failed(AuthorityLost)`，World、presentation 与 history 零写，不记录 `HistoryIntentRejected`，不留下 outstanding owner 或 retry
+
+target 的 Core `resume/freeze_back` source drift 发生在 ECS splice 前，唯一产生 opaque `BackTargetPermanentOwner`；该 owner 只进入 RouterEngine exact settlement API，wrong engine 返还原 owner + evidence，success 返回既有 terminal/settlement evidence。resume 成功后的 ECS physical preparation 若永久失败，必须保留完整 `TargetPreparationOwner` 与 physical evidence，使用独立 composite permanent owner 和 consumer；classification 的 cross-router mismatch 与 settlement 的 engine mismatch 都返还原 composite owner。exact settlement 只准备同时持有 frozen physical cleanup 与既有 Core authority settlement 的整体 disposition，再由唯一 exact-entry dispatch consumer 安装整个 disposition；任何 dispatch mismatch 都返还整体 disposition。physical cleanup 完成后只能按预先冻结的原 branch 消费同一 stored settlement，不能由 obligation count/disposition 反推、回流到 source-drift consumer 或进入 publisher；terminal 必须清空 splice、cleanup、settlement 与 continuation owner
 
 ### 4.4 Typed preparation outcome
 
@@ -232,7 +261,11 @@ back 成为 running 时只执行一次 live preview
 | `Ready` | 单次移动到prepared plan | 尚未publication | 进入commit preparation |
 | `PendingRejected` | 原owner转为typed pending cleanup owner | old active/history不变 | exact pending cleanup后按continuation继续 |
 | `AuthorityLost` | 原owner转为typed authority settlement owner | commit前history不变 | existing scoped settlement |
-| `RetryablePreparationFailure` | 原capability/candidate、boundary evidence、reservation与continuation owner完整返还 | 严格零写 | 只由同一named producer重试 |
+| `RetryablePreparationFailure` | 原capability/candidate、boundary evidence、reservation与已存在的continuation owner完整返还 | 严格零写 | 只由同一named producer重试 |
+
+这四项是 `PreparationDecision<Ready, Owner, PermanentOwner>::Classified(LifecyclePreparationOutcome<Ready, Owner>)` 内的四种物理处置；外层 `Permanent(PermanentOwner)` 持有分支专用的 move-only permanent owner。`Permanent` 不是第五种物理 outcome，而是在没有 live producer 可证明未来可完成时线性持有原 authority 与 exact terminal evidence 的不可重试决策。
+
+no-target 不直接使用该 generic outer outcome，因为 `AuthorityLost` success 会同时消费原 `BackPreparationOwner` 并产生独立 authority settlement disposition。它使用 specialized outcome：`Ready(PreparedBackNoTarget)`、`Retry { original owner, evidence }`、`AuthoritySettlement(BackNoTargetAuthoritySettlementDisposition)`、`Permanent(BackNoTargetPermanentOwner)`，以及消费前返还完整原 owner 的 typed issuer/receiver mismatch。该 specialized outcome 没有普通 `PendingRejected` variant；不可达的 classifier `PendingRejected` 直接转换为 `Permanent`。authority disposition 线性持有 Core settlement owner、ECS capacity retirement evidence，以及冻结 complete source/protected relationship closure、allowed-write set 与 exact authority manifest 的 physical settlement owner
 
 只有可证明未来能满足的容量或尚未finalized boundary facts可以产生 `RetryablePreparationFailure`
 
@@ -240,21 +273,35 @@ back 成为 running 时只执行一次 live preview
 
 | Exact evidence predicate | Typed producer | Original owner | Retry trigger |
 | --- | --- | --- | --- |
-| finite preparation/scratch capacity不足，且evidence绑定同domain的exact live reclaim owner与release generation | `RetryableCapacity` | capability/candidate/reservation/continuation capacity完整返还 | 只有reclaim owner推进或release generation改变后 |
-| boundary facts尚未finalize，且evidence绑定同request/attempt/host epoch的exact outstanding action或ticket | `UnfinalizedBoundaryFacts` | capability/candidate/reservation/continuation capacity完整返还 | 只有该action/ticket状态改变后 |
+| finite preparation/scratch capacity不足，且evidence绑定同domain的exact live reclaim owner与release generation | `RetryableCapacity` | capability/candidate/reservation与该分支已存在的continuation完整返还 | 只有reclaim owner推进或release generation改变后 |
+| boundary facts尚未finalize，且evidence绑定同request/attempt/host epoch的exact outstanding action或ticket | `UnfinalizedBoundaryFacts` | capability/candidate/reservation与该分支已存在的continuation完整返还 | 只有该action/ticket状态改变后 |
 | 无exact reclaim owner、无outstanding ticket、identity/domain永久耗尽或source drift | none，permanent branch classification | 按typed failure/authority transition单次消费 | never |
 
 同一个 case 只能命中一行，capacity 与 boundary evidence 不得合并为通用 retry
 
 永久 identity/domain exhaustion、source drift、owner/seal mismatch 与结构矛盾必须有界 fail closed
 
+no-target 不可达的 `PendingRejected`、source drift 或永久 capacity/domain contradiction 都必须产生 move-only permanent owner。source refreeze 只能由 Core 完成：Core 消费 verified opaque candidate，从当前 authority exact 重建完整 source，返回原 verified candidate 或公开但 opaque 的 typed drift owner/evidence；ECS 不得引用 Core-private `FrozenHistorySource` 或检查 candidate 内部，只能把 drift owner 与原 `NoTargetCapacityPermit` 线性配对
+
+source-drift settlement 只暴露一个 ECS helper。它在同一个 exact-entry borrow 内保留完整 `{ raw drift owner, NoTargetCapacityPermit }`，先完成 issuer non-mutating retirement preflight，再把 locally infallible retirement closure 交给 Core exact drift consumer。issuer mismatch 直接返还完整 composite；wrong engine 调用 closure 零次并返还 raw drift owner，helper 与原 permit 重组；exact receiver 调用 closure 恰好一次并立即产生 terminal evidence。不存在可跨 entry/issuer 移动的 prepared settlement owner 或 two-phase API。该路径不发布正常 no-target rejection/cleanup trace，terminal 后 ownerless且永不 retry
+
 retry 前重建完整 source 并要求 exact equality，drift 时重新分类，不能沿用旧 `RetryablePreparationFailure`
 
 History 不新增 generic retry producer
 
-resolved no-target 的 reservation 已覆盖 ledger identity/domain/capacity，但构造 `ProvenEmptyProjection` 的 bounded scratch capacity 或 boundary finalization 仍可返回上述 typed retry
+resolved no-target 的 reservation 是真实、manifest-neutral 的 ledger header/domain/storage slot owner；在 proven manifest 之前不得声明 zero ledger 或分配 manifest，且构造 `ProvenEmptyProjection` 的 bounded scratch capacity 或 boundary finalization 仍可返回上述 typed retry
 
-proof 成功后 ledger binding 与 zero completion 不再包含可失败 allocation
+`ProvenEmptyApprovalView` 只能由 Core typed producer `approve_back_no_target_logical_zero -> BackNoTargetApprovalOutcome` 签发：producer exact-match 当前 engine 与 verified candidate，从当前 authority 重建完整 source 并验证 logical no-predecessor/zero；Mismatch 返还原 candidate + opaque `PreparationReceiverMismatchView`。ECS 不能构造、clone 或合成 approval；approval 只校验 Core logical facts，不能重建 owner，也不能替代 ECS physical `ProvenEmptyProjection`。`PreparedBackNoTarget` 必须同时持有 Core-issued `ApprovedBackNoTargetCandidate`、原 permit 与独立 physical projection，缺任一都不能进入 Ready
+
+proof 与 Core approval 成功后，唯一 `consume_prepared_back_no_target` helper 在同一个 exact-entry borrow 内先对同一 outstanding issuer reservation 做 canonical-zero non-mutating exact preflight，再把 locally infallible commit closure 交给 Core exact Ready consumer。issuer 或 approved-composite receiver mismatch 调用 closure 零次并返还完整 approved candidate、permit 与 physical projection；exact match 调用 closure 恰好一次，把 reservation 消费为 preflighted manifest-neutral canonical-zero slot，但不公开状态，只返回 sealed move-only `PreparedBackNoTargetPublication`。该 prepared owner 持有 Core publication capability与 opaque `BackNoTargetCleanupInstallation`；installation 私有地整体持有 cleanup batch、rejected-back continuation 与 cleanup action，ECS 只能取得其 read-only `BackNoTargetCleanupBatchView`
+
+仍在同一个 helper/entry borrow 内，prepared publication 的 doc-hidden final consumer 以唯一 ECS installation closure 接收整个 `BackNoTargetCleanupInstallation`，仅用其 batch projection 不可失败地消费 captured canonical-zero slot 并构造 fully bound ledger，再将 `{ ledger, installation }` 作为一个 `InstalledBackNoTargetCleanup` 整体安装到 exact `RouterEntry`；不得拆出 batch/action/continuation。只有整个 field 安装完且 closure 返回后，Core 才发布 `HistoryIntentRejected → CleanupPending`。首个 `HistoryIntentRejected` 观察点必须已经能从 exact entry 找到这一 whole owner。final consumer 不得 query、allocation、validation、hook/observer-triggering write 或执行可失败工作；即使 obligations 为零也不再分配 header/domain/storage，不存在额外 `BindingView`、attestor 或 receipt protocol
+
+同一 schedule 的唯一 zero-completion driver 必须整体 take 该 installed field，证明 ledger 的 exact-zero settled obligations，计算 canonical completion digest/count，再单次消费 installation 形成 `BackNoTargetCleanupCompletionOwner`。Core exact completion 只接收该 Core owner并到达 `Failed(BackTargetUnavailable)`；receiver mismatch 返回完整 completion owner + opaque mismatch view，ECS 与 settled ledger 重组为 whole owner 后原样恢复。exact terminal 后 installed/pending entry fields、batch、action、continuation、capability、candidate、reservation、completion 与 lifecycle owner 全部为空
+
+proven-empty 前的 `AuthorityLost` 也必须在分类所在的同一个 exact-entry helper 内先冻结 complete source/protected closure、allowed-write set 与 exact authority manifest，形成 ECS physical settlement owner，再做 permit retirement preflight并由 Core exact authority consumer 以同一 closure 规则完成：Mismatch 调用零次并返还完整 candidate、permit、physical owner 与 authority evidence，exact match 调用恰好一次后产生整体 `BackNoTargetAuthoritySettlementDisposition { physical, settlement, retirement }`
+
+该 disposition 只有一个 exact-entry dispatch consumer：它在 mutation 前完成 entry 与 Core settlement receiver 校验，任何 mismatch 都返还整体 disposition；exact success 复用既有 scoped authority settlement，只能公开 authority-specific `Running(Recovering) + requested=None`，不得安装 normal no-target field、`HistoryIntentRejected`、normal `CleanupPending` 或 rejected-back continuation。既有 authority physical cleanup 在冻结 allowed-write set 内完成后消费同一 stored Core settlement owner，到原始 `HostLost/AuthorityLost` terminal 并清空 physical/settlement/retirement owner
 
 ### 4.5 Publication
 
@@ -313,6 +360,20 @@ cancel history capability
 
 ### 5.3 Back no-target
 
+`NoTarget` 只表示 frozen history 结构合法且 current cursor 没有 predecessor
+
+entry identity/location 长度不等、cursor 越界、nonempty entries 缺少 cursor、cursor current entry/location 不一致等情况不是 `NoTarget`，必须携带 expected/observed source 形成 typed permanent contradiction，零写并有界 fail closed
+
+running resolution verify 后，no-target 停在 Core-private verified-candidate-owned 状态；candidate 是唯一 opaque unresolved lifecycle lineage owner，不是 continuation owner
+
+normal candidate 与 Retry 在 physical proven-empty + Core logical-zero approval + canonical-zero exact-bind 完成前不得发布 request phase、`HistoryIntentRejected`、`CleanupPending`、ledger、manifest、receipt、continuation、cleanup action 或 terminal，也不得由 `requested=None` 推断状态
+
+canonical-zero bind 后返回的 `PreparedBackNoTargetPublication` 仍保持 public 零写；只有 exact entry 已整体安装 `InstalledBackNoTargetCleanup { ledger, installation }` 后，final consumer 才能产生第一个 `HistoryIntentRejected`，且 installation 的 batch/action/continuation 不得拆开
+
+pre-proof authority loss/permanent fail-closed 仍可进入既有 settlement/terminal，但不得伪装成正常 no-target rejection 或发布其 cleanup trace
+
+single-queue no-target 的 `PendingRejected` producer 不可达；共享 enum caller 仍必须穷举该 variant，并立即 typed fail closed，不能创建 pending cleanup 或公开 trace
+
 ECS 必须产生 typed `ProvenEmptyProjection`
 
 它至少来自
@@ -332,18 +393,34 @@ retained-empty、slot-only 或其他稀疏 topology 也不能绕过 proven-empty
 只有 proven-empty 且 authority valid 后，才允许不可失败配对转换
 
 ```text
-NoTargetCandidate + EcsCleanupCapacityReservation
--> RejectedBackContinuation + canonical-empty Entity manifest/ledger
+raw BackNoTargetCandidate + BoundBackCapacityReservation
+-> Core exact accepted-lineage validation
+-> VerifiedBackResolutionHandoff
+-> accepted view + VerifiedBackNoTargetCandidate
+-> VerifiedBackNoTargetCandidate + recomposed BoundBackCapacityReservation
+-> begin helper preflights entry-owned issuer transfer, then Core exact receiver calls the infallible transfer commit once
+-> Core consumes verified candidate and exact-refreezes source; mismatch calls transfer zero times and restores the full bound branch
+-> unchanged verified candidate + same permit
+-> ECS constructs physical ProvenEmptyProjection
+-> Core exact approval producer validates receiver + candidate + current logical source/no-predecessor
+-> Core-issued ApprovedBackNoTargetCandidate + same permit + distinct physical projection
+-> consume helper preflights canonical-zero, then Core exact Ready receiver calls bind once
+-> Core returns sealed PreparedBackNoTargetPublication with publication capability + whole opaque BackNoTargetCleanupInstallation and public zero-write
+-> final consumer invokes the sole ECS closure; it reads only the installation batch projection, consumes the captured canonical-zero slot into the fully bound ledger and installs whole InstalledBackNoTargetCleanup into exact RouterEntry
+-> installation closure returns
 -> HistoryIntentRejected
 -> CleanupPending
--> exact zero completion
+-> same-schedule driver takes the whole installed field, proves exact zero and converts the whole installation into BackNoTargetCleanupCompletionOwner
+-> Core exact zero completion; mismatch restores whole settled-ledger + completion owner
 -> CleanupSettled
 -> Failed(BackTargetUnavailable)
+
+source drift 分支由单一 helper 保留完整 raw composite，先做 issuer non-mutating exact preflight，再由 Core exact receiver 以 closure 0/1 次调用完成 locally infallible retire + terminal；不存在 prepared owner，不进入 proven-empty、ledger 或 publisher
 ```
 
 不得直接使用无证明的 `FrozenCleanupManifest::empty()`，不得伪造 `FrameTaskIdentity`
 
-若 proven-empty 前发现 pre-commit authority loss，消费 no-target candidate、normal attempt 与 capacity reservation，转入既有 scoped authority settlement，不记录 `HistoryIntentRejected`
+若 proven-empty 前发现 pre-commit authority loss，消费 no-target candidate、accepted reservation lineage 与 capacity reservation，同时冻结 complete physical settlement closure/allowed-write/manifest，形成 `{ physical, Core settlement, retirement }` 整体 disposition。唯一 exact-entry dispatch 后只转入既有 scoped authority settlement 与 authority-specific `Recovering`，不记录 `HistoryIntentRejected` 或 normal `CleanupPending`
 
 ### 5.4 Cleanup authority layering
 
@@ -567,9 +644,15 @@ no-target back 的 current/retained slot 必须进入protected并保持零 attem
 
 | Owner/evidence | Outstanding | Superseded/cancelled | Terminal/replay rule |
 | --- | --- | --- | --- |
-| unresolved back owner | queued/running before resolution | target后转capability，no-target后转candidate，authority loss后线性转settlement | 不可复制或从stamp重建 |
-| no-target candidate | resolved no-target，等待proven-empty | authority loss后线性转settlement，retry时原样返还 | 只可转RejectedBackContinuation或authority settlement |
-| rejected-back continuation | proven-empty后与zero ledger正交持有 | 不因count/disposition重分类 | exact zero completion后单次消费 |
+| accepted back owner | queued/running before resolution | verify Matched后与原capacity重组bound reservation，并与branch-specific verified owner配对 | wrapper只拆为accepted+verified，不能拆回raw handoff；Mismatch返raw accepted+handoff |
+| target pre-splice source-drift owner | Core resume/freeze_back exact drift | 不进入ECS splice或physical preparation | dedicated exact engine settlement，mismatch返还原owner |
+| target post-splice physical permanent owner | exact `TargetPreparationOwner` + physical evidence | 只准备并整体dispatch `{ frozen cleanup, Core authority settlement }`；dispatch mismatch返还整体 disposition | cleanup exact完成后按预冻结原branch消费stored settlement；不从count/disposition反推，不进入source-drift consumer或publication，terminal清空全部owner |
+| no-target candidate | verified unresolved lifecycle lineage，等待physical proven-empty + Core logical-zero approval + canonical-zero bind | authority loss后转为`{ complete physical settlement, Core settlement, ECS retirement }`整体 disposition；retry/mismatch原样返还且public零写 | 唯一dispatch只复用existing scoped authority settlement；bind前不能mint normal continuation/action或发布normal cleanup |
+| no-target logical-zero approval | Core exact receiver + verified candidate + current source/no-predecessor validation单次签发，与physical projection分离 | mismatch返原candidate；ECS/facade不可构造或用其重建owner | 只与原candidate组成approved composite，不能单独授权Ready |
+| no-target source-drift owner | Core exact refreeze消费verified candidate后opaque返回，与原permit配对 | 单一entry helper先做issuer preflight，再调用Core exact consumer | engine/issuer mismatch时closure零次且返还完整raw pair；exact时closure一次并terminal，不存在prepared owner |
+| prepared no-target publication | canonical-zero bind后的Core exact Ready consumer单次mint，持有publication capability + whole opaque cleanup installation，public零写 | final consumer的唯一ECS closure只读batch projection并把whole installation与ledger安装到exact entry | closure返回后才发布；final tail不可失败且不再validation/query |
+| installed no-target cleanup | exact entry持有`{ canonical-zero ledger, whole installation }`；batch/action/continuation保持私有整体 | same-schedule driver整体take、证明exact-zero digest/count并形成Core completion owner；mismatch与settled ledger整体恢复 | Core exact completion后单次terminal，entry fields与所有publication/completion owner清空 |
+| rejected-back continuation | whole cleanup installation内部持有并在首个public write前整体安装，与zero ledger正交持有 | 不因count/disposition重分类或从installation拆出 | exact zero completion owner由whole installation单次转换并消费 |
 | history capability | frozen exact source/destination | precommit failure cancels | PreparedPublication单次消费，replay零写 |
 | cleanup capacity reservation | manifest-neutral | target exists则unused identity烧毁，authority loss则线性消费 | 只由proven manifest建立ledger |
 | cleanup batch/token | exact request/transaction/epoch binding | owner可转交，identity不变 | completion replay零写 |
@@ -615,7 +698,7 @@ host epoch 为 `stale` 时只能处理其自身 sealed residual/lease，不能�
 | Slice | Production owner | Public evidence | Exclusions released | PASS boundary |
 | --- | --- | --- | --- | --- |
 | Replace | shared history capability/revision/refreeze、exact `IdentityExhausted` + replace flow | real facade replace、F1–F3、nested/retained-empty、allocator-derived exhaustion、failure/history unchanged | `RouterNavigation::replace` | replace矩阵与shared protocol绿，不宣称C1或History PASS |
-| Back execution | admission stamp、capacity reservation、late target、typed retry、success与pure no-target | C1、no-target zero、slot-only与retained-empty protected proof、NoBackEntry precedence | `RouterNavigation::back` | public back可用，late-bound完整证据仍待C3两分支 |
+| Back execution | admission stamp、capacity reservation、verified late target、typed retry、success与pure no-target | C1、no-target zero、slot-only与retained-empty protected proof、NoBackEntry precedence、normal no-target与post-splice permanent terminal owner closure | `RouterNavigation::back` | 两条Task 4 terminal owner-closure gate GREEN后public back可用，late-bound完整证据仍待C3两分支 |
 | Back failure | C2/C3、precommit authority invariant、stale/replay与terminal closure | C2、C3 first-success/first-failure、role precedence、authority catalogue addition | none | 全部History-owned生产语义闭合 |
 | Completion gate | no new production semantics | full fixed journeys、authority/facade/workspace gates与事实复审 | History stage marker | 新RED必须回开owning slice |
 
@@ -746,6 +829,8 @@ History completion 必须显式运行
 - focused `cross_incarnation_history_replay_is_zero_write`
 - focused `no_back_entry_precedes_identity_exhaustion`
 - focused typed preparation retry owner-return 与永久 contradiction fail-closed
+- focused `back_no_target_ready_terminal_closes_all_lifecycle_owners`
+- focused `back_target_physical_permanent_terminal_closes_all_lifecycle_owners`
 - workspace nextest、check、doctest
 - fmt、diff check 与 clean tree
 
