@@ -273,6 +273,179 @@ fn parse_history_authority_rows(markdown: &str) -> Vec<HistoryAuthorityRow> {
     rows
 }
 
+#[derive(Debug)]
+struct HistoryRequestBoundaryRow {
+    case: String,
+    cleanup_scope: String,
+    continuation: String,
+    requested_terminal: String,
+}
+
+fn parse_history_request_boundary_rows(markdown: &str) -> Vec<HistoryRequestBoundaryRow> {
+    let lines = markdown.lines().collect::<Vec<_>>();
+    let heading = "### 9.1 History request and cleanup boundary";
+    let headings = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (*line == heading).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        headings.len(),
+        1,
+        "History request boundary heading must occur exactly once"
+    );
+
+    let section_end = lines[headings[0] + 1..]
+        .iter()
+        .position(|line| line.starts_with("## "))
+        .map_or(lines.len(), |offset| headings[0] + 1 + offset);
+    let section = &lines[headings[0] + 1..section_end];
+    let headers = section
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            (line.trim() == "| Case | Cleanup scope | Continuation | requested / terminal |")
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        headers.len(),
+        1,
+        "History request boundary must contain exactly one canonical table header"
+    );
+    let table_start = headers[0];
+    assert_eq!(
+        section.get(table_start + 1).map(|line| line.trim()),
+        Some("| --- | --- | --- | --- |"),
+        "History request boundary must use the exact four-column separator"
+    );
+
+    let rows = section[table_start + 2..]
+        .iter()
+        .take_while(|line| line.trim_start().starts_with('|'))
+        .map(|row| {
+            let cells = row
+                .trim()
+                .trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                cells.len(),
+                4,
+                "History request boundary rows must have exactly four columns"
+            );
+            assert!(
+                !cells[0].is_empty(),
+                "History request boundary Case is empty"
+            );
+            HistoryRequestBoundaryRow {
+                case: cells[0].clone(),
+                cleanup_scope: cells[1].clone(),
+                continuation: cells[2].clone(),
+                requested_terminal: cells[3].clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !rows.is_empty(),
+        "History request boundary table must not be empty"
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.case.as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        rows.len(),
+        "History request boundary Case values must be unique"
+    );
+    rows
+}
+
+fn markdown_plain(value: &str) -> String {
+    value.replace('`', "")
+}
+
+fn unique_history_request_boundary_row<'a>(
+    rows: &'a [HistoryRequestBoundaryRow],
+    expected_case: &str,
+) -> &'a HistoryRequestBoundaryRow {
+    let matches = rows
+        .iter()
+        .filter(|row| markdown_plain(&row.case) == expected_case)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matches.len(),
+        1,
+        "History request boundary must contain exactly one `{expected_case}` row"
+    );
+    matches[0]
+}
+
+#[test]
+fn history_no_target_matrix_rows_are_canonical() {
+    let matrix = fs::read_to_string(workspace_root().join("docs/authority-transition-matrix.md"))
+        .expect("authority transition matrix must be readable");
+    let rows = parse_history_request_boundary_rows(&matrix);
+
+    let resolved = unique_history_request_boundary_row(&rows, "resolved no-target back");
+    assert_eq!(
+        markdown_plain(&resolved.cleanup_scope),
+        "ProvenEmptyProjection 后的 canonical zero manifest/ledger",
+        "resolved no-target cleanup scope must remain canonical"
+    );
+    assert_eq!(
+        markdown_plain(&resolved.continuation),
+        "rejected-back，独立于 zero count/disposition",
+        "resolved no-target continuation must remain canonical"
+    );
+    assert_eq!(
+        markdown_plain(&resolved.requested_terminal),
+        "queued 为 None；正常同一 schedule 内不发布 running None，terminal 为 None + BackTargetUnavailable",
+        "resolved no-target public state must remain canonical"
+    );
+
+    let takeover = unique_history_request_boundary_row(
+        &rows,
+        "proven-empty 前的 pre-commit authority takeover",
+    );
+    assert_eq!(
+        markdown_plain(&takeover.cleanup_scope),
+        "existing scoped authority settlement，不建立 normal no-target ledger",
+        "pre-commit authority takeover cleanup scope must remain canonical"
+    );
+    assert_eq!(
+        markdown_plain(&takeover.continuation),
+        "authority failure",
+        "pre-commit authority takeover continuation must remain canonical"
+    );
+    assert_eq!(
+        markdown_plain(&takeover.requested_terminal),
+        "只可公开 authority-specific Running(Recovering) + None；不得发布 normal CleanupPending、HistoryIntentRejected 或 rejected-back continuation，settlement 后 Failed(HostLost/AuthorityLost)",
+        "pre-commit authority takeover public state must remain canonical"
+    );
+
+    let retry = unique_history_request_boundary_row(
+        &rows,
+        "typed retryable no-target preparation shortage",
+    );
+    assert_eq!(
+        markdown_plain(&retry.cleanup_scope),
+        "no new ledger；原 candidate、reservation 与 typed evidence 完整返还",
+        "retryable no-target shortage cleanup scope must remain canonical"
+    );
+    assert_eq!(
+        markdown_plain(&retry.continuation),
+        "unchanged",
+        "retryable no-target shortage continuation must remain canonical"
+    );
+    assert_eq!(
+        markdown_plain(&retry.requested_terminal),
+        "完全 internal 且 public zero-write；不得发布 running phase/trace，只可由 evidence 绑定的 named producer 在其 trigger 推进后重试",
+        "retryable no-target shortage public state must remain canonical"
+    );
+}
+
 #[test]
 fn history_authority_parser_requires_a_line_exact_heading() {
     let source = "prefix ### 10.3 History authority regression additions\n\n| Test function | Owning slice | State |\n| --- | --- | --- |\n| active_cycle_enters_authority_settlement | Back failure | planned |\n";
