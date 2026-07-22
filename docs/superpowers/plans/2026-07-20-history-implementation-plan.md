@@ -857,6 +857,7 @@ git commit -m "feat: add exact replace history flow"
 - Modify: `crates/bevy_ui_router_core/src/integration.rs`
 - Modify: `crates/bevy_ui_router_core/src/test_support.rs`
 - Modify: `crates/bevy_ui_router_ecs/Cargo.toml`
+- Modify: `crates/bevy_ui_router_ecs/src/app_ext.rs`
 - Create: `crates/bevy_ui_router_ecs/src/lifecycle_preparation.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/lib.rs`
 - Modify: `crates/bevy_ui_router_ecs/src/branch_transaction.rs`
@@ -1206,6 +1207,7 @@ pub enum BackCapacityOrderEvent { EcsIssuer(BackCapacityIssuerEvent), CoreAlloca
 #[cfg(any(test, feature = "test-support"))]
 impl BackCapacityOrderObserver {
     pub fn snapshot(&self) -> BackCapacityOrderSnapshot;
+    pub fn observes_same_journal(&self, other: &Self) -> bool;
 }
 #[cfg(any(test, feature = "test-support"))]
 impl BackCapacityOrderSnapshot {
@@ -1251,14 +1253,13 @@ impl RouterEntry {
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub enum BackCapacityOrderInstallError { UnknownRouter, ForeignRouter, AlreadyInstalled }
-#[cfg(any(test, feature = "test-support"))]
-impl RouterNavigation {
-    #[doc(hidden)]
-    pub fn testing_install_back_capacity_order_observer(
-        &mut self,
-        router: RouterHandle,
-    ) -> Result<BackCapacityOrderObserver, BackCapacityOrderInstallError>;
-}
+// ECS owner test-support module; not a RouterNavigation associated API or facade re-export.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn testing_install_back_capacity_order_observer(
+    navigation: &mut RouterNavigation,
+    router: RouterHandle,
+) -> Result<BackCapacityOrderObserver, BackCapacityOrderInstallError>;
 
 pub enum EnqueueBackErrorKind {
     AuthorityRecovering,
@@ -1285,8 +1286,8 @@ impl AcceptedBackReservation {
 - all retire/transfer rejection variants return the original move-only owner; foreign domain、stale generation and replay cannot become `()`/bool, while success returns only non-authorizing retirement evidence and permanently burns the identity
 - `RouterNavigation` is already the unique ECS World Resource, so it owns the single persistent `back_capacity_domain_issuer` initialized by `RouterNavigation::new`. It owns no per-entry issuer field. During router install, construct the entire `RouterEntry` locally, ask the domain issuer to sign/install its non-reconstructible `BackCapacityIssuer`, and push the entry only after every install step succeeds. Failure maps `BackCapacityIssuerInstallError::Reserve` to existing `IntegrationError::Exhausted` and impossible local-entry `AlreadyInstalled` to existing `IntegrationError::Invalid`; it leaves no ghost entry or partially installed entry
 - `install_back_capacity_issuer` first checks the exact entry's issuer slot. `AlreadyInstalled` returns before `BackCapacityDomainIssuer::issue`, so a second install cannot consume a domain identity、replace the issuer or alter its outstanding registry; only a vacant slot may map `issue` failure to `BackCapacityIssuerInstallError::Reserve`. This production error is separate from test-only journal-channel `BackCapacityOrderInstallError::AlreadyInstalled`
-- under `test-support`, the upper helper resolves that entry before channel creation, moves the Core producer into its engine and moves issuer + facade producers into test-only slots on the same entry. `RouterNavigation::back` records facade return only after resolving that entry and only through its facade slot. Tests receive only `BackCapacityOrderObserver`; Core defines only layer-neutral channels and never depends on ECS cleanup types. Public audit covers only legitimately obtainable foreign and already-installed handles; same-domain unknown uses the existing ECS-private handle fixture
-- set the ECS feature exactly to `test-support = ["bevy_ui_router_core/test-support"]`. Core channel definitions and `issue_back_capacity_order_channels` live in `crates/bevy_ui_router_core/src/test_support.rs`; ECS only installs their sealed producers. No `app_ext.rs` or plugin change is required
+- under `test-support`, only the ECS owner test-support free function installs the observer and the public audit calls that owner function directly; it is not a `RouterNavigation` associated API, is not facade-re-exported and does not change the facade associated-API golden. `BackCapacityOrderObserver::observes_same_journal` performs only opaque identity equality such as `Arc::ptr_eq`; it exposes no raw journal/domain identity or producer and cannot record events or authorize lifecycle work. Tests receive only observer/error, while Core defines only layer-neutral channels and never depends on ECS cleanup types
+- set the ECS feature exactly to `test-support = ["bevy_ui_router_core/test-support"]`, and update the existing dependency-boundary gate to require that exact forwarding edge in this micro-slice. Core channel definitions and `issue_back_capacity_order_channels` live in `crates/bevy_ui_router_core/src/test_support.rs`; ECS only installs their sealed producers. `app_ext.rs` adds exactly one crate-private `RouterHandle` domain predicate so the installer can distinguish a legitimately obtained foreign handle from same-domain unknown without exposing raw domain/router values, a public constructor or a forged-handle path. No plugin or facade change is required
 
 ```toml
 # crates/bevy_ui_router_ecs/Cargo.toml
@@ -1314,12 +1315,15 @@ Implement Step 6 as these ordered RED → GREEN micro-slices; do not batch later
    - after those growth/reclaim gates are GREEN, add `back_capacity_issuer_second_install_preserves_outstanding` using one real reserved owner; assert a second install leaves the exact cell、outstanding owner and generation unchanged
 
 3. **Read-only cross-crate observer install**
-   - RED `back_capacity_order_observer_installs_across_crates_read_only` in the public audit covers two exact routers、per-entry journal isolation、a legitimately obtained foreign handle and already-installed rejection
-   - RED `back_capacity_order_observer_same_domain_unknown_is_zero_write` stays in ECS unit coverage and uses the existing private handle fixture; do not add a public forged-handle constructor
-   - GREEN only when all producer slots are preflighted before Core factory creation、each producer is sealed and single-install、tests receive only the observer and every reject is zero-write with no partial journal installation
+   - this micro-slice installs empty channels only; both independent snapshots stay empty and record none of `Issued | Retired | TransferredNoTarget | BoundCanonicalZero | CoreAllocatorAttempt | CoreAllocatorFailure | FacadeTypedReturn`. All real order-event production remains owned by micro-slice 4
+   - RED `back_capacity_order_observer_installs_across_crates_read_only` in the public audit installs observers for two exact routers in one App, asserts observer A vs its clone is same-journal、A vs independently installed B is different-journal、both snapshots are independently empty、the second install returns exact `AlreadyInstalled`, and a legitimately obtained foreign handle from a second App is rejected with zero write
+   - RED `back_capacity_order_observer_same_domain_unknown_is_zero_write` stays in ECS unit coverage under `test-support` and uses the existing private handle fixture to exercise the same owner free function; assert the Core factory closure call count remains zero and the exact entry plus all producer slots remain unchanged. Do not add a public forged-handle constructor or a `cfg(test)` installer alternative
+   - the sole installer order is: (1) reject foreign domain; (2) resolve the exact same-domain entry or reject unknown; (3) preflight Core、issuer and facade producer slots all vacant; (4) reject any occupied slot as `AlreadyInstalled`; (5) call the Core factory exactly once; (6) infallibly move all three sealed producers into that same exact entry; (7) return the observer
+   - GREEN only when no validation、allocation or fallible installer follows factory creation, each producer is sealed and single-install, tests receive only observer/error, every rejection is zero-write with no partial journal installation, and the existing dependency-boundary gate requires `test-support = ["bevy_ui_router_core/test-support"]`
 
 4. **Real Core allocator failure order**
    - RED `back_capacity_precedes_core_reservation_failure_evidence`
+   - this is the first micro-slice that records real order events; it must not weaken the empty-channel evidence owned by micro-slice 3
    - for every real Core request/transaction/batch/frame/task pool counter, record only production boundaries and assert `ECS issue → Core allocator attempt/failure → ECS exact retire → facade typed return`
    - GREEN requires exact sequence、burned owner identity、advanced reclaim generation、no request/queue/public state and no injectable classification
 
@@ -1336,7 +1340,7 @@ Implement Step 6 as these ordered RED → GREEN micro-slices; do not batch later
 - the accepted view carries no authority to consume the branch pool、resolve a target or construct any later owner
 - `AcceptedBackReservation` exposes only non-authorizing accepted lineage
 
-Install the order channel only after the supplied `RouterHandle` resolves to the exact `RouterEntry` that owns engine + issuer + facade producer slot: call the Core factory once, install all three producers on that entry, then return the observer. Resolve foreign/already-installed identity against entry-local slots before factory creation; the ECS-private same-domain unknown case follows the same zero-write rule. Two entries cannot share a journal and `AlreadyInstalled` is decided per entry
+The micro-slice 3 sequence above is the only observer installer path; there is no inherent or facade installer alternative. Micro-slice 4 may record through the already-installed exact-entry slots but cannot change observer identity or installation semantics
 
 Add installed immutable maximum depth without exposing it through facade
 
@@ -1428,14 +1432,15 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_capacity_growth_failure_is_pre_mint_zero_write -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_capacity_reclaimed_cell_advances_generation_and_rejects_aba -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_capacity_issuer_second_install_preserves_outstanding -j 1
-cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_capacity_order_observer_same_domain_unknown_is_zero_write -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --features test-support --lib back_capacity_order_observer_same_domain_unknown_is_zero_write -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features test-support --test public_navigation_authority_audit back_capacity_order_observer_installs_across_crates_read_only -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_capacity_precedes_core_reservation_failure_evidence -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib no_back_entry_precedes_identity_exhaustion -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --test dependency_boundary ecs_manifest_locks_the_dependency_boundary -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_authority_compile_fail -j 1
 ```
 
-Expected: all nine gates exit `0`; admission-target、exact live verify、max-depth prefix/unused burn、duplicate-entry publication and every resolution/physical test remain RED for Step 8
+Expected: all ten gates exit `0`; admission-target、exact live verify、max-depth prefix/unused burn、duplicate-entry publication and every resolution/physical test remain RED for Step 8
 
 - [ ] **Step 7: Scaffold the complete typed boundary and write RED tests**
 
