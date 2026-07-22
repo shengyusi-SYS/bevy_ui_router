@@ -1370,6 +1370,11 @@ Implement Step 6 as these ordered RED → GREEN micro-slices; do not batch later
 5. **Queued accepted-reservation safe stop**
    - wire the accepted view and single Core queue only after micro-slices 1–4 are GREEN
    - stop at the queued unresolved owner boundary described below
+   - first strengthen the existing assertions, then run the gates as GREEN evidence-strengthening only; this does not fabricate a production RED or alter production semantics
+   - Core evidence companion `back_resolution_action_blocks_next_collect`: before the first `collect`, the single private queue linearly holds the complete `ReservedBranchAttempt`, and its request remains `Queued` with `requested=None`、`matched=None` and an empty trace, with no action/current/history/presentation publication. After `collect`, retain the existing proof that the one `BackResolution` action blocks the next collect without consuming or overwriting the queued Back
+   - ECS evidence companion `accepted_back_reserves_ecs_capacity_before_core_request_identity`: after a successful enqueue, the shared order journal proves exactly `Issued → CoreAllocatorAttempt`, with no `CoreAllocatorFailure`、`Retired` or `FacadeTypedReturn`; the exact entry retains its matching `BoundBackCapacityReservation` beside the exact queued request and persistent `Outstanding` cell; queued request projections remain `requested=None`、`matched=None` and empty trace, with no pending resolution or cleanup and zero public router/history/presentation writes
+   - keep the accepted-view negative/static contract: it has no target、normal attempt、`Entity` or manifest authority, proved by the existing static/negative gates rather than a new production accessor
+   - these are Step 6 evidence-strengthening gates only: they do not alter production semantics or add a production seam、second publisher or later resolution behavior
 
 - acceptance infallibly combines the ECS owner with the view returned by `AcceptedBackReservation::into_parts` into `BoundBackCapacityReservation`; at resolution, Core Matched returns the same accepted view beside one verified branch owner, so ECS recomposes that view with the original capacity into the same bound reservation. Mismatch returns raw view + raw handoff so ECS likewise reconstructs the original bound reservation
 - `BackAcceptedReservationProjection` is independent from `HistoryExecutionBindingProjection` and binds only exact Core world seal projection、router/history incarnation、request、transaction、cleanup batch 与 opaque accepted branch-reservation identity/pool
@@ -1477,12 +1482,14 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-d
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --features test-support --lib back_capacity_precedes_core_reservation_failure_evidence -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --features test-support --lib back_capacity_retire_rejection_owner_is_retained_fail_closed -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --features test-support --lib back_core_allocator_failure_is_post_refreeze_private_zero_write -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --features test-support --lib back_resolution_action_blocks_next_collect -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --features test-support --lib accepted_back_reserves_ecs_capacity_before_core_request_identity -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib no_back_entry_precedes_identity_exhaustion -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --test dependency_boundary ecs_manifest_locks_the_dependency_boundary -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_authority_compile_fail -j 1
 ```
 
-Expected: all twelve gates exit `0`; admission-target、exact live verify、max-depth prefix/unused burn、duplicate-entry publication and every resolution/physical test remain RED for Step 8
+Expected: all fourteen gates exit `0`; admission-target、exact live verify、max-depth prefix/unused burn、duplicate-entry publication and every resolution/physical test remain RED for Step 8
 
 - [ ] **Step 7: Scaffold the complete typed boundary and write RED tests**
 
