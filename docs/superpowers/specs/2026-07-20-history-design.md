@@ -178,7 +178,11 @@ back enqueue 顺序
 
 该 unbound reservation 只预留唯一 identity、domain 与 capacity，不声明 manifest、count 或 zero；Core token drift 或 allocator failure 由 issuer 以 `EnqueueRejected` exact-retire
 
-reservation pool 以一次显式可失败的 bounded allocation 预留 slot；ledger header 使用完全安全的 inline `Vacant | Installed(CleanupLedger)` state，storage 使用普通已初始化的 obligation/receipt vectors，不隐藏 per-header allocation。`LedgerSlotUnavailable` 只来自真实 pool allocation 失败或 free slot 已空。canonical-zero 只把 vacant header 改为 installed 并移动 empty vectors，不分配、不读取未初始化内存；该路径不使用 `unsafe` 或 unchecked initialization conversion。`EnqueueRejected` 只属于 unbound retire 参数，bound disposition 不包含 enqueue rejection
+entry install 只由 domain issuer 签发不可复用的 capacity domain，不预分配固定 pool，也不建立隐藏并发上限。每个 `BackCapacityIssuer` 持有 entry-local persistent slot table；cell 只在 `Free | Outstanding | Leased` 间原位转换，permit、slot 与 ledger owner 只线性持有 exact cell lease，不能把 cell 从 table 移出或从 projection 重建
+
+`reserve` 先复用 `Free` cell；没有可复用 cell 时才执行 grow-on-demand，并在 owner/generation mint 前完成新 cell、fully initialized vacant header/storage 与 exact outstanding registry entry 所需的全部可失败容量预留。真实 growth failure 返回 `LedgerSlotUnavailable` 并在 Core allocator 前映射为 `IdentityExhausted`，不创建 request、不 mint owner/generation，且 Core、queue、public 与语义 capacity state 零写。成功 mint 后的 bind、retire、transfer 与 canonical-zero 都不得再分配
+
+exact retire 烧毁 owner、推进 generation 并把同一 cell 原位归还 `Free`；no-target transfer 把同一 cell 转为 `Leased`，canonical-zero 只在该 cell 内安装安全初始化的 empty ledger。generation 没有后继时，该 cell 永久退出可复用集合，后续 reservation 只能 grow 新 cell。该路径不使用 `unsafe`、未初始化 storage 或 unchecked initialization conversion；`EnqueueRejected` 只属于 unbound retire 参数，bound disposition 不包含 enqueue rejection
 
 `BackAcceptedReservationView` 是 pre-resolution lineage，不绑定 normal attempt、eventual host/slot/frame/task/generation、destination 或 execution authority，也不能重建 Core owner
 
@@ -190,7 +194,7 @@ Core 接受后 reservation 与 accepted view 绑定；live Core exact verify 命
 
 production issuer install 使用 typed `AlreadyInstalled | Reserve(error)` 结果。installer 必须先检查 exact entry 的 issuer slot，再允许 domain issuer 签发；second install 在签发新 domain identity 前拒绝，不能替换既有 issuer、消耗 identity 或覆盖其 outstanding state。test journal channel 的 `AlreadyInstalled` 是独立 test-support 语义，不能代替 production issuer install guard
 
-`test-support` 的跨 crate 顺序证据由 Core doc-hidden channel factory 产生 layer-neutral sealed producer；上层 `RouterNavigation` helper 必须接收 exact `RouterHandle`，先解析唯一 `RouterEntry` 再创建 channel，并将 Core producer、issuer producer 与 facade producer 分别单次安装到同一 entry 的 engine、issuer slot 与 facade-return slot，只把只读 `BackCapacityOrderObserver` 交给测试。`RouterNavigation::back` 解析 exact entry 后才通过该 entry 的 facade slot 记录 return。多 router journal 各自独立，unknown/foreign/already-installed 按 entry typed reject 且无 partial installation；Core 不命名 ECS type，测试不取得 producer 或 write handle
+`test-support` 的跨 crate 顺序证据由 Core doc-hidden channel factory 产生 layer-neutral sealed producer；上层 `RouterNavigation` helper 必须接收 exact `RouterHandle`，先解析唯一 `RouterEntry` 再创建 channel，并将 Core producer、issuer producer 与 facade producer 分别单次安装到同一 entry 的 engine、issuer slot 与 facade-return slot，只把只读 `BackCapacityOrderObserver` 交给测试。`RouterNavigation::back` 解析 exact entry 后才通过该 entry 的 facade slot 记录 return。多 router journal 各自独立，foreign/already-installed 由 public audit 证明，same-domain unknown 由 ECS unit 使用既有内部 handle fixture 证明；所有拒绝均 typed、无 partial installation。Core 不命名 ECS type，测试不取得 producer 或 write handle
 
 `NoBackEntry` 只优先于后续 `IdentityExhausted`，不能越过 router identity 或 availability gate
 

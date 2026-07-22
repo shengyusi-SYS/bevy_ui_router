@@ -249,6 +249,8 @@ terminal evidence 还必须证明该 request/settlement scope 不再持有 outst
 
 `NavigationEnqueueErrorKind::IdentityExhausted` 是 allocator/domain predicate 的永久 fail-closed 结果：不创建 request、没有 request terminal、公开 queue/request/World 零变化、不映射为 recovering。back 的 enqueue precedence 固定为 `UnknownRouter -> availability -> NoBackEntry -> IdentityExhausted`，其中 `NoBackEntry` 仅优先于后续 capacity 申请。
 
+ECS capacity 只来自 exact entry persistent cell table 的真实 identity/grow predicate。router install 只签发 domain，不建立固定 pool 或安装期 pool exhaustion；Back reserve 在 Core allocator 前复用 free cell或完成 grow-on-demand，全部可失败容量预留成功后才 mint owner/generation。grow 或 identity failure 均保持无 request、Core 零触达与公开状态零写。
+
 ## 10. Required Regressions
 
 - admission/mount token 的 reject、cancel、confirm、重复和 stale replay。
