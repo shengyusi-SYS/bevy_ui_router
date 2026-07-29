@@ -1571,7 +1571,12 @@ pub enum EngineAction {
     BackResolution(BackResolutionOwnerHandoff),
 }
 
-pub struct BackTargetResume { /* root task + existing HistoryExecutionBindingView + continuation */ }
+#[doc(hidden)]
+pub enum BackTargetResumeAction {
+    FrameTask(RootFrameTask),
+    Commit(CommitTicket),
+}
+pub struct BackTargetResume { /* action + existing HistoryExecutionBindingView + continuation */ }
 pub enum BackTargetCoreResumeOutcome {
     Resumed(BackTargetResume),
     Permanent(BackTargetPermanentOwner),
@@ -1604,7 +1609,7 @@ pub enum BackTargetPermanentSettlementOutcome {
 }
 impl BackTargetResume {
     pub fn into_parts(self)
-        -> (RootFrameTask, HistoryExecutionBindingView, LifecycleContinuationCapacity);
+        -> (BackTargetResumeAction, HistoryExecutionBindingView, LifecycleContinuationCapacity);
 }
 
 impl RouterEngine {
@@ -1654,6 +1659,8 @@ impl RouterEngine {
 `Current` record 不得 terminal 或 evict，只有 `Consumed` 可进入 terminal retention/eviction
 
 Target resume and contradiction terminal each accept a caller-provided locally infallible `FnOnce` that borrows helper-local bound owner + issuer expectation slots. Core first exact-matches receiver and verified owner; Mismatch returns that verified owner without calling the closure. Matched calls the closure exactly once, then and only then consumes the verified owner into resume/freeze or contradiction terminal. No Core prepared owner、closure or expectation is returned or stored. Target source drift after committed retirement remains the bounded pre-splice `BackTargetPermanentOwner`; `settle_back_target_permanent_exact` independently exact-matches its receiver
+
+`BackTargetResume` linearly carries one `BackTargetResumeAction` beside the existing execution binding and continuation. Real nonzero-entering reconciliation returns `FrameTask`; legitimate duplicate/equivalent or pure-truncate zero-entering reconciliation returns the real `CommitTicket` without synthesizing a task. This doc-hidden enum is not reexported by the facade
 
 Every callback-bearing `*_with_*` method is a `#[doc(hidden)]` trusted ECS integration API and is absent from facade reexports. This follows the existing `ValidatedCommit::publish(FnOnce())` boundary: the callback is not authority; the verified/prepared Core owner is authority. Correctness relies on one audited ECS callsite that captures only helper-local owner/expectation slots and performs no query、allocation、validation or hook/observer-triggering write. Rust visibility/types are not claimed to defeat a malicious direct Core caller; the supported facade/adapter surface cannot obtain the verified owners or name/call these methods
 
@@ -2100,6 +2107,11 @@ Missing symbols、placeholder panics、test setup failures and injected outcomes
 | `back_target_pending_rejected_converts_exact_owner_before_public_state` | PendingRejected converts the exact owner before any public state |
 | `back_target_authority_lost_converts_exact_owner_before_public_state` | AuthorityLost converts the exact owner before any public state |
 | `back_target_retry_returns_exact_owner_capability_and_evidence` | Retry returns the exact live owner、capability、continuation and evidence with zero write |
+| `back_target_resume_action_follows_real_reconciliation` | real nonzero entering returns `FrameTask`；duplicate/equivalent and pure-truncate zero-entering return the real `Commit` action without fake task/remount，unused reserved frame/task identities remain permanently burned |
+| `back_target_resume_action_is_not_facade_reachable` | compile/static facade fixture proves `BackTargetResumeAction` and its variants cannot be named or reexported through the facade，while the facade export golden/profile remains unchanged |
+| `back_target_receiver_mismatch_calls_zero_and_exact_receiver_calls_once` | run one real nonzero-entering `FrameTask` fixture and one real zero-entering `Commit` fixture；for each，foreign receiver returns the exact verified owner and calls retirement zero times，exact receiver calls it once before producing the expected action |
+| `back_target_zero_entering_commit_needs_no_frame_report` | duplicate/equivalent zero-entering consumes the returned `CommitTicket` without frame report，publishes the exact destination entry/cursor/revision once and makes replay zero-write |
+| `back_target_zero_entering_preserves_physical_contract` | equivalent target remains physically zero-write；pure-truncate with no entering still prepares and settles the exact leaving cleanup manifest |
 | `back_target_and_contradiction_receiver_mismatch_never_commits_retirement` | wrong engine returns the verified target/contradiction owner, commit counter remains zero and ECS reconstructs the complete branch bound owner; exact receiver calls commit once before Core consumption |
 | `back_target_resume_source_drift_preserves_owner_and_terminals_once` | before any ECS splice, exact receiver calls retirement commit once then Core resume/freeze may return `BackTargetPermanentOwner`; its exact settlement reaches existing AuthorityLost terminal once |
 | `back_target_physical_permanent_preserves_spliced_owner_and_disposition` | after splice, physical permanent retains the exact `TargetPreparationOwner`; classify cross-router mismatch and settlement engine mismatch each return it unchanged, while exact settlement yields the single physical-cleanup + authority-settlement disposition and never a `BackTargetPermanentOwner` |
@@ -2134,6 +2146,11 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_target_pending_rejected_converts_exact_owner_before_public_state -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_target_authority_lost_converts_exact_owner_before_public_state -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_target_retry_returns_exact_owner_capability_and_evidence -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib back_target_resume_action_follows_real_reconciliation -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_authority_compile_fail back_target_resume_action_is_not_facade_reachable -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib back_target_receiver_mismatch_calls_zero_and_exact_receiver_calls_once -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_target_zero_entering_commit_needs_no_frame_report -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_target_zero_entering_preserves_physical_contract -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_target_and_contradiction_receiver_mismatch_never_commits_retirement -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_target_resume_source_drift_preserves_owner_and_terminals_once -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_target_physical_permanent_preserves_spliced_owner_and_disposition -j 1
@@ -2171,15 +2188,17 @@ Target direction remains existing Core publication flow
 ```text
 ECS exact take + burn neutral capacity
 -> synchronous typed Core resume of move-only target owner
--> Core stores current_history_capability and issues existing HistoryExecutionBindingView + continuation + root task
--> ECS splice/preparation
--> existing prepare_commit consumes capability before publication
+-> Core stores current_history_capability and issues existing HistoryExecutionBindingView + continuation + BackTargetResumeAction
+-> FrameTask: report/apply the real task to obtain CommitTicket
+   Commit: use the returned CommitTicket directly with no frame report
+-> ECS splice and complete physical preparation from the exact commit projection
+-> both branches enter existing prepare_commit, which consumes capability before publication
 -> unique prepared history/publication owner
 ```
 
 Core never constructs ECS `PreparedTargetPublication`
 
-- target resolution stays inside `resume_bound_back_target(&mut RouterEntry, bound)`: the entry-owned issuer first performs `preflight_bound_retirement(Target)`, then Core exact-matches the verified target before invoking the helper-local infallible retirement commit closure. Wrong engine calls the closure zero times and returns the verified target so ECS restores the complete bound branch; exact receiver calls it once, then resumes before ECS splice and returns `Resumed | Permanent(source drift)`. Only this pre-splice drift enters `settle_back_target_permanent`, which delegates to Core `settle_back_target_permanent_exact`; wrong engine preserves the Core owner + evidence and exact success returns existing AuthorityLost terminal/settlement evidence
+- target resolution stays inside `resume_bound_back_target(&mut RouterEntry, bound)`: the entry-owned issuer first performs `preflight_bound_retirement(Target)`, then Core exact-matches the verified target before invoking the helper-local infallible retirement commit closure. Wrong engine calls the closure zero times and returns the verified target so ECS restores the complete bound branch; exact receiver calls it once, then resumes before ECS splice and returns `Resumed | Permanent(source drift)`. `Resumed` carries one linear `FrameTask | Commit` action with the same execution binding and continuation；the task branch obtains its commit only through real report/apply，while the direct commit branch performs no frame report. Both complete physical preparation and converge on the existing `prepare_commit` before publication. Only pre-splice drift enters `settle_back_target_permanent`, which delegates to Core `settle_back_target_permanent_exact`; wrong engine preserves the Core owner + evidence and exact success returns existing AuthorityLost terminal/settlement evidence
 - after `Resumed`, ECS builds `TargetPreparationOwner` and calls `classify_back_target(&mut RouterEntry, owner)`; cross-router/entry mismatch returns the original owner. Its outer physical `Permanent` is `PreparationPermanentOwner<TargetPreparationOwner>` and only `settle_back_target_preparation_permanent` consumes it, returning it on engine mismatch or preparing the whole frozen splice cleanup + Core authority settlement disposition. `dispatch_target_preparation_permanent` is the unique consumer: it validates exact entry/Core receiver before mutation, returns the whole disposition on mismatch, and exact-installs it as one field. Physical cleanup then consumes the pre-frozen original branch and the same stored settlement; it never infers continuation from obligation count、flows through the pre-splice Core drift consumer or reaches the publisher
 - verified no-target candidate owns only unresolved lifecycle lineage. Before physical proven-empty + Core logical-zero approval + canonical-zero exact-bind, candidate and every Retry remain internal and make strict zero public request-phase/trace writes. After ECS constructs `ProvenEmptyProjection`, `approve_back_no_target_logical_zero` exact-matches the engine/candidate and current Core source before producing opaque `ApprovedBackNoTargetCandidate`; mismatch returns the original candidate + opaque Core mismatch view. `PreparedBackNoTarget` holds that approved composite、the same permit and the distinct physical projection; it contains no ledger、continuation or action. `consume_prepared_back_no_target(&mut RouterEntry, owner)` first performs issuer canonical-zero preflight, then calls the Core exact Ready receiver with a helper-local infallible commit closure. Issuer/receiver/approval mismatch calls the closure zero times and returns the full `PreparedBackNoTarget`; exact receiver calls it once to consume the permit into a preflighted manifest-neutral slot and returns sealed `PreparedBackNoTargetPublication` with zero public write. Still in the same helper/entry borrow, `publish_prepared_back_no_target` invokes the sole ECS closure with one opaque `BackNoTargetCleanupInstallation`; the closure reads only its batch projection, consumes the captured slot into the fully bound safe canonical-zero ledger and stores `{ ledger, whole installation }` before Core publishes. Same-schedule zero completion takes the field whole, proves exact-zero digest/count and converts the whole installation to the Core completion owner; receiver mismatch restores the whole settled owner and exact success reaches `Failed(BackTargetUnavailable)` with all fields/owners empty
 - pre-proof authority loss and permanent fail-closed may still enter existing settlement/terminal, but never publish the normal no-target `HistoryIntentRejected` or `CleanupPending` trace. The specialized `BackNoTargetPreparationOutcome` has no ordinary PendingRejected arm: unreachable PendingRejected converts directly to `Permanent`; AuthorityLost success returns `BackNoTargetAuthoritySettlementDisposition { physical, settlement, retirement }`; Retry and both issuer/receiver mismatches return the complete original owner. The unique authority dispatch validates exact entry/Core receiver before mutation, restores the whole disposition on mismatch, and exact-reuses only existing scoped authority settlement with authority-specific `Recovering`. Permanent capacity/domain contradiction retains `PreparationPermanentOwner<BackPreparationOwner>` for `settle_back_no_target_physical_permanent`
@@ -2263,6 +2282,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features test-support --test public_navigation_journeys history_c1_ -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features test-support --test public_navigation_authority_audit history_back_ -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_export_allowlist -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_authority_compile_fail back_target_resume_action_is_not_facade_reachable -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_authority_compile_fail back_trusted_commit_callbacks_are_not_facade_reachable -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_authority_compile_fail back_no_target_approval_cannot_be_forged_or_replace_physical_proof -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_authority_compile_fail -j 1
@@ -2283,6 +2303,7 @@ Reviewers verify
 - no-target uses no fake frame/task identity
 - retry owner/evidence is returned intact
 - matched resolution cannot recover raw handoff and every Core branch consumer requires the exact verified owner
+- `BackTargetResumeAction` remains absent from facade exports and cannot be named through the supported facade; the facade export golden/profile remains unchanged
 - callback-bearing `*_with_*` methods and the prepared no-target final consumer are doc-hidden trusted ECS integration APIs, not facade reexports; the supported facade/adapter cannot obtain their verified/prepared owners, and the callback is explicitly not authority
 - target/contradiction retirement、no-target transfer/refreeze、source-drift retirement and canonical-zero Ready bind each complete issuer + Core receiver preflight in one exact-entry helper, call the infallible commit closure zero times on mismatch and once on exact match, and never leak an issuer expectation or closure
 - every mismatch reconstructs the complete original verified owner/composite, including its bound reservation or permit
