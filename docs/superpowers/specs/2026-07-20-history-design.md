@@ -308,15 +308,21 @@ contradiction terminal 与 no-target transfer/refreeze 继续遵循 wrong receiv
 
 `BackTargetResume` 的 action、execution 与 continuation 是同一个 move-only resume 结果，并与 engine-held history capability 保持唯一关联
 
+ECS 将 resume 后的 execution 与 continuation 保存在 `RouterEntry::pending_back_target_execution` 这一独立 move-only composite 中，不扩展通用 `PendingCommit`。该 composite 必须与 exact request、transaction、当前 task-or-ticket identity 及对应 physical pending 状态成对存在；driver 只能 whole-take，任何尚不能继续的 typed 分支都必须原样 restore，terminal 后必须为空
+
 `FrameTask` 分支经真实 frame report/apply 取得 commit，`MountRequest` 分支进入既有 nested mount handshake，`Commit` 分支不产生 frame report，三者取得 commit 后完成 physical preparation 并进入既有 `prepare_commit`
 
 `FailureCleanup` 只进入既有失败清理链，不能进入正常 publisher
 
-ECS 的 `LifecyclePreflightEvidence` 保持 crate-private physical/boundary evidence，任何 Core source、`RouterEngine` inherent method 或 Core-owned outcome 都不得命名它。Core exact receiver 只验证 move-only verified owner 与所需的 Core-owned `PreparationBoundaryScopeView`；receiver mismatch 返回单一 opaque、不可构造、不可检查且不授权重建 owner 的 `PreparationReceiverMismatchView`。ECS 将该 mismatch view 仅作 diagnostics，并继续把自身 physical evidence 与完整 ECS owner 绑定
+`BackCapacityRetirementEvidence` 只证明 capacity lineage 已 terminal，是 non-authorizing evidence。target dispatcher 必须在同一 exact-entry dispatch 内通过 entry issuer 的现有 exact classifier 完成命名 consuming audit，并将 audit 与 `Ready | FailureCleanup | Permanent` 分支安装作为一个不可分割步骤；未实现分支暂存完整 `{ branch owner, retirement evidence }`，不得 drop，也不得把 evidence 塞进 `TargetPreparationOwner` 或 failure-cleanup chain
+
+ECS 的 `LifecyclePreflightEvidence` 保持 crate-private physical/boundary evidence，任何 Core source、`RouterEngine` inherent method 或 Core-owned outcome 都不得命名它。`PreparationBoundaryScopeView` 的唯一 producer 是同一个 `LifecycleContinuationCapacity` 的只读投影；view 只供 exact receiver 校验，不能重建、消费或授权 owner。Core 的 `accept_back_target_ready | pending_rejected | authority_lost` 均返回 typed `Matched | Mismatch`；Mismatch 必须返还原 `LifecycleContinuationCapacity` 与单一 opaque、不可构造、不可检查且不授权重建 owner 的 `PreparationReceiverMismatchView`，并保持 zero-write。ECS 将 mismatch view 仅作 diagnostics，并继续把自身 physical evidence 与完整 ECS owner 绑定
 
 所有 callback-bearing `*_with_*` 方法都是 `#[doc(hidden)]` trusted ECS integration API，不从 facade reexport；facade/adapter 既不能取得 verified/prepared Core owner，也不能通过受支持 API 调用这些方法。该模式沿用既有 `ValidatedCommit::publish(FnOnce())`：closure 本身不是 authority，verified/prepared Core owner 才是 authority；唯一 ECS callsite 与 callback body 由 static/compile gate 审计。这里不引入 attestor、signature 或 second receipt，也不声称 Rust 类型能阻止恶意 direct Core caller
 
 typed handoff 只确定 running execution lineage，后续 `Ready | PendingRejected | AuthorityLost | RetryablePreparationFailure` physical classification 与 owner disposition 仍由 §4.4 独立决定
+
+最小 root `FrameTask` slice 也必须经过真实 report/apply、real `CommitTicket`、splice、physical classifier、typed Core `Ready` acceptance 和既有 `prepare_commit`/publisher。尚未接线的 resume、classifier 或 acceptance 分支只能 typed safe-stop 并保持 public zero-write，不能绕过 classifier 或引入第二 publisher
 
 contradiction handoff 必须 exact-match paired bound capacity，退休 ECS reservation 后由 Core 单次消费 accepted branch、request、transaction 与 cleanup batch owner；request 有界成为既有 `Failed(AuthorityLost)`，World、presentation 与 history 零写，不记录 `HistoryIntentRejected`，不留下 outstanding owner 或 retry
 
@@ -327,6 +333,8 @@ exact receiver 仍调用 callback 一次再不可失败地移动该 owner，wron
 该 owner 只进入 RouterEngine exact settlement API，settlement wrong engine 返还原 owner + evidence，success 返回既有 terminal/settlement evidence
 
 resume 成功后的 ECS physical preparation 若永久失败，必须保留完整 `TargetPreparationOwner` 与 physical evidence，使用独立 composite permanent owner 和 consumer，classification 的 cross-router mismatch 与 settlement 的 engine mismatch 都返还原 composite owner
+
+`PreparedPostCommitContinuationOwner` 的唯一 consumer 是 target-specific `prepare_back_target_commit` bridge。该 bridge 只在 real ticket 与完整 physical preparation 已 exact 封闭后调用，并在同一 Core receiver 内原子消费 continuation owner、real `CommitTicket` 与 `CleanupManifest`，连续完成既有 `prepare_commit` 与 `validate_publication`。`Validated` 返回包含已安装 continuation/engine capability 的既有 `ValidatedCommit`；receiver mismatch 返还原 continuation owner 与 manifest，ECS 可重组、restore 完整 prepared target owner 并保持 zero-write；任一 preparation/validation failure 必须把 continuation 与 engine-held capability 原子转入既有 typed failure/authority owner。任何分支都不得先产生 ownerless `Consumed` 或在 validation 前释放 continuation，成功仍只进入既有 publisher
 
 exact settlement 只准备同时持有 frozen physical cleanup 与既有 Core authority settlement 的整体 disposition，再由唯一 exact-entry dispatch consumer 安装整个 disposition，任何 dispatch mismatch 都返还整体 disposition
 
