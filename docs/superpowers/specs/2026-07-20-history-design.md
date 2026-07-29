@@ -270,8 +270,9 @@ push/replace 使用 enqueue 时冻结的 canonical target，成为 running 时�
 
 back 成为 running 时，Core 消费 accepted branch reservation owner 并只执行一次 live preview
 
-- 有 target 时先冻结 exact destination，再完成 matcher/Core logical reconciliation；只有此时才产生 move-only typed target execution owner，绑定 actual host/slot/frame/generation、完整 reserved frame/task identity pool、normal attempt 与 exact source/destination；zero-entering 仍保留并烧毁这些 reserved identities，只是不产生 `RootFrameTask` action
-- target resume 路径保持 engine-held exact history capability 的唯一关联，move-only resume 结果携带 execution、continuation 与 `FrameTask(RootFrameTask) | Commit(CommitTicket)`；nonzero entering 才产生 frame task，legitimate zero-entering 直接交出真实 commit ticket，不伪造 task 或强制 remount
+- 有 target 时先冻结 exact destination，生成只携带 lineage 与完整 reserved frame/task identity pool 的 move-only raw target owner；该 owner 绑定 normal attempt 与 exact source/destination，但不提前安装 matcher、reconciliation 或 action，zero-entering 仍保留并烧毁未使用 identities
+- exact target receiver 在 capacity retirement callback 前完成 source、host/top-slot、active/child-slot baseline exact refreeze，以及 matcher、logical reconciliation、first action 与 mount issue 的全部准备，形成 `PreparedReady | PreparedFailureCleanup | PreparedPermanent`
+- `PreparedReady` 保持 engine-held exact history capability 的唯一关联，并以 `BackTargetResumeAction::{FrameTask(RootFrameTask), MountRequest(MountRequest), Commit(CommitTicket)}` 表达正常执行；`PreparedFailureCleanup` 独立交出 `FailureCleanupRequest`，不得伪装成 resume action
 - 结构一致且无 predecessor 时产生 target-free no-target candidate，不签发 history capability，不合成 normal attempt 或 frame identity
 - cursor/entry/location 不一致、target 深度超过 reserved maximum 或 accepted pool 不匹配产生 typed permanent contradiction
 
@@ -289,9 +290,27 @@ Core 通过 doc-hidden `RouterEngine::classify_back_resolution_evidence` 返回 
 
 supported production callsite 中 Core action 与 exact `BoundBackCapacityReservation` 的配对由 enqueue acceptance 建立，并只由 exact take 单次消费，构成 crate-private closed invariant，本阶段不新增 `MissingCapacity`、domain quarantine 或恢复协议，也不把该内部 invariant 破坏提升为公共或生产 lifecycle 分支
 
-target resume、contradiction terminal 与 no-target transfer/refreeze 都必须在同一个 exact-entry helper borrow 内完成：helper 先对 entry-owned issuer 做全部 non-mutating exact preflight，再把只捕获 helper-local owner/expectation slot 的 locally infallible `FnOnce` 交给 Core exact receiver。Core 先匹配 engine 与 verified owner；Mismatch 调用 closure 零次并返还原 verified owner，ECS 可重组完整 bound branch；Matched 调用 closure 恰好一次，再消费 owner 进入 resume、terminal 或 refreeze。closure 只允许不可失败 owner move/registry commit，不得 query、allocation、validation 或触发 hook/observer；issuer expectation 与 closure 均不得跨出 helper
+target resume、contradiction terminal 与 no-target transfer/refreeze 都必须在同一个 exact-entry helper borrow 内完成
 
-`BackTargetResume` 的 action、execution 与 continuation 是同一个 move-only resume 结果，并与 engine-held history capability 保持唯一关联；`FrameTask` 分支经真实 frame report/apply 取得 commit，`Commit` 分支不产生 frame report，两者都必须完成 physical preparation 后进入既有 `prepare_commit`，publication 仍是最后语义步骤
+target helper 先对 entry-owned issuer 做全部 non-mutating exact preflight
+
+Core wrong receiver 在准备前返回 `Mismatch`、调用 callback 零次并返还原 verified owner，ECS 可重组完整 bound branch
+
+exact receiver 在 callback 前完成 history source、host/top-slot、active/child-slot baseline exact refreeze，以及 matcher、reconciliation、action 与 mount issue 的全部可能失败工作，再形成 `PreparedReady | PreparedFailureCleanup | PreparedPermanent`
+
+prepared branch 形成后 callback 恰好调用一次，callback 后只允许不可失败地移动或安装已准备 owner/action，不得 query、allocation、validation、`expect` 或触发 hook/observer
+
+same-engine source/host/baseline drift 与 generation/depth contradiction 使用 private typed `Permanent/AuthorityLost`，不是 `Mismatch`
+
+contradiction terminal 与 no-target transfer/refreeze 继续遵循 wrong receiver callback 零次、exact prepared branch callback 一次的规则，issuer expectation 与 callback 均不得跨出 helper
+
+`BackTargetStart` 将正常 `Ready(BackTargetResume)` 与 `FailureCleanup(FailureCleanupRequest)` 分开
+
+`BackTargetResume` 的 action、execution 与 continuation 是同一个 move-only resume 结果，并与 engine-held history capability 保持唯一关联
+
+`FrameTask` 分支经真实 frame report/apply 取得 commit，`MountRequest` 分支进入既有 nested mount handshake，`Commit` 分支不产生 frame report，三者取得 commit 后完成 physical preparation 并进入既有 `prepare_commit`
+
+`FailureCleanup` 只进入既有失败清理链，不能进入正常 publisher
 
 ECS 的 `LifecyclePreflightEvidence` 保持 crate-private physical/boundary evidence，任何 Core source、`RouterEngine` inherent method 或 Core-owned outcome 都不得命名它。Core exact receiver 只验证 move-only verified owner 与所需的 Core-owned `PreparationBoundaryScopeView`；receiver mismatch 返回单一 opaque、不可构造、不可检查且不授权重建 owner 的 `PreparationReceiverMismatchView`。ECS 将该 mismatch view 仅作 diagnostics，并继续把自身 physical evidence 与完整 ECS owner 绑定
 
@@ -301,7 +320,17 @@ typed handoff 只确定 running execution lineage，后续 `Ready | PendingRejec
 
 contradiction handoff 必须 exact-match paired bound capacity，退休 ECS reservation 后由 Core 单次消费 accepted branch、request、transaction 与 cleanup batch owner；request 有界成为既有 `Failed(AuthorityLost)`，World、presentation 与 history 零写，不记录 `HistoryIntentRejected`，不留下 outstanding owner 或 retry
 
-target 的 Core `resume/freeze_back` source drift 发生在 ECS splice 前，唯一产生 opaque `BackTargetPermanentOwner`；该 owner 只进入 RouterEngine exact settlement API，wrong engine 返还原 owner + evidence，success 返回既有 terminal/settlement evidence。resume 成功后的 ECS physical preparation 若永久失败，必须保留完整 `TargetPreparationOwner` 与 physical evidence，使用独立 composite permanent owner 和 consumer；classification 的 cross-router mismatch 与 settlement 的 engine mismatch 都返还原 composite owner。exact settlement 只准备同时持有 frozen physical cleanup 与既有 Core authority settlement 的整体 disposition，再由唯一 exact-entry dispatch consumer 安装整个 disposition；任何 dispatch mismatch 都返还整体 disposition。physical cleanup 完成后只能按预先冻结的原 branch 消费同一 stored settlement，不能由 obligation count/disposition 反推、回流到 source-drift consumer 或进入 publisher；terminal 必须清空 splice、cleanup、settlement 与 continuation owner
+target 的 Core source/host/baseline drift 在 ECS splice 与 retirement callback 前准备为唯一 opaque `BackTargetPermanentOwner`
+
+exact receiver 仍调用 callback 一次再不可失败地移动该 owner，wrong engine 才返回 `Mismatch` 并调用 callback 零次
+
+该 owner 只进入 RouterEngine exact settlement API，settlement wrong engine 返还原 owner + evidence，success 返回既有 terminal/settlement evidence
+
+resume 成功后的 ECS physical preparation 若永久失败，必须保留完整 `TargetPreparationOwner` 与 physical evidence，使用独立 composite permanent owner 和 consumer，classification 的 cross-router mismatch 与 settlement 的 engine mismatch 都返还原 composite owner
+
+exact settlement 只准备同时持有 frozen physical cleanup 与既有 Core authority settlement 的整体 disposition，再由唯一 exact-entry dispatch consumer 安装整个 disposition，任何 dispatch mismatch 都返还整体 disposition
+
+physical cleanup 完成后只能按预先冻结的原 branch 消费同一 stored settlement，不能由 obligation count/disposition 反推、回流到 source-drift consumer 或进入 publisher，terminal 必须清空 splice、cleanup、settlement 与 continuation owner
 
 ### 4.4 Typed preparation outcome
 
@@ -624,7 +653,7 @@ x host epoch
 | replace | equivalent target | equivalent replacement entry | physical zero，length/cursor unchanged，revision advances | unchanged |
 | replace | fragment-only | remount deepest normal leaf | cursor entry replaced after commit | unchanged |
 | back | `can_back=false` at published admission | none | no request，`NoBackEntry` | no state change |
-| back | target exists at running | previous exact entry | 按 exact entry identity 原子提交 UI/history 后才移动 cursor；duplicate/equivalent 可 zero-entering 且 physical zero，pure-truncate 可 zero-entering 但仍准备 exact leaving cleanup | cursor unchanged |
+| back | target exists at running | previous exact entry | 按 exact entry identity 原子提交 UI/history 后才移动 cursor；nested target 可先进入 mount handshake，duplicate/equivalent 可 zero-entering 且 physical zero，pure-truncate 可 zero-entering 但仍准备 exact leaving cleanup | cursor unchanged |
 | back | target absent at running | none | not applicable | proven-empty 后 `BackTargetUnavailable` |
 | back from Error presentation | published history decides | previous exact entry | normal Route commit，cursor moves | Error or old presentation follows normal failure rules，cursor unchanged |
 | any command with current `None` | command规则决定 | normal Route target | first physical presentation，history按intent更新 | `None`保持或fallback Error |
@@ -633,7 +662,13 @@ x host epoch
 
 `next=None` 与 `next=Some(equivalent route)` 是不同 case
 
-Back target 的 legitimate zero-entering reconciliation 直接产生 `CommitTicket`，不得为满足执行形状伪造 `RootFrameTask`；duplicate/equivalent 仍按 exact entry identity 更新 history，pure-truncate 即使没有 entering 也必须保留 leaving cleanup 的 exact owner、manifest 与 completion
+Back target 的正常 action domain 是 `FrameTask | MountRequest | Commit`
+
+nested entering 可以先产生 `MountRequest` 并沿用既有 mount handshake
+
+mount issue exhaustion 独立产生 `FailureCleanupRequest`，不得伪装为 resume action
+
+legitimate zero-entering reconciliation 直接产生 `CommitTicket`，不得为满足执行形状伪造 `RootFrameTask`；duplicate/equivalent 仍按 exact entry identity 更新 history，pure-truncate 即使没有 entering 也必须保留 leaving cleanup 的 exact owner、manifest 与 completion
 
 ### 7.2 Lifecycle outcome
 
