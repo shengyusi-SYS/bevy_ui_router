@@ -276,7 +276,11 @@ back 成为 running 时，Core 消费 accepted branch reservation owner 并只�
 
 Core 通过 typed resolution handoff 单次移动 `Target(raw target owner) | NoTarget(raw candidate) | Contradiction(raw contradiction owner)` 三个分支之一；ECS 不能读取 `requested`、bool、snapshot 或 reservation projection 推断分支或 execution authority
 
-raw handoff 不能授权后续 Core action。Core 必须消费 exact accepted view + raw handoff 做 lineage verify；Matched 返回 move-only verified wrapper，其唯一 split 是原 accepted view + branch-specific verified target/no-target/contradiction owner，不能拆回 raw handoff。ECS 用该 accepted view 与原 capacity 重组同一个 `BoundBackCapacityReservation`，再与 verified branch owner 配对；resume、source refreeze 与 contradiction consumer 也只接受各自 verified owner。Mismatch 返还原 accepted view、raw handoff 与 evidence，ECS 同样重组完整原 capacity owner
+raw handoff 不能授权后续 Core action。Core 必须消费 exact accepted view + raw handoff 做 lineage verify；Matched 返回 move-only verified wrapper，其唯一 split 是原 accepted view + branch-specific verified target/no-target/contradiction owner，不能拆回 raw handoff。ECS 用该 accepted view 与原 capacity 重组同一个 `BoundBackCapacityReservation`，再与 verified branch owner 配对；resume、source refreeze 与 contradiction consumer 也只接受各自 verified owner。foreign Mismatch 返还原 accepted view、raw handoff 与 evidence，ECS 同样重组完整原 capacity owner
+
+duplicate 不等于 raw handoff replay，ECS 在 exact consumption 前保存可 Clone、non-authorizing 的 `BackResolutionEvidence`，Matched 消费 raw handoff 后必须把该 evidence 交给真实生产 predicate `RouterEntry::validate_back_resolution_evidence(&saved_evidence)` 并要求返回 `BackResolutionEvidenceDisposition::ConsumedReplay`，分类严格 World、history 与 public zero-write，capacity retirement evidence 不能替代 resolution duplicate evidence，测试不得直接注入 disposition，移除或短路该 predicate 时 gate 必须失败
+
+supported production callsite 中 Core action 与 exact `BoundBackCapacityReservation` 的配对由 enqueue acceptance 建立，并只由 exact take 单次消费，构成 crate-private closed invariant，本阶段不新增 `MissingCapacity`、domain quarantine 或恢复协议，也不把该内部 invariant 破坏提升为公共或生产 lifecycle 分支
 
 target resume、contradiction terminal 与 no-target transfer/refreeze 都必须在同一个 exact-entry helper borrow 内完成：helper 先对 entry-owned issuer 做全部 non-mutating exact preflight，再把只捕获 helper-local owner/expectation slot 的 locally infallible `FnOnce` 交给 Core exact receiver。Core 先匹配 engine 与 verified owner；Mismatch 调用 closure 零次并返还原 verified owner，ECS 可重组完整 bound branch；Matched 调用 closure 恰好一次，再消费 owner 进入 resume、terminal 或 refreeze。closure 只允许不可失败 owner move/registry commit，不得 query、allocation、validation 或触发 hook/observer；issuer expectation 与 closure 均不得跨出 helper
 
@@ -682,7 +686,8 @@ no-target back 的 current/retained slot 必须进入protected并保持零 attem
 
 | Owner/evidence | Outstanding | Superseded/cancelled | Terminal/replay rule |
 | --- | --- | --- | --- |
-| accepted back owner | queued/running before resolution | verify Matched后与原capacity重组bound reservation，并与branch-specific verified owner配对 | wrapper只拆为accepted+verified，不能拆回raw handoff；Mismatch返raw accepted+handoff |
+| accepted back owner | queued/running before resolution | verify Matched后与原capacity重组bound reservation，并与branch-specific verified owner配对 | wrapper只拆为accepted+verified，不能拆回raw handoff；foreign Mismatch返raw accepted+handoff |
+| back resolution duplicate evidence | exact consumption前保存的可Clone、non-authorizing projection | Matched消费raw handoff后必须调用`RouterEntry::validate_back_resolution_evidence(&saved_evidence)` | 真实predicate必须返回`BackResolutionEvidenceDisposition::ConsumedReplay`并严格零写；capacity retirement evidence不可替代，测试不得注入disposition，移除或短路predicate时gate必须失败 |
 | target pre-splice source-drift owner | Core resume/freeze_back exact drift | 不进入ECS splice或physical preparation | dedicated exact engine settlement，mismatch返还原owner |
 | target post-splice physical permanent owner | exact `TargetPreparationOwner` + physical evidence | 只准备并整体dispatch `{ frozen cleanup, Core authority settlement }`；dispatch mismatch返还整体 disposition | cleanup exact完成后按预冻结原branch消费stored settlement；不从count/disposition反推，不进入source-drift consumer或publication，terminal清空全部owner |
 | no-target candidate | verified unresolved lifecycle lineage，等待physical proven-empty + Core logical-zero approval + canonical-zero bind | authority loss后转为`{ complete physical settlement, Core settlement, ECS retirement }`整体 disposition；retry/mismatch原样返还且public零写 | 唯一dispatch只复用existing scoped authority settlement；bind前不能mint normal continuation/action或发布normal cleanup |
