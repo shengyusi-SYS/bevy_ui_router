@@ -10,6 +10,7 @@ use crate::cleanup::{
 #[cfg(feature = "test-support")]
 use crate::engine::BackAllocatorBoundary;
 use crate::engine::{
+    BackNoTargetApprovalOutcome as CoreBackNoTargetApprovalOutcome,
     BackNoTargetSourceDriftSettlementOutcome as CoreBackNoTargetSourceDriftSettlementOutcome,
     BackNoTargetSourceRefreezeOutcome as CoreBackNoTargetSourceRefreezeOutcome,
     BackTargetCommitOperationFailure as CoreBackTargetCommitOperationFailure,
@@ -23,8 +24,8 @@ use crate::engine::{
     CoreBackTargetDriverFailureReport, CoreBackTargetDriverFailureReportMode,
     CoreBackTargetDriverFallback, CoreBackTargetDriverTerminal,
     CoreBackTargetDriverTerminalProjection, CoreBackTargetPhysicalReceiverRef,
-    CorePreparationReceiverMismatchProjection, EngineAction as CoreEngineAction,
-    EngineInstallError as CoreEngineInstallError,
+    CorePreparationReceiverMismatchProjection, CoreProvenEmptyApprovalProjection,
+    EngineAction as CoreEngineAction, EngineInstallError as CoreEngineInstallError,
     FailedAuthoritySettlementTrigger as CoreFailedAuthoritySettlementTrigger,
     FailedAuthorityTriggerError as CoreFailedAuthorityTriggerError,
     FailureCleanupError as CoreFailureCleanupError,
@@ -1178,6 +1179,26 @@ pub enum BackNoTargetSourceRefreezeOutcome {
 }
 
 #[doc(hidden)]
+pub struct ProvenEmptyApprovalView {
+    inner: CoreProvenEmptyApprovalProjection,
+}
+
+#[doc(hidden)]
+pub struct ApprovedBackNoTargetCandidate {
+    candidate: VerifiedBackNoTargetCandidate,
+    approval: ProvenEmptyApprovalView,
+}
+
+#[doc(hidden)]
+pub enum BackNoTargetApprovalOutcome {
+    Approved(ApprovedBackNoTargetCandidate),
+    Mismatch {
+        candidate: VerifiedBackNoTargetCandidate,
+        mismatch: PreparationReceiverMismatchView,
+    },
+}
+
+#[doc(hidden)]
 pub enum BackNoTargetSourceDriftSettlementOutcome {
     Settled(BackNoTargetSourceDriftTerminalEvidence),
     Mismatch {
@@ -2015,6 +2036,29 @@ impl RouterEngine {
             } => BackNoTargetSourceRefreezeOutcome::Mismatch {
                 candidate,
                 evidence,
+            },
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn approve_back_no_target_logical_zero(
+        &mut self,
+        candidate: VerifiedBackNoTargetCandidate,
+    ) -> BackNoTargetApprovalOutcome {
+        match self.inner.approve_back_no_target_logical_zero(candidate) {
+            CoreBackNoTargetApprovalOutcome::Approved(inner) => {
+                let (candidate, approval) = inner.into_parts();
+                BackNoTargetApprovalOutcome::Approved(ApprovedBackNoTargetCandidate {
+                    candidate,
+                    approval: ProvenEmptyApprovalView { inner: approval },
+                })
+            }
+            CoreBackNoTargetApprovalOutcome::Mismatch {
+                candidate,
+                mismatch,
+            } => BackNoTargetApprovalOutcome::Mismatch {
+                candidate,
+                mismatch: PreparationReceiverMismatchView { inner: mismatch },
             },
         }
     }
@@ -4975,6 +5019,226 @@ mod tests {
         }
     }
 
+    fn take_refrozen_back_no_target_candidate() -> (RouterEngine, VerifiedBackNoTargetCandidate) {
+        let mut engine = confirmed_engine();
+        settle_push(
+            &mut engine,
+            RouteLocation::new("/").with_fragment("logical-zero-target"),
+        );
+        settle_changed_history_push(
+            &mut engine,
+            RouteLocation::new("/").with_fragment("logical-zero-source"),
+        );
+        let world = engine
+            .claim_history_admission_world()
+            .expect("the exact engine issues one real world seal");
+        let stamp = engine
+            .history_admission_stamp(&world)
+            .expect("the two-entry history admits Back");
+        let first_admission = engine
+            .prepare_back_admission(&world, &stamp)
+            .expect("the first Back exact-refreezes the live history");
+        let second_admission = engine
+            .prepare_back_admission(&world, &stamp)
+            .expect("the second Back shares the same pre-publication source");
+        let first_accepted = engine
+            .enqueue_back(first_admission)
+            .expect("the first live Back reserves one real branch");
+        let second_accepted = engine
+            .enqueue_back(second_admission)
+            .expect("the second live Back reserves one real branch");
+
+        engine.collect();
+        let Some(EngineAction::BackResolution(first_handoff)) = engine.action() else {
+            panic!("the first accepted Back must produce a real resolution handoff")
+        };
+        let (_first_request, first_view) = first_accepted.into_parts();
+        let first_verified = match engine.verify_back_resolution_handoff(first_view, first_handoff)
+        {
+            BackResolutionVerifyOutcome::Matched(verified) => verified,
+            BackResolutionVerifyOutcome::Mismatch { .. } => {
+                panic!("the exact first Back lineage must verify")
+            }
+        };
+        let (_first_view, first_owner) = first_verified.into_parts();
+        let first_target = match first_owner {
+            VerifiedBackResolutionOwnerHandoff::Target(owner) => owner,
+            VerifiedBackResolutionOwnerHandoff::NoTarget(_)
+            | VerifiedBackResolutionOwnerHandoff::Contradiction(_) => {
+                panic!("the first Back from a two-entry history must resolve its predecessor")
+            }
+        };
+        let first_resume = match engine.resume_back_target_with_retirement(first_target, || {}) {
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::Ready(resume)) => resume,
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::FailureCleanup(_)) => {
+                panic!("the real predecessor must reach a normal target action")
+            }
+            BackTargetCoreResumeOutcome::Permanent(_)
+            | BackTargetCoreResumeOutcome::Mismatch { .. } => {
+                panic!("the exact first Back target must resume")
+            }
+        };
+        let (action, _execution, _continuation) = first_resume.into_parts();
+        let BackTargetResumeAction::FrameTask(task) = action else {
+            panic!("the changed depth-one Back target must issue one real frame task")
+        };
+        let ticket = engine
+            .report_applied(task)
+            .expect("the resumed Back target must accept its real frame report");
+        let logical_roots = engine
+            .reconciliation_projection_for_commit(&ticket)
+            .expect("the resumed Back target retains its exact reconciliation projection")
+            .leaving()
+            .map(|leaving| leaving.version().clone())
+            .collect::<Vec<_>>();
+        let obligation_count = logical_roots.len();
+        let manifest = if obligation_count == 0 {
+            CleanupManifest::empty()
+        } else {
+            CleanupManifest::new(logical_roots, 0x4c4f_4749_4341_4c30, obligation_count)
+        };
+        let prepared = engine
+            .prepare_commit(&ticket, manifest)
+            .expect("the resumed Back target prepares its real cleanup manifest");
+        let cleanup = prepared.cleanup().clone();
+        let validated = engine
+            .validate_publication(prepared)
+            .expect("the resumed Back target validates its real publication");
+        validated.publish(|| {});
+        if obligation_count != 0 {
+            engine
+                .observe_cleanup_receipt(&cleanup, CleanupDisposition::Removed)
+                .expect("the resumed Back target records its real cleanup receipt");
+        }
+        let completion = if obligation_count == 0 {
+            cleanup.complete_empty()
+        } else {
+            cleanup.complete(0x4c4f_4749_4341_4c31, obligation_count)
+        };
+        engine
+            .complete_cleanup(completion)
+            .expect("the resumed Back target settles before the queued no-target Back resolves");
+
+        let Some(EngineAction::BackResolution(second_handoff)) = engine.action() else {
+            panic!("the queued second Back must resolve after the first terminal")
+        };
+        let (_second_request, second_view) = second_accepted.into_parts();
+        let second_verified =
+            match engine.verify_back_resolution_handoff(second_view, second_handoff) {
+                BackResolutionVerifyOutcome::Matched(verified) => verified,
+                BackResolutionVerifyOutcome::Mismatch { .. } => {
+                    panic!("the exact second Back lineage must verify")
+                }
+            };
+        let (_second_view, second_owner) = second_verified.into_parts();
+        let candidate = match second_owner {
+            VerifiedBackResolutionOwnerHandoff::NoTarget(candidate) => candidate,
+            VerifiedBackResolutionOwnerHandoff::Target(_)
+            | VerifiedBackResolutionOwnerHandoff::Contradiction(_) => {
+                panic!("the second live Back at cursor zero must resolve NoTarget")
+            }
+        };
+        let candidate = match engine.refreeze_back_no_target_source_with_transfer(candidate, || {})
+        {
+            BackNoTargetSourceRefreezeOutcome::Unchanged(candidate) => candidate,
+            BackNoTargetSourceRefreezeOutcome::Drift(_)
+            | BackNoTargetSourceRefreezeOutcome::Mismatch { .. } => {
+                panic!("the exact no-target source must refreeze before logical-zero approval")
+            }
+        };
+
+        (engine, candidate)
+    }
+
+    fn assert_logical_zero_mismatch(mismatch: PreparationReceiverMismatchView) {
+        match mismatch.inner {
+            CorePreparationReceiverMismatchProjection::LogicalZero {
+                expected: _,
+                observed: _,
+            } => {}
+            _ => panic!("logical-zero rejection must retain its typed receiver/source evidence"),
+        }
+    }
+
+    #[test]
+    fn back_no_target_logical_zero_approval_requires_exact_core_candidate() {
+        let (mut engine, candidate) = take_refrozen_back_no_target_candidate();
+        let mut foreign = confirmed_engine();
+        let exact_before_foreign = engine.inner.testing_snapshot();
+        let foreign_before = foreign.inner.testing_snapshot();
+        let (candidate, mismatch) = match foreign.approve_back_no_target_logical_zero(candidate) {
+            BackNoTargetApprovalOutcome::Mismatch {
+                candidate,
+                mismatch,
+            } => (candidate, mismatch),
+            BackNoTargetApprovalOutcome::Approved(_) => {
+                panic!("a foreign engine must not approve another engine's candidate")
+            }
+        };
+        assert_logical_zero_mismatch(mismatch);
+        assert_eq!(engine.inner.testing_snapshot(), exact_before_foreign);
+        assert_eq!(foreign.inner.testing_snapshot(), foreign_before);
+
+        let exact_before = engine.inner.testing_snapshot();
+        match engine.approve_back_no_target_logical_zero(candidate) {
+            BackNoTargetApprovalOutcome::Approved(_) => {
+                assert_eq!(engine.inner.testing_snapshot(), exact_before);
+            }
+            BackNoTargetApprovalOutcome::Mismatch { .. } => {
+                assert_eq!(engine.inner.testing_snapshot(), exact_before);
+                panic!("exact core logical-zero candidate must receive opaque approval");
+            }
+        }
+
+        let (mut current_owner_drift, candidate) = take_refrozen_back_no_target_candidate();
+        current_owner_drift
+            .push(RouteLocation::new("/").with_fragment("logical-zero-owner-drift"))
+            .expect("the real drift request reserves one normal current owner");
+        current_owner_drift.collect();
+        let before_current_owner_mismatch = current_owner_drift.inner.testing_snapshot();
+        let mismatch = match current_owner_drift.approve_back_no_target_logical_zero(candidate) {
+            BackNoTargetApprovalOutcome::Mismatch {
+                candidate,
+                mismatch,
+            } => {
+                drop(candidate);
+                mismatch
+            }
+            BackNoTargetApprovalOutcome::Approved(_) => {
+                panic!("a current execution owner must reject logical-zero approval")
+            }
+        };
+        assert_logical_zero_mismatch(mismatch);
+        assert_eq!(
+            current_owner_drift.inner.testing_snapshot(),
+            before_current_owner_mismatch
+        );
+
+        let (mut source_drift, candidate) = take_refrozen_back_no_target_candidate();
+        settle_changed_history_push(
+            &mut source_drift,
+            RouteLocation::new("/").with_fragment("logical-zero-predecessor-drift"),
+        );
+        let before_source_mismatch = source_drift.inner.testing_snapshot();
+        let mismatch = match source_drift.approve_back_no_target_logical_zero(candidate) {
+            BackNoTargetApprovalOutcome::Mismatch {
+                candidate,
+                mismatch,
+            } => {
+                drop(candidate);
+                mismatch
+            }
+            BackNoTargetApprovalOutcome::Approved(_) => {
+                panic!("a changed source with a live predecessor must reject approval")
+            }
+        };
+        assert_logical_zero_mismatch(mismatch);
+        assert_eq!(
+            source_drift.inner.testing_snapshot(),
+            before_source_mismatch
+        );
+    }
+
     fn take_back_target_driver_frame_task() -> (
         RouterEngine,
         HistoryExecutionBindingView,
@@ -5379,6 +5643,7 @@ mod tests {
                 );
             }
             CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -5436,6 +5701,7 @@ mod tests {
                 );
             }
             CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -5522,6 +5788,7 @@ mod tests {
                 );
             }
             CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -5612,6 +5879,7 @@ mod tests {
                 );
             }
             CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -5759,6 +6027,7 @@ mod tests {
                 assert_eq!(observed.next_outlet, Some(expected_child_outlet));
             }
             CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -5810,6 +6079,7 @@ mod tests {
                 );
             }
             CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -5949,6 +6219,7 @@ mod tests {
                 );
             }
             CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
@@ -6022,6 +6293,7 @@ mod tests {
                 );
             }
             CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
@@ -6097,6 +6369,7 @@ mod tests {
                 ));
             }
             CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
@@ -6181,6 +6454,7 @@ mod tests {
                 );
             }
             CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
@@ -6252,6 +6526,7 @@ mod tests {
                 );
             }
             CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
@@ -6329,6 +6604,7 @@ mod tests {
                 ));
             }
             CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }

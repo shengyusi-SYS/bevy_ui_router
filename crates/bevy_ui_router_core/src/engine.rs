@@ -17,13 +17,13 @@ use crate::history::MemoryHistory;
 use crate::history_authority::{
     AcceptedBackReservation, BackAcceptedReservationView, BackAdmissionToken, BackDestination,
     BackNoTargetSourceDriftEvidence, BackNoTargetSourceDriftOwner,
-    BackNoTargetSourceDriftTerminalEvidence, BackResolutionEvidence,
+    BackNoTargetSourceDriftTerminalEvidence, BackPreview, BackResolutionEvidence,
     BackResolutionEvidenceClassification, BackResolutionOwnerHandoff,
     BackResolutionScopeProjection, BackResolutionVerifyOutcome, BackTargetAuthorityLossCause,
     BackTargetPermanentOwner, BackTargetPreparationBaseline, CanonicalHistory,
-    ClaimHistoryAdmissionWorldError, CoreIssuedWorldSeal, CoreIssuedWorldSealProjection,
-    EnqueueBackErrorKind, HistoryAdmissionStamp, HistoryAdmissionWorldSeal,
-    HistoryCommitCapability, HistoryEffect, HistoryExecutionBinding,
+    ClaimHistoryAdmissionWorldError, CoreFrozenHistorySourceProjection, CoreIssuedWorldSeal,
+    CoreIssuedWorldSealProjection, EnqueueBackErrorKind, HistoryAdmissionStamp,
+    HistoryAdmissionWorldSeal, HistoryCommitCapability, HistoryEffect, HistoryExecutionBinding,
     HistoryExecutionBindingProjection, HistoryIncarnation, HistoryPreparationError,
     HistoryRevision, HistorySourceDrift, NormalAttemptIdentity, PrepareBackAdmissionErrorKind,
     PreparedHistoryPublication, PreparedPresentationBinding, VerifiedBackNoTargetCandidate,
@@ -639,6 +639,32 @@ pub(crate) enum BackNoTargetSourceRefreezeOutcome {
     },
 }
 
+pub(crate) struct CoreProvenEmptyApprovalProjection;
+
+pub(crate) struct ApprovedBackNoTargetCandidate {
+    candidate: VerifiedBackNoTargetCandidate,
+    approval: CoreProvenEmptyApprovalProjection,
+}
+
+impl ApprovedBackNoTargetCandidate {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        VerifiedBackNoTargetCandidate,
+        CoreProvenEmptyApprovalProjection,
+    ) {
+        (self.candidate, self.approval)
+    }
+}
+
+pub(crate) enum BackNoTargetApprovalOutcome {
+    Approved(ApprovedBackNoTargetCandidate),
+    Mismatch {
+        candidate: VerifiedBackNoTargetCandidate,
+        mismatch: CorePreparationReceiverMismatchProjection,
+    },
+}
+
 pub(crate) enum BackNoTargetSourceDriftSettlementOutcome {
     Settled(BackNoTargetSourceDriftTerminalEvidence),
     Mismatch {
@@ -1026,11 +1052,57 @@ pub(crate) struct CoreBackTargetDriverTerminalObservedProjection {
     pub(crate) request: CoreBackTargetDriverTerminalObservedRequestProjection,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackNoTargetLogicalZeroExpectedProjection {
+    receiver: BackResolutionEvidence,
+    source: CoreFrozenHistorySourceProjection,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum CoreBackNoTargetLogicalZeroRequestProjection {
+    Retained {
+        request: NavigationRequestId,
+        status: RequestStatus,
+        requested: Option<RouteLocation>,
+        resolution: BackResolutionEvidenceClassification,
+    },
+    Missing {
+        request: NavigationRequestId,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum CoreBackNoTargetLogicalZeroPreparationErrorProjection {
+    Vacant,
+    Source,
+    Binding,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackNoTargetLogicalZeroObservedProjection {
+    scope: CoreBackTargetEngineScopeProjection,
+    source: CoreFrozenHistorySourceProjection,
+    request: CoreBackNoTargetLogicalZeroRequestProjection,
+    queued_requests: Vec<NavigationRequestId>,
+    current: Option<FrameTaskIdentity>,
+    action: CoreBackTargetReceiverActionProjection,
+    pending_no_target_back: Option<NavigationRequestId>,
+    current_history_capability: Option<HistoryExecutionBindingProjection>,
+    pending_history_preparation_error: CoreBackNoTargetLogicalZeroPreparationErrorProjection,
+    prepared_publication: Option<SealedCommitEvidence>,
+    current_request: Option<RequestStatus>,
+    preview: BackPreview,
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CorePreparationReceiverMismatchProjection {
     Scope {
         expected: BackResolutionScopeProjection,
         observed: BackResolutionScopeProjection,
+    },
+    LogicalZero {
+        expected: CoreBackNoTargetLogicalZeroExpectedProjection,
+        observed: CoreBackNoTargetLogicalZeroObservedProjection,
     },
     Continuation {
         expected: CoreBackTargetContinuationExpectedProjection,
@@ -2442,6 +2514,116 @@ impl RouterEngine {
             }
             PreparedBackNoTargetSourceRefreeze::Drift(owner) => {
                 BackNoTargetSourceRefreezeOutcome::Drift(owner)
+            }
+        }
+    }
+
+    pub(crate) fn approve_back_no_target_logical_zero(
+        &mut self,
+        candidate: VerifiedBackNoTargetCandidate,
+    ) -> BackNoTargetApprovalOutcome {
+        let receiver = candidate.evidence();
+        let request = receiver.request();
+        let expected = CoreBackNoTargetLogicalZeroExpectedProjection {
+            receiver: receiver.clone(),
+            source: CoreFrozenHistorySourceProjection::project(candidate.source()),
+        };
+        let preview = self.history.preview_back();
+        let request_projection = match self.request(request) {
+            Some(record) => CoreBackNoTargetLogicalZeroRequestProjection::Retained {
+                request,
+                status: record.status().clone(),
+                requested: record.requested().cloned(),
+                resolution: record.classify_back_resolution(&receiver),
+            },
+            None => CoreBackNoTargetLogicalZeroRequestProjection::Missing { request },
+        };
+        let pending_history_preparation_error = match &self.pending_history_preparation_error {
+            None => CoreBackNoTargetLogicalZeroPreparationErrorProjection::Vacant,
+            Some(HistoryPreparationError::Source(_)) => {
+                CoreBackNoTargetLogicalZeroPreparationErrorProjection::Source
+            }
+            Some(HistoryPreparationError::Binding(_)) => {
+                CoreBackNoTargetLogicalZeroPreparationErrorProjection::Binding
+            }
+        };
+        let observed = CoreBackNoTargetLogicalZeroObservedProjection {
+            scope: self.back_target_engine_scope_projection(),
+            source: CoreFrozenHistorySourceProjection::project(preview.observed_source()),
+            request: request_projection,
+            queued_requests: self.queue.iter().map(|queued| queued.request).collect(),
+            current: self
+                .current
+                .as_ref()
+                .map(|current| current.identity.clone()),
+            action: Self::back_target_action_projection(self.action.as_ref()),
+            pending_no_target_back: self
+                .pending_no_target_back
+                .as_ref()
+                .map(|pending| pending.request),
+            current_history_capability: self
+                .current_history_capability
+                .as_ref()
+                .map(HistoryCommitCapability::execution_projection),
+            pending_history_preparation_error,
+            prepared_publication: self
+                .prepared_publication_authority
+                .as_ref()
+                .map(|authority| authority.owner().evidence.clone()),
+            current_request: self.state.current_request().cloned(),
+            preview,
+        };
+        let exact_receiver = candidate.matches_receiver(
+            self.history_admission_world,
+            self.router,
+            self.history.incarnation(),
+        );
+        let exact_request = matches!(
+            &observed.request,
+            CoreBackNoTargetLogicalZeroRequestProjection::Retained {
+                status: RequestStatus::Queued,
+                requested: None,
+                resolution: BackResolutionEvidenceClassification::ConsumedReplay,
+                ..
+            }
+        ) && observed
+            .queued_requests
+            .iter()
+            .all(|queued| *queued != request);
+        let exact_owner_vacancies = observed.current.is_none()
+            && matches!(
+                &observed.action,
+                CoreBackTargetReceiverActionProjection::Missing
+            )
+            && observed.pending_no_target_back.is_none()
+            && observed.current_history_capability.is_none()
+            && matches!(
+                &observed.pending_history_preparation_error,
+                CoreBackNoTargetLogicalZeroPreparationErrorProjection::Vacant
+            )
+            && observed.prepared_publication.is_none()
+            && observed.current_request.is_none();
+        let exact_source = self
+            .history
+            .refreeze_back_no_target_source(candidate.source())
+            .is_ok();
+        let logical_zero = matches!(
+            &observed.preview,
+            BackPreview::NoTarget(source) if source == candidate.source()
+        );
+        if exact_receiver && exact_request && exact_owner_vacancies && exact_source && logical_zero
+        {
+            BackNoTargetApprovalOutcome::Approved(ApprovedBackNoTargetCandidate {
+                candidate,
+                approval: CoreProvenEmptyApprovalProjection,
+            })
+        } else {
+            BackNoTargetApprovalOutcome::Mismatch {
+                candidate,
+                mismatch: CorePreparationReceiverMismatchProjection::LogicalZero {
+                    expected,
+                    observed,
+                },
             }
         }
     }

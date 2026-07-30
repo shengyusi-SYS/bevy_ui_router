@@ -147,7 +147,7 @@ struct BackResolutionEvidenceProjection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct CoreFrozenHistorySourceProjection {
+pub(crate) struct CoreFrozenHistorySourceProjection {
     incarnation: HistoryIncarnation,
     revision: HistoryRevision,
     cursor: Option<usize>,
@@ -681,7 +681,7 @@ impl BackResolutionEvidence {
 }
 
 impl CoreFrozenHistorySourceProjection {
-    fn project(source: &FrozenHistorySource) -> Self {
+    pub(crate) fn project(source: &FrozenHistorySource) -> Self {
         Self {
             incarnation: source.incarnation,
             revision: source.revision,
@@ -1210,6 +1210,16 @@ pub(crate) enum BackPreview {
     Target(BackDestination),
     NoTarget(FrozenHistorySource),
     Contradiction(BackPreviewContradiction),
+}
+
+impl BackPreview {
+    pub(crate) const fn observed_source(&self) -> &FrozenHistorySource {
+        match self {
+            Self::Target(destination) => &destination.source,
+            Self::NoTarget(source) => source,
+            Self::Contradiction(contradiction) => &contradiction.observed,
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
