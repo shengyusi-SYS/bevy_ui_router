@@ -536,7 +536,15 @@ impl HostGrant {
 }
 
 pub fn host_version_matches_frame(version: &crate::HostVersion, frame: &RouteFrameVersion) -> bool {
-    version.router_identity() == frame.router_identity() && version.host() == frame.host()
+    host_version_shares_router_with_frame(version, frame) && version.host() == frame.host()
+}
+
+#[doc(hidden)]
+pub fn host_version_shares_router_with_frame(
+    version: &crate::HostVersion,
+    frame: &RouteFrameVersion,
+) -> bool {
+    version.router_identity() == frame.router_identity()
 }
 
 #[doc(hidden)]
@@ -4552,6 +4560,79 @@ mod tests {
             &same_router_frame
         ));
         assert!(!frame_versions_share_router(&first_frame, &foreign_frame));
+    }
+
+    #[test]
+    fn host_version_shares_router_with_frame_rejects_cross_world_raw_collision() {
+        let mut first_ids = CoreIdAllocator::new().unwrap();
+        let first_router = first_ids.allocate_router_identity().unwrap();
+        let mut exact_admission = HostAdmissionIssuer::new().unwrap();
+        let exact_token = exact_admission.issue(first_router).unwrap();
+        let exact_grant = exact_admission.grant(&exact_token, &mut first_ids).unwrap();
+        let exact_version = exact_grant.version().clone();
+        let exact_frame = RouteFrameVersion::new(
+            first_router,
+            exact_version.host(),
+            exact_grant.top_slot(),
+            FrameOrigin::RouterFallback,
+            first_ids.allocate_frame().unwrap(),
+            RouteGeneration::initial(),
+        );
+
+        assert!(host_version_matches_frame(&exact_version, &exact_frame));
+        assert!(host_version_shares_router_with_frame(
+            &exact_version,
+            &exact_frame
+        ));
+
+        let mut other_host_admission = HostAdmissionIssuer::new().unwrap();
+        let other_host_token = other_host_admission.issue(first_router).unwrap();
+        let other_host_grant = other_host_admission
+            .grant(&other_host_token, &mut first_ids)
+            .unwrap();
+        let other_host_frame = RouteFrameVersion::new(
+            first_router,
+            other_host_grant.version().host(),
+            other_host_grant.top_slot(),
+            FrameOrigin::RouterFallback,
+            first_ids.allocate_frame().unwrap(),
+            RouteGeneration::initial(),
+        );
+
+        assert_eq!(
+            exact_version.router_identity(),
+            other_host_frame.router_identity()
+        );
+        assert_ne!(exact_version.host(), other_host_frame.host());
+        assert!(!host_version_matches_frame(
+            &exact_version,
+            &other_host_frame
+        ));
+
+        let mut foreign_ids = CoreIdAllocator::new().unwrap();
+        let foreign_router = foreign_ids.allocate_router_identity().unwrap();
+        let mut foreign_admission = HostAdmissionIssuer::new().unwrap();
+        let foreign_token = foreign_admission.issue(foreign_router).unwrap();
+        let foreign_grant = foreign_admission
+            .grant(&foreign_token, &mut foreign_ids)
+            .unwrap();
+        let foreign_version = foreign_grant.version().clone();
+
+        assert_eq!(foreign_version.router().raw(), exact_frame.router().raw());
+        assert_eq!(foreign_version.host().raw(), exact_frame.host().raw());
+        assert_ne!(
+            foreign_version.router_identity(),
+            exact_frame.router_identity()
+        );
+        assert!(!host_version_matches_frame(&foreign_version, &exact_frame));
+        assert!(!host_version_shares_router_with_frame(
+            &foreign_version,
+            &exact_frame
+        ));
+        assert!(host_version_shares_router_with_frame(
+            &exact_version,
+            &other_host_frame
+        ));
     }
 
     fn ready_engine() -> (RouterEngine, HostGrant) {
