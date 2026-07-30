@@ -1107,7 +1107,10 @@ enum ProvenEmptyProtectedRole {
     HostTopSlot,
     Current(ProvenEmptyCurrentRole),
     UnregisteredForeignDescendant,
-    OtherAuthorityDescendant,
+    OtherAuthorityDescendant {
+        expected: BackNoTargetRegisteredExtraExpectedProjection,
+        observed: BackNoTargetRegisteredExtraObservedProjection,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1422,6 +1425,329 @@ fn observe_back_no_target_authority_graph_slot(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackNoTargetRegisteredExtraIndeterminateCause {
+    RegistryRecordDrift,
+    PhysicalManifestDrift,
+    OwnershipSealDrift,
+    RoleLifecycleDrift,
+    OpaqueAuthorityRelationUnavailable,
+}
+
+enum BackNoTargetRegisteredExtraAuthoritySource<'a> {
+    Frame(&'a RouteFrameVersion),
+    Host(&'a bevy_ui_router_core::HostVersion),
+    Unavailable,
+}
+
+fn back_no_target_registered_extra_authority_source(
+    owner: &RegistryOwner,
+) -> BackNoTargetRegisteredExtraAuthoritySource<'_> {
+    match owner {
+        RegistryOwner::Committed(
+            EntityOwner::FrameShell(frame)
+            | EntityOwner::FrameContentTarget(frame)
+            | EntityOwner::FrameOutput { frame, .. },
+        )
+        | RegistryOwner::Committed(EntityOwner::ChildSlot { parent: frame, .. })
+        | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { parent: frame, .. }) => {
+            BackNoTargetRegisteredExtraAuthoritySource::Frame(frame)
+        }
+        RegistryOwner::Committed(EntityOwner::HostTopSlot { host, .. }) => {
+            BackNoTargetRegisteredExtraAuthoritySource::Host(host)
+        }
+        RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(_)) => {
+            BackNoTargetRegisteredExtraAuthoritySource::Unavailable
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BackNoTargetRegisteredExtraExpectedRole {
+    Frame {
+        lifecycle: FrameLifecycle,
+    },
+    ChildSlot {
+        lifecycle: ChildSlotLifecycle,
+        authority: ChildSlotAuthority,
+    },
+    HostTop {
+        lifecycle: EntityLifecycle,
+        candidate_revision: Option<crate::host::HostCandidateRevision>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BackNoTargetRegisteredExtraObservedRole {
+    Frame {
+        lifecycle: Option<FrameLifecycle>,
+    },
+    ChildSlot {
+        lifecycle: Option<ChildSlotLifecycle>,
+        authority: Option<ChildSlotAuthority>,
+    },
+    HostTop {
+        lifecycle: Option<ProvisionalSlotLifecycle>,
+        candidate_revision: Option<crate::host::HostCandidateRevision>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BackNoTargetRegisteredExtraExpectedProjection {
+    claim: ExactRegistryClaim,
+    registered_manifest: crate::registry::ComponentManifest,
+    ownership_seal: RouteOwnershipSeal,
+    role: BackNoTargetRegisteredExtraExpectedRole,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BackNoTargetRegisteredExtraObservedProjection {
+    entity_exists: bool,
+    registry_claim: Option<ExactRegistryClaim>,
+    registry_manifest: Option<crate::registry::ComponentManifest>,
+    physical_manifest: Option<crate::registry::ComponentManifest>,
+    ownership_seal: Option<RouteOwnershipSeal>,
+    role: BackNoTargetRegisteredExtraObservedRole,
+    observed_parent: Option<bevy_ecs::entity::Entity>,
+}
+
+fn expected_registered_extra_role(
+    claim: &ExactRegistryClaim,
+) -> BackNoTargetRegisteredExtraExpectedRole {
+    match claim.owner() {
+        RegistryOwner::Committed(
+            EntityOwner::FrameShell(_)
+            | EntityOwner::FrameContentTarget(_)
+            | EntityOwner::FrameOutput { .. },
+        ) => BackNoTargetRegisteredExtraExpectedRole::Frame {
+            lifecycle: FrameLifecycle(claim.lifecycle()),
+        },
+        RegistryOwner::Committed(EntityOwner::ChildSlot {
+            parent,
+            outlet,
+            slot,
+        })
+        | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
+            parent,
+            outlet,
+            slot,
+        }) => {
+            let lifecycle = match (claim.owner(), claim.lifecycle()) {
+                (
+                    RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { .. }),
+                    EntityLifecycle::PreparedInert,
+                ) => ChildSlotLifecycle::ProvisionalInert,
+                (
+                    RegistryOwner::Committed(EntityOwner::ChildSlot { .. }),
+                    EntityLifecycle::PreparedInert,
+                ) => ChildSlotLifecycle::RegisteredInert,
+                (_, EntityLifecycle::Active) => ChildSlotLifecycle::Active,
+                (_, EntityLifecycle::Leaving) => ChildSlotLifecycle::Leaving,
+                (_, EntityLifecycle::Quarantined) => ChildSlotLifecycle::Quarantined,
+                _ => unreachable!("the outer owner match admits only child-slot owners"),
+            };
+            BackNoTargetRegisteredExtraExpectedRole::ChildSlot {
+                lifecycle,
+                authority: ChildSlotAuthority::new(parent.clone(), outlet.clone(), *slot),
+            }
+        }
+        RegistryOwner::Committed(EntityOwner::HostTopSlot { .. }) => {
+            BackNoTargetRegisteredExtraExpectedRole::HostTop {
+                lifecycle: claim.lifecycle(),
+                candidate_revision: None,
+            }
+        }
+        RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(owner)) => {
+            BackNoTargetRegisteredExtraExpectedRole::HostTop {
+                lifecycle: claim.lifecycle(),
+                candidate_revision: Some(owner.candidate_revision()),
+            }
+        }
+    }
+}
+
+fn freeze_back_no_target_registered_extra(
+    world: &World,
+    registry: &RouteEntityRegistry,
+    claim: &ExactRegistryClaim,
+    registered_manifest: crate::registry::ComponentManifest,
+) -> Result<
+    (
+        BackNoTargetRegisteredExtraExpectedProjection,
+        BackNoTargetRegisteredExtraObservedProjection,
+    ),
+    (
+        BackNoTargetRegisteredExtraIndeterminateCause,
+        BackNoTargetRegisteredExtraExpectedProjection,
+        BackNoTargetRegisteredExtraObservedProjection,
+    ),
+> {
+    let expected = BackNoTargetRegisteredExtraExpectedProjection {
+        claim: claim.clone(),
+        registered_manifest,
+        ownership_seal: RouteOwnershipSeal::new(claim.seal()),
+        role: expected_registered_extra_role(claim),
+    };
+    let observed_record = registry.record(claim.entity());
+    let observed_claim = observed_record.map(|record| record.claim());
+    let observed_role = match &expected.role {
+        BackNoTargetRegisteredExtraExpectedRole::Frame { .. } => {
+            BackNoTargetRegisteredExtraObservedRole::Frame {
+                lifecycle: world.get::<FrameLifecycle>(claim.entity()).copied(),
+            }
+        }
+        BackNoTargetRegisteredExtraExpectedRole::ChildSlot { .. } => {
+            BackNoTargetRegisteredExtraObservedRole::ChildSlot {
+                lifecycle: world.get::<ChildSlotLifecycle>(claim.entity()).copied(),
+                authority: world.get::<ChildSlotAuthority>(claim.entity()).cloned(),
+            }
+        }
+        BackNoTargetRegisteredExtraExpectedRole::HostTop { .. } => {
+            let candidate_revision =
+                observed_claim
+                    .as_ref()
+                    .and_then(|claim| match claim.owner() {
+                        RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(owner)) => {
+                            Some(owner.candidate_revision())
+                        }
+                        _ => None,
+                    });
+            BackNoTargetRegisteredExtraObservedRole::HostTop {
+                lifecycle: world
+                    .get::<ProvisionalSlotLifecycle>(claim.entity())
+                    .copied(),
+                candidate_revision,
+            }
+        }
+    };
+    let observed = BackNoTargetRegisteredExtraObservedProjection {
+        entity_exists: world.get_entity(claim.entity()).is_ok(),
+        registry_claim: observed_claim,
+        registry_manifest: observed_record.map(|record| record.manifest().clone()),
+        physical_manifest: crate::registry::ComponentManifest::from_world(world, claim.entity()),
+        ownership_seal: world.get::<RouteOwnershipSeal>(claim.entity()).copied(),
+        role: observed_role,
+        observed_parent: world
+            .get::<bevy_ecs::hierarchy::ChildOf>(claim.entity())
+            .map(bevy_ecs::hierarchy::ChildOf::parent),
+    };
+    if observed.registry_claim.as_ref() != Some(&expected.claim)
+        || observed.registry_manifest.as_ref() != Some(&expected.registered_manifest)
+    {
+        return Err((
+            BackNoTargetRegisteredExtraIndeterminateCause::RegistryRecordDrift,
+            expected,
+            observed,
+        ));
+    }
+    if observed.physical_manifest.as_ref().is_none_or(|physical| {
+        expected
+            .registered_manifest
+            .component_ids()
+            .iter()
+            .any(|component| !physical.component_ids().contains(component))
+    }) {
+        return Err((
+            BackNoTargetRegisteredExtraIndeterminateCause::PhysicalManifestDrift,
+            expected,
+            observed,
+        ));
+    }
+    if observed.ownership_seal != Some(expected.ownership_seal) {
+        return Err((
+            BackNoTargetRegisteredExtraIndeterminateCause::OwnershipSealDrift,
+            expected,
+            observed,
+        ));
+    }
+    let owner_lifecycle_is_legal = match (claim.owner(), claim.lifecycle()) {
+        (
+            RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { .. }),
+            EntityLifecycle::PreparedInert | EntityLifecycle::Quarantined,
+        ) => true,
+        (RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { .. }), _) => false,
+        (RegistryOwner::Committed(EntityOwner::ChildSlot { .. }), _) => true,
+        (
+            RegistryOwner::Committed(EntityOwner::HostTopSlot { .. })
+            | RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(_)),
+            EntityLifecycle::PreparedInert | EntityLifecycle::Quarantined,
+        ) => true,
+        (
+            RegistryOwner::Committed(EntityOwner::HostTopSlot { .. })
+            | RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(_)),
+            _,
+        ) => false,
+        (
+            RegistryOwner::Committed(
+                EntityOwner::FrameShell(_)
+                | EntityOwner::FrameContentTarget(_)
+                | EntityOwner::FrameOutput { .. },
+            ),
+            _,
+        ) => true,
+    };
+    if !owner_lifecycle_is_legal {
+        return Err((
+            BackNoTargetRegisteredExtraIndeterminateCause::RoleLifecycleDrift,
+            expected,
+            observed,
+        ));
+    }
+    let role_is_exact = match (&expected.role, &observed.role) {
+        (
+            BackNoTargetRegisteredExtraExpectedRole::Frame {
+                lifecycle: expected,
+            },
+            BackNoTargetRegisteredExtraObservedRole::Frame {
+                lifecycle: observed,
+            },
+        ) => observed.as_ref() == Some(expected),
+        (
+            BackNoTargetRegisteredExtraExpectedRole::ChildSlot {
+                lifecycle: expected_lifecycle,
+                authority: expected_authority,
+            },
+            BackNoTargetRegisteredExtraObservedRole::ChildSlot {
+                lifecycle: observed_lifecycle,
+                authority: observed_authority,
+            },
+        ) => {
+            observed_lifecycle.as_ref() == Some(expected_lifecycle)
+                && observed_authority.as_ref() == Some(expected_authority)
+        }
+        (
+            BackNoTargetRegisteredExtraExpectedRole::HostTop {
+                lifecycle,
+                candidate_revision: expected_revision,
+            },
+            BackNoTargetRegisteredExtraObservedRole::HostTop {
+                lifecycle: observed_lifecycle,
+                candidate_revision: observed_revision,
+            },
+        ) => {
+            matches!(
+                (lifecycle, observed_lifecycle),
+                (
+                    EntityLifecycle::PreparedInert,
+                    Some(ProvisionalSlotLifecycle::PreparedInert)
+                ) | (
+                    EntityLifecycle::Quarantined,
+                    Some(ProvisionalSlotLifecycle::Quarantined)
+                )
+            ) && expected_revision == observed_revision
+        }
+        _ => false,
+    };
+    if !role_is_exact {
+        return Err((
+            BackNoTargetRegisteredExtraIndeterminateCause::RoleLifecycleDrift,
+            expected,
+            observed,
+        ));
+    }
+    Ok((expected, observed))
+}
+
 #[derive(Debug)]
 enum BackNoTargetPhysicalIndeterminateReason {
     MissingRegistry,
@@ -1443,8 +1769,14 @@ enum BackNoTargetPhysicalIndeterminateReason {
     },
     UnexpectedSameAuthorityDescendant {
         entity: bevy_ecs::entity::Entity,
-        observed_parent: Option<bevy_ecs::entity::Entity>,
-        claim: ExactRegistryClaim,
+        expected: BackNoTargetRegisteredExtraExpectedProjection,
+        observed: BackNoTargetRegisteredExtraObservedProjection,
+    },
+    RegisteredExtra {
+        entity: bevy_ecs::entity::Entity,
+        cause: BackNoTargetRegisteredExtraIndeterminateCause,
+        expected: BackNoTargetRegisteredExtraExpectedProjection,
+        observed: BackNoTargetRegisteredExtraObservedProjection,
     },
     AuthorityGraph(BackNoTargetAuthorityGraphEvidence),
 }
@@ -2294,45 +2626,71 @@ pub(crate) fn freeze_back_no_target_proven_empty(
         if protected.iter().any(|protected| protected.entity == entity) {
             continue;
         }
-        let claim = registry.record(entity).map(|record| record.claim());
-        if let Some(claim) = claim {
-            let committed_frame = match claim.owner() {
-                RegistryOwner::Committed(
-                    EntityOwner::FrameShell(frame)
-                    | EntityOwner::FrameContentTarget(frame)
-                    | EntityOwner::FrameOutput { frame, .. },
-                )
-                | RegistryOwner::Committed(EntityOwner::ChildSlot { parent: frame, .. }) => {
-                    Some(frame)
+        if let Some(record) = registry.record(entity) {
+            let claim = record.claim();
+            let registered_manifest = record.manifest().clone();
+            let (expected, observed) = match freeze_back_no_target_registered_extra(
+                world,
+                registry,
+                &claim,
+                registered_manifest,
+            ) {
+                Ok(frozen) => frozen,
+                Err((cause, expected, observed)) => {
+                    return indeterminate(
+                        owner,
+                        BackNoTargetPhysicalIndeterminateReason::RegisteredExtra {
+                            entity,
+                            cause,
+                            expected,
+                            observed,
+                        },
+                    );
                 }
-                RegistryOwner::Committed(EntityOwner::HostTopSlot { .. })
-                | RegistryOwner::Provisional(_) => None,
             };
-            if cleanup_claim_has_exact_authority(world, &claim) {
-                if committed_frame.is_some_and(|frame| {
+            let authority_source = back_no_target_registered_extra_authority_source(claim.owner());
+            let shares_current_authority = match authority_source {
+                BackNoTargetRegisteredExtraAuthoritySource::Frame(frame) => {
                     bevy_ui_router_core::integration::frame_versions_share_router(
                         current_authority_anchor,
                         frame,
                     )
-                }) {
+                }
+                BackNoTargetRegisteredExtraAuthoritySource::Host(host) => {
+                    bevy_ui_router_core::integration::host_version_shares_router_with_frame(
+                        host,
+                        current_authority_anchor,
+                    )
+                }
+                BackNoTargetRegisteredExtraAuthoritySource::Unavailable => {
                     return indeterminate(
                         owner,
-                        BackNoTargetPhysicalIndeterminateReason::UnexpectedSameAuthorityDescendant {
+                        BackNoTargetPhysicalIndeterminateReason::RegisteredExtra {
                             entity,
-                            observed_parent: observed_parent(entity),
-                            claim,
+                            cause: BackNoTargetRegisteredExtraIndeterminateCause::OpaqueAuthorityRelationUnavailable,
+                            expected,
+                            observed,
                         },
                     );
                 }
-                if committed_frame.is_some() {
-                    protected.push(ProvenEmptyProtectedEntityProjection {
+            };
+            if shares_current_authority {
+                return indeterminate(
+                    owner,
+                    BackNoTargetPhysicalIndeterminateReason::UnexpectedSameAuthorityDescendant {
                         entity,
-                        observed_parent: observed_parent(entity),
-                        claim: Some(claim),
-                        role: ProvenEmptyProtectedRole::OtherAuthorityDescendant,
-                    });
-                }
+                        expected,
+                        observed,
+                    },
+                );
             }
+            let observed_parent = observed.observed_parent;
+            protected.push(ProvenEmptyProtectedEntityProjection {
+                entity,
+                observed_parent,
+                claim: Some(claim),
+                role: ProvenEmptyProtectedRole::OtherAuthorityDescendant { expected, observed },
+            });
             continue;
         }
         protected.push(ProvenEmptyProtectedEntityProjection {
@@ -18462,6 +18820,229 @@ pub(crate) mod tests {
         (app, router, request, owner)
     }
 
+    fn spawn_exact_host_top_extra(
+        app: &mut App,
+        parent: Entity,
+        owner: RegistryOwner,
+    ) -> (Entity, ExactRegistryClaim) {
+        let entity = app.world_mut().spawn_empty().id();
+        let manifest = ComponentManifest::new([
+            app.world()
+                .components()
+                .component_id::<RouteOwnershipSeal>()
+                .expect("the real plugin registers RouteOwnershipSeal"),
+            app.world()
+                .components()
+                .component_id::<ProvisionalSlotLifecycle>()
+                .expect("the real plugin registers ProvisionalSlotLifecycle"),
+            app.world()
+                .components()
+                .component_id::<ChildOf>()
+                .expect("the real plugin registers ChildOf"),
+        ]);
+        let seal = {
+            let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
+            let seal = registry.issue_seal();
+            registry
+                .register(
+                    entity,
+                    owner,
+                    seal,
+                    manifest,
+                    EntityLifecycle::PreparedInert,
+                )
+                .expect("one exact HostTopSlot extra must be registrable");
+            seal
+        };
+        app.world_mut().entity_mut(entity).insert((
+            RouteOwnershipSeal::new(seal),
+            ProvisionalSlotLifecycle::PreparedInert,
+            ChildOf(parent),
+        ));
+        app.world_mut().flush();
+
+        let world = app.world();
+        let registry = world.resource::<RouteEntityRegistry>();
+        let record = registry
+            .record(entity)
+            .expect("the HostTopSlot extra retains its exact record");
+        let claim = record.claim();
+        let physical = ComponentManifest::from_world(world, entity)
+            .expect("the committed HostTopSlot extra has one physical manifest");
+        assert!(
+            record
+                .manifest()
+                .component_ids()
+                .iter()
+                .all(|component| physical.component_ids().contains(component)),
+            "the registered HostTopSlot manifest must be a subset of its physical manifest"
+        );
+        assert_eq!(
+            world.get::<RouteOwnershipSeal>(entity),
+            Some(&RouteOwnershipSeal::new(claim.seal()))
+        );
+        assert_eq!(
+            world.get::<ProvisionalSlotLifecycle>(entity),
+            Some(&ProvisionalSlotLifecycle::PreparedInert)
+        );
+        if matches!(
+            claim.owner(),
+            RegistryOwner::Committed(EntityOwner::HostTopSlot { .. })
+        ) {
+            assert!(cleanup_claim_has_exact_authority(world, &claim));
+        }
+        assert_eq!(
+            world.get::<ChildOf>(entity).map(ChildOf::parent),
+            Some(parent)
+        );
+        (entity, claim)
+    }
+
+    fn spawn_exact_provisional_child_slot_extra(
+        app: &mut App,
+        parent_entity: Entity,
+        parent: RouteFrameVersion,
+        outlet: bevy_ui_router_core::slot::RouteSlotKey,
+        slot: bevy_ui_router_core::prelude::RouteSlotId,
+    ) -> (Entity, ExactRegistryClaim) {
+        let entity = app.world_mut().spawn_empty().id();
+        let manifest = {
+            let world = app.world_mut();
+            ComponentManifest::new([
+                world.register_component::<RouteOwnershipSeal>(),
+                world.register_component::<ChildSlotLifecycle>(),
+                world.register_component::<ChildSlotAuthority>(),
+                world.register_component::<ChildOf>(),
+            ])
+        };
+        let authority = ChildSlotAuthority::new(parent.clone(), outlet.clone(), slot);
+        let seal = {
+            let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
+            let seal = registry.issue_seal();
+            registry
+                .register(
+                    entity,
+                    RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
+                        parent,
+                        outlet,
+                        slot,
+                    }),
+                    seal,
+                    manifest,
+                    EntityLifecycle::PreparedInert,
+                )
+                .expect("one exact provisional ChildSlot extra must be registrable");
+            seal
+        };
+        app.world_mut().entity_mut(entity).insert((
+            RouteOwnershipSeal::new(seal),
+            ChildSlotLifecycle::ProvisionalInert,
+            authority,
+            ChildOf(parent_entity),
+        ));
+        app.world_mut().flush();
+        let claim = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(entity)
+            .map(|record| record.claim())
+            .expect("the provisional ChildSlot extra retains its exact record");
+        assert!(cleanup_claim_has_exact_authority(app.world(), &claim));
+        (entity, claim)
+    }
+
+    fn foreign_resolved_child_slot_fixture() -> (
+        RouteFrameVersion,
+        bevy_ui_router_core::slot::RouteSlotKey,
+        bevy_ui_router_core::prelude::RouteSlotId,
+    ) {
+        let mut engine = RouterEngine::install(
+            bevy_ui_router_core::test_support::nested_items_view_route_tree(),
+            RouteViewKey::new("registered-child-extra-foreign-fallback").unwrap(),
+        )
+        .unwrap();
+        let token = engine.request_host_admission().unwrap();
+        let grant = engine.grant_host_admission(&token).unwrap();
+        engine.confirm_host(grant);
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("the foreign nested router must request its real parent frame")
+        };
+        let parent_frame = parent.frame().clone();
+        let outlet = bevy_ui_router_core::slot::RouteSlotKey::default();
+        engine
+            .report_applied_with_outlets(parent, vec![outlet.clone()])
+            .unwrap();
+        let EngineAction::MountRequest(request) = engine.action().unwrap() else {
+            panic!("the applied foreign parent must request one real child mount")
+        };
+        let slot = engine.resolve_mount(request).unwrap().slot();
+        assert_ne!(
+            slot,
+            parent_frame.slot(),
+            "the registered extra must use the allocator-issued child slot, not the parent top slot"
+        );
+        (parent_frame, outlet, slot)
+    }
+
+    fn expected_registered_extra_evidence(
+        world: &World,
+        entity: Entity,
+    ) -> (
+        BackNoTargetRegisteredExtraExpectedProjection,
+        BackNoTargetRegisteredExtraObservedProjection,
+    ) {
+        let registry = world.resource::<RouteEntityRegistry>();
+        let record = registry
+            .record(entity)
+            .expect("the registered-extra fixture retains its exact record");
+        let claim = record.claim();
+        let role = expected_registered_extra_role(&claim);
+        let observed_role = match &role {
+            BackNoTargetRegisteredExtraExpectedRole::Frame { .. } => {
+                BackNoTargetRegisteredExtraObservedRole::Frame {
+                    lifecycle: world.get::<FrameLifecycle>(entity).copied(),
+                }
+            }
+            BackNoTargetRegisteredExtraExpectedRole::ChildSlot { .. } => {
+                BackNoTargetRegisteredExtraObservedRole::ChildSlot {
+                    lifecycle: world.get::<ChildSlotLifecycle>(entity).copied(),
+                    authority: world.get::<ChildSlotAuthority>(entity).cloned(),
+                }
+            }
+            BackNoTargetRegisteredExtraExpectedRole::HostTop { .. } => {
+                let candidate_revision = match claim.owner() {
+                    RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(owner)) => {
+                        Some(owner.candidate_revision())
+                    }
+                    _ => None,
+                };
+                BackNoTargetRegisteredExtraObservedRole::HostTop {
+                    lifecycle: world.get::<ProvisionalSlotLifecycle>(entity).copied(),
+                    candidate_revision,
+                }
+            }
+        };
+        (
+            BackNoTargetRegisteredExtraExpectedProjection {
+                claim: claim.clone(),
+                registered_manifest: record.manifest().clone(),
+                ownership_seal: RouteOwnershipSeal::new(claim.seal()),
+                role,
+            },
+            BackNoTargetRegisteredExtraObservedProjection {
+                entity_exists: world.get_entity(entity).is_ok(),
+                registry_claim: Some(claim),
+                registry_manifest: Some(record.manifest().clone()),
+                physical_manifest: ComponentManifest::from_world(world, entity),
+                ownership_seal: world.get::<RouteOwnershipSeal>(entity).copied(),
+                role: observed_role,
+                observed_parent: world.get::<ChildOf>(entity).map(ChildOf::parent),
+            },
+        )
+    }
+
     fn expected_back_no_target_authority_graph_evidence(
         world: &World,
         entry: &RouterEntry,
@@ -26429,7 +27010,943 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn back_no_target_proven_empty_protects_sparse_current_topology() {
+    fn back_no_target_committed_host_top_extras_classify_by_router_authority() {
+        const RED: &str =
+            "RED: committed HostTopSlot extras require opaque router authority classification";
+
+        let (mut app, router, request, owner) =
+            prepare_nested_back_no_target_authority_graph_fixture();
+        let other_router = install_atomic_router(&mut app, "no-target-host-top-other");
+        app.update();
+        let other_request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(other_router, RouteLocation::new("/"))
+            .expect("the second real router accepts its root route");
+        run_updates_until_succeeded(&mut app, other_request);
+
+        let (active_frame, active_output, extra_slot, current_host_version, other_host_version) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the nested fixture retains its exact entry");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the nested fixture retains its real active branch");
+            let child_slot = active
+                .child_slots()
+                .first()
+                .expect("the real nested branch provides one allocator-issued child slot");
+            let current_host_version = entry
+                .host
+                .as_ref()
+                .expect("the nested fixture retains its admitted host")
+                .version
+                .clone();
+            let other_host_version = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == other_router)
+                .and_then(|entry| entry.host.as_ref())
+                .expect("the second real router retains its admitted host")
+                .version
+                .clone();
+            (
+                active.frames()[0].frame().clone(),
+                child_slot.anchor(),
+                child_slot.slot_id(),
+                current_host_version,
+                other_host_version,
+            )
+        };
+        assert!(
+            bevy_ui_router_core::integration::host_version_shares_router_with_frame(
+                &current_host_version,
+                &active_frame,
+            )
+        );
+        assert!(
+            !bevy_ui_router_core::integration::host_version_shares_router_with_frame(
+                &other_host_version,
+                &active_frame,
+            )
+        );
+
+        let capture = |world: &World| {
+            let navigation = world.resource::<RouterNavigation>();
+            let host_roots = navigation
+                .entries
+                .iter()
+                .filter(|entry| entry.handle == router || entry.handle == other_router)
+                .filter_map(|entry| entry.host.as_ref().map(|host| host.host))
+                .collect::<Vec<_>>();
+            let entry_projection = navigation
+                .entries
+                .iter()
+                .filter(|entry| entry.handle == router || entry.handle == other_router)
+                .map(|entry| {
+                    let active = entry.active.as_ref().map(|active| {
+                        let frames = active
+                            .frames()
+                            .iter()
+                            .map(|frame| {
+                                (
+                                    frame.frame().clone(),
+                                    frame.mount_binding().clone(),
+                                    frame.claims().cloned().collect::<Vec<_>>(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let slots = active
+                            .child_slots()
+                            .iter()
+                            .map(|slot| {
+                                (
+                                    slot.slot_claim().clone(),
+                                    slot.parent().clone(),
+                                    slot.outlet().clone(),
+                                    slot.anchor_claim().clone(),
+                                    slot.expected_anchor_children().to_vec(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        (frames, slots)
+                    });
+                    (
+                        entry.handle,
+                        entry.engine.snapshot(),
+                        entry.engine.history().clone(),
+                        entry.host.as_ref().map(ProjectionlessHostProjection::from),
+                        active,
+                        entry
+                            .back_capacity_issuer
+                            .as_ref()
+                            .map(BackCapacityIssuer::semantic_snapshot_for_test),
+                        entry.requests.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let snapshots = world.resource::<RouterSnapshots>();
+            let public_routers = [router, other_router].map(|handle| {
+                snapshots
+                    .get(handle)
+                    .expect("both real routers retain public snapshots")
+                    .clone()
+            });
+            let public_requests =
+                [(router, request), (other_router, other_request)].map(|(handle, request)| {
+                    match snapshots.request(handle, request) {
+                        crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                        crate::snapshots::RequestLookup::NotRetained => {
+                            panic!("the real setup request must remain retained")
+                        }
+                        crate::snapshots::RequestLookup::Unknown => {
+                            panic!("the real setup request must remain public")
+                        }
+                    }
+                });
+            (
+                ProjectionlessObservedProjection::capture(world, host_roots),
+                world.resource::<RouteEntityRegistry>().records().to_vec(),
+                entry_projection,
+                public_routers,
+                public_requests,
+            )
+        };
+
+        let (other_extra, other_claim) = spawn_exact_host_top_extra(
+            &mut app,
+            active_output,
+            RegistryOwner::Committed(EntityOwner::HostTopSlot {
+                host: other_host_version,
+                slot: extra_slot,
+            }),
+        );
+        let (other_expected, other_observed) =
+            expected_registered_extra_evidence(app.world(), other_extra);
+        let other_before = capture(app.world());
+        let owner_identity = owner.capacity.capacity_identity_for_test();
+        let proven = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the other-authority extra cannot remove the main entry");
+            match freeze_back_no_target_proven_empty(world, entry, owner) {
+                BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(proven) => proven,
+                BackNoTargetPhysicalFreezeOutcome::Indeterminate { evidence, .. } => {
+                    panic!(
+                        "{RED}: exact other-authority HostTopSlot was {:?}",
+                        evidence.reason
+                    )
+                }
+            }
+        };
+        assert_eq!(proven.owner.request, request);
+        assert_eq!(
+            proven.owner.capacity.capacity_identity_for_test(),
+            owner_identity
+        );
+        assert!(proven.projection.authorized_targets.is_empty());
+        let protected = proven
+            .projection
+            .protected
+            .iter()
+            .find(|protected| protected.entity == other_extra)
+            .expect("the other-authority HostTopSlot must remain protected");
+        assert_eq!(protected.claim.as_ref(), Some(&other_claim));
+        match &protected.role {
+            ProvenEmptyProtectedRole::OtherAuthorityDescendant { expected, observed } => {
+                assert_eq!(expected, &other_expected);
+                assert_eq!(observed, &other_observed);
+            }
+            role => panic!("{RED}: other-authority HostTopSlot used {role:?}"),
+        }
+        assert!(
+            capture(app.world()) == other_before,
+            "other-authority classification must leave World, registry, entries and public snapshots zero-write"
+        );
+        let owner = proven.owner;
+
+        {
+            let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
+            assert!(registry.remove_exact(&other_claim));
+        }
+        assert!(app.world_mut().despawn(other_extra));
+
+        let (same_extra, same_claim) = spawn_exact_host_top_extra(
+            &mut app,
+            active_output,
+            RegistryOwner::Committed(EntityOwner::HostTopSlot {
+                host: current_host_version,
+                slot: extra_slot,
+            }),
+        );
+        let (same_expected, same_observed) =
+            expected_registered_extra_evidence(app.world(), same_extra);
+        let same_before = capture(app.world());
+        let outcome = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the same-authority extra cannot remove the main entry");
+            freeze_back_no_target_proven_empty(world, entry, owner)
+        };
+        let returned = match outcome {
+            BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(_) => {
+                panic!("{RED}: same-authority HostTopSlot reached ProvenEmpty")
+            }
+            BackNoTargetPhysicalFreezeOutcome::Indeterminate { owner, evidence } => {
+                assert_eq!(evidence.request, request);
+                match evidence.reason {
+                    BackNoTargetPhysicalIndeterminateReason::UnexpectedSameAuthorityDescendant {
+                        entity,
+                        expected,
+                        observed,
+                    } => {
+                        assert_eq!(entity, same_extra);
+                        assert_eq!(expected, same_expected);
+                        assert_eq!(observed, same_observed);
+                    }
+                    reason => panic!("{RED}: same-authority HostTopSlot was {reason:?}"),
+                }
+                owner
+            }
+        };
+        assert_eq!(returned.request, request);
+        assert_eq!(
+            returned.capacity.capacity_identity_for_test(),
+            owner_identity
+        );
+        assert!(
+            capture(app.world()) == same_before,
+            "same-authority classification must leave World, registry, entries and public snapshots zero-write"
+        );
+
+        let drifted_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(same_extra)
+            .insert(RouteOwnershipSeal::new(drifted_seal));
+        let (expected, observed) = expected_registered_extra_evidence(app.world(), same_extra);
+        assert_eq!(expected.claim, same_claim);
+        assert_eq!(observed.registry_claim.as_ref(), Some(&same_claim));
+        assert_eq!(
+            observed.registry_manifest.as_ref(),
+            Some(&expected.registered_manifest)
+        );
+        assert!(observed.physical_manifest.as_ref().is_some_and(|physical| {
+            expected
+                .registered_manifest
+                .component_ids()
+                .iter()
+                .all(|component| physical.component_ids().contains(component))
+        }));
+        assert_ne!(
+            observed.ownership_seal,
+            Some(expected.ownership_seal),
+            "the RED must drift only the physical ownership seal"
+        );
+        assert_eq!(
+            expected.role,
+            BackNoTargetRegisteredExtraExpectedRole::HostTop {
+                lifecycle: EntityLifecycle::PreparedInert,
+                candidate_revision: None,
+            }
+        );
+        assert_eq!(
+            observed.role,
+            BackNoTargetRegisteredExtraObservedRole::HostTop {
+                lifecycle: Some(ProvisionalSlotLifecycle::PreparedInert),
+                candidate_revision: None,
+            }
+        );
+        assert_eq!(observed.observed_parent, Some(active_output));
+        let drift_before = capture(app.world());
+        let outcome = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the seal drift cannot remove the main entry");
+            freeze_back_no_target_proven_empty(world, entry, returned)
+        };
+        let returned = match outcome {
+            BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(_) => {
+                panic!("{RED}: ownership-seal drift reached ProvenEmpty")
+            }
+            BackNoTargetPhysicalFreezeOutcome::Indeterminate { owner, evidence } => {
+                assert_eq!(evidence.request, request);
+                match evidence.reason {
+                    BackNoTargetPhysicalIndeterminateReason::RegisteredExtra {
+                        entity,
+                        cause,
+                        expected: actual_expected,
+                        observed: actual_observed,
+                    } => {
+                        assert_eq!(entity, same_extra);
+                        assert_eq!(
+                            cause,
+                            BackNoTargetRegisteredExtraIndeterminateCause::OwnershipSealDrift
+                        );
+                        assert_eq!(actual_expected, expected);
+                        assert_eq!(actual_observed, observed);
+                    }
+                    reason => panic!("{RED}: ownership-seal drift was {reason:?}"),
+                }
+                owner
+            }
+        };
+        assert_eq!(returned.request, request);
+        assert_eq!(
+            returned.capacity.capacity_identity_for_test(),
+            owner_identity
+        );
+        assert!(
+            capture(app.world()) == drift_before,
+            "registered-extra seal drift must leave World, registry, entries and public snapshots zero-write"
+        );
+    }
+
+    #[test]
+    fn back_no_target_provisional_host_top_extra_is_typed_indeterminate() {
+        const RED: &str =
+            "RED: provisional HostTopSlot extras require opaque-authority typed evidence";
+
+        let (mut app, router, request, owner) =
+            prepare_nested_back_no_target_authority_graph_fixture();
+        let (active_output, host_entity) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the provisional fixture retains its exact entry");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the provisional fixture retains its real active branch");
+            (
+                active
+                    .child_slots()
+                    .first()
+                    .expect("the real nested branch retains one child-slot anchor")
+                    .anchor(),
+                entry
+                    .host
+                    .as_ref()
+                    .expect("the provisional fixture retains its admitted host")
+                    .host,
+            )
+        };
+        let revision = {
+            let mut revisions = HostCandidateRevisionState::default();
+            match classify_host_candidate(app.world(), router, &mut revisions) {
+                HostCandidateClassification::Unique(candidate) => candidate.revision(),
+                HostCandidateClassification::None => {
+                    panic!("the real admitted host must remain a candidate")
+                }
+                HostCandidateClassification::InvalidTopology(_) => {
+                    panic!("the real admitted host must retain valid topology")
+                }
+                HostCandidateClassification::Conflict(_) => {
+                    panic!("the real admitted host must remain unique")
+                }
+            }
+        };
+        let (extra, claim) = spawn_exact_host_top_extra(
+            &mut app,
+            active_output,
+            RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
+                ProvisionalTopSlotOwner::new(revision),
+            )),
+        );
+        let (expected, observed) = expected_registered_extra_evidence(app.world(), extra);
+        assert_eq!(expected.claim, claim);
+        assert!(observed.entity_exists);
+        assert_eq!(observed.registry_claim.as_ref(), Some(&claim));
+        assert_eq!(
+            expected.role,
+            BackNoTargetRegisteredExtraExpectedRole::HostTop {
+                lifecycle: EntityLifecycle::PreparedInert,
+                candidate_revision: Some(revision),
+            }
+        );
+        assert_eq!(
+            observed.role,
+            BackNoTargetRegisteredExtraObservedRole::HostTop {
+                lifecycle: Some(ProvisionalSlotLifecycle::PreparedInert),
+                candidate_revision: Some(revision),
+            }
+        );
+        assert_eq!(
+            observed.registry_manifest.as_ref(),
+            Some(&expected.registered_manifest)
+        );
+        assert!(observed.physical_manifest.as_ref().is_some_and(|physical| {
+            expected
+                .registered_manifest
+                .component_ids()
+                .iter()
+                .all(|component| physical.component_ids().contains(component))
+        }));
+        assert_eq!(observed.ownership_seal, Some(expected.ownership_seal));
+        assert_eq!(observed.observed_parent, Some(active_output));
+
+        let capture = |world: &World| {
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the provisional extra cannot remove its router entry");
+            let active = entry.active.as_ref().map(|active| {
+                (
+                    active
+                        .frames()
+                        .iter()
+                        .map(|frame| {
+                            (
+                                frame.frame().clone(),
+                                frame.claims().cloned().collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    active
+                        .child_slots()
+                        .iter()
+                        .map(|slot| slot.slot_claim().clone())
+                        .collect::<Vec<_>>(),
+                )
+            });
+            let snapshots = world.resource::<RouterSnapshots>();
+            let public_request = match snapshots.request(router, request) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                crate::snapshots::RequestLookup::NotRetained => {
+                    panic!("the provisional fixture request must remain retained")
+                }
+                crate::snapshots::RequestLookup::Unknown => {
+                    panic!("the provisional fixture request must remain public")
+                }
+            };
+            (
+                ProjectionlessObservedProjection::capture(world, vec![host_entity]),
+                world.resource::<RouteEntityRegistry>().records().to_vec(),
+                entry.engine.snapshot(),
+                entry.engine.history().clone(),
+                entry.host.as_ref().map(ProjectionlessHostProjection::from),
+                active,
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .map(BackCapacityIssuer::semantic_snapshot_for_test),
+                entry.requests.clone(),
+                snapshots
+                    .get(router)
+                    .expect("the provisional fixture retains its public router snapshot")
+                    .clone(),
+                public_request,
+            )
+        };
+        let before = capture(app.world());
+        let owner_identity = owner.capacity.capacity_identity_for_test();
+        let outcome = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the provisional extra cannot remove its router entry");
+            freeze_back_no_target_proven_empty(world, entry, owner)
+        };
+        let returned = match outcome {
+            BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(_) => {
+                panic!("{RED}: provisional HostTopSlot reached ProvenEmpty")
+            }
+            BackNoTargetPhysicalFreezeOutcome::Indeterminate { owner, evidence } => {
+                assert_eq!(evidence.request, request);
+                match evidence.reason {
+                    BackNoTargetPhysicalIndeterminateReason::RegisteredExtra {
+                        entity,
+                        cause,
+                        expected: actual_expected,
+                        observed: actual_observed,
+                    } => {
+                        assert_eq!(entity, extra);
+                        assert_eq!(
+                            cause,
+                            BackNoTargetRegisteredExtraIndeterminateCause::OpaqueAuthorityRelationUnavailable
+                        );
+                        assert_eq!(actual_expected, expected);
+                        assert_eq!(actual_observed, observed);
+                    }
+                    reason => panic!("{RED}: provisional HostTopSlot was {reason:?}"),
+                }
+                owner
+            }
+        };
+        assert_eq!(returned.request, request);
+        assert_eq!(
+            returned.capacity.capacity_identity_for_test(),
+            owner_identity
+        );
+        assert!(
+            capture(app.world()) == before,
+            "provisional registered-extra classification must leave World, registry, entry and public snapshots zero-write"
+        );
+    }
+
+    #[test]
+    fn back_no_target_registered_child_slot_extras_use_owner_parent_authority() {
+        const RED: &str =
+            "RED: illegal provisional ChildSlot lifecycle requires role-lifecycle evidence";
+
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router =
+            install_atomic_router_at_pattern(&mut app, "registered-child-extra-main", "/:id");
+        app.update();
+        for location in ["/first", "/second"] {
+            let setup = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .expect("the atomic router accepts each real setup route");
+            run_updates_until_succeeded(&mut app, setup);
+        }
+        let retired_same_authority_frame = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .and_then(|entry| entry.active.as_ref())
+                .expect("the successful second route retains one active frame")
+                .frames()[0]
+                .frame()
+                .clone()
+        };
+        let (request, bound) =
+            take_real_bound_back_no_target_from_current_history(&mut app, router);
+        let owner = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the atomic router retains its exact entry");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the no-target source retains one atomic active frame");
+            assert_eq!(active.frames().len(), 1);
+            assert!(
+                active.child_slots().is_empty(),
+                "the atomic main router must not contribute a current ChildSlot"
+            );
+            match begin_bound_back_no_target(entry, bound) {
+                BackNoTargetBeginOutcome::Begun(owner) => owner,
+                BackNoTargetBeginOutcome::Permanent(_) => {
+                    panic!("the unchanged atomic source must refreeze")
+                }
+                BackNoTargetBeginOutcome::CapacityRejected { .. } => {
+                    panic!("the real no-target capacity must remain current")
+                }
+                BackNoTargetBeginOutcome::ReceiverMismatch { .. } => {
+                    panic!("the exact atomic entry must receive its bound owner")
+                }
+            }
+        };
+        let owner_identity = owner.capacity.capacity_identity_for_test();
+        let (active_frame, active_output) = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let active = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .and_then(|entry| entry.active.as_ref())
+                .expect("the atomic entry retains its active frame");
+            let output = active.frames()[0]
+                .claims()
+                .find(|claim| world.get::<FrameOutput>(claim.entity()).is_some())
+                .map(ExactRegistryClaim::entity)
+                .expect("the atomic frame retains one exact FrameOutput");
+            (active.frames()[0].frame().clone(), output)
+        };
+        let (foreign_parent, outlet, resolved_slot) = foreign_resolved_child_slot_fixture();
+        assert_ne!(
+            active_frame, retired_same_authority_frame,
+            "the first Back must replace the captured second-route frame"
+        );
+        assert!(
+            bevy_ui_router_core::integration::frame_versions_share_router(
+                &active_frame,
+                &retired_same_authority_frame,
+            ),
+            "the retired frame must retain the main router's opaque authority"
+        );
+        assert!(
+            !bevy_ui_router_core::integration::frame_versions_share_router(
+                &active_frame,
+                &foreign_parent,
+            ),
+            "the foreign owner parent must retain a distinct opaque router authority"
+        );
+
+        let capture = |world: &World| {
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("registered extras cannot remove the atomic entry");
+            let host = entry
+                .host
+                .as_ref()
+                .expect("registered extras cannot remove the admitted host");
+            let active = entry.active.as_ref().map(|active| {
+                (
+                    active
+                        .frames()
+                        .iter()
+                        .map(|frame| {
+                            (
+                                frame.frame().clone(),
+                                frame.claims().cloned().collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    active
+                        .child_slots()
+                        .iter()
+                        .map(|slot| slot.slot_claim().clone())
+                        .collect::<Vec<_>>(),
+                )
+            });
+            let snapshots = world.resource::<RouterSnapshots>();
+            let public_request = match snapshots.request(router, request) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                crate::snapshots::RequestLookup::NotRetained => {
+                    panic!("the accepted no-target request must remain retained")
+                }
+                crate::snapshots::RequestLookup::Unknown => {
+                    panic!("the atomic router must expose its accepted request")
+                }
+            };
+            (
+                ProjectionlessObservedProjection::capture(world, vec![host.host]),
+                world.resource::<RouteEntityRegistry>().records().to_vec(),
+                entry.engine.snapshot(),
+                entry.engine.history().clone(),
+                entry.host.as_ref().map(ProjectionlessHostProjection::from),
+                active,
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .map(BackCapacityIssuer::semantic_snapshot_for_test),
+                entry.requests.clone(),
+                snapshots
+                    .get(router)
+                    .expect("the atomic router retains its public snapshot")
+                    .clone(),
+                public_request,
+            )
+        };
+        let prove_other = |app: &App,
+                           owner: BackPreparationOwner,
+                           entity: Entity,
+                           claim: &ExactRegistryClaim,
+                           expected: BackNoTargetRegisteredExtraExpectedProjection,
+                           observed: BackNoTargetRegisteredExtraObservedProjection|
+         -> BackPreparationOwner {
+            let before = capture(app.world());
+            let outcome = {
+                let world = app.world();
+                let navigation = world.resource::<RouterNavigation>();
+                let entry = navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == router)
+                    .expect("the registered extra cannot remove the atomic entry");
+                freeze_back_no_target_proven_empty(world, entry, owner)
+            };
+            let BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(proven) = outcome else {
+                panic!("an exact foreign-parent ChildSlot extra must remain protected")
+            };
+            assert!(proven.projection.authorized_targets.is_empty());
+            let protected = proven
+                .projection
+                .protected
+                .iter()
+                .find(|protected| protected.entity == entity)
+                .expect("the foreign-parent ChildSlot extra must be protected");
+            assert_eq!(protected.observed_parent, Some(active_output));
+            assert_eq!(protected.claim.as_ref(), Some(claim));
+            match &protected.role {
+                ProvenEmptyProtectedRole::OtherAuthorityDescendant {
+                    expected: actual_expected,
+                    observed: actual_observed,
+                } => {
+                    assert_eq!(actual_expected, &expected);
+                    assert_eq!(actual_observed, &observed);
+                }
+                role => panic!("the foreign-parent ChildSlot used {role:?}"),
+            }
+            let returned = proven.owner;
+            assert_eq!(returned.request, request);
+            assert_eq!(
+                returned.capacity.capacity_identity_for_test(),
+                owner_identity
+            );
+            assert!(
+                capture(app.world()) == before,
+                "other-authority classification must be World and router-state zero-write"
+            );
+            returned
+        };
+
+        let (foreign_extra, provisional_claim) = spawn_exact_provisional_child_slot_extra(
+            &mut app,
+            active_output,
+            foreign_parent.clone(),
+            outlet.clone(),
+            resolved_slot,
+        );
+        let (expected, observed) = expected_registered_extra_evidence(app.world(), foreign_extra);
+        let owner = prove_other(
+            &app,
+            owner,
+            foreign_extra,
+            &provisional_claim,
+            expected,
+            observed,
+        );
+
+        let committed_claim = {
+            let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
+            registry
+                .compare_exchange_owner(
+                    &provisional_claim,
+                    RegistryOwner::Committed(EntityOwner::ChildSlot {
+                        parent: foreign_parent,
+                        outlet: outlet.clone(),
+                        slot: resolved_slot,
+                    }),
+                )
+                .expect("the exact provisional ChildSlot claim must commit once")
+        };
+        app.world_mut()
+            .entity_mut(foreign_extra)
+            .insert(ChildSlotLifecycle::RegisteredInert);
+        app.world_mut().flush();
+        assert!(cleanup_claim_has_exact_authority(
+            app.world(),
+            &committed_claim,
+        ));
+        let (expected, observed) = expected_registered_extra_evidence(app.world(), foreign_extra);
+        let owner = prove_other(
+            &app,
+            owner,
+            foreign_extra,
+            &committed_claim,
+            expected,
+            observed,
+        );
+
+        {
+            let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
+            assert!(registry.remove_exact(&committed_claim));
+        }
+        assert!(app.world_mut().despawn(foreign_extra));
+
+        let (same_extra, same_claim) = spawn_exact_provisional_child_slot_extra(
+            &mut app,
+            active_output,
+            retired_same_authority_frame,
+            outlet,
+            resolved_slot,
+        );
+        let (same_expected, same_observed) =
+            expected_registered_extra_evidence(app.world(), same_extra);
+        let same_before = capture(app.world());
+        let outcome = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the same-authority extra cannot remove the atomic entry");
+            freeze_back_no_target_proven_empty(world, entry, owner)
+        };
+        let returned = match outcome {
+            BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(_) => {
+                panic!("a same-authority ChildSlot extra cannot prove empty")
+            }
+            BackNoTargetPhysicalFreezeOutcome::Indeterminate { owner, evidence } => {
+                assert_eq!(evidence.request, request);
+                match evidence.reason {
+                    BackNoTargetPhysicalIndeterminateReason::UnexpectedSameAuthorityDescendant {
+                        entity,
+                        expected,
+                        observed,
+                    } => {
+                        assert_eq!(entity, same_extra);
+                        assert_eq!(expected, same_expected);
+                        assert_eq!(observed, same_observed);
+                    }
+                    reason => panic!("the same-authority ChildSlot used {reason:?}"),
+                }
+                owner
+            }
+        };
+        assert_eq!(returned.request, request);
+        assert_eq!(
+            returned.capacity.capacity_identity_for_test(),
+            owner_identity
+        );
+        assert!(
+            capture(app.world()) == same_before,
+            "same-authority classification must be World and router-state zero-write"
+        );
+
+        let active_claim = {
+            let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
+            registry
+                .compare_exchange_lifecycle(&same_claim, EntityLifecycle::Active)
+                .expect("the exact provisional ChildSlot lifecycle must CAS to Active")
+        };
+        app.world_mut()
+            .entity_mut(same_extra)
+            .insert(ChildSlotLifecycle::Active);
+        app.world_mut().flush();
+        let (drift_expected, drift_observed) =
+            expected_registered_extra_evidence(app.world(), same_extra);
+        assert_eq!(drift_observed.registry_claim.as_ref(), Some(&active_claim));
+        match (&drift_expected.role, &drift_observed.role) {
+            (
+                BackNoTargetRegisteredExtraExpectedRole::ChildSlot {
+                    lifecycle: ChildSlotLifecycle::Active,
+                    authority: expected_authority,
+                },
+                BackNoTargetRegisteredExtraObservedRole::ChildSlot {
+                    lifecycle: Some(ChildSlotLifecycle::Active),
+                    authority: Some(observed_authority),
+                },
+            ) => assert_eq!(expected_authority, observed_authority),
+            roles => {
+                panic!("the illegal provisional lifecycle must remain locally exact: {roles:?}")
+            }
+        }
+        assert!(
+            !cleanup_claim_has_exact_authority(app.world(), &active_claim),
+            "the canonical exact-authority gate must reject provisional Active"
+        );
+        let drift_before = capture(app.world());
+        let outcome = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("lifecycle drift cannot remove the atomic entry");
+            freeze_back_no_target_proven_empty(world, entry, returned)
+        };
+        let (returned, cause, actual_expected, actual_observed) = match outcome {
+            BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(_) => {
+                panic!("{RED}: illegal provisional Active reached ProvenEmpty")
+            }
+            BackNoTargetPhysicalFreezeOutcome::Indeterminate { owner, evidence } => {
+                assert_eq!(evidence.request, request);
+                match evidence.reason {
+                    BackNoTargetPhysicalIndeterminateReason::RegisteredExtra {
+                        entity,
+                        cause,
+                        expected,
+                        observed,
+                    } => {
+                        assert_eq!(entity, same_extra);
+                        (owner, cause, expected, observed)
+                    }
+                    reason => panic!("{RED}: illegal provisional Active used {reason:?}"),
+                }
+            }
+        };
+        assert_eq!(returned.request, request);
+        assert_eq!(
+            returned.capacity.capacity_identity_for_test(),
+            owner_identity
+        );
+        assert_eq!(actual_expected, drift_expected);
+        assert_eq!(actual_observed, drift_observed);
+        assert!(
+            capture(app.world()) == drift_before,
+            "role-lifecycle drift classification must be World and router-state zero-write"
+        );
+        assert_eq!(
+            cause,
+            BackNoTargetRegisteredExtraIndeterminateCause::RoleLifecycleDrift,
+            "{RED}"
+        );
+    }
+
+    #[test]
+    fn back_no_target_registered_frame_and_child_extras_preserve_authority_evidence() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
         let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -26803,11 +28320,16 @@ pub(crate) mod tests {
                 claim: None,
                 role: ProvenEmptyProtectedRole::UnregisteredForeignDescendant,
             });
+            let (other_expected, other_observed) =
+                expected_registered_extra_evidence(world, other_authority_output);
             protected.push(ProvenEmptyProtectedEntityProjection {
                 entity: other_authority_output,
                 observed_parent: Some(active_output),
                 claim: Some(other_output_claim.clone()),
-                role: ProvenEmptyProtectedRole::OtherAuthorityDescendant,
+                role: ProvenEmptyProtectedRole::OtherAuthorityDescendant {
+                    expected: other_expected,
+                    observed: other_observed,
+                },
             });
             protected.sort_by_key(|protected| protected.entity.to_bits());
             assert_eq!(
@@ -27219,6 +28741,8 @@ pub(crate) mod tests {
                 public_request,
             )
         };
+        let (same_expected, same_observed) =
+            expected_registered_extra_evidence(app.world(), same_authority_descendant);
         let returned_capacity_before = returned_owner.capacity.capacity_identity_for_test();
         let outcome = {
             let world = app.world();
@@ -27241,12 +28765,12 @@ pub(crate) mod tests {
                 match evidence.reason {
                     BackNoTargetPhysicalIndeterminateReason::UnexpectedSameAuthorityDescendant {
                         entity,
-                        observed_parent,
-                        claim,
+                        expected,
+                        observed,
                     } => {
                         assert_eq!(entity, same_authority_descendant);
-                        assert_eq!(observed_parent, Some(active_output));
-                        assert_eq!(claim, same_authority_claim);
+                        assert_eq!(expected, same_expected);
+                        assert_eq!(observed, same_observed);
                     }
                     _ => {
                         panic!(
