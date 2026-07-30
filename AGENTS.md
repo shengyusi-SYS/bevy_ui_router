@@ -39,6 +39,7 @@
 - exact entering、leaving、pending cleanup 或 authority-invalid current 可以按 active plan 成为 authorized target
 - role classification 先确定 authorized target，剩余 preserved、non-target current、app-owned、foreign 与 other-authority non-target closure 必须保持为 protected，non-target current 只包含 authorized target role 之外的 current Entity
 - authorized target closure 必须与每个 non-target protected closure 不相交，且 mutation 只能落在 allowed write set 内
+- 验证 primitive 仅能在证明目的、accepted role partition 与 failure 语义一致时复用，只读 preservation/zero-target proof 不得套用 mutation-oriented closed-world child-set 假设来排除合法 protected extras
 - 可能触发 hook/observer 的 staging、cleanup 或 recovery 写入后，必须重建并复验 target/protected partition
 - failure cleanup 的 target/obligation manifest 与 completion 后 lifecycle continuation 必须独立冻结和校验；continuation 只来自原始 failure/authority、attempt 与 branch 分类，不能由 preserved active、obligation 数量或物理 disposition 反推
 - atomic publication tail 不得包含会触发 hook/observer 的写入、query 或可失败 validation

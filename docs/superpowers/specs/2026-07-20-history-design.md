@@ -512,6 +512,8 @@ ECS 必须产生 typed `ProvenEmptyProjection`
 - 所有 existing current 明确归入 protected
 - attempt target 为空且与 protected 不相交
 
+完整 observed closure 不等同于 registered branch exact child set：unregistered app-owned/foreign 和明确 other-authority non-target descendant 归入 protected，这类合法 extras 本身不阻止 zero-obligation proof，exact anchor/claim/lifecycle/relationship invariant drift、cycle 或 unexpected same-authority Router-owned Entity 仍按 Matrix fail closed
+
 logical roots 为空不能推导 Entity obligations 为零
 
 retained-empty、slot-only 或其他稀疏 topology 也不能绕过 proven-empty
