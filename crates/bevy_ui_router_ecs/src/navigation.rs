@@ -56,6 +56,9 @@ use crate::{
         RouterCleanupObservation, cleanup_claim_has_exact_authority,
         failed_prepared_branch_roots_are_exact,
     },
+    components::{
+        ChildSlotAuthority, ChildSlotLifecycle, ProvisionalSlotLifecycle, RouteOwnershipSeal,
+    },
     content::{ContentPlan, FrameContentWriter},
     driver::{EcsViewReportSession, ReportSeal, ViewBuildReport, ViewBuildReportKind},
     frame_local::{
@@ -85,8 +88,8 @@ use crate::{
         residual_child_slot_is_isolated, residual_child_slot_local_is_isolated, stage_child_slot,
     },
     presentation::{
-        DeferredRealizationFailure, RealizedFrame, expected_children,
-        frame_is_isolated_for_settlement, isolate_frame_for_settlement,
+        DeferredRealizationFailure, FrameLifecycle, FrameMountBinding, RealizedFrame,
+        expected_children, frame_is_isolated_for_settlement, isolate_frame_for_settlement,
         prepare_presentation_mutation, realize_child_frame_deferred, realize_frame_deferred,
         realize_reconciliation_child_frame_deferred, validate_active_frame,
         validate_realized_frame,
@@ -1065,6 +1068,1318 @@ pub(crate) struct BoundBackNoTargetResolution {
 pub(crate) struct BackPreparationOwner {
     candidate: VerifiedBackNoTargetCandidate,
     capacity: NoTargetCapacityPermit,
+    request: NavigationRequestId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProvenEmptyChildSlotBindingProjection {
+    parent: RouteFrameVersion,
+    outlet: bevy_ui_router_core::slot::RouteSlotKey,
+    slot_id: bevy_ui_router_core::ids::RouteSlotId,
+    anchor_claim: ExactRegistryClaim,
+    expected_support_relationships: Vec<bevy_ecs::entity::Entity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProvenEmptyOccupiedSlotProjection {
+    child: RouteFrameVersion,
+    binding: ProvenEmptyChildSlotBindingProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProvenEmptyCurrentRole {
+    FrameShell(RouteFrameVersion),
+    FrameContentTarget(RouteFrameVersion),
+    FrameOutput(RouteFrameVersion),
+    OccupiedActiveSlotBinding(ProvenEmptyOccupiedSlotProjection),
+    RetainedEmptySlotBinding(ProvenEmptyChildSlotBindingProjection),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProvenEmptyCurrentClaimProjection {
+    claim: ExactRegistryClaim,
+    role: ProvenEmptyCurrentRole,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProvenEmptyProtectedRole {
+    AppOwnedHost,
+    HostTopSlot,
+    Current(ProvenEmptyCurrentRole),
+    UnregisteredForeignDescendant,
+    OtherAuthorityDescendant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProvenEmptyProtectedEntityProjection {
+    entity: bevy_ecs::entity::Entity,
+    observed_parent: Option<bevy_ecs::entity::Entity>,
+    claim: Option<ExactRegistryClaim>,
+    role: ProvenEmptyProtectedRole,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProvenEmptyAttemptOwnerInventory {
+    request: NavigationRequestId,
+    host_settlement_vacant: bool,
+    pending_commit_vacant: bool,
+    pending_frame_drive_vacant: bool,
+    pending_mount_frame_task_vacant: bool,
+    pending_mount_request_vacant: bool,
+    pending_mount_mutation_rejection_vacant: bool,
+    pending_failed_branch_vacant: bool,
+    projectionless_fail_close_vacant: bool,
+    cleanup_ledger_vacant: bool,
+    authority_protocol_residual_vacant: bool,
+    back_capacity_enqueue_retire_residual_vacant: bool,
+    back_capacity_reservations_vacant: bool,
+    pending_back_resolution_action_vacant: bool,
+    pending_bound_back_resolution_vacant: bool,
+    pending_back_target_execution_vacant: bool,
+}
+
+impl ProvenEmptyAttemptOwnerInventory {
+    fn capture(entry: &RouterEntry, request: NavigationRequestId) -> Self {
+        Self {
+            request,
+            host_settlement_vacant: entry.host_settlement.is_none(),
+            pending_commit_vacant: entry.pending_commit.is_none(),
+            pending_frame_drive_vacant: entry.pending_frame_drive.is_none(),
+            pending_mount_frame_task_vacant: entry.pending_mount_frame_task.is_none(),
+            pending_mount_request_vacant: entry.pending_mount_request.is_none(),
+            pending_mount_mutation_rejection_vacant: entry
+                .pending_mount_mutation_rejection
+                .is_none(),
+            pending_failed_branch_vacant: entry.pending_failed_branch.is_none(),
+            projectionless_fail_close_vacant: entry.projectionless_fail_close.is_none(),
+            cleanup_ledger_vacant: entry.cleanup_ledger.is_none(),
+            authority_protocol_residual_vacant: entry.authority_protocol_residual.is_none(),
+            back_capacity_enqueue_retire_residual_vacant: entry
+                .back_capacity_enqueue_retire_residual
+                .is_none(),
+            back_capacity_reservations_vacant: entry.back_capacity_reservations.is_empty(),
+            pending_back_resolution_action_vacant: entry.pending_back_resolution_action.is_none(),
+            pending_bound_back_resolution_vacant: entry.pending_bound_back_resolution.is_none(),
+            pending_back_target_execution_vacant: entry.pending_back_target_execution.is_none(),
+        }
+    }
+
+    fn is_vacant(&self) -> bool {
+        self.host_settlement_vacant
+            && self.pending_commit_vacant
+            && self.pending_frame_drive_vacant
+            && self.pending_mount_frame_task_vacant
+            && self.pending_mount_request_vacant
+            && self.pending_mount_mutation_rejection_vacant
+            && self.pending_failed_branch_vacant
+            && self.projectionless_fail_close_vacant
+            && self.cleanup_ledger_vacant
+            && self.authority_protocol_residual_vacant
+            && self.back_capacity_enqueue_retire_residual_vacant
+            && self.back_capacity_reservations_vacant
+            && self.pending_back_resolution_action_vacant
+            && self.pending_bound_back_resolution_vacant
+            && self.pending_back_target_execution_vacant
+    }
+}
+
+pub(crate) struct ProvenEmptyAuthorizedTargets {
+    private: (),
+}
+
+impl ProvenEmptyAuthorizedTargets {
+    const fn new() -> Self {
+        Self { private: () }
+    }
+
+    const fn is_empty(&self) -> bool {
+        true
+    }
+}
+
+pub(crate) struct ProvenEmptyProjection {
+    host: ProjectionlessHostProjection,
+    request: NavigationRequestId,
+    authority_graph: BackNoTargetAuthorityGraphProjection,
+    attempt_owner_inventory: ProvenEmptyAttemptOwnerInventory,
+    current_claims: Vec<ProvenEmptyCurrentClaimProjection>,
+    observed_relationship_closure: Vec<bevy_ecs::entity::Entity>,
+    protected: Vec<ProvenEmptyProtectedEntityProjection>,
+    authorized_targets: ProvenEmptyAuthorizedTargets,
+}
+
+pub(crate) struct BackNoTargetProvenEmptyOwner {
+    owner: BackPreparationOwner,
+    projection: ProvenEmptyProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BackNoTargetAuthorityGraphFrameProjection {
+    frame: RouteFrameVersion,
+    stored_shell: bevy_ecs::entity::Entity,
+    mount: FrameMountBinding,
+    claims: Vec<ExactRegistryClaim>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BackNoTargetAuthorityGraphSlotProjection {
+    claim: ExactRegistryClaim,
+    binding: ProvenEmptyChildSlotBindingProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BackNoTargetAuthorityGraphIncomingProjection {
+    frame: RouteFrameVersion,
+    incoming: Vec<ExactRegistryClaim>,
+}
+
+struct BackNoTargetAuthorityGraphFrameRow {
+    frame: BackNoTargetAuthorityGraphFrameProjection,
+    incoming: BackNoTargetAuthorityGraphIncomingProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BackNoTargetAuthorityGraphProjection {
+    host: ProjectionlessHostProjection,
+    frames: Vec<BackNoTargetAuthorityGraphFrameProjection>,
+    slots: Vec<BackNoTargetAuthorityGraphSlotProjection>,
+    observed_roots: Vec<RouteFrameVersion>,
+    observed_incoming: Vec<BackNoTargetAuthorityGraphIncomingProjection>,
+    verified_reachable_from_root: Vec<RouteFrameVersion>,
+}
+
+impl BackNoTargetAuthorityGraphProjection {
+    fn root(&self) -> Option<&RouteFrameVersion> {
+        (self.observed_roots.len() == 1).then(|| &self.observed_roots[0])
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BackNoTargetAuthorityGraphViolation {
+    RootCount {
+        observed_roots: Vec<RouteFrameVersion>,
+    },
+    DuplicateIncomingSlot {
+        slot: ExactRegistryClaim,
+        observed_children: Vec<RouteFrameVersion>,
+    },
+    DuplicateFrameIdentity {
+        left: BackNoTargetAuthorityGraphFrameProjection,
+        right: BackNoTargetAuthorityGraphFrameProjection,
+    },
+    ForeignFrameAuthority {
+        frame: RouteFrameVersion,
+    },
+    FrameClaimBoundaryDrift {
+        frame: RouteFrameVersion,
+        expected_claim: ExactRegistryClaim,
+        expected_parent: bevy_ecs::entity::Entity,
+        observed: BackNoTargetAuthorityGraphObservedClaimProjection,
+    },
+    FrameShellBindingDrift {
+        frame: RouteFrameVersion,
+        stored_shell: bevy_ecs::entity::Entity,
+        owner_shell_claims: Vec<ExactRegistryClaim>,
+    },
+    FrameShellMountBoundaryDrift {
+        frame: RouteFrameVersion,
+        mount_slot: bevy_ecs::entity::Entity,
+        stored_parent: bevy_ecs::entity::Entity,
+        observed_shell: BackNoTargetAuthorityGraphObservedClaimProjection,
+    },
+    DuplicateClaim {
+        left: ExactRegistryClaim,
+        right: ExactRegistryClaim,
+        conflicts: Vec<BackNoTargetAuthorityGraphClaimConflict>,
+    },
+    RootMountMismatch {
+        root: RouteFrameVersion,
+    },
+    SlotBoundaryDrift {
+        expected: BackNoTargetAuthorityGraphSlotProjection,
+        observed: BackNoTargetAuthorityGraphObservedSlotProjection,
+    },
+    IncomingCount {
+        frame: RouteFrameVersion,
+        observed: Vec<ExactRegistryClaim>,
+    },
+    Cycle {
+        observed: Vec<RouteFrameVersion>,
+    },
+    Unreachable {
+        root: RouteFrameVersion,
+        observed: Vec<RouteFrameVersion>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackNoTargetAuthorityGraphClaimConflict {
+    Entity,
+    Seal,
+    Owner,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BackNoTargetAuthorityGraphEvidence {
+    projection: BackNoTargetAuthorityGraphProjection,
+    violation: BackNoTargetAuthorityGraphViolation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BackNoTargetAuthorityGraphObservedClaimProjection {
+    entity_exists: bool,
+    registry_claim: Option<ExactRegistryClaim>,
+    registry_manifest: Option<crate::registry::ComponentManifest>,
+    physical_manifest: Option<crate::registry::ComponentManifest>,
+    ownership_seal: Option<RouteOwnershipSeal>,
+    frame_lifecycle: Option<FrameLifecycle>,
+    child_slot_lifecycle: Option<ChildSlotLifecycle>,
+    child_slot_authority: Option<ChildSlotAuthority>,
+    provisional_slot_lifecycle: Option<ProvisionalSlotLifecycle>,
+    observed_parent: Option<bevy_ecs::entity::Entity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BackNoTargetAuthorityGraphObservedOutletProjection {
+    parent: RouteFrameVersion,
+    outlet: bevy_ui_router_core::slot::RouteSlotKey,
+    anchor: bevy_ecs::entity::Entity,
+    anchor_claim: ExactRegistryClaim,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BackNoTargetAuthorityGraphObservedSlotProjection {
+    slot: BackNoTargetAuthorityGraphObservedClaimProjection,
+    anchor: BackNoTargetAuthorityGraphObservedClaimProjection,
+    owner_outlets: Vec<BackNoTargetAuthorityGraphObservedOutletProjection>,
+    observed_anchor_children: Vec<bevy_ecs::entity::Entity>,
+}
+
+fn observe_back_no_target_authority_graph_claim(
+    world: &World,
+    registry: &RouteEntityRegistry,
+    entity: bevy_ecs::entity::Entity,
+) -> BackNoTargetAuthorityGraphObservedClaimProjection {
+    BackNoTargetAuthorityGraphObservedClaimProjection {
+        entity_exists: world.get_entity(entity).is_ok(),
+        registry_claim: registry.record(entity).map(|record| record.claim()),
+        registry_manifest: registry
+            .record(entity)
+            .map(|record| record.manifest().clone()),
+        physical_manifest: crate::registry::ComponentManifest::from_world(world, entity),
+        ownership_seal: world.get::<RouteOwnershipSeal>(entity).copied(),
+        frame_lifecycle: world.get::<FrameLifecycle>(entity).copied(),
+        child_slot_lifecycle: world.get::<ChildSlotLifecycle>(entity).copied(),
+        child_slot_authority: world.get::<ChildSlotAuthority>(entity).cloned(),
+        provisional_slot_lifecycle: world.get::<ProvisionalSlotLifecycle>(entity).copied(),
+        observed_parent: world
+            .get::<bevy_ecs::hierarchy::ChildOf>(entity)
+            .map(bevy_ecs::hierarchy::ChildOf::parent),
+    }
+}
+
+fn observe_back_no_target_authority_graph_slot(
+    world: &World,
+    registry: &RouteEntityRegistry,
+    active: &RealizedBranch,
+    slot: &crate::mount::MountedChildSlot,
+) -> BackNoTargetAuthorityGraphObservedSlotProjection {
+    let mut owner_outlets = active
+        .frames()
+        .iter()
+        .filter(|frame| frame.frame() == slot.parent())
+        .flat_map(|frame| frame.outlets())
+        .map(
+            |outlet| BackNoTargetAuthorityGraphObservedOutletProjection {
+                parent: outlet.parent().clone(),
+                outlet: outlet.key().clone(),
+                anchor: outlet.anchor(),
+                anchor_claim: outlet.anchor_claim().clone(),
+            },
+        )
+        .collect::<Vec<_>>();
+    owner_outlets.sort_by(|left, right| {
+        left.outlet
+            .cmp(&right.outlet)
+            .then_with(|| left.anchor.to_bits().cmp(&right.anchor.to_bits()))
+            .then_with(|| {
+                left.anchor_claim
+                    .entity()
+                    .to_bits()
+                    .cmp(&right.anchor_claim.entity().to_bits())
+            })
+    });
+    let mut observed_anchor_children = world
+        .get::<bevy_ecs::hierarchy::Children>(slot.anchor())
+        .map(|children| children.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    observed_anchor_children.sort_by_key(|entity| entity.to_bits());
+    BackNoTargetAuthorityGraphObservedSlotProjection {
+        slot: observe_back_no_target_authority_graph_claim(world, registry, slot.slot()),
+        anchor: observe_back_no_target_authority_graph_claim(world, registry, slot.anchor()),
+        owner_outlets,
+        observed_anchor_children,
+    }
+}
+
+#[derive(Debug)]
+enum BackNoTargetPhysicalIndeterminateReason {
+    MissingRegistry,
+    MissingHost,
+    MissingActive,
+    RequestIndexDrift,
+    Capacity(BackCapacityRetireError),
+    ConflictingAttemptOwners(ProvenEmptyAttemptOwnerInventory),
+    HostAuthorityDrift,
+    ActiveTopologyDrift,
+    ActiveRegistryDrift {
+        expected: Vec<ExactRegistryClaim>,
+        observed: Vec<ExactRegistryClaim>,
+    },
+    DuplicateProtectedEntity(bevy_ecs::entity::Entity),
+    RelationshipClosureDrift {
+        observed: Vec<bevy_ecs::entity::Entity>,
+        protected: Vec<ProvenEmptyProtectedEntityProjection>,
+    },
+    UnexpectedSameAuthorityDescendant {
+        entity: bevy_ecs::entity::Entity,
+        observed_parent: Option<bevy_ecs::entity::Entity>,
+        claim: ExactRegistryClaim,
+    },
+    AuthorityGraph(BackNoTargetAuthorityGraphEvidence),
+}
+
+pub(crate) struct BackNoTargetPhysicalIndeterminateEvidence {
+    request: NavigationRequestId,
+    reason: BackNoTargetPhysicalIndeterminateReason,
+}
+
+pub(crate) enum BackNoTargetPhysicalFreezeOutcome {
+    ProvenEmpty(BackNoTargetProvenEmptyOwner),
+    Indeterminate {
+        owner: BackPreparationOwner,
+        evidence: BackNoTargetPhysicalIndeterminateEvidence,
+    },
+}
+
+fn back_no_target_logical_frame_identity_key(
+    version: &RouteFrameVersion,
+) -> (u64, u64, u64, u8, u64, u64, u64) {
+    let (origin_tag, origin_route) = match version.origin() {
+        bevy_ui_router_core::prelude::FrameOrigin::MatchedRoute(route) => (0, route.raw()),
+        bevy_ui_router_core::prelude::FrameOrigin::RouteError(route) => (1, route.raw()),
+        bevy_ui_router_core::prelude::FrameOrigin::RouterFallback => (2, 0),
+    };
+    (
+        version.router().raw(),
+        version.host().raw(),
+        version.slot().raw(),
+        origin_tag,
+        origin_route,
+        version.frame().raw(),
+        version.generation().raw(),
+    )
+}
+
+fn classify_back_no_target_authority_topology(
+    root_index: usize,
+    adjacency: &[Vec<usize>],
+) -> Result<Vec<bool>, Vec<usize>> {
+    fn visit(
+        node: usize,
+        adjacency: &[Vec<usize>],
+        states: &mut [u8],
+        stack: &mut Vec<usize>,
+    ) -> Option<Vec<usize>> {
+        states[node] = 1;
+        stack.push(node);
+        for child in adjacency[node].iter().copied() {
+            if states[child] == 1 {
+                let start = stack
+                    .iter()
+                    .position(|current| *current == child)
+                    .unwrap_or(0);
+                return Some(
+                    stack[start..]
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(child))
+                        .collect(),
+                );
+            }
+            if states[child] == 0 {
+                if let Some(cycle) = visit(child, adjacency, states, stack) {
+                    return Some(cycle);
+                }
+            }
+        }
+        stack.pop();
+        states[node] = 2;
+        None
+    }
+
+    assert!(
+        root_index < adjacency.len(),
+        "authority topology root must index one adjacency row"
+    );
+    let mut states = vec![0; adjacency.len()];
+    if let Some(cycle) = visit(root_index, adjacency, &mut states, &mut Vec::new()) {
+        return Err(cycle);
+    }
+    let reachable_from_root = states.iter().map(|state| *state != 0).collect::<Vec<_>>();
+    for index in 0..states.len() {
+        if states[index] == 0 {
+            if let Some(cycle) = visit(index, adjacency, &mut states, &mut Vec::new()) {
+                return Err(cycle);
+            }
+        }
+    }
+    Ok(reachable_from_root)
+}
+
+fn freeze_back_no_target_authority_graph(
+    world: &World,
+    registry: &RouteEntityRegistry,
+    host: &HostBinding,
+    active: &RealizedBranch,
+) -> Result<BackNoTargetAuthorityGraphProjection, BackNoTargetAuthorityGraphEvidence> {
+    let project_frame = |frame: &RealizedFrame| {
+        let mut claims = frame.claims().cloned().collect::<Vec<_>>();
+        claims.sort_by_key(|claim| claim.entity().to_bits());
+        BackNoTargetAuthorityGraphFrameProjection {
+            frame: frame.frame().clone(),
+            stored_shell: frame.shell(),
+            mount: frame.mount_binding().clone(),
+            claims,
+        }
+    };
+    let mut frame_rows = active
+        .frames()
+        .iter()
+        .map(|frame| {
+            let frame_projection = project_frame(frame);
+            let mut incoming = active
+                .child_slots()
+                .iter()
+                .filter(|slot| frame.mount_binding().matches_mounted_child_slot(slot))
+                .map(|slot| slot.slot_claim().clone())
+                .collect::<Vec<_>>();
+            incoming.sort_by_key(|claim| claim.entity().to_bits());
+            BackNoTargetAuthorityGraphFrameRow {
+                incoming: BackNoTargetAuthorityGraphIncomingProjection {
+                    frame: frame.frame().clone(),
+                    incoming,
+                },
+                frame: frame_projection,
+            }
+        })
+        .collect::<Vec<_>>();
+    frame_rows.sort_by(|left, right| {
+        back_no_target_logical_frame_identity_key(&left.frame.frame)
+            .cmp(&back_no_target_logical_frame_identity_key(
+                &right.frame.frame,
+            ))
+            .then_with(|| {
+                left.frame
+                    .stored_shell
+                    .to_bits()
+                    .cmp(&right.frame.stored_shell.to_bits())
+            })
+            .then_with(|| {
+                left.frame
+                    .mount
+                    .slot()
+                    .to_bits()
+                    .cmp(&right.frame.mount.slot().to_bits())
+            })
+            .then_with(|| {
+                left.frame
+                    .claims
+                    .iter()
+                    .map(|claim| claim.entity().to_bits())
+                    .cmp(
+                        right
+                            .frame
+                            .claims
+                            .iter()
+                            .map(|claim| claim.entity().to_bits()),
+                    )
+            })
+    });
+    let (frames, observed_incoming): (Vec<_>, Vec<_>) = frame_rows
+        .into_iter()
+        .map(|row| (row.frame, row.incoming))
+        .unzip();
+    let mut slots = active
+        .child_slots()
+        .iter()
+        .map(|slot| {
+            let mut expected_support_relationships = slot.expected_anchor_children().to_vec();
+            expected_support_relationships.sort_by_key(|entity| entity.to_bits());
+            BackNoTargetAuthorityGraphSlotProjection {
+                claim: slot.slot_claim().clone(),
+                binding: ProvenEmptyChildSlotBindingProjection {
+                    parent: slot.parent().clone(),
+                    outlet: slot.outlet().clone(),
+                    slot_id: slot.slot_id(),
+                    anchor_claim: slot.anchor_claim().clone(),
+                    expected_support_relationships,
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    slots.sort_by_key(|slot| slot.claim.entity().to_bits());
+    let observed_roots = observed_incoming
+        .iter()
+        .filter(|incoming| incoming.incoming.is_empty())
+        .map(|incoming| incoming.frame.clone())
+        .collect::<Vec<_>>();
+    let mut projection = BackNoTargetAuthorityGraphProjection {
+        host: ProjectionlessHostProjection::from(host),
+        frames,
+        slots,
+        observed_roots,
+        observed_incoming,
+        verified_reachable_from_root: Vec::new(),
+    };
+    let reject = |violation| BackNoTargetAuthorityGraphEvidence {
+        projection: projection.clone(),
+        violation,
+    };
+
+    for slot in active.child_slots() {
+        let mut observed_children = active
+            .frames()
+            .iter()
+            .filter(|frame| frame.mount_binding().matches_mounted_child_slot(slot))
+            .map(|frame| frame.frame().clone())
+            .collect::<Vec<_>>();
+        observed_children.sort_by_key(back_no_target_logical_frame_identity_key);
+        if observed_children.len() > 1 {
+            return Err(reject(
+                BackNoTargetAuthorityGraphViolation::DuplicateIncomingSlot {
+                    slot: slot.slot_claim().clone(),
+                    observed_children,
+                },
+            ));
+        }
+    }
+    let Some(root_version) = projection.root().cloned() else {
+        return Err(reject(BackNoTargetAuthorityGraphViolation::RootCount {
+            observed_roots: projection.observed_roots.clone(),
+        }));
+    };
+    let Some(root_index) = active
+        .frames()
+        .iter()
+        .position(|frame| frame.frame() == &root_version)
+    else {
+        return Err(reject(BackNoTargetAuthorityGraphViolation::RootCount {
+            observed_roots: projection.observed_roots.clone(),
+        }));
+    };
+    let root = &active.frames()[root_index];
+
+    for (index, frame) in active.frames().iter().enumerate() {
+        if let Some(other) = active.frames()[index + 1..].iter().find(|other| {
+            other.frame() == frame.frame() || other.frame().frame() == frame.frame().frame()
+        }) {
+            return Err(reject(
+                BackNoTargetAuthorityGraphViolation::DuplicateFrameIdentity {
+                    left: project_frame(frame),
+                    right: project_frame(other),
+                },
+            ));
+        }
+        if !bevy_ui_router_core::integration::frame_versions_share_router(
+            &root_version,
+            frame.frame(),
+        ) || !bevy_ui_router_core::integration::host_version_matches_frame(
+            &host.version,
+            frame.frame(),
+        ) {
+            return Err(reject(
+                BackNoTargetAuthorityGraphViolation::ForeignFrameAuthority {
+                    frame: frame.frame().clone(),
+                },
+            ));
+        }
+        let mut owner_shell_claims = frame
+            .claims()
+            .filter(|claim| {
+                matches!(
+                    claim.owner(),
+                    RegistryOwner::Committed(EntityOwner::FrameShell(owner))
+                        if owner == frame.frame()
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        owner_shell_claims.sort_by_key(|claim| claim.entity().to_bits());
+        if owner_shell_claims.len() != 1 || owner_shell_claims[0].entity() != frame.shell() {
+            return Err(reject(
+                BackNoTargetAuthorityGraphViolation::FrameShellBindingDrift {
+                    frame: frame.frame().clone(),
+                    stored_shell: frame.shell(),
+                    owner_shell_claims,
+                },
+            ));
+        }
+        let shell_claim = &owner_shell_claims[0];
+        let Some(stored_shell_parent) = frame
+            .cleanup_members()
+            .find(|(claim, _)| *claim == shell_claim)
+            .map(|(_, parent)| parent)
+        else {
+            return Err(reject(
+                BackNoTargetAuthorityGraphViolation::FrameShellBindingDrift {
+                    frame: frame.frame().clone(),
+                    stored_shell: frame.shell(),
+                    owner_shell_claims,
+                },
+            ));
+        };
+        let mount_slot = frame.mount_binding().slot();
+        let observed_shell =
+            observe_back_no_target_authority_graph_claim(world, registry, shell_claim.entity());
+        if stored_shell_parent != mount_slot || observed_shell.observed_parent != Some(mount_slot) {
+            return Err(reject(
+                BackNoTargetAuthorityGraphViolation::FrameShellMountBoundaryDrift {
+                    frame: frame.frame().clone(),
+                    mount_slot,
+                    stored_parent: stored_shell_parent,
+                    observed_shell,
+                },
+            ));
+        }
+        for (claim, parent) in frame.cleanup_members() {
+            let role_is_exact = matches!(
+                claim.owner(),
+                RegistryOwner::Committed(
+                    EntityOwner::FrameShell(owner)
+                        | EntityOwner::FrameContentTarget(owner)
+                        | EntityOwner::FrameOutput { frame: owner, .. }
+                ) if owner == frame.frame()
+            );
+            let record_is_exact = registry.record(claim.entity()).is_some_and(|record| {
+                record.claim() == *claim
+                    && crate::registry::ComponentManifest::from_world(world, claim.entity())
+                        .is_some_and(|actual| {
+                            record
+                                .manifest()
+                                .component_ids()
+                                .iter()
+                                .all(|component| actual.component_ids().contains(component))
+                        })
+            });
+            if claim.lifecycle() != EntityLifecycle::Active
+                || !role_is_exact
+                || !record_is_exact
+                || !cleanup_claim_has_exact_authority(world, claim)
+                || world
+                    .get::<bevy_ecs::hierarchy::ChildOf>(claim.entity())
+                    .map(bevy_ecs::hierarchy::ChildOf::parent)
+                    != Some(parent)
+            {
+                return Err(reject(
+                    BackNoTargetAuthorityGraphViolation::FrameClaimBoundaryDrift {
+                        frame: frame.frame().clone(),
+                        expected_claim: claim.clone(),
+                        expected_parent: parent,
+                        observed: observe_back_no_target_authority_graph_claim(
+                            world,
+                            registry,
+                            claim.entity(),
+                        ),
+                    },
+                ));
+            }
+        }
+    }
+
+    if root.frame().slot() != host.slot_id
+        || root.mount_binding().slot() != host.top_slot
+        || root.mount_binding().slot_claim() != &host.top_slot_claim
+        || root.mount_binding().physical_parent() != (host.host, None)
+        || !matches!(
+            host.top_slot_claim.owner(),
+            RegistryOwner::Committed(EntityOwner::HostTopSlot {
+                host: version,
+                slot,
+            }) if version == &host.version && *slot == host.slot_id
+        )
+    {
+        return Err(reject(
+            BackNoTargetAuthorityGraphViolation::RootMountMismatch {
+                root: root_version.clone(),
+            },
+        ));
+    }
+
+    let mut claims = active
+        .frames()
+        .iter()
+        .flat_map(RealizedFrame::claims)
+        .chain(active.child_slots().iter().map(|slot| slot.slot_claim()))
+        .collect::<Vec<_>>();
+    claims.push(&host.top_slot_claim);
+    for (index, claim) in claims.iter().enumerate() {
+        if let Some(other) = claims[index + 1..].iter().find(|other| {
+            other.entity() == claim.entity()
+                || other.seal() == claim.seal()
+                || other.owner().conflicts_with(claim.owner())
+        }) {
+            let mut conflicts = Vec::new();
+            if other.entity() == claim.entity() {
+                conflicts.push(BackNoTargetAuthorityGraphClaimConflict::Entity);
+            }
+            if other.seal() == claim.seal() {
+                conflicts.push(BackNoTargetAuthorityGraphClaimConflict::Seal);
+            }
+            if other.owner().conflicts_with(claim.owner()) {
+                conflicts.push(BackNoTargetAuthorityGraphClaimConflict::Owner);
+            }
+            return Err(reject(
+                BackNoTargetAuthorityGraphViolation::DuplicateClaim {
+                    left: (*claim).clone(),
+                    right: (**other).clone(),
+                    conflicts,
+                },
+            ));
+        }
+    }
+    for (index, frame) in active.frames().iter().enumerate() {
+        if active.frames()[index + 1..].iter().any(|other| {
+            frame
+                .mount_binding()
+                .same_physical_mount(other.mount_binding())
+        }) {
+            let observed = projection
+                .observed_incoming
+                .iter()
+                .find(|incoming| incoming.frame == *frame.frame())
+                .map(|incoming| incoming.incoming.clone())
+                .unwrap_or_default();
+            return Err(reject(BackNoTargetAuthorityGraphViolation::IncomingCount {
+                frame: frame.frame().clone(),
+                observed,
+            }));
+        }
+    }
+
+    let mut adjacency = vec![Vec::new(); active.frames().len()];
+    for slot in active.child_slots() {
+        let expected_slot = projection
+            .slots
+            .iter()
+            .find(|expected| expected.claim == *slot.slot_claim())
+            .cloned()
+            .expect("the graph projection retains every owner-held child slot");
+        let boundary_drift = || BackNoTargetAuthorityGraphViolation::SlotBoundaryDrift {
+            expected: expected_slot.clone(),
+            observed: observe_back_no_target_authority_graph_slot(world, registry, active, slot),
+        };
+        let Some(parent_index) = active
+            .frames()
+            .iter()
+            .position(|frame| frame.frame() == slot.parent())
+        else {
+            return Err(reject(boundary_drift()));
+        };
+        let Some(parent) = active.frames().get(parent_index) else {
+            return Err(reject(boundary_drift()));
+        };
+        let observed_children = active
+            .frames()
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| frame.mount_binding().matches_mounted_child_slot(slot))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let lifecycle_is_exact = match observed_children.as_slice() {
+            [] => slot.slot_claim().lifecycle() == EntityLifecycle::PreparedInert,
+            [_] => slot.slot_claim().lifecycle() == EntityLifecycle::Active,
+            _ => false,
+        };
+        let observed_anchor_children = world
+            .get::<bevy_ecs::hierarchy::Children>(slot.anchor())
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let slot_record_is_exact =
+            registry.record(slot.slot()).is_some_and(|record| {
+                record.claim() == *slot.slot_claim()
+                    && crate::registry::ComponentManifest::from_world(world, slot.slot())
+                        .is_some_and(|physical_manifest| {
+                            record.manifest().component_ids().iter().all(|required| {
+                                physical_manifest.component_ids().contains(required)
+                            })
+                        })
+            });
+        let binding_is_exact = slot.slot_claim().owner()
+            == &RegistryOwner::Committed(EntityOwner::ChildSlot {
+                parent: slot.parent().clone(),
+                outlet: slot.outlet().clone(),
+                slot: slot.slot_id(),
+            })
+            && lifecycle_is_exact
+            && slot_record_is_exact
+            && cleanup_claim_has_exact_authority(world, slot.slot_claim())
+            && world
+                .get::<bevy_ecs::hierarchy::ChildOf>(slot.slot())
+                .map(bevy_ecs::hierarchy::ChildOf::parent)
+                == Some(slot.anchor())
+            && parent.outlet(slot.outlet()).is_some_and(|outlet| {
+                outlet.anchor() == slot.anchor()
+                    && outlet.anchor_claim() == slot.anchor_claim()
+                    && parent.claims().any(|claim| claim == slot.anchor_claim())
+            })
+            && registry
+                .record(slot.anchor())
+                .is_some_and(|record| record.claim() == *slot.anchor_claim())
+            && cleanup_claim_has_exact_authority(world, slot.anchor_claim())
+            && slot
+                .expected_anchor_children()
+                .iter()
+                .all(|expected| observed_anchor_children.contains(expected));
+        if !binding_is_exact {
+            return Err(reject(boundary_drift()));
+        }
+        if let Some(child) = observed_children.first().copied() {
+            adjacency[parent_index].push(child);
+        }
+    }
+    for children in &mut adjacency {
+        children.sort_by_key(|index| {
+            back_no_target_logical_frame_identity_key(active.frames()[*index].frame())
+        });
+    }
+    for incoming in &projection.observed_incoming {
+        let expected = usize::from(incoming.frame != root_version);
+        if incoming.incoming.len() != expected {
+            return Err(reject(BackNoTargetAuthorityGraphViolation::IncomingCount {
+                frame: incoming.frame.clone(),
+                observed: incoming.incoming.clone(),
+            }));
+        }
+    }
+
+    let reachable_from_root =
+        match classify_back_no_target_authority_topology(root_index, &adjacency) {
+            Ok(reachable) => reachable,
+            Err(cycle) => {
+                return Err(reject(BackNoTargetAuthorityGraphViolation::Cycle {
+                    observed: cycle
+                        .into_iter()
+                        .map(|index| active.frames()[index].frame().clone())
+                        .collect(),
+                }));
+            }
+        };
+    let mut unreachable = reachable_from_root
+        .iter()
+        .enumerate()
+        .filter(|(_, reachable)| !**reachable)
+        .map(|(index, _)| active.frames()[index].frame().clone())
+        .collect::<Vec<_>>();
+    unreachable.sort_by_key(back_no_target_logical_frame_identity_key);
+    if !unreachable.is_empty() {
+        return Err(reject(BackNoTargetAuthorityGraphViolation::Unreachable {
+            root: root_version,
+            observed: unreachable,
+        }));
+    }
+    projection.verified_reachable_from_root = projection
+        .frames
+        .iter()
+        .map(|frame| frame.frame.clone())
+        .collect();
+    Ok(projection)
+}
+
+pub(crate) fn freeze_back_no_target_proven_empty(
+    world: &World,
+    entry: &RouterEntry,
+    owner: BackPreparationOwner,
+) -> BackNoTargetPhysicalFreezeOutcome {
+    let indeterminate = |owner: BackPreparationOwner, reason| {
+        let request = owner.request;
+        BackNoTargetPhysicalFreezeOutcome::Indeterminate {
+            owner,
+            evidence: BackNoTargetPhysicalIndeterminateEvidence { request, reason },
+        }
+    };
+    let request = owner.request;
+    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+        return indeterminate(
+            owner,
+            BackNoTargetPhysicalIndeterminateReason::MissingRegistry,
+        );
+    };
+    let Some(host) = entry.host.as_ref() else {
+        return indeterminate(owner, BackNoTargetPhysicalIndeterminateReason::MissingHost);
+    };
+    let Some(active) = entry.active.as_ref() else {
+        return indeterminate(
+            owner,
+            BackNoTargetPhysicalIndeterminateReason::MissingActive,
+        );
+    };
+    if entry
+        .requests
+        .iter()
+        .filter(|indexed| **indexed == request)
+        .count()
+        != 1
+    {
+        return indeterminate(
+            owner,
+            BackNoTargetPhysicalIndeterminateReason::RequestIndexDrift,
+        );
+    }
+    let Some(issuer) = entry.back_capacity_issuer.as_ref() else {
+        return indeterminate(
+            owner,
+            BackNoTargetPhysicalIndeterminateReason::Capacity(
+                BackCapacityRetireError::StaleGeneration,
+            ),
+        );
+    };
+    if let Err(error) = issuer.validate_no_target_capacity(&owner.capacity) {
+        return indeterminate(
+            owner,
+            BackNoTargetPhysicalIndeterminateReason::Capacity(error),
+        );
+    }
+    let attempt_owner_inventory = ProvenEmptyAttemptOwnerInventory::capture(entry, request);
+    if !attempt_owner_inventory.is_vacant() {
+        return indeterminate(
+            owner,
+            BackNoTargetPhysicalIndeterminateReason::ConflictingAttemptOwners(
+                attempt_owner_inventory,
+            ),
+        );
+    }
+    if !current_host_binding_is_exact(world, host) {
+        return indeterminate(
+            owner,
+            BackNoTargetPhysicalIndeterminateReason::HostAuthorityDrift,
+        );
+    }
+    let authority_graph = match freeze_back_no_target_authority_graph(world, registry, host, active)
+    {
+        Ok(projection) => projection,
+        Err(evidence) => {
+            return indeterminate(
+                owner,
+                BackNoTargetPhysicalIndeterminateReason::AuthorityGraph(evidence),
+            );
+        }
+    };
+    let mut current_claims = Vec::new();
+    for frame in active.frames() {
+        for claim in frame.claims() {
+            if claim.lifecycle() != EntityLifecycle::Active {
+                return indeterminate(
+                    owner,
+                    BackNoTargetPhysicalIndeterminateReason::ActiveTopologyDrift,
+                );
+            }
+            let role = match claim.owner() {
+                RegistryOwner::Committed(EntityOwner::FrameShell(claim_frame))
+                    if claim_frame == frame.frame() =>
+                {
+                    ProvenEmptyCurrentRole::FrameShell(claim_frame.clone())
+                }
+                RegistryOwner::Committed(EntityOwner::FrameContentTarget(claim_frame))
+                    if claim_frame == frame.frame() =>
+                {
+                    ProvenEmptyCurrentRole::FrameContentTarget(claim_frame.clone())
+                }
+                RegistryOwner::Committed(EntityOwner::FrameOutput {
+                    frame: claim_frame, ..
+                }) if claim_frame == frame.frame() => {
+                    ProvenEmptyCurrentRole::FrameOutput(claim_frame.clone())
+                }
+                _ => {
+                    return indeterminate(
+                        owner,
+                        BackNoTargetPhysicalIndeterminateReason::ActiveTopologyDrift,
+                    );
+                }
+            };
+            current_claims.push(ProvenEmptyCurrentClaimProjection {
+                claim: claim.clone(),
+                role,
+            });
+        }
+    }
+    for slot in active.child_slots() {
+        let mut exact_parents = active
+            .frames()
+            .iter()
+            .filter(|frame| frame.frame() == slot.parent());
+        let Some(parent_frame) = exact_parents.next() else {
+            return indeterminate(
+                owner,
+                BackNoTargetPhysicalIndeterminateReason::ActiveTopologyDrift,
+            );
+        };
+        if exact_parents.next().is_some()
+            || parent_frame.outlet(slot.outlet()).is_none_or(|outlet| {
+                outlet.anchor() != slot.anchor() || outlet.anchor_claim() != slot.anchor_claim()
+            })
+            || slot.slot_claim().owner()
+                != &RegistryOwner::Committed(EntityOwner::ChildSlot {
+                    parent: slot.parent().clone(),
+                    outlet: slot.outlet().clone(),
+                    slot: slot.slot_id(),
+                })
+            || !cleanup_claim_has_exact_authority(world, slot.slot_claim())
+            || world
+                .get::<bevy_ecs::hierarchy::ChildOf>(slot.slot())
+                .map(bevy_ecs::hierarchy::ChildOf::parent)
+                != Some(slot.anchor())
+            || !matches!(
+                slot.anchor_claim().owner(),
+                RegistryOwner::Committed(EntityOwner::FrameOutput { frame, .. })
+                    if frame == slot.parent()
+            )
+            || !parent_frame
+                .claims()
+                .any(|claim| claim == slot.anchor_claim())
+            || registry
+                .record(slot.anchor())
+                .is_none_or(|record| record.claim() != *slot.anchor_claim())
+            || !cleanup_claim_has_exact_authority(world, slot.anchor_claim())
+        {
+            return indeterminate(
+                owner,
+                BackNoTargetPhysicalIndeterminateReason::ActiveTopologyDrift,
+            );
+        }
+        let observed_anchor_children = world
+            .get::<bevy_ecs::hierarchy::Children>(slot.anchor())
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if slot
+            .expected_anchor_children()
+            .iter()
+            .any(|expected| !observed_anchor_children.contains(expected))
+        {
+            return indeterminate(
+                owner,
+                BackNoTargetPhysicalIndeterminateReason::ActiveTopologyDrift,
+            );
+        }
+        let binding = ProvenEmptyChildSlotBindingProjection {
+            parent: slot.parent().clone(),
+            outlet: slot.outlet().clone(),
+            slot_id: slot.slot_id(),
+            anchor_claim: slot.anchor_claim().clone(),
+            expected_support_relationships: slot.expected_anchor_children().to_vec(),
+        };
+        let mut mounted_children = active
+            .frames()
+            .iter()
+            .filter(|frame| frame.mount_binding().matches_mounted_child_slot(slot));
+        let child = mounted_children.next();
+        if mounted_children.next().is_some() {
+            return indeterminate(
+                owner,
+                BackNoTargetPhysicalIndeterminateReason::ActiveTopologyDrift,
+            );
+        }
+        let role = match child {
+            Some(child) if slot.slot_claim().lifecycle() == EntityLifecycle::Active => {
+                ProvenEmptyCurrentRole::OccupiedActiveSlotBinding(
+                    ProvenEmptyOccupiedSlotProjection {
+                        child: child.frame().clone(),
+                        binding,
+                    },
+                )
+            }
+            None if slot.slot_claim().lifecycle() == EntityLifecycle::PreparedInert => {
+                ProvenEmptyCurrentRole::RetainedEmptySlotBinding(binding)
+            }
+            Some(_) | None => {
+                return indeterminate(
+                    owner,
+                    BackNoTargetPhysicalIndeterminateReason::ActiveTopologyDrift,
+                );
+            }
+        };
+        current_claims.push(ProvenEmptyCurrentClaimProjection {
+            claim: slot.slot_claim().clone(),
+            role,
+        });
+    }
+    current_claims.sort_by_key(|current| current.claim.entity().to_bits());
+
+    let Some(current_authority_anchor) = authority_graph.root() else {
+        return indeterminate(
+            owner,
+            BackNoTargetPhysicalIndeterminateReason::ActiveTopologyDrift,
+        );
+    };
+    let current_authority_frames = active
+        .frames()
+        .iter()
+        .map(|frame| frame.frame().clone())
+        .collect::<Vec<_>>();
+    let mut expected_authority_claims = current_claims
+        .iter()
+        .map(|current| current.claim.clone())
+        .chain(std::iter::once(host.top_slot_claim.clone()))
+        .collect::<Vec<_>>();
+    expected_authority_claims.sort_by_key(|claim| claim.entity().to_bits());
+    let mut observed_authority_claims = registry
+        .records()
+        .iter()
+        .filter(|record| {
+            back_target_driver_owner_belongs_to_frames(record.owner(), &current_authority_frames)
+                || matches!(
+                    record.owner(),
+                    RegistryOwner::Committed(EntityOwner::HostTopSlot {
+                        host: version,
+                        slot,
+                    }) if version == &host.version && *slot == host.slot_id
+                )
+        })
+        .map(|record| record.claim())
+        .collect::<Vec<_>>();
+    observed_authority_claims.sort_by_key(|claim| claim.entity().to_bits());
+    if observed_authority_claims != expected_authority_claims {
+        return indeterminate(
+            owner,
+            BackNoTargetPhysicalIndeterminateReason::ActiveRegistryDrift {
+                expected: expected_authority_claims,
+                observed: observed_authority_claims,
+            },
+        );
+    }
+
+    let observed_parent = |entity| {
+        world
+            .get::<bevy_ecs::hierarchy::ChildOf>(entity)
+            .map(bevy_ecs::hierarchy::ChildOf::parent)
+    };
+    let mut protected = vec![
+        ProvenEmptyProtectedEntityProjection {
+            entity: host.host,
+            observed_parent: observed_parent(host.host),
+            claim: None,
+            role: ProvenEmptyProtectedRole::AppOwnedHost,
+        },
+        ProvenEmptyProtectedEntityProjection {
+            entity: host.top_slot,
+            observed_parent: observed_parent(host.top_slot),
+            claim: Some(host.top_slot_claim.clone()),
+            role: ProvenEmptyProtectedRole::HostTopSlot,
+        },
+    ];
+    protected.extend(current_claims.iter().map(|current| {
+        let entity = current.claim.entity();
+        ProvenEmptyProtectedEntityProjection {
+            entity,
+            observed_parent: observed_parent(entity),
+            claim: Some(current.claim.clone()),
+            role: ProvenEmptyProtectedRole::Current(current.role.clone()),
+        }
+    }));
+    let mut observed_relationship_closure = observed_descendant_closure(world, [host.host])
+        .into_iter()
+        .collect::<Vec<_>>();
+    observed_relationship_closure.sort_by_key(|entity| entity.to_bits());
+    for entity in observed_relationship_closure.iter().copied() {
+        if protected.iter().any(|protected| protected.entity == entity) {
+            continue;
+        }
+        let claim = registry.record(entity).map(|record| record.claim());
+        if let Some(claim) = claim {
+            let committed_frame = match claim.owner() {
+                RegistryOwner::Committed(
+                    EntityOwner::FrameShell(frame)
+                    | EntityOwner::FrameContentTarget(frame)
+                    | EntityOwner::FrameOutput { frame, .. },
+                )
+                | RegistryOwner::Committed(EntityOwner::ChildSlot { parent: frame, .. }) => {
+                    Some(frame)
+                }
+                RegistryOwner::Committed(EntityOwner::HostTopSlot { .. })
+                | RegistryOwner::Provisional(_) => None,
+            };
+            if cleanup_claim_has_exact_authority(world, &claim) {
+                if committed_frame.is_some_and(|frame| {
+                    bevy_ui_router_core::integration::frame_versions_share_router(
+                        current_authority_anchor,
+                        frame,
+                    )
+                }) {
+                    return indeterminate(
+                        owner,
+                        BackNoTargetPhysicalIndeterminateReason::UnexpectedSameAuthorityDescendant {
+                            entity,
+                            observed_parent: observed_parent(entity),
+                            claim,
+                        },
+                    );
+                }
+                if committed_frame.is_some() {
+                    protected.push(ProvenEmptyProtectedEntityProjection {
+                        entity,
+                        observed_parent: observed_parent(entity),
+                        claim: Some(claim),
+                        role: ProvenEmptyProtectedRole::OtherAuthorityDescendant,
+                    });
+                }
+            }
+            continue;
+        }
+        protected.push(ProvenEmptyProtectedEntityProjection {
+            entity,
+            observed_parent: observed_parent(entity),
+            claim: None,
+            role: ProvenEmptyProtectedRole::UnregisteredForeignDescendant,
+        });
+    }
+    protected.sort_by_key(|entity| entity.entity.to_bits());
+    if let Some(duplicate) = protected
+        .windows(2)
+        .find(|pair| pair[0].entity == pair[1].entity)
+        .map(|pair| pair[0].entity)
+    {
+        return indeterminate(
+            owner,
+            BackNoTargetPhysicalIndeterminateReason::DuplicateProtectedEntity(duplicate),
+        );
+    }
+    if protected
+        .iter()
+        .map(|protected| protected.entity)
+        .ne(observed_relationship_closure.iter().copied())
+    {
+        return indeterminate(
+            owner,
+            BackNoTargetPhysicalIndeterminateReason::RelationshipClosureDrift {
+                observed: observed_relationship_closure,
+                protected,
+            },
+        );
+    }
+
+    BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(BackNoTargetProvenEmptyOwner {
+        owner,
+        projection: ProvenEmptyProjection {
+            host: ProjectionlessHostProjection::from(host),
+            request,
+            authority_graph,
+            attempt_owner_inventory,
+            current_claims,
+            observed_relationship_closure,
+            protected,
+            authorized_targets: ProvenEmptyAuthorizedTargets::new(),
+        },
+    })
 }
 
 pub(crate) struct BackNoTargetSourceDriftPermanentOwner {
@@ -1200,6 +2515,7 @@ pub(crate) fn begin_bound_back_no_target(
             };
         }
     };
+    let request = reservation.request();
 
     match engine.refreeze_back_no_target_source_with_transfer(candidate, move || guard.commit()) {
         BackNoTargetSourceRefreezeOutcome::Unchanged(candidate) => {
@@ -1207,6 +2523,7 @@ pub(crate) fn begin_bound_back_no_target(
             BackNoTargetBeginOutcome::Begun(BackPreparationOwner {
                 candidate,
                 capacity,
+                request,
             })
         }
         BackNoTargetSourceRefreezeOutcome::Drift(drift) => {
@@ -1283,7 +2600,7 @@ struct ProjectionlessFallbackAdmission {
     top_slot_claim: crate::registry::ExactRegistryClaim,
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ProjectionlessHostProjection {
     version: bevy_ui_router_core::HostVersion,
     slot_id: bevy_ui_router_core::ids::RouteSlotId,
@@ -9855,6 +11172,18 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn back_no_target_authority_topology_prioritizes_disconnected_cycle_after_root_closure() {
+        assert_eq!(
+            classify_back_no_target_authority_topology(0, &[vec![2], vec![1], Vec::new()],),
+            Err(vec![1, 1])
+        );
+        assert_eq!(
+            classify_back_no_target_authority_topology(0, &[vec![1], vec![2], Vec::new()],),
+            Ok(vec![true, true, true])
+        );
+    }
+
+    #[test]
     fn commit_without_a_leaving_branch_has_no_focus_release_targets() {
         let mut world = World::new();
         let active_focus = world.spawn_empty().id();
@@ -17036,6 +18365,13 @@ pub(crate) mod tests {
                 .expect("the real no-target fixture accepts each setup route");
             app.update();
         }
+        take_real_bound_back_no_target_from_current_history(app, router)
+    }
+
+    fn take_real_bound_back_no_target_from_current_history(
+        app: &mut App,
+        router: RouterHandle,
+    ) -> (NavigationRequestId, BoundBackNoTargetResolution) {
         let (first, second) = {
             let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
             let first = navigation
@@ -17072,6 +18408,3275 @@ pub(crate) mod tests {
             "the verified no-target owner must remain paired with its exact accepted request"
         );
         (second, bound)
+    }
+
+    #[derive(Clone, Copy)]
+    enum NoTargetAuthorityGraphMutation {
+        MissingIncomingEdges,
+        DuplicateIncomingSlot,
+    }
+
+    fn prepare_nested_back_no_target_authority_graph_fixture()
+    -> (App, RouterHandle, NavigationRequestId, BackPreparationOwner) {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        for location in ["/items/1", "/items/2"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .expect("the nested authority-graph fixture accepts each real route");
+            run_updates_until_succeeded(&mut app, request);
+        }
+        let (request, bound) =
+            take_real_bound_back_no_target_from_current_history(&mut app, router);
+        let owner = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the nested authority-graph fixture retains its exact entry");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the first Back retains the real nested current branch");
+            assert_eq!(active.frames().len(), 2);
+            assert_eq!(active.child_slots().len(), 1);
+            match begin_bound_back_no_target(entry, bound) {
+                BackNoTargetBeginOutcome::Begun(owner) => owner,
+                BackNoTargetBeginOutcome::Permanent(_) => {
+                    panic!("the unchanged nested source must refreeze before graph perturbation")
+                }
+                BackNoTargetBeginOutcome::CapacityRejected { .. } => {
+                    panic!("the real no-target capacity must remain current")
+                }
+                BackNoTargetBeginOutcome::ReceiverMismatch { .. } => {
+                    panic!("the exact nested entry must receive its verified no-target owner")
+                }
+            }
+        };
+        (app, router, request, owner)
+    }
+
+    fn expected_back_no_target_authority_graph_evidence(
+        world: &World,
+        entry: &RouterEntry,
+        mutation: NoTargetAuthorityGraphMutation,
+    ) -> BackNoTargetAuthorityGraphEvidence {
+        let host = entry
+            .host
+            .as_ref()
+            .expect("the graph evidence fixture retains its exact host");
+        let active = entry
+            .active
+            .as_ref()
+            .expect("the graph evidence fixture retains its current branch");
+        let canonical_frame_identity_key = |version: &RouteFrameVersion| {
+            let (origin_tag, origin_route) = match version.origin() {
+                FrameOrigin::MatchedRoute(route) => (0_u8, route.raw()),
+                FrameOrigin::RouteError(route) => (1_u8, route.raw()),
+                FrameOrigin::RouterFallback => (2_u8, 0),
+            };
+            (
+                version.router().raw(),
+                version.host().raw(),
+                version.slot().raw(),
+                origin_tag,
+                origin_route,
+                version.frame().raw(),
+                version.generation().raw(),
+            )
+        };
+        let mut frame_rows = active
+            .frames()
+            .iter()
+            .map(|frame| {
+                let mut claims = frame.claims().cloned().collect::<Vec<_>>();
+                claims.sort_by_key(|claim| claim.entity().to_bits());
+                let frame_projection = BackNoTargetAuthorityGraphFrameProjection {
+                    frame: frame.frame().clone(),
+                    stored_shell: frame.shell(),
+                    mount: frame.mount_binding().clone(),
+                    claims,
+                };
+                let mut incoming = active
+                    .child_slots()
+                    .iter()
+                    .filter(|slot| frame.mount_binding().matches_mounted_child_slot(slot))
+                    .map(|slot| slot.slot_claim().clone())
+                    .collect::<Vec<_>>();
+                incoming.sort_by_key(|claim| claim.entity().to_bits());
+                (
+                    frame_projection,
+                    BackNoTargetAuthorityGraphIncomingProjection {
+                        frame: frame.frame().clone(),
+                        incoming,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        frame_rows.sort_by(|left, right| {
+            canonical_frame_identity_key(&left.0.frame)
+                .cmp(&canonical_frame_identity_key(&right.0.frame))
+                .then_with(|| {
+                    left.0
+                        .stored_shell
+                        .to_bits()
+                        .cmp(&right.0.stored_shell.to_bits())
+                })
+                .then_with(|| {
+                    left.0
+                        .mount
+                        .slot()
+                        .to_bits()
+                        .cmp(&right.0.mount.slot().to_bits())
+                })
+                .then_with(|| {
+                    left.0
+                        .claims
+                        .iter()
+                        .map(|claim| claim.entity().to_bits())
+                        .cmp(right.0.claims.iter().map(|claim| claim.entity().to_bits()))
+                })
+        });
+        let (frames, observed_incoming): (Vec<_>, Vec<_>) = frame_rows.into_iter().unzip();
+        let mut slots = active
+            .child_slots()
+            .iter()
+            .map(|slot| {
+                let mut expected_support_relationships = slot.expected_anchor_children().to_vec();
+                expected_support_relationships.sort_by_key(|entity| entity.to_bits());
+                BackNoTargetAuthorityGraphSlotProjection {
+                    claim: slot.slot_claim().clone(),
+                    binding: ProvenEmptyChildSlotBindingProjection {
+                        parent: slot.parent().clone(),
+                        outlet: slot.outlet().clone(),
+                        slot_id: slot.slot_id(),
+                        anchor_claim: slot.anchor_claim().clone(),
+                        expected_support_relationships,
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        slots.sort_by_key(|slot| slot.claim.entity().to_bits());
+        let observed_roots = observed_incoming
+            .iter()
+            .filter(|incoming| incoming.incoming.is_empty())
+            .map(|incoming| incoming.frame.clone())
+            .collect::<Vec<_>>();
+        let violation = match mutation {
+            NoTargetAuthorityGraphMutation::MissingIncomingEdges => {
+                BackNoTargetAuthorityGraphViolation::RootCount {
+                    observed_roots: observed_roots.clone(),
+                }
+            }
+            NoTargetAuthorityGraphMutation::DuplicateIncomingSlot => {
+                let slot = slots
+                    .first()
+                    .expect("the duplicate-incoming fixture retains its exact child slot")
+                    .claim
+                    .clone();
+                let mut observed_children = observed_incoming
+                    .iter()
+                    .filter(|incoming| incoming.incoming.contains(&slot))
+                    .map(|incoming| incoming.frame.clone())
+                    .collect::<Vec<_>>();
+                observed_children.sort_by_key(&canonical_frame_identity_key);
+                BackNoTargetAuthorityGraphViolation::DuplicateIncomingSlot {
+                    slot,
+                    observed_children,
+                }
+            }
+        };
+        assert!(
+            current_host_binding_is_exact(world, host),
+            "the graph perturbation must not drift the exact host authority"
+        );
+        BackNoTargetAuthorityGraphEvidence {
+            projection: BackNoTargetAuthorityGraphProjection {
+                host: ProjectionlessHostProjection::from(host),
+                frames,
+                slots,
+                observed_roots,
+                observed_incoming,
+                verified_reachable_from_root: Vec::new(),
+            },
+            violation,
+        }
+    }
+
+    #[test]
+    fn back_no_target_proven_empty_requires_exact_acyclic_authority_graph() {
+        const RED: &str =
+            "RED: no-target proven-empty requires an exact acyclic root-mount authority graph";
+
+        for mutation in [
+            NoTargetAuthorityGraphMutation::MissingIncomingEdges,
+            NoTargetAuthorityGraphMutation::DuplicateIncomingSlot,
+        ] {
+            let (mut app, router, request, owner) =
+                prepare_nested_back_no_target_authority_graph_fixture();
+            {
+                let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+                let active = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .and_then(|entry| entry.active.as_mut())
+                    .expect("the real fixture retains its nested current owner");
+                match mutation {
+                    NoTargetAuthorityGraphMutation::MissingIncomingEdges => {
+                        active.clear_child_slots_for_test()
+                    }
+                    NoTargetAuthorityGraphMutation::DuplicateIncomingSlot => {
+                        active.replace_frame_mount_from_for_test(0, 1)
+                    }
+                }
+            }
+
+            let (
+                expected_evidence,
+                world_before,
+                registry_before,
+                engine_before,
+                history_before,
+                active_frames_before,
+                active_claims_before,
+                active_slots_before,
+                issuer_before,
+                requests_before,
+                public_router_before,
+                public_request_before,
+            ) = {
+                let world = app.world();
+                let navigation = world.resource::<RouterNavigation>();
+                let entry = navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == router)
+                    .expect("the graph perturbation cannot remove the router entry");
+                let host = entry
+                    .host
+                    .as_ref()
+                    .expect("the graph perturbation cannot remove the exact host");
+                let active = entry
+                    .active
+                    .as_ref()
+                    .expect("the graph perturbation cannot remove the current owner");
+                let expected_evidence =
+                    expected_back_no_target_authority_graph_evidence(world, entry, mutation);
+                match mutation {
+                    NoTargetAuthorityGraphMutation::MissingIncomingEdges => {
+                        assert!(active.child_slots().is_empty());
+                        assert_eq!(expected_evidence.projection.observed_roots.len(), 2);
+                        let current_frames = active
+                            .frames()
+                            .iter()
+                            .map(|frame| frame.frame().clone())
+                            .collect::<Vec<_>>();
+                        assert!(
+                            world
+                                .resource::<RouteEntityRegistry>()
+                                .records()
+                                .iter()
+                                .any(|record| matches!(
+                                    record.owner(),
+                                    RegistryOwner::Committed(EntityOwner::ChildSlot {
+                                        parent,
+                                        ..
+                                    }) if current_frames.contains(parent)
+                                )),
+                            "the missing-edge case must retain a registry-set mismatch after the graph producer"
+                        );
+                    }
+                    NoTargetAuthorityGraphMutation::DuplicateIncomingSlot => {
+                        assert_eq!(active.child_slots().len(), 1);
+                        assert!(expected_evidence.projection.observed_roots.is_empty());
+                        assert!(expected_evidence.projection.observed_incoming.iter().all(
+                            |incoming| {
+                                incoming.incoming
+                                    == vec![active.child_slots()[0].slot_claim().clone()]
+                            }
+                        ));
+                    }
+                }
+                let active_frames = active
+                    .frames()
+                    .iter()
+                    .map(|frame| {
+                        (
+                            frame.frame().clone(),
+                            frame.mount_binding().clone(),
+                            frame.claims().cloned().collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let active_slots = active
+                    .child_slots()
+                    .iter()
+                    .map(|slot| {
+                        (
+                            slot.slot_claim().clone(),
+                            slot.parent().clone(),
+                            slot.outlet().clone(),
+                            slot.anchor_claim().clone(),
+                            slot.expected_anchor_children().to_vec(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let snapshots = world.resource::<RouterSnapshots>();
+                let public_request = match snapshots.request(router, request) {
+                    crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                    crate::snapshots::RequestLookup::NotRetained => {
+                        panic!("the accepted no-target Back must remain retained")
+                    }
+                    crate::snapshots::RequestLookup::Unknown => {
+                        panic!("the accepted no-target Back must remain publicly visible")
+                    }
+                };
+                (
+                    expected_evidence,
+                    ProjectionlessObservedProjection::capture(world, vec![host.host]),
+                    world.resource::<RouteEntityRegistry>().records().to_vec(),
+                    entry.engine.snapshot(),
+                    entry.engine.history().clone(),
+                    active_frames,
+                    active.claims().cloned().collect::<Vec<_>>(),
+                    active_slots,
+                    entry
+                        .back_capacity_issuer
+                        .as_ref()
+                        .expect("the exact entry retains its capacity issuer")
+                        .semantic_snapshot_for_test(),
+                    entry.requests.clone(),
+                    snapshots
+                        .get(router)
+                        .expect("the exact router retains its public snapshot")
+                        .clone(),
+                    public_request,
+                )
+            };
+            let capacity_before = owner.capacity.capacity_identity_for_test();
+
+            let outcome = {
+                let world = app.world();
+                let navigation = world.resource::<RouterNavigation>();
+                let entry = navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == router)
+                    .expect("the exact entry receives the physical graph proof");
+                freeze_back_no_target_proven_empty(world, entry, owner)
+            };
+            let returned_owner = match outcome {
+                BackNoTargetPhysicalFreezeOutcome::Indeterminate { owner, evidence } => {
+                    if evidence.request != request {
+                        panic!("{RED}")
+                    }
+                    match evidence.reason {
+                        BackNoTargetPhysicalIndeterminateReason::AuthorityGraph(observed)
+                            if observed == expected_evidence =>
+                        {
+                            owner
+                        }
+                        _ => panic!("{RED}"),
+                    }
+                }
+                BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(_) => panic!("{RED}"),
+            };
+            assert_eq!(returned_owner.request, request);
+            assert_eq!(
+                returned_owner.capacity.capacity_identity_for_test(),
+                capacity_before,
+                "graph indeterminate must return the whole original preparation owner"
+            );
+
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("graph indeterminate cannot remove the router entry");
+            let host = entry
+                .host
+                .as_ref()
+                .expect("graph indeterminate cannot remove the host");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("graph indeterminate cannot remove the current owner");
+            assert!(
+                ProjectionlessObservedProjection::capture(world, vec![host.host]) == world_before,
+                "graph indeterminate must be World zero-write"
+            );
+            assert_eq!(
+                world.resource::<RouteEntityRegistry>().records(),
+                registry_before
+            );
+            assert_eq!(entry.engine.snapshot(), engine_before);
+            assert_eq!(entry.engine.history(), &history_before);
+            assert_eq!(
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| {
+                        (
+                            frame.frame().clone(),
+                            frame.mount_binding().clone(),
+                            frame.claims().cloned().collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                active_frames_before
+            );
+            assert_eq!(
+                active.claims().cloned().collect::<Vec<_>>(),
+                active_claims_before
+            );
+            assert_eq!(
+                active
+                    .child_slots()
+                    .iter()
+                    .map(|slot| {
+                        (
+                            slot.slot_claim().clone(),
+                            slot.parent().clone(),
+                            slot.outlet().clone(),
+                            slot.anchor_claim().clone(),
+                            slot.expected_anchor_children().to_vec(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                active_slots_before
+            );
+            assert_eq!(
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("graph indeterminate retains the exact capacity issuer")
+                    .semantic_snapshot_for_test(),
+                issuer_before
+            );
+            assert_eq!(entry.requests, requests_before);
+            let snapshots = world.resource::<RouterSnapshots>();
+            assert_eq!(
+                snapshots
+                    .get(router)
+                    .expect("graph indeterminate retains the public router snapshot"),
+                &public_router_before
+            );
+            match snapshots.request(router, request) {
+                crate::snapshots::RequestLookup::Found(snapshot) => {
+                    assert_eq!(snapshot, &public_request_before)
+                }
+                crate::snapshots::RequestLookup::NotRetained => {
+                    panic!("graph indeterminate cannot evict the accepted no-target Back")
+                }
+                crate::snapshots::RequestLookup::Unknown => {
+                    panic!("graph indeterminate cannot hide the accepted no-target Back")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn back_no_target_authority_graph_is_independent_of_frame_storage_order() {
+        const RED: &str =
+            "RED: no-target authority graph must be independent of frame storage order";
+
+        for reverse in [false, true] {
+            let (mut app, router, request, owner) =
+                prepare_nested_back_no_target_authority_graph_fixture();
+            if reverse {
+                let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+                let active = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .and_then(|entry| entry.active.as_mut())
+                    .expect("the real nested fixture retains its current owner");
+                active.reverse_frames_for_test();
+            }
+
+            let (
+                exact_root,
+                expected_normalized_frames,
+                world_before,
+                registry_before,
+                engine_before,
+                history_before,
+                active_frames_before,
+                active_claims_before,
+                issuer_before,
+                requests_before,
+                public_router_before,
+                public_request_before,
+            ) = {
+                let world = app.world();
+                let navigation = world.resource::<RouterNavigation>();
+                let entry = navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == router)
+                    .expect("the reversed fixture retains its exact entry");
+                let host = entry
+                    .host
+                    .as_ref()
+                    .expect("the reversed fixture retains its exact host");
+                let active = entry
+                    .active
+                    .as_ref()
+                    .expect("the reversed fixture retains its current owner");
+                assert_eq!(active.frames().len(), 2);
+                assert_eq!(active.child_slots().len(), 1);
+                let exact_root = active
+                    .frames()
+                    .iter()
+                    .find(|frame| {
+                        frame.mount_binding().slot() == host.top_slot
+                            && frame.mount_binding().slot_claim() == &host.top_slot_claim
+                            && frame.mount_binding().physical_parent() == (host.host, None)
+                    })
+                    .map(|frame| frame.frame().clone())
+                    .expect("one exact owner-held frame mounts at the host top slot");
+                let canonical_frame_identity_key = |version: &RouteFrameVersion| {
+                    let (origin_tag, origin_route) = match version.origin() {
+                        FrameOrigin::MatchedRoute(route) => (0_u8, route.raw()),
+                        FrameOrigin::RouteError(route) => (1_u8, route.raw()),
+                        FrameOrigin::RouterFallback => (2_u8, 0),
+                    };
+                    (
+                        version.router().raw(),
+                        version.host().raw(),
+                        version.slot().raw(),
+                        origin_tag,
+                        origin_route,
+                        version.frame().raw(),
+                        version.generation().raw(),
+                    )
+                };
+                let mut expected_normalized_frames = active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>();
+                expected_normalized_frames.sort_by_key(&canonical_frame_identity_key);
+                let mut physical_min_claim_frames = active
+                    .frames()
+                    .iter()
+                    .map(|frame| {
+                        (
+                            frame
+                                .claims()
+                                .map(ExactRegistryClaim::entity)
+                                .min_by_key(|entity| entity.to_bits())
+                                .expect("every active frame retains owner-held claims"),
+                            frame.frame().clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                physical_min_claim_frames.sort_by_key(|(entity, _)| entity.to_bits());
+                let physical_min_claim_frames = physical_min_claim_frames
+                    .into_iter()
+                    .map(|(_, frame)| frame)
+                    .collect::<Vec<_>>();
+                assert_ne!(
+                    physical_min_claim_frames, expected_normalized_frames,
+                    "the real nested fixture must expose physical claim order diverging from logical identity"
+                );
+                let snapshots = world.resource::<RouterSnapshots>();
+                let public_request = match snapshots.request(router, request) {
+                    crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                    crate::snapshots::RequestLookup::NotRetained => {
+                        panic!("the accepted no-target Back remains retained")
+                    }
+                    crate::snapshots::RequestLookup::Unknown => {
+                        panic!("the accepted no-target Back remains publicly visible")
+                    }
+                };
+                (
+                    exact_root,
+                    expected_normalized_frames,
+                    ProjectionlessObservedProjection::capture(world, vec![host.host]),
+                    world.resource::<RouteEntityRegistry>().records().to_vec(),
+                    entry.engine.snapshot(),
+                    entry.engine.history().clone(),
+                    active
+                        .frames()
+                        .iter()
+                        .map(|frame| {
+                            (
+                                frame.frame().clone(),
+                                frame.mount_binding().clone(),
+                                frame.claims().cloned().collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    active.claims().cloned().collect::<Vec<_>>(),
+                    entry
+                        .back_capacity_issuer
+                        .as_ref()
+                        .expect("the exact entry retains its capacity issuer")
+                        .semantic_snapshot_for_test(),
+                    entry.requests.clone(),
+                    snapshots
+                        .get(router)
+                        .expect("the exact router retains its public snapshot")
+                        .clone(),
+                    public_request,
+                )
+            };
+            let capacity_before = owner.capacity.capacity_identity_for_test();
+
+            let outcome = {
+                let world = app.world();
+                let navigation = world.resource::<RouterNavigation>();
+                let entry = navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == router)
+                    .expect("the exact entry receives the order-independent proof");
+                freeze_back_no_target_proven_empty(world, entry, owner)
+            };
+            let proven = match outcome {
+                BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(proven) => proven,
+                BackNoTargetPhysicalFreezeOutcome::Indeterminate { .. } => panic!("{RED}"),
+            };
+            assert_eq!(proven.owner.request, request);
+            assert_eq!(
+                proven.owner.capacity.capacity_identity_for_test(),
+                capacity_before,
+                "successful proof must move the whole original preparation owner"
+            );
+            assert_eq!(proven.projection.request, request);
+            assert_eq!(
+                proven.projection.authority_graph.root(),
+                Some(&exact_root),
+                "the graph root must come from the exact host-top mount"
+            );
+            assert_eq!(
+                proven
+                    .projection
+                    .authority_graph
+                    .frames
+                    .iter()
+                    .map(|frame| frame.frame.clone())
+                    .collect::<Vec<_>>(),
+                expected_normalized_frames,
+                "{RED}: graph evidence must use normalized frame order"
+            );
+            assert_eq!(
+                proven
+                    .projection
+                    .authority_graph
+                    .observed_incoming
+                    .iter()
+                    .map(|incoming| incoming.frame.clone())
+                    .collect::<Vec<_>>(),
+                expected_normalized_frames,
+                "{RED}: incoming evidence must share the normalized frame order"
+            );
+            assert_eq!(
+                proven
+                    .projection
+                    .authority_graph
+                    .verified_reachable_from_root,
+                expected_normalized_frames,
+                "{RED}: successful graph evidence must retain the exact verified reachable set"
+            );
+
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("successful proof cannot remove the router entry");
+            let host = entry
+                .host
+                .as_ref()
+                .expect("successful proof cannot remove the exact host");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("successful proof cannot consume the current owner");
+            assert!(
+                ProjectionlessObservedProjection::capture(world, vec![host.host]) == world_before,
+                "successful graph proof must be World zero-write"
+            );
+            assert_eq!(
+                world.resource::<RouteEntityRegistry>().records(),
+                registry_before
+            );
+            assert_eq!(entry.engine.snapshot(), engine_before);
+            assert_eq!(entry.engine.history(), &history_before);
+            assert_eq!(
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| {
+                        (
+                            frame.frame().clone(),
+                            frame.mount_binding().clone(),
+                            frame.claims().cloned().collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                active_frames_before,
+                "the freezer cannot normalize by mutating the owner Vec"
+            );
+            assert_eq!(
+                active.claims().cloned().collect::<Vec<_>>(),
+                active_claims_before
+            );
+            assert_eq!(
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("successful graph proof retains the exact capacity issuer")
+                    .semantic_snapshot_for_test(),
+                issuer_before
+            );
+            assert_eq!(entry.requests, requests_before);
+            let snapshots = world.resource::<RouterSnapshots>();
+            assert_eq!(
+                snapshots
+                    .get(router)
+                    .expect("successful graph proof retains the public router snapshot"),
+                &public_router_before
+            );
+            match snapshots.request(router, request) {
+                crate::snapshots::RequestLookup::Found(snapshot) => {
+                    assert_eq!(snapshot, &public_request_before)
+                }
+                crate::snapshots::RequestLookup::NotRetained => {
+                    panic!("successful graph proof cannot evict the accepted no-target Back")
+                }
+                crate::snapshots::RequestLookup::Unknown => {
+                    panic!("successful graph proof cannot hide the accepted no-target Back")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn back_no_target_authority_graph_requires_exact_stored_shell_claim() {
+        const RED: &str = "RED: no-target authority graph requires one exact stored shell claim";
+
+        let (mut app, router, request, owner) =
+            prepare_nested_back_no_target_authority_graph_fixture();
+        let (frame_version, stored_shell, owner_shell_claims) = {
+            let (frame_version, replacement) = {
+                let world = app.world();
+                let navigation = world.resource::<RouterNavigation>();
+                let entry = navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == router)
+                    .expect("the real nested fixture retains its exact entry");
+                let host = entry
+                    .host
+                    .as_ref()
+                    .expect("the real nested fixture retains its exact host");
+                let active = entry
+                    .active
+                    .as_ref()
+                    .expect("the real nested fixture retains its current owner");
+                let frame = active
+                    .frames()
+                    .iter()
+                    .find(|frame| {
+                        frame.mount_binding().slot() == host.top_slot
+                            && frame.mount_binding().slot_claim() == &host.top_slot_claim
+                            && frame.mount_binding().physical_parent() == (host.host, None)
+                    })
+                    .expect("one exact owner-held frame mounts at the host top slot");
+                let shell_claims = frame
+                    .claims()
+                    .filter(|claim| {
+                        matches!(
+                            claim.owner(),
+                            RegistryOwner::Committed(EntityOwner::FrameShell(owner))
+                                if owner == frame.frame()
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    shell_claims.len(),
+                    1,
+                    "the real frame starts with one exact FrameShell claim"
+                );
+                assert_eq!(frame.shell(), shell_claims[0].entity());
+                let replacement = frame
+                    .claims()
+                    .find(|claim| {
+                        claim.entity() != frame.shell()
+                            && matches!(
+                                claim.owner(),
+                                RegistryOwner::Committed(
+                                    EntityOwner::FrameContentTarget(owner)
+                                        | EntityOwner::FrameOutput { frame: owner, .. }
+                                ) if owner == frame.frame()
+                            )
+                    })
+                    .map(ExactRegistryClaim::entity)
+                    .expect("the same frame retains a registered non-shell entity");
+                (frame.frame().clone(), replacement)
+            };
+            {
+                let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+                let frame = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .and_then(|entry| entry.active.as_mut())
+                    .and_then(|active| {
+                        active
+                            .frames_mut_for_test()
+                            .iter_mut()
+                            .find(|frame| frame.frame() == &frame_version)
+                    })
+                    .expect("the owner mutation targets the exact real frame");
+                frame.replace_shell_entity_for_test(replacement);
+            }
+            let navigation = app.world().resource::<RouterNavigation>();
+            let frame = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .and_then(|entry| entry.active.as_ref())
+                .and_then(|active| {
+                    active
+                        .frames()
+                        .iter()
+                        .find(|frame| frame.frame() == &frame_version)
+                })
+                .expect("the mutated owner retains the exact frame");
+            let mut owner_shell_claims = frame
+                .claims()
+                .filter(|claim| {
+                    matches!(
+                        claim.owner(),
+                        RegistryOwner::Committed(EntityOwner::FrameShell(owner))
+                            if owner == frame.frame()
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            owner_shell_claims.sort_by_key(|claim| claim.entity().to_bits());
+            assert_eq!(owner_shell_claims.len(), 1);
+            assert_ne!(frame.shell(), owner_shell_claims[0].entity());
+            (frame_version, frame.shell(), owner_shell_claims)
+        };
+
+        let (
+            world_before,
+            registry_before,
+            engine_before,
+            history_before,
+            active_frames_before,
+            active_slots_before,
+            issuer_before,
+            requests_before,
+            public_router_before,
+            public_request_before,
+        ) = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the shell-drift fixture retains its exact entry");
+            let host = entry
+                .host
+                .as_ref()
+                .expect("the shell-drift fixture retains its exact host");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the shell-drift fixture retains its current owner");
+            let snapshots = world.resource::<RouterSnapshots>();
+            let public_request = match snapshots.request(router, request) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                crate::snapshots::RequestLookup::NotRetained => {
+                    panic!("the accepted no-target Back remains retained")
+                }
+                crate::snapshots::RequestLookup::Unknown => {
+                    panic!("the accepted no-target Back remains publicly visible")
+                }
+            };
+            (
+                ProjectionlessObservedProjection::capture(world, vec![host.host]),
+                world.resource::<RouteEntityRegistry>().records().to_vec(),
+                entry.engine.snapshot(),
+                entry.engine.history().clone(),
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| {
+                        (
+                            frame.frame().clone(),
+                            frame.shell(),
+                            frame.mount_binding().clone(),
+                            frame.claims().cloned().collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                active
+                    .child_slots()
+                    .iter()
+                    .map(|slot| {
+                        (
+                            slot.slot_claim().clone(),
+                            slot.parent().clone(),
+                            slot.outlet().clone(),
+                            slot.anchor_claim().clone(),
+                            slot.expected_anchor_children().to_vec(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("the exact entry retains its capacity issuer")
+                    .semantic_snapshot_for_test(),
+                entry.requests.clone(),
+                snapshots
+                    .get(router)
+                    .expect("the exact router retains its public snapshot")
+                    .clone(),
+                public_request,
+            )
+        };
+        let capacity_before = owner.capacity.capacity_identity_for_test();
+
+        let outcome = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the exact entry receives the stored-shell proof");
+            freeze_back_no_target_proven_empty(world, entry, owner)
+        };
+        let returned_owner = match outcome {
+            BackNoTargetPhysicalFreezeOutcome::Indeterminate { owner, evidence } => {
+                assert_eq!(evidence.request, request);
+                match evidence.reason {
+                    BackNoTargetPhysicalIndeterminateReason::AuthorityGraph(evidence) => {
+                        assert!(
+                            evidence
+                                .projection
+                                .frames
+                                .iter()
+                                .any(|frame| frame.frame == frame_version),
+                            "graph evidence must retain the exact mutated frame"
+                        );
+                        match evidence.violation {
+                            BackNoTargetAuthorityGraphViolation::FrameShellBindingDrift {
+                                frame,
+                                stored_shell: observed_shell,
+                                owner_shell_claims: observed_claims,
+                            } => {
+                                assert_eq!(frame, frame_version);
+                                assert_eq!(observed_shell, stored_shell);
+                                assert_eq!(observed_claims, owner_shell_claims);
+                            }
+                            _ => panic!("{RED}"),
+                        }
+                    }
+                    _ => panic!("{RED}"),
+                }
+                owner
+            }
+            BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(_) => panic!("{RED}"),
+        };
+        assert_eq!(returned_owner.request, request);
+        assert_eq!(
+            returned_owner.capacity.capacity_identity_for_test(),
+            capacity_before,
+            "shell-binding drift must return the whole original preparation owner"
+        );
+
+        let world = app.world();
+        let navigation = world.resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("shell-binding rejection cannot remove the router entry");
+        let host = entry
+            .host
+            .as_ref()
+            .expect("shell-binding rejection cannot remove the exact host");
+        let active = entry
+            .active
+            .as_ref()
+            .expect("shell-binding rejection cannot consume the current owner");
+        assert!(
+            ProjectionlessObservedProjection::capture(world, vec![host.host]) == world_before,
+            "shell-binding rejection must be World zero-write"
+        );
+        assert_eq!(
+            world.resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(entry.engine.snapshot(), engine_before);
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(
+            active
+                .frames()
+                .iter()
+                .map(|frame| {
+                    (
+                        frame.frame().clone(),
+                        frame.shell(),
+                        frame.mount_binding().clone(),
+                        frame.claims().cloned().collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            active_frames_before
+        );
+        assert_eq!(
+            active
+                .child_slots()
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.slot_claim().clone(),
+                        slot.parent().clone(),
+                        slot.outlet().clone(),
+                        slot.anchor_claim().clone(),
+                        slot.expected_anchor_children().to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            active_slots_before
+        );
+        assert_eq!(
+            entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("shell-binding rejection retains the exact capacity issuer")
+                .semantic_snapshot_for_test(),
+            issuer_before
+        );
+        assert_eq!(entry.requests, requests_before);
+        let snapshots = world.resource::<RouterSnapshots>();
+        assert_eq!(
+            snapshots
+                .get(router)
+                .expect("shell-binding rejection retains the public router snapshot"),
+            &public_router_before
+        );
+        match snapshots.request(router, request) {
+            crate::snapshots::RequestLookup::Found(snapshot) => {
+                assert_eq!(snapshot, &public_request_before)
+            }
+            crate::snapshots::RequestLookup::NotRetained => {
+                panic!("shell-binding rejection cannot evict the accepted no-target Back")
+            }
+            crate::snapshots::RequestLookup::Unknown => {
+                panic!("shell-binding rejection cannot hide the accepted no-target Back")
+            }
+        }
+    }
+
+    #[test]
+    fn back_no_target_frame_claim_drift_preserves_exact_observed_evidence() {
+        const RED: &str = "RED: no-target frame claim drift must preserve exact observed evidence";
+
+        let (mut app, router, request, owner) =
+            prepare_nested_back_no_target_authority_graph_fixture();
+        let (frame_version, expected_claim, expected_parent, observed) = {
+            let (frame_version, expected_claim, expected_parent, replacement_parent) = {
+                let world = app.world();
+                let navigation = world.resource::<RouterNavigation>();
+                let entry = navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == router)
+                    .expect("the real nested fixture retains its exact entry");
+                let active = entry
+                    .active
+                    .as_ref()
+                    .expect("the real nested fixture retains its current owner");
+                let frame = active
+                    .frames()
+                    .iter()
+                    .find(|frame| {
+                        frame.claims().any(|claim| {
+                            matches!(
+                                claim.owner(),
+                                RegistryOwner::Committed(EntityOwner::FrameOutput {
+                                    frame: owner,
+                                    ..
+                                }) if owner == frame.frame()
+                            )
+                        })
+                    })
+                    .expect("one active frame retains a real FrameOutput cleanup member");
+                let (expected_claim, expected_parent) = frame
+                    .cleanup_members()
+                    .find(|(claim, _)| {
+                        matches!(
+                            claim.owner(),
+                            RegistryOwner::Committed(EntityOwner::FrameOutput {
+                                frame: owner,
+                                ..
+                            }) if owner == frame.frame()
+                        )
+                    })
+                    .map(|(claim, parent)| (claim.clone(), parent))
+                    .expect("the selected output retains its exact owner-held parent");
+                assert_ne!(expected_parent, frame.shell());
+                (
+                    frame.frame().clone(),
+                    expected_claim,
+                    expected_parent,
+                    frame.shell(),
+                )
+            };
+            app.world_mut()
+                .spawn(bevy_ecs::hierarchy::ChildOf(expected_parent));
+            app.world_mut()
+                .entity_mut(expected_claim.entity())
+                .insert(bevy_ecs::hierarchy::ChildOf(replacement_parent));
+            let world = app.world();
+            let registry = world.resource::<RouteEntityRegistry>();
+            let observed = observe_back_no_target_authority_graph_claim(
+                world,
+                registry,
+                expected_claim.entity(),
+            );
+            assert_eq!(observed.observed_parent, Some(replacement_parent));
+            assert_ne!(observed.observed_parent, Some(expected_parent));
+            let host = world
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .and_then(|entry| entry.host.as_ref())
+                .expect("the relationship mutation retains the exact host");
+            assert!(
+                observed_descendant_closure(world, [host.host]).contains(&expected_claim.entity()),
+                "the reparented claim must remain inside the observed host closure"
+            );
+            (frame_version, expected_claim, expected_parent, observed)
+        };
+
+        let (
+            world_before,
+            registry_before,
+            engine_before,
+            history_before,
+            active_frames_before,
+            active_slots_before,
+            issuer_before,
+            requests_before,
+            public_router_before,
+            public_request_before,
+        ) = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the claim-drift fixture retains its exact entry");
+            let host = entry
+                .host
+                .as_ref()
+                .expect("the claim-drift fixture retains its exact host");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the claim-drift fixture retains its current owner");
+            let snapshots = world.resource::<RouterSnapshots>();
+            let public_request = match snapshots.request(router, request) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                crate::snapshots::RequestLookup::NotRetained => {
+                    panic!("the accepted no-target Back remains retained")
+                }
+                crate::snapshots::RequestLookup::Unknown => {
+                    panic!("the accepted no-target Back remains publicly visible")
+                }
+            };
+            (
+                ProjectionlessObservedProjection::capture(world, vec![host.host]),
+                world.resource::<RouteEntityRegistry>().records().to_vec(),
+                entry.engine.snapshot(),
+                entry.engine.history().clone(),
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| {
+                        (
+                            frame.frame().clone(),
+                            frame.shell(),
+                            frame.mount_binding().clone(),
+                            frame.claims().cloned().collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                active
+                    .child_slots()
+                    .iter()
+                    .map(|slot| {
+                        (
+                            slot.slot_claim().clone(),
+                            slot.parent().clone(),
+                            slot.outlet().clone(),
+                            slot.anchor_claim().clone(),
+                            slot.expected_anchor_children().to_vec(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("the exact entry retains its capacity issuer")
+                    .semantic_snapshot_for_test(),
+                entry.requests.clone(),
+                snapshots
+                    .get(router)
+                    .expect("the exact router retains its public snapshot")
+                    .clone(),
+                public_request,
+            )
+        };
+        let capacity_before = owner.capacity.capacity_identity_for_test();
+
+        let outcome = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the exact entry receives the frame-claim boundary proof");
+            freeze_back_no_target_proven_empty(world, entry, owner)
+        };
+        let returned_owner = match outcome {
+            BackNoTargetPhysicalFreezeOutcome::Indeterminate { owner, evidence } => {
+                assert_eq!(evidence.request, request);
+                match evidence.reason {
+                    BackNoTargetPhysicalIndeterminateReason::AuthorityGraph(evidence) => {
+                        assert!(
+                            evidence.projection.frames.iter().any(|frame| {
+                                frame.frame == frame_version
+                                    && frame.claims.contains(&expected_claim)
+                            }),
+                            "graph evidence must retain the exact owner frame and claim"
+                        );
+                        match evidence.violation {
+                            BackNoTargetAuthorityGraphViolation::FrameClaimBoundaryDrift {
+                                frame,
+                                expected_claim: observed_claim,
+                                expected_parent: observed_expected_parent,
+                                observed: observed_projection,
+                            } => {
+                                assert_eq!(frame, frame_version);
+                                assert_eq!(observed_claim, expected_claim);
+                                assert_eq!(observed_expected_parent, expected_parent);
+                                assert_eq!(observed_projection, observed);
+                            }
+                            _ => panic!("{RED}"),
+                        }
+                    }
+                    _ => panic!("{RED}"),
+                }
+                owner
+            }
+            BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(_) => panic!("{RED}"),
+        };
+        assert_eq!(returned_owner.request, request);
+        assert_eq!(
+            returned_owner.capacity.capacity_identity_for_test(),
+            capacity_before,
+            "claim-boundary drift must return the whole original preparation owner"
+        );
+
+        let world = app.world();
+        let navigation = world.resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("claim-boundary rejection cannot remove the router entry");
+        let host = entry
+            .host
+            .as_ref()
+            .expect("claim-boundary rejection cannot remove the exact host");
+        let active = entry
+            .active
+            .as_ref()
+            .expect("claim-boundary rejection cannot consume the current owner");
+        assert!(
+            ProjectionlessObservedProjection::capture(world, vec![host.host]) == world_before,
+            "claim-boundary rejection must be World zero-write"
+        );
+        assert_eq!(
+            world.resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(entry.engine.snapshot(), engine_before);
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(
+            active
+                .frames()
+                .iter()
+                .map(|frame| {
+                    (
+                        frame.frame().clone(),
+                        frame.shell(),
+                        frame.mount_binding().clone(),
+                        frame.claims().cloned().collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            active_frames_before
+        );
+        assert_eq!(
+            active
+                .child_slots()
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.slot_claim().clone(),
+                        slot.parent().clone(),
+                        slot.outlet().clone(),
+                        slot.anchor_claim().clone(),
+                        slot.expected_anchor_children().to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            active_slots_before
+        );
+        assert_eq!(
+            entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("claim-boundary rejection retains the exact capacity issuer")
+                .semantic_snapshot_for_test(),
+            issuer_before
+        );
+        assert_eq!(entry.requests, requests_before);
+        let snapshots = world.resource::<RouterSnapshots>();
+        assert_eq!(
+            snapshots
+                .get(router)
+                .expect("claim-boundary rejection retains the public router snapshot"),
+            &public_router_before
+        );
+        match snapshots.request(router, request) {
+            crate::snapshots::RequestLookup::Found(snapshot) => {
+                assert_eq!(snapshot, &public_request_before)
+            }
+            crate::snapshots::RequestLookup::NotRetained => {
+                panic!("claim-boundary rejection cannot evict the accepted no-target Back")
+            }
+            crate::snapshots::RequestLookup::Unknown => {
+                panic!("claim-boundary rejection cannot hide the accepted no-target Back")
+            }
+        }
+    }
+
+    #[test]
+    fn back_no_target_slot_drift_preserves_exact_observed_binding_evidence() {
+        const RED: &str = "RED: no-target slot drift must preserve exact observed binding evidence";
+
+        let (mut app, router, request, owner) =
+            prepare_nested_back_no_target_authority_graph_fixture();
+        let (expected, observed) = {
+            let (slot_entity, anchor, replacement_parent, expected) = {
+                let navigation = app.world().resource::<RouterNavigation>();
+                let entry = navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == router)
+                    .expect("the real nested fixture retains its exact entry");
+                let active = entry
+                    .active
+                    .as_ref()
+                    .expect("the real nested fixture retains its current owner");
+                assert_eq!(active.child_slots().len(), 1);
+                let slot = &active.child_slots()[0];
+                let replacement_parent = active
+                    .frames()
+                    .iter()
+                    .find(|frame| frame.frame() == slot.parent())
+                    .map(RealizedFrame::shell)
+                    .expect("the exact parent frame retains a real shell");
+                assert_ne!(replacement_parent, slot.anchor());
+                let mut expected_support_relationships = slot.expected_anchor_children().to_vec();
+                expected_support_relationships.sort_by_key(|entity| entity.to_bits());
+                (
+                    slot.slot(),
+                    slot.anchor(),
+                    replacement_parent,
+                    BackNoTargetAuthorityGraphSlotProjection {
+                        claim: slot.slot_claim().clone(),
+                        binding: ProvenEmptyChildSlotBindingProjection {
+                            parent: slot.parent().clone(),
+                            outlet: slot.outlet().clone(),
+                            slot_id: slot.slot_id(),
+                            anchor_claim: slot.anchor_claim().clone(),
+                            expected_support_relationships,
+                        },
+                    },
+                )
+            };
+            let sibling = app
+                .world_mut()
+                .spawn(bevy_ecs::hierarchy::ChildOf(anchor))
+                .id();
+            assert!(
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(sibling)
+                    .is_none(),
+                "the anchor sibling must remain unregistered"
+            );
+            app.world_mut()
+                .entity_mut(slot_entity)
+                .insert(bevy_ecs::hierarchy::ChildOf(replacement_parent));
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the slot relationship mutation retains its exact entry");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the slot relationship mutation retains its current owner");
+            let slot = active
+                .child_slots()
+                .iter()
+                .find(|slot| slot.slot() == slot_entity)
+                .expect("the owner still retains the exact child slot");
+            let observed = observe_back_no_target_authority_graph_slot(
+                world,
+                world.resource::<RouteEntityRegistry>(),
+                active,
+                slot,
+            );
+            assert_eq!(observed.slot.observed_parent, Some(replacement_parent));
+            assert_ne!(observed.slot.observed_parent, Some(anchor));
+            assert!(
+                observed.observed_anchor_children.contains(&sibling),
+                "the unregistered sibling must preserve the anchor Children manifest"
+            );
+            assert!(
+                !observed.observed_anchor_children.contains(&slot_entity),
+                "the reparented slot must leave the exact anchor children"
+            );
+            let host = entry
+                .host
+                .as_ref()
+                .expect("the slot relationship mutation retains the exact host");
+            assert!(
+                observed_descendant_closure(world, [host.host]).contains(&slot_entity),
+                "the reparented slot must remain inside the observed host closure"
+            );
+            (expected, observed)
+        };
+
+        let (
+            world_before,
+            registry_before,
+            engine_before,
+            history_before,
+            active_frames_before,
+            active_slots_before,
+            issuer_before,
+            requests_before,
+            public_router_before,
+            public_request_before,
+        ) = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the slot-drift fixture retains its exact entry");
+            let host = entry
+                .host
+                .as_ref()
+                .expect("the slot-drift fixture retains its exact host");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the slot-drift fixture retains its current owner");
+            let snapshots = world.resource::<RouterSnapshots>();
+            let public_request = match snapshots.request(router, request) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                crate::snapshots::RequestLookup::NotRetained => {
+                    panic!("the accepted no-target Back remains retained")
+                }
+                crate::snapshots::RequestLookup::Unknown => {
+                    panic!("the accepted no-target Back remains publicly visible")
+                }
+            };
+            (
+                ProjectionlessObservedProjection::capture(world, vec![host.host]),
+                world.resource::<RouteEntityRegistry>().records().to_vec(),
+                entry.engine.snapshot(),
+                entry.engine.history().clone(),
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| {
+                        (
+                            frame.frame().clone(),
+                            frame.shell(),
+                            frame.mount_binding().clone(),
+                            frame.claims().cloned().collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                active
+                    .child_slots()
+                    .iter()
+                    .map(|slot| {
+                        (
+                            slot.slot_claim().clone(),
+                            slot.parent().clone(),
+                            slot.outlet().clone(),
+                            slot.anchor_claim().clone(),
+                            slot.expected_anchor_children().to_vec(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("the exact entry retains its capacity issuer")
+                    .semantic_snapshot_for_test(),
+                entry.requests.clone(),
+                snapshots
+                    .get(router)
+                    .expect("the exact router retains its public snapshot")
+                    .clone(),
+                public_request,
+            )
+        };
+        let capacity_before = owner.capacity.capacity_identity_for_test();
+
+        let outcome = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the exact entry receives the child-slot boundary proof");
+            freeze_back_no_target_proven_empty(world, entry, owner)
+        };
+        let returned_owner = match outcome {
+            BackNoTargetPhysicalFreezeOutcome::Indeterminate { owner, evidence } => {
+                assert_eq!(evidence.request, request);
+                match evidence.reason {
+                    BackNoTargetPhysicalIndeterminateReason::AuthorityGraph(evidence) => {
+                        assert!(
+                            evidence.projection.slots.contains(&expected),
+                            "graph evidence must retain the exact owner-held child slot"
+                        );
+                        match evidence.violation {
+                            BackNoTargetAuthorityGraphViolation::SlotBoundaryDrift {
+                                expected: observed_expected,
+                                observed: observed_projection,
+                            } => {
+                                assert_eq!(observed_expected, expected);
+                                assert_eq!(observed_projection, observed);
+                            }
+                            _ => panic!("{RED}"),
+                        }
+                    }
+                    _ => panic!("{RED}"),
+                }
+                owner
+            }
+            BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(_) => panic!("{RED}"),
+        };
+        assert_eq!(returned_owner.request, request);
+        assert_eq!(
+            returned_owner.capacity.capacity_identity_for_test(),
+            capacity_before,
+            "slot-boundary drift must return the whole original preparation owner"
+        );
+
+        let world = app.world();
+        let navigation = world.resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("slot-boundary rejection cannot remove the router entry");
+        let host = entry
+            .host
+            .as_ref()
+            .expect("slot-boundary rejection cannot remove the exact host");
+        let active = entry
+            .active
+            .as_ref()
+            .expect("slot-boundary rejection cannot consume the current owner");
+        assert!(
+            ProjectionlessObservedProjection::capture(world, vec![host.host]) == world_before,
+            "slot-boundary rejection must be World zero-write"
+        );
+        assert_eq!(
+            world.resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(entry.engine.snapshot(), engine_before);
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(
+            active
+                .frames()
+                .iter()
+                .map(|frame| {
+                    (
+                        frame.frame().clone(),
+                        frame.shell(),
+                        frame.mount_binding().clone(),
+                        frame.claims().cloned().collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            active_frames_before
+        );
+        assert_eq!(
+            active
+                .child_slots()
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.slot_claim().clone(),
+                        slot.parent().clone(),
+                        slot.outlet().clone(),
+                        slot.anchor_claim().clone(),
+                        slot.expected_anchor_children().to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            active_slots_before
+        );
+        assert_eq!(
+            entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("slot-boundary rejection retains the exact capacity issuer")
+                .semantic_snapshot_for_test(),
+            issuer_before
+        );
+        assert_eq!(entry.requests, requests_before);
+        let snapshots = world.resource::<RouterSnapshots>();
+        assert_eq!(
+            snapshots
+                .get(router)
+                .expect("slot-boundary rejection retains the public router snapshot"),
+            &public_router_before
+        );
+        match snapshots.request(router, request) {
+            crate::snapshots::RequestLookup::Found(snapshot) => {
+                assert_eq!(snapshot, &public_request_before)
+            }
+            crate::snapshots::RequestLookup::NotRetained => {
+                panic!("slot-boundary rejection cannot evict the accepted no-target Back")
+            }
+            crate::snapshots::RequestLookup::Unknown => {
+                panic!("slot-boundary rejection cannot hide the accepted no-target Back")
+            }
+        }
+    }
+
+    #[test]
+    fn back_no_target_authority_graph_requires_slot_registry_manifest_within_physical_manifest() {
+        const RED: &str =
+            "RED: no-target slot proof requires registry manifest within physical manifest";
+
+        let (mut app, router, request, owner) =
+            prepare_nested_back_no_target_authority_graph_fixture();
+        let (slot_entity, node_component, expected, registry_manifest) = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the real nested fixture retains its exact entry");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the real nested fixture retains its current owner");
+            assert_eq!(active.child_slots().len(), 1);
+            let slot = &active.child_slots()[0];
+            let mut expected_support_relationships = slot.expected_anchor_children().to_vec();
+            expected_support_relationships.sort_by_key(|entity| entity.to_bits());
+            let expected = BackNoTargetAuthorityGraphSlotProjection {
+                claim: slot.slot_claim().clone(),
+                binding: ProvenEmptyChildSlotBindingProjection {
+                    parent: slot.parent().clone(),
+                    outlet: slot.outlet().clone(),
+                    slot_id: slot.slot_id(),
+                    anchor_claim: slot.anchor_claim().clone(),
+                    expected_support_relationships,
+                },
+            };
+            let node_component = world
+                .components()
+                .component_id::<Node>()
+                .expect("the real committed child slot registers Node");
+            let record = world
+                .resource::<RouteEntityRegistry>()
+                .record(slot.slot())
+                .expect("the real child slot retains its registry record");
+            assert_eq!(record.claim(), expected.claim);
+            assert!(
+                record.manifest().component_ids().contains(&node_component),
+                "Node must be a real registry manifest requirement before the perturbation"
+            );
+            assert!(
+                ComponentManifest::from_world(world, slot.slot())
+                    .is_some_and(|physical| physical == *record.manifest()),
+                "the real child slot must begin with an exact physical manifest"
+            );
+            (
+                slot.slot(),
+                node_component,
+                expected,
+                record.manifest().clone(),
+            )
+        };
+
+        assert!(
+            app.world().get::<Node>(slot_entity).is_some(),
+            "the single-variable perturbation requires the real child-slot Node"
+        );
+        app.world_mut().entity_mut(slot_entity).remove::<Node>();
+
+        let observed = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the manifest perturbation retains its exact entry");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the manifest perturbation retains its current owner");
+            let slot = active
+                .child_slots()
+                .iter()
+                .find(|slot| slot.slot() == slot_entity)
+                .expect("the owner still retains the exact committed child slot");
+            let registry = world.resource::<RouteEntityRegistry>();
+            let record = registry
+                .record(slot_entity)
+                .expect("the physical mutation cannot remove the registry record");
+            assert_eq!(record.claim(), expected.claim);
+            assert_eq!(
+                record.owner(),
+                &RegistryOwner::Committed(EntityOwner::ChildSlot {
+                    parent: expected.binding.parent.clone(),
+                    outlet: expected.binding.outlet.clone(),
+                    slot: expected.binding.slot_id,
+                })
+            );
+            assert_eq!(record.lifecycle(), EntityLifecycle::Active);
+            assert_eq!(record.manifest(), &registry_manifest);
+            assert_eq!(
+                world.get::<RouteOwnershipSeal>(slot_entity),
+                Some(&RouteOwnershipSeal::new(expected.claim.seal()))
+            );
+            assert_eq!(
+                world.get::<ChildSlotLifecycle>(slot_entity),
+                Some(&ChildSlotLifecycle::Active)
+            );
+            assert!(
+                world
+                    .get::<ChildSlotAuthority>(slot_entity)
+                    .is_some_and(|authority| {
+                        authority.parent() == &expected.binding.parent
+                            && authority.outlet() == &expected.binding.outlet
+                            && authority.slot() == expected.binding.slot_id
+                    }),
+                "the ChildSlot authority identity and binding must remain exact"
+            );
+            assert_eq!(
+                world.get::<ChildOf>(slot_entity).map(ChildOf::parent),
+                Some(slot.anchor())
+            );
+            let parent = active
+                .frames()
+                .iter()
+                .find(|frame| frame.frame() == &expected.binding.parent)
+                .expect("the exact child-slot parent frame remains owner-held");
+            assert!(
+                parent
+                    .outlet(&expected.binding.outlet)
+                    .is_some_and(|outlet| {
+                        outlet.anchor() == slot.anchor()
+                            && outlet.anchor_claim() == &expected.binding.anchor_claim
+                    })
+            );
+            assert!(
+                expected
+                    .binding
+                    .expected_support_relationships
+                    .iter()
+                    .all(|entity| {
+                        world
+                            .get::<Children>(slot.anchor())
+                            .is_some_and(|children| children.contains(entity))
+                    }),
+                "the exact anchor support relationships must remain present"
+            );
+            assert!(cleanup_claim_has_exact_authority(world, &expected.claim));
+            assert!(cleanup_claim_has_exact_authority(
+                world,
+                &expected.binding.anchor_claim
+            ));
+            let observed =
+                observe_back_no_target_authority_graph_slot(world, registry, active, slot);
+            assert_eq!(observed.slot.registry_claim, Some(expected.claim.clone()));
+            assert_eq!(
+                observed.slot.registry_manifest,
+                Some(record.manifest().clone())
+            );
+            assert_eq!(world.get::<Node>(slot_entity), None);
+            let physical_manifest = observed
+                .slot
+                .physical_manifest
+                .as_ref()
+                .expect("the committed child-slot Entity still has a physical manifest");
+            let missing_required = record
+                .manifest()
+                .component_ids()
+                .iter()
+                .copied()
+                .filter(|component| !physical_manifest.component_ids().contains(component))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                missing_required,
+                vec![node_component],
+                "Node must be the only registry requirement absent from the physical manifest"
+            );
+            observed
+        };
+
+        let (
+            world_before,
+            registry_before,
+            engine_before,
+            history_before,
+            active_frames_before,
+            active_slots_before,
+            issuer_before,
+            requests_before,
+            public_router_before,
+            public_request_before,
+        ) = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the manifest-drift fixture retains its exact entry");
+            let host = entry
+                .host
+                .as_ref()
+                .expect("the manifest-drift fixture retains its exact host");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the manifest-drift fixture retains its current owner");
+            let snapshots = world.resource::<RouterSnapshots>();
+            let public_request = match snapshots.request(router, request) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                crate::snapshots::RequestLookup::NotRetained => {
+                    panic!("the accepted no-target Back remains retained")
+                }
+                crate::snapshots::RequestLookup::Unknown => {
+                    panic!("the accepted no-target Back remains publicly visible")
+                }
+            };
+            (
+                ProjectionlessObservedProjection::capture(world, vec![host.host]),
+                world.resource::<RouteEntityRegistry>().records().to_vec(),
+                entry.engine.snapshot(),
+                entry.engine.history().clone(),
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| {
+                        (
+                            frame.frame().clone(),
+                            frame.shell(),
+                            frame.mount_binding().clone(),
+                            frame.claims().cloned().collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                active
+                    .child_slots()
+                    .iter()
+                    .map(|slot| {
+                        (
+                            slot.slot_claim().clone(),
+                            slot.parent().clone(),
+                            slot.outlet().clone(),
+                            slot.anchor_claim().clone(),
+                            slot.expected_anchor_children().to_vec(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("the exact entry retains its capacity issuer")
+                    .semantic_snapshot_for_test(),
+                entry.requests.clone(),
+                snapshots
+                    .get(router)
+                    .expect("the exact router retains its public snapshot")
+                    .clone(),
+                public_request,
+            )
+        };
+        let capacity_before = owner.capacity.capacity_identity_for_test();
+
+        let outcome = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the exact entry receives the child-slot manifest proof");
+            freeze_back_no_target_proven_empty(world, entry, owner)
+        };
+        let returned_owner = match outcome {
+            BackNoTargetPhysicalFreezeOutcome::Indeterminate { owner, evidence } => {
+                assert_eq!(evidence.request, request);
+                match evidence.reason {
+                    BackNoTargetPhysicalIndeterminateReason::AuthorityGraph(evidence) => {
+                        assert!(
+                            evidence.projection.slots.contains(&expected),
+                            "graph evidence must retain the exact owner-held child slot"
+                        );
+                        match evidence.violation {
+                            BackNoTargetAuthorityGraphViolation::SlotBoundaryDrift {
+                                expected: observed_expected,
+                                observed: observed_projection,
+                            } => {
+                                assert_eq!(observed_expected, expected);
+                                assert_eq!(observed_projection, observed);
+                            }
+                            _ => panic!("{RED}"),
+                        }
+                    }
+                    _ => panic!("{RED}"),
+                }
+                owner
+            }
+            BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(_) => panic!("{RED}"),
+        };
+        assert_eq!(returned_owner.request, request);
+        assert_eq!(
+            returned_owner.capacity.capacity_identity_for_test(),
+            capacity_before,
+            "slot-manifest drift must return the whole original preparation owner"
+        );
+
+        let world = app.world();
+        let navigation = world.resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("slot-manifest rejection cannot remove the router entry");
+        let host = entry
+            .host
+            .as_ref()
+            .expect("slot-manifest rejection cannot remove the exact host");
+        let active = entry
+            .active
+            .as_ref()
+            .expect("slot-manifest rejection cannot consume the current owner");
+        assert_eq!(
+            observe_back_no_target_authority_graph_slot(
+                world,
+                world.resource::<RouteEntityRegistry>(),
+                active,
+                active
+                    .child_slots()
+                    .iter()
+                    .find(|slot| slot.slot() == slot_entity)
+                    .expect("slot-manifest rejection retains the exact child slot"),
+            ),
+            observed,
+            "slot-manifest rejection must preserve the exact observed physical drift"
+        );
+        assert!(
+            ProjectionlessObservedProjection::capture(world, vec![host.host]) == world_before,
+            "slot-manifest rejection must be World zero-write"
+        );
+        assert_eq!(
+            world.resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(entry.engine.snapshot(), engine_before);
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(
+            active
+                .frames()
+                .iter()
+                .map(|frame| {
+                    (
+                        frame.frame().clone(),
+                        frame.shell(),
+                        frame.mount_binding().clone(),
+                        frame.claims().cloned().collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            active_frames_before
+        );
+        assert_eq!(
+            active
+                .child_slots()
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.slot_claim().clone(),
+                        slot.parent().clone(),
+                        slot.outlet().clone(),
+                        slot.anchor_claim().clone(),
+                        slot.expected_anchor_children().to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            active_slots_before
+        );
+        assert_eq!(
+            entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("slot-manifest rejection retains the exact capacity issuer")
+                .semantic_snapshot_for_test(),
+            issuer_before
+        );
+        assert_eq!(entry.requests, requests_before);
+        let snapshots = world.resource::<RouterSnapshots>();
+        assert_eq!(
+            snapshots
+                .get(router)
+                .expect("slot-manifest rejection retains the public router snapshot"),
+            &public_router_before
+        );
+        match snapshots.request(router, request) {
+            crate::snapshots::RequestLookup::Found(snapshot) => {
+                assert_eq!(snapshot, &public_request_before)
+            }
+            crate::snapshots::RequestLookup::NotRetained => {
+                panic!("slot-manifest rejection cannot evict the accepted no-target Back")
+            }
+            crate::snapshots::RequestLookup::Unknown => {
+                panic!("slot-manifest rejection cannot hide the accepted no-target Back")
+            }
+        }
+    }
+
+    #[test]
+    fn back_no_target_authority_graph_rejects_foreign_real_root_mount() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        let other_router = install_atomic_router(&mut app, "no-target-root-mount-foreign");
+        app.update();
+
+        for location in ["/items/1", "/items/2"] {
+            let setup = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .expect("the current nested router accepts each real setup route");
+            run_updates_until_succeeded(&mut app, setup);
+        }
+        let other_request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(other_router, RouteLocation::new("/"))
+            .expect("the second real router accepts its root route");
+        run_updates_until_succeeded(&mut app, other_request);
+
+        let (request, bound) =
+            take_real_bound_back_no_target_from_current_history(&mut app, router);
+        let owner = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the current nested router retains its exact entry");
+            match begin_bound_back_no_target(entry, bound) {
+                BackNoTargetBeginOutcome::Begun(owner) => owner,
+                BackNoTargetBeginOutcome::Permanent(_) => {
+                    panic!("the unchanged current source must refreeze before mount mutation")
+                }
+                BackNoTargetBeginOutcome::CapacityRejected { .. } => {
+                    panic!("the real no-target capacity must remain current")
+                }
+                BackNoTargetBeginOutcome::ReceiverMismatch { .. } => {
+                    panic!("the exact current entry must receive its verified no-target owner")
+                }
+            }
+        };
+        let (root, foreign_host) = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let current = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the current nested router retains its exact entry");
+            let host = current
+                .host
+                .as_ref()
+                .expect("the current nested router retains its exact host");
+            let active = current
+                .active
+                .as_ref()
+                .expect("the current nested router retains its active owner");
+            let root = active
+                .frames()
+                .iter()
+                .find(|frame| {
+                    frame.mount_binding().slot() == host.top_slot
+                        && frame.mount_binding().slot_claim() == &host.top_slot_claim
+                        && frame.mount_binding().physical_parent() == (host.host, None)
+                })
+                .map(|frame| frame.frame().clone())
+                .expect("the current owner retains one exact host-top root");
+            let foreign_host = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == other_router)
+                .and_then(|entry| entry.host.as_ref())
+                .map(|host| host.host)
+                .expect("the second real router retains its app-owned host");
+            assert!(world.get_entity(foreign_host).is_ok());
+            assert!(
+                world
+                    .resource::<RouteEntityRegistry>()
+                    .record(foreign_host)
+                    .is_none(),
+                "the second real host must remain app-owned"
+            );
+            assert_ne!(foreign_host, host.host);
+            (root, foreign_host)
+        };
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let frame = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .and_then(|entry| entry.active.as_mut())
+                .and_then(|active| {
+                    active
+                        .frames_mut_for_test()
+                        .iter_mut()
+                        .find(|frame| frame.frame() == &root)
+                })
+                .expect("the owner-only mutation targets the exact current root");
+            assert!(
+                frame.replace_host_top_mount_host_for_test(foreign_host),
+                "the narrow seam must target only the exact HostTop mount"
+            );
+        }
+        let foreign_mount = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the host-metadata mutation retains the current entry");
+            let host = entry
+                .host
+                .as_ref()
+                .expect("the host-metadata mutation retains the current host");
+            let frame = entry
+                .active
+                .as_ref()
+                .and_then(|active| active.frames().iter().find(|frame| frame.frame() == &root))
+                .expect("the host-metadata mutation retains the exact root");
+            assert_eq!(frame.mount_binding().slot(), host.top_slot);
+            assert_eq!(frame.mount_binding().slot_claim(), &host.top_slot_claim);
+            assert_eq!(
+                frame.mount_binding().physical_parent(),
+                (foreign_host, None)
+            );
+            let shell_claim = frame
+                .claims()
+                .find(|claim| {
+                    matches!(
+                        claim.owner(),
+                        RegistryOwner::Committed(EntityOwner::FrameShell(owner))
+                            if owner == frame.frame()
+                    )
+                })
+                .expect("the current root retains one exact shell claim");
+            let stored_shell_parent = frame
+                .cleanup_members()
+                .find(|(claim, _)| *claim == shell_claim)
+                .map(|(_, parent)| parent)
+                .expect("the current root retains its exact shell parent");
+            assert_eq!(stored_shell_parent, host.top_slot);
+            assert_eq!(
+                world
+                    .get::<ChildOf>(shell_claim.entity())
+                    .map(ChildOf::parent),
+                Some(host.top_slot)
+            );
+            assert!(
+                world
+                    .resource::<RouteEntityRegistry>()
+                    .record(shell_claim.entity())
+                    .is_some_and(|record| record.claim() == *shell_claim)
+            );
+            assert!(cleanup_claim_has_exact_authority(world, shell_claim));
+            frame.mount_binding().clone()
+        };
+
+        let (
+            expected_host,
+            world_before,
+            registry_before,
+            engine_before,
+            history_before,
+            active_before,
+            issuer_before,
+            requests_before,
+            public_router_before,
+            public_request_before,
+            other_engine_before,
+            other_history_before,
+            other_active_before,
+            other_issuer_before,
+            other_requests_before,
+            other_public_router_before,
+            other_public_request_before,
+        ) = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the current router retains its exact entry");
+            let host = entry
+                .host
+                .as_ref()
+                .expect("the current router retains its exact host");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the current router retains its active owner");
+            let other_entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == other_router)
+                .expect("the second router retains its exact entry");
+            let other_host = other_entry
+                .host
+                .as_ref()
+                .expect("the second router retains its exact host");
+            let other_active = other_entry
+                .active
+                .as_ref()
+                .expect("the second router retains its active owner");
+            let snapshots = world.resource::<RouterSnapshots>();
+            let public_request = match snapshots.request(router, request) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                crate::snapshots::RequestLookup::NotRetained => {
+                    panic!("the accepted no-target Back remains retained")
+                }
+                crate::snapshots::RequestLookup::Unknown => {
+                    panic!("the accepted no-target Back remains publicly visible")
+                }
+            };
+            let other_public_request = match snapshots.request(other_router, other_request) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                crate::snapshots::RequestLookup::NotRetained => {
+                    panic!("the second router's root request remains retained")
+                }
+                crate::snapshots::RequestLookup::Unknown => {
+                    panic!("the second router's root request remains publicly visible")
+                }
+            };
+            let capture_active = |active: &RealizedBranch| {
+                (
+                    active
+                        .frames()
+                        .iter()
+                        .map(|frame| {
+                            (
+                                frame.frame().clone(),
+                                frame.shell(),
+                                frame.mount_binding().clone(),
+                                frame.claims().cloned().collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    active
+                        .child_slots()
+                        .iter()
+                        .map(|slot| {
+                            (
+                                slot.slot_claim().clone(),
+                                slot.parent().clone(),
+                                slot.outlet().clone(),
+                                slot.anchor_claim().clone(),
+                                slot.expected_anchor_children().to_vec(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
+            (
+                ProjectionlessHostProjection::from(host),
+                ProjectionlessObservedProjection::capture(world, vec![host.host, other_host.host]),
+                world.resource::<RouteEntityRegistry>().records().to_vec(),
+                entry.engine.snapshot(),
+                entry.engine.history().clone(),
+                capture_active(active),
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("the current entry retains its capacity issuer")
+                    .semantic_snapshot_for_test(),
+                entry.requests.clone(),
+                snapshots
+                    .get(router)
+                    .expect("the current router retains its public snapshot")
+                    .clone(),
+                public_request,
+                other_entry.engine.snapshot(),
+                other_entry.engine.history().clone(),
+                capture_active(other_active),
+                other_entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("the second entry retains its capacity issuer")
+                    .semantic_snapshot_for_test(),
+                other_entry.requests.clone(),
+                snapshots
+                    .get(other_router)
+                    .expect("the second router retains its public snapshot")
+                    .clone(),
+                other_public_request,
+            )
+        };
+        let capacity_before = owner.capacity.capacity_identity_for_test();
+
+        let outcome = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the exact entry receives the root-mount proof");
+            freeze_back_no_target_proven_empty(world, entry, owner)
+        };
+        let returned_owner =
+            match outcome {
+                BackNoTargetPhysicalFreezeOutcome::Indeterminate { owner, evidence } => {
+                    assert_eq!(evidence.request, request);
+                    match evidence.reason {
+                        BackNoTargetPhysicalIndeterminateReason::AuthorityGraph(evidence) => {
+                            assert_eq!(evidence.projection.host, expected_host);
+                            assert!(evidence.projection.frames.iter().any(|frame| {
+                                frame.frame == root && frame.mount == foreign_mount
+                            }));
+                            assert_eq!(
+                                evidence.violation,
+                                BackNoTargetAuthorityGraphViolation::RootMountMismatch {
+                                    root: root.clone(),
+                                }
+                            );
+                        }
+                        _ => panic!("root mount drift must remain typed graph evidence"),
+                    }
+                    owner
+                }
+                BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(_) => {
+                    panic!("a foreign real root mount cannot prove exact current authority")
+                }
+            };
+        assert_eq!(returned_owner.request, request);
+        assert_eq!(
+            returned_owner.capacity.capacity_identity_for_test(),
+            capacity_before
+        );
+
+        let world = app.world();
+        let navigation = world.resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("root-mount rejection retains the current entry");
+        let host = entry
+            .host
+            .as_ref()
+            .expect("root-mount rejection retains the current host");
+        let active = entry
+            .active
+            .as_ref()
+            .expect("root-mount rejection retains the current owner");
+        let other_entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == other_router)
+            .expect("root-mount rejection retains the second entry");
+        let other_host = other_entry
+            .host
+            .as_ref()
+            .expect("root-mount rejection retains the second host");
+        let other_active = other_entry
+            .active
+            .as_ref()
+            .expect("root-mount rejection retains the second active owner");
+        let capture_active = |active: &RealizedBranch| {
+            (
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| {
+                        (
+                            frame.frame().clone(),
+                            frame.shell(),
+                            frame.mount_binding().clone(),
+                            frame.claims().cloned().collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                active
+                    .child_slots()
+                    .iter()
+                    .map(|slot| {
+                        (
+                            slot.slot_claim().clone(),
+                            slot.parent().clone(),
+                            slot.outlet().clone(),
+                            slot.anchor_claim().clone(),
+                            slot.expected_anchor_children().to_vec(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert!(
+            ProjectionlessObservedProjection::capture(world, vec![host.host, other_host.host],)
+                == world_before
+        );
+        assert_eq!(
+            world.resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(entry.engine.snapshot(), engine_before);
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(capture_active(active), active_before);
+        assert_eq!(
+            entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("root-mount rejection retains the current issuer")
+                .semantic_snapshot_for_test(),
+            issuer_before
+        );
+        assert_eq!(entry.requests, requests_before);
+        assert_eq!(other_entry.engine.snapshot(), other_engine_before);
+        assert_eq!(other_entry.engine.history(), &other_history_before);
+        assert_eq!(capture_active(other_active), other_active_before);
+        assert_eq!(
+            other_entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("root-mount rejection retains the second issuer")
+                .semantic_snapshot_for_test(),
+            other_issuer_before
+        );
+        assert_eq!(other_entry.requests, other_requests_before);
+        let snapshots = world.resource::<RouterSnapshots>();
+        assert_eq!(
+            snapshots
+                .get(router)
+                .expect("root-mount rejection retains the current public snapshot"),
+            &public_router_before
+        );
+        assert_eq!(
+            snapshots
+                .get(other_router)
+                .expect("root-mount rejection retains the second public snapshot"),
+            &other_public_router_before
+        );
+        match snapshots.request(router, request) {
+            crate::snapshots::RequestLookup::Found(snapshot) => {
+                assert_eq!(snapshot, &public_request_before)
+            }
+            _ => panic!("root-mount rejection retains the current public request"),
+        }
+        match snapshots.request(other_router, other_request) {
+            crate::snapshots::RequestLookup::Found(snapshot) => {
+                assert_eq!(snapshot, &other_public_request_before)
+            }
+            _ => panic!("root-mount rejection retains the second public request"),
+        }
+    }
+
+    #[test]
+    fn back_no_target_authority_graph_rejects_disconnected_cycle_at_shell_mount_boundary() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_deep_nested_router(&mut app);
+        app.update();
+        for location in ["/sections/a/items/1", "/sections/a/items/2"] {
+            let setup = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .expect("the deep router accepts each real three-frame route");
+            run_updates_until_succeeded(&mut app, setup);
+        }
+        let (request, bound) =
+            take_real_bound_back_no_target_from_current_history(&mut app, router);
+        let owner = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the deep router retains its exact entry");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the first Back retains the real deep current branch");
+            assert_eq!(active.frames().len(), 3);
+            assert_eq!(active.child_slots().len(), 2);
+            match begin_bound_back_no_target(entry, bound) {
+                BackNoTargetBeginOutcome::Begun(owner) => owner,
+                BackNoTargetBeginOutcome::Permanent(_) => {
+                    panic!("the unchanged deep source must refreeze before graph mutation")
+                }
+                BackNoTargetBeginOutcome::CapacityRejected { .. } => {
+                    panic!("the real no-target capacity must remain current")
+                }
+                BackNoTargetBeginOutcome::ReceiverMismatch { .. } => {
+                    panic!("the exact deep entry must receive its verified no-target owner")
+                }
+            }
+        };
+
+        let (root, middle, leaf, middle_mount, leaf_mount) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the deep router retains its exact entry");
+            let host = entry
+                .host
+                .as_ref()
+                .expect("the deep router retains its exact host");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the deep router retains its current owner");
+            let root = active
+                .frames()
+                .iter()
+                .find(|frame| {
+                    frame.mount_binding().slot() == host.top_slot
+                        && frame.mount_binding().slot_claim() == &host.top_slot_claim
+                        && frame.mount_binding().physical_parent() == (host.host, None)
+                })
+                .map(|frame| frame.frame().clone())
+                .expect("one exact frame mounts at the host top slot");
+            let root_slot = active
+                .child_slots()
+                .iter()
+                .find(|slot| slot.parent() == &root)
+                .expect("the exact root owns one real child slot");
+            let middle_frame = active
+                .frames()
+                .iter()
+                .find(|frame| frame.mount_binding().matches_mounted_child_slot(root_slot))
+                .expect("one exact middle frame enters through the root slot");
+            let middle = middle_frame.frame().clone();
+            let middle_slot = active
+                .child_slots()
+                .iter()
+                .find(|slot| slot.parent() == &middle)
+                .expect("the exact middle frame owns one real child slot");
+            let leaf_frame = active
+                .frames()
+                .iter()
+                .find(|frame| {
+                    frame
+                        .mount_binding()
+                        .matches_mounted_child_slot(middle_slot)
+                })
+                .expect("one exact leaf frame enters through the middle slot");
+            (
+                root,
+                middle,
+                leaf_frame.frame().clone(),
+                middle_frame.mount_binding().clone(),
+                leaf_frame.mount_binding().clone(),
+            )
+        };
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let active = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .and_then(|entry| entry.active.as_mut())
+                .expect("the owner-only mutation retains the deep current branch");
+            active
+                .frames_mut_for_test()
+                .iter_mut()
+                .find(|frame| frame.frame() == &middle)
+                .expect("the exact middle frame remains owner-held")
+                .replace_mount_binding_for_test(leaf_mount.clone());
+            active
+                .frames_mut_for_test()
+                .iter_mut()
+                .find(|frame| frame.frame() == &leaf)
+                .expect("the exact leaf frame remains owner-held")
+                .replace_mount_binding_for_test(middle_mount.clone());
+        }
+        let (middle_stored_parent, observed_middle_shell) = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the owner-only swap retains the exact entry");
+            let frame = entry
+                .active
+                .as_ref()
+                .and_then(|active| {
+                    active
+                        .frames()
+                        .iter()
+                        .find(|frame| frame.frame() == &middle)
+                })
+                .expect("the owner-only swap retains the exact middle frame");
+            let shell_claim = frame
+                .claims()
+                .find(|claim| {
+                    matches!(
+                        claim.owner(),
+                        RegistryOwner::Committed(EntityOwner::FrameShell(owner))
+                            if owner == frame.frame()
+                    )
+                })
+                .expect("the middle frame retains one exact shell claim");
+            let stored_parent = frame
+                .cleanup_members()
+                .find(|(claim, _)| *claim == shell_claim)
+                .map(|(_, parent)| parent)
+                .expect("the middle frame retains its original shell parent");
+            let observed_shell = observe_back_no_target_authority_graph_claim(
+                world,
+                world.resource::<RouteEntityRegistry>(),
+                shell_claim.entity(),
+            );
+            assert_eq!(frame.mount_binding(), &leaf_mount);
+            assert_eq!(stored_parent, middle_mount.slot());
+            assert_ne!(stored_parent, leaf_mount.slot());
+            assert_eq!(observed_shell.observed_parent, Some(stored_parent));
+            (stored_parent, observed_shell)
+        };
+
+        let (
+            expected_host,
+            world_before,
+            registry_before,
+            engine_before,
+            history_before,
+            active_before,
+            issuer_before,
+            requests_before,
+            public_router_before,
+            public_request_before,
+        ) =
+            {
+                let world = app.world();
+                let navigation = world.resource::<RouterNavigation>();
+                let entry = navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == router)
+                    .expect("the cycle fixture retains its exact entry");
+                let host = entry
+                    .host
+                    .as_ref()
+                    .expect("the cycle fixture retains its exact host");
+                let active = entry
+                    .active
+                    .as_ref()
+                    .expect("the cycle fixture retains its current owner");
+                assert!(active.frames().iter().any(|frame| {
+                    frame.frame() == &root
+                        && frame.mount_binding().slot() == host.top_slot
+                        && frame.mount_binding().slot_claim() == &host.top_slot_claim
+                }));
+                assert!(active.frames().iter().any(|frame| {
+                    frame.frame() == &middle && frame.mount_binding() == &leaf_mount
+                }));
+                assert!(active.frames().iter().any(|frame| {
+                    frame.frame() == &leaf && frame.mount_binding() == &middle_mount
+                }));
+                let snapshots = world.resource::<RouterSnapshots>();
+                let public_request = match snapshots.request(router, request) {
+                    crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                    crate::snapshots::RequestLookup::NotRetained => {
+                        panic!("the accepted no-target Back remains retained")
+                    }
+                    crate::snapshots::RequestLookup::Unknown => {
+                        panic!("the accepted no-target Back remains publicly visible")
+                    }
+                };
+                (
+                    ProjectionlessHostProjection::from(host),
+                    ProjectionlessObservedProjection::capture(world, vec![host.host]),
+                    world.resource::<RouteEntityRegistry>().records().to_vec(),
+                    entry.engine.snapshot(),
+                    entry.engine.history().clone(),
+                    (
+                        active
+                            .frames()
+                            .iter()
+                            .map(|frame| {
+                                (
+                                    frame.frame().clone(),
+                                    frame.shell(),
+                                    frame.mount_binding().clone(),
+                                    frame.claims().cloned().collect::<Vec<_>>(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                        active
+                            .child_slots()
+                            .iter()
+                            .map(|slot| {
+                                (
+                                    slot.slot_claim().clone(),
+                                    slot.parent().clone(),
+                                    slot.outlet().clone(),
+                                    slot.anchor_claim().clone(),
+                                    slot.expected_anchor_children().to_vec(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    entry
+                        .back_capacity_issuer
+                        .as_ref()
+                        .expect("the exact entry retains its capacity issuer")
+                        .semantic_snapshot_for_test(),
+                    entry.requests.clone(),
+                    snapshots
+                        .get(router)
+                        .expect("the deep router retains its public snapshot")
+                        .clone(),
+                    public_request,
+                )
+            };
+        let capacity_before = owner.capacity.capacity_identity_for_test();
+
+        let outcome = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the exact entry receives the boundary-first cycle proof");
+            freeze_back_no_target_proven_empty(world, entry, owner)
+        };
+        let returned_owner =
+            match outcome {
+                BackNoTargetPhysicalFreezeOutcome::Indeterminate { owner, evidence } => {
+                    assert_eq!(evidence.request, request);
+                    match evidence.reason {
+                        BackNoTargetPhysicalIndeterminateReason::AuthorityGraph(evidence) => {
+                            assert_eq!(evidence.projection.host, expected_host);
+                            assert!(evidence.projection.frames.iter().any(|frame| {
+                                frame.frame == middle && frame.mount == leaf_mount
+                            }));
+                            assert!(evidence.projection.frames.iter().any(|frame| {
+                                frame.frame == leaf && frame.mount == middle_mount
+                            }));
+                            assert_eq!(
+                                evidence.violation,
+                                BackNoTargetAuthorityGraphViolation::FrameShellMountBoundaryDrift {
+                                    frame: middle.clone(),
+                                    mount_slot: leaf_mount.slot(),
+                                    stored_parent: middle_stored_parent,
+                                    observed_shell: observed_middle_shell.clone(),
+                                }
+                            );
+                        }
+                        _ => panic!("the owner-only cycle must reject at the shell-mount boundary"),
+                    }
+                    owner
+                }
+                BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(_) => {
+                    panic!("a boundary-invalid owner-held cycle cannot prove empty authority")
+                }
+            };
+        assert_eq!(returned_owner.request, request);
+        assert_eq!(
+            returned_owner.capacity.capacity_identity_for_test(),
+            capacity_before
+        );
+
+        let world = app.world();
+        let navigation = world.resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("cycle rejection retains the exact entry");
+        let host = entry
+            .host
+            .as_ref()
+            .expect("cycle rejection retains the exact host");
+        let active = entry
+            .active
+            .as_ref()
+            .expect("cycle rejection retains the current owner");
+        let active_after = (
+            active
+                .frames()
+                .iter()
+                .map(|frame| {
+                    (
+                        frame.frame().clone(),
+                        frame.shell(),
+                        frame.mount_binding().clone(),
+                        frame.claims().cloned().collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            active
+                .child_slots()
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.slot_claim().clone(),
+                        slot.parent().clone(),
+                        slot.outlet().clone(),
+                        slot.anchor_claim().clone(),
+                        slot.expected_anchor_children().to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        assert!(ProjectionlessObservedProjection::capture(world, vec![host.host]) == world_before);
+        assert_eq!(
+            world.resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(entry.engine.snapshot(), engine_before);
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(active_after, active_before);
+        assert_eq!(
+            entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("cycle rejection retains the exact capacity issuer")
+                .semantic_snapshot_for_test(),
+            issuer_before
+        );
+        assert_eq!(entry.requests, requests_before);
+        let snapshots = world.resource::<RouterSnapshots>();
+        assert_eq!(
+            snapshots
+                .get(router)
+                .expect("cycle rejection retains the public router snapshot"),
+            &public_router_before
+        );
+        match snapshots.request(router, request) {
+            crate::snapshots::RequestLookup::Found(snapshot) => {
+                assert_eq!(snapshot, &public_request_before)
+            }
+            _ => panic!("cycle rejection retains the public no-target request"),
+        }
+    }
+
+    #[test]
+    fn back_no_target_authority_graph_requires_exact_mount_slot_to_shell_binding() {
+        const RED: &str =
+            "RED: no-target authority graph requires exact mount-slot to shell binding";
+
+        let (mut app, router, request, owner) =
+            prepare_nested_back_no_target_authority_graph_fixture();
+        let (frame_version, mount_slot, shell_claim, stored_parent, observed_shell) = {
+            let (frame_version, mount_slot, shell_claim, host_top_slot) = {
+                let navigation = app.world().resource::<RouterNavigation>();
+                let entry = navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == router)
+                    .expect("the real nested fixture retains its exact entry");
+                let host = entry
+                    .host
+                    .as_ref()
+                    .expect("the real nested fixture retains its exact host");
+                let active = entry
+                    .active
+                    .as_ref()
+                    .expect("the real nested fixture retains its current owner");
+                assert_eq!(active.child_slots().len(), 1);
+                let child_slot = &active.child_slots()[0];
+                let frame = active
+                    .frames()
+                    .iter()
+                    .find(|frame| frame.mount_binding().matches_mounted_child_slot(child_slot))
+                    .expect("one exact nonroot frame enters through the child slot");
+                let shell_claim = frame
+                    .claims()
+                    .find(|claim| {
+                        matches!(
+                            claim.owner(),
+                            RegistryOwner::Committed(EntityOwner::FrameShell(owner))
+                                if owner == frame.frame()
+                        )
+                    })
+                    .cloned()
+                    .expect("the nonroot frame retains one exact FrameShell claim");
+                let stored_shell_parent = frame
+                    .cleanup_members()
+                    .find(|(claim, _)| *claim == &shell_claim)
+                    .map(|(_, parent)| parent)
+                    .expect("the owner-held shell retains one exact cleanup parent");
+                assert_eq!(stored_shell_parent, child_slot.slot());
+                (
+                    frame.frame().clone(),
+                    child_slot.slot(),
+                    shell_claim,
+                    host.top_slot,
+                )
+            };
+            let sibling = app
+                .world_mut()
+                .spawn(bevy_ecs::hierarchy::ChildOf(mount_slot))
+                .id();
+            assert!(
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(sibling)
+                    .is_none(),
+                "the mount-slot sibling must remain unregistered"
+            );
+            {
+                let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+                let frame = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .and_then(|entry| entry.active.as_mut())
+                    .and_then(|active| {
+                        active
+                            .frames_mut_for_test()
+                            .iter_mut()
+                            .find(|frame| frame.frame() == &frame_version)
+                    })
+                    .expect("the owner-only mutation targets the exact nonroot frame");
+                frame.replace_shell_parent_for_test(host_top_slot);
+            }
+            app.world_mut()
+                .entity_mut(shell_claim.entity())
+                .insert(bevy_ecs::hierarchy::ChildOf(host_top_slot));
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the shell reparent retains the exact entry");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the shell reparent retains the current owner");
+            let frame = active
+                .frames()
+                .iter()
+                .find(|frame| frame.frame() == &frame_version)
+                .expect("the shell reparent retains the exact nonroot frame");
+            assert_eq!(frame.mount_binding().slot(), mount_slot);
+            let stored_parent = frame
+                .cleanup_members()
+                .find(|(claim, _)| *claim == &shell_claim)
+                .map(|(_, parent)| parent)
+                .expect("the mutated owner retains the shell cleanup member");
+            assert_eq!(stored_parent, host_top_slot);
+            let observed_shell = observe_back_no_target_authority_graph_claim(
+                world,
+                world.resource::<RouteEntityRegistry>(),
+                shell_claim.entity(),
+            );
+            assert_eq!(observed_shell.observed_parent, Some(stored_parent));
+            assert!(
+                world
+                    .get::<bevy_ecs::hierarchy::Children>(mount_slot)
+                    .is_some_and(|children| children.contains(&sibling)),
+                "the unregistered sibling must preserve the mount-slot Children manifest"
+            );
+            (
+                frame_version,
+                mount_slot,
+                shell_claim,
+                stored_parent,
+                observed_shell,
+            )
+        };
+
+        let (
+            world_before,
+            registry_before,
+            engine_before,
+            history_before,
+            active_before,
+            issuer_before,
+            requests_before,
+            public_router_before,
+            public_request_before,
+        ) = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the shell-mount fixture retains its exact entry");
+            let host = entry
+                .host
+                .as_ref()
+                .expect("the shell-mount fixture retains its exact host");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the shell-mount fixture retains its current owner");
+            let snapshots = world.resource::<RouterSnapshots>();
+            let public_request = match snapshots.request(router, request) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                crate::snapshots::RequestLookup::NotRetained => {
+                    panic!("the accepted no-target Back remains retained")
+                }
+                crate::snapshots::RequestLookup::Unknown => {
+                    panic!("the accepted no-target Back remains publicly visible")
+                }
+            };
+            (
+                ProjectionlessObservedProjection::capture(world, vec![host.host]),
+                world.resource::<RouteEntityRegistry>().records().to_vec(),
+                entry.engine.snapshot(),
+                entry.engine.history().clone(),
+                (
+                    active
+                        .frames()
+                        .iter()
+                        .map(|frame| {
+                            (
+                                frame.frame().clone(),
+                                frame.shell(),
+                                frame.mount_binding().clone(),
+                                frame
+                                    .cleanup_members()
+                                    .map(|(claim, parent)| (claim.clone(), parent))
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    active
+                        .child_slots()
+                        .iter()
+                        .map(|slot| {
+                            (
+                                slot.slot_claim().clone(),
+                                slot.parent().clone(),
+                                slot.outlet().clone(),
+                                slot.anchor_claim().clone(),
+                                slot.expected_anchor_children().to_vec(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("the exact entry retains its capacity issuer")
+                    .semantic_snapshot_for_test(),
+                entry.requests.clone(),
+                snapshots
+                    .get(router)
+                    .expect("the exact router retains its public snapshot")
+                    .clone(),
+                public_request,
+            )
+        };
+        let capacity_before = owner.capacity.capacity_identity_for_test();
+
+        let outcome = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the exact entry receives the shell-mount boundary proof");
+            freeze_back_no_target_proven_empty(world, entry, owner)
+        };
+        let returned_owner = match outcome {
+            BackNoTargetPhysicalFreezeOutcome::Indeterminate { owner, evidence } => {
+                assert_eq!(evidence.request, request);
+                match evidence.reason {
+                    BackNoTargetPhysicalIndeterminateReason::AuthorityGraph(evidence) => {
+                        assert!(evidence.projection.frames.iter().any(|frame| {
+                            frame.frame == frame_version
+                                && frame.mount.slot() == mount_slot
+                                && frame.claims.contains(&shell_claim)
+                        }));
+                        match evidence.violation {
+                            BackNoTargetAuthorityGraphViolation::FrameShellMountBoundaryDrift {
+                                frame,
+                                mount_slot: observed_mount_slot,
+                                stored_parent: observed_stored_parent,
+                                observed_shell: observed_projection,
+                            } => {
+                                assert_eq!(frame, frame_version);
+                                assert_eq!(observed_mount_slot, mount_slot);
+                                assert_eq!(observed_stored_parent, stored_parent);
+                                assert_eq!(observed_projection, observed_shell);
+                            }
+                            _ => panic!("{RED}"),
+                        }
+                    }
+                    _ => panic!("{RED}"),
+                }
+                owner
+            }
+            BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(_) => panic!("{RED}"),
+        };
+        assert_eq!(returned_owner.request, request);
+        assert_eq!(
+            returned_owner.capacity.capacity_identity_for_test(),
+            capacity_before
+        );
+
+        let world = app.world();
+        let navigation = world.resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("shell-mount rejection retains the exact entry");
+        let host = entry
+            .host
+            .as_ref()
+            .expect("shell-mount rejection retains the exact host");
+        let active = entry
+            .active
+            .as_ref()
+            .expect("shell-mount rejection retains the current owner");
+        let active_after = (
+            active
+                .frames()
+                .iter()
+                .map(|frame| {
+                    (
+                        frame.frame().clone(),
+                        frame.shell(),
+                        frame.mount_binding().clone(),
+                        frame
+                            .cleanup_members()
+                            .map(|(claim, parent)| (claim.clone(), parent))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            active
+                .child_slots()
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.slot_claim().clone(),
+                        slot.parent().clone(),
+                        slot.outlet().clone(),
+                        slot.anchor_claim().clone(),
+                        slot.expected_anchor_children().to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        assert!(ProjectionlessObservedProjection::capture(world, vec![host.host]) == world_before);
+        assert_eq!(
+            world.resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(entry.engine.snapshot(), engine_before);
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(active_after, active_before);
+        assert_eq!(
+            entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("shell-mount rejection retains the exact capacity issuer")
+                .semantic_snapshot_for_test(),
+            issuer_before
+        );
+        assert_eq!(entry.requests, requests_before);
+        let snapshots = world.resource::<RouterSnapshots>();
+        assert_eq!(
+            snapshots
+                .get(router)
+                .expect("shell-mount rejection retains the public router snapshot"),
+            &public_router_before
+        );
+        match snapshots.request(router, request) {
+            crate::snapshots::RequestLookup::Found(snapshot) => {
+                assert_eq!(snapshot, &public_request_before)
+            }
+            _ => panic!("shell-mount rejection retains the public no-target request"),
+        }
     }
 
     #[test]
@@ -21821,6 +26426,890 @@ pub(crate) mod tests {
             None,
             "pre-proof no-target handling must not publish any pending phase"
         );
+    }
+
+    #[test]
+    fn back_no_target_proven_empty_protects_sparse_current_topology() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        let other_router = install_atomic_router(&mut app, "no-target-other-authority");
+        app.update();
+
+        let other_push = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(other_router, RouteLocation::new("/"))
+            .expect("the second real router accepts its root route");
+        run_updates_until_succeeded(&mut app, other_push);
+        let (other_frame, other_output_claim) = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let other_active = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == other_router)
+                .and_then(|entry| entry.active.as_ref())
+                .expect("the second real router completes one active root");
+            let other_frame = other_active.frames()[0].frame().clone();
+            let output_claim = other_active.frames()[0]
+                .claims()
+                .find(|claim| world.get::<FrameOutput>(claim.entity()).is_some())
+                .cloned()
+                .expect("the second real router registers one exact FrameOutput");
+            assert_eq!(
+                world
+                    .resource::<RouteEntityRegistry>()
+                    .record(output_claim.entity())
+                    .map(|record| record.claim()),
+                Some(output_claim.clone()),
+                "the other-authority fixture must start from its live exact registered claim"
+            );
+            (other_frame, output_claim)
+        };
+
+        let mounted = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .expect("the installed nested router accepts the occupied setup route");
+        run_updates_until_succeeded(&mut app, mounted);
+        let retired_same_authority_frame = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let active = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .and_then(|entry| entry.active.as_ref())
+                .expect("the occupied setup route completes its real nested branch");
+            assert_eq!(active.frames().len(), 2);
+            active.frames()[1].frame().clone()
+        };
+        let truncated = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .replace(router, RouteLocation::new("/"))
+            .expect("the real replace truncates into a retained-empty current slot");
+        run_updates_until_succeeded(&mut app, truncated);
+        let duplicate = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .expect("the real duplicate push creates a second equivalent history entry");
+        run_updates_until_succeeded(&mut app, duplicate);
+
+        let (second_back, bound) =
+            take_real_bound_back_no_target_from_current_history(&mut app, router);
+        let owner = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the installed nested router retains its exact entry");
+            match begin_bound_back_no_target(entry, bound) {
+                BackNoTargetBeginOutcome::Begun(owner) => owner,
+                BackNoTargetBeginOutcome::Permanent(_) => {
+                    panic!("the unchanged real sparse-current source must refreeze")
+                }
+                BackNoTargetBeginOutcome::CapacityRejected { .. } => {
+                    panic!("the transferred real no-target capacity must remain current")
+                }
+                BackNoTargetBeginOutcome::ReceiverMismatch { .. } => {
+                    panic!("the exact nested entry must receive its verified no-target owner")
+                }
+            }
+        };
+        let owner_capacity_before = owner.capacity.capacity_identity_for_test();
+        let (active_frame, active_output, foreign) = {
+            let (active_frame, active_output) = {
+                let world = app.world();
+                let navigation = world.resource::<RouterNavigation>();
+                let active = navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == router)
+                    .and_then(|entry| entry.active.as_ref())
+                    .expect("the real truncate retains one sparse current branch");
+                let output = active.frames()[0]
+                    .claims()
+                    .find(|claim| world.get::<FrameOutput>(claim.entity()).is_some())
+                    .map(ExactRegistryClaim::entity)
+                    .expect("the sparse current frame retains one exact FrameOutput");
+                (active.frames()[0].frame().clone(), output)
+            };
+            let foreign = app.world_mut().spawn(ChildOf(active_output)).id();
+            assert!(
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(foreign)
+                    .is_none(),
+                "the foreign descendant fixture must remain outside router ownership"
+            );
+            (active_frame, active_output, foreign)
+        };
+        assert!(
+            !bevy_ui_router_core::integration::frame_versions_share_router(
+                &active_frame,
+                &other_frame
+            ),
+            "the registered companion must belong to a different opaque router authority"
+        );
+        let other_authority_output = other_output_claim.entity();
+        app.world_mut()
+            .entity_mut(other_authority_output)
+            .insert(ChildOf(active_output));
+        assert_eq!(
+            app.world()
+                .get::<ChildOf>(other_authority_output)
+                .map(ChildOf::parent),
+            Some(active_output),
+            "the other-authority FrameOutput must be observed inside the main active closure"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(other_authority_output)
+                .map(|record| record.claim()),
+            Some(other_output_claim.clone()),
+            "reparenting must retain the foreign router's exact registered claim"
+        );
+
+        let (
+            expected_host,
+            expected_current_claims,
+            expected_observed_closure,
+            expected_protected,
+            expected_attempt_owner_inventory,
+            world_before,
+            registry_before,
+            engine_before,
+            history_before,
+            active_frames_before,
+            active_claims_before,
+            issuer_before,
+            requests_before,
+            public_router_before,
+            public_request_before,
+            other_engine_before,
+            other_history_before,
+            other_active_frames_before,
+            other_active_claims_before,
+            other_requests_before,
+            other_public_router_before,
+            other_public_request_before,
+        ) = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the installed nested router retains its exact entry");
+            let host = entry
+                .host
+                .as_ref()
+                .expect("the admitted nested router retains its exact host binding");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the real truncate retains one sparse current branch");
+            assert_eq!(active.frames().len(), 1);
+            assert_eq!(active.child_slots().len(), 1);
+            let retained = &active.child_slots()[0];
+            assert_eq!(
+                retained.slot_claim().lifecycle(),
+                EntityLifecycle::PreparedInert
+            );
+            assert_eq!(
+                world.get::<ChildSlotLifecycle>(retained.slot()),
+                Some(&ChildSlotLifecycle::RegisteredInert)
+            );
+            assert!(
+                world
+                    .get::<Children>(retained.slot())
+                    .is_none_or(|children| children.is_empty()),
+                "the retained-empty current slot must remain physically unoccupied"
+            );
+            assert!(
+                active
+                    .frames()
+                    .iter()
+                    .all(|frame| { frame.mount_binding().slot_claim() != retained.slot_claim() })
+            );
+            assert!(current_host_binding_is_exact(world, host));
+            assert!(branch_owner_projection_is_exact(world, active));
+
+            assert!(matches!(
+                retained.slot_claim().owner(),
+                RegistryOwner::Committed(EntityOwner::ChildSlot {
+                    parent,
+                    outlet,
+                    slot,
+                }) if parent == retained.parent()
+                    && outlet == retained.outlet()
+                    && *slot == retained.slot_id()
+            ));
+            assert_eq!(
+                retained.slot_claim().lifecycle(),
+                EntityLifecycle::PreparedInert
+            );
+            assert_eq!(
+                retained.anchor(),
+                active_output,
+                "the retained slot fixture must use the exact observed FrameOutput anchor"
+            );
+            assert!(matches!(
+                retained.anchor_claim().owner(),
+                RegistryOwner::Committed(EntityOwner::FrameOutput { frame, .. })
+                    if frame == retained.parent()
+            ));
+            assert_eq!(
+                world
+                    .resource::<RouteEntityRegistry>()
+                    .record(retained.anchor())
+                    .map(|record| record.claim()),
+                Some(retained.anchor_claim().clone())
+            );
+            assert!(cleanup_claim_has_exact_authority(
+                world,
+                retained.anchor_claim(),
+            ));
+            let slot_binding = ProvenEmptyChildSlotBindingProjection {
+                parent: retained.parent().clone(),
+                outlet: retained.outlet().clone(),
+                slot_id: retained.slot_id(),
+                anchor_claim: retained.anchor_claim().clone(),
+                expected_support_relationships: retained.expected_anchor_children().to_vec(),
+            };
+            assert!(
+                slot_binding
+                    .expected_support_relationships
+                    .contains(&retained.slot()),
+                "the owner-held support relationships must include the exact retained slot"
+            );
+            let observed_anchor_children = world
+                .get::<Children>(retained.anchor())
+                .map(|children| children.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            assert!(
+                slot_binding
+                    .expected_support_relationships
+                    .iter()
+                    .all(|expected| observed_anchor_children.contains(expected)),
+                "every owner-held support relationship must still exist"
+            );
+            assert!(
+                [foreign, other_authority_output]
+                    .into_iter()
+                    .all(|extra| observed_anchor_children.contains(&extra)
+                        && !slot_binding.expected_support_relationships.contains(&extra)),
+                "foreign and other-authority extra children must remain closure facts rather than owner-held support"
+            );
+
+            let mut current_claims = active.frames()[0]
+                .claims()
+                .cloned()
+                .map(|claim| ProvenEmptyCurrentClaimProjection {
+                    role: match claim.owner() {
+                        RegistryOwner::Committed(EntityOwner::FrameShell(frame)) => {
+                            ProvenEmptyCurrentRole::FrameShell(frame.clone())
+                        }
+                        RegistryOwner::Committed(EntityOwner::FrameContentTarget(frame)) => {
+                            ProvenEmptyCurrentRole::FrameContentTarget(frame.clone())
+                        }
+                        RegistryOwner::Committed(EntityOwner::FrameOutput { frame, .. }) => {
+                            ProvenEmptyCurrentRole::FrameOutput(frame.clone())
+                        }
+                        owner => panic!(
+                            "the real current frame claim must retain one exact Entity-local role: {owner:?}"
+                        ),
+                    },
+                    claim,
+                })
+                .collect::<Vec<_>>();
+            current_claims.push(ProvenEmptyCurrentClaimProjection {
+                claim: retained.slot_claim().clone(),
+                role: ProvenEmptyCurrentRole::RetainedEmptySlotBinding(slot_binding.clone()),
+            });
+            current_claims.sort_by_key(|current| current.claim.entity().to_bits());
+
+            let mut observed_closure = observed_descendant_closure(world, [host.host])
+                .into_iter()
+                .collect::<Vec<_>>();
+            observed_closure.sort_by_key(|entity| entity.to_bits());
+
+            let mut protected = Vec::new();
+            protected.push(ProvenEmptyProtectedEntityProjection {
+                entity: host.host,
+                observed_parent: world
+                    .get::<bevy_ecs::hierarchy::ChildOf>(host.host)
+                    .map(bevy_ecs::hierarchy::ChildOf::parent),
+                claim: None,
+                role: ProvenEmptyProtectedRole::AppOwnedHost,
+            });
+            protected.push(ProvenEmptyProtectedEntityProjection {
+                entity: host.top_slot,
+                observed_parent: world
+                    .get::<bevy_ecs::hierarchy::ChildOf>(host.top_slot)
+                    .map(bevy_ecs::hierarchy::ChildOf::parent),
+                claim: Some(host.top_slot_claim.clone()),
+                role: ProvenEmptyProtectedRole::HostTopSlot,
+            });
+            protected.extend(active.frames()[0].claims().cloned().map(|claim| {
+                let entity = claim.entity();
+                ProvenEmptyProtectedEntityProjection {
+                    entity,
+                    observed_parent: world
+                        .get::<bevy_ecs::hierarchy::ChildOf>(entity)
+                        .map(bevy_ecs::hierarchy::ChildOf::parent),
+                    role: match claim.owner() {
+                        RegistryOwner::Committed(EntityOwner::FrameShell(frame)) => {
+                            ProvenEmptyProtectedRole::Current(
+                                ProvenEmptyCurrentRole::FrameShell(frame.clone()),
+                            )
+                        }
+                        RegistryOwner::Committed(EntityOwner::FrameContentTarget(frame)) => {
+                            ProvenEmptyProtectedRole::Current(
+                                ProvenEmptyCurrentRole::FrameContentTarget(frame.clone()),
+                            )
+                        }
+                        RegistryOwner::Committed(EntityOwner::FrameOutput { frame, .. }) => {
+                            ProvenEmptyProtectedRole::Current(
+                                ProvenEmptyCurrentRole::FrameOutput(frame.clone()),
+                            )
+                        }
+                        owner => panic!(
+                            "the real protected current claim must retain one exact Entity-local role: {owner:?}"
+                        ),
+                    },
+                    claim: Some(claim),
+                }
+            }));
+            protected.push(ProvenEmptyProtectedEntityProjection {
+                entity: retained.slot(),
+                observed_parent: world
+                    .get::<bevy_ecs::hierarchy::ChildOf>(retained.slot())
+                    .map(bevy_ecs::hierarchy::ChildOf::parent),
+                claim: Some(retained.slot_claim().clone()),
+                role: ProvenEmptyProtectedRole::Current(
+                    ProvenEmptyCurrentRole::RetainedEmptySlotBinding(slot_binding),
+                ),
+            });
+            protected.push(ProvenEmptyProtectedEntityProjection {
+                entity: foreign,
+                observed_parent: Some(active_output),
+                claim: None,
+                role: ProvenEmptyProtectedRole::UnregisteredForeignDescendant,
+            });
+            protected.push(ProvenEmptyProtectedEntityProjection {
+                entity: other_authority_output,
+                observed_parent: Some(active_output),
+                claim: Some(other_output_claim.clone()),
+                role: ProvenEmptyProtectedRole::OtherAuthorityDescendant,
+            });
+            protected.sort_by_key(|protected| protected.entity.to_bits());
+            assert_eq!(
+                protected
+                    .iter()
+                    .map(|protected| protected.entity)
+                    .collect::<Vec<_>>(),
+                observed_closure,
+                "the real sparse current host closure must consist entirely of explicitly protected roles"
+            );
+
+            let snapshots = world.resource::<RouterSnapshots>();
+            let public_request = match snapshots.request(router, second_back) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                crate::snapshots::RequestLookup::NotRetained => {
+                    panic!("the accepted no-target Back must remain publicly retained")
+                }
+                crate::snapshots::RequestLookup::Unknown => {
+                    panic!("the installed nested router must expose its accepted no-target Back")
+                }
+            };
+            let other_entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == other_router)
+                .expect("the second real router retains its exact entry");
+            let other_active = other_entry
+                .active
+                .as_ref()
+                .expect("the second real router retains its active root");
+            let other_public_request = match snapshots.request(other_router, other_push) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                crate::snapshots::RequestLookup::NotRetained => {
+                    panic!("the other router's completed root push must remain publicly retained")
+                }
+                crate::snapshots::RequestLookup::Unknown => {
+                    panic!("the second real router must expose its completed root push")
+                }
+            };
+            let other_host = other_entry
+                .host
+                .as_ref()
+                .expect("the second real router retains its exact host binding");
+            (
+                ProjectionlessHostProjection::from(host),
+                current_claims,
+                observed_closure,
+                protected,
+                ProvenEmptyAttemptOwnerInventory::capture(entry, second_back),
+                ProjectionlessObservedProjection::capture(world, vec![host.host, other_host.host]),
+                world.resource::<RouteEntityRegistry>().records().to_vec(),
+                entry.engine.snapshot(),
+                entry.engine.history().clone(),
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                active.claims().cloned().collect::<Vec<_>>(),
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("the installed entry retains its exact capacity issuer")
+                    .semantic_snapshot_for_test(),
+                entry.requests.clone(),
+                snapshots
+                    .get(router)
+                    .expect("the installed nested router has a public snapshot")
+                    .clone(),
+                public_request,
+                other_entry.engine.snapshot(),
+                other_entry.engine.history().clone(),
+                other_active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                other_active.claims().cloned().collect::<Vec<_>>(),
+                other_entry.requests.clone(),
+                snapshots
+                    .get(other_router)
+                    .expect("the second real router has a public snapshot")
+                    .clone(),
+                other_public_request,
+            )
+        };
+
+        let outcome = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the installed nested router retains its exact entry");
+            freeze_back_no_target_proven_empty(world, entry, owner)
+        };
+        let (returned_owner, projection) = match outcome {
+            BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(owner) => {
+                (owner.owner, Some(owner.projection))
+            }
+            BackNoTargetPhysicalFreezeOutcome::Indeterminate { owner, evidence } => {
+                assert_eq!(
+                    evidence.request, second_back,
+                    "typed physical indeterminate evidence must retain the exact no-target request"
+                );
+                let _typed_reason = evidence.reason;
+                (owner, None)
+            }
+        };
+        assert_eq!(
+            returned_owner.capacity.capacity_identity_for_test(),
+            owner_capacity_before,
+            "every physical outcome must return the whole original no-target preparation owner"
+        );
+        assert_eq!(returned_owner.request, second_back);
+
+        {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the installed nested router retains its exact entry");
+            let host = entry
+                .host
+                .as_ref()
+                .expect("physical rejection cannot remove the exact host binding");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("physical rejection cannot remove the sparse current branch");
+            let other_entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == other_router)
+                .expect("physical rejection cannot remove the second router entry");
+            let other_active = other_entry
+                .active
+                .as_ref()
+                .expect("physical rejection cannot remove the second router active root");
+            let other_host = other_entry
+                .host
+                .as_ref()
+                .expect("physical rejection cannot remove the second router host binding");
+            assert!(
+                ProjectionlessObservedProjection::capture(world, vec![host.host, other_host.host],)
+                    == world_before,
+                "physical rejection must be World zero-write"
+            );
+            assert_eq!(
+                world.resource::<RouteEntityRegistry>().records(),
+                registry_before
+            );
+            assert_eq!(entry.engine.snapshot(), engine_before);
+            assert_eq!(entry.engine.history(), &history_before);
+            assert_eq!(
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                active_frames_before
+            );
+            assert_eq!(
+                active.claims().cloned().collect::<Vec<_>>(),
+                active_claims_before
+            );
+            assert!(current_host_binding_is_exact(world, host));
+            assert!(branch_owner_projection_is_exact(world, active));
+            assert_eq!(
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("physical rejection retains the exact capacity issuer")
+                    .semantic_snapshot_for_test(),
+                issuer_before
+            );
+            assert_eq!(entry.requests, requests_before);
+            assert_eq!(other_entry.engine.snapshot(), other_engine_before);
+            assert_eq!(other_entry.engine.history(), &other_history_before);
+            assert_eq!(
+                other_active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                other_active_frames_before
+            );
+            assert_eq!(
+                other_active.claims().cloned().collect::<Vec<_>>(),
+                other_active_claims_before
+            );
+            assert_eq!(other_entry.requests, other_requests_before);
+            assert_eq!(
+                world
+                    .resource::<RouteEntityRegistry>()
+                    .record(other_authority_output)
+                    .map(|record| record.claim()),
+                Some(other_output_claim.clone()),
+                "physical rejection must preserve the other router's exact registered claim"
+            );
+            let snapshots = world.resource::<RouterSnapshots>();
+            assert_eq!(
+                snapshots
+                    .get(router)
+                    .expect("physical rejection retains the public router snapshot"),
+                &public_router_before
+            );
+            match snapshots.request(router, second_back) {
+                crate::snapshots::RequestLookup::Found(snapshot) => {
+                    assert_eq!(snapshot, &public_request_before)
+                }
+                crate::snapshots::RequestLookup::NotRetained => {
+                    panic!("physical rejection cannot evict the accepted no-target Back")
+                }
+                crate::snapshots::RequestLookup::Unknown => {
+                    panic!("physical rejection cannot hide the accepted no-target Back")
+                }
+            }
+            assert_eq!(
+                snapshots
+                    .get(other_router)
+                    .expect("physical rejection retains the other public router snapshot"),
+                &other_public_router_before
+            );
+            match snapshots.request(other_router, other_push) {
+                crate::snapshots::RequestLookup::Found(snapshot) => {
+                    assert_eq!(snapshot, &other_public_request_before)
+                }
+                crate::snapshots::RequestLookup::NotRetained => {
+                    panic!("physical rejection cannot evict the other router's completed push")
+                }
+                crate::snapshots::RequestLookup::Unknown => {
+                    panic!("physical rejection cannot hide the other router's completed push")
+                }
+            }
+        }
+
+        let Some(projection) = projection else {
+            panic!(
+                "RED: the no-target physical freezer must classify the exact other-authority descendant as protected"
+            );
+        };
+        assert!(
+            projection.host == expected_host,
+            "physical proof must bind the exact host and top-slot authority"
+        );
+        assert_eq!(projection.request, second_back);
+        assert_eq!(
+            projection.authority_graph.root(),
+            Some(&active_frame),
+            "successful physical proof must retain the exact owner-derived root authority"
+        );
+        assert_eq!(projection.authority_graph.frames.len(), 1);
+        assert_eq!(projection.authority_graph.slots.len(), 1);
+        assert!(
+            projection.authority_graph.frames[0].claims.len() >= 3,
+            "successful graph evidence must retain the owner-held frame claims"
+        );
+        assert_eq!(
+            projection.attempt_owner_inventory,
+            expected_attempt_owner_inventory
+        );
+        assert!(
+            projection.attempt_owner_inventory.is_vacant(),
+            "physical proof must freeze a vacant entry-local attempt owner inventory"
+        );
+        assert_eq!(
+            projection.observed_relationship_closure,
+            expected_observed_closure
+        );
+        if projection.current_claims != expected_current_claims
+            || projection.protected != expected_protected
+        {
+            panic!("RED: sparse no-target proof requires exact Entity-local slot-anchor evidence");
+        }
+        assert!(
+            projection.authorized_targets.is_empty(),
+            "a proven-empty no-target projection must authorize zero physical targets"
+        );
+
+        assert!(
+            bevy_ui_router_core::integration::frame_versions_share_router(
+                &active_frame,
+                &retired_same_authority_frame,
+            ),
+            "the companion fact must retain the main router's opaque authority"
+        );
+        assert_ne!(
+            active_frame, retired_same_authority_frame,
+            "the companion fact must not duplicate a stored current-frame claim"
+        );
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .records()
+                .iter()
+                .all(|record| !back_target_driver_owner_belongs_to_frames(
+                    record.owner(),
+                    std::slice::from_ref(&retired_same_authority_frame),
+                )),
+            "the real replace must retire every prior claim before the companion fact is registered"
+        );
+        let same_authority_descendant = app.world_mut().spawn_empty().id();
+        let same_authority_manifest = ComponentManifest::new([
+            app.world()
+                .components()
+                .component_id::<RouteOwnershipSeal>()
+                .expect("the real router registers ownership seals"),
+            app.world()
+                .components()
+                .component_id::<FrameLifecycle>()
+                .expect("the real router registers frame lifecycle"),
+            app.world()
+                .components()
+                .component_id::<ChildOf>()
+                .expect("the real router registers hierarchy relationships"),
+        ]);
+        let same_authority_seal = {
+            let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
+            let seal = registry.issue_seal();
+            registry
+                .register(
+                    same_authority_descendant,
+                    RegistryOwner::Committed(EntityOwner::FrameOutput {
+                        frame: retired_same_authority_frame.clone(),
+                        output: u64::MAX,
+                        local_index: usize::MAX,
+                    }),
+                    seal,
+                    same_authority_manifest,
+                    EntityLifecycle::PreparedInert,
+                )
+                .expect("the retired real frame identity admits one new exact companion fact");
+            seal
+        };
+        app.world_mut()
+            .entity_mut(same_authority_descendant)
+            .insert((
+                RouteOwnershipSeal::new(same_authority_seal),
+                FrameLifecycle(EntityLifecycle::PreparedInert),
+                ChildOf(active_output),
+            ));
+        let same_authority_claim = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(same_authority_descendant)
+            .map(|record| record.claim())
+            .expect("the companion descendant retains its exact registry claim");
+        assert!(cleanup_claim_has_exact_authority(
+            app.world(),
+            &same_authority_claim,
+        ));
+        assert_eq!(
+            app.world()
+                .get::<ChildOf>(same_authority_descendant)
+                .map(ChildOf::parent),
+            Some(active_output)
+        );
+
+        let (
+            same_authority_world_before,
+            same_authority_registry_before,
+            same_authority_engine_before,
+            same_authority_history_before,
+            same_authority_public_router_before,
+            same_authority_public_request_before,
+        ) = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the main real router retains its entry");
+            let host = entry
+                .host
+                .as_ref()
+                .expect("the main real router retains its exact host");
+            let other_host = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == other_router)
+                .and_then(|entry| entry.host.as_ref())
+                .expect("the foreign real router retains its exact host");
+            let snapshots = world.resource::<RouterSnapshots>();
+            let public_request = match snapshots.request(router, second_back) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                crate::snapshots::RequestLookup::NotRetained => {
+                    panic!(
+                        "the accepted no-target Back remains retained before the companion proof"
+                    )
+                }
+                crate::snapshots::RequestLookup::Unknown => {
+                    panic!("the main real router exposes the accepted no-target Back")
+                }
+            };
+            (
+                ProjectionlessObservedProjection::capture(world, vec![host.host, other_host.host]),
+                world.resource::<RouteEntityRegistry>().records().to_vec(),
+                entry.engine.snapshot(),
+                entry.engine.history().clone(),
+                snapshots
+                    .get(router)
+                    .expect("the main real router retains its public snapshot")
+                    .clone(),
+                public_request,
+            )
+        };
+        let returned_capacity_before = returned_owner.capacity.capacity_identity_for_test();
+        let outcome = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the main real router retains its entry");
+            freeze_back_no_target_proven_empty(world, entry, returned_owner)
+        };
+        let returned_owner = match outcome {
+            BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(_) => {
+                panic!(
+                    "RED: unexpected same-authority registered descendants require exact typed evidence"
+                )
+            }
+            BackNoTargetPhysicalFreezeOutcome::Indeterminate { owner, evidence } => {
+                assert_eq!(evidence.request, second_back);
+                match evidence.reason {
+                    BackNoTargetPhysicalIndeterminateReason::UnexpectedSameAuthorityDescendant {
+                        entity,
+                        observed_parent,
+                        claim,
+                    } => {
+                        assert_eq!(entity, same_authority_descendant);
+                        assert_eq!(observed_parent, Some(active_output));
+                        assert_eq!(claim, same_authority_claim);
+                    }
+                    _ => {
+                        panic!(
+                            "RED: unexpected same-authority registered descendants require exact typed evidence"
+                        )
+                    }
+                }
+                owner
+            }
+        };
+        assert_eq!(returned_owner.request, second_back);
+        assert_eq!(
+            returned_owner.capacity.capacity_identity_for_test(),
+            returned_capacity_before
+        );
+        {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("typed indeterminate cannot remove the main real router");
+            let host = entry
+                .host
+                .as_ref()
+                .expect("typed indeterminate cannot remove the main exact host");
+            let other_host = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == other_router)
+                .and_then(|entry| entry.host.as_ref())
+                .expect("typed indeterminate cannot remove the foreign exact host");
+            assert!(
+                ProjectionlessObservedProjection::capture(world, vec![host.host, other_host.host],)
+                    == same_authority_world_before,
+                "same-authority indeterminate must be World zero-write"
+            );
+            assert_eq!(
+                world.resource::<RouteEntityRegistry>().records(),
+                same_authority_registry_before
+            );
+            assert_eq!(entry.engine.snapshot(), same_authority_engine_before);
+            assert_eq!(entry.engine.history(), &same_authority_history_before);
+            let snapshots = world.resource::<RouterSnapshots>();
+            assert_eq!(
+                snapshots
+                    .get(router)
+                    .expect("typed indeterminate retains the main public snapshot"),
+                &same_authority_public_router_before
+            );
+            match snapshots.request(router, second_back) {
+                crate::snapshots::RequestLookup::Found(snapshot) => {
+                    assert_eq!(snapshot, &same_authority_public_request_before)
+                }
+                crate::snapshots::RequestLookup::NotRetained => {
+                    panic!("typed indeterminate cannot evict the accepted no-target Back")
+                }
+                crate::snapshots::RequestLookup::Unknown => {
+                    panic!("typed indeterminate cannot hide the accepted no-target Back")
+                }
+            }
+        }
     }
 
     #[test]

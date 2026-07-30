@@ -128,6 +128,15 @@ impl FrameMountBinding {
         }
     }
 
+    #[cfg(test)]
+    fn replace_host_top_host_for_test(&mut self, replacement: Entity) -> bool {
+        let FrameMountBindingKind::HostTop { host } = &mut self.kind else {
+            return false;
+        };
+        *host = replacement;
+        true
+    }
+
     pub(crate) fn matches_mounted_child_slot(&self, mounted: &MountedChildSlot) -> bool {
         self.slot == mounted.slot()
             && self.slot_claim == *mounted.slot_claim()
@@ -783,6 +792,26 @@ impl RealizedFrame {
     #[cfg(test)]
     pub(crate) fn replace_mount_binding_for_test(&mut self, mount: FrameMountBinding) {
         self.mount = mount;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_host_top_mount_host_for_test(&mut self, replacement: Entity) -> bool {
+        self.mount.replace_host_top_host_for_test(replacement)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_shell_entity_for_test(&mut self, shell: Entity) {
+        self.shell = shell;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_shell_parent_for_test(&mut self, parent: Entity) {
+        let shell = self.shell;
+        self.entities
+            .iter_mut()
+            .find(|realized| realized.entity == shell)
+            .expect("test parent replacement targets the stored frame shell")
+            .parent = parent;
     }
 
     #[cfg(test)]
