@@ -15,9 +15,16 @@ use crate::frame::{
 };
 use crate::history::MemoryHistory;
 use crate::history_authority::{
-    CanonicalHistory, HistoryCommitCapability, HistoryEffect, HistoryExecutionBinding,
-    HistoryExecutionBindingProjection, HistoryPreparationError, HistoryRevision,
-    NormalAttemptIdentity, PreparedHistoryPublication, PreparedPresentationBinding,
+    AcceptedBackReservation, BackAcceptedReservationView, BackAdmissionToken, BackDestination,
+    BackResolutionEvidence, BackResolutionEvidenceClassification, BackResolutionOwnerHandoff,
+    BackResolutionScopeProjection, BackResolutionVerifyOutcome, BackTargetAuthorityLossCause,
+    BackTargetPermanentOwner, BackTargetPreparationBaseline, CanonicalHistory,
+    ClaimHistoryAdmissionWorldError, CoreIssuedWorldSeal, CoreIssuedWorldSealProjection,
+    EnqueueBackErrorKind, HistoryAdmissionStamp, HistoryAdmissionWorldSeal,
+    HistoryCommitCapability, HistoryEffect, HistoryExecutionBinding,
+    HistoryExecutionBindingProjection, HistoryIncarnation, HistoryPreparationError,
+    HistoryRevision, HistorySourceDrift, NormalAttemptIdentity, PrepareBackAdmissionErrorKind,
+    PreparedHistoryPublication, PreparedPresentationBinding, VerifiedBackTargetExecutionOwner,
 };
 #[cfg(test)]
 use crate::history_authority::{
@@ -30,9 +37,10 @@ use crate::ids::{
 use crate::location::RouteLocation;
 use crate::matcher::RouteMatcher;
 use crate::mount::{
-    MountConfirmation, MountError, MountGrant, MountIssuer, MountReceiptAttestation,
-    MountReceiptProof, MountRegistrationCompletion, MountRegistrationDigest,
-    MountRegistrationPermit, MountRequestToken,
+    MountConfirmation, MountError, MountGrant, MountIssuer, MountIssuerContextDisposition,
+    MountIssuerRequestProjection, MountReceiptAttestation, MountReceiptProof,
+    MountRegistrationCompletion, MountRegistrationDigest, MountRegistrationPermit,
+    MountRequestReceiverDisposition, MountRequestToken, MountRequestTokenProjection,
 };
 use crate::presentation::{ActivePresentation, ActivePresentationKind, RouterNavigationState};
 use crate::request::{
@@ -47,6 +55,12 @@ use crate::{HostVersion, slot::RouteSlotKey};
 
 const TERMINAL_RETENTION: usize = 64;
 const ROUTER_DIAGNOSTIC_RETENTION: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackAllocatorBoundary {
+    Attempt,
+    Failure,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FrameTaskIdentity {
@@ -287,6 +301,39 @@ impl AppliedFrameReport {
     pub(crate) fn testing_duplicate(&self) -> Self {
         self.clone()
     }
+}
+
+struct ValidatedAppliedReport {
+    report: AppliedFrameReport,
+    frame: RouteFrameVersion,
+    next_outlet: Option<RouteSlotKey>,
+}
+
+enum AppliedReportTransition {
+    MountRequest(FrameMountRequest),
+    Commit(CommitTicket),
+    FailureCleanup(FailureCleanupRequest),
+}
+
+struct AppliedReportPredicateProjection {
+    next_outlet: Option<RouteSlotKey>,
+    reconciliation: Option<RouteReconciliationProjection>,
+    active_baseline: BackTargetPreparationBaseline,
+}
+
+enum AppliedReportRejection {
+    Identity(ReportError),
+    InvalidInput,
+}
+
+enum AppliedReportInspection {
+    Rejected {
+        report: AppliedFrameReport,
+        rejection: AppliedReportRejection,
+        predicates: AppliedReportPredicateProjection,
+    },
+    ReconciliationDrift,
+    Validated(ValidatedAppliedReport),
 }
 
 pub(crate) struct FrameMountRequest {
@@ -542,6 +589,11 @@ impl FrameMountRequest {
             outlet: self.outlet.clone(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn testing_advance_token_binding(&mut self) {
+        self.token.testing_advance_binding();
+    }
 }
 
 pub(crate) enum EngineAction {
@@ -549,6 +601,38 @@ pub(crate) enum EngineAction {
     MountRequest(FrameMountRequest),
     FailureCleanup(FailureCleanupRequest),
     Commit(CommitTicket),
+    BackResolution(BackResolutionOwnerHandoff),
+}
+
+pub(crate) enum BackTargetResumeAction {
+    FrameTask(FrameTask),
+    MountRequest(FrameMountRequest),
+    Commit(CommitTicket),
+}
+
+pub(crate) struct BackTargetResume {
+    pub(crate) action: BackTargetResumeAction,
+    pub(crate) execution: HistoryExecutionBindingProjection,
+    pub(crate) continuation: BackResolutionScopeProjection,
+}
+
+pub(crate) enum BackTargetStart {
+    Ready(BackTargetResume),
+    FailureCleanup(FailureCleanupRequest),
+}
+
+pub(crate) enum BackTargetResumeOutcome {
+    Resumed(BackTargetStart),
+    Permanent(BackTargetPermanentOwner),
+    Mismatch(VerifiedBackTargetExecutionOwner),
+}
+
+enum StartReconciledRequestOutcome {
+    Started(HistoryExecutionBindingProjection),
+    BackSourceDrift {
+        reservation: ReservedBranchAttempt,
+        drift: HistorySourceDrift,
+    },
 }
 
 #[derive(Debug)]
@@ -635,6 +719,365 @@ impl ValidatedPublication<'_> {
         drop(prepared);
         engine.publish_validated(mutation);
     }
+}
+
+pub(crate) struct CoreBackTargetCommitRetainedInputProjection {
+    scope: BackResolutionScopeProjection,
+    error: CommitError,
+}
+
+pub(crate) struct CoreBackTargetCommitFailureCleanup {
+    continuation: BackResolutionScopeProjection,
+    request: FailureCleanupRequest,
+}
+
+pub(crate) struct CoreBackTargetCommitRejectedPublication {
+    continuation: BackResolutionScopeProjection,
+    rejection: PreparedPublicationRejection,
+}
+
+pub(crate) struct CoreBackTargetDriverFailureCleanup {
+    pub(crate) scope: BackResolutionScopeProjection,
+    pub(crate) request: FailureCleanupRequest,
+}
+
+pub(crate) struct CoreBackTargetDriverFallback {
+    pub(crate) scope: BackResolutionScopeProjection,
+    pub(crate) action: FrameTaskIdentity,
+    expected_attempt: CoreBackTargetReceiverAttemptProjection,
+}
+
+pub(crate) struct CoreBackTargetDriverTerminal {
+    pub(crate) scope: BackResolutionScopeProjection,
+    pub(crate) request: NavigationRequestId,
+}
+
+pub(crate) struct CoreBackTargetDriverTerminalProjection {
+    pub(crate) scope: BackResolutionScopeProjection,
+    pub(crate) request: NavigationRequestId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetFailureCleanupRequestProjection {
+    identity: FrameTaskIdentity,
+    expected: PendingFailureKind,
+    logical_roots: Vec<RouteFrameVersion>,
+    failure: NavigationFailure,
+    continuation: FailureCleanupContinuation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CoreBackTargetReceiverActionProjection {
+    Missing,
+    FrameTask(FrameTaskIdentity),
+    MountRequest {
+        token: MountRequestTokenProjection,
+        request: NavigationRequestId,
+        parent: RouteFrameVersion,
+        outlet: RouteSlotKey,
+    },
+    FailureCleanup(CoreBackTargetFailureCleanupRequestProjection),
+    Commit(FrameTaskIdentity),
+    BackResolution,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CoreBackTargetReceiverAttemptProjection {
+    Missing,
+    NormalPush,
+    NormalReplace,
+    NormalBack,
+    Fallback { original_failure: NavigationFailure },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CoreBackTargetReceiverStageProjection {
+    Missing,
+    Applying,
+    AwaitingMount,
+    AwaitingReceipt,
+    ConfirmingMount,
+    ReadyToCommit,
+    CommitSealed,
+    PostCommitCleanup,
+    FailureCleanupManifestPending(CoreBackTargetFailureCleanupRequestProjection),
+    FailureCleanupPrepared,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetEngineScopeProjection {
+    pub(crate) world: Option<CoreIssuedWorldSealProjection>,
+    pub(crate) router: RouterIdentity,
+    pub(crate) history: HistoryIncarnation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CoreBackTargetReservedFrameProjection {
+    frame_task: FrameTaskId,
+    frame: RouteFrameId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoreBackTargetPendingMountProjection {
+    child_index: usize,
+    parent: RouteFrameVersion,
+    outlet: RouteSlotKey,
+    from_preserved_parent: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoreBackTargetMountCurrentProjection {
+    identity: FrameTaskIdentity,
+    branch_routes: Option<Vec<MatchedRoute>>,
+    reservation: Vec<CoreBackTargetReservedFrameProjection>,
+    target_frames: Vec<RouteFrameVersion>,
+    applied_frames: Vec<RouteFrameVersion>,
+    current_target: FrameMountTarget,
+    pending_mount: Option<CoreBackTargetPendingMountProjection>,
+    stage: CoreBackTargetReceiverStageProjection,
+    reconciliation: Option<RouteReconciliationProjection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoreBackTargetMountContextProjection {
+    router: RouterIdentity,
+    host: Option<HostVersion>,
+    top_slot: Option<RouteSlotId>,
+    current: Option<CoreBackTargetMountCurrentProjection>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoreBackTargetMountContextDisposition {
+    Matched,
+    Mismatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoreBackTargetMountObservedProjection {
+    issuer: MountIssuerRequestProjection,
+    context: CoreBackTargetMountContextProjection,
+    receiver: MountRequestReceiverDisposition,
+    engine_context: CoreBackTargetMountContextDisposition,
+    issuer_context: MountIssuerContextDisposition,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetExecutionExpectedProjection {
+    pub(crate) scope: BackResolutionScopeProjection,
+    pub(crate) execution: HistoryExecutionBindingProjection,
+    pub(crate) physical: CoreBackTargetReceiverActionProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetExecutionObservedProjection {
+    scope: CoreBackTargetEngineScopeProjection,
+    history: Option<HistoryExecutionBindingProjection>,
+    pub(crate) current: Option<FrameTaskIdentity>,
+    action: CoreBackTargetReceiverActionProjection,
+    stage: CoreBackTargetReceiverStageProjection,
+    mount: Option<CoreBackTargetMountObservedProjection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetContinuationExpectedProjection {
+    pub(crate) scope: BackResolutionScopeProjection,
+    pub(crate) commit: Option<FrameTaskIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetContinuationObservedProjection {
+    pub(crate) scope: CoreBackTargetEngineScopeProjection,
+    pub(crate) history: Option<HistoryExecutionBindingProjection>,
+    pub(crate) current: Option<FrameTaskIdentity>,
+    pub(crate) action: CoreBackTargetReceiverActionProjection,
+    pub(crate) stage: CoreBackTargetReceiverStageProjection,
+}
+
+struct CoreBackTargetExecutionInspection {
+    expected: CoreBackTargetExecutionExpectedProjection,
+    observed: CoreBackTargetExecutionObservedProjection,
+    exact: bool,
+}
+
+impl CoreBackTargetExecutionInspection {
+    fn into_exact(
+        self,
+    ) -> Result<
+        (
+            CoreBackTargetExecutionExpectedProjection,
+            CoreBackTargetExecutionObservedProjection,
+        ),
+        CorePreparationReceiverMismatchProjection,
+    > {
+        if self.exact {
+            Ok((self.expected, self.observed))
+        } else {
+            Err(CorePreparationReceiverMismatchProjection::Execution {
+                expected: self.expected,
+                observed: self.observed,
+            })
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CoreBackTargetAppliedReportProjection {
+    LegacyLeaf,
+    WithOutlets(Vec<RouteSlotKey>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetAppliedExpectedProjection {
+    receiver: CoreBackTargetExecutionExpectedProjection,
+    pub(crate) report: CoreBackTargetAppliedReportProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetAppliedObservedProjection {
+    receiver: CoreBackTargetExecutionObservedProjection,
+    pub(crate) next_outlet: Option<RouteSlotKey>,
+    reconciliation: Option<RouteReconciliationProjection>,
+    active_baseline: BackTargetPreparationBaseline,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetDriverFailureCleanupExpectedProjection {
+    pub(crate) scope: BackResolutionScopeProjection,
+    pub(crate) request: CoreBackTargetFailureCleanupRequestProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetDriverFailureCleanupObservedProjection {
+    scope: CoreBackTargetEngineScopeProjection,
+    pub(crate) current: Option<FrameTaskIdentity>,
+    pub(crate) stage: CoreBackTargetReceiverStageProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetDriverFallbackExpectedProjection {
+    pub(crate) scope: BackResolutionScopeProjection,
+    pub(crate) action: CoreBackTargetReceiverActionProjection,
+    pub(crate) attempt: CoreBackTargetReceiverAttemptProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetDriverFallbackObservedProjection {
+    scope: CoreBackTargetEngineScopeProjection,
+    pub(crate) action: CoreBackTargetReceiverActionProjection,
+    pub(crate) current: Option<FrameTaskIdentity>,
+    pub(crate) attempt: CoreBackTargetReceiverAttemptProjection,
+    pub(crate) stage: CoreBackTargetReceiverStageProjection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoreBackTargetDriverTerminalExpectedStatus {
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetDriverTerminalExpectedProjection {
+    pub(crate) scope: BackResolutionScopeProjection,
+    pub(crate) router: RouterIdentity,
+    pub(crate) request: NavigationRequestId,
+    pub(crate) status: CoreBackTargetDriverTerminalExpectedStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CoreBackTargetDriverTerminalObservedRequestProjection {
+    Retained {
+        request: NavigationRequestId,
+        status: RequestStatus,
+    },
+    Evicted {
+        request: NavigationRequestId,
+        evicted_through: Option<u64>,
+        highest_issued: Option<u64>,
+    },
+    Unknown {
+        request: NavigationRequestId,
+        evicted_through: Option<u64>,
+        highest_issued: Option<u64>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetDriverTerminalObservedProjection {
+    scope: CoreBackTargetEngineScopeProjection,
+    pub(crate) request: CoreBackTargetDriverTerminalObservedRequestProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CorePreparationReceiverMismatchProjection {
+    Scope {
+        expected: BackResolutionScopeProjection,
+        observed: BackResolutionScopeProjection,
+    },
+    Continuation {
+        expected: CoreBackTargetContinuationExpectedProjection,
+        observed: CoreBackTargetContinuationObservedProjection,
+    },
+    Execution {
+        expected: CoreBackTargetExecutionExpectedProjection,
+        observed: CoreBackTargetExecutionObservedProjection,
+    },
+    Applied {
+        expected: CoreBackTargetAppliedExpectedProjection,
+        observed: CoreBackTargetAppliedObservedProjection,
+    },
+    DriverFailureCleanup {
+        expected: CoreBackTargetDriverFailureCleanupExpectedProjection,
+        observed: CoreBackTargetDriverFailureCleanupObservedProjection,
+    },
+    DriverFallback {
+        expected: CoreBackTargetDriverFallbackExpectedProjection,
+        observed: CoreBackTargetDriverFallbackObservedProjection,
+    },
+    DriverTerminal {
+        expected: CoreBackTargetDriverTerminalExpectedProjection,
+        observed: CoreBackTargetDriverTerminalObservedProjection,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CoreBackTargetPhysicalReceiverRef<'a> {
+    FrameTask(&'a FrameTask),
+    MountRequest(&'a FrameMountRequest),
+    Commit(&'a CommitTicket),
+}
+
+pub(crate) enum CoreBackTargetDriverFailureReportMode {
+    Normal,
+    PhysicalResidual,
+}
+
+pub(crate) enum CoreBackTargetDriverFailureReport {
+    FailureCleanup(CoreBackTargetDriverFailureCleanup),
+    Fallback(CoreBackTargetDriverFallback),
+    Terminal(CoreBackTargetDriverTerminal),
+}
+
+pub(crate) enum CoreBackTargetAppliedOutcome {
+    MountRequest(FrameMountRequest),
+    Commit(CommitTicket),
+    FailureCleanup(CoreBackTargetDriverFailureCleanup),
+}
+
+pub(crate) enum BackTargetCommitOperationFailure {
+    RetainedInput {
+        continuation: BackResolutionScopeProjection,
+        evidence: CoreBackTargetCommitRetainedInputProjection,
+    },
+    FailureCleanup(CoreBackTargetCommitFailureCleanup),
+    RejectedPublication(CoreBackTargetCommitRejectedPublication),
+}
+
+pub(crate) enum BackTargetCommitOperationOutcome<'a> {
+    Validated {
+        publication: ValidatedPublication<'a>,
+        cleanup: CleanupBatchToken,
+        continuation: BackResolutionScopeProjection,
+    },
+    Failed(BackTargetCommitOperationFailure),
 }
 
 enum PreparedPublicationAuthority {
@@ -912,6 +1355,32 @@ struct ConfirmedChildPublication {
     input: RouteViewInput,
 }
 
+struct PreparedBackTargetInstallation {
+    current: CurrentWork,
+    records: VecDeque<NavigationRequestRecord>,
+    state: RouterNavigationState,
+    issued_view_tasks: Vec<FrameTaskIdentity>,
+}
+
+struct PreparedBackTargetReady {
+    installation: PreparedBackTargetInstallation,
+    history_capability: HistoryCommitCapability,
+    action: BackTargetResumeAction,
+    execution: HistoryExecutionBindingProjection,
+    continuation: BackResolutionScopeProjection,
+}
+
+struct PreparedBackTargetFailureCleanup {
+    installation: PreparedBackTargetInstallation,
+    request: FailureCleanupRequest,
+}
+
+enum PreparedBackTargetStart {
+    Ready(PreparedBackTargetReady),
+    FailureCleanup(PreparedBackTargetFailureCleanup),
+    Permanent(BackTargetPermanentOwner),
+}
+
 #[derive(Clone, Debug)]
 enum QueuedMatchOutcome {
     Matched(MatchedBranch),
@@ -922,12 +1391,14 @@ enum QueuedMatchOutcome {
 enum NavigationCommand {
     Push(RouteLocation),
     Replace(RouteLocation),
+    Back,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NavigationCommandKind {
     Push,
     Replace,
+    Back,
 }
 
 impl NavigationCommand {
@@ -935,29 +1406,45 @@ impl NavigationCommand {
         match self {
             Self::Push(_) => NavigationCommandKind::Push,
             Self::Replace(_) => NavigationCommandKind::Replace,
+            Self::Back => NavigationCommandKind::Back,
         }
     }
 
-    fn location(&self) -> &RouteLocation {
+    fn location(&self) -> Option<&RouteLocation> {
         match self {
-            Self::Push(location) | Self::Replace(location) => location,
+            Self::Push(location) | Self::Replace(location) => Some(location),
+            Self::Back => None,
         }
     }
 
-    fn history_effect(&self) -> HistoryEffect {
+    fn history_effect(&self) -> Option<HistoryEffect> {
         match self {
-            Self::Push(location) => HistoryEffect::Push(location.clone()),
-            Self::Replace(location) => HistoryEffect::Replace(location.clone()),
+            Self::Push(location) => Some(HistoryEffect::Push(location.clone())),
+            Self::Replace(location) => Some(HistoryEffect::Replace(location.clone())),
+            Self::Back => None,
         }
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
+enum QueuedReservation {
+    Branch(ReservedBranchAttempt),
+    RequestOnly(NavigationRequestId),
+}
+
+#[derive(Debug)]
 struct QueuedNavigation {
     request: NavigationRequestId,
     command: NavigationCommand,
-    outcome: QueuedMatchOutcome,
-    reservation: Option<ReservedBranchAttempt>,
+    outcome: Option<QueuedMatchOutcome>,
+    reservation: QueuedReservation,
+}
+
+#[derive(Debug)]
+struct PendingNoTargetBack {
+    request: NavigationRequestId,
+    #[allow(dead_code)]
+    source: crate::history_authority::FrozenHistorySource,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -986,6 +1473,7 @@ pub(crate) struct RouterEngine {
     fallback: RouteViewKey,
     state: RouterNavigationState,
     history: CanonicalHistory,
+    history_admission_world: Option<CoreIssuedWorldSealProjection>,
     active_branch: Option<MatchedBranch>,
     active_child_slots: Vec<LogicalChildSlotBinding>,
     records: VecDeque<NavigationRequestRecord>,
@@ -993,6 +1481,7 @@ pub(crate) struct RouterEngine {
     highest_issued: Option<u64>,
     queue: VecDeque<QueuedNavigation>,
     current: Option<CurrentWork>,
+    pending_no_target_back: Option<PendingNoTargetBack>,
     current_history_capability: Option<HistoryCommitCapability>,
     pending_history_preparation_error: Option<HistoryPreparationError>,
     prepared_publication_authority: Option<PreparedPublicationAuthority>,
@@ -1022,6 +1511,7 @@ impl RouterEngine {
             fallback,
             state: RouterNavigationState::new(router),
             history: CanonicalHistory::new(router),
+            history_admission_world: None,
             active_branch: None,
             active_child_slots: Vec::new(),
             records: VecDeque::new(),
@@ -1029,6 +1519,7 @@ impl RouterEngine {
             highest_issued: None,
             queue: VecDeque::new(),
             current: None,
+            pending_no_target_back: None,
             current_history_capability: None,
             pending_history_preparation_error: None,
             prepared_publication_authority: None,
@@ -1624,7 +2115,10 @@ impl RouterEngine {
         if self.state.host().is_none() {
             return Err(PushError::AwaitingHost);
         }
-        let location = command.location().clone();
+        let location = command
+            .location()
+            .expect("push and replace carry an enqueue-time target")
+            .clone();
         let matched = self.matcher.match_location(&location);
         let (request, outcome, reservation) = match matched {
             Ok(branch) => {
@@ -1634,8 +2128,8 @@ impl RouterEngine {
                     .map_err(|_| PushError::IdExhausted)?;
                 (
                     reserved.request(),
-                    QueuedMatchOutcome::Matched(branch),
-                    Some(reserved),
+                    Some(QueuedMatchOutcome::Matched(branch)),
+                    QueuedReservation::Branch(reserved),
                 )
             }
             Err(error) => {
@@ -1645,11 +2139,11 @@ impl RouterEngine {
                     .map_err(|_| PushError::IdExhausted)?;
                 (
                     request,
-                    QueuedMatchOutcome::MatchFailed(NavigationFailure::new(
+                    Some(QueuedMatchOutcome::MatchFailed(NavigationFailure::new(
                         NavigationFailureKind::Match,
                         error.redacted_message(),
-                    )),
-                    None,
+                    ))),
+                    QueuedReservation::RequestOnly(request),
                 )
             }
         };
@@ -1667,8 +2161,986 @@ impl RouterEngine {
         Ok(request)
     }
 
+    pub(crate) fn claim_history_admission_world(
+        &mut self,
+    ) -> Result<HistoryAdmissionWorldSeal, ClaimHistoryAdmissionWorldError> {
+        if self.history_admission_world.is_some() {
+            return Err(ClaimHistoryAdmissionWorldError::AlreadyClaimed);
+        }
+        let seal = CoreIssuedWorldSeal::issue(self.router, self.history.incarnation())?;
+        self.history_admission_world = Some(seal.projection());
+        Ok(HistoryAdmissionWorldSeal::issued(seal))
+    }
+
+    pub(crate) fn history_admission_stamp(
+        &self,
+        world: &HistoryAdmissionWorldSeal,
+    ) -> Result<HistoryAdmissionStamp, PrepareBackAdmissionErrorKind> {
+        let Some(issued) = self.history_admission_world else {
+            return Err(PrepareBackAdmissionErrorKind::ForeignStamp);
+        };
+        if world.projection() != issued {
+            return Err(PrepareBackAdmissionErrorKind::ForeignStamp);
+        }
+        Ok(HistoryAdmissionStamp::issued(
+            issued,
+            self.router,
+            self.history.incarnation(),
+            self.history.revision(),
+            self.history.snapshot().can_back(),
+        ))
+    }
+
+    pub(crate) fn prepare_back_admission(
+        &self,
+        current_world: &HistoryAdmissionWorldSeal,
+        stamp: &HistoryAdmissionStamp,
+    ) -> Result<BackAdmissionToken, PrepareBackAdmissionErrorKind> {
+        let Some(issued) = self.history_admission_world else {
+            return Err(PrepareBackAdmissionErrorKind::ForeignStamp);
+        };
+        if current_world.projection() != issued
+            || !stamp.matches(issued, self.router, self.history.incarnation())
+        {
+            return Err(PrepareBackAdmissionErrorKind::ForeignStamp);
+        }
+        let _published_revision = stamp.published_revision();
+        if self.state.availability() != &crate::presentation::RouterAvailability::Ready {
+            return Err(PrepareBackAdmissionErrorKind::AuthorityRecovering);
+        }
+        if !stamp.can_back() {
+            return Err(PrepareBackAdmissionErrorKind::NoBackEntry);
+        }
+        Ok(BackAdmissionToken::issued(stamp, self.history.revision()))
+    }
+
+    pub(crate) fn enqueue_back(
+        &mut self,
+        admission: BackAdmissionToken,
+    ) -> Result<AcceptedBackReservation, EnqueueBackErrorKind> {
+        self.enqueue_back_observed(admission, |_| {})
+    }
+
+    pub(crate) fn enqueue_back_observed<F>(
+        &mut self,
+        admission: BackAdmissionToken,
+        mut observe: F,
+    ) -> Result<AcceptedBackReservation, EnqueueBackErrorKind>
+    where
+        F: FnMut(BackAllocatorBoundary),
+    {
+        let Some(issued) = self.history_admission_world else {
+            return Err(EnqueueBackErrorKind::AuthorityRecovering);
+        };
+        if self.state.availability() != &crate::presentation::RouterAvailability::Ready
+            || !admission.matches(
+                issued,
+                self.router,
+                self.history.incarnation(),
+                self.history.revision(),
+            )
+        {
+            return Err(EnqueueBackErrorKind::AuthorityRecovering);
+        }
+        let maximum_depth = self.matcher.max_branch_depth();
+        debug_assert!(maximum_depth > 0, "an installed route tree has one root");
+        observe(BackAllocatorBoundary::Attempt);
+        let reservation = match self
+            .ids
+            .reserve_navigation_branch(self.router, maximum_depth)
+        {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                observe(BackAllocatorBoundary::Failure);
+                return Err(EnqueueBackErrorKind::Exhausted);
+            }
+        };
+        let request = reservation.request();
+        let accepted = AcceptedBackReservation::accepted(
+            issued,
+            self.router,
+            self.history.incarnation(),
+            &reservation,
+        );
+        self.records
+            .push_back(NavigationRequestRecord::unresolved_back(request));
+        self.highest_issued = Some(request.sequence());
+        self.queue.push_back(QueuedNavigation {
+            request,
+            command: NavigationCommand::Back,
+            outcome: None,
+            reservation: QueuedReservation::Branch(reservation),
+        });
+        Ok(accepted)
+    }
+
+    pub(crate) fn verify_back_resolution_handoff(
+        &mut self,
+        accepted: BackAcceptedReservationView,
+        handoff: BackResolutionOwnerHandoff,
+    ) -> BackResolutionVerifyOutcome {
+        let observed = handoff.evidence();
+        let request = observed.request();
+        let exact_lineage = accepted.matches(
+            self.history_admission_world,
+            self.router,
+            self.history.incarnation(),
+            handoff.scope_projection(),
+        );
+        let exact_record = exact_lineage
+            && self.request(request).is_some_and(|record| {
+                record.classify_back_resolution(&observed)
+                    == BackResolutionEvidenceClassification::Current
+            });
+        if exact_record {
+            self.record_mut(request)
+                .expect("exact retained Back evidence was checked before consumption")
+                .consume_back_resolution(&observed)
+                .expect("exact current Back evidence is consumed once");
+            return BackResolutionVerifyOutcome::Matched(handoff.into_verified(accepted));
+        }
+        let evidence = BackResolutionEvidence::mismatch(&accepted, &handoff);
+        BackResolutionVerifyOutcome::Mismatch {
+            accepted,
+            handoff,
+            evidence,
+        }
+    }
+
+    pub(crate) fn classify_back_resolution_evidence(
+        &self,
+        evidence: &BackResolutionEvidence,
+    ) -> BackResolutionEvidenceClassification {
+        if !evidence.matches_engine_scope(
+            self.history_admission_world,
+            self.router,
+            self.history.incarnation(),
+        ) {
+            return BackResolutionEvidenceClassification::Foreign;
+        }
+        let request = evidence.request();
+        if let Some(record) = self.request(request) {
+            return record.classify_back_resolution(evidence);
+        }
+        let sequence = request.sequence();
+        if request.router_identity() == self.router
+            && self
+                .evicted_through
+                .is_some_and(|evicted| sequence <= evicted)
+            && self
+                .highest_issued
+                .is_some_and(|highest| sequence <= highest)
+        {
+            BackResolutionEvidenceClassification::ConsumedReplay
+        } else {
+            BackResolutionEvidenceClassification::Foreign
+        }
+    }
+
+    pub(crate) fn resume_back_target_with_retirement<F>(
+        &mut self,
+        owner: VerifiedBackTargetExecutionOwner,
+        commit_retirement: F,
+    ) -> BackTargetResumeOutcome
+    where
+        F: FnOnce(),
+    {
+        let exact_receiver = owner.matches_receiver(
+            self.history_admission_world,
+            self.router,
+            self.history.incarnation(),
+        );
+        if !exact_receiver {
+            return BackTargetResumeOutcome::Mismatch(owner);
+        }
+
+        let prepared = self.prepare_back_target_start(owner);
+        commit_retirement();
+        self.install_prepared_back_target_start(prepared)
+    }
+
+    fn prepare_back_target_start(
+        &mut self,
+        owner: VerifiedBackTargetExecutionOwner,
+    ) -> PreparedBackTargetStart {
+        let evidence = owner.evidence();
+        let request = evidence.request();
+        let (continuation, reservation, destination, expected_baseline) =
+            owner.into_execution_parts();
+        if let Err(observed_source) = self.history.refreeze_back_source(&destination) {
+            let observed_baseline = self.back_target_preparation_baseline();
+            return PreparedBackTargetStart::Permanent(
+                BackTargetPermanentOwner::source_refreeze_drift(
+                    continuation,
+                    reservation,
+                    destination,
+                    observed_source,
+                    expected_baseline,
+                    observed_baseline,
+                ),
+            );
+        }
+        let observed_baseline = self.back_target_preparation_baseline();
+
+        let authority_lost = |continuation, reservation, destination, cause| {
+            PreparedBackTargetStart::Permanent(BackTargetPermanentOwner::authority_lost(
+                continuation,
+                reservation,
+                destination,
+                cause,
+                expected_baseline.clone(),
+                observed_baseline.clone(),
+            ))
+        };
+
+        if let Err(cause) = expected_baseline.classify_refreeze(&observed_baseline) {
+            return authority_lost(continuation, reservation, destination, cause);
+        }
+        if self.action.is_some()
+            || self.current.is_some()
+            || self.pending_no_target_back.is_some()
+            || self.current_history_capability.is_some()
+        {
+            return authority_lost(
+                continuation,
+                reservation,
+                destination,
+                BackTargetAuthorityLossCause::RequestRecord,
+            );
+        }
+
+        let Some(record_index) = self.records.iter().position(|record| {
+            record.id() == request
+                && record.classify_back_resolution(&evidence)
+                    == BackResolutionEvidenceClassification::ConsumedReplay
+                && record.requested() == Some(destination.target_location())
+                && !is_terminal(record.status())
+        }) else {
+            return authority_lost(
+                continuation,
+                reservation,
+                destination,
+                BackTargetAuthorityLossCause::RequestRecord,
+            );
+        };
+        let records = self.records.clone();
+        let mut record = records[record_index].clone();
+
+        let Some(host) = self.state.host().cloned() else {
+            return authority_lost(
+                continuation,
+                reservation,
+                destination,
+                BackTargetAuthorityLossCause::Host,
+            );
+        };
+        let Some(top_slot) = self.state.top_slot() else {
+            return authority_lost(
+                continuation,
+                reservation,
+                destination,
+                BackTargetAuthorityLossCause::Host,
+            );
+        };
+        if host.router_identity() != self.router {
+            return authority_lost(
+                continuation,
+                reservation,
+                destination,
+                BackTargetAuthorityLossCause::Host,
+            );
+        }
+
+        let location = destination.target_location().clone();
+        let Ok(branch) = self.matcher.match_location(&location) else {
+            return authority_lost(
+                continuation,
+                reservation,
+                destination,
+                BackTargetAuthorityLossCause::TargetMatch,
+            );
+        };
+        if record
+            .set_matched(branch.branch_fingerprint().clone())
+            .is_err()
+        {
+            return authority_lost(
+                continuation,
+                reservation,
+                destination,
+                BackTargetAuthorityLossCause::RequestRecord,
+            );
+        }
+        if branch.routes().len() > reservation.frames().len() {
+            return authority_lost(
+                continuation,
+                reservation,
+                destination,
+                BackTargetAuthorityLossCause::MaximumDepth,
+            );
+        }
+
+        let reserved_frames = reservation.frames()[..branch.routes().len()].to_vec();
+        let reserved_frame_ids = reserved_frames
+            .iter()
+            .map(|reserved| reserved.frame())
+            .collect::<Vec<_>>();
+        let active_location = self.state.active().location();
+        let reconciliation_fragment = active_location.is_some_and(|active| {
+            active.path() == location.path()
+                && active.search() == location.search()
+                && active.fragment() != location.fragment()
+        }) && self
+            .current_active_branch()
+            .is_some_and(|active| active.branch_fingerprint() == branch.branch_fingerprint());
+        let reconciliation = match RouteReconciliationProjection::from_running(
+            self.router,
+            host.host(),
+            host.epoch(),
+            top_slot,
+            active_location,
+            self.current_active_branch(),
+            self.state.active().frames(),
+            &self.active_child_slots,
+            &branch,
+            &reserved_frame_ids,
+            reconciliation_fragment,
+        ) {
+            Ok(reconciliation) => reconciliation,
+            Err(ReconciliationProjectionError::InvalidActiveBaseline) => {
+                return authority_lost(
+                    continuation,
+                    reservation,
+                    destination,
+                    BackTargetAuthorityLossCause::ActiveBaseline,
+                );
+            }
+            Err(ReconciliationProjectionError::GenerationExhausted) => {
+                return authority_lost(
+                    continuation,
+                    reservation,
+                    destination,
+                    BackTargetAuthorityLossCause::Generation,
+                );
+            }
+        };
+
+        let mut target_frames = reconciliation
+            .preserved()
+            .iter()
+            .map(|frame| frame.version().clone())
+            .collect::<Vec<_>>();
+        let cleanup_roots = reconciliation
+            .leaving()
+            .iter()
+            .map(|frame| frame.version().clone())
+            .collect::<Vec<_>>();
+        let root_frame = reconciliation
+            .preserved()
+            .iter()
+            .find(|frame| frame.branch_index() == 0)
+            .map(|frame| frame.version().clone())
+            .or_else(|| {
+                reconciliation
+                    .entering()
+                    .iter()
+                    .find(|frame| frame.branch_index() == 0)
+                    .map(|entering| {
+                        RouteFrameVersion::new(
+                            self.router,
+                            host.host(),
+                            top_slot,
+                            FrameOrigin::MatchedRoute(entering.route()),
+                            entering.frame(),
+                            entering.generation(),
+                        )
+                    })
+            });
+        let Some(root_frame) = root_frame else {
+            return authority_lost(
+                continuation,
+                reservation,
+                destination,
+                BackTargetAuthorityLossCause::ActiveBaseline,
+            );
+        };
+        let Some(root_reservation) = reserved_frames.first() else {
+            return authority_lost(
+                continuation,
+                reservation,
+                destination,
+                BackTargetAuthorityLossCause::MaximumDepth,
+            );
+        };
+        let root_attempt = NormalAttemptIdentity::new(
+            host.host(),
+            host.epoch(),
+            top_slot,
+            root_reservation.frame_task(),
+            root_frame.frame(),
+            root_frame.generation(),
+            root_frame.origin().clone(),
+            0,
+        );
+        let execution = HistoryExecutionBinding::new(
+            self.router,
+            request,
+            root_attempt,
+            reservation.transaction(),
+            reservation.cleanup_batch(),
+        );
+        let execution_projection = execution.projection();
+
+        let Some(entering) = reconciliation.entering().first().cloned() else {
+            let Some(leaf_index) = target_frames.len().checked_sub(1) else {
+                return authority_lost(
+                    continuation,
+                    reservation,
+                    destination,
+                    BackTargetAuthorityLossCause::ActiveBaseline,
+                );
+            };
+            let Some(leaf) = branch.routes().get(leaf_index) else {
+                return authority_lost(
+                    continuation,
+                    reservation,
+                    destination,
+                    BackTargetAuthorityLossCause::ActiveBaseline,
+                );
+            };
+            let Some(reserved) = reserved_frames.get(leaf_index) else {
+                return authority_lost(
+                    continuation,
+                    reservation,
+                    destination,
+                    BackTargetAuthorityLossCause::MaximumDepth,
+                );
+            };
+            let frame = target_frames[leaf_index].clone();
+            let identity = FrameTaskIdentity {
+                router: self.router,
+                host: host.host(),
+                host_epoch: host.epoch(),
+                slot: frame.slot(),
+                request,
+                transaction: reservation.transaction(),
+                frame_task: reserved.frame_task(),
+                frame: frame.frame(),
+                generation: frame.generation(),
+                origin: FrameOrigin::MatchedRoute(leaf.route()),
+                branch_index: leaf_index,
+            };
+            let target = if leaf_index == 0 {
+                FrameMountTarget::TopSlot {
+                    host: host.clone(),
+                    slot: top_slot,
+                }
+            } else {
+                let Some(parent) = target_frames.get(leaf_index - 1).cloned() else {
+                    return authority_lost(
+                        continuation,
+                        reservation,
+                        destination,
+                        BackTargetAuthorityLossCause::ActiveBaseline,
+                    );
+                };
+                FrameMountTarget::ChildOutlet {
+                    parent,
+                    outlet: leaf.slot().clone(),
+                }
+            };
+            let phase = NavigationPhase::ReadyToSwitch;
+            if record
+                .transition(RequestStatus::Running(phase.clone()))
+                .is_err()
+                || record
+                    .append_trace(NavigationTraceEvent::request_phase_changed(phase.clone()))
+                    .is_err()
+            {
+                return authority_lost(
+                    continuation,
+                    reservation,
+                    destination,
+                    BackTargetAuthorityLossCause::RequestRecord,
+                );
+            }
+            let mut state = self.state.clone();
+            state.set_request(Some(RequestStatus::Running(phase)));
+            let history_capability = match self.history.freeze_back(execution, destination) {
+                Ok(capability) => capability,
+                Err(drift) => {
+                    return PreparedBackTargetStart::Permanent(
+                        BackTargetPermanentOwner::source_drift(
+                            continuation,
+                            reservation,
+                            drift,
+                            expected_baseline,
+                            observed_baseline,
+                        ),
+                    );
+                }
+            };
+            let current = CurrentWork {
+                identity: identity.clone(),
+                branch: Some(branch),
+                location,
+                reservation: reserved_frames,
+                target_frames,
+                applied_frames: Vec::new(),
+                current_target: target,
+                pending_mount: None,
+                stage: WorkStage::ReadyToCommit,
+                cleanup_batch: reservation.cleanup_batch(),
+                cleanup_roots,
+                attempt: AttemptKind::Normal(NavigationCommandKind::Back),
+                reconciliation: Some(reconciliation),
+                retired_host: None,
+            };
+            let mut records = records;
+            records[record_index] = record;
+            return PreparedBackTargetStart::Ready(PreparedBackTargetReady {
+                installation: PreparedBackTargetInstallation {
+                    current,
+                    records,
+                    state,
+                    issued_view_tasks: self.issued_view_tasks.clone(),
+                },
+                history_capability,
+                action: BackTargetResumeAction::Commit(CommitTicket { identity }),
+                execution: execution_projection,
+                continuation,
+            });
+        };
+
+        let branch_index = entering.branch_index();
+        let Some(matched) = branch.routes().get(branch_index).cloned() else {
+            return authority_lost(
+                continuation,
+                reservation,
+                destination,
+                BackTargetAuthorityLossCause::ActiveBaseline,
+            );
+        };
+        let Some(reserved) = reserved_frames.get(branch_index) else {
+            return authority_lost(
+                continuation,
+                reservation,
+                destination,
+                BackTargetAuthorityLossCause::MaximumDepth,
+            );
+        };
+        let origin = FrameOrigin::MatchedRoute(entering.route());
+        if entering.slot() == ProjectedEnteringSlot::MountNew {
+            let Some(parent_index) = branch_index.checked_sub(1) else {
+                return authority_lost(
+                    continuation,
+                    reservation,
+                    destination,
+                    BackTargetAuthorityLossCause::ActiveBaseline,
+                );
+            };
+            let Some(parent) = target_frames.get(parent_index).cloned() else {
+                return authority_lost(
+                    continuation,
+                    reservation,
+                    destination,
+                    BackTargetAuthorityLossCause::ActiveBaseline,
+                );
+            };
+            let outlet = matched.slot().clone();
+            let identity = FrameTaskIdentity {
+                router: self.router,
+                host: host.host(),
+                host_epoch: host.epoch(),
+                slot: parent.slot(),
+                request,
+                transaction: reservation.transaction(),
+                frame_task: reserved.frame_task(),
+                frame: parent.frame(),
+                generation: parent.generation(),
+                origin: parent.origin().clone(),
+                branch_index: parent_index,
+            };
+            let target = if parent_index == 0 {
+                FrameMountTarget::TopSlot {
+                    host: host.clone(),
+                    slot: top_slot,
+                }
+            } else {
+                let Some(grandparent) = target_frames.get(parent_index - 1).cloned() else {
+                    return authority_lost(
+                        continuation,
+                        reservation,
+                        destination,
+                        BackTargetAuthorityLossCause::ActiveBaseline,
+                    );
+                };
+                let Some(parent_route) = branch.routes().get(parent_index) else {
+                    return authority_lost(
+                        continuation,
+                        reservation,
+                        destination,
+                        BackTargetAuthorityLossCause::ActiveBaseline,
+                    );
+                };
+                FrameMountTarget::ChildOutlet {
+                    parent: grandparent,
+                    outlet: parent_route.slot().clone(),
+                }
+            };
+            let phase = NavigationPhase::ResolvingMount;
+            if record
+                .transition(RequestStatus::Running(phase.clone()))
+                .is_err()
+                || record
+                    .append_trace(NavigationTraceEvent::request_phase_changed(phase.clone()))
+                    .is_err()
+            {
+                return authority_lost(
+                    continuation,
+                    reservation,
+                    destination,
+                    BackTargetAuthorityLossCause::RequestRecord,
+                );
+            }
+            let mut success_record = record.clone();
+            if success_record
+                .append_trace(NavigationTraceEvent::mount_requested(
+                    parent.clone(),
+                    outlet.clone(),
+                ))
+                .is_err()
+            {
+                return authority_lost(
+                    continuation,
+                    reservation,
+                    destination,
+                    BackTargetAuthorityLossCause::RequestRecord,
+                );
+            }
+            let mut failure_record = record;
+            let failure_phase = NavigationPhase::CleanupPending;
+            if failure_record
+                .transition(RequestStatus::Running(failure_phase.clone()))
+                .is_err()
+                || failure_record
+                    .append_trace(NavigationTraceEvent::request_phase_changed(
+                        failure_phase.clone(),
+                    ))
+                    .is_err()
+            {
+                return authority_lost(
+                    continuation,
+                    reservation,
+                    destination,
+                    BackTargetAuthorityLossCause::RequestRecord,
+                );
+            }
+            let mut state = self.state.clone();
+            state.set_request(Some(RequestStatus::Running(phase)));
+            let history_capability = match self.history.freeze_back(execution, destination) {
+                Ok(capability) => capability,
+                Err(drift) => {
+                    return PreparedBackTargetStart::Permanent(
+                        BackTargetPermanentOwner::source_drift(
+                            continuation,
+                            reservation,
+                            drift,
+                            expected_baseline,
+                            observed_baseline,
+                        ),
+                    );
+                }
+            };
+            let mut current = CurrentWork {
+                identity: identity.clone(),
+                branch: Some(branch),
+                location,
+                reservation: reserved_frames,
+                target_frames,
+                applied_frames: Vec::new(),
+                current_target: target,
+                pending_mount: Some(PendingMount {
+                    child_index: branch_index,
+                    parent: parent.clone(),
+                    outlet: outlet.clone(),
+                    from_preserved_parent: true,
+                }),
+                stage: WorkStage::AwaitingMount,
+                cleanup_batch: reservation.cleanup_batch(),
+                cleanup_roots,
+                attempt: AttemptKind::Normal(NavigationCommandKind::Back),
+                reconciliation: Some(reconciliation),
+                retired_host: None,
+            };
+            let action_parent = parent.clone();
+            let action_outlet = outlet.clone();
+            let issued_view_tasks = self.issued_view_tasks.clone();
+            let mut success_records = records.clone();
+            success_records[record_index] = success_record;
+            let mut failure_records = records;
+            failure_records[record_index] = failure_record;
+            return match self.mount.issue(
+                &mut self.ids,
+                host,
+                request,
+                reservation.transaction(),
+                parent,
+                outlet,
+            ) {
+                Ok(token) => PreparedBackTargetStart::Ready(PreparedBackTargetReady {
+                    installation: PreparedBackTargetInstallation {
+                        current,
+                        records: success_records,
+                        state,
+                        issued_view_tasks,
+                    },
+                    history_capability,
+                    action: BackTargetResumeAction::MountRequest(FrameMountRequest {
+                        token,
+                        request,
+                        parent: action_parent,
+                        outlet: action_outlet,
+                    }),
+                    execution: execution_projection,
+                    continuation,
+                }),
+                Err(error) => {
+                    drop(history_capability);
+                    let message = match error {
+                        MountError::Exhausted => "child mount request identity exhausted",
+                        MountError::Foreign | MountError::Stale | MountError::WrongPhase => {
+                            "child mount request issuer rejected internal identity"
+                        }
+                    };
+                    let failure = FailureCleanupRequest {
+                        identity: current.identity.clone(),
+                        expected: PendingFailureKind::MountIssue,
+                        logical_roots: current.applied_frames.iter().rev().cloned().collect(),
+                        failure: NavigationFailure::new(NavigationFailureKind::Mount, message),
+                        continuation: FailureCleanupContinuation::Terminal,
+                    };
+                    current.pending_mount = None;
+                    current.stage = WorkStage::FailureCleanupManifestPending {
+                        expected: failure.clone(),
+                    };
+                    state.set_request(Some(RequestStatus::Running(failure_phase)));
+                    PreparedBackTargetStart::FailureCleanup(PreparedBackTargetFailureCleanup {
+                        installation: PreparedBackTargetInstallation {
+                            current,
+                            records: failure_records,
+                            state,
+                            issued_view_tasks,
+                        },
+                        request: failure,
+                    })
+                }
+            };
+        }
+
+        let ProjectedEnteringSlot::Existing(slot) = entering.slot() else {
+            return authority_lost(
+                continuation,
+                reservation,
+                destination,
+                BackTargetAuthorityLossCause::ActiveBaseline,
+            );
+        };
+        let target_frame = RouteFrameVersion::new(
+            self.router,
+            host.host(),
+            slot,
+            origin.clone(),
+            entering.frame(),
+            entering.generation(),
+        );
+        let target = if branch_index == 0 {
+            FrameMountTarget::TopSlot {
+                host: host.clone(),
+                slot: top_slot,
+            }
+        } else {
+            let Some(parent) = target_frames.get(branch_index - 1).cloned() else {
+                return authority_lost(
+                    continuation,
+                    reservation,
+                    destination,
+                    BackTargetAuthorityLossCause::ActiveBaseline,
+                );
+            };
+            FrameMountTarget::RegisteredChildSlot {
+                parent,
+                outlet: matched.slot().clone(),
+            }
+        };
+        let Some(view) = self.matcher.view_binding(matched.route()).cloned() else {
+            return authority_lost(
+                continuation,
+                reservation,
+                destination,
+                BackTargetAuthorityLossCause::ViewBinding,
+            );
+        };
+        let input = RouteViewInput::new(
+            location.clone(),
+            Some(matched.route()),
+            matched.params().clone(),
+            origin.clone(),
+            None,
+        );
+        let identity = FrameTaskIdentity {
+            router: self.router,
+            host: host.host(),
+            host_epoch: host.epoch(),
+            slot,
+            request,
+            transaction: reservation.transaction(),
+            frame_task: reserved.frame_task(),
+            frame: entering.frame(),
+            generation: entering.generation(),
+            origin,
+            branch_index,
+        };
+        target_frames.push(target_frame.clone());
+        if record
+            .append_trace(NavigationTraceEvent::frame_task_issued(
+                target_frame.clone(),
+            ))
+            .is_err()
+        {
+            return authority_lost(
+                continuation,
+                reservation,
+                destination,
+                BackTargetAuthorityLossCause::RequestRecord,
+            );
+        }
+        let phase = NavigationPhase::ApplyingFrame(branch_index);
+        if record
+            .transition(RequestStatus::Running(phase.clone()))
+            .is_err()
+            || record
+                .append_trace(NavigationTraceEvent::request_phase_changed(phase.clone()))
+                .is_err()
+        {
+            return authority_lost(
+                continuation,
+                reservation,
+                destination,
+                BackTargetAuthorityLossCause::RequestRecord,
+            );
+        }
+        let mut state = self.state.clone();
+        state.set_request(Some(RequestStatus::Running(phase)));
+        let mut issued_view_tasks = self.issued_view_tasks.clone();
+        issued_view_tasks.push(identity.clone());
+        let history_capability = match self.history.freeze_back(execution, destination) {
+            Ok(capability) => capability,
+            Err(drift) => {
+                return PreparedBackTargetStart::Permanent(BackTargetPermanentOwner::source_drift(
+                    continuation,
+                    reservation,
+                    drift,
+                    expected_baseline,
+                    observed_baseline,
+                ));
+            }
+        };
+        let current = CurrentWork {
+            identity: identity.clone(),
+            branch: Some(branch),
+            location: location.clone(),
+            reservation: reserved_frames,
+            target_frames,
+            applied_frames: Vec::new(),
+            current_target: target.clone(),
+            pending_mount: None,
+            stage: WorkStage::Applying,
+            cleanup_batch: reservation.cleanup_batch(),
+            cleanup_roots,
+            attempt: AttemptKind::Normal(NavigationCommandKind::Back),
+            reconciliation: Some(reconciliation),
+            retired_host: None,
+        };
+        let mut records = records;
+        records[record_index] = record;
+        PreparedBackTargetStart::Ready(PreparedBackTargetReady {
+            installation: PreparedBackTargetInstallation {
+                current,
+                records,
+                state,
+                issued_view_tasks,
+            },
+            history_capability,
+            action: BackTargetResumeAction::FrameTask(FrameTask {
+                identity,
+                frame: target_frame,
+                target,
+                location,
+                matched: Some(matched),
+                view,
+                input: Some(input),
+            }),
+            execution: execution_projection,
+            continuation,
+        })
+    }
+
+    fn install_prepared_back_target_start(
+        &mut self,
+        prepared: PreparedBackTargetStart,
+    ) -> BackTargetResumeOutcome {
+        match prepared {
+            PreparedBackTargetStart::Ready(prepared) => {
+                let PreparedBackTargetReady {
+                    installation,
+                    history_capability,
+                    action,
+                    execution,
+                    continuation,
+                } = prepared;
+                let PreparedBackTargetInstallation {
+                    current,
+                    records,
+                    state,
+                    issued_view_tasks,
+                } = installation;
+                self.current = Some(current);
+                self.records = records;
+                self.state = state;
+                self.issued_view_tasks = issued_view_tasks;
+                self.current_history_capability = Some(history_capability);
+                BackTargetResumeOutcome::Resumed(BackTargetStart::Ready(BackTargetResume {
+                    action,
+                    execution,
+                    continuation,
+                }))
+            }
+            PreparedBackTargetStart::FailureCleanup(prepared) => {
+                let PreparedBackTargetFailureCleanup {
+                    installation,
+                    request,
+                } = prepared;
+                let PreparedBackTargetInstallation {
+                    current,
+                    records,
+                    state,
+                    issued_view_tasks,
+                } = installation;
+                self.current = Some(current);
+                self.records = records;
+                self.state = state;
+                self.issued_view_tasks = issued_view_tasks;
+                self.current_history_capability = None;
+                BackTargetResumeOutcome::Resumed(BackTargetStart::FailureCleanup(request))
+            }
+            PreparedBackTargetStart::Permanent(owner) => BackTargetResumeOutcome::Permanent(owner),
+        }
+    }
+
     pub(crate) fn collect(&mut self) {
-        if self.current.is_none() {
+        if self.action.is_none() && self.current.is_none() && self.pending_no_target_back.is_none()
+        {
             self.start_next();
         }
     }
@@ -1682,25 +3154,7 @@ impl RouterEngine {
         self.action = Some(action);
     }
 
-    pub(crate) fn accept_applied_report(
-        &mut self,
-        report: AppliedFrameReport,
-    ) -> Result<(), ReportError> {
-        if let Err(error) = self.validate_view_report_identity(&report.identity) {
-            if self.action.is_none()
-                && self
-                    .current
-                    .as_ref()
-                    .is_some_and(|current| current.stage == WorkStage::Applying)
-            {
-                self.reissue_current_frame_task();
-            }
-            return Err(error);
-        }
-        if self.reject_current_reconciliation_drift() {
-            return Err(ReportError::Stale);
-        }
-        let sorted_unique = report.outlets.windows(2).all(|pair| pair[0] < pair[1]);
+    fn inspect_applied_report(&self, report: AppliedFrameReport) -> AppliedReportInspection {
         let next_outlet = self.current.as_ref().and_then(|current| {
             current
                 .branch
@@ -1708,19 +3162,107 @@ impl RouterEngine {
                 .and_then(|branch| branch.routes().get(report.identity.branch_index + 1))
                 .map(|matched| matched.slot().clone())
         });
+        let predicates = AppliedReportPredicateProjection {
+            next_outlet: next_outlet.clone(),
+            reconciliation: self
+                .current
+                .as_ref()
+                .and_then(|current| current.reconciliation.clone()),
+            active_baseline: self.back_target_preparation_baseline(),
+        };
+        if let Err(error) = self.inspect_view_report_identity(&report.identity) {
+            return AppliedReportInspection::Rejected {
+                report,
+                rejection: AppliedReportRejection::Identity(error),
+                predicates,
+            };
+        }
+        if !self.current_reconciliation_matches_active() {
+            return AppliedReportInspection::ReconciliationDrift;
+        }
+        let sorted_unique = report.outlets.windows(2).all(|pair| pair[0] < pair[1]);
         if !sorted_unique || (report.mode == AppliedReportMode::LegacyLeaf && next_outlet.is_some())
         {
-            self.reissue_current_frame_task();
-            return Err(ReportError::Invalid);
+            return AppliedReportInspection::Rejected {
+                report,
+                rejection: AppliedReportRejection::InvalidInput,
+                predicates,
+            };
         }
-
-        let request = report.identity.request;
         let frame = self
             .current
             .as_ref()
             .and_then(|current| current.target_frames.last())
-            .expect("an issued task has one target frame")
+            .expect("an inspected task has one target frame")
             .clone();
+        AppliedReportInspection::Validated(ValidatedAppliedReport {
+            report,
+            frame,
+            next_outlet,
+        })
+    }
+
+    pub(crate) fn accept_applied_report(
+        &mut self,
+        report: AppliedFrameReport,
+    ) -> Result<(), ReportError> {
+        match self.inspect_applied_report(report) {
+            AppliedReportInspection::Rejected {
+                report,
+                rejection: AppliedReportRejection::Identity(error),
+                predicates: _,
+            } => {
+                let validation = self.validate_view_report_identity(&report.identity);
+                debug_assert_eq!(validation, Err(error));
+                if self.action.is_none()
+                    && self
+                        .current
+                        .as_ref()
+                        .is_some_and(|current| current.stage == WorkStage::Applying)
+                {
+                    self.reissue_current_frame_task();
+                }
+                Err(error)
+            }
+            AppliedReportInspection::Rejected {
+                rejection: AppliedReportRejection::InvalidInput,
+                ..
+            } => {
+                self.reissue_current_frame_task();
+                Err(ReportError::Invalid)
+            }
+            AppliedReportInspection::ReconciliationDrift => {
+                self.install_current_reconciliation_drift_failure();
+                Err(ReportError::Stale)
+            }
+            AppliedReportInspection::Validated(plan) => {
+                let transition = self.apply_validated_applied_report(plan);
+                self.install_applied_report_transition(transition);
+                Ok(())
+            }
+        }
+    }
+
+    fn install_applied_report_transition(&mut self, transition: AppliedReportTransition) {
+        self.action = Some(match transition {
+            AppliedReportTransition::MountRequest(request) => EngineAction::MountRequest(request),
+            AppliedReportTransition::Commit(ticket) => EngineAction::Commit(ticket),
+            AppliedReportTransition::FailureCleanup(request) => {
+                EngineAction::FailureCleanup(request)
+            }
+        });
+    }
+
+    fn apply_validated_applied_report(
+        &mut self,
+        plan: ValidatedAppliedReport,
+    ) -> AppliedReportTransition {
+        let ValidatedAppliedReport {
+            report,
+            frame,
+            next_outlet,
+        } = plan;
+        let request = report.identity.request;
         self.record_report_disposition(
             &report.identity,
             ReportDisposition::Accepted,
@@ -1772,8 +3314,7 @@ impl RouterEngine {
                         PendingFailureKind::MountIssue,
                         NavigationFailure::new(NavigationFailureKind::Mount, message),
                     );
-                    self.action = Some(EngineAction::FailureCleanup(failure));
-                    return Ok(());
+                    return AppliedReportTransition::FailureCleanup(failure);
                 }
             };
             let child_index = report.identity.branch_index + 1;
@@ -1793,22 +3334,21 @@ impl RouterEngine {
                     outlet.clone(),
                 ))
                 .expect("running trace is open");
-            self.action = Some(EngineAction::MountRequest(FrameMountRequest {
+            AppliedReportTransition::MountRequest(FrameMountRequest {
                 token,
                 request,
                 parent: frame,
                 outlet,
-            }));
+            })
         } else {
             let current = self.current.as_mut().expect("report was preflighted");
             current.identity = report.identity.clone();
             current.stage = WorkStage::ReadyToCommit;
             self.transition_with_trace(request, NavigationPhase::ReadyToSwitch);
-            self.action = Some(EngineAction::Commit(CommitTicket {
+            AppliedReportTransition::Commit(CommitTicket {
                 identity: report.identity,
-            }));
+            })
         }
-        Ok(())
     }
 
     pub(crate) fn resolve_mount(
@@ -2320,6 +3860,656 @@ impl RouterEngine {
         })
     }
 
+    fn back_target_engine_scope_projection(&self) -> CoreBackTargetEngineScopeProjection {
+        CoreBackTargetEngineScopeProjection {
+            world: self.history_admission_world,
+            router: self.router,
+            history: self.history.incarnation(),
+        }
+    }
+
+    fn back_target_failure_cleanup_request_projection(
+        request: &FailureCleanupRequest,
+    ) -> CoreBackTargetFailureCleanupRequestProjection {
+        CoreBackTargetFailureCleanupRequestProjection {
+            identity: request.identity.clone(),
+            expected: request.expected.clone(),
+            logical_roots: request.logical_roots.clone(),
+            failure: request.failure.clone(),
+            continuation: request.continuation,
+        }
+    }
+
+    fn back_target_action_projection(
+        action: Option<&EngineAction>,
+    ) -> CoreBackTargetReceiverActionProjection {
+        match action {
+            Some(EngineAction::FrameTask(task)) => {
+                CoreBackTargetReceiverActionProjection::FrameTask(task.identity.clone())
+            }
+            Some(EngineAction::MountRequest(request)) => {
+                CoreBackTargetReceiverActionProjection::MountRequest {
+                    token: request.token.receiver_projection(),
+                    request: request.request,
+                    parent: request.parent.clone(),
+                    outlet: request.outlet.clone(),
+                }
+            }
+            Some(EngineAction::FailureCleanup(request)) => {
+                CoreBackTargetReceiverActionProjection::FailureCleanup(
+                    Self::back_target_failure_cleanup_request_projection(request),
+                )
+            }
+            Some(EngineAction::Commit(ticket)) => {
+                CoreBackTargetReceiverActionProjection::Commit(ticket.identity.clone())
+            }
+            Some(EngineAction::BackResolution(_)) => {
+                CoreBackTargetReceiverActionProjection::BackResolution
+            }
+            None => CoreBackTargetReceiverActionProjection::Missing,
+        }
+    }
+
+    fn back_target_physical_projection(
+        physical: CoreBackTargetPhysicalReceiverRef<'_>,
+    ) -> CoreBackTargetReceiverActionProjection {
+        match physical {
+            CoreBackTargetPhysicalReceiverRef::FrameTask(task) => {
+                CoreBackTargetReceiverActionProjection::FrameTask(task.identity.clone())
+            }
+            CoreBackTargetPhysicalReceiverRef::MountRequest(request) => {
+                CoreBackTargetReceiverActionProjection::MountRequest {
+                    token: request.token.receiver_projection(),
+                    request: request.request,
+                    parent: request.parent.clone(),
+                    outlet: request.outlet.clone(),
+                }
+            }
+            CoreBackTargetPhysicalReceiverRef::Commit(ticket) => {
+                CoreBackTargetReceiverActionProjection::Commit(ticket.identity.clone())
+            }
+        }
+    }
+
+    fn back_target_stage_projection(
+        current: Option<&CurrentWork>,
+    ) -> CoreBackTargetReceiverStageProjection {
+        match current.map(|current| &current.stage) {
+            Some(WorkStage::Applying) => CoreBackTargetReceiverStageProjection::Applying,
+            Some(WorkStage::AwaitingMount) => CoreBackTargetReceiverStageProjection::AwaitingMount,
+            Some(WorkStage::AwaitingReceipt) => {
+                CoreBackTargetReceiverStageProjection::AwaitingReceipt
+            }
+            Some(WorkStage::ConfirmingMount) => {
+                CoreBackTargetReceiverStageProjection::ConfirmingMount
+            }
+            Some(WorkStage::ReadyToCommit) => CoreBackTargetReceiverStageProjection::ReadyToCommit,
+            Some(WorkStage::CommitSealed { .. }) => {
+                CoreBackTargetReceiverStageProjection::CommitSealed
+            }
+            Some(WorkStage::PostCommitCleanup { .. }) => {
+                CoreBackTargetReceiverStageProjection::PostCommitCleanup
+            }
+            Some(WorkStage::FailureCleanupManifestPending { expected }) => {
+                CoreBackTargetReceiverStageProjection::FailureCleanupManifestPending(
+                    Self::back_target_failure_cleanup_request_projection(expected),
+                )
+            }
+            Some(WorkStage::FailureCleanupPrepared { .. }) => {
+                CoreBackTargetReceiverStageProjection::FailureCleanupPrepared
+            }
+            None => CoreBackTargetReceiverStageProjection::Missing,
+        }
+    }
+
+    fn back_target_attempt_projection(
+        current: Option<&CurrentWork>,
+    ) -> CoreBackTargetReceiverAttemptProjection {
+        match current.map(|current| &current.attempt) {
+            Some(AttemptKind::Normal(NavigationCommandKind::Push)) => {
+                CoreBackTargetReceiverAttemptProjection::NormalPush
+            }
+            Some(AttemptKind::Normal(NavigationCommandKind::Replace)) => {
+                CoreBackTargetReceiverAttemptProjection::NormalReplace
+            }
+            Some(AttemptKind::Normal(NavigationCommandKind::Back)) => {
+                CoreBackTargetReceiverAttemptProjection::NormalBack
+            }
+            Some(AttemptKind::Fallback { original_failure }) => {
+                CoreBackTargetReceiverAttemptProjection::Fallback {
+                    original_failure: original_failure.clone(),
+                }
+            }
+            None => CoreBackTargetReceiverAttemptProjection::Missing,
+        }
+    }
+
+    fn back_target_mount_context_projection(&self) -> CoreBackTargetMountContextProjection {
+        CoreBackTargetMountContextProjection {
+            router: self.router,
+            host: self.state.host().cloned(),
+            top_slot: self.state.top_slot(),
+            current: self
+                .current
+                .as_ref()
+                .map(|current| CoreBackTargetMountCurrentProjection {
+                    identity: current.identity.clone(),
+                    branch_routes: current
+                        .branch
+                        .as_ref()
+                        .map(|branch| branch.routes().to_vec()),
+                    reservation: current
+                        .reservation
+                        .iter()
+                        .map(|reserved| CoreBackTargetReservedFrameProjection {
+                            frame_task: reserved.frame_task(),
+                            frame: reserved.frame(),
+                        })
+                        .collect(),
+                    target_frames: current.target_frames.clone(),
+                    applied_frames: current.applied_frames.clone(),
+                    current_target: current.current_target.clone(),
+                    pending_mount: current.pending_mount.as_ref().map(|pending| {
+                        CoreBackTargetPendingMountProjection {
+                            child_index: pending.child_index,
+                            parent: pending.parent.clone(),
+                            outlet: pending.outlet.clone(),
+                            from_preserved_parent: pending.from_preserved_parent,
+                        }
+                    }),
+                    stage: Self::back_target_stage_projection(Some(current)),
+                    reconciliation: current.reconciliation.clone(),
+                }),
+        }
+    }
+
+    fn classify_back_target_mount_context(
+        context: &CoreBackTargetMountContextProjection,
+        issuer: &MountIssuerRequestProjection,
+        request: NavigationRequestId,
+        parent: &RouteFrameVersion,
+        outlet: &RouteSlotKey,
+    ) -> (
+        CoreBackTargetMountContextDisposition,
+        MountIssuerContextDisposition,
+    ) {
+        let Some(current) = context.current.as_ref() else {
+            return (
+                CoreBackTargetMountContextDisposition::Mismatch,
+                MountIssuerContextDisposition::Mismatch,
+            );
+        };
+        let Some(pending) = current.pending_mount.as_ref() else {
+            return (
+                CoreBackTargetMountContextDisposition::Mismatch,
+                MountIssuerContextDisposition::Mismatch,
+            );
+        };
+        let Some(host) = context.host.as_ref() else {
+            return (
+                CoreBackTargetMountContextDisposition::Mismatch,
+                MountIssuerContextDisposition::Mismatch,
+            );
+        };
+        let issuer_context = issuer.classify_context(
+            host,
+            current.identity.request,
+            current.identity.transaction,
+            &pending.parent,
+            &pending.outlet,
+        );
+        let identity_is_current = current.stage
+            == CoreBackTargetReceiverStageProjection::AwaitingMount
+            && current.identity.router == context.router
+            && current.identity.host == host.host()
+            && current.identity.host_epoch == host.epoch();
+        let Some(child_index) = current.identity.branch_index.checked_add(1) else {
+            return (
+                CoreBackTargetMountContextDisposition::Mismatch,
+                issuer_context,
+            );
+        };
+        let reservation_matches = if pending.from_preserved_parent {
+            current
+                .reservation
+                .get(pending.child_index)
+                .is_some_and(|reserved| reserved.frame_task == current.identity.frame_task)
+        } else {
+            current
+                .reservation
+                .get(current.identity.branch_index)
+                .is_some_and(|reserved| {
+                    reserved.frame_task == current.identity.frame_task
+                        && reserved.frame == current.identity.frame
+                })
+        };
+        let current_parent = RouteFrameVersion::new(
+            current.identity.router,
+            current.identity.host,
+            current.identity.slot,
+            current.identity.origin.clone(),
+            current.identity.frame,
+            current.identity.generation,
+        );
+        let entering_start = current
+            .reconciliation
+            .as_ref()
+            .map_or(0, |projection| projection.preserved().len());
+        let topology_is_current = pending.child_index == child_index
+            && reservation_matches
+            && current_parent == pending.parent
+            && current.target_frames.len() == child_index
+            && current.target_frames.last() == Some(&pending.parent)
+            && entering_start <= current.target_frames.len()
+            && current.applied_frames == current.target_frames[entering_start..];
+        let Some(branch_routes) = current.branch_routes.as_ref() else {
+            return (
+                CoreBackTargetMountContextDisposition::Mismatch,
+                issuer_context,
+            );
+        };
+        let Some(current_route) = branch_routes.get(current.identity.branch_index) else {
+            return (
+                CoreBackTargetMountContextDisposition::Mismatch,
+                issuer_context,
+            );
+        };
+        let Some(child_route) = branch_routes.get(child_index) else {
+            return (
+                CoreBackTargetMountContextDisposition::Mismatch,
+                issuer_context,
+            );
+        };
+        let branch_is_current = current.identity.origin
+            == FrameOrigin::MatchedRoute(current_route.route())
+            && child_route.slot() == &pending.outlet
+            && current.reservation.get(child_index).is_some();
+        let current_target_is_exact = if pending.from_preserved_parent {
+            current.reconciliation.as_ref().is_some_and(|projection| {
+                projection.preserved().iter().any(|preserved| {
+                    preserved.branch_index() == current.identity.branch_index
+                        && preserved.version() == &pending.parent
+                }) && projection.entering().first().is_some_and(|entering| {
+                    entering.branch_index() == pending.child_index
+                        && entering.slot() == ProjectedEnteringSlot::MountNew
+                })
+            })
+        } else {
+            match &current.current_target {
+                FrameMountTarget::TopSlot {
+                    host: target_host,
+                    slot,
+                } => {
+                    current.identity.branch_index == 0
+                        && target_host == host
+                        && *slot == current.identity.slot
+                        && context.top_slot == Some(*slot)
+                }
+                FrameMountTarget::ChildOutlet { parent, outlet }
+                | FrameMountTarget::RegisteredChildSlot { parent, outlet } => {
+                    current.identity.branch_index > 0
+                        && current
+                            .target_frames
+                            .get(current.identity.branch_index - 1)
+                            .is_some_and(|expected_parent| expected_parent == parent)
+                        && current_route.slot() == outlet
+                }
+            }
+        };
+        let expected_request_is_exact = current.identity.request == request
+            && pending.parent == *parent
+            && pending.outlet == *outlet;
+        let disposition = if identity_is_current
+            && topology_is_current
+            && branch_is_current
+            && current_target_is_exact
+            && expected_request_is_exact
+        {
+            CoreBackTargetMountContextDisposition::Matched
+        } else {
+            CoreBackTargetMountContextDisposition::Mismatch
+        };
+        (disposition, issuer_context)
+    }
+
+    fn back_target_execution_pairing_inspection(
+        &self,
+        scope: &BackResolutionScopeProjection,
+        execution: &HistoryExecutionBindingProjection,
+        physical: CoreBackTargetPhysicalReceiverRef<'_>,
+    ) -> CoreBackTargetExecutionInspection {
+        let (physical_projection, mount) = match physical {
+            CoreBackTargetPhysicalReceiverRef::MountRequest(request) => {
+                let (token, issuer, receiver) = self
+                    .mount
+                    .inspect_request_receiver(&request.token)
+                    .into_parts();
+                let context = self.back_target_mount_context_projection();
+                let (engine_context, issuer_context) = Self::classify_back_target_mount_context(
+                    &context,
+                    &issuer,
+                    request.request,
+                    &request.parent,
+                    &request.outlet,
+                );
+                (
+                    CoreBackTargetReceiverActionProjection::MountRequest {
+                        token,
+                        request: request.request,
+                        parent: request.parent.clone(),
+                        outlet: request.outlet.clone(),
+                    },
+                    Some(CoreBackTargetMountObservedProjection {
+                        issuer,
+                        context,
+                        receiver,
+                        engine_context,
+                        issuer_context,
+                    }),
+                )
+            }
+            CoreBackTargetPhysicalReceiverRef::FrameTask(_)
+            | CoreBackTargetPhysicalReceiverRef::Commit(_) => {
+                (Self::back_target_physical_projection(physical), None)
+            }
+        };
+        let expected = CoreBackTargetExecutionExpectedProjection {
+            scope: scope.clone(),
+            execution: execution.clone(),
+            physical: physical_projection,
+        };
+        let current = self.current.as_ref();
+        let observed = CoreBackTargetExecutionObservedProjection {
+            scope: self.back_target_engine_scope_projection(),
+            history: self
+                .current_history_capability
+                .as_ref()
+                .map(HistoryCommitCapability::execution_projection),
+            current: current.map(|current| current.identity.clone()),
+            action: Self::back_target_action_projection(self.action.as_ref()),
+            stage: Self::back_target_stage_projection(current),
+            mount,
+        };
+        let physical_is_exact = match (&expected.physical, physical) {
+            (
+                CoreBackTargetReceiverActionProjection::FrameTask(identity),
+                CoreBackTargetPhysicalReceiverRef::FrameTask(_),
+            ) => {
+                observed.current.as_ref() == Some(identity)
+                    && observed.stage == CoreBackTargetReceiverStageProjection::Applying
+            }
+            (
+                CoreBackTargetReceiverActionProjection::MountRequest { .. },
+                CoreBackTargetPhysicalReceiverRef::MountRequest(_),
+            ) => observed.mount.as_ref().is_some_and(|mount| {
+                mount.receiver == MountRequestReceiverDisposition::Matched
+                    && mount.engine_context == CoreBackTargetMountContextDisposition::Matched
+                    && mount.issuer_context == MountIssuerContextDisposition::Matched
+            }),
+            (
+                CoreBackTargetReceiverActionProjection::Commit(identity),
+                CoreBackTargetPhysicalReceiverRef::Commit(_),
+            ) => {
+                observed.current.as_ref() == Some(identity)
+                    && observed.stage == CoreBackTargetReceiverStageProjection::ReadyToCommit
+            }
+            _ => false,
+        };
+        let exact = scope.matches_engine_scope(
+            observed.scope.world,
+            observed.scope.router,
+            observed.scope.history,
+        ) && scope.matches_execution(execution)
+            && observed.history.as_ref() == Some(execution)
+            && physical_is_exact
+            && observed.action == CoreBackTargetReceiverActionProjection::Missing;
+        CoreBackTargetExecutionInspection {
+            expected,
+            observed,
+            exact,
+        }
+    }
+
+    pub(crate) fn inspect_back_target_execution_pairing(
+        &self,
+        scope: &BackResolutionScopeProjection,
+        execution: &HistoryExecutionBindingProjection,
+        physical: CoreBackTargetPhysicalReceiverRef<'_>,
+    ) -> Result<(), CorePreparationReceiverMismatchProjection> {
+        self.back_target_execution_pairing_inspection(scope, execution, physical)
+            .into_exact()
+            .map(|_| ())
+    }
+
+    pub(crate) fn is_current_root_back_frame_task(&self, identity: &RootTaskIdentity) -> bool {
+        self.inspect_view_report_identity(identity).is_ok()
+            && self.current.as_ref().is_some_and(|current| {
+                current.identity == *identity
+                    && matches!(
+                        current.attempt,
+                        AttemptKind::Normal(NavigationCommandKind::Back)
+                    )
+            })
+    }
+
+    pub(crate) fn report_back_target_failed(
+        &mut self,
+        scope: BackResolutionScopeProjection,
+        execution: &HistoryExecutionBindingProjection,
+        task: &FrameTask,
+        failure: NavigationFailure,
+        mode: CoreBackTargetDriverFailureReportMode,
+    ) -> Result<CoreBackTargetDriverFailureReport, CorePreparationReceiverMismatchProjection> {
+        self.inspect_back_target_execution_pairing(
+            &scope,
+            execution,
+            CoreBackTargetPhysicalReceiverRef::FrameTask(task),
+        )?;
+        let session = ViewReportSession {
+            engine: self,
+            identity: task.identity().clone(),
+        };
+        Ok(session.failed_back_target(scope, failure, mode))
+    }
+
+    pub(crate) fn inspect_back_target_driver_failure_fallback(
+        &self,
+        owner: &CoreBackTargetDriverFallback,
+    ) -> Result<(), CorePreparationReceiverMismatchProjection> {
+        let expected = CoreBackTargetDriverFallbackExpectedProjection {
+            scope: owner.scope.clone(),
+            action: CoreBackTargetReceiverActionProjection::FrameTask(owner.action.clone()),
+            attempt: owner.expected_attempt.clone(),
+        };
+        let current = self.current.as_ref();
+        let observed = CoreBackTargetDriverFallbackObservedProjection {
+            scope: self.back_target_engine_scope_projection(),
+            action: Self::back_target_action_projection(self.action.as_ref()),
+            current: current.map(|current| current.identity.clone()),
+            attempt: Self::back_target_attempt_projection(current),
+            stage: Self::back_target_stage_projection(current),
+        };
+        let exact = owner.scope.matches_engine_scope(
+            observed.scope.world,
+            observed.scope.router,
+            observed.scope.history,
+        ) && observed.action == expected.action
+            && observed.current.as_ref() == Some(&owner.action)
+            && observed.attempt == expected.attempt
+            && observed.stage == CoreBackTargetReceiverStageProjection::Applying
+            && owner.action.router_identity() == self.router;
+        if exact {
+            Ok(())
+        } else {
+            Err(CorePreparationReceiverMismatchProjection::DriverFallback { expected, observed })
+        }
+    }
+
+    pub(crate) fn inspect_back_target_driver_failure_cleanup(
+        &self,
+        owner: &CoreBackTargetDriverFailureCleanup,
+    ) -> Result<(), CorePreparationReceiverMismatchProjection> {
+        let expected = CoreBackTargetDriverFailureCleanupExpectedProjection {
+            scope: owner.scope.clone(),
+            request: Self::back_target_failure_cleanup_request_projection(&owner.request),
+        };
+        let current = self.current.as_ref();
+        let observed = CoreBackTargetDriverFailureCleanupObservedProjection {
+            scope: self.back_target_engine_scope_projection(),
+            current: current.map(|current| current.identity.clone()),
+            stage: Self::back_target_stage_projection(current),
+        };
+        let exact = owner.scope.matches_engine_scope(
+            observed.scope.world,
+            observed.scope.router,
+            observed.scope.history,
+        ) && observed.current.as_ref() == Some(&expected.request.identity)
+            && observed.stage
+                == CoreBackTargetReceiverStageProjection::FailureCleanupManifestPending(
+                    expected.request.clone(),
+                );
+        if exact {
+            Ok(())
+        } else {
+            Err(
+                CorePreparationReceiverMismatchProjection::DriverFailureCleanup {
+                    expected,
+                    observed,
+                },
+            )
+        }
+    }
+
+    pub(crate) fn inspect_back_target_driver_failure_terminal(
+        &self,
+        owner: &CoreBackTargetDriverTerminal,
+    ) -> Result<(), CorePreparationReceiverMismatchProjection> {
+        let expected = CoreBackTargetDriverTerminalExpectedProjection {
+            scope: owner.scope.clone(),
+            router: owner.request.router_identity(),
+            request: owner.request,
+            status: CoreBackTargetDriverTerminalExpectedStatus::Failed,
+        };
+        let request = match self.private_lookup(owner.request) {
+            PrivateRequestLookup::Retained(record) => {
+                CoreBackTargetDriverTerminalObservedRequestProjection::Retained {
+                    request: record.id(),
+                    status: record.status().clone(),
+                }
+            }
+            PrivateRequestLookup::Evicted => {
+                CoreBackTargetDriverTerminalObservedRequestProjection::Evicted {
+                    request: owner.request,
+                    evicted_through: self.evicted_through,
+                    highest_issued: self.highest_issued,
+                }
+            }
+            PrivateRequestLookup::Unknown => {
+                CoreBackTargetDriverTerminalObservedRequestProjection::Unknown {
+                    request: owner.request,
+                    evicted_through: self.evicted_through,
+                    highest_issued: self.highest_issued,
+                }
+            }
+        };
+        let observed = CoreBackTargetDriverTerminalObservedProjection {
+            scope: self.back_target_engine_scope_projection(),
+            request,
+        };
+        let exact = owner.scope.matches_engine_scope(
+            observed.scope.world,
+            observed.scope.router,
+            observed.scope.history,
+        ) && expected.router == self.router
+            && matches!(
+                (expected.status, &observed.request),
+                (
+                    CoreBackTargetDriverTerminalExpectedStatus::Failed,
+                    CoreBackTargetDriverTerminalObservedRequestProjection::Retained {
+                        request,
+                        status: RequestStatus::Failed(_),
+                    }
+                ) if *request == expected.request
+            );
+        if exact {
+            Ok(())
+        } else {
+            Err(CorePreparationReceiverMismatchProjection::DriverTerminal { expected, observed })
+        }
+    }
+
+    pub(crate) fn report_back_target_applied(
+        &mut self,
+        scope: BackResolutionScopeProjection,
+        execution: &HistoryExecutionBindingProjection,
+        task: &FrameTask,
+        outlets: Option<Vec<RouteSlotKey>>,
+    ) -> Result<CoreBackTargetAppliedOutcome, CorePreparationReceiverMismatchProjection> {
+        let (receiver_expected, receiver_observed) = self
+            .back_target_execution_pairing_inspection(
+                &scope,
+                execution,
+                CoreBackTargetPhysicalReceiverRef::FrameTask(task),
+            )
+            .into_exact()?;
+        let report = match outlets {
+            Some(outlets) => AppliedFrameReport {
+                identity: task.identity().clone(),
+                outlets,
+                mode: AppliedReportMode::OutletAware,
+            },
+            None => AppliedFrameReport {
+                identity: task.identity().clone(),
+                outlets: Vec::new(),
+                mode: AppliedReportMode::LegacyLeaf,
+            },
+        };
+        let report_projection = match report.mode {
+            AppliedReportMode::LegacyLeaf => CoreBackTargetAppliedReportProjection::LegacyLeaf,
+            AppliedReportMode::OutletAware => {
+                CoreBackTargetAppliedReportProjection::WithOutlets(report.outlets.clone())
+            }
+        };
+        let transition = match self.inspect_applied_report(report) {
+            AppliedReportInspection::Rejected {
+                report: _,
+                rejection: _,
+                predicates,
+            } => {
+                return Err(CorePreparationReceiverMismatchProjection::Applied {
+                    expected: CoreBackTargetAppliedExpectedProjection {
+                        receiver: receiver_expected,
+                        report: report_projection,
+                    },
+                    observed: CoreBackTargetAppliedObservedProjection {
+                        receiver: receiver_observed,
+                        next_outlet: predicates.next_outlet,
+                        reconciliation: predicates.reconciliation,
+                        active_baseline: predicates.active_baseline,
+                    },
+                });
+            }
+            AppliedReportInspection::ReconciliationDrift => {
+                AppliedReportTransition::FailureCleanup(
+                    self.begin_current_reconciliation_drift_failure(),
+                )
+            }
+            AppliedReportInspection::Validated(plan) => self.apply_validated_applied_report(plan),
+        };
+        Ok(match transition {
+            AppliedReportTransition::MountRequest(request) => {
+                CoreBackTargetAppliedOutcome::MountRequest(request)
+            }
+            AppliedReportTransition::Commit(ticket) => CoreBackTargetAppliedOutcome::Commit(ticket),
+            AppliedReportTransition::FailureCleanup(request) => {
+                CoreBackTargetAppliedOutcome::FailureCleanup(CoreBackTargetDriverFailureCleanup {
+                    scope,
+                    request,
+                })
+            }
+        })
+    }
+
     pub(crate) fn validate_view_report_identity(
         &mut self,
         identity: &RootTaskIdentity,
@@ -2532,6 +4722,81 @@ impl RouterEngine {
             .ok_or(CommitError::Stale)
     }
 
+    pub(crate) fn inspect_back_target_continuation(
+        &self,
+        scope: &BackResolutionScopeProjection,
+        ticket: Option<&CommitTicket>,
+    ) -> Result<(), CorePreparationReceiverMismatchProjection> {
+        let current = self.current.as_ref();
+        let observed = CoreBackTargetContinuationObservedProjection {
+            scope: self.back_target_engine_scope_projection(),
+            history: self
+                .current_history_capability
+                .as_ref()
+                .map(HistoryCommitCapability::execution_projection),
+            current: current.map(|current| current.identity.clone()),
+            action: Self::back_target_action_projection(self.action.as_ref()),
+            stage: Self::back_target_stage_projection(current),
+        };
+        let continuation_is_exact = scope.matches_engine_scope(
+            observed.scope.world,
+            observed.scope.router,
+            observed.scope.history,
+        ) && observed
+            .history
+            .as_ref()
+            .is_some_and(|execution| scope.matches_execution(execution));
+        let commit_is_exact = ticket.is_none_or(|ticket| {
+            observed.current.as_ref() == Some(&ticket.identity)
+                && observed.stage == CoreBackTargetReceiverStageProjection::ReadyToCommit
+        });
+        let action_is_exact = observed.action == CoreBackTargetReceiverActionProjection::Missing;
+        if continuation_is_exact && commit_is_exact && action_is_exact {
+            Ok(())
+        } else {
+            Err(CorePreparationReceiverMismatchProjection::Continuation {
+                expected: CoreBackTargetContinuationExpectedProjection {
+                    scope: scope.clone(),
+                    commit: ticket.map(|ticket| ticket.identity.clone()),
+                },
+                observed,
+            })
+        }
+    }
+
+    pub(crate) fn accepts_back_target_continuation(
+        &self,
+        scope: &BackResolutionScopeProjection,
+    ) -> bool {
+        let exact_scope = self.accepts_back_target_scope(scope);
+        let exact_execution = self
+            .current_history_capability
+            .as_ref()
+            .is_some_and(|capability| scope.matches_execution(&capability.execution_projection()));
+        exact_scope && exact_execution
+    }
+
+    pub(crate) fn accepts_back_target_scope(&self, scope: &BackResolutionScopeProjection) -> bool {
+        scope.matches_engine_scope(
+            self.history_admission_world,
+            self.router,
+            self.history.incarnation(),
+        )
+    }
+
+    pub(crate) fn accepts_back_target_execution(
+        &self,
+        scope: &BackResolutionScopeProjection,
+        execution: &HistoryExecutionBindingProjection,
+    ) -> bool {
+        self.accepts_back_target_continuation(scope)
+            && scope.matches_execution(execution)
+            && self
+                .current_history_capability
+                .as_ref()
+                .is_some_and(|capability| capability.execution_projection() == *execution)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn testing_invalidate_commit_action(&mut self) {
         if let Some(current) = self.current.as_mut()
@@ -2539,6 +4804,70 @@ impl RouterEngine {
         {
             current.stage = WorkStage::Applying;
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_drift_current_frame_task_identity(&mut self) -> bool {
+        let Some(current) = self
+            .current
+            .as_mut()
+            .filter(|current| current.stage == WorkStage::Applying)
+        else {
+            return false;
+        };
+        let Some(host_epoch) = current.identity.host_epoch.checked_add(1) else {
+            return false;
+        };
+        current.identity.host_epoch = host_epoch;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_drift_current_fallback_failure(&mut self) -> bool {
+        let Some(AttemptKind::Fallback { original_failure }) = self
+            .current
+            .as_mut()
+            .filter(|current| current.stage == WorkStage::Applying)
+            .map(|current| &mut current.attempt)
+        else {
+            return false;
+        };
+        *original_failure = NavigationFailure::new(
+            NavigationFailureKind::AuthorityLost,
+            "test-only fallback attempt fact drift",
+        );
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_drift_failure_cleanup_manifest_request(&mut self) -> bool {
+        let Some(WorkStage::FailureCleanupManifestPending { expected }) =
+            self.current.as_mut().map(|current| &mut current.stage)
+        else {
+            return false;
+        };
+        let Some(host_epoch) = expected.identity.host_epoch.checked_add(1) else {
+            return false;
+        };
+        expected.identity.host_epoch = host_epoch;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_drift_retained_terminal_request_status(
+        &mut self,
+        request: NavigationRequestId,
+    ) -> bool {
+        let Some(record) = self
+            .records
+            .iter_mut()
+            .find(|record| record.id() == request)
+            .filter(|record| matches!(record.status(), RequestStatus::Failed(_)))
+        else {
+            return false;
+        };
+        *record = NavigationRequestRecord::unresolved_back(request);
+        true
     }
 
     pub(crate) fn prepare_publication(
@@ -2737,6 +5066,17 @@ impl RouterEngine {
         &mut self,
         prepared: PreparedPublication,
     ) -> Result<ValidatedPublication<'_>, CommitError> {
+        let prepared = self.validate_publication_owner(prepared)?;
+        Ok(ValidatedPublication {
+            engine: self,
+            prepared,
+        })
+    }
+
+    fn validate_publication_owner(
+        &mut self,
+        prepared: PreparedPublication,
+    ) -> Result<PreparedPublication, CommitError> {
         let validation = match self.prepared_publication_authority.as_ref() {
             Some(PreparedPublicationAuthority::Ready(owner))
                 if owner.evidence == prepared.evidence =>
@@ -2761,10 +5101,95 @@ impl RouterEngine {
             };
             return Err(self.retain_rejected_publication(owner, error));
         }
-        Ok(ValidatedPublication {
-            engine: self,
-            prepared,
-        })
+        Ok(prepared)
+    }
+
+    pub(crate) fn prepare_back_target_commit(
+        &mut self,
+        scope: BackResolutionScopeProjection,
+        ticket: &CommitTicket,
+        seal: CleanupManifestSeal,
+    ) -> BackTargetCommitOperationOutcome<'_> {
+        let sealed = match self.seal_commit(ticket, seal) {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                return BackTargetCommitOperationOutcome::Failed(
+                    self.take_back_target_commit_failure(scope, error),
+                );
+            }
+        };
+        let cleanup = sealed.cleanup().clone();
+        let prepared = match self.prepare_publication(sealed) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return BackTargetCommitOperationOutcome::Failed(
+                    self.take_back_target_commit_failure(scope, error),
+                );
+            }
+        };
+        match self.validate_publication_owner(prepared) {
+            Ok(prepared) => BackTargetCommitOperationOutcome::Validated {
+                publication: ValidatedPublication {
+                    engine: self,
+                    prepared,
+                },
+                cleanup,
+                continuation: scope,
+            },
+            Err(error) => BackTargetCommitOperationOutcome::Failed(
+                self.take_back_target_commit_failure(scope, error),
+            ),
+        }
+    }
+
+    fn take_back_target_commit_failure(
+        &mut self,
+        scope: BackResolutionScopeProjection,
+        error: CommitError,
+    ) -> BackTargetCommitOperationFailure {
+        if matches!(
+            self.action.as_ref(),
+            Some(EngineAction::FailureCleanup(request))
+                if request.request() == scope.request()
+        ) {
+            if let Some(EngineAction::FailureCleanup(request)) = self.action.take() {
+                return BackTargetCommitOperationFailure::FailureCleanup(
+                    CoreBackTargetCommitFailureCleanup {
+                        continuation: scope,
+                        request,
+                    },
+                );
+            }
+        }
+        if matches!(
+            self.prepared_publication_authority.as_ref(),
+            Some(PreparedPublicationAuthority::Rejected(rejection))
+                if rejection
+                    .owner
+                    .evidence
+                    .history_execution
+                    .as_ref()
+                    .is_some_and(|execution| scope.matches_execution(execution))
+        ) {
+            if let Some(PreparedPublicationAuthority::Rejected(rejection)) =
+                self.prepared_publication_authority.take()
+            {
+                return BackTargetCommitOperationFailure::RejectedPublication(
+                    CoreBackTargetCommitRejectedPublication {
+                        continuation: scope,
+                        rejection,
+                    },
+                );
+            }
+        }
+        debug_assert!(
+            self.accepts_back_target_continuation(&scope),
+            "retained-input failure must leave the exact history capability in the engine"
+        );
+        BackTargetCommitOperationFailure::RetainedInput {
+            continuation: scope.clone(),
+            evidence: CoreBackTargetCommitRetainedInputProjection { scope, error },
+        }
     }
 
     #[cfg(test)]
@@ -2915,7 +5340,7 @@ impl RouterEngine {
                 request,
                 token: completed_token,
             });
-            self.begin_fallback(request, failure);
+            let _ = self.begin_fallback(request, failure);
             return Ok(());
         }
         if let Some((failure, FailureCleanupContinuation::AuthoritySettlement)) = &failure {
@@ -3041,6 +5466,11 @@ impl RouterEngine {
         self.current
             .as_ref()
             .map(|current| current.identity.request)
+            .or_else(|| {
+                self.pending_no_target_back
+                    .as_ref()
+                    .map(|pending| pending.request)
+            })
     }
 
     pub(crate) fn requested(&self) -> Option<&RouteLocation> {
@@ -3179,21 +5609,64 @@ impl RouterEngine {
         };
         let request = queued.request;
         let command = queued.command;
-        let location = command.location().clone();
-        let branch = match queued.outcome {
-            QueuedMatchOutcome::Matched(branch) => branch,
-            QueuedMatchOutcome::MatchFailed(failure) => {
-                self.record_mut(request)
-                    .expect("running record is retained")
-                    .push_diagnostic(DiagnosticEvent::match_failed(failure.message()))
-                    .expect("running diagnostics are open");
-                self.begin_fallback(request, failure);
+        let (location, branch, reservation, back_destination) = match &command {
+            NavigationCommand::Back => {
+                let QueuedReservation::Branch(reservation) = queued.reservation else {
+                    unreachable!("accepted back retains one maximum-depth branch reservation")
+                };
+                let world = self
+                    .history_admission_world
+                    .expect("accepted back retains its issued world projection");
+                let preparation_baseline = self.back_target_preparation_baseline();
+                let handoff = BackResolutionOwnerHandoff::resolved(
+                    world,
+                    self.router,
+                    self.history.incarnation(),
+                    reservation,
+                    preparation_baseline,
+                    self.history.preview_back(),
+                );
+                let evidence = handoff.evidence();
+                let record = self
+                    .record_mut(request)
+                    .expect("accepted Back request remains retained until resolution");
+                if let Some(target) = handoff.target_location().cloned() {
+                    record
+                        .resolve_requested_once(target)
+                        .expect("Back target resolution is single-assignment");
+                }
+                record
+                    .install_back_resolution(evidence)
+                    .expect("raw Back resolution evidence is installed exactly once");
+                self.action = Some(EngineAction::BackResolution(handoff));
                 return;
             }
+            NavigationCommand::Push(location) | NavigationCommand::Replace(location) => {
+                let outcome = queued
+                    .outcome
+                    .expect("push and replace retain an enqueue-time match outcome");
+                let branch = match outcome {
+                    QueuedMatchOutcome::Matched(branch) => branch,
+                    QueuedMatchOutcome::MatchFailed(failure) => {
+                        let QueuedReservation::RequestOnly(reserved_request) = queued.reservation
+                        else {
+                            unreachable!("match failure retains request-only identity")
+                        };
+                        debug_assert_eq!(reserved_request, request);
+                        self.record_mut(request)
+                            .expect("running record is retained")
+                            .push_diagnostic(DiagnosticEvent::match_failed(failure.message()))
+                            .expect("running diagnostics are open");
+                        let _ = self.begin_fallback(request, failure);
+                        return;
+                    }
+                };
+                let QueuedReservation::Branch(reservation) = queued.reservation else {
+                    unreachable!("a stored matched branch has one atomic reservation")
+                };
+                (location.clone(), branch, reservation, None)
+            }
         };
-        let reservation = queued
-            .reservation
-            .expect("a stored matched branch has one atomic reservation");
         self.record_mut(request)
             .expect("running record is retained")
             .set_matched(branch.branch_fingerprint().clone())
@@ -3214,7 +5687,18 @@ impl RouterEngine {
             .expect("host was checked before push")
             .clone();
         let top_slot = self.state.top_slot().expect("confirmed host has top slot");
-        let reserved_frames = reservation.frames().to_vec();
+        if branch.routes().len() > reservation.frames().len() {
+            self.fail_reserved_request(
+                request,
+                NavigationFailure::new(
+                    NavigationFailureKind::AuthorityLost,
+                    "resolved back target exceeded installed maximum branch depth",
+                ),
+            );
+            self.start_next();
+            return;
+        }
+        let reserved_frames = reservation.frames()[..branch.routes().len()].to_vec();
         let reserved_frame_ids = reserved_frames
             .iter()
             .map(|reserved| reserved.frame())
@@ -3261,7 +5745,7 @@ impl RouterEngine {
             reconciliation.target_fingerprint(),
             branch.branch_fingerprint()
         );
-        self.start_reconciled_request(
+        let _ = self.start_reconciled_request(
             request,
             command,
             location,
@@ -3271,6 +5755,7 @@ impl RouterEngine {
             host,
             top_slot,
             reconciliation,
+            back_destination,
         );
     }
     #[allow(clippy::too_many_arguments)]
@@ -3285,7 +5770,8 @@ impl RouterEngine {
         host: HostVersion,
         top_slot: RouteSlotId,
         reconciliation: RouteReconciliationProjection,
-    ) {
+        back_destination: Option<BackDestination>,
+    ) -> StartReconciledRequestOutcome {
         let mut target_frames = reconciliation
             .preserved()
             .iter()
@@ -3334,8 +5820,22 @@ impl RouterEngine {
             reservation.transaction(),
             reservation.cleanup_batch(),
         );
-        self.current_history_capability =
-            Some(self.history.freeze(execution, command.history_effect()));
+        let execution_projection = execution.projection();
+        let history_capability = match back_destination {
+            Some(destination) => match self.history.freeze_back(execution, destination) {
+                Ok(capability) => capability,
+                Err(drift) => {
+                    return StartReconciledRequestOutcome::BackSourceDrift { reservation, drift };
+                }
+            },
+            None => self.history.freeze(
+                execution,
+                command
+                    .history_effect()
+                    .expect("push and replace freeze their enqueue-time effect"),
+            ),
+        };
+        self.current_history_capability = Some(history_capability);
         let Some(entering) = reconciliation.entering().first().cloned() else {
             let leaf_index = target_frames
                 .len()
@@ -3388,7 +5888,7 @@ impl RouterEngine {
             });
             self.transition_with_trace(request, NavigationPhase::ReadyToSwitch);
             self.action = Some(EngineAction::Commit(CommitTicket { identity }));
-            return;
+            return StartReconciledRequestOutcome::Started(execution_projection);
         };
 
         let branch_index = entering.branch_index();
@@ -3467,7 +5967,7 @@ impl RouterEngine {
                         NavigationFailure::new(NavigationFailureKind::Mount, message),
                     );
                     self.action = Some(EngineAction::FailureCleanup(failure));
-                    return;
+                    return StartReconciledRequestOutcome::Started(execution_projection);
                 }
             };
             self.record_mut(request)
@@ -3483,7 +5983,7 @@ impl RouterEngine {
                 parent,
                 outlet,
             }));
-            return;
+            return StartReconciledRequestOutcome::Started(execution_projection);
         }
 
         let ProjectedEnteringSlot::Existing(slot) = entering.slot() else {
@@ -3576,6 +6076,7 @@ impl RouterEngine {
             view,
             input: Some(input),
         }));
+        StartReconciledRequestOutcome::Started(execution_projection)
     }
 
     fn begin_failure_cleanup(
@@ -3710,7 +6211,7 @@ impl RouterEngine {
         &mut self,
         request: NavigationRequestId,
         original_failure: NavigationFailure,
-    ) {
+    ) -> Option<FrameTaskIdentity> {
         self.current_history_capability = None;
         let matched = self
             .current
@@ -3738,7 +6239,7 @@ impl RouterEngine {
                     ),
                 );
                 self.start_next();
-                return;
+                return None;
             }
         };
         let location = self
@@ -3821,6 +6322,7 @@ impl RouterEngine {
             .expect("running trace is open");
         self.transition_with_trace(request, NavigationPhase::Recovering);
         self.issued_view_tasks.push(identity.clone());
+        let fallback_identity = identity.clone();
         self.action = Some(EngineAction::FrameTask(FrameTask {
             identity,
             frame: target_frame,
@@ -3830,6 +6332,7 @@ impl RouterEngine {
             view: self.fallback.clone(),
             input: Some(input),
         }));
+        Some(fallback_identity)
     }
 
     fn prepare_confirmed_child(
@@ -4071,6 +6574,18 @@ impl RouterEngine {
         self.active_branch.as_ref()
     }
 
+    fn back_target_preparation_baseline(&self) -> BackTargetPreparationBaseline {
+        BackTargetPreparationBaseline::new(
+            self.state.availability() == &crate::presentation::RouterAvailability::Ready,
+            self.state.host().cloned(),
+            self.state.top_slot(),
+            self.state.active().clone(),
+            self.current_active_branch()
+                .map(|branch| branch.branch_fingerprint().clone()),
+            self.active_child_slots.clone(),
+        )
+    }
+
     fn current_reconciliation_matches_active(&self) -> bool {
         let Some(projection) = self
             .current
@@ -4101,15 +6616,24 @@ impl RouterEngine {
         if self.current_reconciliation_matches_active() {
             return false;
         }
-        let failure = self.begin_failure_cleanup(
+        self.install_current_reconciliation_drift_failure();
+        true
+    }
+
+    fn install_current_reconciliation_drift_failure(&mut self) {
+        let failure = self.begin_current_reconciliation_drift_failure();
+        self.action = Some(EngineAction::FailureCleanup(failure));
+    }
+
+    fn begin_current_reconciliation_drift_failure(&mut self) -> FailureCleanupRequest {
+        self.action = None;
+        self.begin_failure_cleanup(
             PendingFailureKind::AuthorityLost,
             NavigationFailure::new(
                 NavigationFailureKind::AuthorityLost,
                 "active reconciliation baseline drifted",
             ),
-        );
-        self.action = Some(EngineAction::FailureCleanup(failure));
-        true
+        )
     }
 
     fn transition_with_trace(&mut self, request: NavigationRequestId, phase: NavigationPhase) {
@@ -4312,6 +6836,7 @@ impl RouterEngine {
             state: self.state.snapshot(),
             ids: self.ids.snapshot(),
             history: self.history.authority_snapshot(),
+            history_admission_world: self.history_admission_world,
             active_branch: self
                 .active_branch
                 .as_ref()
@@ -4326,14 +6851,63 @@ impl RouterEngine {
                 .map(|queued| format!("{queued:?}"))
                 .collect(),
             current: self.current.as_ref().map(|current| format!("{current:?}")),
+            pending_no_target_back: self
+                .pending_no_target_back
+                .as_ref()
+                .map(|pending| format!("{pending:?}")),
+            current_history_capability: self
+                .current_history_capability
+                .as_ref()
+                .map(HistoryCommitCapability::snapshot),
+            pending_history_preparation_error: self
+                .pending_history_preparation_error
+                .as_ref()
+                .map(HistoryPreparationError::snapshot),
+            prepared_publication_authority: self
+                .prepared_publication_authority
+                .as_ref()
+                .map(PreparedPublicationAuthoritySnapshot::from),
             action: self.action.as_ref().map(ActionSnapshot::from),
+            issued_view_tasks: self.issued_view_tasks.clone(),
             mount: self.mount.snapshot(),
+            report_dispositions: self.report_dispositions.clone(),
+            router_diagnostics: self.router_diagnostics.clone(),
+            completed_cleanup: self.completed_cleanup.clone(),
+            next_failed_authority_trigger_revision: self.next_failed_authority_trigger_revision,
+            live_failed_authority_trigger_revision: self.live_failed_authority_trigger_revision,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn testing_snapshot(&self) -> EngineSnapshot {
         self.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_next_frame_identities(&self) -> (u64, u64) {
+        let ids = self.ids.snapshot();
+        (ids.next_frame(), ids.next_frame_task())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_id_allocator_snapshot(&self) -> crate::ids::CoreIdAllocatorSnapshot {
+        self.ids.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_mount_issuer_snapshot(&self) -> crate::mount::MountIssuerSnapshot {
+        self.mount.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_begin_back_target_host_drift(&mut self) -> bool {
+        let Some(host) = self.state.host().cloned() else {
+            return false;
+        };
+        let Some(top_slot) = self.state.top_slot() else {
+            return false;
+        };
+        self.state.begin_authority_recovery(&host, top_slot)
     }
 
     #[cfg(test)]
@@ -4369,8 +6943,8 @@ impl RouterEngine {
             .testing_exhaust_reservation_counter(self.router, counter);
     }
 
-    #[cfg(test)]
-    fn testing_exhaust_mount_sequence_counter(&mut self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_exhaust_mount_sequence_counter(&mut self) {
         self.ids.testing_exhaust_mount_sequence_counter();
     }
 
@@ -4385,7 +6959,7 @@ impl RouterEngine {
     }
 
     #[cfg(test)]
-    fn testing_set_active_generation(&mut self, generation: RouteGeneration) {
+    pub(crate) fn testing_set_active_generation(&mut self, generation: RouteGeneration) {
         let active = self
             .state
             .active()
@@ -4511,6 +7085,103 @@ impl std::fmt::Debug for ViewReportSession<'_> {
 }
 
 impl ViewReportSession<'_> {
+    fn failed_back_target(
+        self,
+        scope: BackResolutionScopeProjection,
+        failure: NavigationFailure,
+        mode: CoreBackTargetDriverFailureReportMode,
+    ) -> CoreBackTargetDriverFailureReport {
+        if matches!(
+            mode,
+            CoreBackTargetDriverFailureReportMode::PhysicalResidual
+        ) {
+            let request = self.failed_with_physical_residual(failure);
+            return CoreBackTargetDriverFailureReport::FailureCleanup(
+                CoreBackTargetDriverFailureCleanup { scope, request },
+            );
+        }
+
+        let request = self.identity.request;
+        let branch_index = self.identity.branch_index;
+        let attempt = self
+            .engine
+            .current
+            .as_ref()
+            .expect("report was preflighted")
+            .attempt
+            .clone();
+        let diagnostic_message = match &attempt {
+            AttemptKind::Normal(_) => format!(
+                "accepted normal {:?} failure: {}",
+                failure.kind(),
+                failure.message()
+            ),
+            AttemptKind::Fallback { .. } => format!(
+                "accepted fallback {:?} failure: {}",
+                failure.kind(),
+                failure.message()
+            ),
+        };
+        self.engine.record_report_disposition(
+            &self.identity,
+            ReportDisposition::Accepted,
+            diagnostic_message,
+        );
+
+        match attempt {
+            AttemptKind::Normal(_) if branch_index > 0 => {
+                let expected = match failure.kind() {
+                    NavigationFailureKind::Build => PendingFailureKind::Build,
+                    NavigationFailureKind::Apply => PendingFailureKind::Apply,
+                    _ => PendingFailureKind::Apply,
+                };
+                CoreBackTargetDriverFailureReport::FailureCleanup(
+                    CoreBackTargetDriverFailureCleanup {
+                        scope,
+                        request: self.engine.begin_failure_cleanup(expected, failure),
+                    },
+                )
+            }
+            AttemptKind::Normal(_) => {
+                let expected_attempt = CoreBackTargetReceiverAttemptProjection::Fallback {
+                    original_failure: failure.clone(),
+                };
+                match self.engine.begin_fallback(request, failure) {
+                    Some(action) => {
+                        CoreBackTargetDriverFailureReport::Fallback(CoreBackTargetDriverFallback {
+                            scope,
+                            action,
+                            expected_attempt,
+                        })
+                    }
+                    None => {
+                        CoreBackTargetDriverFailureReport::Terminal(CoreBackTargetDriverTerminal {
+                            scope,
+                            request,
+                        })
+                    }
+                }
+            }
+            AttemptKind::Fallback { .. } => {
+                self.engine.retire_history_authority();
+                self.engine.current = None;
+                self.engine.action = None;
+                self.engine.fail_reserved_request(
+                    request,
+                    NavigationFailure::new(
+                        NavigationFailureKind::RecoveryFailed,
+                        "router fallback failed",
+                    ),
+                );
+                self.engine.start_next();
+                CoreBackTargetDriverFailureReport::Terminal(CoreBackTargetDriverTerminal {
+                    scope,
+                    request,
+                })
+            }
+        }
+    }
+
     pub(crate) fn applied(self) -> CommitTicket {
         self.engine
             .accept_applied_report(AppliedFrameReport {
@@ -4563,7 +7234,7 @@ impl ViewReportSession<'_> {
                 Some(self.engine.begin_failure_cleanup(expected, failure))
             }
             AttemptKind::Normal(_) => {
-                self.engine.begin_fallback(request, failure);
+                let _ = self.engine.begin_fallback(request, failure);
                 None
             }
             AttemptKind::Fallback { .. } => {
@@ -4643,6 +7314,9 @@ impl ViewReportSession<'_> {
                 (failure, FailureCleanupContinuation::BeginFallback)
             }
             AttemptKind::Normal(NavigationCommandKind::Push) => {
+                (failure, FailureCleanupContinuation::Terminal)
+            }
+            AttemptKind::Normal(NavigationCommandKind::Back) => {
                 (failure, FailureCleanupContinuation::Terminal)
             }
             AttemptKind::Fallback { .. } => (
@@ -4899,6 +7573,9 @@ fn history_fixture_drive_to_commit(
             }
             EngineAction::FailureCleanup(_) => panic!("fixture success reached failure cleanup"),
             EngineAction::Commit(ticket) => return ticket,
+            EngineAction::BackResolution(_) => {
+                panic!("history commit fixture does not drive unresolved back")
+            }
         };
     }
 }
@@ -4948,6 +7625,73 @@ enum ActionSnapshot {
     MountRequest(NavigationRequestId, RouteFrameVersion, RouteSlotKey),
     FailureCleanup(NavigationRequestId),
     Commit(RootTaskIdentity),
+    BackResolution,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+struct PreparedPublicationOwnerSnapshot {
+    identity: FrameTaskIdentity,
+    evidence: SealedCommitEvidence,
+    source: String,
+    state: RouterNavigationState,
+    history: Option<HistoryCapabilitySnapshot>,
+    active_branch: Option<String>,
+    active_child_slots: Vec<LogicalChildSlotBinding>,
+    record_index: usize,
+    published_record: NavigationRequestRecord,
+    current: String,
+}
+
+#[cfg(test)]
+impl From<&SealedCommit> for PreparedPublicationOwnerSnapshot {
+    fn from(owner: &SealedCommit) -> Self {
+        Self {
+            identity: owner.identity.clone(),
+            evidence: owner.evidence.clone(),
+            source: format!("{:?}", owner.source),
+            state: owner.publication.state.clone(),
+            history: owner
+                .publication
+                .history
+                .as_ref()
+                .map(PreparedHistoryPublication::capability_snapshot),
+            active_branch: owner
+                .publication
+                .active_branch
+                .as_ref()
+                .map(|branch| format!("{branch:?}")),
+            active_child_slots: owner.publication.active_child_slots.clone(),
+            record_index: owner.publication.record_index,
+            published_record: owner.publication.published_record.clone(),
+            current: format!("{:?}", owner.publication.current),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+enum PreparedPublicationAuthoritySnapshot {
+    Ready(PreparedPublicationOwnerSnapshot),
+    Rejected {
+        owner: PreparedPublicationOwnerSnapshot,
+        error: CommitError,
+        observed: String,
+    },
+}
+
+#[cfg(test)]
+impl From<&PreparedPublicationAuthority> for PreparedPublicationAuthoritySnapshot {
+    fn from(authority: &PreparedPublicationAuthority) -> Self {
+        match authority {
+            PreparedPublicationAuthority::Ready(owner) => Self::Ready(owner.into()),
+            PreparedPublicationAuthority::Rejected(rejection) => Self::Rejected {
+                owner: (&rejection.owner).into(),
+                error: rejection.error,
+                observed: format!("{:?}", rejection.observed),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4962,6 +7706,7 @@ impl From<&EngineAction> for ActionSnapshot {
             ),
             EngineAction::FailureCleanup(request) => Self::FailureCleanup(request.request()),
             EngineAction::Commit(ticket) => Self::Commit(ticket.identity.clone()),
+            EngineAction::BackResolution(_) => Self::BackResolution,
         }
     }
 }
@@ -4972,6 +7717,7 @@ pub(crate) struct EngineSnapshot {
     state: RouterNavigationState,
     ids: crate::ids::CoreIdAllocatorSnapshot,
     history: HistoryAuthoritySnapshot,
+    history_admission_world: Option<CoreIssuedWorldSealProjection>,
     active_branch: Option<String>,
     active_child_slots: Vec<LogicalChildSlotBinding>,
     records: VecDeque<NavigationRequestRecord>,
@@ -4979,15 +7725,41 @@ pub(crate) struct EngineSnapshot {
     highest_issued: Option<u64>,
     queue: Vec<String>,
     current: Option<String>,
+    pending_no_target_back: Option<String>,
+    current_history_capability: Option<HistoryCapabilitySnapshot>,
+    pending_history_preparation_error: Option<HistoryDriftEvidenceSnapshot>,
+    prepared_publication_authority: Option<PreparedPublicationAuthoritySnapshot>,
     action: Option<ActionSnapshot>,
+    issued_view_tasks: Vec<FrameTaskIdentity>,
     mount: crate::mount::MountIssuerSnapshot,
+    report_dispositions: Vec<ReportDispositionRecord>,
+    router_diagnostics: Vec<DiagnosticEvent>,
+    completed_cleanup: Vec<CompletedCleanupTombstone>,
+    next_failed_authority_trigger_revision: u64,
+    live_failed_authority_trigger_revision: Option<u64>,
+}
+
+#[cfg(test)]
+impl EngineSnapshot {
+    pub(crate) fn without_back_resolution_state_for(
+        mut self,
+        request: NavigationRequestId,
+    ) -> Self {
+        self.records
+            .iter_mut()
+            .find(|record| record.id() == request)
+            .expect("the compared Back request remains retained")
+            .testing_clear_back_resolution();
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionSnapshot, CleanupError, CommitError, EngineAction, MountError, PrivateRequestLookup,
-        PushError, ROUTER_DIAGNOSTIC_RETENTION, ReportError, RootTaskIdentity, RouterEngine,
+        ActionSnapshot, CleanupError, CommitError, EngineAction, MountError, NavigationCommand,
+        PrivateRequestLookup, PushError, QueuedNavigation, QueuedReservation,
+        ROUTER_DIAGNOSTIC_RETENTION, ReportError, RootTaskIdentity, RouterEngine,
         TERMINAL_RETENTION, WorkStage, occupied_child_slots,
     };
     use crate::admission::{AdmissionError, HostAdmissionIssuer};
@@ -5133,6 +7905,9 @@ mod tests {
                     panic!("successful drive cannot produce failure cleanup")
                 }
                 EngineAction::Commit(ticket) => break ticket,
+                EngineAction::BackResolution(_) => {
+                    panic!("commit helper does not drive unresolved back")
+                }
             }
         }
     }
@@ -5147,6 +7922,145 @@ mod tests {
     {
         let prepared = engine.prepare_publication(sealed)?;
         engine.publish_prepared(prepared, mutation)
+    }
+
+    #[test]
+    fn back_resolution_action_blocks_next_collect() {
+        let mut engine = ready_engine();
+        engine.enqueue_push(RouteLocation::new("/")).unwrap();
+        engine.collect();
+        settle_current(&mut engine);
+        engine.enqueue_push(RouteLocation::new("/about")).unwrap();
+        engine.collect();
+        settle_current(&mut engine);
+
+        let world = engine
+            .claim_history_admission_world()
+            .expect("the confirmed engine issues one real history world seal");
+        let stamp = engine
+            .history_admission_stamp(&world)
+            .expect("the published history has a real back entry");
+        let first_admission = engine
+            .prepare_back_admission(&world, &stamp)
+            .expect("the first back admission exact-refreezes the live history");
+        let second_admission = engine
+            .prepare_back_admission(&world, &stamp)
+            .expect("the second back admission exact-refreezes the same live history");
+        let history_authority_before = engine.testing_history_authority_snapshot();
+        let history_world_before = engine.history_admission_world;
+        let active_before = engine.active().clone();
+        let state_before = engine.state.snapshot();
+        let first_accepted = engine
+            .enqueue_back(first_admission)
+            .expect("the first back reserves a real branch owner");
+        let second_accepted = engine
+            .enqueue_back(second_admission)
+            .expect("the second back reserves a distinct real branch owner");
+        let first_request = first_accepted.request();
+        let second_request = second_accepted.request();
+        assert_ne!(first_request, second_request);
+
+        let queued_back_projection = |queued: &QueuedNavigation| {
+            let QueuedReservation::Branch(reservation) = &queued.reservation else {
+                panic!("accepted Back must retain its complete branch reservation")
+            };
+            (
+                queued.request,
+                matches!(&queued.command, NavigationCommand::Back),
+                queued.outcome.is_none(),
+                reservation.request(),
+                reservation.transaction(),
+                reservation.cleanup_batch(),
+                reservation
+                    .frames()
+                    .iter()
+                    .map(|frame| (frame.frame_task(), frame.frame()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let second_queued_before_collect = queued_back_projection(
+            engine
+                .queue
+                .get(1)
+                .expect("the second accepted Back remains queued behind the first"),
+        );
+        assert_eq!(second_queued_before_collect.0, second_request);
+        assert!(second_queued_before_collect.1);
+        assert!(second_queued_before_collect.2);
+        assert_eq!(engine.queue.len(), 2);
+        for (queued, request) in engine.queue.iter().zip([first_request, second_request]) {
+            assert_eq!(queued.request, request);
+            assert!(matches!(&queued.command, NavigationCommand::Back));
+            assert!(queued.outcome.is_none());
+            let QueuedReservation::Branch(reservation) = &queued.reservation else {
+                panic!("each accepted Back must retain its complete branch reservation")
+            };
+            assert_eq!(reservation.request(), request);
+            assert_eq!(
+                reservation.frames().len(),
+                engine.matcher.max_branch_depth(),
+                "each accepted Back reserves the installed maximum depth before resolution"
+            );
+        }
+        for request in [first_request, second_request] {
+            let record = engine
+                .request(request)
+                .expect("each accepted Back retains its queued request record");
+            assert_eq!(record.status(), &RequestStatus::Queued);
+            assert_eq!(record.requested(), None);
+            assert_eq!(record.matched(), None);
+            assert!(record.trace().is_empty());
+            assert!(record.diagnostics().is_empty());
+        }
+        assert!(engine.current.is_none());
+        assert!(engine.pending_no_target_back.is_none());
+        assert!(engine.action.is_none());
+        assert!(engine.current_history_capability.is_none());
+        assert!(engine.pending_history_preparation_error.is_none());
+        assert!(engine.prepared_publication_authority.is_none());
+        assert_eq!(
+            engine.testing_history_authority_snapshot(),
+            history_authority_before
+        );
+        assert_eq!(engine.history_admission_world, history_world_before);
+        assert_eq!(engine.active(), &active_before);
+        assert_eq!(engine.state.snapshot(), state_before);
+
+        engine.collect();
+        let queue_len_with_outstanding_action = engine.queue.len();
+        let first_action_evidence = match engine.action.as_ref() {
+            Some(EngineAction::BackResolution(handoff)) => handoff.evidence(),
+            _ => panic!("the first accepted back must leave one raw resolution action outstanding"),
+        };
+        assert_eq!(queue_len_with_outstanding_action, 1);
+
+        engine.collect();
+
+        assert_eq!(first_accepted.request(), first_request);
+        assert_eq!(second_accepted.request(), second_request);
+        let observed_action_evidence = match engine.action.as_ref() {
+            Some(EngineAction::BackResolution(handoff)) => handoff.evidence(),
+            _ => panic!("the original raw resolution action must remain outstanding"),
+        };
+        assert_eq!(
+            observed_action_evidence, first_action_evidence,
+            "an outstanding BackResolution action must not be overwritten by collect"
+        );
+        assert_eq!(
+            engine.queue.len(),
+            queue_len_with_outstanding_action,
+            "an outstanding BackResolution action must block collect from consuming the queued back"
+        );
+        assert_eq!(
+            queued_back_projection(
+                engine
+                    .queue
+                    .front()
+                    .expect("the second accepted Back must remain at the front of the queue"),
+            ),
+            second_queued_before_collect,
+            "the blocked second Back must retain its exact non-authorizing queue projection"
+        );
     }
 
     #[test]
@@ -9453,7 +12367,8 @@ mod tests {
             .expect("task retains current work")
             .applied_frames
             .push(task.frame_version().clone());
-        let before = engine.snapshot();
+        let mut before = engine.snapshot();
+        before.live_failed_authority_trigger_revision = None;
         let mutation_ran = std::cell::Cell::new(false);
         let error = engine
             .begin_failed_authority_settlement_retaining(
@@ -9476,6 +12391,10 @@ mod tests {
         let _lease = error.into_owner();
         assert!(!mutation_ran.get());
         assert!(issuer.has_current());
+        assert_eq!(
+            engine.live_failed_authority_trigger_revision, None,
+            "an exact-receiver rejection burns the one-shot trigger while returning the lease"
+        );
         assert_eq!(engine.snapshot(), before);
     }
 
@@ -10193,5 +13112,44 @@ mod tests {
             );
             assert_eq!(engine.snapshot(), before, "counter: {counter:?}");
         }
+    }
+
+    #[test]
+    fn back_target_atomic_applied_receiver_never_derives_outcome_from_ambient_action() {
+        let source = include_str!("engine.rs");
+        let signature = "pub(crate) fn report_back_target_applied(";
+        let function_start = source
+            .find(signature)
+            .expect("the target atomic applied receiver must remain present");
+        let body_start = function_start
+            + source[function_start..]
+                .find('{')
+                .expect("the target atomic applied receiver must have one body");
+        let mut depth = 0usize;
+        let mut body_end = None;
+        for (offset, character) in source[body_start..].char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = Some(body_start + offset + character.len_utf8());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let receiver = &source
+            [function_start..body_end.expect("the target atomic applied receiver body must close")];
+
+        assert!(
+            !receiver.contains("self.action"),
+            "the target atomic applied receiver must consume a direct typed producer result, not read ambient action"
+        );
+        assert!(
+            !receiver.contains("EngineAction::"),
+            "the target atomic applied receiver must not infer its typed outcome by matching EngineAction"
+        );
     }
 }

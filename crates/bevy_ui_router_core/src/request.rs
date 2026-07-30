@@ -1,5 +1,6 @@
 use crate::diagnostics::DiagnosticEvent;
 use crate::fingerprint::RouteBranchFingerprint;
+use crate::history_authority::{BackResolutionEvidence, BackResolutionEvidenceClassification};
 use crate::ids::NavigationRequestId;
 use crate::location::RouteLocation;
 use crate::trace::{
@@ -65,10 +66,17 @@ pub enum RequestStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BackResolutionRecordState {
+    Current(BackResolutionEvidence),
+    Consumed(BackResolutionEvidence),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NavigationRequestRecord {
     id: NavigationRequestId,
     requested: Option<RouteLocation>,
     matched: Option<RouteBranchFingerprint>,
+    back_resolution: Option<BackResolutionRecordState>,
     status: RequestStatus,
     trace: NavigationTraceLog,
     diagnostics: Vec<DiagnosticEvent>,
@@ -84,6 +92,7 @@ impl NavigationRequestRecord {
             id,
             requested: Some(requested),
             matched: None,
+            back_resolution: None,
             status: RequestStatus::Queued,
             trace: NavigationTraceLog::new(),
             diagnostics: Vec::new(),
@@ -96,6 +105,7 @@ impl NavigationRequestRecord {
             id,
             requested: None,
             matched: None,
+            back_resolution: None,
             status: RequestStatus::Queued,
             trace: NavigationTraceLog::new(),
             diagnostics: Vec::new(),
@@ -127,6 +137,52 @@ impl NavigationRequestRecord {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn matched(&self) -> Option<&RouteBranchFingerprint> {
         self.matched.as_ref()
+    }
+
+    pub(crate) fn install_back_resolution(
+        &mut self,
+        evidence: BackResolutionEvidence,
+    ) -> Result<(), RequestRecordError> {
+        if self.back_resolution.is_some() {
+            return Err(RequestRecordError::BackResolutionAlreadyInstalled);
+        }
+        if !evidence.is_observed() || evidence.request() != self.id {
+            return Err(RequestRecordError::BackResolutionMismatch);
+        }
+        self.back_resolution = Some(BackResolutionRecordState::Current(evidence));
+        Ok(())
+    }
+
+    pub(crate) fn classify_back_resolution(
+        &self,
+        evidence: &BackResolutionEvidence,
+    ) -> BackResolutionEvidenceClassification {
+        match &self.back_resolution {
+            Some(BackResolutionRecordState::Current(stored)) if stored == evidence => {
+                BackResolutionEvidenceClassification::Current
+            }
+            Some(BackResolutionRecordState::Consumed(stored)) if stored == evidence => {
+                BackResolutionEvidenceClassification::ConsumedReplay
+            }
+            Some(_) | None => BackResolutionEvidenceClassification::Foreign,
+        }
+    }
+
+    pub(crate) fn consume_back_resolution(
+        &mut self,
+        evidence: &BackResolutionEvidence,
+    ) -> Result<(), RequestRecordError> {
+        if !matches!(
+            &self.back_resolution,
+            Some(BackResolutionRecordState::Current(stored)) if stored == evidence
+        ) {
+            return Err(RequestRecordError::BackResolutionMismatch);
+        }
+        let Some(BackResolutionRecordState::Current(stored)) = self.back_resolution.take() else {
+            unreachable!("exact current evidence was checked before consumption")
+        };
+        self.back_resolution = Some(BackResolutionRecordState::Consumed(stored));
+        Ok(())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -161,6 +217,14 @@ impl NavigationRequestRecord {
         if self.status.is_terminal() {
             return Err(RequestRecordError::AlreadyTerminal);
         }
+        if status.is_terminal()
+            && matches!(
+                &self.back_resolution,
+                Some(BackResolutionRecordState::Current(_))
+            )
+        {
+            return Err(RequestRecordError::OutstandingBackResolution);
+        }
         self.status = status;
         Ok(())
     }
@@ -191,6 +255,11 @@ impl NavigationRequestRecord {
         self.diagnostics.push(event);
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn testing_clear_back_resolution(&mut self) {
+        self.back_resolution = None;
+    }
 }
 
 impl RequestStatus {
@@ -202,7 +271,10 @@ impl RequestStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestRecordError {
     AlreadyTerminal,
+    BackResolutionAlreadyInstalled,
+    BackResolutionMismatch,
     ImmutableMatch,
+    OutstandingBackResolution,
     TerminalStatusRequired,
     TerminalEventRequired,
     TraceClosed,
@@ -220,6 +292,10 @@ impl From<NavigationTraceError> for RequestRecordError {
 mod tests {
     use super::*;
     use crate::fingerprint::RouteSearchFingerprint;
+    use crate::history_authority::{
+        BackResolutionOwnerHandoff, BackTargetPreparationBaseline, CanonicalHistory,
+        CoreIssuedWorldSeal,
+    };
     use crate::ids::CoreIdAllocator;
     use crate::trace::NavigationTraceEventKind;
 
@@ -233,12 +309,84 @@ mod tests {
         ids.allocate_request(router).unwrap()
     }
 
+    fn back_resolution_evidence() -> (NavigationRequestId, BackResolutionEvidence) {
+        let mut ids = CoreIdAllocator::new().unwrap();
+        let router = ids.allocate_router_identity().unwrap();
+        let reservation = ids.reserve_navigation_branch(router, 1).unwrap();
+        let request = reservation.request();
+        let history = CanonicalHistory::new(router);
+        let world = CoreIssuedWorldSeal::issue(router, history.incarnation())
+            .unwrap()
+            .projection();
+        let handoff = BackResolutionOwnerHandoff::resolved(
+            world,
+            router,
+            history.incarnation(),
+            reservation,
+            BackTargetPreparationBaseline::new(
+                false,
+                None,
+                None,
+                crate::presentation::ActivePresentation::none(),
+                None,
+                Vec::new(),
+            ),
+            history.preview_back(),
+        );
+        (request, handoff.evidence())
+    }
+
     #[test]
     fn queued_back_projects_no_requested_target() {
         let queued_back = NavigationRequestRecord::unresolved_back(request_id());
 
         assert_eq!(queued_back.status(), &RequestStatus::Queued);
         assert_eq!(queued_back.requested(), None);
+        assert_eq!(queued_back.back_resolution, None);
+    }
+
+    #[test]
+    fn back_resolution_record_is_exact_linear_and_blocks_current_terminal() {
+        let (request, evidence) = back_resolution_evidence();
+        let (_, foreign) = back_resolution_evidence();
+        let mut record = NavigationRequestRecord::unresolved_back(request);
+
+        record.install_back_resolution(evidence.clone()).unwrap();
+        assert_eq!(
+            record.classify_back_resolution(&evidence),
+            BackResolutionEvidenceClassification::Current
+        );
+        assert_eq!(
+            record.classify_back_resolution(&foreign),
+            BackResolutionEvidenceClassification::Foreign
+        );
+
+        let current = record.clone();
+        assert_eq!(
+            record.transition(RequestStatus::Failed(NavigationFailure::new(
+                NavigationFailureKind::AuthorityLost,
+                "current Back resolution cannot become terminal",
+            ))),
+            Err(RequestRecordError::OutstandingBackResolution)
+        );
+        assert_eq!(record, current);
+        assert_eq!(
+            record.consume_back_resolution(&foreign),
+            Err(RequestRecordError::BackResolutionMismatch)
+        );
+        assert_eq!(record, current);
+
+        record.consume_back_resolution(&evidence).unwrap();
+        assert_eq!(
+            record.classify_back_resolution(&evidence),
+            BackResolutionEvidenceClassification::ConsumedReplay
+        );
+        record
+            .transition(RequestStatus::Failed(NavigationFailure::new(
+                NavigationFailureKind::AuthorityLost,
+                "consumed Back resolution may become terminal",
+            )))
+            .unwrap();
     }
 
     #[test]

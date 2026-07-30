@@ -1,10 +1,13 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::HostVersion;
 use crate::cleanup::CleanupBatchToken;
 use crate::fingerprint::RouteBranchFingerprint;
-use crate::frame::{FrameOrigin, RouteFrameVersion};
+use crate::frame::{FrameOrigin, LogicalChildSlotBinding, RouteFrameVersion};
 use crate::history::{HistorySnapshot, MemoryHistory};
 use crate::ids::{
-    CleanupBatchId, FrameTaskId, NavigationRequestId, RouteFrameId, RouteGeneration, RouteHostId,
-    RouteSlotId, RouterIdentity, TransactionId,
+    CleanupBatchId, FrameTaskId, NavigationRequestId, ReservedBranchAttempt, RouteFrameId,
+    RouteGeneration, RouteHostId, RouteSlotId, RouterIdentity, TransactionId,
 };
 use crate::location::RouteLocation;
 use crate::presentation::ActivePresentation;
@@ -31,6 +34,917 @@ pub(crate) struct FrozenHistorySource {
     cursor: Option<usize>,
     entry_ids: Vec<HistoryEntryId>,
     locations: Vec<RouteLocation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CoreIssuedWorldSealProjection {
+    identity: u64,
+    router: RouterIdentity,
+    incarnation: HistoryIncarnation,
+}
+
+pub(crate) struct CoreIssuedWorldSeal {
+    projection: CoreIssuedWorldSealProjection,
+}
+
+#[doc(hidden)]
+pub struct HistoryAdmissionWorldSeal {
+    inner: CoreIssuedWorldSeal,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryAdmissionStamp {
+    world: CoreIssuedWorldSealProjection,
+    router: RouterIdentity,
+    incarnation: HistoryIncarnation,
+    published_revision: HistoryRevision,
+    can_back: bool,
+}
+
+#[doc(hidden)]
+pub struct BackAdmissionToken {
+    verified_stamp: HistoryAdmissionStamp,
+    live_revision_at_prepare: HistoryRevision,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrepareBackAdmissionErrorKind {
+    ForeignStamp,
+    AuthorityRecovering,
+    NoBackEntry,
+}
+
+#[doc(hidden)]
+pub struct BackAcceptedReservationView {
+    inner: BackAcceptedReservationProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BackAcceptedReservationProjection {
+    world: CoreIssuedWorldSealProjection,
+    router: RouterIdentity,
+    history: HistoryIncarnation,
+    request: NavigationRequestId,
+    transaction: TransactionId,
+    cleanup_batch: CleanupBatchId,
+    branch: CoreAcceptedBranchReservationProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoreAcceptedBranchReservationProjection {
+    identity: CoreAcceptedBranchReservationIdentity,
+    pool_capacity: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoreAcceptedBranchReservationIdentity(TransactionId);
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnqueueBackErrorKind {
+    AuthorityRecovering,
+    Exhausted,
+}
+
+#[doc(hidden)]
+pub struct AcceptedBackReservation {
+    request: NavigationRequestId,
+    accepted: BackAcceptedReservationView,
+}
+
+impl AcceptedBackReservation {
+    pub fn request(&self) -> NavigationRequestId {
+        self.request
+    }
+
+    pub fn into_parts(self) -> (NavigationRequestId, BackAcceptedReservationView) {
+        (self.request, self.accepted)
+    }
+}
+
+#[doc(hidden)]
+pub struct BackResolutionScopeView {
+    inner: BackResolutionScopeProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BackResolutionScopeProjection {
+    world: CoreIssuedWorldSealProjection,
+    router: RouterIdentity,
+    history: HistoryIncarnation,
+    request: NavigationRequestId,
+    transaction: TransactionId,
+    cleanup_batch: CleanupBatchId,
+    branch: CoreAcceptedBranchReservationProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BackResolutionEvidenceProjection {
+    expected: Option<BackAcceptedReservationProjection>,
+    observed: BackResolutionScopeProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoreFrozenHistorySourceProjection {
+    incarnation: HistoryIncarnation,
+    revision: HistoryRevision,
+    cursor: Option<usize>,
+    entry_ids: Vec<HistoryEntryId>,
+    locations: Vec<RouteLocation>,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackResolutionEvidence {
+    inner: BackResolutionEvidenceProjection,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackResolutionEvidenceClassification {
+    Current,
+    Foreign,
+    ConsumedReplay,
+}
+
+#[allow(dead_code)]
+struct CoreBackTargetExecutionOwner {
+    scope: BackResolutionScopeProjection,
+    reservation: ReservedBranchAttempt,
+    destination: BackDestination,
+    preparation_baseline: BackTargetPreparationBaseline,
+}
+
+#[doc(hidden)]
+pub struct BackTargetExecutionOwner {
+    inner: CoreBackTargetExecutionOwner,
+}
+
+#[allow(dead_code)]
+struct CoreBackNoTargetCandidate {
+    scope: BackResolutionScopeProjection,
+    reservation: ReservedBranchAttempt,
+    source: FrozenHistorySource,
+}
+
+#[doc(hidden)]
+pub struct BackNoTargetCandidate {
+    inner: CoreBackNoTargetCandidate,
+}
+
+#[allow(dead_code)]
+struct CoreBackResolutionContradiction {
+    scope: BackResolutionScopeProjection,
+    reservation: ReservedBranchAttempt,
+    contradiction: BackPreviewContradiction,
+}
+
+#[doc(hidden)]
+pub struct BackResolutionContradiction {
+    inner: CoreBackResolutionContradiction,
+}
+
+#[allow(dead_code)]
+struct CoreVerifiedBackTargetExecutionOwner {
+    raw: CoreBackTargetExecutionOwner,
+}
+
+#[doc(hidden)]
+pub struct VerifiedBackTargetExecutionOwner {
+    inner: CoreVerifiedBackTargetExecutionOwner,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BackTargetPreparationBaseline {
+    ready: bool,
+    host: Option<HostVersion>,
+    top_slot: Option<RouteSlotId>,
+    active: ActivePresentation,
+    active_branch: Option<RouteBranchFingerprint>,
+    active_child_slots: Vec<LogicalChildSlotBinding>,
+}
+
+impl BackTargetPreparationBaseline {
+    pub(crate) fn new(
+        ready: bool,
+        host: Option<HostVersion>,
+        top_slot: Option<RouteSlotId>,
+        active: ActivePresentation,
+        active_branch: Option<RouteBranchFingerprint>,
+        active_child_slots: Vec<LogicalChildSlotBinding>,
+    ) -> Self {
+        Self {
+            ready,
+            host,
+            top_slot,
+            active,
+            active_branch,
+            active_child_slots,
+        }
+    }
+
+    pub(crate) fn classify_refreeze(
+        &self,
+        observed: &Self,
+    ) -> Result<(), BackTargetAuthorityLossCause> {
+        if self.ready != observed.ready
+            || self.host != observed.host
+            || self.top_slot != observed.top_slot
+        {
+            return Err(BackTargetAuthorityLossCause::Host);
+        }
+        if self.active != observed.active
+            || self.active_branch != observed.active_branch
+            || self.active_child_slots != observed.active_child_slots
+        {
+            return Err(BackTargetAuthorityLossCause::ActiveBaseline);
+        }
+        Ok(())
+    }
+}
+
+#[allow(dead_code)]
+struct CoreVerifiedBackNoTargetCandidate {
+    raw: CoreBackNoTargetCandidate,
+}
+
+#[doc(hidden)]
+pub struct VerifiedBackNoTargetCandidate {
+    inner: CoreVerifiedBackNoTargetCandidate,
+}
+
+#[allow(dead_code)]
+struct CoreVerifiedBackResolutionContradiction {
+    raw: CoreBackResolutionContradiction,
+}
+
+#[doc(hidden)]
+pub struct VerifiedBackResolutionContradiction {
+    inner: CoreVerifiedBackResolutionContradiction,
+}
+
+#[allow(dead_code)]
+struct CoreBackTargetPermanentOwner {
+    scope: BackResolutionScopeProjection,
+    reservation: ReservedBranchAttempt,
+    cause: CoreBackTargetPermanentCause,
+}
+
+#[allow(dead_code)]
+enum CoreBackTargetPermanentCause {
+    SourceDrift(CoreBackTargetSourceDriftOwner),
+    AuthorityLost {
+        destination: BackDestination,
+        cause: BackTargetAuthorityLossCause,
+        expected: BackTargetPreparationBaseline,
+        observed: BackTargetPreparationBaseline,
+    },
+}
+
+#[allow(dead_code)]
+enum CoreBackTargetSourceDriftOwner {
+    Refreeze {
+        destination: BackDestination,
+        observed_source: FrozenHistorySource,
+        expected: BackTargetPreparationBaseline,
+        observed: BackTargetPreparationBaseline,
+    },
+    Capability {
+        drift: HistorySourceDrift,
+        expected: BackTargetPreparationBaseline,
+        observed: BackTargetPreparationBaseline,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackTargetAuthorityLossCause {
+    Host,
+    TargetMatch,
+    MaximumDepth,
+    ActiveBaseline,
+    Generation,
+    ViewBinding,
+    RequestRecord,
+}
+
+#[doc(hidden)]
+pub struct BackTargetPermanentOwner {
+    inner: CoreBackTargetPermanentOwner,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoreBackTargetPermanentTerminalProjection {
+    scope: BackResolutionScopeProjection,
+    expected: CoreFrozenHistorySourceProjection,
+    observed: CoreFrozenHistorySourceProjection,
+}
+
+#[doc(hidden)]
+pub struct BackTargetPermanentTerminalEvidence {
+    inner: CoreBackTargetPermanentTerminalProjection,
+}
+
+#[allow(dead_code)]
+struct CoreBackNoTargetSourceDriftOwner {
+    candidate: CoreVerifiedBackNoTargetCandidate,
+    observed: FrozenHistorySource,
+}
+
+#[doc(hidden)]
+pub struct BackNoTargetSourceDriftOwner {
+    inner: CoreBackNoTargetSourceDriftOwner,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoreBackNoTargetSourceDriftProjection {
+    scope: BackResolutionScopeProjection,
+    expected: CoreFrozenHistorySourceProjection,
+    observed: CoreFrozenHistorySourceProjection,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackNoTargetSourceDriftEvidence {
+    inner: CoreBackNoTargetSourceDriftProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoreBackNoTargetSourceDriftTerminalProjection {
+    drift: CoreBackNoTargetSourceDriftProjection,
+}
+
+#[doc(hidden)]
+pub struct BackNoTargetSourceDriftTerminalEvidence {
+    inner: CoreBackNoTargetSourceDriftTerminalProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoreBackContradictionTerminalProjection {
+    scope: BackResolutionScopeProjection,
+    expected: CoreFrozenHistorySourceProjection,
+    observed: CoreFrozenHistorySourceProjection,
+}
+
+#[doc(hidden)]
+pub struct BackContradictionTerminalEvidence {
+    inner: CoreBackContradictionTerminalProjection,
+}
+
+#[doc(hidden)]
+pub enum BackResolutionOwnerHandoff {
+    Target(BackTargetExecutionOwner),
+    NoTarget(BackNoTargetCandidate),
+    Contradiction(BackResolutionContradiction),
+}
+
+#[doc(hidden)]
+pub enum VerifiedBackResolutionOwnerHandoff {
+    Target(VerifiedBackTargetExecutionOwner),
+    NoTarget(VerifiedBackNoTargetCandidate),
+    Contradiction(VerifiedBackResolutionContradiction),
+}
+
+#[doc(hidden)]
+pub struct VerifiedBackResolutionHandoff {
+    accepted: BackAcceptedReservationView,
+    handoff: VerifiedBackResolutionOwnerHandoff,
+}
+
+#[doc(hidden)]
+pub enum BackResolutionVerifyOutcome {
+    Matched(VerifiedBackResolutionHandoff),
+    Mismatch {
+        accepted: BackAcceptedReservationView,
+        handoff: BackResolutionOwnerHandoff,
+        evidence: BackResolutionEvidence,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClaimHistoryAdmissionWorldError {
+    Exhausted,
+    AlreadyClaimed,
+}
+
+impl CoreIssuedWorldSeal {
+    pub(crate) fn issue(
+        router: RouterIdentity,
+        incarnation: HistoryIncarnation,
+    ) -> Result<Self, ClaimHistoryAdmissionWorldError> {
+        static NEXT_HISTORY_WORLD_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+        let identity = NEXT_HISTORY_WORLD_IDENTITY
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1).filter(|_| current != 0)
+            })
+            .map_err(|_| ClaimHistoryAdmissionWorldError::Exhausted)?;
+        Ok(Self {
+            projection: CoreIssuedWorldSealProjection {
+                identity,
+                router,
+                incarnation,
+            },
+        })
+    }
+
+    pub(crate) const fn projection(&self) -> CoreIssuedWorldSealProjection {
+        self.projection
+    }
+}
+
+impl HistoryAdmissionWorldSeal {
+    pub(crate) const fn issued(inner: CoreIssuedWorldSeal) -> Self {
+        Self { inner }
+    }
+
+    pub(crate) const fn projection(&self) -> CoreIssuedWorldSealProjection {
+        self.inner.projection()
+    }
+}
+
+impl HistoryAdmissionStamp {
+    pub(crate) const fn issued(
+        world: CoreIssuedWorldSealProjection,
+        router: RouterIdentity,
+        incarnation: HistoryIncarnation,
+        published_revision: HistoryRevision,
+        can_back: bool,
+    ) -> Self {
+        Self {
+            world,
+            router,
+            incarnation,
+            published_revision,
+            can_back,
+        }
+    }
+
+    pub(crate) fn matches(
+        &self,
+        world: CoreIssuedWorldSealProjection,
+        router: RouterIdentity,
+        incarnation: HistoryIncarnation,
+    ) -> bool {
+        self.world == world && self.router == router && self.incarnation == incarnation
+    }
+
+    pub(crate) const fn can_back(&self) -> bool {
+        self.can_back
+    }
+
+    pub(crate) const fn published_revision(&self) -> HistoryRevision {
+        self.published_revision
+    }
+}
+
+impl BackAdmissionToken {
+    pub(crate) fn issued(
+        verified_stamp: &HistoryAdmissionStamp,
+        live_revision_at_prepare: HistoryRevision,
+    ) -> Self {
+        Self {
+            verified_stamp: verified_stamp.clone(),
+            live_revision_at_prepare,
+        }
+    }
+
+    pub(crate) fn matches(
+        &self,
+        world: CoreIssuedWorldSealProjection,
+        router: RouterIdentity,
+        incarnation: HistoryIncarnation,
+        live_revision: HistoryRevision,
+    ) -> bool {
+        self.verified_stamp.matches(world, router, incarnation)
+            && self.live_revision_at_prepare == live_revision
+    }
+}
+
+impl CoreAcceptedBranchReservationProjection {
+    fn from_reservation(reservation: &ReservedBranchAttempt) -> Self {
+        Self {
+            identity: CoreAcceptedBranchReservationIdentity(reservation.transaction()),
+            pool_capacity: reservation.frames().len(),
+        }
+    }
+}
+
+impl AcceptedBackReservation {
+    pub(crate) fn accepted(
+        world: CoreIssuedWorldSealProjection,
+        router: RouterIdentity,
+        history: HistoryIncarnation,
+        reservation: &ReservedBranchAttempt,
+    ) -> Self {
+        let request = reservation.request();
+        Self {
+            request,
+            accepted: BackAcceptedReservationView {
+                inner: BackAcceptedReservationProjection {
+                    world,
+                    router,
+                    history,
+                    request,
+                    transaction: reservation.transaction(),
+                    cleanup_batch: reservation.cleanup_batch(),
+                    branch: CoreAcceptedBranchReservationProjection::from_reservation(reservation),
+                },
+            },
+        }
+    }
+}
+
+impl BackResolutionScopeProjection {
+    fn from_reservation(
+        world: CoreIssuedWorldSealProjection,
+        router: RouterIdentity,
+        history: HistoryIncarnation,
+        reservation: &ReservedBranchAttempt,
+    ) -> Self {
+        Self {
+            world,
+            router,
+            history,
+            request: reservation.request(),
+            transaction: reservation.transaction(),
+            cleanup_batch: reservation.cleanup_batch(),
+            branch: CoreAcceptedBranchReservationProjection::from_reservation(reservation),
+        }
+    }
+
+    pub(crate) fn matches_engine_scope(
+        &self,
+        world: Option<CoreIssuedWorldSealProjection>,
+        router: RouterIdentity,
+        history: HistoryIncarnation,
+    ) -> bool {
+        world == Some(self.world)
+            && self.router == router
+            && self.history == history
+            && self.request.router_identity() == router
+    }
+
+    pub(crate) const fn request(&self) -> NavigationRequestId {
+        self.request
+    }
+
+    pub(crate) fn matches_execution(&self, execution: &HistoryExecutionBindingProjection) -> bool {
+        self.router == execution.router
+            && self.request == execution.request
+            && self.transaction == execution.transaction
+            && self.cleanup_batch == execution.cleanup_batch
+            && self.branch.identity.0 == execution.transaction
+    }
+}
+
+impl BackAcceptedReservationView {
+    pub fn matches_resolution_scope(&self, observed: &BackResolutionScopeView) -> bool {
+        let expected = BackResolutionScopeProjection {
+            world: self.inner.world,
+            router: self.inner.router,
+            history: self.inner.history,
+            request: self.inner.request,
+            transaction: self.inner.transaction,
+            cleanup_batch: self.inner.cleanup_batch,
+            branch: self.inner.branch.clone(),
+        };
+        expected == observed.inner
+    }
+
+    pub(crate) fn matches(
+        &self,
+        world: Option<CoreIssuedWorldSealProjection>,
+        router: RouterIdentity,
+        history: HistoryIncarnation,
+        observed: &BackResolutionScopeProjection,
+    ) -> bool {
+        let expected = BackResolutionScopeProjection {
+            world: self.inner.world,
+            router: self.inner.router,
+            history: self.inner.history,
+            request: self.inner.request,
+            transaction: self.inner.transaction,
+            cleanup_batch: self.inner.cleanup_batch,
+            branch: self.inner.branch.clone(),
+        };
+        world == Some(self.inner.world)
+            && self.inner.router == router
+            && self.inner.history == history
+            && &expected == observed
+    }
+}
+
+impl BackResolutionEvidence {
+    pub(crate) fn mismatch(
+        accepted: &BackAcceptedReservationView,
+        handoff: &BackResolutionOwnerHandoff,
+    ) -> Self {
+        Self {
+            inner: BackResolutionEvidenceProjection {
+                expected: Some(accepted.inner.clone()),
+                observed: handoff.scope_projection().clone(),
+            },
+        }
+    }
+
+    fn observed(scope: &BackResolutionScopeProjection) -> Self {
+        Self {
+            inner: BackResolutionEvidenceProjection {
+                expected: None,
+                observed: scope.clone(),
+            },
+        }
+    }
+
+    pub(crate) fn is_observed(&self) -> bool {
+        self.inner.expected.is_none()
+    }
+
+    pub(crate) const fn request(&self) -> NavigationRequestId {
+        self.inner.observed.request
+    }
+
+    pub(crate) fn matches_engine_scope(
+        &self,
+        world: Option<CoreIssuedWorldSealProjection>,
+        router: RouterIdentity,
+        history: HistoryIncarnation,
+    ) -> bool {
+        self.is_observed()
+            && world == Some(self.inner.observed.world)
+            && self.inner.observed.router == router
+            && self.inner.observed.history == history
+            && self.inner.observed.request.router_identity() == router
+    }
+}
+
+impl CoreFrozenHistorySourceProjection {
+    fn project(source: &FrozenHistorySource) -> Self {
+        Self {
+            incarnation: source.incarnation,
+            revision: source.revision,
+            cursor: source.cursor,
+            entry_ids: source.entry_ids.clone(),
+            locations: source.locations.clone(),
+        }
+    }
+}
+
+impl VerifiedBackTargetExecutionOwner {
+    pub(crate) fn evidence(&self) -> BackResolutionEvidence {
+        BackResolutionEvidence::observed(&self.inner.raw.scope)
+    }
+
+    pub(crate) const fn target_location(&self) -> &RouteLocation {
+        &self.inner.raw.destination.target_location
+    }
+
+    pub(crate) fn matches_receiver(
+        &self,
+        world: Option<CoreIssuedWorldSealProjection>,
+        router: RouterIdentity,
+        history: HistoryIncarnation,
+    ) -> bool {
+        let scope = &self.inner.raw.scope;
+        world == Some(scope.world)
+            && scope.router == router
+            && scope.history == history
+            && scope.request.router_identity() == router
+    }
+
+    pub(crate) fn into_execution_parts(
+        self,
+    ) -> (
+        BackResolutionScopeProjection,
+        ReservedBranchAttempt,
+        BackDestination,
+        BackTargetPreparationBaseline,
+    ) {
+        let CoreVerifiedBackTargetExecutionOwner {
+            raw:
+                CoreBackTargetExecutionOwner {
+                    scope,
+                    reservation,
+                    destination,
+                    preparation_baseline,
+                },
+        } = self.inner;
+        (scope, reservation, destination, preparation_baseline)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_truncate_reserved_frames(&mut self, len: usize) {
+        self.inner.raw.reservation.testing_truncate_frames(len);
+    }
+}
+
+impl VerifiedBackNoTargetCandidate {
+    pub(crate) fn evidence(&self) -> BackResolutionEvidence {
+        BackResolutionEvidence::observed(&self.inner.raw.scope)
+    }
+}
+
+impl VerifiedBackResolutionContradiction {
+    pub(crate) fn evidence(&self) -> BackResolutionEvidence {
+        BackResolutionEvidence::observed(&self.inner.raw.scope)
+    }
+}
+
+impl BackTargetPermanentOwner {
+    pub(crate) fn source_drift(
+        scope: BackResolutionScopeProjection,
+        reservation: ReservedBranchAttempt,
+        drift: HistorySourceDrift,
+        expected: BackTargetPreparationBaseline,
+        observed: BackTargetPreparationBaseline,
+    ) -> Self {
+        Self {
+            inner: CoreBackTargetPermanentOwner {
+                scope,
+                reservation,
+                cause: CoreBackTargetPermanentCause::SourceDrift(
+                    CoreBackTargetSourceDriftOwner::Capability {
+                        drift,
+                        expected,
+                        observed,
+                    },
+                ),
+            },
+        }
+    }
+
+    pub(crate) fn source_refreeze_drift(
+        scope: BackResolutionScopeProjection,
+        reservation: ReservedBranchAttempt,
+        destination: BackDestination,
+        observed_source: FrozenHistorySource,
+        expected: BackTargetPreparationBaseline,
+        observed: BackTargetPreparationBaseline,
+    ) -> Self {
+        Self {
+            inner: CoreBackTargetPermanentOwner {
+                scope,
+                reservation,
+                cause: CoreBackTargetPermanentCause::SourceDrift(
+                    CoreBackTargetSourceDriftOwner::Refreeze {
+                        destination,
+                        observed_source,
+                        expected,
+                        observed,
+                    },
+                ),
+            },
+        }
+    }
+
+    pub(crate) fn authority_lost(
+        scope: BackResolutionScopeProjection,
+        reservation: ReservedBranchAttempt,
+        destination: BackDestination,
+        cause: BackTargetAuthorityLossCause,
+        expected: BackTargetPreparationBaseline,
+        observed: BackTargetPreparationBaseline,
+    ) -> Self {
+        Self {
+            inner: CoreBackTargetPermanentOwner {
+                scope,
+                reservation,
+                cause: CoreBackTargetPermanentCause::AuthorityLost {
+                    destination,
+                    cause,
+                    expected,
+                    observed,
+                },
+            },
+        }
+    }
+
+    pub(crate) fn evidence(&self) -> BackResolutionEvidence {
+        BackResolutionEvidence::observed(&self.inner.scope)
+    }
+}
+
+impl BackNoTargetSourceDriftOwner {
+    pub fn evidence(&self) -> BackNoTargetSourceDriftEvidence {
+        BackNoTargetSourceDriftEvidence {
+            inner: CoreBackNoTargetSourceDriftProjection {
+                scope: self.inner.candidate.raw.scope.clone(),
+                expected: CoreFrozenHistorySourceProjection::project(
+                    &self.inner.candidate.raw.source,
+                ),
+                observed: CoreFrozenHistorySourceProjection::project(&self.inner.observed),
+            },
+        }
+    }
+}
+
+impl BackResolutionOwnerHandoff {
+    pub(crate) fn resolved(
+        world: CoreIssuedWorldSealProjection,
+        router: RouterIdentity,
+        history: HistoryIncarnation,
+        reservation: ReservedBranchAttempt,
+        preparation_baseline: BackTargetPreparationBaseline,
+        preview: BackPreview,
+    ) -> Self {
+        let scope =
+            BackResolutionScopeProjection::from_reservation(world, router, history, &reservation);
+        match preview {
+            BackPreview::Target(destination) => Self::Target(BackTargetExecutionOwner {
+                inner: CoreBackTargetExecutionOwner {
+                    scope,
+                    reservation,
+                    destination,
+                    preparation_baseline,
+                },
+            }),
+            BackPreview::NoTarget(source) => Self::NoTarget(BackNoTargetCandidate {
+                inner: CoreBackNoTargetCandidate {
+                    scope,
+                    reservation,
+                    source,
+                },
+            }),
+            BackPreview::Contradiction(contradiction) => {
+                Self::Contradiction(BackResolutionContradiction {
+                    inner: CoreBackResolutionContradiction {
+                        scope,
+                        reservation,
+                        contradiction,
+                    },
+                })
+            }
+        }
+    }
+
+    pub(crate) fn scope_projection(&self) -> &BackResolutionScopeProjection {
+        match self {
+            Self::Target(owner) => &owner.inner.scope,
+            Self::NoTarget(candidate) => &candidate.inner.scope,
+            Self::Contradiction(owner) => &owner.inner.scope,
+        }
+    }
+
+    pub(crate) fn target_location(&self) -> Option<&RouteLocation> {
+        match self {
+            Self::Target(owner) => Some(&owner.inner.destination.target_location),
+            Self::NoTarget(_) | Self::Contradiction(_) => None,
+        }
+    }
+
+    pub fn scope(&self) -> BackResolutionScopeView {
+        BackResolutionScopeView {
+            inner: self.scope_projection().clone(),
+        }
+    }
+
+    pub fn evidence(&self) -> BackResolutionEvidence {
+        BackResolutionEvidence {
+            inner: BackResolutionEvidenceProjection {
+                expected: None,
+                observed: self.scope_projection().clone(),
+            },
+        }
+    }
+
+    pub(crate) fn into_verified(
+        self,
+        accepted: BackAcceptedReservationView,
+    ) -> VerifiedBackResolutionHandoff {
+        let handoff = match self {
+            Self::Target(owner) => {
+                VerifiedBackResolutionOwnerHandoff::Target(VerifiedBackTargetExecutionOwner {
+                    inner: CoreVerifiedBackTargetExecutionOwner { raw: owner.inner },
+                })
+            }
+            Self::NoTarget(candidate) => {
+                VerifiedBackResolutionOwnerHandoff::NoTarget(VerifiedBackNoTargetCandidate {
+                    inner: CoreVerifiedBackNoTargetCandidate {
+                        raw: candidate.inner,
+                    },
+                })
+            }
+            Self::Contradiction(owner) => VerifiedBackResolutionOwnerHandoff::Contradiction(
+                VerifiedBackResolutionContradiction {
+                    inner: CoreVerifiedBackResolutionContradiction { raw: owner.inner },
+                },
+            ),
+        };
+        VerifiedBackResolutionHandoff { accepted, handoff }
+    }
+}
+
+impl VerifiedBackResolutionHandoff {
+    pub fn into_parts(
+        self,
+    ) -> (
+        BackAcceptedReservationView,
+        VerifiedBackResolutionOwnerHandoff,
+    ) {
+        (self.accepted, self.handoff)
+    }
 }
 
 pub(crate) struct CanonicalHistory {
@@ -193,6 +1107,43 @@ pub(crate) enum FrozenHistoryDestination {
         target: RouteLocation,
         replaced: Option<HistoryEntryId>,
     },
+    Back(FrozenBackDestination),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct BackDestination {
+    source: FrozenHistorySource,
+    target_entry: HistoryEntryId,
+    target_cursor: usize,
+    target_location: RouteLocation,
+}
+
+impl BackDestination {
+    pub(crate) const fn target_location(&self) -> &RouteLocation {
+        &self.target_location
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct BackPreviewContradiction {
+    expected: FrozenHistorySource,
+    observed: FrozenHistorySource,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct FrozenBackDestination {
+    source_entry: HistoryEntryId,
+    source_cursor: usize,
+    target_entry: HistoryEntryId,
+    target_cursor: usize,
+    target: RouteLocation,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum BackPreview {
+    Target(BackDestination),
+    NoTarget(FrozenHistorySource),
+    Contradiction(BackPreviewContradiction),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -262,6 +1213,7 @@ impl PreparedHistoryPublication {
         let destination_target = match &self.destination {
             FrozenHistoryDestination::Push { target }
             | FrozenHistoryDestination::Replace { target, .. } => target,
+            FrozenHistoryDestination::Back(destination) => &destination.target,
         };
         self.execution.projection() == *execution
             && self.source.revision == source_revision
@@ -387,6 +1339,13 @@ enum FrozenHistoryDestinationSnapshot {
         target: RouteLocation,
         replaced: Option<HistoryEntryId>,
     },
+    Back {
+        source_entry: HistoryEntryId,
+        source_cursor: usize,
+        target_entry: HistoryEntryId,
+        target_cursor: usize,
+        target: RouteLocation,
+    },
 }
 
 #[cfg(test)]
@@ -397,6 +1356,13 @@ impl FrozenHistoryDestinationSnapshot {
             FrozenHistoryDestination::Replace { target, replaced } => Self::Replace {
                 target: target.clone(),
                 replaced: *replaced,
+            },
+            FrozenHistoryDestination::Back(destination) => Self::Back {
+                source_entry: destination.source_entry,
+                source_cursor: destination.source_cursor,
+                target_entry: destination.target_entry,
+                target_cursor: destination.target_cursor,
+                target: destination.target.clone(),
             },
         }
     }
@@ -482,6 +1448,44 @@ impl CanonicalHistory {
         self.revision
     }
 
+    pub(crate) const fn incarnation(&self) -> HistoryIncarnation {
+        self.incarnation
+    }
+
+    pub(crate) fn preview_back(&self) -> BackPreview {
+        let source = self.freeze_source();
+        let Some(source_cursor) = source.cursor else {
+            return BackPreview::NoTarget(source);
+        };
+        let Some(target_cursor) = source_cursor.checked_sub(1) else {
+            return BackPreview::NoTarget(source);
+        };
+        let Some(target_entry) = source.entry_ids.get(target_cursor).copied() else {
+            return BackPreview::NoTarget(source);
+        };
+        let Some(target) = source.locations.get(target_cursor).cloned() else {
+            return BackPreview::NoTarget(source);
+        };
+        BackPreview::Target(BackDestination {
+            source,
+            target_cursor,
+            target_entry,
+            target_location: target,
+        })
+    }
+
+    pub(crate) fn refreeze_back_source(
+        &self,
+        destination: &BackDestination,
+    ) -> Result<(), FrozenHistorySource> {
+        let observed = self.freeze_source();
+        if destination.source == observed {
+            Ok(())
+        } else {
+            Err(observed)
+        }
+    }
+
     pub(crate) fn freeze(
         &self,
         execution: HistoryExecutionBinding,
@@ -502,6 +1506,38 @@ impl CanonicalHistory {
             source: self.freeze_source(),
             destination,
         }
+    }
+
+    pub(crate) fn freeze_back(
+        &self,
+        execution: HistoryExecutionBinding,
+        destination: BackDestination,
+    ) -> Result<HistoryCommitCapability, HistorySourceDrift> {
+        let source_cursor = destination
+            .source
+            .cursor
+            .expect("a resolved back destination has one source cursor");
+        let source_entry = destination.source.entry_ids[source_cursor];
+        let frozen = FrozenHistoryDestination::Back(FrozenBackDestination {
+            source_entry,
+            source_cursor,
+            target_entry: destination.target_entry,
+            target_cursor: destination.target_cursor,
+            target: destination.target_location,
+        });
+        let capability = HistoryCommitCapability {
+            execution,
+            source: destination.source,
+            destination: frozen,
+        };
+        let observed = self.freeze_source();
+        if capability.source != observed {
+            return Err(HistorySourceDrift {
+                capability,
+                observed,
+            });
+        }
+        Ok(capability)
     }
 
     pub(crate) fn prepare(
@@ -563,6 +1599,36 @@ impl CanonicalHistory {
                     None => unreachable!("replace always creates or preserves a current entry"),
                 }
             }
+            FrozenHistoryDestination::Back(destination) => {
+                let source_entry = capability
+                    .source
+                    .entry_ids
+                    .get(destination.source_cursor)
+                    .copied();
+                let target_entry = capability
+                    .source
+                    .entry_ids
+                    .get(destination.target_cursor)
+                    .copied();
+                let target = capability.source.locations.get(destination.target_cursor);
+                if source_entry != Some(destination.source_entry)
+                    || target_entry != Some(destination.target_entry)
+                    || target != Some(&destination.target)
+                    || destination.target_cursor.checked_add(1) != Some(destination.source_cursor)
+                {
+                    return Err(HistoryPreparationError::Source(HistorySourceDrift {
+                        capability,
+                        observed: self.freeze_source(),
+                    }));
+                }
+                let observed = projection.back();
+                if !matches!(observed, Ok(ref target) if target == &destination.target) {
+                    return Err(HistoryPreparationError::Source(HistorySourceDrift {
+                        capability,
+                        observed: self.freeze_source(),
+                    }));
+                }
+            }
         }
 
         let next = CanonicalHistory {
@@ -614,7 +1680,6 @@ impl CanonicalHistory {
 }
 
 impl HistoryCommitCapability {
-    #[cfg(test)]
     pub(crate) fn execution_projection(&self) -> HistoryExecutionBindingProjection {
         self.execution.projection()
     }
@@ -680,7 +1745,7 @@ impl HistoryPreparationError {
 
 #[cfg(test)]
 mod tests {
-    use super::{CanonicalHistory, HistoryEffect, HistoryPreparationError};
+    use super::{BackPreview, CanonicalHistory, HistoryEffect, HistoryPreparationError};
     use crate::engine::{CommitError, HistoryAuthorityFixture};
     use crate::location::RouteLocation;
     use crate::trace::NavigationTraceEventKind;
@@ -697,6 +1762,38 @@ mod tests {
             Err(_) => panic!("an exact source and execution binding prepare once"),
         };
         history.publish(prepared);
+    }
+
+    #[test]
+    fn back_between_duplicate_locations_uses_entry_identity() {
+        let mut fixture = HistoryAuthorityFixture::new();
+        let mut history = CanonicalHistory::new(fixture.router_identity());
+        let duplicate = RouteLocation::new("/items/1");
+        publish(
+            &mut history,
+            &mut fixture,
+            HistoryEffect::Push(duplicate.clone()),
+        );
+        publish(
+            &mut history,
+            &mut fixture,
+            HistoryEffect::Push(duplicate.clone()),
+        );
+        let source_cursor = history.snapshot().cursor().unwrap();
+        let source_revision = history.revision;
+        let source_entry = history.entry_ids[source_cursor];
+        let target_entry = history.entry_ids[source_cursor - 1];
+
+        let BackPreview::Target(destination) = history.preview_back() else {
+            panic!("two exact entries must produce a live back target")
+        };
+
+        assert_eq!(destination.source.cursor, Some(source_cursor));
+        assert_eq!(destination.source.revision, source_revision);
+        assert_eq!(destination.target_cursor, source_cursor - 1);
+        assert_eq!(destination.target_entry, target_entry);
+        assert_eq!(destination.target_location, duplicate);
+        assert_ne!(destination.target_entry, source_entry);
     }
 
     #[test]

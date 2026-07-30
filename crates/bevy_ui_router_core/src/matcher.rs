@@ -40,6 +40,14 @@ impl RouteMatcher {
         self.tree.node(route)?.options().view_binding()
     }
 
+    pub(crate) fn max_branch_depth(&self) -> usize {
+        self.tree.max_branch_depth()
+    }
+
+    pub(crate) const fn root_route(&self) -> RouteId {
+        self.tree.root()
+    }
+
     fn visit(
         &self,
         route: RouteId,
@@ -293,6 +301,39 @@ mod tests {
             project,
             files,
         )
+    }
+
+    #[test]
+    fn back_reserves_installed_maximum_branch_depth() {
+        let mut builder = RouteTree::builder()
+            .root(RoutePattern::path("/").unwrap())
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        builder
+            .route(root, RoutePattern::path("short").unwrap())
+            .unwrap();
+        let deep = builder
+            .route(root, RoutePattern::path("deep").unwrap())
+            .unwrap();
+        builder
+            .route(deep, RoutePattern::path("leaf").unwrap())
+            .unwrap();
+        let matcher = RouteMatcher::new(builder.build().unwrap());
+
+        assert_eq!(
+            matcher.max_branch_depth(),
+            3,
+            "back must reserve the installed immutable maximum before target resolution"
+        );
+        assert_eq!(
+            matcher
+                .match_location(&RouteLocation::new("/short"))
+                .unwrap()
+                .routes()
+                .len(),
+            2,
+            "later matching consumes only the resolved target prefix"
+        );
     }
 
     #[test]

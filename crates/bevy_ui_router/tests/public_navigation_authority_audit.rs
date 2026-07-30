@@ -10,6 +10,9 @@ use bevy_picking::Pickable;
 use bevy_ui::{Node, Val};
 use bevy_ui_router::ecs::RouterScheduleSet;
 use bevy_ui_router::prelude::*;
+use bevy_ui_router_ecs::test_support::{
+    BackCapacityOrderInstallError, testing_install_back_capacity_order_observer,
+};
 
 const ROOT_RECT_WIDTH: u16 = 37;
 const LAYOUT_RECT_WIDTH: u16 = 39;
@@ -177,6 +180,82 @@ fn install_boundary_probe(app: &mut App, probe: Arc<BoundaryProbe>) {
         .after(RouterScheduleSet::CommitPresentation)
         .before(RouterScheduleSet::SettleCleanup),
     );
+}
+
+#[test]
+fn back_capacity_order_observer_installs_across_crates_read_only() {
+    fn install_router(app: &mut App, label: &str) -> RouterHandle {
+        let driver = app
+            .register_ui_view_driver(AuditDriver {
+                key: ViewDriverKey::new(format!("{label}-driver")).unwrap(),
+                outlet_view: None,
+            })
+            .unwrap();
+        let view = RouteViewKey::new(format!("{label}-view")).unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(view.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut views = RouteViewRegistry::new();
+        views
+            .insert(view.clone(), RouteViewDescriptor::new(driver))
+            .unwrap();
+        app.add_ui_router(RouterConfig::new(routes, views, view))
+            .unwrap()
+    }
+
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let router_a = install_router(&mut app, "back-capacity-order-a");
+    let router_b = install_router(&mut app, "back-capacity-order-b");
+
+    let observer_a = testing_install_back_capacity_order_observer(
+        &mut app.world_mut().resource_mut::<RouterNavigation>(),
+        router_a,
+    )
+    .unwrap();
+    let observer_a_clone = observer_a.clone();
+    let observer_b = testing_install_back_capacity_order_observer(
+        &mut app.world_mut().resource_mut::<RouterNavigation>(),
+        router_b,
+    )
+    .unwrap();
+
+    assert!(observer_a.observes_same_journal(&observer_a_clone));
+    assert!(!observer_a.observes_same_journal(&observer_b));
+    assert!(observer_a.snapshot().events().is_empty());
+    assert!(observer_b.snapshot().events().is_empty());
+
+    assert!(matches!(
+        testing_install_back_capacity_order_observer(
+            &mut app.world_mut().resource_mut::<RouterNavigation>(),
+            router_a,
+        ),
+        Err(BackCapacityOrderInstallError::AlreadyInstalled)
+    ));
+    assert!(observer_a.observes_same_journal(&observer_a_clone));
+    assert!(!observer_a.observes_same_journal(&observer_b));
+    assert!(observer_a.snapshot().events().is_empty());
+    assert!(observer_b.snapshot().events().is_empty());
+
+    let mut foreign_app = App::new();
+    foreign_app.add_plugins(BevyUiRouterPlugin::default());
+    let foreign_router = install_router(&mut foreign_app, "back-capacity-order-foreign");
+    assert!(matches!(
+        testing_install_back_capacity_order_observer(
+            &mut app.world_mut().resource_mut::<RouterNavigation>(),
+            foreign_router,
+        ),
+        Err(BackCapacityOrderInstallError::ForeignRouter)
+    ));
+    assert!(observer_a.observes_same_journal(&observer_a_clone));
+    assert!(!observer_a.observes_same_journal(&observer_b));
+    assert!(observer_a.snapshot().events().is_empty());
+    assert!(observer_b.snapshot().events().is_empty());
 }
 
 #[test]

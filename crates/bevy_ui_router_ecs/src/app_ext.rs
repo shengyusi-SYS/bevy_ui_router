@@ -41,6 +41,10 @@ impl RouterHandle {
         Self { domain, router }
     }
 
+    pub(crate) const fn is_same_domain_as(self, other: Self) -> bool {
+        self.domain == other.domain
+    }
+
     #[cfg(test)]
     pub(crate) const fn fixture(domain: u64, router: u64) -> Self {
         Self { domain, router }
@@ -194,6 +198,24 @@ impl ViewDriverStore {
 
     pub(crate) fn contains(&self, key: &ViewDriverKey) -> bool {
         self.drivers.iter().any(|(stored, _)| stored == key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_for_test(
+        &mut self,
+        key: &ViewDriverKey,
+    ) -> Option<(ViewDriverKey, Box<dyn EcsViewDriver>)> {
+        let position = self.drivers.iter().position(|(stored, _)| stored == key)?;
+        Some(self.drivers.remove(position))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore_for_test(&mut self, driver: (ViewDriverKey, Box<dyn EcsViewDriver>)) {
+        assert!(
+            !self.contains(&driver.0),
+            "the removed driver key must remain absent until exact restoration"
+        );
+        self.drivers.push(driver);
     }
 
     #[cfg(test)]

@@ -22,6 +22,9 @@ mod registry;
 mod snapshots;
 #[cfg(test)]
 mod task10_regression_tests;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support;
 
 pub use app_ext::{
     AppRouterExt, RouterConfig, RouterHandle, RouterHostRegistration, RouterInstallError,

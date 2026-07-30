@@ -221,6 +221,21 @@ impl RouteTree {
         nodes.sort_by_key(|node| node.declaration_index());
         nodes
     }
+
+    pub(crate) fn max_branch_depth(&self) -> usize {
+        fn visit(tree: &RouteTree, route: RouteId, depth: usize) -> usize {
+            let node = tree
+                .node(route)
+                .expect("an immutable route tree only retains declared children");
+            node.children()
+                .iter()
+                .map(|child| visit(tree, *child, depth + 1))
+                .max()
+                .unwrap_or(depth)
+        }
+
+        visit(self, self.root, 1)
+    }
 }
 
 #[derive(Clone)]

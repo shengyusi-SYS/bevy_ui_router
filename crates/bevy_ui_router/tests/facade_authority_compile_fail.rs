@@ -11,6 +11,67 @@ use facade_contract_cases::{
     read_workspace, root_symbols, run_negative_consumer,
 };
 
+fn back_target_facade_cases() -> Vec<NegativeCase> {
+    [
+        (
+            "back-target-resume-action-not-root-exported",
+            "pub use bevy_ui_router::BackTargetResumeAction as Probe;",
+        ),
+        (
+            "back-target-resume-action-not-prelude-exported",
+            "pub use bevy_ui_router::prelude::BackTargetResumeAction as Probe;",
+        ),
+        (
+            "back-target-start-not-root-exported",
+            "pub use bevy_ui_router::BackTargetStart as Probe;",
+        ),
+        (
+            "back-target-start-not-prelude-exported",
+            "pub use bevy_ui_router::prelude::BackTargetStart as Probe;",
+        ),
+    ]
+    .into_iter()
+    .map(|(slug, source)| NegativeCase {
+        consumer: ConsumerCase {
+            kind: "fail",
+            feature_set: "test-support",
+            slug: slug.to_owned(),
+            default_features: false,
+            features: vec!["test-support".to_owned()],
+            source: source.to_owned(),
+        },
+        expected_codes: vec!["E0432", "E0433", "E0603"],
+    })
+    .collect()
+}
+
+#[test]
+fn back_target_resume_action_is_not_facade_reachable() {
+    let sources = [
+        (
+            "facade allowlist",
+            read_workspace("docs/facade-export-allowlist.md"),
+        ),
+        (
+            "facade associated API golden",
+            read_workspace("docs/facade-associated-api-golden.txt"),
+        ),
+        (
+            "facade root source",
+            read_workspace("crates/bevy_ui_router/src/lib.rs"),
+        ),
+    ];
+    for symbol in ["BackTargetResumeAction", "BackTargetStart"] {
+        for (label, source) in &sources {
+            assert!(
+                !source.contains(symbol),
+                "{symbol} must remain absent from {label}"
+            );
+        }
+    }
+    assert_eq!(back_target_facade_cases().len(), 4);
+}
+
 #[test]
 fn history_profile_forbidden_consumers_fail_with_expected_rustc_categories() {
     let allowlist = read_workspace("docs/facade-export-allowlist.md");
@@ -97,6 +158,7 @@ fn history_profile_forbidden_consumers_fail_with_expected_rustc_categories() {
         .chain(profile_cases)
         .chain(disabled_cases)
         .chain(history_authority_cases)
+        .chain(back_target_facade_cases())
         .collect::<Vec<_>>();
     assert!(
         !cases.is_empty(),

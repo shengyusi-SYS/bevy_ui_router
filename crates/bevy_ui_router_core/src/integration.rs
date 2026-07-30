@@ -7,10 +7,22 @@ use crate::cleanup::{
     CleanupBatchToken, CleanupCompletion as CoreCleanupCompletion, CleanupCompletionDigest,
     CleanupManifestDigest, CleanupManifestSeal, CleanupSummary,
 };
+#[cfg(feature = "test-support")]
+use crate::engine::BackAllocatorBoundary;
 use crate::engine::{
+    BackTargetCommitOperationFailure as CoreBackTargetCommitOperationFailure,
+    BackTargetCommitOperationOutcome as CoreBackTargetCommitOperationOutcome,
+    BackTargetResumeAction as CoreBackTargetResumeAction,
+    BackTargetResumeOutcome as CoreBackTargetResumeOutcome,
     BeginAuthoritySettlementErrorKind as CoreBeginAuthoritySettlementErrorKind,
-    CommitError as CoreCommitError, CommitTicket as CoreCommitTicket,
-    EngineAction as CoreEngineAction, EngineInstallError as CoreEngineInstallError,
+    CommitError as CoreCommitError, CommitTicket as CoreCommitTicket, CoreBackTargetAppliedOutcome,
+    CoreBackTargetCommitFailureCleanup, CoreBackTargetCommitRejectedPublication,
+    CoreBackTargetCommitRetainedInputProjection, CoreBackTargetDriverFailureCleanup,
+    CoreBackTargetDriverFailureReport, CoreBackTargetDriverFailureReportMode,
+    CoreBackTargetDriverFallback, CoreBackTargetDriverTerminal,
+    CoreBackTargetDriverTerminalProjection, CoreBackTargetPhysicalReceiverRef,
+    CorePreparationReceiverMismatchProjection, EngineAction as CoreEngineAction,
+    EngineInstallError as CoreEngineInstallError,
     FailedAuthoritySettlementTrigger as CoreFailedAuthoritySettlementTrigger,
     FailedAuthorityTriggerError as CoreFailedAuthorityTriggerError,
     FailureCleanupError as CoreFailureCleanupError,
@@ -27,7 +39,22 @@ use crate::frame::{
     RouteReconciliationProjection,
 };
 use crate::history::{HistorySnapshot, MemoryHistory};
-use crate::history_authority::HistoryExecutionBindingProjection;
+pub use crate::history_authority::{
+    AcceptedBackReservation, BackAcceptedReservationView, BackAdmissionToken,
+    BackContradictionTerminalEvidence, BackNoTargetCandidate, BackNoTargetSourceDriftEvidence,
+    BackNoTargetSourceDriftOwner, BackNoTargetSourceDriftTerminalEvidence,
+    BackResolutionContradiction, BackResolutionEvidence, BackResolutionEvidenceClassification,
+    BackResolutionOwnerHandoff, BackResolutionScopeView, BackResolutionVerifyOutcome,
+    BackTargetExecutionOwner, BackTargetPermanentOwner, BackTargetPermanentTerminalEvidence,
+    EnqueueBackErrorKind, HistoryAdmissionStamp, HistoryAdmissionWorldSeal,
+    PrepareBackAdmissionErrorKind, VerifiedBackNoTargetCandidate,
+    VerifiedBackResolutionContradiction, VerifiedBackResolutionHandoff,
+    VerifiedBackResolutionOwnerHandoff, VerifiedBackTargetExecutionOwner,
+};
+use crate::history_authority::{
+    BackResolutionScopeProjection, ClaimHistoryAdmissionWorldError,
+    HistoryExecutionBindingProjection,
+};
 use crate::ids::{NavigationRequestId, RouteSlotId, RouterIdentity};
 use crate::location::RouteLocation;
 use crate::meta::ErrorBoundaryKey;
@@ -687,6 +714,8 @@ pub enum EngineAction {
     #[doc(hidden)]
     FailureCleanup(FailureCleanupRequest),
     Commit(CommitTicket),
+    #[doc(hidden)]
+    BackResolution(BackResolutionOwnerHandoff),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -801,6 +830,7 @@ impl PreparedCommit {
 pub struct ValidatedCommit<'a> {
     publication: CoreValidatedPublication<'a>,
     cleanup: CleanupBatch,
+    back_target_continuation: Option<PreparedPostCommitContinuation>,
 }
 
 impl ValidatedCommit<'_> {
@@ -815,9 +845,11 @@ impl ValidatedCommit<'_> {
         let Self {
             publication,
             cleanup,
+            back_target_continuation,
         } = self;
         drop(cleanup);
         publication.publish(mutation);
+        drop(back_target_continuation);
     }
 }
 
@@ -829,6 +861,345 @@ pub struct NavigationRequestView<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistoryExecutionBindingView {
     inner: HistoryExecutionBindingProjection,
+}
+
+struct LifecycleContinuationBinding {
+    scope: BackResolutionScopeProjection,
+}
+
+#[doc(hidden)]
+pub struct LifecycleContinuationCapacity {
+    inner: LifecycleContinuationBinding,
+}
+
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct PreparationBoundaryScopeView {
+    inner: BackResolutionScopeProjection,
+}
+
+#[doc(hidden)]
+pub struct PreparationReceiverMismatchView {
+    inner: CorePreparationReceiverMismatchProjection,
+}
+
+#[doc(hidden)]
+pub enum BackTargetPreparationAcceptance<Accepted> {
+    Matched(Accepted),
+    Mismatch {
+        capacity: LifecycleContinuationCapacity,
+        mismatch: PreparationReceiverMismatchView,
+    },
+}
+
+#[doc(hidden)]
+pub enum BackTargetExecutionOwnerRef<'a> {
+    Driving {
+        history: &'a HistoryExecutionBindingView,
+        continuation: &'a LifecycleContinuationCapacity,
+    },
+    Classifying {
+        history: &'a HistoryExecutionBindingView,
+        continuation: &'a LifecycleContinuationCapacity,
+    },
+    Prepared {
+        history: &'a HistoryExecutionBindingView,
+        continuation: &'a PreparedPostCommitContinuationOwner,
+    },
+}
+
+#[doc(hidden)]
+pub enum BackTargetPhysicalOwnerRef<'a> {
+    ResumeAction(&'a BackTargetResumeAction),
+    FrameTask(&'a RootFrameTask),
+    MountRequest(&'a MountRequest),
+    CommitTicket(&'a CommitTicket),
+}
+
+#[doc(hidden)]
+pub enum BackTargetExecutionPairingOutcome {
+    Matched,
+    Mismatch(PreparationReceiverMismatchView),
+}
+
+#[doc(hidden)]
+pub enum BackTargetDriverFailureReportMode {
+    Normal,
+    PhysicalResidual,
+}
+
+#[doc(hidden)]
+pub struct BackTargetDriverFailureCleanupOwner {
+    inner: CoreBackTargetDriverFailureCleanup,
+}
+
+#[doc(hidden)]
+pub struct BackTargetDriverFallbackOwner {
+    inner: CoreBackTargetDriverFallback,
+}
+
+#[doc(hidden)]
+pub struct BackTargetDriverTerminalOwner {
+    inner: CoreBackTargetDriverTerminal,
+}
+
+#[doc(hidden)]
+pub struct BackTargetDriverTerminalEvidence {
+    inner: CoreBackTargetDriverTerminalProjection,
+}
+
+#[doc(hidden)]
+pub enum BackTargetDriverFailureCoreOutcome {
+    FailureCleanup(BackTargetDriverFailureCleanupOwner),
+    Fallback(BackTargetDriverFallbackOwner),
+    Terminal(BackTargetDriverTerminalOwner),
+}
+
+#[doc(hidden)]
+pub enum BackTargetDriverFailureReportOutcome {
+    Reported(BackTargetDriverFailureCoreOutcome),
+    Mismatch {
+        capacity: LifecycleContinuationCapacity,
+        task: RootFrameTask,
+        mismatch: PreparationReceiverMismatchView,
+    },
+}
+
+#[doc(hidden)]
+pub enum BackTargetDriverFailureConsumeOutcome {
+    FailureCleanup(FailureCleanupRequest),
+    FallbackReleased,
+    Terminal(BackTargetDriverTerminalEvidence),
+    Mismatch {
+        owner: BackTargetDriverFailureCoreOutcome,
+        mismatch: PreparationReceiverMismatchView,
+    },
+}
+
+#[doc(hidden)]
+pub enum BackTargetAppliedReport {
+    LegacyLeaf,
+    WithOutlets(Vec<RouteSlotKey>),
+}
+
+#[doc(hidden)]
+pub enum BackTargetAppliedReportOutcome {
+    MountRequest {
+        capacity: LifecycleContinuationCapacity,
+        request: MountRequest,
+    },
+    Commit {
+        capacity: LifecycleContinuationCapacity,
+        ticket: CommitTicket,
+    },
+    FailureCleanup(BackTargetDriverFailureCleanupOwner),
+    Mismatch {
+        capacity: LifecycleContinuationCapacity,
+        task: RootFrameTask,
+        report: BackTargetAppliedReport,
+        mismatch: PreparationReceiverMismatchView,
+    },
+}
+
+struct PreparedPostCommitContinuation {
+    binding: LifecycleContinuationBinding,
+}
+
+#[doc(hidden)]
+pub struct PreparedPostCommitContinuationOwner {
+    inner: PreparedPostCommitContinuation,
+}
+
+#[doc(hidden)]
+pub struct BackTargetCommitRetainedInputOwner {
+    continuation: PreparedPostCommitContinuationOwner,
+    manifest: CleanupManifest,
+    evidence: CoreBackTargetCommitRetainedInputProjection,
+}
+
+#[doc(hidden)]
+pub struct BackTargetCommitFailureCleanupOwner {
+    inner: CoreBackTargetCommitFailureCleanup,
+}
+
+#[doc(hidden)]
+pub struct BackTargetCommitRejectedPublicationOwner {
+    inner: CoreBackTargetCommitRejectedPublication,
+}
+
+#[doc(hidden)]
+pub enum BackTargetCommitPreparationFailure {
+    RetainedInput(BackTargetCommitRetainedInputOwner),
+    FailureCleanup(BackTargetCommitFailureCleanupOwner),
+    RejectedPublication(BackTargetCommitRejectedPublicationOwner),
+}
+
+#[doc(hidden)]
+pub struct RouteFailureContinuationOwner {
+    inner: PreparedPostCommitContinuation,
+}
+
+#[doc(hidden)]
+pub struct TargetAuthoritySettlementOwner {
+    inner: PreparedPostCommitContinuation,
+}
+
+#[doc(hidden)]
+pub enum BackTargetCommitPreparationOutcome<'a> {
+    Validated(ValidatedCommit<'a>),
+    Mismatch {
+        owner: PreparedPostCommitContinuationOwner,
+        manifest: CleanupManifest,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    PreparationFailed(BackTargetCommitPreparationFailure),
+}
+
+impl LifecycleContinuationCapacity {
+    pub fn preparation_boundary_scope(&self) -> PreparationBoundaryScopeView {
+        PreparationBoundaryScopeView {
+            inner: self.inner.scope.clone(),
+        }
+    }
+}
+
+#[doc(hidden)]
+pub enum BackTargetResumeAction {
+    FrameTask(RootFrameTask),
+    MountRequest(MountRequest),
+    Commit(CommitTicket),
+}
+
+#[doc(hidden)]
+pub struct BackTargetResume {
+    action: BackTargetResumeAction,
+    execution: HistoryExecutionBindingView,
+    continuation: LifecycleContinuationCapacity,
+}
+
+impl BackTargetResume {
+    pub fn parts(
+        &self,
+    ) -> (
+        &BackTargetResumeAction,
+        &HistoryExecutionBindingView,
+        &LifecycleContinuationCapacity,
+    ) {
+        (&self.action, &self.execution, &self.continuation)
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        BackTargetResumeAction,
+        HistoryExecutionBindingView,
+        LifecycleContinuationCapacity,
+    ) {
+        (self.action, self.execution, self.continuation)
+    }
+
+    pub fn into_frame_task_parts(
+        self,
+    ) -> Result<
+        (
+            RootFrameTask,
+            HistoryExecutionBindingView,
+            LifecycleContinuationCapacity,
+        ),
+        Self,
+    > {
+        let Self {
+            action,
+            execution,
+            continuation,
+        } = self;
+        match action {
+            BackTargetResumeAction::FrameTask(task) => Ok((task, execution, continuation)),
+            action => Err(Self {
+                action,
+                execution,
+                continuation,
+            }),
+        }
+    }
+
+    pub fn into_commit_parts(
+        self,
+    ) -> Result<
+        (
+            CommitTicket,
+            HistoryExecutionBindingView,
+            LifecycleContinuationCapacity,
+        ),
+        Self,
+    > {
+        let Self {
+            action,
+            execution,
+            continuation,
+        } = self;
+        match action {
+            BackTargetResumeAction::Commit(ticket) => Ok((ticket, execution, continuation)),
+            action => Err(Self {
+                action,
+                execution,
+                continuation,
+            }),
+        }
+    }
+}
+
+#[doc(hidden)]
+pub enum BackTargetStart {
+    Ready(BackTargetResume),
+    FailureCleanup(FailureCleanupRequest),
+}
+
+#[doc(hidden)]
+pub enum BackTargetCoreResumeOutcome {
+    Resumed(BackTargetStart),
+    Permanent(BackTargetPermanentOwner),
+    Mismatch {
+        owner: VerifiedBackTargetExecutionOwner,
+        evidence: BackResolutionEvidence,
+    },
+}
+
+#[doc(hidden)]
+pub enum BackNoTargetSourceRefreezeOutcome {
+    Unchanged(VerifiedBackNoTargetCandidate),
+    Drift(BackNoTargetSourceDriftOwner),
+    Mismatch {
+        candidate: VerifiedBackNoTargetCandidate,
+        evidence: BackResolutionEvidence,
+    },
+}
+
+#[doc(hidden)]
+pub enum BackNoTargetSourceDriftSettlementOutcome {
+    Settled(BackNoTargetSourceDriftTerminalEvidence),
+    Mismatch {
+        owner: BackNoTargetSourceDriftOwner,
+        evidence: BackNoTargetSourceDriftEvidence,
+    },
+}
+
+#[doc(hidden)]
+pub enum BackContradictionCoreOutcome {
+    Failed(BackContradictionTerminalEvidence),
+    Mismatch {
+        owner: VerifiedBackResolutionContradiction,
+        evidence: BackResolutionEvidence,
+    },
+}
+
+#[doc(hidden)]
+pub enum BackTargetPermanentSettlementOutcome {
+    Settled(BackTargetPermanentTerminalEvidence),
+    Mismatch {
+        owner: BackTargetPermanentOwner,
+        evidence: BackResolutionEvidence,
+    },
 }
 
 #[doc(hidden)]
@@ -1159,10 +1530,26 @@ impl NavigationRequestView<'_> {
     }
 }
 
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub struct BackCapacityCoreProducerSlot<'engine> {
+    slot: &'engine mut Option<crate::test_support::BackCapacityCoreProducer>,
+}
+
+#[cfg(feature = "test-support")]
+impl BackCapacityCoreProducerSlot<'_> {
+    #[doc(hidden)]
+    pub fn install(self, producer: crate::test_support::BackCapacityCoreProducer) {
+        *self.slot = Some(producer);
+    }
+}
+
 pub struct RouterEngine {
     inner: CoreRouterEngine,
     admission: HostAdmissionIssuer,
     host_trace: Vec<HostTraceEvent>,
+    #[cfg(feature = "test-support")]
+    back_capacity_core_producer: Option<crate::test_support::BackCapacityCoreProducer>,
 }
 
 impl RouterEngine {
@@ -1173,6 +1560,21 @@ impl RouterEngine {
             inner,
             admission,
             host_trace: Vec::new(),
+            #[cfg(feature = "test-support")]
+            back_capacity_core_producer: None,
+        })
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn prepare_back_capacity_core_producer_slot(
+        &mut self,
+    ) -> Option<BackCapacityCoreProducerSlot<'_>> {
+        if self.back_capacity_core_producer.is_some() {
+            return None;
+        }
+        Some(BackCapacityCoreProducerSlot {
+            slot: &mut self.back_capacity_core_producer,
         })
     }
 
@@ -1448,6 +1850,187 @@ impl RouterEngine {
     }
 
     #[doc(hidden)]
+    pub fn claim_history_admission_world(
+        &mut self,
+    ) -> Result<HistoryAdmissionWorldSeal, IntegrationError> {
+        self.inner
+            .claim_history_admission_world()
+            .map_err(|error| match error {
+                ClaimHistoryAdmissionWorldError::Exhausted => IntegrationError::Exhausted,
+                ClaimHistoryAdmissionWorldError::AlreadyClaimed => IntegrationError::Duplicate,
+            })
+    }
+
+    #[doc(hidden)]
+    pub fn history_admission_stamp(
+        &self,
+        world: &HistoryAdmissionWorldSeal,
+    ) -> Result<HistoryAdmissionStamp, PrepareBackAdmissionErrorKind> {
+        self.inner.history_admission_stamp(world)
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_back_admission(
+        &self,
+        current_world: &HistoryAdmissionWorldSeal,
+        stamp: &HistoryAdmissionStamp,
+    ) -> Result<BackAdmissionToken, PrepareBackAdmissionErrorKind> {
+        self.inner.prepare_back_admission(current_world, stamp)
+    }
+
+    #[doc(hidden)]
+    pub fn enqueue_back(
+        &mut self,
+        admission: BackAdmissionToken,
+    ) -> Result<AcceptedBackReservation, EnqueueBackErrorKind> {
+        #[cfg(feature = "test-support")]
+        {
+            let Self {
+                inner,
+                back_capacity_core_producer,
+                ..
+            } = self;
+            return inner.enqueue_back_observed(admission, |boundary| {
+                let Some(producer) = back_capacity_core_producer.as_mut() else {
+                    return;
+                };
+                match boundary {
+                    BackAllocatorBoundary::Attempt => producer.allocator_attempt(),
+                    BackAllocatorBoundary::Failure => producer.allocator_failure(),
+                }
+            });
+        }
+
+        #[cfg(not(feature = "test-support"))]
+        {
+            self.inner.enqueue_back(admission)
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn verify_back_resolution_handoff(
+        &mut self,
+        accepted: BackAcceptedReservationView,
+        handoff: BackResolutionOwnerHandoff,
+    ) -> BackResolutionVerifyOutcome {
+        self.inner.verify_back_resolution_handoff(accepted, handoff)
+    }
+
+    #[doc(hidden)]
+    pub fn classify_back_resolution_evidence(
+        &self,
+        evidence: &BackResolutionEvidence,
+    ) -> BackResolutionEvidenceClassification {
+        self.inner.classify_back_resolution_evidence(evidence)
+    }
+
+    #[doc(hidden)]
+    pub fn resume_back_target_with_retirement<F>(
+        &mut self,
+        owner: VerifiedBackTargetExecutionOwner,
+        commit_retirement: F,
+    ) -> BackTargetCoreResumeOutcome
+    where
+        F: FnOnce(),
+    {
+        match self
+            .inner
+            .resume_back_target_with_retirement(owner, commit_retirement)
+        {
+            CoreBackTargetResumeOutcome::Resumed(start) => {
+                let start = match start {
+                    crate::engine::BackTargetStart::Ready(resume) => {
+                        let action = match resume.action {
+                            CoreBackTargetResumeAction::FrameTask(inner) => {
+                                BackTargetResumeAction::FrameTask(FrameTask { inner })
+                            }
+                            CoreBackTargetResumeAction::MountRequest(inner) => {
+                                BackTargetResumeAction::MountRequest(MountRequest { inner })
+                            }
+                            CoreBackTargetResumeAction::Commit(inner) => {
+                                BackTargetResumeAction::Commit(CommitTicket { inner })
+                            }
+                        };
+                        BackTargetStart::Ready(BackTargetResume {
+                            action,
+                            execution: HistoryExecutionBindingView {
+                                inner: resume.execution,
+                            },
+                            continuation: LifecycleContinuationCapacity {
+                                inner: LifecycleContinuationBinding {
+                                    scope: resume.continuation,
+                                },
+                            },
+                        })
+                    }
+                    crate::engine::BackTargetStart::FailureCleanup(inner) => {
+                        BackTargetStart::FailureCleanup(FailureCleanupRequest { inner })
+                    }
+                };
+                BackTargetCoreResumeOutcome::Resumed(start)
+            }
+            CoreBackTargetResumeOutcome::Permanent(owner) => {
+                BackTargetCoreResumeOutcome::Permanent(owner)
+            }
+            CoreBackTargetResumeOutcome::Mismatch(owner) => {
+                let evidence = owner.evidence();
+                BackTargetCoreResumeOutcome::Mismatch { owner, evidence }
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn settle_back_target_permanent_exact(
+        &mut self,
+        owner: BackTargetPermanentOwner,
+    ) -> BackTargetPermanentSettlementOutcome {
+        let evidence = owner.evidence();
+        BackTargetPermanentSettlementOutcome::Mismatch { owner, evidence }
+    }
+
+    #[doc(hidden)]
+    pub fn refreeze_back_no_target_source_with_transfer<F>(
+        &mut self,
+        candidate: VerifiedBackNoTargetCandidate,
+        _commit_transfer: F,
+    ) -> BackNoTargetSourceRefreezeOutcome
+    where
+        F: FnOnce(),
+    {
+        let evidence = candidate.evidence();
+        BackNoTargetSourceRefreezeOutcome::Mismatch {
+            candidate,
+            evidence,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn settle_back_no_target_source_drift_with_retirement<F>(
+        &mut self,
+        owner: BackNoTargetSourceDriftOwner,
+        _commit_retirement: F,
+    ) -> BackNoTargetSourceDriftSettlementOutcome
+    where
+        F: FnOnce(),
+    {
+        let evidence = owner.evidence();
+        BackNoTargetSourceDriftSettlementOutcome::Mismatch { owner, evidence }
+    }
+
+    #[doc(hidden)]
+    pub fn fail_back_resolution_contradiction_with_retirement<F>(
+        &mut self,
+        owner: VerifiedBackResolutionContradiction,
+        _commit_retirement: F,
+    ) -> BackContradictionCoreOutcome
+    where
+        F: FnOnce(),
+    {
+        let evidence = owner.evidence();
+        BackContradictionCoreOutcome::Mismatch { owner, evidence }
+    }
+
+    #[doc(hidden)]
     #[cfg(any(test, feature = "test-support"))]
     pub fn testing_exhaust_reservation_counter(&mut self, counter: TestingReservationCounter) {
         let counter = match counter {
@@ -1476,7 +2059,20 @@ impl RouterEngine {
                 EngineAction::FailureCleanup(FailureCleanupRequest { inner })
             }
             CoreEngineAction::Commit(inner) => EngineAction::Commit(CommitTicket { inner }),
+            CoreEngineAction::BackResolution(inner) => EngineAction::BackResolution(inner),
         })
+    }
+
+    #[doc(hidden)]
+    pub fn take_back_resolution_action(&mut self) -> Option<BackResolutionOwnerHandoff> {
+        match self.inner.action() {
+            Some(CoreEngineAction::BackResolution(handoff)) => Some(handoff),
+            Some(other) => {
+                self.inner.restore_action(other);
+                None
+            }
+            None => None,
+        }
     }
 
     pub fn report_applied_with_outlets(
@@ -1662,6 +2258,12 @@ impl RouterEngine {
     }
 
     #[doc(hidden)]
+    pub fn is_current_root_back_frame_task(&self, task: &RootFrameTask) -> bool {
+        self.inner
+            .is_current_root_back_frame_task(task.inner.identity())
+    }
+
+    #[doc(hidden)]
     pub fn expected_child_outlet(
         &self,
         task: &RootFrameTask,
@@ -1682,6 +2284,12 @@ impl RouterEngine {
     #[doc(hidden)]
     pub fn testing_exhaust_slot_counter(&mut self) {
         self.inner.testing_exhaust_slot_counter();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn testing_exhaust_mount_sequence_counter(&mut self) {
+        self.inner.testing_exhaust_mount_sequence_counter();
     }
 
     #[cfg(feature = "test-support")]
@@ -1804,6 +2412,370 @@ impl RouterEngine {
         })
     }
 
+    fn accept_back_target_capacity<Accepted>(
+        &mut self,
+        capacity: LifecycleContinuationCapacity,
+        scope: PreparationBoundaryScopeView,
+        matched: impl FnOnce(PreparedPostCommitContinuation) -> Accepted,
+    ) -> BackTargetPreparationAcceptance<Accepted> {
+        let exact_projection = capacity.inner.scope == scope.inner;
+        if !exact_projection {
+            let mismatch = PreparationReceiverMismatchView {
+                inner: CorePreparationReceiverMismatchProjection::Scope {
+                    expected: capacity.inner.scope.clone(),
+                    observed: scope.inner,
+                },
+            };
+            return BackTargetPreparationAcceptance::Mismatch { capacity, mismatch };
+        }
+        if let Err(inner) = self
+            .inner
+            .inspect_back_target_continuation(&capacity.inner.scope, None)
+        {
+            return BackTargetPreparationAcceptance::Mismatch {
+                capacity,
+                mismatch: PreparationReceiverMismatchView { inner },
+            };
+        }
+        BackTargetPreparationAcceptance::Matched(matched(PreparedPostCommitContinuation {
+            binding: capacity.inner,
+        }))
+    }
+
+    #[doc(hidden)]
+    pub fn validate_back_target_execution_pairing(
+        &self,
+        owner: BackTargetExecutionOwnerRef<'_>,
+        physical: BackTargetPhysicalOwnerRef<'_>,
+    ) -> BackTargetExecutionPairingOutcome {
+        let (history, scope) = match owner {
+            BackTargetExecutionOwnerRef::Driving {
+                history,
+                continuation,
+            }
+            | BackTargetExecutionOwnerRef::Classifying {
+                history,
+                continuation,
+            } => (history, &continuation.inner.scope),
+            BackTargetExecutionOwnerRef::Prepared {
+                history,
+                continuation,
+            } => (history, &continuation.inner.binding.scope),
+        };
+        let physical = match physical {
+            BackTargetPhysicalOwnerRef::ResumeAction(action) => match action {
+                BackTargetResumeAction::FrameTask(task) => {
+                    CoreBackTargetPhysicalReceiverRef::FrameTask(&task.inner)
+                }
+                BackTargetResumeAction::MountRequest(request) => {
+                    CoreBackTargetPhysicalReceiverRef::MountRequest(&request.inner)
+                }
+                BackTargetResumeAction::Commit(ticket) => {
+                    CoreBackTargetPhysicalReceiverRef::Commit(&ticket.inner)
+                }
+            },
+            BackTargetPhysicalOwnerRef::FrameTask(task) => {
+                CoreBackTargetPhysicalReceiverRef::FrameTask(&task.inner)
+            }
+            BackTargetPhysicalOwnerRef::MountRequest(request) => {
+                CoreBackTargetPhysicalReceiverRef::MountRequest(&request.inner)
+            }
+            BackTargetPhysicalOwnerRef::CommitTicket(ticket) => {
+                CoreBackTargetPhysicalReceiverRef::Commit(&ticket.inner)
+            }
+        };
+        match self
+            .inner
+            .inspect_back_target_execution_pairing(scope, &history.inner, physical)
+        {
+            Ok(()) => BackTargetExecutionPairingOutcome::Matched,
+            Err(inner) => {
+                BackTargetExecutionPairingOutcome::Mismatch(PreparationReceiverMismatchView {
+                    inner,
+                })
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn report_back_target_failed(
+        &mut self,
+        history: &HistoryExecutionBindingView,
+        capacity: LifecycleContinuationCapacity,
+        task: RootFrameTask,
+        kind: ViewFailureKind,
+        message: &'static str,
+        mode: BackTargetDriverFailureReportMode,
+    ) -> BackTargetDriverFailureReportOutcome {
+        let failure_kind = match kind {
+            ViewFailureKind::Build => NavigationFailureKind::Build,
+            ViewFailureKind::Apply => NavigationFailureKind::Apply,
+        };
+        let core_mode = match mode {
+            BackTargetDriverFailureReportMode::Normal => {
+                CoreBackTargetDriverFailureReportMode::Normal
+            }
+            BackTargetDriverFailureReportMode::PhysicalResidual => {
+                CoreBackTargetDriverFailureReportMode::PhysicalResidual
+            }
+        };
+        let scope = capacity.inner.scope.clone();
+        let reported = self.inner.report_back_target_failed(
+            scope.clone(),
+            &history.inner,
+            &task.inner,
+            NavigationFailure::new(failure_kind, message),
+            core_mode,
+        );
+        let reported = match reported {
+            Ok(reported) => reported,
+            Err(inner) => {
+                return BackTargetDriverFailureReportOutcome::Mismatch {
+                    capacity,
+                    task,
+                    mismatch: PreparationReceiverMismatchView { inner },
+                };
+            }
+        };
+        drop(capacity);
+        drop(task);
+        let outcome = match reported {
+            CoreBackTargetDriverFailureReport::FailureCleanup(inner) => {
+                BackTargetDriverFailureCoreOutcome::FailureCleanup(
+                    BackTargetDriverFailureCleanupOwner { inner },
+                )
+            }
+            CoreBackTargetDriverFailureReport::Fallback(inner) => {
+                BackTargetDriverFailureCoreOutcome::Fallback(BackTargetDriverFallbackOwner {
+                    inner,
+                })
+            }
+            CoreBackTargetDriverFailureReport::Terminal(inner) => {
+                BackTargetDriverFailureCoreOutcome::Terminal(BackTargetDriverTerminalOwner {
+                    inner,
+                })
+            }
+        };
+        BackTargetDriverFailureReportOutcome::Reported(outcome)
+    }
+
+    #[doc(hidden)]
+    pub fn consume_back_target_driver_failure(
+        &mut self,
+        owner: BackTargetDriverFailureCoreOutcome,
+    ) -> BackTargetDriverFailureConsumeOutcome {
+        let mismatch = match &owner {
+            BackTargetDriverFailureCoreOutcome::FailureCleanup(owner) => self
+                .inner
+                .inspect_back_target_driver_failure_cleanup(&owner.inner)
+                .err(),
+            BackTargetDriverFailureCoreOutcome::Fallback(owner) => self
+                .inner
+                .inspect_back_target_driver_failure_fallback(&owner.inner)
+                .err(),
+            BackTargetDriverFailureCoreOutcome::Terminal(owner) => self
+                .inner
+                .inspect_back_target_driver_failure_terminal(&owner.inner)
+                .err(),
+        };
+        if let Some(inner) = mismatch {
+            return BackTargetDriverFailureConsumeOutcome::Mismatch {
+                mismatch: PreparationReceiverMismatchView { inner },
+                owner,
+            };
+        }
+
+        match owner {
+            BackTargetDriverFailureCoreOutcome::FailureCleanup(owner) => {
+                BackTargetDriverFailureConsumeOutcome::FailureCleanup(FailureCleanupRequest {
+                    inner: owner.inner.request,
+                })
+            }
+            BackTargetDriverFailureCoreOutcome::Fallback(owner) => {
+                drop(owner);
+                BackTargetDriverFailureConsumeOutcome::FallbackReleased
+            }
+            BackTargetDriverFailureCoreOutcome::Terminal(owner) => {
+                BackTargetDriverFailureConsumeOutcome::Terminal(BackTargetDriverTerminalEvidence {
+                    inner: CoreBackTargetDriverTerminalProjection {
+                        scope: owner.inner.scope,
+                        request: owner.inner.request,
+                    },
+                })
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn report_back_target_applied(
+        &mut self,
+        history: &HistoryExecutionBindingView,
+        capacity: LifecycleContinuationCapacity,
+        task: RootFrameTask,
+        report: BackTargetAppliedReport,
+    ) -> BackTargetAppliedReportOutcome {
+        let scope = capacity.inner.scope.clone();
+        let outlets = match &report {
+            BackTargetAppliedReport::LegacyLeaf => None,
+            BackTargetAppliedReport::WithOutlets(outlets) => Some(outlets.clone()),
+        };
+        let outcome =
+            match self
+                .inner
+                .report_back_target_applied(scope, &history.inner, &task.inner, outlets)
+            {
+                Ok(outcome) => outcome,
+                Err(inner) => {
+                    return BackTargetAppliedReportOutcome::Mismatch {
+                        capacity,
+                        task,
+                        report,
+                        mismatch: PreparationReceiverMismatchView { inner },
+                    };
+                }
+            };
+        drop(report);
+        drop(task);
+        match outcome {
+            CoreBackTargetAppliedOutcome::MountRequest(inner) => {
+                BackTargetAppliedReportOutcome::MountRequest {
+                    capacity,
+                    request: MountRequest { inner },
+                }
+            }
+            CoreBackTargetAppliedOutcome::Commit(inner) => BackTargetAppliedReportOutcome::Commit {
+                capacity,
+                ticket: CommitTicket { inner },
+            },
+            CoreBackTargetAppliedOutcome::FailureCleanup(inner) => {
+                drop(capacity);
+                BackTargetAppliedReportOutcome::FailureCleanup(
+                    BackTargetDriverFailureCleanupOwner { inner },
+                )
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn accept_back_target_ready(
+        &mut self,
+        capacity: LifecycleContinuationCapacity,
+        scope: PreparationBoundaryScopeView,
+    ) -> BackTargetPreparationAcceptance<PreparedPostCommitContinuationOwner> {
+        self.accept_back_target_capacity(capacity, scope, |inner| {
+            PreparedPostCommitContinuationOwner { inner }
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn accept_back_target_pending_rejected(
+        &mut self,
+        capacity: LifecycleContinuationCapacity,
+        scope: PreparationBoundaryScopeView,
+    ) -> BackTargetPreparationAcceptance<RouteFailureContinuationOwner> {
+        self.accept_back_target_capacity(capacity, scope, |inner| RouteFailureContinuationOwner {
+            inner,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn accept_back_target_authority_lost(
+        &mut self,
+        capacity: LifecycleContinuationCapacity,
+        scope: PreparationBoundaryScopeView,
+    ) -> BackTargetPreparationAcceptance<TargetAuthoritySettlementOwner> {
+        self.accept_back_target_capacity(capacity, scope, |inner| TargetAuthoritySettlementOwner {
+            inner,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_back_target_commit<'a>(
+        &'a mut self,
+        owner: PreparedPostCommitContinuationOwner,
+        ticket: &CommitTicket,
+        manifest: CleanupManifest,
+    ) -> BackTargetCommitPreparationOutcome<'a> {
+        if let Err(inner) = self
+            .inner
+            .inspect_back_target_continuation(&owner.inner.binding.scope, Some(&ticket.inner))
+        {
+            return BackTargetCommitPreparationOutcome::Mismatch {
+                owner,
+                manifest,
+                mismatch: PreparationReceiverMismatchView { inner },
+            };
+        }
+        let manifest_digest = manifest.manifest_digest;
+        let obligation_count = manifest.obligation_count;
+        let seal = CleanupManifestSeal::new(
+            manifest.logical_roots.clone(),
+            CleanupManifestDigest::from_opaque(manifest_digest),
+            obligation_count,
+        );
+        let PreparedPostCommitContinuationOwner {
+            inner:
+                PreparedPostCommitContinuation {
+                    binding: LifecycleContinuationBinding { scope },
+                },
+        } = owner;
+        match self
+            .inner
+            .prepare_back_target_commit(scope, &ticket.inner, seal)
+        {
+            CoreBackTargetCommitOperationOutcome::Validated {
+                publication,
+                cleanup,
+                continuation,
+            } => BackTargetCommitPreparationOutcome::Validated(ValidatedCommit {
+                publication,
+                cleanup: CleanupBatch {
+                    inner: cleanup,
+                    manifest_digest,
+                    obligation_count,
+                },
+                back_target_continuation: Some(PreparedPostCommitContinuation {
+                    binding: LifecycleContinuationBinding {
+                        scope: continuation,
+                    },
+                }),
+            }),
+            CoreBackTargetCommitOperationOutcome::Failed(failure) => {
+                let failure = match failure {
+                    CoreBackTargetCommitOperationFailure::RetainedInput {
+                        continuation,
+                        evidence,
+                    } => BackTargetCommitPreparationFailure::RetainedInput(
+                        BackTargetCommitRetainedInputOwner {
+                            continuation: PreparedPostCommitContinuationOwner {
+                                inner: PreparedPostCommitContinuation {
+                                    binding: LifecycleContinuationBinding {
+                                        scope: continuation,
+                                    },
+                                },
+                            },
+                            manifest,
+                            evidence,
+                        },
+                    ),
+                    CoreBackTargetCommitOperationFailure::FailureCleanup(inner) => {
+                        drop(manifest);
+                        BackTargetCommitPreparationFailure::FailureCleanup(
+                            BackTargetCommitFailureCleanupOwner { inner },
+                        )
+                    }
+                    CoreBackTargetCommitOperationFailure::RejectedPublication(inner) => {
+                        drop(manifest);
+                        BackTargetCommitPreparationFailure::RejectedPublication(
+                            BackTargetCommitRejectedPublicationOwner { inner },
+                        )
+                    }
+                };
+                BackTargetCommitPreparationOutcome::PreparationFailed(failure)
+            }
+        }
+    }
+
     #[doc(hidden)]
     pub fn inspect_commit_identity(&self, ticket: &CommitTicket) -> Result<(), IntegrationError> {
         self.inner
@@ -1815,6 +2787,12 @@ impl RouterEngine {
     #[cfg(any(test, feature = "test-support"))]
     pub fn testing_invalidate_commit_action(&mut self) {
         self.inner.testing_invalidate_commit_action();
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_drift_current_frame_task_identity(&mut self) -> bool {
+        self.inner.testing_drift_current_frame_task_identity()
     }
 
     pub fn validate_publication(
@@ -1832,6 +2810,7 @@ impl RouterEngine {
         Ok(ValidatedCommit {
             publication,
             cleanup,
+            back_target_continuation: None,
         })
     }
 
@@ -2077,6 +3056,23 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn back_capacity_core_producer_slot_cannot_be_reacquired_after_install() {
+        let view = RouteViewKey::new("back-capacity-core-producer-slot").unwrap();
+        let fallback = RouteViewKey::new("back-capacity-core-producer-fallback").unwrap();
+        let mut engine = RouterEngine::install(tree(&view), fallback).unwrap();
+        let slot = engine
+            .prepare_back_capacity_core_producer_slot()
+            .expect("a fresh integration engine has one vacant Core producer slot");
+        let (_observer, _issuer, core_producer, _facade) =
+            crate::test_support::issue_back_capacity_order_channels();
+
+        slot.install(core_producer);
+
+        assert!(engine.prepare_back_capacity_core_producer_slot().is_none());
+    }
+
     fn nested_tree() -> RouteTree {
         let mut builder = RouteTree::builder()
             .root_with_options(
@@ -2104,9 +3100,47 @@ mod tests {
         builder.build().unwrap()
     }
 
+    fn back_target_nested_tree() -> RouteTree {
+        let mut builder = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("layout").unwrap()),
+            )
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let items = builder
+            .route_with_options(
+                root,
+                RoutePattern::path("items").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("items").unwrap()),
+            )
+            .unwrap();
+        builder
+            .route_with_options(
+                items,
+                RoutePattern::path(":id").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("item").unwrap()),
+            )
+            .unwrap();
+        builder.build().unwrap()
+    }
+
     fn confirmed_nested_engine() -> RouterEngine {
         let mut engine =
             RouterEngine::install(nested_tree(), RouteViewKey::new("fallback").unwrap()).unwrap();
+        let token = engine.request_host_admission().unwrap();
+        let grant = engine.grant_host_admission(&token).unwrap();
+        engine.record_top_slot_registered(&grant).unwrap();
+        engine.confirm_host(grant);
+        engine
+    }
+
+    fn confirmed_back_target_nested_engine() -> RouterEngine {
+        let mut engine = RouterEngine::install(
+            back_target_nested_tree(),
+            RouteViewKey::new("fallback").unwrap(),
+        )
+        .unwrap();
         let token = engine.request_host_admission().unwrap();
         let grant = engine.grant_host_admission(&token).unwrap();
         engine.record_top_slot_registered(&grant).unwrap();
@@ -3478,6 +4512,9 @@ mod tests {
                 panic!("depth-one helper cannot hold nested failure cleanup")
             }
             EngineAction::Commit(ticket) => ticket,
+            EngineAction::BackResolution(_) => {
+                panic!("push helper cannot receive unresolved back resolution")
+            }
         };
         let prepared = engine
             .prepare_commit(&ticket, CleanupManifest::empty())
@@ -3487,6 +4524,2069 @@ mod tests {
         validated.publish(|| {});
         engine.complete_cleanup(cleanup.complete_empty()).unwrap();
         request
+    }
+
+    fn settle_changed_history_push(
+        engine: &mut RouterEngine,
+        location: RouteLocation,
+    ) -> NavigationRequestId {
+        let request = engine.push(location).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("changed history location must issue one replacement frame task")
+        };
+        let ticket = engine.report_applied(task).unwrap();
+        let logical_roots = engine
+            .reconciliation_projection_for_commit(&ticket)
+            .unwrap()
+            .leaving()
+            .map(|leaving| leaving.version().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            logical_roots.len(),
+            1,
+            "the depth-one changed location has one real logical leaving root"
+        );
+        let manifest_digest = 0x4144_4d49_5353_494f;
+        let obligation_count = logical_roots.len();
+        let prepared = engine
+            .prepare_commit(
+                &ticket,
+                CleanupManifest::new(logical_roots, manifest_digest, obligation_count),
+            )
+            .unwrap();
+        let cleanup = prepared.cleanup().clone();
+        assert_eq!(cleanup.manifest_digest(), manifest_digest);
+        assert_eq!(cleanup.obligation_count(), obligation_count);
+        let validated = engine.validate_publication(prepared).unwrap();
+        validated.publish(|| {});
+        engine
+            .observe_cleanup_receipt(&cleanup, CleanupDisposition::Removed)
+            .unwrap();
+        engine
+            .complete_cleanup(cleanup.complete(0x4144_4d49_5353_444f, obligation_count))
+            .unwrap();
+        request
+    }
+
+    #[derive(Clone, Copy)]
+    enum HistoryFixtureCommand {
+        Push,
+        Replace,
+    }
+
+    fn settle_nested_history_command(
+        engine: &mut RouterEngine,
+        command: HistoryFixtureCommand,
+        location: RouteLocation,
+    ) -> NavigationRequestId {
+        let request = match command {
+            HistoryFixtureCommand::Push => engine.push(location).unwrap(),
+            HistoryFixtureCommand::Replace => engine.replace(location).unwrap(),
+        };
+        engine.collect();
+        loop {
+            match engine
+                .action()
+                .expect("a running nested fixture retains one real action")
+            {
+                EngineAction::FrameTask(task) => {
+                    let outlets = engine
+                        .expected_child_outlet(&task)
+                        .unwrap()
+                        .into_iter()
+                        .collect();
+                    engine.report_applied_with_outlets(task, outlets).unwrap();
+                }
+                EngineAction::MountRequest(mount) => {
+                    let receipt = engine.resolve_mount(mount).unwrap().attest_receipt(0x51);
+                    let completion = engine.accept_mount_receipt(receipt).unwrap().complete(0x53);
+                    engine.complete_mount_registration(completion).unwrap();
+                }
+                EngineAction::Commit(ticket) => {
+                    let logical_roots = engine
+                        .reconciliation_projection_for_commit(&ticket)
+                        .unwrap()
+                        .leaving()
+                        .map(|leaving| leaving.version().clone())
+                        .collect::<Vec<_>>();
+                    let obligation_count = logical_roots.len();
+                    let manifest = if obligation_count == 0 {
+                        CleanupManifest::empty()
+                    } else {
+                        CleanupManifest::new(logical_roots, 0x4241_434b_4e45_5354, obligation_count)
+                    };
+                    let prepared = engine.prepare_commit(&ticket, manifest).unwrap();
+                    let cleanup = prepared.cleanup().clone();
+                    let validated = engine.validate_publication(prepared).unwrap();
+                    validated.publish(|| {});
+                    let completion = if obligation_count == 0 {
+                        cleanup.complete_empty()
+                    } else {
+                        cleanup.complete(0x4241_434b_444f_4e45, obligation_count)
+                    };
+                    engine.complete_cleanup(completion).unwrap();
+                    return request;
+                }
+                EngineAction::FailureCleanup(_) => {
+                    panic!("a successful nested history fixture cannot enter failure cleanup")
+                }
+                EngineAction::BackResolution(_) => {
+                    panic!("push and replace fixtures cannot produce Back resolution")
+                }
+            }
+        }
+    }
+
+    fn nested_mount_back_fixture() -> RouterEngine {
+        let mut engine = confirmed_back_target_nested_engine();
+        settle_nested_history_command(
+            &mut engine,
+            HistoryFixtureCommand::Push,
+            RouteLocation::new("/items/1"),
+        );
+        settle_nested_history_command(
+            &mut engine,
+            HistoryFixtureCommand::Push,
+            RouteLocation::new("/"),
+        );
+        settle_nested_history_command(
+            &mut engine,
+            HistoryFixtureCommand::Replace,
+            RouteLocation::new("/items"),
+        );
+        engine
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn back_core_allocator_failure_is_post_refreeze_private_zero_write() {
+        use crate::test_support::{BackCapacityOrderEvent, issue_back_capacity_order_channels};
+
+        for counter in TestingReservationCounter::ALL {
+            let mut engine = confirmed_engine();
+            let (observer, _issuer, core, _facade) = issue_back_capacity_order_channels();
+            engine
+                .prepare_back_capacity_core_producer_slot()
+                .expect("each fresh engine has one vacant sealed Core producer slot")
+                .install(core);
+            settle_push(
+                &mut engine,
+                RouteLocation::new("/").with_fragment("back-target"),
+            );
+            settle_changed_history_push(
+                &mut engine,
+                RouteLocation::new("/").with_fragment("back-source"),
+            );
+            assert!(engine.snapshot().history().can_back());
+
+            let world = engine
+                .claim_history_admission_world()
+                .expect("the fresh confirmed engine issues one exact world seal");
+            let stamp = engine
+                .history_admission_stamp(&world)
+                .expect("the settled history publishes can_back=true");
+            let admission = engine
+                .prepare_back_admission(&world, &stamp)
+                .expect("the exact live history verifies Back admission");
+
+            engine.testing_exhaust_reservation_counter(counter);
+            let before = engine.inner.testing_snapshot();
+            let error = match engine.enqueue_back(admission) {
+                Ok(_) => panic!("a real exhausted reservation counter cannot accept Back"),
+                Err(error) => error,
+            };
+
+            assert_eq!(error, EnqueueBackErrorKind::Exhausted);
+            assert_eq!(engine.inner.testing_snapshot(), before);
+            assert_eq!(
+                observer.snapshot().events(),
+                &[
+                    (0, BackCapacityOrderEvent::CoreAllocatorAttempt),
+                    (1, BackCapacityOrderEvent::CoreAllocatorFailure),
+                ]
+            );
+        }
+
+        let mut stale = confirmed_engine();
+        let (observer, _issuer, core, _facade) = issue_back_capacity_order_channels();
+        stale
+            .prepare_back_capacity_core_producer_slot()
+            .expect("the separate fresh engine has one vacant sealed Core producer slot")
+            .install(core);
+        settle_push(
+            &mut stale,
+            RouteLocation::new("/").with_fragment("stale-back-target"),
+        );
+        settle_changed_history_push(
+            &mut stale,
+            RouteLocation::new("/").with_fragment("stale-back-source"),
+        );
+        assert!(stale.snapshot().history().can_back());
+        let world = stale
+            .claim_history_admission_world()
+            .expect("the separate engine issues its exact world seal");
+        let stamp = stale
+            .history_admission_stamp(&world)
+            .expect("the separate settled history publishes can_back=true");
+        let admission = stale
+            .prepare_back_admission(&world, &stamp)
+            .expect("the exact pre-drift history verifies Back admission");
+
+        settle_changed_history_push(
+            &mut stale,
+            RouteLocation::new("/").with_fragment("new-live-current"),
+        );
+        let before = stale.inner.testing_snapshot();
+        let error = match stale.enqueue_back(admission) {
+            Ok(_) => panic!("a stale Back admission token cannot reserve allocator capacity"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, EnqueueBackErrorKind::AuthorityRecovering);
+        assert_eq!(stale.inner.testing_snapshot(), before);
+        assert!(observer.snapshot().events().is_empty());
+    }
+
+    #[test]
+    fn admission_stamp_cannot_authorize_or_reconstruct_target() {
+        let mut engine = confirmed_engine();
+        settle_push(&mut engine, RouteLocation::new("/").with_fragment("first"));
+        settle_changed_history_push(
+            &mut engine,
+            RouteLocation::new("/").with_fragment("published-current"),
+        );
+        let published_preview = RouteLocation::new("/").with_fragment("first");
+        let world = engine
+            .claim_history_admission_world()
+            .expect("an installed engine must issue one opaque world seal");
+        let stamp = engine
+            .history_admission_stamp(&world)
+            .expect("published can_back=true must produce an admission-only stamp");
+
+        settle_changed_history_push(
+            &mut engine,
+            RouteLocation::new("/").with_fragment("new-live-current"),
+        );
+        let expected_live_target = RouteLocation::new("/").with_fragment("published-current");
+        let admission = engine
+            .prepare_back_admission(&world, &stamp)
+            .expect("a lagging same-provenance positive stamp still admits back");
+        let accepted = engine
+            .enqueue_back(admission)
+            .expect("live history, not the stamp, reserves the back request");
+
+        assert_eq!(
+            engine.request(accepted.request()).unwrap().requested(),
+            None
+        );
+        engine.collect();
+        assert_eq!(
+            engine.request(accepted.request()).unwrap().requested(),
+            Some(&expected_live_target)
+        );
+        assert_ne!(expected_live_target, published_preview);
+    }
+
+    #[test]
+    fn back_resolution_evidence_classifies_current_record_and_foreign_engine() {
+        let mut exact = confirmed_engine();
+        settle_push(
+            &mut exact,
+            RouteLocation::new("/").with_fragment("back-target"),
+        );
+        settle_changed_history_push(
+            &mut exact,
+            RouteLocation::new("/").with_fragment("back-source"),
+        );
+        let world = exact
+            .claim_history_admission_world()
+            .expect("the exact engine issues one real world seal");
+        let stamp = exact
+            .history_admission_stamp(&world)
+            .expect("the exact published history admits back");
+        let admission = exact
+            .prepare_back_admission(&world, &stamp)
+            .expect("the exact live authority verifies admission");
+        let _accepted = exact
+            .enqueue_back(admission)
+            .expect("the exact engine reserves one real back branch");
+
+        exact.collect();
+        let evidence = match exact.action() {
+            Some(EngineAction::BackResolution(handoff)) => handoff.evidence(),
+            Some(_) | None => panic!("the accepted request must yield resolution evidence"),
+        };
+
+        assert_eq!(
+            exact.classify_back_resolution_evidence(&evidence),
+            BackResolutionEvidenceClassification::Current
+        );
+
+        let foreign = confirmed_engine();
+        assert_eq!(
+            foreign.classify_back_resolution_evidence(&evidence),
+            BackResolutionEvidenceClassification::Foreign
+        );
+    }
+
+    #[test]
+    fn accepted_back_view_exact_lineage_rejects_cross_scope() {
+        let mut exact = confirmed_engine();
+        settle_push(
+            &mut exact,
+            RouteLocation::new("/").with_fragment("back-target"),
+        );
+        settle_changed_history_push(
+            &mut exact,
+            RouteLocation::new("/").with_fragment("back-source"),
+        );
+        let world = exact
+            .claim_history_admission_world()
+            .expect("the exact engine issues one real world seal");
+        let stamp = exact
+            .history_admission_stamp(&world)
+            .expect("the exact published history admits back");
+        let admission = exact
+            .prepare_back_admission(&world, &stamp)
+            .expect("the exact live authority verifies admission");
+        let accepted = exact
+            .enqueue_back(admission)
+            .expect("the exact engine reserves one real back branch");
+        let request = accepted.request();
+        let (_, accepted) = accepted.into_parts();
+
+        exact.collect();
+        let Some(EngineAction::BackResolution(handoff)) = exact.action() else {
+            panic!("the accepted request must yield its real raw resolution handoff")
+        };
+        let saved_evidence = handoff.evidence();
+        assert_eq!(
+            exact.classify_back_resolution_evidence(&saved_evidence),
+            BackResolutionEvidenceClassification::Current
+        );
+
+        let mut foreign = confirmed_engine();
+        let (accepted, handoff, mismatch_evidence) =
+            match foreign.verify_back_resolution_handoff(accepted, handoff) {
+                BackResolutionVerifyOutcome::Mismatch {
+                    accepted,
+                    handoff,
+                    evidence,
+                } => (accepted, handoff, evidence),
+                BackResolutionVerifyOutcome::Matched(_) => {
+                    panic!("a foreign engine must not verify accepted back lineage")
+                }
+            };
+        assert_eq!(
+            exact.classify_back_resolution_evidence(&saved_evidence),
+            BackResolutionEvidenceClassification::Current
+        );
+        assert_eq!(
+            exact.classify_back_resolution_evidence(&mismatch_evidence),
+            BackResolutionEvidenceClassification::Foreign
+        );
+        assert_eq!(
+            foreign.classify_back_resolution_evidence(&mismatch_evidence),
+            BackResolutionEvidenceClassification::Foreign
+        );
+
+        let before = exact
+            .inner
+            .testing_snapshot()
+            .without_back_resolution_state_for(request);
+        match exact.verify_back_resolution_handoff(accepted, handoff) {
+            BackResolutionVerifyOutcome::Matched(verified) => {
+                let (_accepted, _verified_owner) = verified.into_parts();
+            }
+            BackResolutionVerifyOutcome::Mismatch { .. } => {
+                panic!("the exact engine must verify the original accepted and raw owners")
+            }
+        }
+        let after = exact
+            .inner
+            .testing_snapshot()
+            .without_back_resolution_state_for(request);
+        assert_eq!(after, before);
+        assert_eq!(
+            exact.classify_back_resolution_evidence(&saved_evidence),
+            BackResolutionEvidenceClassification::ConsumedReplay
+        );
+    }
+
+    fn take_verified_back_target(exact: &mut RouterEngine) -> VerifiedBackTargetExecutionOwner {
+        let world = exact
+            .claim_history_admission_world()
+            .expect("the exact engine issues one real world seal");
+        let stamp = exact
+            .history_admission_stamp(&world)
+            .expect("the exact published history admits back");
+        let admission = exact
+            .prepare_back_admission(&world, &stamp)
+            .expect("the exact live authority verifies admission");
+        let accepted = exact
+            .enqueue_back(admission)
+            .expect("the exact engine reserves one real back branch");
+        let (_, accepted) = accepted.into_parts();
+
+        exact.collect();
+        let Some(EngineAction::BackResolution(handoff)) = exact.action() else {
+            panic!("the accepted request must yield its real raw resolution handoff")
+        };
+        let verified = match exact.verify_back_resolution_handoff(accepted, handoff) {
+            BackResolutionVerifyOutcome::Matched(verified) => verified,
+            BackResolutionVerifyOutcome::Mismatch { .. } => {
+                panic!("the exact engine must verify the accepted view and raw handoff")
+            }
+        };
+        let (_, owner) = verified.into_parts();
+        match owner {
+            VerifiedBackResolutionOwnerHandoff::Target(owner) => owner,
+            VerifiedBackResolutionOwnerHandoff::NoTarget(_) => {
+                panic!("two published history entries must resolve one live predecessor")
+            }
+            VerifiedBackResolutionOwnerHandoff::Contradiction(_) => {
+                panic!("an unchanged live predecessor must not contradict its accepted branch")
+            }
+        }
+    }
+
+    fn take_back_target_driver_frame_task() -> (
+        RouterEngine,
+        HistoryExecutionBindingView,
+        LifecycleContinuationCapacity,
+        RootFrameTask,
+    ) {
+        let mut exact = confirmed_engine();
+        settle_push(
+            &mut exact,
+            RouteLocation::new("/").with_fragment("driver-target"),
+        );
+        settle_changed_history_push(
+            &mut exact,
+            RouteLocation::new("/").with_fragment("driver-source"),
+        );
+        let owner = take_verified_back_target(&mut exact);
+        let resume = match exact.resume_back_target_with_retirement(owner, || {}) {
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::Ready(resume)) => resume,
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::FailureCleanup(_)) => {
+                panic!("an unchanged depth-one Back target must not enter failure cleanup")
+            }
+            BackTargetCoreResumeOutcome::Permanent(_) => {
+                panic!("an unchanged depth-one Back target must resume")
+            }
+            BackTargetCoreResumeOutcome::Mismatch { .. } => {
+                panic!("the exact depth-one Back target receiver must match")
+            }
+        };
+        let (action, history, continuation) = resume.into_parts();
+        let BackTargetResumeAction::FrameTask(task) = action else {
+            panic!("the changed depth-one Back target must issue one real frame task")
+        };
+        (exact, history, continuation, task)
+    }
+
+    fn take_back_target_nested_parent_frame_task() -> (
+        RouterEngine,
+        HistoryExecutionBindingView,
+        LifecycleContinuationCapacity,
+        RootFrameTask,
+    ) {
+        let mut exact = confirmed_back_target_nested_engine();
+        settle_nested_history_command(
+            &mut exact,
+            HistoryFixtureCommand::Push,
+            RouteLocation::new("/items/1").with_fragment("applied-nested-target"),
+        );
+        settle_nested_history_command(
+            &mut exact,
+            HistoryFixtureCommand::Push,
+            RouteLocation::new("/").with_fragment("applied-nested-source"),
+        );
+        let owner = take_verified_back_target(&mut exact);
+        let resume = match exact.resume_back_target_with_retirement(owner, || {}) {
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::Ready(resume)) => resume,
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::FailureCleanup(_)) => {
+                panic!("the unchanged nested Back target must not enter failure cleanup")
+            }
+            BackTargetCoreResumeOutcome::Permanent(_) => {
+                panic!("the unchanged nested Back target must resume")
+            }
+            BackTargetCoreResumeOutcome::Mismatch { .. } => {
+                panic!("the exact nested Back target receiver must match")
+            }
+        };
+        let (action, history, continuation) = resume.into_parts();
+        let BackTargetResumeAction::FrameTask(task) = action else {
+            panic!("the changed nested parent must issue one real frame task")
+        };
+        (exact, history, continuation, task)
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExpectedBackTargetResumeAction {
+        FrameTask,
+        MountRequest,
+        Commit,
+    }
+
+    fn assert_back_target_wrong_receiver_calls_zero(
+        owner: VerifiedBackTargetExecutionOwner,
+    ) -> VerifiedBackTargetExecutionOwner {
+        let callback_calls = std::cell::Cell::new(0);
+        let mut foreign = confirmed_engine();
+        let owner = match foreign.resume_back_target_with_retirement(owner, || {
+            callback_calls.set(callback_calls.get() + 1);
+        }) {
+            BackTargetCoreResumeOutcome::Mismatch { owner, .. } => owner,
+            BackTargetCoreResumeOutcome::Resumed(_) => {
+                panic!("a foreign receiver must not resume the exact target owner")
+            }
+            BackTargetCoreResumeOutcome::Permanent(_) => {
+                panic!("a foreign receiver mismatch must preserve the verified target owner")
+            }
+        };
+        assert_eq!(
+            callback_calls.get(),
+            0,
+            "receiver mismatch must not invoke the retirement callback"
+        );
+        owner
+    }
+
+    fn assert_back_target_receiver_fixture(
+        mut exact: RouterEngine,
+        expected: ExpectedBackTargetResumeAction,
+    ) {
+        let owner = take_verified_back_target(&mut exact);
+        let owner = assert_back_target_wrong_receiver_calls_zero(owner);
+        let callback_calls = std::cell::Cell::new(0);
+
+        let outcome = exact.resume_back_target_with_retirement(owner, || {
+            callback_calls.set(callback_calls.get() + 1);
+        });
+        assert_eq!(
+            callback_calls.get(),
+            1,
+            "the exact receiver must invoke the retirement callback exactly once"
+        );
+        match outcome {
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::Ready(resume)) => {
+                let (action, _execution, _continuation) = resume.into_parts();
+                assert!(
+                    matches!(
+                        (expected, action),
+                        (
+                            ExpectedBackTargetResumeAction::FrameTask,
+                            BackTargetResumeAction::FrameTask(_)
+                        ) | (
+                            ExpectedBackTargetResumeAction::MountRequest,
+                            BackTargetResumeAction::MountRequest(_)
+                        ) | (
+                            ExpectedBackTargetResumeAction::Commit,
+                            BackTargetResumeAction::Commit(_)
+                        )
+                    ),
+                    "the exact receiver must return the real reconciliation action"
+                );
+            }
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::FailureCleanup(_)) => {
+                panic!("a non-exhausted fixture must not enter failure cleanup")
+            }
+            BackTargetCoreResumeOutcome::Permanent(_) => {
+                panic!("the unchanged live history source must resume, not become permanent")
+            }
+            BackTargetCoreResumeOutcome::Mismatch { .. } => {
+                panic!("the exact receiver must resume its verified target owner")
+            }
+        }
+    }
+
+    fn assert_back_target_permanent_zero_write(
+        mut engine: RouterEngine,
+        mutate: impl FnOnce(&mut RouterEngine, &mut VerifiedBackTargetExecutionOwner),
+    ) {
+        let mut owner = take_verified_back_target(&mut engine);
+        mutate(&mut engine, &mut owner);
+        let before = engine.inner.testing_snapshot();
+        let callback_calls = std::cell::Cell::new(0);
+
+        let outcome = engine.resume_back_target_with_retirement(owner, || {
+            callback_calls.set(callback_calls.get() + 1);
+        });
+
+        assert_eq!(callback_calls.get(), 1);
+        assert!(matches!(outcome, BackTargetCoreResumeOutcome::Permanent(_)));
+        assert_eq!(engine.inner.testing_snapshot(), before);
+        assert!(engine.action().is_none());
+    }
+
+    fn direct_back_target_fixture() -> RouterEngine {
+        let mut engine = confirmed_engine();
+        settle_push(
+            &mut engine,
+            RouteLocation::new("/").with_fragment("prepared-target"),
+        );
+        settle_changed_history_push(
+            &mut engine,
+            RouteLocation::new("/").with_fragment("prepared-source"),
+        );
+        engine
+    }
+
+    #[test]
+    fn back_target_prepares_all_fallible_work_before_retirement_callback() {
+        assert_back_target_permanent_zero_write(direct_back_target_fixture(), |engine, _owner| {
+            assert!(engine.inner.testing_begin_back_target_host_drift());
+        });
+
+        assert_back_target_permanent_zero_write(direct_back_target_fixture(), |engine, _owner| {
+            engine
+                .inner
+                .testing_set_active_generation(RouteGeneration::testing_max());
+        });
+
+        let mut generation = direct_back_target_fixture();
+        generation
+            .inner
+            .testing_set_active_generation(RouteGeneration::testing_max());
+        assert_back_target_permanent_zero_write(generation, |_engine, _owner| {});
+
+        assert_back_target_permanent_zero_write(nested_mount_back_fixture(), |_engine, owner| {
+            owner.testing_truncate_reserved_frames(1);
+        });
+    }
+
+    fn rust_function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("missing Rust function signature `{signature}`"));
+        let open = source[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("missing body for Rust function `{signature}`"));
+        let mut depth = 0usize;
+        for (offset, byte) in source.as_bytes()[open..].iter().copied().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[open + 1..open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated Rust function `{signature}`")
+    }
+
+    #[test]
+    fn back_target_callback_tail_is_infallible_and_query_free() {
+        let source = include_str!("engine.rs");
+        let install = rust_function_body(source, "fn install_prepared_back_target_start(");
+        let prepare = rust_function_body(source, "fn prepare_back_target_start(");
+        let mount_success = prepare
+            .split_once("return match self.mount.issue(")
+            .and_then(|(_, tail)| tail.split_once("Err(error)"))
+            .map(|(success, _)| success)
+            .expect("prepared target mount issue keeps explicit success and failure arms");
+        let mut violations = Vec::new();
+
+        for forbidden in [
+            "self.records[record_index]",
+            ".clone()",
+            ".to_vec()",
+            ".push(",
+            ".position(",
+            ".get(",
+            "matcher.",
+            "mount.",
+            "history.",
+            ".validate",
+            "if ",
+            ".expect(",
+            ".unwrap(",
+            "unreachable!(",
+        ] {
+            if install.contains(forbidden) {
+                violations.push(format!("callback tail contains `{forbidden}`"));
+            }
+        }
+        if !install.contains("self.records = records") {
+            violations.push(
+                "callback tail does not install one prebuilt whole records replacement".to_owned(),
+            );
+        }
+        for forbidden in [
+            ".clone()",
+            ".to_vec()",
+            ".push(",
+            "matcher.",
+            ".position(",
+            ".validate",
+            ".expect(",
+            ".unwrap(",
+        ] {
+            if mount_success.contains(forbidden) {
+                violations.push(format!(
+                    "mount issue success performs late preparation `{forbidden}`"
+                ));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "all fallible or allocating work must close before retirement: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn back_target_receiver_mismatch_calls_zero_and_exact_receiver_calls_once() {
+        let mut frame_task = confirmed_engine();
+        settle_push(
+            &mut frame_task,
+            RouteLocation::new("/").with_fragment("back-target"),
+        );
+        settle_changed_history_push(
+            &mut frame_task,
+            RouteLocation::new("/").with_fragment("back-source"),
+        );
+        assert_back_target_receiver_fixture(frame_task, ExpectedBackTargetResumeAction::FrameTask);
+
+        let mut commit = confirmed_engine();
+        let duplicate = RouteLocation::new("/");
+        settle_push(&mut commit, duplicate.clone());
+        settle_push(&mut commit, duplicate);
+        assert_back_target_receiver_fixture(commit, ExpectedBackTargetResumeAction::Commit);
+
+        assert_back_target_receiver_fixture(
+            nested_mount_back_fixture(),
+            ExpectedBackTargetResumeAction::MountRequest,
+        );
+
+        let mut exhausted = nested_mount_back_fixture();
+        let owner = take_verified_back_target(&mut exhausted);
+        let owner = assert_back_target_wrong_receiver_calls_zero(owner);
+        exhausted.inner.testing_exhaust_mount_sequence_counter();
+        let callback_calls = std::cell::Cell::new(0);
+        let outcome = exhausted.resume_back_target_with_retirement(owner, || {
+            callback_calls.set(callback_calls.get() + 1);
+        });
+        assert_eq!(callback_calls.get(), 1);
+        assert!(matches!(
+            outcome,
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::FailureCleanup(_))
+        ));
+
+        let mut permanent = confirmed_engine();
+        settle_push(
+            &mut permanent,
+            RouteLocation::new("/").with_fragment("permanent-target"),
+        );
+        settle_changed_history_push(
+            &mut permanent,
+            RouteLocation::new("/").with_fragment("permanent-source"),
+        );
+        let owner = take_verified_back_target(&mut permanent);
+        let owner = assert_back_target_wrong_receiver_calls_zero(owner);
+        settle_changed_history_push(
+            &mut permanent,
+            RouteLocation::new("/").with_fragment("post-resolution-source-drift"),
+        );
+        let before = permanent.inner.testing_snapshot();
+        let callback_calls = std::cell::Cell::new(0);
+        let outcome = permanent.resume_back_target_with_retirement(owner, || {
+            callback_calls.set(callback_calls.get() + 1);
+        });
+        assert_eq!(callback_calls.get(), 1);
+        assert!(matches!(outcome, BackTargetCoreResumeOutcome::Permanent(_)));
+        assert_eq!(
+            permanent.inner.testing_snapshot(),
+            before,
+            "source drift must be classified before matcher/reconciliation writes"
+        );
+        assert!(
+            permanent.action().is_none(),
+            "typed permanent source drift must not install current work or an action"
+        );
+    }
+
+    #[test]
+    fn back_target_execution_pairing_mismatch_freezes_expected_task_and_observed_current() {
+        let (mut exact, history, continuation, task) = take_back_target_driver_frame_task();
+        let task_identity = task.inner.identity().clone();
+        assert!(
+            exact.testing_drift_current_frame_task_identity(),
+            "the fixture must drift the real current frame-task receiver"
+        );
+        let before = exact.inner.testing_snapshot();
+
+        let mismatch = match exact.validate_back_target_execution_pairing(
+            BackTargetExecutionOwnerRef::Driving {
+                history: &history,
+                continuation: &continuation,
+            },
+            BackTargetPhysicalOwnerRef::FrameTask(&task),
+        ) {
+            BackTargetExecutionPairingOutcome::Mismatch(mismatch) => mismatch,
+            BackTargetExecutionPairingOutcome::Matched => {
+                panic!("the drifted current receiver must not match the exact task")
+            }
+        };
+
+        assert_eq!(
+            exact.inner.testing_snapshot(),
+            before,
+            "execution pairing mismatch must be a semantic zero-write"
+        );
+        match mismatch.inner {
+            CorePreparationReceiverMismatchProjection::Execution { expected, observed } => {
+                assert_eq!(
+                    expected.physical,
+                    crate::engine::CoreBackTargetReceiverActionProjection::FrameTask(
+                        task_identity.clone()
+                    )
+                );
+                assert_ne!(
+                    Some(&task_identity),
+                    observed.current.as_ref(),
+                    "the projection must retain the distinct expected task and observed current"
+                );
+            }
+            CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::Continuation { .. }
+            | CorePreparationReceiverMismatchProjection::Applied { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFallback { .. }
+            | CorePreparationReceiverMismatchProjection::DriverTerminal { .. } => {
+                panic!("target execution mismatch must use its tagged expected/observed projection")
+            }
+        }
+    }
+
+    #[test]
+    fn back_target_ready_wrong_receiver_freezes_actual_receiver_state() {
+        let (_exact, _history, capacity, _task) = take_back_target_driver_frame_task();
+        let expected_scope = capacity.inner.scope.clone();
+        let boundary = capacity.preparation_boundary_scope();
+        let mut foreign = confirmed_engine();
+        let before = foreign.inner.testing_snapshot();
+
+        let (capacity, mismatch) = match foreign.accept_back_target_ready(capacity, boundary) {
+            BackTargetPreparationAcceptance::Mismatch { capacity, mismatch } => {
+                (capacity, mismatch)
+            }
+            BackTargetPreparationAcceptance::Matched(_) => {
+                panic!("a foreign continuation receiver must not accept the exact capacity")
+            }
+        };
+        assert_eq!(
+            foreign.inner.testing_snapshot(),
+            before,
+            "wrong-receiver classification must be a semantic zero-write"
+        );
+        assert_eq!(capacity.inner.scope, expected_scope);
+
+        match mismatch.inner {
+            CorePreparationReceiverMismatchProjection::Continuation { expected, observed } => {
+                assert_eq!(&expected.scope, &expected_scope);
+                assert!(expected.commit.is_none());
+                assert!(
+                    !expected.scope.matches_engine_scope(
+                        observed.scope.world,
+                        observed.scope.router,
+                        observed.scope.history,
+                    ),
+                    "the observed engine scope must be the actual foreign receiver"
+                );
+                assert!(observed.history.is_none());
+                assert!(observed.current.is_none());
+                assert_eq!(
+                    observed.action,
+                    crate::engine::CoreBackTargetReceiverActionProjection::Missing
+                );
+                assert_eq!(
+                    observed.stage,
+                    crate::engine::CoreBackTargetReceiverStageProjection::Missing
+                );
+            }
+            CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::Execution { .. }
+            | CorePreparationReceiverMismatchProjection::Applied { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFallback { .. }
+            | CorePreparationReceiverMismatchProjection::DriverTerminal { .. } => {
+                panic!("wrong receiver must return its typed continuation observation")
+            }
+        }
+    }
+
+    #[test]
+    fn back_target_commit_preparation_drift_freezes_actual_receiver_state() {
+        let (mut engine, history, capacity, task) = take_back_target_driver_frame_task();
+        let (capacity, ticket) = match engine.report_back_target_applied(
+            &history,
+            capacity,
+            task,
+            BackTargetAppliedReport::LegacyLeaf,
+        ) {
+            BackTargetAppliedReportOutcome::Commit { capacity, ticket } => (capacity, ticket),
+            BackTargetAppliedReportOutcome::MountRequest { .. }
+            | BackTargetAppliedReportOutcome::FailureCleanup(_)
+            | BackTargetAppliedReportOutcome::Mismatch { .. } => {
+                panic!("the exact leaf report must advance to one commit ticket")
+            }
+        };
+        let boundary = capacity.preparation_boundary_scope();
+        let owner = match engine.accept_back_target_ready(capacity, boundary) {
+            BackTargetPreparationAcceptance::Matched(owner) => owner,
+            BackTargetPreparationAcceptance::Mismatch { .. } => {
+                panic!("the unchanged commit receiver must accept its continuation capacity")
+            }
+        };
+        let expected_scope = owner.inner.binding.scope.clone();
+        let expected_current = ticket.inner.identity().clone();
+        engine.testing_invalidate_commit_action();
+        let before = engine.inner.testing_snapshot();
+
+        let (owner, manifest, mismatch) =
+            match engine.prepare_back_target_commit(owner, &ticket, CleanupManifest::empty()) {
+                BackTargetCommitPreparationOutcome::Mismatch {
+                    owner,
+                    manifest,
+                    mismatch,
+                } => (owner, manifest, mismatch),
+                BackTargetCommitPreparationOutcome::Validated(_)
+                | BackTargetCommitPreparationOutcome::PreparationFailed(_) => {
+                    panic!("the drifted commit receiver must retain the whole preparation input")
+                }
+            };
+        assert_eq!(
+            engine.inner.testing_snapshot(),
+            before,
+            "commit receiver drift must be classified before preparation writes"
+        );
+        assert_eq!(owner.inner.binding.scope, expected_scope);
+        assert!(manifest.logical_roots.is_empty());
+        assert_eq!(manifest.manifest_digest, 0);
+        assert_eq!(manifest.obligation_count, 0);
+
+        match mismatch.inner {
+            CorePreparationReceiverMismatchProjection::Continuation { expected, observed } => {
+                assert_eq!(&expected.scope, &expected_scope);
+                assert_eq!(expected.commit.as_ref(), Some(&expected_current));
+                assert!(expected.scope.matches_engine_scope(
+                    observed.scope.world,
+                    observed.scope.router,
+                    observed.scope.history,
+                ));
+                assert_eq!(observed.history.as_ref(), Some(&history.inner));
+                assert!(
+                    expected
+                        .scope
+                        .matches_execution(observed.history.as_ref().unwrap())
+                );
+                assert_eq!(observed.current.as_ref(), Some(&expected_current));
+                assert_eq!(
+                    observed.action,
+                    crate::engine::CoreBackTargetReceiverActionProjection::Missing
+                );
+                assert_eq!(
+                    observed.stage,
+                    crate::engine::CoreBackTargetReceiverStageProjection::Applying
+                );
+            }
+            CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::Execution { .. }
+            | CorePreparationReceiverMismatchProjection::Applied { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFallback { .. }
+            | CorePreparationReceiverMismatchProjection::DriverTerminal { .. } => {
+                panic!("commit receiver drift must return typed continuation evidence")
+            }
+        }
+    }
+
+    #[test]
+    fn back_target_commit_preparation_ambient_action_drift_is_typed_and_zero_write() {
+        let (mut engine, history, capacity, task) = take_back_target_driver_frame_task();
+        let ambient_identity = task.inner.identity().clone();
+        let ambient_action = CoreEngineAction::FrameTask(task.inner.testing_duplicate());
+        let (capacity, ticket) = match engine.report_back_target_applied(
+            &history,
+            capacity,
+            task,
+            BackTargetAppliedReport::LegacyLeaf,
+        ) {
+            BackTargetAppliedReportOutcome::Commit { capacity, ticket } => (capacity, ticket),
+            BackTargetAppliedReportOutcome::MountRequest { .. }
+            | BackTargetAppliedReportOutcome::FailureCleanup(_)
+            | BackTargetAppliedReportOutcome::Mismatch { .. } => {
+                panic!("the exact leaf report must advance to one commit ticket")
+            }
+        };
+        let logical_roots = engine
+            .reconciliation_projection_for_commit(&ticket)
+            .unwrap()
+            .leaving()
+            .map(|leaving| leaving.version().clone())
+            .collect::<Vec<_>>();
+        let obligation_count = logical_roots.len();
+        let manifest = CleanupManifest::new(logical_roots, 0x414d_4249_454e_54, obligation_count);
+        let boundary = capacity.preparation_boundary_scope();
+        let owner = match engine.accept_back_target_ready(capacity, boundary) {
+            BackTargetPreparationAcceptance::Matched(owner) => owner,
+            BackTargetPreparationAcceptance::Mismatch { .. } => {
+                panic!("the unchanged commit receiver must accept its continuation capacity")
+            }
+        };
+        let expected_scope = owner.inner.binding.scope.clone();
+        let expected_commit = ticket.inner.identity().clone();
+        engine.inner.restore_action(ambient_action);
+        let before = engine.inner.testing_snapshot();
+
+        let (owner, manifest, mismatch) =
+            match engine.prepare_back_target_commit(owner, &ticket, manifest) {
+                BackTargetCommitPreparationOutcome::Mismatch {
+                    owner,
+                    manifest,
+                    mismatch,
+                } => (owner, manifest, mismatch),
+                BackTargetCommitPreparationOutcome::Validated(_)
+                | BackTargetCommitPreparationOutcome::PreparationFailed(_) => {
+                    panic!("ambient action drift must be rejected by the continuation receiver")
+                }
+            };
+        assert_eq!(
+            engine.inner.testing_snapshot(),
+            before,
+            "ambient action drift must be a semantic zero-write"
+        );
+        assert_eq!(owner.inner.binding.scope, expected_scope);
+        assert_eq!(manifest.obligation_count, obligation_count);
+        match mismatch.inner {
+            CorePreparationReceiverMismatchProjection::Continuation { expected, observed } => {
+                assert_eq!(&expected.scope, &expected_scope);
+                assert_eq!(expected.commit.as_ref(), Some(&expected_commit));
+                assert!(expected.scope.matches_engine_scope(
+                    observed.scope.world,
+                    observed.scope.router,
+                    observed.scope.history,
+                ));
+                assert_eq!(observed.history.as_ref(), Some(&history.inner));
+                assert_eq!(observed.current.as_ref(), Some(&expected_commit));
+                assert_eq!(
+                    observed.action,
+                    crate::engine::CoreBackTargetReceiverActionProjection::FrameTask(
+                        ambient_identity
+                    )
+                );
+                assert_eq!(
+                    observed.stage,
+                    crate::engine::CoreBackTargetReceiverStageProjection::ReadyToCommit
+                );
+            }
+            CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::Execution { .. }
+            | CorePreparationReceiverMismatchProjection::Applied { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFallback { .. }
+            | CorePreparationReceiverMismatchProjection::DriverTerminal { .. } => {
+                panic!("ambient action drift must return typed continuation evidence")
+            }
+        }
+    }
+
+    #[test]
+    fn back_target_applied_same_engine_task_drift_is_zero_write_and_returns_whole_input() {
+        let (mut engine, history, capacity, task) = take_back_target_driver_frame_task();
+        let expected_scope = capacity.inner.scope.clone();
+        let expected_task = task.inner.identity().clone();
+        assert!(
+            engine.testing_drift_current_frame_task_identity(),
+            "the fixture must drift only the real current frame-task receiver"
+        );
+        let before = engine.inner.testing_snapshot();
+
+        let outcome = engine.report_back_target_applied(
+            &history,
+            capacity,
+            task,
+            BackTargetAppliedReport::LegacyLeaf,
+        );
+        assert_eq!(
+            engine.inner.testing_snapshot(),
+            before,
+            "same-engine task drift must be rejected before applied-report mutation"
+        );
+
+        let (capacity, task, report, mismatch) = match outcome {
+            BackTargetAppliedReportOutcome::Mismatch {
+                capacity,
+                task,
+                report,
+                mismatch,
+            } => (capacity, task, report, mismatch),
+            BackTargetAppliedReportOutcome::MountRequest { .. }
+            | BackTargetAppliedReportOutcome::Commit { .. }
+            | BackTargetAppliedReportOutcome::FailureCleanup(_) => {
+                panic!("same-engine task drift must return the whole atomic applied input")
+            }
+        };
+        assert_eq!(capacity.inner.scope, expected_scope);
+        assert_eq!(task.inner.identity(), &expected_task);
+        assert!(matches!(report, BackTargetAppliedReport::LegacyLeaf));
+        assert!(matches!(
+            mismatch.inner,
+            CorePreparationReceiverMismatchProjection::Execution { .. }
+        ));
+    }
+
+    #[test]
+    fn back_target_applied_rejects_same_engine_ambient_action_collision_before_mutation() {
+        let (mut engine, history, capacity, task) = take_back_target_driver_frame_task();
+        let expected_scope = capacity.inner.scope.clone();
+        let expected_task = task.inner.identity().clone();
+        engine
+            .inner
+            .restore_action(CoreEngineAction::FrameTask(task.inner.testing_duplicate()));
+        let before = engine.inner.testing_snapshot();
+
+        let outcome = engine.report_back_target_applied(
+            &history,
+            capacity,
+            task,
+            BackTargetAppliedReport::LegacyLeaf,
+        );
+        assert_eq!(
+            engine.inner.testing_snapshot(),
+            before,
+            "an occupied ambient action slot must be rejected before report mutation or action loss"
+        );
+
+        let (capacity, task, report, mismatch) = match outcome {
+            BackTargetAppliedReportOutcome::Mismatch {
+                capacity,
+                task,
+                report,
+                mismatch,
+            } => (capacity, task, report, mismatch),
+            BackTargetAppliedReportOutcome::MountRequest { .. }
+            | BackTargetAppliedReportOutcome::Commit { .. }
+            | BackTargetAppliedReportOutcome::FailureCleanup(_) => {
+                panic!("an occupied ambient action slot must return the whole applied input")
+            }
+        };
+        assert_eq!(capacity.inner.scope, expected_scope);
+        assert_eq!(task.inner.identity(), &expected_task);
+        assert!(matches!(report, BackTargetAppliedReport::LegacyLeaf));
+        assert!(matches!(
+            mismatch.inner,
+            CorePreparationReceiverMismatchProjection::Execution { .. }
+        ));
+    }
+
+    #[test]
+    fn back_target_applied_invalid_nested_legacy_report_returns_tagged_evidence_and_whole_input() {
+        let (mut engine, history, capacity, task) = take_back_target_nested_parent_frame_task();
+        let expected_scope = capacity.inner.scope.clone();
+        let expected_task = task.inner.identity().clone();
+        let expected_child_outlet = engine
+            .expected_child_outlet(&task)
+            .expect("the exact task must remain a live report receiver")
+            .expect("the nested parent must require one child outlet");
+        let before = engine.inner.testing_snapshot();
+
+        let outcome = engine.report_back_target_applied(
+            &history,
+            capacity,
+            task,
+            BackTargetAppliedReport::LegacyLeaf,
+        );
+        assert_eq!(
+            engine.inner.testing_snapshot(),
+            before,
+            "invalid LegacyLeaf input must be rejected before applied-report mutation"
+        );
+
+        let (capacity, task, report, mismatch) = match outcome {
+            BackTargetAppliedReportOutcome::Mismatch {
+                capacity,
+                task,
+                report,
+                mismatch,
+            } => (capacity, task, report, mismatch),
+            BackTargetAppliedReportOutcome::MountRequest { .. }
+            | BackTargetAppliedReportOutcome::Commit { .. }
+            | BackTargetAppliedReportOutcome::FailureCleanup(_) => {
+                panic!("invalid LegacyLeaf input must return the whole atomic applied input")
+            }
+        };
+        assert_eq!(capacity.inner.scope, expected_scope);
+        assert_eq!(task.inner.identity(), &expected_task);
+        assert!(matches!(report, BackTargetAppliedReport::LegacyLeaf));
+        match mismatch.inner {
+            CorePreparationReceiverMismatchProjection::Applied { expected, observed } => {
+                assert_eq!(
+                    expected.report,
+                    crate::engine::CoreBackTargetAppliedReportProjection::LegacyLeaf
+                );
+                assert_eq!(observed.next_outlet, Some(expected_child_outlet));
+            }
+            CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::Continuation { .. }
+            | CorePreparationReceiverMismatchProjection::Execution { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFallback { .. }
+            | CorePreparationReceiverMismatchProjection::DriverTerminal { .. } => {
+                panic!("invalid applied input must use its tagged expected/observed projection")
+            }
+        }
+    }
+
+    #[test]
+    fn back_target_driver_report_wrong_receiver_is_zero_write_and_returns_exact_inputs() {
+        let (mut exact, history, continuation, task) = take_back_target_driver_frame_task();
+        let task_identity = task.inner.identity().clone();
+        let mut foreign = confirmed_engine();
+        let foreign_before = foreign.inner.testing_snapshot();
+
+        let (continuation, task, mismatch) = match foreign.report_back_target_failed(
+            &history,
+            continuation,
+            task,
+            ViewFailureKind::Build,
+            "wrong report receiver must return the exact inputs",
+            BackTargetDriverFailureReportMode::Normal,
+        ) {
+            BackTargetDriverFailureReportOutcome::Mismatch {
+                capacity,
+                task,
+                mismatch,
+            } => (capacity, task, mismatch),
+            BackTargetDriverFailureReportOutcome::Reported(_) => {
+                panic!("a foreign report receiver must not consume the exact inputs")
+            }
+        };
+        assert_eq!(
+            foreign.inner.testing_snapshot(),
+            foreign_before,
+            "the foreign report receiver must be a semantic zero-write"
+        );
+        match mismatch.inner {
+            CorePreparationReceiverMismatchProjection::Execution { expected, observed } => {
+                assert_eq!(
+                    expected.physical,
+                    crate::engine::CoreBackTargetReceiverActionProjection::FrameTask(task_identity)
+                );
+                assert!(
+                    observed.current.is_none(),
+                    "the foreign receiver must freeze its absent current task"
+                );
+            }
+            CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::Continuation { .. }
+            | CorePreparationReceiverMismatchProjection::Applied { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFallback { .. }
+            | CorePreparationReceiverMismatchProjection::DriverTerminal { .. } => {
+                panic!("target report mismatch must retain execution receiver facts")
+            }
+        }
+
+        let outcome = match exact.report_back_target_failed(
+            &history,
+            continuation,
+            task,
+            ViewFailureKind::Build,
+            "returned report inputs must remain exact",
+            BackTargetDriverFailureReportMode::Normal,
+        ) {
+            BackTargetDriverFailureReportOutcome::Reported(outcome) => outcome,
+            BackTargetDriverFailureReportOutcome::Mismatch { .. } => {
+                panic!(
+                    "the returned capacity and task must remain exact for their original receiver"
+                )
+            }
+        };
+        assert!(matches!(
+            &outcome,
+            BackTargetDriverFailureCoreOutcome::Fallback(_)
+        ));
+        let exact_before_consume = exact.inner.testing_snapshot();
+        assert!(matches!(
+            exact.consume_back_target_driver_failure(outcome),
+            BackTargetDriverFailureConsumeOutcome::FallbackReleased
+        ));
+        assert_eq!(
+            exact.inner.testing_snapshot(),
+            exact_before_consume,
+            "exact consumption must leave the installed fallback action engine-held"
+        );
+    }
+
+    #[test]
+    fn back_target_driver_consume_wrong_receiver_is_zero_write_and_returns_whole_owner() {
+        let (mut exact, history, continuation, task) = take_back_target_driver_frame_task();
+        let outcome = match exact.report_back_target_failed(
+            &history,
+            continuation,
+            task,
+            ViewFailureKind::Apply,
+            "exact report must create one whole fallback owner",
+            BackTargetDriverFailureReportMode::Normal,
+        ) {
+            BackTargetDriverFailureReportOutcome::Reported(outcome) => outcome,
+            BackTargetDriverFailureReportOutcome::Mismatch { .. } => {
+                panic!("the exact report receiver must match")
+            }
+        };
+        assert!(matches!(
+            &outcome,
+            BackTargetDriverFailureCoreOutcome::Fallback(_)
+        ));
+
+        let mut foreign = confirmed_engine();
+        let foreign_before = foreign.inner.testing_snapshot();
+        let outcome = match foreign.consume_back_target_driver_failure(outcome) {
+            BackTargetDriverFailureConsumeOutcome::Mismatch { owner, mismatch: _ } => owner,
+            BackTargetDriverFailureConsumeOutcome::FailureCleanup(_)
+            | BackTargetDriverFailureConsumeOutcome::FallbackReleased
+            | BackTargetDriverFailureConsumeOutcome::Terminal(_) => {
+                panic!("a foreign consumer must return the whole Core owner")
+            }
+        };
+        assert_eq!(
+            foreign.inner.testing_snapshot(),
+            foreign_before,
+            "the foreign consumer must be a semantic zero-write"
+        );
+        assert!(matches!(
+            &outcome,
+            BackTargetDriverFailureCoreOutcome::Fallback(_)
+        ));
+
+        let exact_before_consume = exact.inner.testing_snapshot();
+        assert!(matches!(
+            exact.consume_back_target_driver_failure(outcome),
+            BackTargetDriverFailureConsumeOutcome::FallbackReleased
+        ));
+        assert_eq!(
+            exact.inner.testing_snapshot(),
+            exact_before_consume,
+            "the returned whole owner must remain consumable without taking the fallback action"
+        );
+    }
+
+    #[test]
+    fn back_target_driver_consume_wrong_receiver_uses_tagged_expected_observed_projection() {
+        let (mut exact, history, continuation, task) = take_back_target_driver_frame_task();
+        let outcome = match exact.report_back_target_failed(
+            &history,
+            continuation,
+            task,
+            ViewFailureKind::Apply,
+            "exact report must create one whole fallback owner",
+            BackTargetDriverFailureReportMode::Normal,
+        ) {
+            BackTargetDriverFailureReportOutcome::Reported(outcome) => outcome,
+            BackTargetDriverFailureReportOutcome::Mismatch { .. } => {
+                panic!("the exact report receiver must match")
+            }
+        };
+        assert!(matches!(
+            &outcome,
+            BackTargetDriverFailureCoreOutcome::Fallback(_)
+        ));
+
+        let mut foreign = confirmed_engine();
+        let before = foreign.inner.testing_snapshot();
+        let (outcome, mismatch) = match foreign.consume_back_target_driver_failure(outcome) {
+            BackTargetDriverFailureConsumeOutcome::Mismatch { owner, mismatch } => {
+                (owner, mismatch)
+            }
+            BackTargetDriverFailureConsumeOutcome::FailureCleanup(_)
+            | BackTargetDriverFailureConsumeOutcome::FallbackReleased
+            | BackTargetDriverFailureConsumeOutcome::Terminal(_) => {
+                panic!("a foreign consumer must return the whole fallback owner")
+            }
+        };
+        assert_eq!(
+            foreign.inner.testing_snapshot(),
+            before,
+            "fallback receiver mismatch must be a semantic zero-write"
+        );
+        match mismatch.inner {
+            CorePreparationReceiverMismatchProjection::DriverFallback { expected, observed } => {
+                assert_ne!(
+                    expected.action, observed.action,
+                    "the mismatch must retain expected and observed action facts"
+                );
+            }
+            CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::Continuation { .. }
+            | CorePreparationReceiverMismatchProjection::Execution { .. }
+            | CorePreparationReceiverMismatchProjection::Applied { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
+            | CorePreparationReceiverMismatchProjection::DriverTerminal { .. } => {
+                panic!("fallback mismatch must use its tagged expected/observed projection")
+            }
+        }
+
+        let exact_before_consume = exact.inner.testing_snapshot();
+        assert!(matches!(
+            exact.consume_back_target_driver_failure(outcome),
+            BackTargetDriverFailureConsumeOutcome::FallbackReleased
+        ));
+        assert_eq!(
+            exact.inner.testing_snapshot(),
+            exact_before_consume,
+            "the returned whole fallback owner must remain exact"
+        );
+    }
+
+    #[test]
+    fn back_target_driver_cleanup_wrong_receiver_uses_tagged_expected_observed_projection() {
+        let (mut exact, history, continuation, task) = take_back_target_driver_frame_task();
+        let outcome = match exact.report_back_target_failed(
+            &history,
+            continuation,
+            task,
+            ViewFailureKind::Apply,
+            "physical residual must create one whole cleanup owner",
+            BackTargetDriverFailureReportMode::PhysicalResidual,
+        ) {
+            BackTargetDriverFailureReportOutcome::Reported(outcome) => outcome,
+            BackTargetDriverFailureReportOutcome::Mismatch { .. } => {
+                panic!("the exact report receiver must match")
+            }
+        };
+        assert!(matches!(
+            &outcome,
+            BackTargetDriverFailureCoreOutcome::FailureCleanup(_)
+        ));
+
+        let mut foreign = confirmed_engine();
+        let before = foreign.inner.testing_snapshot();
+        let (outcome, mismatch) = match foreign.consume_back_target_driver_failure(outcome) {
+            BackTargetDriverFailureConsumeOutcome::Mismatch { owner, mismatch } => {
+                (owner, mismatch)
+            }
+            BackTargetDriverFailureConsumeOutcome::FailureCleanup(_)
+            | BackTargetDriverFailureConsumeOutcome::FallbackReleased
+            | BackTargetDriverFailureConsumeOutcome::Terminal(_) => {
+                panic!("a foreign consumer must return the whole cleanup owner")
+            }
+        };
+        assert_eq!(
+            foreign.inner.testing_snapshot(),
+            before,
+            "cleanup receiver mismatch must be a semantic zero-write"
+        );
+        match mismatch.inner {
+            CorePreparationReceiverMismatchProjection::DriverFailureCleanup {
+                expected,
+                observed,
+            } => {
+                assert_ne!(
+                    observed.stage,
+                    crate::engine::CoreBackTargetReceiverStageProjection::FailureCleanupManifestPending(
+                        expected.request
+                    ),
+                    "the mismatch must retain the expected request and observed cleanup stage"
+                );
+            }
+            CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::Continuation { .. }
+            | CorePreparationReceiverMismatchProjection::Execution { .. }
+            | CorePreparationReceiverMismatchProjection::Applied { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFallback { .. }
+            | CorePreparationReceiverMismatchProjection::DriverTerminal { .. } => {
+                panic!("cleanup mismatch must use its tagged expected/observed projection")
+            }
+        }
+
+        let exact_before_consume = exact.inner.testing_snapshot();
+        assert!(matches!(
+            exact.consume_back_target_driver_failure(outcome),
+            BackTargetDriverFailureConsumeOutcome::FailureCleanup(_)
+        ));
+        assert_eq!(
+            exact.inner.testing_snapshot(),
+            exact_before_consume,
+            "the returned whole cleanup owner must remain exact"
+        );
+    }
+
+    #[test]
+    fn back_target_driver_terminal_wrong_receiver_uses_tagged_expected_observed_projection() {
+        let (mut exact, history, continuation, task) = take_back_target_driver_frame_task();
+        exact.testing_exhaust_reservation_counter(TestingReservationCounter::Transaction);
+        let outcome = match exact.report_back_target_failed(
+            &history,
+            continuation,
+            task,
+            ViewFailureKind::Build,
+            "fallback reservation exhaustion must create one terminal owner",
+            BackTargetDriverFailureReportMode::Normal,
+        ) {
+            BackTargetDriverFailureReportOutcome::Reported(outcome) => outcome,
+            BackTargetDriverFailureReportOutcome::Mismatch { .. } => {
+                panic!("the exact report receiver must match")
+            }
+        };
+        assert!(matches!(
+            &outcome,
+            BackTargetDriverFailureCoreOutcome::Terminal(_)
+        ));
+
+        let mut foreign = confirmed_engine();
+        let before = foreign.inner.testing_snapshot();
+        let (outcome, mismatch) = match foreign.consume_back_target_driver_failure(outcome) {
+            BackTargetDriverFailureConsumeOutcome::Mismatch { owner, mismatch } => {
+                (owner, mismatch)
+            }
+            BackTargetDriverFailureConsumeOutcome::FailureCleanup(_)
+            | BackTargetDriverFailureConsumeOutcome::FallbackReleased
+            | BackTargetDriverFailureConsumeOutcome::Terminal(_) => {
+                panic!("a foreign consumer must return the whole terminal owner")
+            }
+        };
+        assert_eq!(
+            foreign.inner.testing_snapshot(),
+            before,
+            "terminal receiver mismatch must be a semantic zero-write"
+        );
+        match mismatch.inner {
+            CorePreparationReceiverMismatchProjection::DriverTerminal { expected, observed } => {
+                assert!(matches!(
+                    expected.status,
+                    crate::engine::CoreBackTargetDriverTerminalExpectedStatus::Failed
+                ));
+                assert!(matches!(
+                    observed.request,
+                    crate::engine::CoreBackTargetDriverTerminalObservedRequestProjection::Unknown {
+                        request,
+                        ..
+                    } if request == expected.request
+                ));
+            }
+            CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::Continuation { .. }
+            | CorePreparationReceiverMismatchProjection::Execution { .. }
+            | CorePreparationReceiverMismatchProjection::Applied { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFallback { .. } => {
+                panic!("terminal mismatch must use its tagged expected/observed projection")
+            }
+        }
+
+        let exact_before_consume = exact.inner.testing_snapshot();
+        assert!(matches!(
+            exact.consume_back_target_driver_failure(outcome),
+            BackTargetDriverFailureConsumeOutcome::Terminal(_)
+        ));
+        assert_eq!(
+            exact.inner.testing_snapshot(),
+            exact_before_consume,
+            "the returned whole terminal owner must remain exact"
+        );
+    }
+
+    #[test]
+    fn back_target_fallback_consume_rejects_same_engine_original_failure_drift() {
+        let (mut engine, history, continuation, task) = take_back_target_driver_frame_task();
+        let outcome = match engine.report_back_target_failed(
+            &history,
+            continuation,
+            task,
+            ViewFailureKind::Apply,
+            "exact report must create one fallback attempt",
+            BackTargetDriverFailureReportMode::Normal,
+        ) {
+            BackTargetDriverFailureReportOutcome::Reported(outcome) => outcome,
+            BackTargetDriverFailureReportOutcome::Mismatch { .. } => {
+                panic!("the exact report receiver must match")
+            }
+        };
+        assert!(matches!(
+            &outcome,
+            BackTargetDriverFailureCoreOutcome::Fallback(_)
+        ));
+        assert!(
+            engine.inner.testing_drift_current_fallback_failure(),
+            "the seam must change only the current fallback attempt's original failure"
+        );
+        let before = engine.inner.testing_snapshot();
+
+        let (outcome, mismatch) = match engine.consume_back_target_driver_failure(outcome) {
+            BackTargetDriverFailureConsumeOutcome::Mismatch { owner, mismatch } => {
+                (owner, mismatch)
+            }
+            BackTargetDriverFailureConsumeOutcome::FailureCleanup(_)
+            | BackTargetDriverFailureConsumeOutcome::FallbackReleased
+            | BackTargetDriverFailureConsumeOutcome::Terminal(_) => {
+                panic!(
+                    "a same-engine fallback whose original failure drifted must retain the whole owner"
+                )
+            }
+        };
+        assert_eq!(
+            engine.inner.testing_snapshot(),
+            before,
+            "fallback attempt mismatch must be a semantic zero-write"
+        );
+        assert!(matches!(
+            &outcome,
+            BackTargetDriverFailureCoreOutcome::Fallback(_)
+        ));
+        match mismatch.inner {
+            CorePreparationReceiverMismatchProjection::DriverFallback { expected, observed } => {
+                assert_eq!(
+                    expected.action, observed.action,
+                    "the action identity is deliberately unchanged"
+                );
+                assert_ne!(
+                    expected.attempt, observed.attempt,
+                    "the evidence must retain the changed fallback attempt fact"
+                );
+                assert_eq!(
+                    observed.stage,
+                    crate::engine::CoreBackTargetReceiverStageProjection::Applying
+                );
+            }
+            CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::Continuation { .. }
+            | CorePreparationReceiverMismatchProjection::Execution { .. }
+            | CorePreparationReceiverMismatchProjection::Applied { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
+            | CorePreparationReceiverMismatchProjection::DriverTerminal { .. } => {
+                panic!("fallback attempt drift must use its tagged projection")
+            }
+        }
+    }
+
+    #[test]
+    fn back_target_cleanup_consume_freezes_same_engine_pending_request_drift() {
+        let (mut engine, history, continuation, task) = take_back_target_driver_frame_task();
+        let outcome = match engine.report_back_target_failed(
+            &history,
+            continuation,
+            task,
+            ViewFailureKind::Apply,
+            "physical residual must create one cleanup request",
+            BackTargetDriverFailureReportMode::PhysicalResidual,
+        ) {
+            BackTargetDriverFailureReportOutcome::Reported(outcome) => outcome,
+            BackTargetDriverFailureReportOutcome::Mismatch { .. } => {
+                panic!("the exact report receiver must match")
+            }
+        };
+        assert!(matches!(
+            &outcome,
+            BackTargetDriverFailureCoreOutcome::FailureCleanup(_)
+        ));
+        assert!(
+            engine
+                .inner
+                .testing_drift_failure_cleanup_manifest_request(),
+            "the seam must change only the pending cleanup stage's expected request"
+        );
+        let before = engine.inner.testing_snapshot();
+
+        let (outcome, mismatch) = match engine.consume_back_target_driver_failure(outcome) {
+            BackTargetDriverFailureConsumeOutcome::Mismatch { owner, mismatch } => {
+                (owner, mismatch)
+            }
+            BackTargetDriverFailureConsumeOutcome::FailureCleanup(_)
+            | BackTargetDriverFailureConsumeOutcome::FallbackReleased
+            | BackTargetDriverFailureConsumeOutcome::Terminal(_) => {
+                panic!("a drifted pending cleanup request must retain the whole owner")
+            }
+        };
+        assert_eq!(
+            engine.inner.testing_snapshot(),
+            before,
+            "cleanup request mismatch must be a semantic zero-write"
+        );
+        assert!(matches!(
+            &outcome,
+            BackTargetDriverFailureCoreOutcome::FailureCleanup(_)
+        ));
+        match mismatch.inner {
+            CorePreparationReceiverMismatchProjection::DriverFailureCleanup {
+                expected,
+                observed,
+            } => {
+                assert_ne!(
+                    observed.stage,
+                    crate::engine::CoreBackTargetReceiverStageProjection::FailureCleanupManifestPending(
+                        expected.request
+                    ),
+                    "the evidence must distinguish the owner request from the observed pending request"
+                );
+            }
+            CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::Continuation { .. }
+            | CorePreparationReceiverMismatchProjection::Execution { .. }
+            | CorePreparationReceiverMismatchProjection::Applied { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFallback { .. }
+            | CorePreparationReceiverMismatchProjection::DriverTerminal { .. } => {
+                panic!("cleanup request drift must use its tagged projection")
+            }
+        }
+    }
+
+    #[test]
+    fn back_target_terminal_consume_freezes_same_engine_retained_status_drift() {
+        let (mut engine, history, continuation, task) = take_back_target_driver_frame_task();
+        engine.testing_exhaust_reservation_counter(TestingReservationCounter::Transaction);
+        let outcome = match engine.report_back_target_failed(
+            &history,
+            continuation,
+            task,
+            ViewFailureKind::Build,
+            "fallback reservation exhaustion must create one terminal owner",
+            BackTargetDriverFailureReportMode::Normal,
+        ) {
+            BackTargetDriverFailureReportOutcome::Reported(outcome) => outcome,
+            BackTargetDriverFailureReportOutcome::Mismatch { .. } => {
+                panic!("the exact report receiver must match")
+            }
+        };
+        let request = match &outcome {
+            BackTargetDriverFailureCoreOutcome::Terminal(owner) => owner.inner.request,
+            BackTargetDriverFailureCoreOutcome::FailureCleanup(_)
+            | BackTargetDriverFailureCoreOutcome::Fallback(_) => {
+                panic!("the exhausted fallback reservation must produce Terminal")
+            }
+        };
+        assert!(
+            engine
+                .inner
+                .testing_drift_retained_terminal_request_status(request),
+            "the seam must keep the terminal record retained and change only its observed status"
+        );
+        let before = engine.inner.testing_snapshot();
+
+        let (outcome, mismatch) = match engine.consume_back_target_driver_failure(outcome) {
+            BackTargetDriverFailureConsumeOutcome::Mismatch { owner, mismatch } => {
+                (owner, mismatch)
+            }
+            BackTargetDriverFailureConsumeOutcome::FailureCleanup(_)
+            | BackTargetDriverFailureConsumeOutcome::FallbackReleased
+            | BackTargetDriverFailureConsumeOutcome::Terminal(_) => {
+                panic!("a retained terminal record with status drift must return the whole owner")
+            }
+        };
+        assert_eq!(
+            engine.inner.testing_snapshot(),
+            before,
+            "terminal status mismatch must be a semantic zero-write"
+        );
+        assert!(matches!(
+            &outcome,
+            BackTargetDriverFailureCoreOutcome::Terminal(_)
+        ));
+        match mismatch.inner {
+            CorePreparationReceiverMismatchProjection::DriverTerminal { expected, observed } => {
+                assert_eq!(expected.request, request);
+                assert!(matches!(
+                    expected.status,
+                    crate::engine::CoreBackTargetDriverTerminalExpectedStatus::Failed
+                ));
+                assert!(matches!(
+                    observed.request,
+                    crate::engine::CoreBackTargetDriverTerminalObservedRequestProjection::Retained {
+                        request: observed_request,
+                        status: RequestStatus::Queued,
+                    } if observed_request == request
+                ));
+            }
+            CorePreparationReceiverMismatchProjection::Scope { .. }
+            | CorePreparationReceiverMismatchProjection::Continuation { .. }
+            | CorePreparationReceiverMismatchProjection::Execution { .. }
+            | CorePreparationReceiverMismatchProjection::Applied { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
+            | CorePreparationReceiverMismatchProjection::DriverFallback { .. } => {
+                panic!("terminal status drift must use its tagged projection")
+            }
+        }
+    }
+
+    #[test]
+    fn back_target_mount_pairing_evidence_changes_with_same_request_token_fact() {
+        let mut engine = nested_mount_back_fixture();
+        let owner = take_verified_back_target(&mut engine);
+        let resume = match engine.resume_back_target_with_retirement(owner, || {}) {
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::Ready(resume)) => resume,
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::FailureCleanup(_)) => {
+                panic!("the live nested mount must resume with one MountRequest")
+            }
+            BackTargetCoreResumeOutcome::Permanent(_) => {
+                panic!("the unchanged nested target must not become permanent")
+            }
+            BackTargetCoreResumeOutcome::Mismatch { .. } => {
+                panic!("the exact nested target receiver must match")
+            }
+        };
+        let (mut action, history, continuation) = resume.into_parts();
+        let BackTargetResumeAction::MountRequest(request) = &mut action else {
+            panic!("the nested fixture must return a MountRequest")
+        };
+        request.inner.testing_advance_token_binding();
+        let before = engine.inner.testing_snapshot();
+
+        let first = match engine.validate_back_target_execution_pairing(
+            BackTargetExecutionOwnerRef::Driving {
+                history: &history,
+                continuation: &continuation,
+            },
+            BackTargetPhysicalOwnerRef::ResumeAction(&action),
+        ) {
+            BackTargetExecutionPairingOutcome::Mismatch(mismatch) => mismatch.inner,
+            BackTargetExecutionPairingOutcome::Matched => {
+                panic!("the first drifted mount token must fail the real receiver predicate")
+            }
+        };
+        assert_eq!(
+            engine.inner.testing_snapshot(),
+            before,
+            "mount-token pairing mismatch must be a semantic zero-write"
+        );
+
+        let BackTargetResumeAction::MountRequest(request) = &mut action else {
+            unreachable!("the action variant was already established")
+        };
+        request.inner.testing_advance_token_binding();
+        let second = match engine.validate_back_target_execution_pairing(
+            BackTargetExecutionOwnerRef::Driving {
+                history: &history,
+                continuation: &continuation,
+            },
+            BackTargetPhysicalOwnerRef::ResumeAction(&action),
+        ) {
+            BackTargetExecutionPairingOutcome::Mismatch(mismatch) => mismatch.inner,
+            BackTargetExecutionPairingOutcome::Matched => {
+                panic!("the second drifted mount token must fail the real receiver predicate")
+            }
+        };
+        assert_eq!(
+            engine.inner.testing_snapshot(),
+            before,
+            "repeated mount-token inspection must remain zero-write"
+        );
+        assert_ne!(
+            first, second,
+            "exact mismatch evidence must change when the sole drifted mount-token fact changes"
+        );
+    }
+
+    #[test]
+    fn back_target_resume_action_follows_real_reconciliation() {
+        let mut frame_task = confirmed_engine();
+        settle_push(
+            &mut frame_task,
+            RouteLocation::new("/").with_fragment("frame-target"),
+        );
+        settle_changed_history_push(
+            &mut frame_task,
+            RouteLocation::new("/").with_fragment("frame-source"),
+        );
+        let owner = take_verified_back_target(&mut frame_task);
+        let resume = match frame_task.resume_back_target_with_retirement(owner, || {}) {
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::Ready(resume)) => resume,
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::FailureCleanup(_)) => {
+                panic!("a non-exhausted direct entering target must not enter failure cleanup")
+            }
+            BackTargetCoreResumeOutcome::Permanent(_) => {
+                panic!("an unchanged nonzero-entering target must resume")
+            }
+            BackTargetCoreResumeOutcome::Mismatch { .. } => {
+                panic!("the exact nonzero-entering target receiver must match")
+            }
+        };
+        let (action, _execution, _continuation) = resume.into_parts();
+        assert!(matches!(action, BackTargetResumeAction::FrameTask(_)));
+
+        let mut commit = confirmed_nested_engine();
+        let duplicate = RouteLocation::new("/");
+        settle_push(&mut commit, duplicate.clone());
+        settle_push(&mut commit, duplicate);
+        let before = commit.inner.testing_next_frame_identities();
+        let owner = take_verified_back_target(&mut commit);
+        let resume = match commit.resume_back_target_with_retirement(owner, || {}) {
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::Ready(resume)) => resume,
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::FailureCleanup(_)) => {
+                panic!("an unchanged zero-entering target must not enter failure cleanup")
+            }
+            BackTargetCoreResumeOutcome::Permanent(_) => {
+                panic!("an unchanged zero-entering target must resume")
+            }
+            BackTargetCoreResumeOutcome::Mismatch { .. } => {
+                panic!("the exact zero-entering target receiver must match")
+            }
+        };
+        let after = commit.inner.testing_next_frame_identities();
+        assert_eq!(after.0, before.0 + 2);
+        assert_eq!(after.1, before.1 + 2);
+        let (action, _execution, _continuation) = resume.into_parts();
+        assert!(matches!(action, BackTargetResumeAction::Commit(_)));
+
+        let mut pure_truncate = confirmed_back_target_nested_engine();
+        settle_nested_history_command(
+            &mut pure_truncate,
+            HistoryFixtureCommand::Push,
+            RouteLocation::new("/items"),
+        );
+        settle_nested_history_command(
+            &mut pure_truncate,
+            HistoryFixtureCommand::Push,
+            RouteLocation::new("/items/1"),
+        );
+        let before = pure_truncate.inner.testing_next_frame_identities();
+        let owner = take_verified_back_target(&mut pure_truncate);
+        let resume = match pure_truncate.resume_back_target_with_retirement(owner, || {}) {
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::Ready(resume)) => resume,
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::FailureCleanup(_)) => {
+                panic!("pure truncate must not enter failure cleanup")
+            }
+            BackTargetCoreResumeOutcome::Permanent(_) => {
+                panic!("pure truncate of an unchanged target must resume")
+            }
+            BackTargetCoreResumeOutcome::Mismatch { .. } => {
+                panic!("the exact pure-truncate target receiver must match")
+            }
+        };
+        let after = pure_truncate.inner.testing_next_frame_identities();
+        assert_eq!(after.0, before.0 + 3);
+        assert_eq!(after.1, before.1 + 3);
+        let (action, _execution, _continuation) = resume.into_parts();
+        assert!(matches!(action, BackTargetResumeAction::Commit(_)));
+    }
+
+    #[test]
+    fn back_target_nested_resume_uses_real_mount_request() {
+        let mut engine = nested_mount_back_fixture();
+        let owner = take_verified_back_target(&mut engine);
+        let callback_calls = std::cell::Cell::new(0);
+
+        let start = match engine.resume_back_target_with_retirement(owner, || {
+            callback_calls.set(callback_calls.get() + 1);
+        }) {
+            BackTargetCoreResumeOutcome::Resumed(start) => start,
+            BackTargetCoreResumeOutcome::Permanent(_) => {
+                panic!("an unchanged nested Back target must resume")
+            }
+            BackTargetCoreResumeOutcome::Mismatch { .. } => {
+                panic!("the exact nested Back target receiver must match")
+            }
+        };
+
+        assert_eq!(callback_calls.get(), 1);
+        let BackTargetStart::Ready(resume) = start else {
+            panic!("a live nested mount is a normal Ready start")
+        };
+        let (action, _execution, _continuation) = resume.into_parts();
+        assert!(matches!(action, BackTargetResumeAction::MountRequest(_)));
+    }
+
+    #[test]
+    fn back_target_mount_exhaustion_is_failure_cleanup_not_resume_action() {
+        let mut engine = nested_mount_back_fixture();
+        let owner = take_verified_back_target(&mut engine);
+        engine.inner.testing_exhaust_mount_sequence_counter();
+        let ids_before = engine.inner.testing_id_allocator_snapshot();
+        let mount_before = engine.inner.testing_mount_issuer_snapshot();
+        let callback_calls = std::cell::Cell::new(0);
+
+        let start = match engine.resume_back_target_with_retirement(owner, || {
+            callback_calls.set(callback_calls.get() + 1);
+        }) {
+            BackTargetCoreResumeOutcome::Resumed(start) => start,
+            BackTargetCoreResumeOutcome::Permanent(_) => {
+                panic!("mount sequence exhaustion belongs to the failure-cleanup branch")
+            }
+            BackTargetCoreResumeOutcome::Mismatch { .. } => {
+                panic!("the exact nested Back target receiver must match")
+            }
+        };
+
+        assert_eq!(callback_calls.get(), 1);
+        let BackTargetStart::FailureCleanup(failure) = start else {
+            panic!("mount issue exhaustion must not be represented as a resume action")
+        };
+        assert_eq!(failure.failure().kind(), NavigationFailureKind::Mount);
+        let request = failure.request();
+        assert_eq!(engine.inner.testing_id_allocator_snapshot(), ids_before);
+        assert_eq!(engine.inner.testing_mount_issuer_snapshot(), mount_before);
+        assert!(
+            !engine
+                .inner
+                .testing_history_capability_snapshot()
+                .has_owner()
+        );
+        let record = engine
+            .request(request)
+            .expect("failure cleanup request remains retained");
+        assert_eq!(
+            record.status(),
+            &RequestStatus::Running(NavigationPhase::CleanupPending)
+        );
+        assert!(
+            record
+                .trace()
+                .iter()
+                .all(|event| { event.kind() != NavigationTraceEventKind::MountRequested })
+        );
+
+        let cleanup = engine
+            .prepare_failure_cleanup(failure, CleanupManifest::empty())
+            .expect("mount issue exhaustion enters the existing cleanup owner chain");
+        engine
+            .complete_cleanup(cleanup.complete_empty())
+            .expect("empty failure cleanup settles through the existing completion");
+        assert!(matches!(
+            engine
+                .request(request)
+                .expect("terminal request remains retained")
+                .status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::Mount
+        ));
+    }
+
+    #[test]
+    fn back_typed_receivers_keep_branch_specific_owner_signatures() {
+        let _: fn(
+            &mut RouterEngine,
+            VerifiedBackTargetExecutionOwner,
+            fn(),
+        ) -> BackTargetCoreResumeOutcome = RouterEngine::resume_back_target_with_retirement::<fn()>;
+        let _: fn(
+            &mut RouterEngine,
+            BackTargetPermanentOwner,
+        ) -> BackTargetPermanentSettlementOutcome =
+            RouterEngine::settle_back_target_permanent_exact;
+        let _: fn(
+            &mut RouterEngine,
+            VerifiedBackNoTargetCandidate,
+            fn(),
+        ) -> BackNoTargetSourceRefreezeOutcome =
+            RouterEngine::refreeze_back_no_target_source_with_transfer::<fn()>;
+        let _: fn(
+            &mut RouterEngine,
+            BackNoTargetSourceDriftOwner,
+            fn(),
+        ) -> BackNoTargetSourceDriftSettlementOutcome =
+            RouterEngine::settle_back_no_target_source_drift_with_retirement::<fn()>;
+        let _: fn(
+            &mut RouterEngine,
+            VerifiedBackResolutionContradiction,
+            fn(),
+        ) -> BackContradictionCoreOutcome =
+            RouterEngine::fail_back_resolution_contradiction_with_retirement::<fn()>;
     }
 
     #[test]

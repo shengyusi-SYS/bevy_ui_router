@@ -1,16 +1,36 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+
 use bevy_ecs::{prelude::World, resource::Resource};
 use bevy_input_focus::InputFocus;
 use bevy_ui_router_core::{
     integration::{
-        BeginAuthoritySettlementErrorKind, CleanupManifest, EngineAction,
+        BackResolutionEvidence, BackResolutionEvidenceClassification, BackResolutionOwnerHandoff,
+        BackResolutionVerifyOutcome, BackTargetAppliedReport, BackTargetAppliedReportOutcome,
+        BackTargetCommitPreparationFailure, BackTargetCommitPreparationOutcome,
+        BackTargetCoreResumeOutcome, BackTargetDriverFailureConsumeOutcome,
+        BackTargetDriverFailureCoreOutcome, BackTargetDriverFailureReportMode,
+        BackTargetDriverFailureReportOutcome, BackTargetExecutionOwnerRef,
+        BackTargetExecutionPairingOutcome, BackTargetPermanentOwner, BackTargetPhysicalOwnerRef,
+        BackTargetPreparationAcceptance, BackTargetStart, BeginAuthoritySettlementErrorKind,
+        CleanupManifest, CommitTicket, EngineAction, EnqueueBackErrorKind,
         FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError, FailureCleanupRequest,
-        FrameMountTarget, HostLease, IntegrationError, MountMutationArtifact, MountReceiptProof,
-        MountRegistrationBeginError, MountRequest, ResolveMountOwner, RootFrameTask, RouterEngine,
-        ViewFailureKind, ViewReportIdentity,
+        FrameMountTarget, HistoryAdmissionStamp, HistoryAdmissionWorldSeal,
+        HistoryExecutionBindingView, HostLease, IntegrationError, LifecycleContinuationCapacity,
+        MountMutationArtifact, MountReceiptProof, MountRegistrationBeginError, MountRequest,
+        PreparationReceiverMismatchView, PrepareBackAdmissionErrorKind,
+        PreparedPostCommitContinuationOwner, ResolveMountOwner, RootFrameTask,
+        RouteFailureContinuationOwner, RouterEngine, TargetAuthoritySettlementOwner,
+        VerifiedBackNoTargetCandidate, VerifiedBackResolutionContradiction,
+        VerifiedBackResolutionOwnerHandoff, VerifiedBackTargetExecutionOwner, ViewFailureKind,
+        ViewReportIdentity,
     },
-    prelude::{MountRejectionKind, NavigationRequestId, RouteFrameVersion, RouteLocation},
+    prelude::{
+        MountRejectionKind, NavigationRequestId, RouteFrameVersion, RouteLocation,
+        RouterAvailability,
+    },
 };
 use bevy_ui_router_view::{RouteViewRegistry, ViewBuildEffect, integration as view_integration};
 
@@ -23,11 +43,15 @@ use crate::{
         seal_reconciliation_staging_mount,
     },
     cleanup::{
-        AuthoritySettlementManifestError, CleanupLedger, CleanupLedgerReserveErrorKind,
+        AuthoritySettlementManifestError, BackCapacityDomainIssuer,
+        BackCapacityEnqueueRetireResidual, BackCapacityIssuer, BackCapacityIssuerInstallError,
+        BackCapacityRetireDisposition, BackCapacityRetireError, BackCapacityRetireOutcome,
+        BackCapacityRetirementEvidence, BoundBackCapacityReservation, CleanupLedger,
+        CleanupLedgerReserveError, CleanupLedgerReserveErrorKind, EnqueueRejected,
         FailedAuthorityBoundaryBinding, FailedBoundaryDrift, FailedBoundarySource,
         FailedManifestBuildError, FailedPreparedTopologyError, FrozenCleanupManifest,
-        PendingBoundaryBinding, RouterCleanupObservation, cleanup_claim_has_exact_authority,
-        failed_prepared_branch_roots_are_exact,
+        PendingBoundaryBinding, PreparedCleanupLedger, RouterCleanupObservation,
+        cleanup_claim_has_exact_authority, failed_prepared_branch_roots_are_exact,
     },
     content::{ContentPlan, FrameContentWriter},
     driver::{EcsViewReportSession, ReportSeal, ViewBuildReport, ViewBuildReportKind},
@@ -286,6 +310,556 @@ struct PendingMountMutationRejection {
     allowance: Option<SealedMountNewStagingAllowance>,
 }
 
+pub(crate) struct PendingBackTargetDriving {
+    history: HistoryExecutionBindingView,
+    continuation: LifecycleContinuationCapacity,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct BackTargetDriverTaskPhysicalProjection {
+    report: ViewReportIdentity,
+    request: NavigationRequestId,
+    sequence: u64,
+    frame: RouteFrameVersion,
+    mount: FrameMountTarget,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct BackTargetDriverHostPhysicalProjection {
+    version: bevy_ui_router_core::HostVersion,
+    slot_id: bevy_ui_router_core::ids::RouteSlotId,
+    host: bevy_ecs::entity::Entity,
+    top_slot: bevy_ecs::entity::Entity,
+    top_slot_claim: ExactRegistryClaim,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+enum BackTargetDriverRootPhysicalParentProjection {
+    Host(bevy_ecs::entity::Entity),
+    Claimed {
+        entity: bevy_ecs::entity::Entity,
+        claim: ExactRegistryClaim,
+    },
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct BackTargetDriverRootMountPhysicalProjection {
+    frame: RouteFrameVersion,
+    slot: bevy_ecs::entity::Entity,
+    slot_claim: ExactRegistryClaim,
+    physical_parent: BackTargetDriverRootPhysicalParentProjection,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+enum BackTargetDriverActiveChildSlotRole {
+    Occupied(RouteFrameVersion),
+    RetainedEmpty,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct BackTargetDriverActiveChildSlotProjection {
+    parent: RouteFrameVersion,
+    outlet: bevy_ui_router_core::slot::RouteSlotKey,
+    slot_id: bevy_ui_router_core::ids::RouteSlotId,
+    entity: bevy_ecs::entity::Entity,
+    claim: ExactRegistryClaim,
+    role: BackTargetDriverActiveChildSlotRole,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BackTargetDriverObservedClaimState {
+    Exact,
+    MissingEntity,
+    AuthorityDrift,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct BackTargetDriverObservedRegistryClaim {
+    claim: ExactRegistryClaim,
+    state: BackTargetDriverObservedClaimState,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct BackTargetDriverPhysicalPartitionProjection {
+    router: RouterHandle,
+    task: BackTargetDriverTaskPhysicalProjection,
+    target_claims: Vec<ExactRegistryClaim>,
+    host: BackTargetDriverHostPhysicalProjection,
+    active_frames: Vec<RouteFrameVersion>,
+    active_root_mount: Option<BackTargetDriverRootMountPhysicalProjection>,
+    active_child_slots: Vec<BackTargetDriverActiveChildSlotProjection>,
+    expected_active_claims: Vec<ExactRegistryClaim>,
+    observed_active_claims: Vec<BackTargetDriverObservedRegistryClaim>,
+    protected: Vec<bevy_ecs::entity::Entity>,
+}
+
+pub(crate) struct BackTargetDriverPhysicalPartitionSource {
+    frozen: BackTargetDriverPhysicalPartitionProjection,
+}
+
+pub(crate) struct BackTargetDriverPostReportRefreezeSource {
+    frozen: BackTargetDriverPhysicalPartitionProjection,
+}
+
+impl BackTargetDriverPhysicalPartitionSource {
+    fn seal_for_report(self) -> BackTargetDriverPostReportRefreezeSource {
+        BackTargetDriverPostReportRefreezeSource {
+            frozen: self.frozen,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BackTargetDriverPhysicalIndeterminateReason {
+    MissingHost,
+    MissingActive,
+    HostAuthorityDrift,
+    ActiveTopologyDrift,
+    DuplicateActiveClaim,
+    SourceDrift,
+    UnsupportedRootLineage,
+    ActiveRegistryIncomplete,
+    PendingPhysicalResidual,
+    ResidualTopologyIncomplete,
+    TargetRegistryIncomplete,
+    UnclassifiedTargetClaims,
+    TargetProtectedOverlap,
+}
+
+enum BackTargetDriverPhysicalIndeterminateObservation {
+    PairingMismatch(PreparationReceiverMismatchView),
+    Freeze(BackTargetDriverPhysicalIndeterminateReason),
+    Refreeze {
+        expected: BackTargetDriverPhysicalPartitionProjection,
+        observed: Option<BackTargetDriverPhysicalPartitionProjection>,
+        reason: BackTargetDriverPhysicalIndeterminateReason,
+    },
+    Classification {
+        source: BackTargetDriverPhysicalPartitionProjection,
+        reason: BackTargetDriverPhysicalIndeterminateReason,
+    },
+}
+
+pub(crate) struct FrozenBackTargetDriverPhysicalIndeterminateEvidence {
+    observation: BackTargetDriverPhysicalIndeterminateObservation,
+}
+
+pub(crate) struct FrozenBackTargetDriverZeroPhysicalProof {
+    source: BackTargetDriverPhysicalPartitionProjection,
+}
+
+pub(crate) struct BackTargetDriverZeroPhysicalOwner {
+    pending: PendingCommit,
+    proof: FrozenBackTargetDriverZeroPhysicalProof,
+}
+
+pub(crate) enum BackTargetDriverUnverifiedPhysicalOwner {
+    Pending(PendingCommit),
+    Residual(FailedPreparedBranch),
+}
+
+pub(crate) struct FrozenBackTargetDriverPhysicalPartitionProof {
+    source: BackTargetDriverPhysicalPartitionProjection,
+    manifest: FrozenCleanupManifest,
+    target_claims: Vec<ExactRegistryClaim>,
+}
+
+pub(crate) struct BackTargetDriverResidualPhysicalOwner {
+    branch: FailedPreparedBranch,
+    proof: FrozenBackTargetDriverPhysicalPartitionProof,
+}
+
+pub(crate) enum BackTargetDriverReportablePhysicalOwner {
+    ProvenZero(BackTargetDriverZeroPhysicalOwner),
+    Residual(BackTargetDriverResidualPhysicalOwner),
+}
+
+impl BackTargetDriverReportablePhysicalOwner {
+    pub(crate) const fn report_mode(&self) -> BackTargetDriverFailureReportMode {
+        match self {
+            Self::ProvenZero(_) => BackTargetDriverFailureReportMode::Normal,
+            Self::Residual(_) => BackTargetDriverFailureReportMode::PhysicalResidual,
+        }
+    }
+
+    pub(crate) fn into_unverified(self) -> BackTargetDriverUnverifiedPhysicalOwner {
+        match self {
+            Self::ProvenZero(owner) => {
+                BackTargetDriverUnverifiedPhysicalOwner::Pending(owner.pending)
+            }
+            Self::Residual(owner) => {
+                BackTargetDriverUnverifiedPhysicalOwner::Residual(owner.branch)
+            }
+        }
+    }
+}
+
+pub(crate) struct BackTargetDriverPhysicalIndeterminateOwner {
+    original: BackTargetDriverUnverifiedPhysicalOwner,
+    evidence: FrozenBackTargetDriverPhysicalIndeterminateEvidence,
+}
+
+pub(crate) enum BackTargetDriverPhysicalClassification {
+    Reportable(BackTargetDriverReportablePhysicalOwner),
+    Indeterminate(BackTargetDriverPhysicalIndeterminateOwner),
+}
+
+pub(crate) struct PendingBackTargetDriverAwaitingReport {
+    driving: PendingBackTargetDriving,
+    task: RootFrameTask,
+    source: BackTargetDriverPhysicalPartitionSource,
+    physical: BackTargetDriverUnverifiedPhysicalOwner,
+    kind: ViewFailureKind,
+    message: &'static str,
+}
+
+pub(crate) struct PendingBackTargetDriverReceiverMismatch {
+    driving: PendingBackTargetDriving,
+    task: RootFrameTask,
+    physical: BackTargetDriverUnverifiedPhysicalOwner,
+    kind: ViewFailureKind,
+    message: &'static str,
+    mismatch: PreparationReceiverMismatchView,
+}
+
+pub(crate) struct PendingBackTargetDriverPhysicalIndeterminate {
+    driving: PendingBackTargetDriving,
+    task: RootFrameTask,
+    physical: BackTargetDriverPhysicalIndeterminateOwner,
+    kind: ViewFailureKind,
+    message: &'static str,
+}
+
+pub(crate) struct PendingBackTargetAppliedReportInput {
+    driving: PendingBackTargetDriving,
+    task: RootFrameTask,
+    pending: PendingCommit,
+    report: BackTargetAppliedReport,
+}
+
+pub(crate) struct PendingBackTargetAppliedPhysicalIndeterminate {
+    owner: PendingBackTargetAppliedReportInput,
+    evidence: FrozenBackTargetDriverPhysicalIndeterminateEvidence,
+}
+
+pub(crate) struct PendingBackTargetAppliedReportMismatch {
+    source: BackTargetDriverPostReportRefreezeSource,
+    owner: PendingBackTargetAppliedReportInput,
+    mismatch: PreparationReceiverMismatchView,
+}
+
+pub(crate) struct PendingBackTargetAppliedStagingMismatch {
+    previous: Option<BackTargetDriverStagingOwner>,
+    pending: PendingCommit,
+    task: RootFrameTask,
+    report: BackTargetAppliedReport,
+    evidence: BackTargetDriverStagingMismatchEvidence,
+}
+
+pub(crate) struct PendingBackTargetAppliedReportAttempt {
+    pending: PendingCommit,
+    task: RootFrameTask,
+    report: BackTargetAppliedReport,
+}
+
+pub(crate) struct PendingBackTargetAppliedStagingConflict {
+    existing: PendingBackTargetAppliedStagingMismatch,
+    incoming: PendingBackTargetAppliedReportAttempt,
+    evidence: BackTargetDriverStagingMismatchEvidence,
+}
+
+pub(crate) struct PendingBackTargetAppliedMountRequest {
+    driving: PendingBackTargetDriving,
+    request: MountRequest,
+    pending: PendingCommit,
+}
+
+pub(crate) struct PendingBackTargetAppliedMountRequestPairingMismatch {
+    source: BackTargetDriverPostReportRefreezeSource,
+    driving: PendingBackTargetDriving,
+    request: MountRequest,
+    pending: PendingCommit,
+    mismatch: PreparationReceiverMismatchView,
+}
+
+pub(crate) struct PendingBackTargetAppliedCommit {
+    driving: PendingBackTargetDriving,
+    ticket: CommitTicket,
+    pending: PendingCommit,
+}
+
+pub(crate) struct PendingBackTargetAppliedCommitPairingMismatch {
+    owner: PendingBackTargetAppliedCommit,
+    mismatch: PreparationReceiverMismatchView,
+}
+
+pub(crate) struct PendingBackTargetAppliedCommitPermanent {
+    owner: PendingBackTargetAppliedCommit,
+    evidence: LifecyclePreflightEvidence,
+}
+
+struct BackTargetDriverFailureReported {
+    source: BackTargetDriverPostReportRefreezeSource,
+    history: HistoryExecutionBindingView,
+    physical: BackTargetDriverReportablePhysicalOwner,
+    outcome: BackTargetDriverFailureCoreOutcome,
+}
+
+pub(crate) struct PendingBackTargetDriverConsumeMismatch {
+    source: BackTargetDriverPostReportRefreezeSource,
+    history: HistoryExecutionBindingView,
+    physical: BackTargetDriverUnverifiedPhysicalOwner,
+    outcome: BackTargetDriverFailureCoreOutcome,
+    mismatch: PreparationReceiverMismatchView,
+}
+
+pub(crate) struct PendingBackTargetDriverPhysicalMismatch {
+    source: BackTargetDriverPostReportRefreezeSource,
+    history: HistoryExecutionBindingView,
+    physical: BackTargetDriverUnverifiedPhysicalOwner,
+    outcome: BackTargetDriverFailureCoreOutcome,
+    evidence: BackTargetDriverPhysicalMismatchEvidence,
+}
+
+pub(crate) struct PendingBackTargetDriverPostReportPhysicalIndeterminate {
+    source: BackTargetDriverPostReportRefreezeSource,
+    history: HistoryExecutionBindingView,
+    physical: BackTargetDriverUnverifiedPhysicalOwner,
+    outcome: BackTargetDriverFailureCoreOutcome,
+    evidence: FrozenBackTargetDriverPhysicalIndeterminateEvidence,
+}
+
+pub(crate) enum PendingBackTargetDriverFailure {
+    PhysicalIndeterminate(PendingBackTargetDriverPhysicalIndeterminate),
+    AwaitingReport(PendingBackTargetDriverAwaitingReport),
+    ReceiverMismatch(PendingBackTargetDriverReceiverMismatch),
+    ConsumeMismatch(PendingBackTargetDriverConsumeMismatch),
+    PhysicalMismatch(PendingBackTargetDriverPhysicalMismatch),
+    PostReportPhysicalIndeterminate(PendingBackTargetDriverPostReportPhysicalIndeterminate),
+}
+
+pub(crate) struct BackTargetDriverPhysicalMismatchEvidence {
+    _private: (),
+}
+
+pub(crate) struct TargetPreparationOwner {
+    splice: SealedReconciliationSplice,
+    history: HistoryExecutionBindingView,
+    continuation: LifecycleContinuationCapacity,
+}
+
+pub(crate) struct BackTargetClassifiedPhysicalOwner {
+    splice: SealedReconciliationSplice,
+    history: HistoryExecutionBindingView,
+}
+
+pub(crate) struct PreparedBackTargetPhysicalOwner {
+    classified: BackTargetClassifiedPhysicalOwner,
+    focus_leaving: Vec<bevy_ecs::entity::Entity>,
+}
+
+pub(crate) struct BackTargetReadyAcceptanceOwner {
+    physical: PreparedBackTargetPhysicalOwner,
+    continuation: LifecycleContinuationCapacity,
+    frozen_manifest: FrozenCleanupManifest,
+    manifest: CleanupManifest,
+}
+
+pub(crate) struct PendingBackTargetReadyAccepted {
+    physical: PreparedBackTargetPhysicalOwner,
+    continuation: PreparedPostCommitContinuationOwner,
+    frozen_manifest: FrozenCleanupManifest,
+    manifest: CleanupManifest,
+}
+
+pub(crate) struct PendingPreparedBackTargetCommit {
+    physical: PreparedBackTargetPhysicalOwner,
+    continuation: PreparedPostCommitContinuationOwner,
+    ledger: PreparedCleanupLedger,
+    manifest: CleanupManifest,
+}
+
+pub(crate) enum PreparationRetryEvidence {
+    RetryableCapacity(LifecyclePreflightEvidence),
+    UnfinalizedBoundaryFacts(LifecyclePreflightEvidence),
+}
+
+pub(crate) enum PreparationPermanentEvidence {
+    PhysicalPreparationContradiction(LifecyclePreflightEvidence),
+}
+
+pub(crate) struct PreparationPermanentOwner<Owner> {
+    owner: Owner,
+    evidence: PreparationPermanentEvidence,
+}
+
+pub(crate) enum PendingBackTargetClassification {
+    Active(TargetPreparationOwner),
+    PairingMismatch {
+        owner: TargetPreparationOwner,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    EntryMismatch {
+        owner: TargetPreparationOwner,
+        evidence: LifecyclePreflightEvidence,
+    },
+    ReadyAwaitingAcceptance(BackTargetReadyAcceptanceOwner),
+    ReadyPlanRetry {
+        owner: BackTargetReadyAcceptanceOwner,
+        evidence: PreparationRetryEvidence,
+    },
+    ReadyPlanPermanent(PreparationPermanentOwner<BackTargetReadyAcceptanceOwner>),
+    ReadyAcceptanceMismatch {
+        owner: BackTargetReadyAcceptanceOwner,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    ReadyAccepted(PendingBackTargetReadyAccepted),
+    ReadyReserveFailure {
+        physical: PreparedBackTargetPhysicalOwner,
+        continuation: PreparedPostCommitContinuationOwner,
+        manifest: CleanupManifest,
+        error: CleanupLedgerReserveError,
+    },
+    PendingRejectedUnaccepted {
+        owner: TargetPreparationOwner,
+        evidence: LifecyclePreflightEvidence,
+    },
+    PendingRejectedAcceptanceMismatch {
+        owner: TargetPreparationOwner,
+        evidence: LifecyclePreflightEvidence,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    PendingRejected {
+        physical: BackTargetClassifiedPhysicalOwner,
+        continuation: RouteFailureContinuationOwner,
+        evidence: LifecyclePreflightEvidence,
+    },
+    AuthorityLostUnaccepted {
+        owner: TargetPreparationOwner,
+        evidence: LifecyclePreflightEvidence,
+    },
+    AuthorityLostAcceptanceMismatch {
+        owner: TargetPreparationOwner,
+        evidence: LifecyclePreflightEvidence,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    AuthorityLost {
+        physical: BackTargetClassifiedPhysicalOwner,
+        settlement: TargetAuthoritySettlementOwner,
+        evidence: LifecyclePreflightEvidence,
+    },
+    Retry {
+        owner: TargetPreparationOwner,
+        evidence: PreparationRetryEvidence,
+    },
+    Permanent(PreparationPermanentOwner<TargetPreparationOwner>),
+}
+
+pub(crate) enum PendingBackTargetCommitFailure {
+    PairingMismatch {
+        owner: PendingPreparedBackTargetCommit,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    ReceiverMismatch {
+        owner: PendingPreparedBackTargetCommit,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    Failed {
+        physical: PreparedBackTargetPhysicalOwner,
+        ledger: PreparedCleanupLedger,
+        failure: BackTargetCommitPreparationFailure,
+    },
+}
+
+pub(crate) enum PendingBackTargetResumeBlocked {
+    Start {
+        start: BackTargetStart,
+        retirement: BackCapacityRetirementEvidence,
+    },
+    PairingMismatch {
+        start: BackTargetStart,
+        retirement: BackCapacityRetirementEvidence,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    DrivingPairingMismatch {
+        owner: PendingBackTargetDriving,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    DriverFailure(PendingBackTargetDriverFailure),
+    AppliedPhysicalIndeterminate(PendingBackTargetAppliedPhysicalIndeterminate),
+    AppliedReportMismatch(PendingBackTargetAppliedReportMismatch),
+    AppliedMountRequestPending(PendingBackTargetAppliedMountRequest),
+    AppliedMountRequestPairingMismatch(PendingBackTargetAppliedMountRequestPairingMismatch),
+    AppliedCommitPending(PendingBackTargetAppliedCommit),
+    AppliedCommitPairingMismatch(PendingBackTargetAppliedCommitPairingMismatch),
+    AppliedCommitPermanent(PendingBackTargetAppliedCommitPermanent),
+    Permanent {
+        owner: BackTargetPermanentOwner,
+        retirement: BackCapacityRetirementEvidence,
+    },
+    CapacityRejected {
+        bound: BoundBackTargetResolution,
+        error: BackCapacityRetireError,
+    },
+    ReceiverMismatch {
+        bound: BoundBackTargetResolution,
+        evidence: BackResolutionEvidence,
+    },
+}
+
+pub(crate) enum BackTargetDriverStagingOwner {
+    ResumeBlocked(PendingBackTargetResumeBlocked),
+    Driving(PendingBackTargetDriving),
+    Classifying(PendingBackTargetClassification),
+    Prepared(PendingPreparedBackTargetCommit),
+    CommitFailure(PendingBackTargetCommitFailure),
+    ExistingMismatch(Box<PendingBackTargetDriverStagingMismatch>),
+    #[cfg(test)]
+    TestDrift(PendingBackTargetDriving),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum BackTargetDriverStagingMismatchObservation {
+    Missing,
+    PairingMismatch,
+    NonCurrentRoot,
+    ResumeBlocked,
+    Classifying,
+    Prepared,
+    CommitFailure,
+    ExistingMismatch,
+    ExistingAppliedMismatch,
+    #[cfg(test)]
+    TestDrift,
+}
+
+pub(crate) struct BackTargetDriverStagingMismatchEvidence {
+    observed: BackTargetDriverStagingMismatchObservation,
+    pairing: Option<PreparationReceiverMismatchView>,
+}
+
+pub(crate) struct PendingBackTargetDriverStagingMismatch {
+    previous: Option<BackTargetDriverStagingOwner>,
+    physical: BackTargetDriverUnverifiedPhysicalOwner,
+    task: RootFrameTask,
+    kind: ViewFailureKind,
+    message: &'static str,
+    evidence: BackTargetDriverStagingMismatchEvidence,
+}
+
+pub(crate) enum PendingBackTargetExecution {
+    ResumeBlocked(PendingBackTargetResumeBlocked),
+    Driving(PendingBackTargetDriving),
+    Classifying(PendingBackTargetClassification),
+    Prepared(PendingPreparedBackTargetCommit),
+    CommitFailure(PendingBackTargetCommitFailure),
+    DriverFailureStagingMismatch(PendingBackTargetDriverStagingMismatch),
+    AppliedReportStagingMismatch(PendingBackTargetAppliedStagingMismatch),
+    AppliedReportStagingConflict(PendingBackTargetAppliedStagingConflict),
+    #[cfg(test)]
+    DriverFailureStagingDrift(PendingBackTargetDriving),
+}
+
 struct MountNewStagingSeed {
     request: NavigationRequestId,
     parent: RouteFrameVersion,
@@ -430,7 +1004,131 @@ pub(crate) struct RouterEntry {
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
     cleanup_observation: RouterCleanupObservation,
     pub(crate) authority_protocol_residual: Option<AuthorityProtocolResidualOwner>,
+    back_capacity_enqueue_retire_residual: Option<BackCapacityEnqueueRetireResidual>,
     pub(crate) requests: Vec<NavigationRequestId>,
+    back_capacity_reservations: Vec<(NavigationRequestId, BoundBackCapacityReservation)>,
+    pending_back_resolution_action: Option<(BackResolutionOwnerHandoff, BackResolutionEvidence)>,
+    pending_bound_back_resolution: Option<BoundBackResolutionHandoff>,
+    pending_back_target_execution: Option<PendingBackTargetExecution>,
+    history_admission_world: HistoryAdmissionWorldSeal,
+    history_admission_stamp: Option<HistoryAdmissionStamp>,
+    back_capacity_issuer: Option<BackCapacityIssuer>,
+    #[cfg(test)]
+    back_resolution_evidence_predicate_calls: AtomicUsize,
+    #[cfg(test)]
+    back_target_driver_failure_dispatch_calls: AtomicUsize,
+    #[cfg(test)]
+    back_target_atomic_applied_dispatch_calls: AtomicUsize,
+    #[cfg(test)]
+    back_target_driver_staging_drift_armed: bool,
+    #[cfg(test)]
+    back_target_driver_report_receiver_drift_armed: bool,
+    #[cfg(test)]
+    back_target_driver_consume_receiver_drift_armed: bool,
+    #[cfg(feature = "test-support")]
+    back_capacity_facade_producer:
+        Option<bevy_ui_router_core::test_support::BackCapacityFacadeProducer>,
+}
+
+pub(crate) struct BoundBackTargetResolution {
+    owner: VerifiedBackTargetExecutionOwner,
+    reservation: BoundBackCapacityReservation,
+}
+
+pub(crate) enum BackTargetResumeOutcome {
+    Resumed {
+        start: BackTargetStart,
+        retirement: BackCapacityRetirementEvidence,
+    },
+    Permanent {
+        owner: BackTargetPermanentOwner,
+        retirement: BackCapacityRetirementEvidence,
+    },
+    CapacityRejected {
+        bound: BoundBackTargetResolution,
+        error: BackCapacityRetireError,
+    },
+    ReceiverMismatch {
+        bound: BoundBackTargetResolution,
+        evidence: BackResolutionEvidence,
+    },
+}
+
+pub(crate) struct BoundBackNoTargetResolution {
+    candidate: VerifiedBackNoTargetCandidate,
+    reservation: BoundBackCapacityReservation,
+}
+
+pub(crate) struct BoundBackContradictionResolution {
+    owner: VerifiedBackResolutionContradiction,
+    reservation: BoundBackCapacityReservation,
+}
+
+pub(crate) enum BoundBackResolutionHandoff {
+    Target(BoundBackTargetResolution),
+    NoTarget(BoundBackNoTargetResolution),
+    Contradiction(BoundBackContradictionResolution),
+}
+
+pub(crate) enum TakeBackResolutionOutcome {
+    Matched(BoundBackResolutionHandoff),
+    Mismatch {
+        reservation: BoundBackCapacityReservation,
+        handoff: BackResolutionOwnerHandoff,
+        evidence: BackResolutionEvidence,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackResolutionEvidenceDisposition {
+    Current,
+    Foreign,
+    ConsumedReplay,
+}
+
+pub(crate) fn resume_bound_back_target(
+    entry: &mut RouterEntry,
+    bound: BoundBackTargetResolution,
+) -> BackTargetResumeOutcome {
+    let BoundBackTargetResolution { owner, reservation } = bound;
+    let RouterEntry {
+        engine,
+        back_capacity_issuer,
+        ..
+    } = entry;
+    let issuer = back_capacity_issuer
+        .as_mut()
+        .expect("an installed RouterEntry retains its exact back capacity issuer");
+    let (guard, prepared_retirement) = match issuer
+        .preflight_bound_retirement(&reservation, BackCapacityRetireDisposition::Target)
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return BackTargetResumeOutcome::CapacityRejected {
+                bound: BoundBackTargetResolution { owner, reservation },
+                error,
+            };
+        }
+    };
+
+    match engine.resume_back_target_with_retirement(owner, move || guard.commit()) {
+        BackTargetCoreResumeOutcome::Resumed(start) => {
+            drop(reservation);
+            let retirement = prepared_retirement.into_evidence_after_exact_receiver();
+            BackTargetResumeOutcome::Resumed { start, retirement }
+        }
+        BackTargetCoreResumeOutcome::Permanent(owner) => {
+            drop(reservation);
+            let retirement = prepared_retirement.into_evidence_after_exact_receiver();
+            BackTargetResumeOutcome::Permanent { owner, retirement }
+        }
+        BackTargetCoreResumeOutcome::Mismatch { owner, evidence } => {
+            BackTargetResumeOutcome::ReceiverMismatch {
+                bound: BoundBackTargetResolution { owner, reservation },
+                evidence,
+            }
+        }
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -533,6 +1231,124 @@ enum AuthorityProtocolResidualKind {
 }
 
 impl RouterEntry {
+    pub(crate) fn install_back_capacity_issuer(
+        &mut self,
+        domains: &mut BackCapacityDomainIssuer,
+    ) -> Result<(), BackCapacityIssuerInstallError> {
+        if self.back_capacity_issuer.is_some() {
+            return Err(BackCapacityIssuerInstallError::AlreadyInstalled);
+        }
+        let issuer = domains
+            .issue()
+            .map_err(BackCapacityIssuerInstallError::Reserve)?;
+        self.back_capacity_issuer = Some(issuer);
+        Ok(())
+    }
+
+    pub(crate) fn take_back_resolution_handoff(
+        &mut self,
+        handoff: BackResolutionOwnerHandoff,
+    ) -> TakeBackResolutionOutcome {
+        let evidence = handoff.evidence();
+        let scope = handoff.scope();
+        let reservation_index = self
+            .back_capacity_reservations
+            .iter()
+            .position(|(_, reservation)| reservation.matches_resolution_scope(&scope))
+            .expect("a Core back resolution action retains its exact accepted capacity owner");
+        let (stored_request, reservation) =
+            self.back_capacity_reservations.remove(reservation_index);
+        let (request, capacity, accepted) = reservation.into_parts();
+        debug_assert_eq!(stored_request, request);
+
+        match self
+            .engine
+            .verify_back_resolution_handoff(accepted, handoff)
+        {
+            BackResolutionVerifyOutcome::Matched(verified) => {
+                let (accepted, owner) = verified.into_parts();
+                let reservation = BoundBackCapacityReservation::bind(request, capacity, accepted);
+                let bound = match owner {
+                    VerifiedBackResolutionOwnerHandoff::Target(owner) => {
+                        BoundBackResolutionHandoff::Target(BoundBackTargetResolution {
+                            owner,
+                            reservation,
+                        })
+                    }
+                    VerifiedBackResolutionOwnerHandoff::NoTarget(candidate) => {
+                        BoundBackResolutionHandoff::NoTarget(BoundBackNoTargetResolution {
+                            candidate,
+                            reservation,
+                        })
+                    }
+                    VerifiedBackResolutionOwnerHandoff::Contradiction(owner) => {
+                        BoundBackResolutionHandoff::Contradiction(
+                            BoundBackContradictionResolution { owner, reservation },
+                        )
+                    }
+                };
+                assert_eq!(
+                    self.validate_back_resolution_evidence(&evidence),
+                    BackResolutionEvidenceDisposition::ConsumedReplay,
+                    "a matched Core back resolution must consume its exact saved evidence"
+                );
+                TakeBackResolutionOutcome::Matched(bound)
+            }
+            BackResolutionVerifyOutcome::Mismatch {
+                accepted,
+                handoff,
+                evidence,
+            } => TakeBackResolutionOutcome::Mismatch {
+                reservation: BoundBackCapacityReservation::bind(request, capacity, accepted),
+                handoff,
+                evidence,
+            },
+        }
+    }
+
+    pub(crate) fn validate_back_resolution_evidence(
+        &self,
+        evidence: &BackResolutionEvidence,
+    ) -> BackResolutionEvidenceDisposition {
+        #[cfg(test)]
+        self.back_resolution_evidence_predicate_calls
+            .fetch_add(1, Ordering::Relaxed);
+
+        match self.engine.classify_back_resolution_evidence(evidence) {
+            BackResolutionEvidenceClassification::Current => {
+                BackResolutionEvidenceDisposition::Current
+            }
+            BackResolutionEvidenceClassification::Foreign => {
+                BackResolutionEvidenceDisposition::Foreign
+            }
+            BackResolutionEvidenceClassification::ConsumedReplay => {
+                BackResolutionEvidenceDisposition::ConsumedReplay
+            }
+        }
+    }
+
+    fn restore_back_capacity_reservation(&mut self, reservation: BoundBackCapacityReservation) {
+        self.back_capacity_reservations
+            .push((reservation.request(), reservation));
+    }
+
+    fn restore_back_resolution_mismatch(
+        &mut self,
+        reservation: BoundBackCapacityReservation,
+        handoff: BackResolutionOwnerHandoff,
+        evidence: BackResolutionEvidence,
+    ) {
+        self.restore_back_capacity_reservation(reservation);
+        self.pending_back_resolution_action = Some((handoff, evidence));
+    }
+
+    pub(crate) fn publish_history_admission_stamp(&mut self) {
+        self.history_admission_stamp = self
+            .engine
+            .history_admission_stamp(&self.history_admission_world)
+            .ok();
+    }
+
     pub(crate) fn current_reconciliation_entering_branch(&self) -> Option<&RealizedBranch> {
         let pending = self.pending_commit.as_ref()?;
         let projection_is_current = if let Some(ticket) = pending.ticket.as_ref() {
@@ -768,6 +1584,7 @@ impl RouterEntry {
 pub struct RouterNavigation {
     domain: u64,
     next_router: u64,
+    back_capacity_domain_issuer: BackCapacityDomainIssuer,
     pub(crate) entries: Vec<RouterEntry>,
 }
 
@@ -780,6 +1597,7 @@ impl RouterNavigation {
         Self {
             domain,
             next_router: 1,
+            back_capacity_domain_issuer: BackCapacityDomainIssuer::new(),
             entries: Vec::new(),
         }
     }
@@ -795,8 +1613,9 @@ impl RouterNavigation {
             .next_router
             .checked_add(1)
             .ok_or(IntegrationError::Exhausted)?;
-        let engine = RouterEngine::install(routes, fallback)?;
-        self.entries.push(RouterEntry {
+        let mut engine = RouterEngine::install(routes, fallback)?;
+        let history_admission_world = engine.claim_history_admission_world()?;
+        let mut entry = RouterEntry {
             handle,
             engine,
             views,
@@ -813,8 +1632,37 @@ impl RouterNavigation {
             cleanup_ledger: None,
             cleanup_observation: RouterCleanupObservation::default(),
             authority_protocol_residual: None,
+            back_capacity_enqueue_retire_residual: None,
             requests: Vec::new(),
-        });
+            back_capacity_reservations: Vec::new(),
+            pending_back_resolution_action: None,
+            pending_bound_back_resolution: None,
+            pending_back_target_execution: None,
+            history_admission_world,
+            history_admission_stamp: None,
+            back_capacity_issuer: None,
+            #[cfg(test)]
+            back_resolution_evidence_predicate_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            back_target_driver_failure_dispatch_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            back_target_atomic_applied_dispatch_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            back_target_driver_staging_drift_armed: false,
+            #[cfg(test)]
+            back_target_driver_report_receiver_drift_armed: false,
+            #[cfg(test)]
+            back_target_driver_consume_receiver_drift_armed: false,
+            #[cfg(feature = "test-support")]
+            back_capacity_facade_producer: None,
+        };
+        entry
+            .install_back_capacity_issuer(&mut self.back_capacity_domain_issuer)
+            .map_err(|error| match error {
+                BackCapacityIssuerInstallError::AlreadyInstalled => IntegrationError::Invalid,
+                BackCapacityIssuerInstallError::Reserve(_) => IntegrationError::Exhausted,
+            })?;
+        self.entries.push(entry);
         Ok(handle)
     }
 
@@ -867,6 +1715,192 @@ impl RouterNavigation {
         entry.requests.push(request);
         Ok(request)
     }
+
+    pub(crate) fn back(
+        &mut self,
+        router: RouterHandle,
+    ) -> Result<NavigationRequestId, NavigationEnqueueError> {
+        let entry_index = self
+            .entries
+            .iter()
+            .position(|entry| entry.handle == router)
+            .ok_or_else(|| {
+                NavigationEnqueueError::new(NavigationEnqueueErrorKind::UnknownRouter)
+            })?;
+        let result = (|| {
+            let admission = {
+                let entry = &self.entries[entry_index];
+                if entry.back_capacity_enqueue_retire_residual.is_some() {
+                    return Err(NavigationEnqueueError::new(
+                        NavigationEnqueueErrorKind::HostUnavailable,
+                    ));
+                }
+                match entry.engine.snapshot().availability() {
+                    RouterAvailability::Ready => {}
+                    RouterAvailability::RecoveringAuthority => {
+                        return Err(NavigationEnqueueError::new(
+                            NavigationEnqueueErrorKind::AuthorityRecovering,
+                        ));
+                    }
+                    RouterAvailability::AwaitingHost | RouterAvailability::Unavailable(_) => {
+                        return Err(NavigationEnqueueError::new(
+                            NavigationEnqueueErrorKind::HostUnavailable,
+                        ));
+                    }
+                }
+                if entry.authority_protocol_residual.is_some() {
+                    return Err(NavigationEnqueueError::new(
+                        NavigationEnqueueErrorKind::HostUnavailable,
+                    ));
+                }
+                let stamp = entry.history_admission_stamp.as_ref().ok_or_else(|| {
+                    NavigationEnqueueError::new(NavigationEnqueueErrorKind::AuthorityRecovering)
+                })?;
+                entry
+                    .engine
+                    .prepare_back_admission(&entry.history_admission_world, stamp)
+                    .map_err(|error| {
+                        NavigationEnqueueError::new(match error {
+                            PrepareBackAdmissionErrorKind::NoBackEntry => {
+                                NavigationEnqueueErrorKind::NoBackEntry
+                            }
+                            PrepareBackAdmissionErrorKind::ForeignStamp
+                            | PrepareBackAdmissionErrorKind::AuthorityRecovering => {
+                                NavigationEnqueueErrorKind::AuthorityRecovering
+                            }
+                        })
+                    })?
+            };
+
+            let entry = &mut self.entries[entry_index];
+            entry.requests.try_reserve(1).map_err(|_| {
+                NavigationEnqueueError::new(NavigationEnqueueErrorKind::IdentityExhausted)
+            })?;
+            entry
+                .back_capacity_reservations
+                .try_reserve(1)
+                .map_err(|_| {
+                    NavigationEnqueueError::new(NavigationEnqueueErrorKind::IdentityExhausted)
+                })?;
+            let permit = entry
+                .back_capacity_issuer
+                .as_mut()
+                .expect("installed RouterEntry retains its exact back capacity issuer")
+                .reserve()
+                .map_err(|_| {
+                    NavigationEnqueueError::new(NavigationEnqueueErrorKind::IdentityExhausted)
+                })?;
+            let accepted = match entry.engine.enqueue_back(admission) {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    let (kind, rejection) = match error {
+                        EnqueueBackErrorKind::AuthorityRecovering => (
+                            NavigationEnqueueErrorKind::AuthorityRecovering,
+                            EnqueueRejected::CoreTokenDrift,
+                        ),
+                        EnqueueBackErrorKind::Exhausted => (
+                            NavigationEnqueueErrorKind::IdentityExhausted,
+                            EnqueueRejected::CoreAllocatorFailure(error),
+                        ),
+                    };
+                    match entry
+                        .back_capacity_issuer
+                        .as_mut()
+                        .expect("installed RouterEntry retains its exact back capacity issuer")
+                        .retire_unbound(permit, rejection)
+                    {
+                        BackCapacityRetireOutcome::Retired(_evidence) => {
+                            return Err(NavigationEnqueueError::new(kind));
+                        }
+                        BackCapacityRetireOutcome::Rejected {
+                            owner,
+                            rejection,
+                            error,
+                        } => {
+                            entry.back_capacity_enqueue_retire_residual =
+                                Some(BackCapacityEnqueueRetireResidual {
+                                    owner,
+                                    rejection,
+                                    retire_error: error,
+                                });
+                            return Err(NavigationEnqueueError::new(
+                                NavigationEnqueueErrorKind::HostUnavailable,
+                            ));
+                        }
+                    }
+                }
+            };
+            let (request, execution) = accepted.into_parts();
+            let bound = BoundBackCapacityReservation::bind(request, permit, execution);
+            entry.back_capacity_reservations.push((request, bound));
+            entry.requests.push(request);
+            Ok(request)
+        })();
+
+        #[cfg(feature = "test-support")]
+        if result.is_err() {
+            if let Some(producer) = self.entries[entry_index]
+                .back_capacity_facade_producer
+                .as_mut()
+            {
+                producer.typed_return();
+            }
+        }
+
+        result
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn install_back_capacity_order_observer_with<F>(
+    navigation: &mut RouterNavigation,
+    router: RouterHandle,
+    factory: F,
+) -> Result<
+    bevy_ui_router_core::test_support::BackCapacityOrderObserver,
+    crate::test_support::BackCapacityOrderInstallError,
+>
+where
+    F: FnOnce() -> (
+        bevy_ui_router_core::test_support::BackCapacityOrderObserver,
+        bevy_ui_router_core::test_support::BackCapacityIssuerProducer,
+        bevy_ui_router_core::test_support::BackCapacityCoreProducer,
+        bevy_ui_router_core::test_support::BackCapacityFacadeProducer,
+    ),
+{
+    let domain_witness = RouterHandle::from_parts(navigation.domain, 0);
+    if !router.is_same_domain_as(domain_witness) {
+        return Err(crate::test_support::BackCapacityOrderInstallError::ForeignRouter);
+    }
+
+    let entry_index = navigation
+        .entries
+        .iter()
+        .position(|entry| entry.handle == router)
+        .ok_or(crate::test_support::BackCapacityOrderInstallError::UnknownRouter)?;
+
+    let RouterEntry {
+        engine,
+        back_capacity_issuer,
+        back_capacity_facade_producer,
+        ..
+    } = &mut navigation.entries[entry_index];
+    let core_slot = engine
+        .prepare_back_capacity_core_producer_slot()
+        .ok_or(crate::test_support::BackCapacityOrderInstallError::AlreadyInstalled)?;
+    let issuer_slot = back_capacity_issuer
+        .as_mut()
+        .filter(|issuer| issuer.back_capacity_order_producer_slot_is_vacant())
+        .ok_or(crate::test_support::BackCapacityOrderInstallError::AlreadyInstalled)?;
+    if back_capacity_facade_producer.is_some() {
+        return Err(crate::test_support::BackCapacityOrderInstallError::AlreadyInstalled);
+    }
+
+    let (observer, issuer, core, facade) = factory();
+    core_slot.install(core);
+    issuer_slot.install_back_capacity_order_producer(issuer);
+    *back_capacity_facade_producer = Some(facade);
+    Ok(observer)
 }
 
 fn map_navigation_enqueue_error(error: IntegrationError) -> NavigationEnqueueError {
@@ -1054,8 +2088,46 @@ pub(crate) fn observe_authority_system(world: &mut World) {
 
 pub(crate) fn collect_navigation_system(world: &mut World) {
     for entry in &mut world.resource_mut::<RouterNavigation>().entries {
-        entry.engine.collect();
+        if entry.pending_back_resolution_action.is_none()
+            && entry.pending_bound_back_resolution.is_none()
+            && entry.pending_back_target_execution.is_none()
+        {
+            entry.engine.collect();
+        }
     }
+}
+
+fn bind_back_resolution_handoff(
+    entry: &mut RouterEntry,
+    handoff: BackResolutionOwnerHandoff,
+) -> bool {
+    match entry.take_back_resolution_handoff(handoff) {
+        TakeBackResolutionOutcome::Matched(bound) => {
+            entry.pending_bound_back_resolution = Some(bound);
+            true
+        }
+        TakeBackResolutionOutcome::Mismatch {
+            reservation,
+            handoff,
+            evidence,
+        } => {
+            entry.restore_back_resolution_mismatch(reservation, handoff, evidence);
+            false
+        }
+    }
+}
+
+fn bind_post_cleanup_back_resolution(entry: &mut RouterEntry) {
+    if entry.pending_back_resolution_action.is_some()
+        || entry.pending_bound_back_resolution.is_some()
+        || entry.pending_back_target_execution.is_some()
+    {
+        return;
+    }
+    let Some(handoff) = entry.engine.take_back_resolution_action() else {
+        return;
+    };
+    let _ = bind_back_resolution_handoff(entry, handoff);
 }
 
 enum DriverReportApplicationError {
@@ -1654,12 +2726,182 @@ fn isolate_exact_failed_prepared_branch(
         && focus_is_outside_closure(world, &focus_closure)
 }
 
+enum BackTargetDispatchOutcome {
+    NoTargetPending,
+    Action(EngineAction),
+    SafeStopped,
+}
+
+fn dispatch_pending_back_target(entry: &mut RouterEntry) -> BackTargetDispatchOutcome {
+    match entry.pending_back_target_execution.as_ref() {
+        Some(PendingBackTargetExecution::Driving(_)) => {
+            return BackTargetDispatchOutcome::NoTargetPending;
+        }
+        Some(
+            PendingBackTargetExecution::ResumeBlocked(_)
+            | PendingBackTargetExecution::Classifying(_)
+            | PendingBackTargetExecution::Prepared(_)
+            | PendingBackTargetExecution::CommitFailure(_)
+            | PendingBackTargetExecution::DriverFailureStagingMismatch(_)
+            | PendingBackTargetExecution::AppliedReportStagingMismatch(_)
+            | PendingBackTargetExecution::AppliedReportStagingConflict(_),
+        ) => {
+            return BackTargetDispatchOutcome::SafeStopped;
+        }
+        #[cfg(test)]
+        Some(PendingBackTargetExecution::DriverFailureStagingDrift(_)) => {
+            return BackTargetDispatchOutcome::SafeStopped;
+        }
+        None => {}
+    }
+    if !matches!(
+        entry.pending_bound_back_resolution.as_ref(),
+        Some(BoundBackResolutionHandoff::Target(_))
+    ) {
+        return BackTargetDispatchOutcome::NoTargetPending;
+    }
+    let physical_slots_are_vacant = entry.pending_commit.is_none()
+        && entry.pending_frame_drive.is_none()
+        && entry.pending_mount_frame_task.is_none()
+        && entry.pending_mount_request.is_none()
+        && entry.pending_mount_mutation_rejection.is_none()
+        && entry.pending_failed_branch.is_none();
+    if !physical_slots_are_vacant {
+        return BackTargetDispatchOutcome::SafeStopped;
+    }
+    let Some(BoundBackResolutionHandoff::Target(bound)) =
+        entry.pending_bound_back_resolution.take()
+    else {
+        return BackTargetDispatchOutcome::NoTargetPending;
+    };
+    match resume_bound_back_target(entry, bound) {
+        BackTargetResumeOutcome::Resumed { start, retirement } => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::Start { start, retirement },
+            ));
+            let Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::Start { start, retirement },
+            )) = entry.pending_back_target_execution.take()
+            else {
+                return BackTargetDispatchOutcome::SafeStopped;
+            };
+            let retirement_is_exact = entry.back_capacity_issuer.as_ref().is_some_and(|issuer| {
+                matches!(
+                    issuer.classify_retirement_evidence(&retirement),
+                    Err(BackCapacityRetireError::ConsumedReplay)
+                )
+            });
+            if !retirement_is_exact {
+                entry.pending_back_target_execution =
+                    Some(PendingBackTargetExecution::ResumeBlocked(
+                        PendingBackTargetResumeBlocked::Start { start, retirement },
+                    ));
+                return BackTargetDispatchOutcome::SafeStopped;
+            }
+            let resume = match start {
+                BackTargetStart::Ready(resume) => resume,
+                start => {
+                    entry.pending_back_target_execution =
+                        Some(PendingBackTargetExecution::ResumeBlocked(
+                            PendingBackTargetResumeBlocked::Start { start, retirement },
+                        ));
+                    return BackTargetDispatchOutcome::SafeStopped;
+                }
+            };
+            let (action, history, continuation) = resume.parts();
+            if let BackTargetExecutionPairingOutcome::Mismatch(mismatch) =
+                entry.engine.validate_back_target_execution_pairing(
+                    BackTargetExecutionOwnerRef::Driving {
+                        history,
+                        continuation,
+                    },
+                    BackTargetPhysicalOwnerRef::ResumeAction(action),
+                )
+            {
+                entry.pending_back_target_execution =
+                    Some(PendingBackTargetExecution::ResumeBlocked(
+                        PendingBackTargetResumeBlocked::PairingMismatch {
+                            start: BackTargetStart::Ready(resume),
+                            retirement,
+                            mismatch,
+                        },
+                    ));
+                return BackTargetDispatchOutcome::SafeStopped;
+            }
+            match resume.into_frame_task_parts() {
+                Ok((task, history, continuation)) => {
+                    drop(retirement);
+                    entry.pending_back_target_execution = Some(
+                        PendingBackTargetExecution::Driving(PendingBackTargetDriving {
+                            history,
+                            continuation,
+                        }),
+                    );
+                    BackTargetDispatchOutcome::Action(EngineAction::FrameTask(task))
+                }
+                Err(resume) => match resume.into_commit_parts() {
+                    Ok((ticket, history, continuation)) => {
+                        drop(retirement);
+                        entry.pending_back_target_execution = Some(
+                            PendingBackTargetExecution::Driving(PendingBackTargetDriving {
+                                history,
+                                continuation,
+                            }),
+                        );
+                        BackTargetDispatchOutcome::Action(EngineAction::Commit(ticket))
+                    }
+                    Err(resume) => {
+                        entry.pending_back_target_execution =
+                            Some(PendingBackTargetExecution::ResumeBlocked(
+                                PendingBackTargetResumeBlocked::Start {
+                                    start: BackTargetStart::Ready(resume),
+                                    retirement,
+                                },
+                            ));
+                        BackTargetDispatchOutcome::SafeStopped
+                    }
+                },
+            }
+        }
+        BackTargetResumeOutcome::Permanent { owner, retirement } => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::Permanent { owner, retirement },
+            ));
+            BackTargetDispatchOutcome::SafeStopped
+        }
+        BackTargetResumeOutcome::CapacityRejected { bound, error } => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::CapacityRejected { bound, error },
+            ));
+            BackTargetDispatchOutcome::SafeStopped
+        }
+        BackTargetResumeOutcome::ReceiverMismatch { bound, evidence } => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::ReceiverMismatch { bound, evidence },
+            ));
+            BackTargetDispatchOutcome::SafeStopped
+        }
+    }
+}
+
 pub(crate) fn drive_navigation_system(world: &mut World) {
+    let redispatch = drive_navigation_pass(world, None);
+    if !redispatch.is_empty() {
+        let _ = drive_navigation_pass(world, Some(&redispatch));
+    }
+    refresh_authority_audits(world);
+}
+
+fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> Vec<usize> {
+    let mut newly_bound_entries = Vec::new();
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             world.resource_scope(
                 |world, mut drivers: bevy_ecs::change_detection::Mut<ViewDriverStore>| {
-                    for entry in &mut navigation.entries {
+                    for (entry_index, entry) in navigation.entries.iter_mut().enumerate() {
+                        if only_entries.is_some_and(|entries| !entries.contains(&entry_index)) {
+                            continue;
+                        }
                         if let Some(pending_rejection) =
                             entry.pending_mount_mutation_rejection.take()
                         {
@@ -1674,13 +2916,62 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                         if entry.pending_failed_branch.is_some() {
                             continue;
                         }
+                        let target_action = match dispatch_pending_back_target(entry) {
+                            BackTargetDispatchOutcome::Action(action) => Some(action),
+                            BackTargetDispatchOutcome::SafeStopped => continue,
+                            BackTargetDispatchOutcome::NoTargetPending => None,
+                        };
+                        if entry.pending_back_resolution_action.is_some()
+                            || entry.pending_bound_back_resolution.is_some()
+                        {
+                            continue;
+                        }
                         if entry.pending_commit.as_ref().is_some_and(|pending| {
                             pending.ticket.is_some() || pending.final_task.is_some()
                         }) {
                             continue;
                         }
+                        let retry_pairing_mismatch =
+                            match (
+                                entry.pending_back_target_execution.as_ref(),
+                                entry.pending_frame_drive.as_ref(),
+                            ) {
+                                (
+                                    Some(PendingBackTargetExecution::Driving(owner)),
+                                    Some(retry),
+                                ) => match entry.engine.validate_back_target_execution_pairing(
+                                    BackTargetExecutionOwnerRef::Driving {
+                                        history: &owner.history,
+                                        continuation: &owner.continuation,
+                                    },
+                                    BackTargetPhysicalOwnerRef::FrameTask(&retry.task),
+                                ) {
+                                    BackTargetExecutionPairingOutcome::Matched => None,
+                                    BackTargetExecutionPairingOutcome::Mismatch(mismatch) => {
+                                        Some(mismatch)
+                                    }
+                                },
+                                _ => None,
+                            };
+                        if let Some(mismatch) = retry_pairing_mismatch {
+                            let Some(PendingBackTargetExecution::Driving(owner)) =
+                                entry.pending_back_target_execution.take()
+                            else {
+                                continue;
+                            };
+                            entry.pending_back_target_execution =
+                                Some(PendingBackTargetExecution::ResumeBlocked(
+                                    PendingBackTargetResumeBlocked::DrivingPairingMismatch {
+                                        owner,
+                                        mismatch,
+                                    },
+                                ));
+                            continue;
+                        }
                         let (action, retry_context) =
-                            if let Some(retry) = entry.pending_frame_drive.take() {
+                            if let Some(action) = target_action {
+                                (Some(action), None)
+                            } else if let Some(retry) = entry.pending_frame_drive.take() {
                                 (
                                     Some(EngineAction::FrameTask(retry.task)),
                                     Some((retry.pending, retry.effect)),
@@ -1724,12 +3015,73 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                     match entry.engine.expected_child_outlet(&task) {
                                         Ok(expected) => expected,
                                         Err(_) => {
-                                            entry.pending_failed_branch =
-                                                Some(stale_driver_report_owner(pending, task));
+                                            match route_back_target_frame_failure(
+                                                world,
+                                                entry,
+                                                BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                    pending,
+                                                ),
+                                                task,
+                                                ViewFailureKind::Apply,
+                                                "route view report application became stale",
+                                            ) {
+                                                RouteBackTargetFrameFailureOutcome::Handled => {}
+                                                RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                    physical:
+                                                        BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                            pending,
+                                                        ),
+                                                    task,
+                                                } => {
+                                                    entry.pending_failed_branch = Some(
+                                                        stale_driver_report_owner(pending, task),
+                                                    );
+                                                }
+                                                RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                    physical:
+                                                        BackTargetDriverUnverifiedPhysicalOwner::Residual(
+                                                            _,
+                                                        ),
+                                                    ..
+                                                } => unreachable!(
+                                                    "a Pending stale report must remain Pending when proven non-target"
+                                                ),
+                                            }
                                             continue;
                                         }
                                     };
                                 let Some(host) = entry.host.as_ref() else {
+                                    let (pending, task) =
+                                        match route_back_target_frame_failure(
+                                            world,
+                                            entry,
+                                            BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                pending,
+                                            ),
+                                            task,
+                                            ViewFailureKind::Apply,
+                                            "router host unavailable during frame apply",
+                                        ) {
+                                            RouteBackTargetFrameFailureOutcome::Handled => {
+                                                continue;
+                                            }
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                        pending,
+                                                    ),
+                                                task,
+                                            } => (pending, task),
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Residual(
+                                                        _,
+                                                    ),
+                                                ..
+                                            } => unreachable!(
+                                                "a Pending host failure must remain Pending when proven non-target"
+                                            ),
+                                        };
                                     let failure = entry.engine.report_failed(
                                         task,
                                         ViewFailureKind::Apply,
@@ -1744,6 +3096,37 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                     continue;
                                 };
                                 if !validated_host_candidate_is_current(world, &host.candidate) {
+                                    let (pending, task) =
+                                        match route_back_target_frame_failure(
+                                            world,
+                                            entry,
+                                            BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                pending,
+                                            ),
+                                            task,
+                                            ViewFailureKind::Apply,
+                                            "router host authority changed before frame realization",
+                                        ) {
+                                            RouteBackTargetFrameFailureOutcome::Handled => {
+                                                continue;
+                                            }
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                        pending,
+                                                    ),
+                                                task,
+                                            } => (pending, task),
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Residual(
+                                                        _,
+                                                    ),
+                                                ..
+                                            } => unreachable!(
+                                                "a Pending host drift must remain Pending when proven non-target"
+                                            ),
+                                        };
                                     let failure = entry.engine.report_failed(
                                         task,
                                         ViewFailureKind::Apply,
@@ -1761,6 +3144,37 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                     view_integration::driver_key(&entry.views, task.view())
                                         .cloned()
                                 else {
+                                    let (pending, task) =
+                                        match route_back_target_frame_failure(
+                                            world,
+                                            entry,
+                                            BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                pending,
+                                            ),
+                                            task,
+                                            ViewFailureKind::Build,
+                                            "route view binding unavailable",
+                                        ) {
+                                            RouteBackTargetFrameFailureOutcome::Handled => {
+                                                continue;
+                                            }
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                        pending,
+                                                    ),
+                                                task,
+                                            } => (pending, task),
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Residual(
+                                                        _,
+                                                    ),
+                                                ..
+                                            } => unreachable!(
+                                                "a Pending binding failure must remain Pending when proven non-target"
+                                            ),
+                                        };
                                     let failure = entry.engine.report_failed(
                                         task,
                                         ViewFailureKind::Build,
@@ -1775,6 +3189,37 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                     continue;
                                 };
                                 let Some(driver) = drivers.get_mut(&driver_key) else {
+                                    let (pending, task) =
+                                        match route_back_target_frame_failure(
+                                            world,
+                                            entry,
+                                            BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                pending,
+                                            ),
+                                            task,
+                                            ViewFailureKind::Build,
+                                            "route view driver unavailable",
+                                        ) {
+                                            RouteBackTargetFrameFailureOutcome::Handled => {
+                                                continue;
+                                            }
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                        pending,
+                                                    ),
+                                                task,
+                                            } => (pending, task),
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Residual(
+                                                        _,
+                                                    ),
+                                                ..
+                                            } => unreachable!(
+                                                "a Pending missing driver must remain Pending when proven non-target"
+                                            ),
+                                        };
                                     let failure = entry.engine.report_failed(
                                         task,
                                         ViewFailureKind::Build,
@@ -1814,14 +3259,45 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                 }
                                 if report.kind() != ViewBuildReportKind::Applied {
                                     if entry.engine.inspect_report_identity(&task).is_err() {
-                                        entry.pending_failed_branch = Some(PendingFailedBranch {
-                                            terminal: PendingFailedBranchTerminal::Task {
+                                        match route_back_target_frame_failure(
+                                            world,
+                                            entry,
+                                            BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                pending,
+                                            ),
+                                            task,
+                                            ViewFailureKind::Apply,
+                                            "route view report identity became stale",
+                                        ) {
+                                            RouteBackTargetFrameFailureOutcome::Handled => {}
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                        pending,
+                                                    ),
                                                 task,
-                                                failure: ViewFailureKind::Apply,
-                                                message: "route view report identity became stale",
-                                            },
-                                            branch: failed_prepared_branch(pending, None),
-                                        });
+                                            } => {
+                                                entry.pending_failed_branch =
+                                                    Some(PendingFailedBranch {
+                                                        terminal:
+                                                            PendingFailedBranchTerminal::Task {
+                                                                task,
+                                                                failure: ViewFailureKind::Apply,
+                                                                message: "route view report identity became stale",
+                                                            },
+                                                        branch: failed_prepared_branch(pending, None),
+                                                    });
+                                            }
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Residual(
+                                                        _,
+                                                    ),
+                                                ..
+                                            } => unreachable!(
+                                                "a Pending stale report must remain Pending when proven non-target"
+                                            ),
+                                        }
                                         continue;
                                     }
                                     let failure = match report.kind() {
@@ -1829,6 +3305,39 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                         ViewBuildReportKind::ApplyFailed => ViewFailureKind::Apply,
                                         ViewBuildReportKind::Applied => unreachable!(),
                                     };
+                                    #[cfg(test)]
+                                    inject_back_target_driver_staging_drift(entry);
+                                    let (pending, task) =
+                                        match route_back_target_frame_failure(
+                                            world,
+                                            entry,
+                                            BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                pending,
+                                            ),
+                                            task,
+                                            failure,
+                                            "route view driver rejected the frame",
+                                        ) {
+                                            RouteBackTargetFrameFailureOutcome::Handled => {
+                                                continue;
+                                            }
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                        pending,
+                                                    ),
+                                                task,
+                                            } => (pending, task),
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Residual(
+                                                        _,
+                                                    ),
+                                                ..
+                                            } => unreachable!(
+                                                "a Pending driver failure must remain Pending when proven non-target"
+                                            ),
+                                        };
                                     let failure = entry.engine.report_failed(
                                         task,
                                         failure,
@@ -1859,8 +3368,38 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                 let realized = match realized {
                                     Ok(realized) => realized,
                                     Err(DriverReportApplicationError::Stale) => {
-                                        entry.pending_failed_branch =
-                                            Some(stale_driver_report_owner(pending, task));
+                                        match route_back_target_frame_failure(
+                                            world,
+                                            entry,
+                                            BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                pending,
+                                            ),
+                                            task,
+                                            ViewFailureKind::Apply,
+                                            "route view report application became stale",
+                                        ) {
+                                            RouteBackTargetFrameFailureOutcome::Handled => {}
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                        pending,
+                                                    ),
+                                                task,
+                                            } => {
+                                                entry.pending_failed_branch = Some(
+                                                    stale_driver_report_owner(pending, task),
+                                                );
+                                            }
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Residual(
+                                                        _,
+                                                    ),
+                                                ..
+                                            } => unreachable!(
+                                                "a Pending stale application must remain Pending when proven non-target"
+                                            ),
+                                        }
                                         continue;
                                     }
                                     Err(DriverReportApplicationError::Realization(failure)) => {
@@ -1875,30 +3414,87 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                                     )
                                                 }
                                             };
-                                            if realizing_root {
-                                                entry.pending_failed_branch =
-                                                    Some(PendingFailedBranch {
-                                                        terminal: PendingFailedBranchTerminal::TaskWithPhysicalResidual {
-                                                        task,
-                                                        failure: ViewFailureKind::Apply,
-                                                        message: "frame realization rejected",
-                                                    },
-                                                        branch: failed_branch,
-                                                    });
-                                            } else {
-                                                let terminal = nested_failure_terminal(
-                                                    &mut entry.engine,
+                                            match route_back_target_frame_failure(
+                                                world,
+                                                entry,
+                                                BackTargetDriverUnverifiedPhysicalOwner::Residual(
+                                                    failed_branch,
+                                                ),
+                                                task,
+                                                ViewFailureKind::Apply,
+                                                "frame realization rejected",
+                                            ) {
+                                                RouteBackTargetFrameFailureOutcome::Handled => {}
+                                                RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                    physical:
+                                                        BackTargetDriverUnverifiedPhysicalOwner::Residual(
+                                                            failed_branch,
+                                                        ),
+                                                    task,
+                                                } => {
+                                                    let terminal = if realizing_root {
+                                                        PendingFailedBranchTerminal::TaskWithPhysicalResidual {
+                                                            task,
+                                                            failure: ViewFailureKind::Apply,
+                                                            message: "frame realization rejected",
+                                                        }
+                                                    } else {
+                                                        nested_failure_terminal(
+                                                            &mut entry.engine,
+                                                            task,
+                                                            ViewFailureKind::Apply,
+                                                            "frame realization rejected",
+                                                        )
+                                                    };
+                                                    entry.pending_failed_branch = Some(
+                                                        PendingFailedBranch {
+                                                            terminal,
+                                                            branch: failed_branch,
+                                                        },
+                                                    );
+                                                }
+                                                RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                    physical:
+                                                        BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                            _,
+                                                        ),
+                                                    ..
+                                                } => unreachable!(
+                                                    "a realized residual must remain Residual when proven non-target"
+                                                ),
+                                            }
+                                        } else {
+                                            let (pending, task) =
+                                                match route_back_target_frame_failure(
+                                                    world,
+                                                    entry,
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                        pending,
+                                                    ),
                                                     task,
                                                     ViewFailureKind::Apply,
                                                     "frame realization rejected",
-                                                );
-                                                entry.pending_failed_branch =
-                                                    Some(PendingFailedBranch {
-                                                        terminal,
-                                                        branch: failed_branch,
-                                                    });
-                                            }
-                                        } else {
+                                                ) {
+                                                    RouteBackTargetFrameFailureOutcome::Handled => {
+                                                        continue;
+                                                    }
+                                                    RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                        physical:
+                                                            BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                                pending,
+                                                            ),
+                                                        task,
+                                                    } => (pending, task),
+                                                    RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                        physical:
+                                                            BackTargetDriverUnverifiedPhysicalOwner::Residual(
+                                                                _,
+                                                            ),
+                                                        ..
+                                                    } => unreachable!(
+                                                        "a Pending realization failure must remain Pending when proven non-target"
+                                                    ),
+                                                };
                                             let failure = entry.engine.report_failed(
                                                 task,
                                                 ViewFailureKind::Apply,
@@ -1923,51 +3519,157 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                         pending.branch,
                                         realized,
                                     );
-                                    if realizing_root {
-                                        entry.pending_failed_branch = Some(PendingFailedBranch {
-                                            terminal: PendingFailedBranchTerminal::TaskWithPhysicalResidual {
-                                                task,
-                                                failure: ViewFailureKind::Apply,
-                                                message: "frame branch append rejected",
-                                            },
-                                            branch: failed_branch,
-                                        });
-                                    } else {
-                                        let terminal = nested_failure_terminal(
-                                            &mut entry.engine,
+                                    match route_back_target_frame_failure(
+                                        world,
+                                        entry,
+                                        BackTargetDriverUnverifiedPhysicalOwner::Residual(
+                                            failed_branch,
+                                        ),
+                                        task,
+                                        ViewFailureKind::Apply,
+                                        "frame branch append rejected",
+                                    ) {
+                                        RouteBackTargetFrameFailureOutcome::Handled => {}
+                                        RouteBackTargetFrameFailureOutcome::NonTarget {
+                                            physical:
+                                                BackTargetDriverUnverifiedPhysicalOwner::Residual(
+                                                    failed_branch,
+                                                ),
                                             task,
-                                            ViewFailureKind::Apply,
-                                            "frame branch append rejected",
-                                        );
-                                        entry.pending_failed_branch = Some(PendingFailedBranch {
-                                            terminal,
-                                            branch: failed_branch,
-                                        });
+                                        } => {
+                                            let terminal = if realizing_root {
+                                                PendingFailedBranchTerminal::TaskWithPhysicalResidual {
+                                                    task,
+                                                    failure: ViewFailureKind::Apply,
+                                                    message: "frame branch append rejected",
+                                                }
+                                            } else {
+                                                nested_failure_terminal(
+                                                    &mut entry.engine,
+                                                    task,
+                                                    ViewFailureKind::Apply,
+                                                    "frame branch append rejected",
+                                                )
+                                            };
+                                            entry.pending_failed_branch =
+                                                Some(PendingFailedBranch {
+                                                    terminal,
+                                                    branch: failed_branch,
+                                                });
+                                        }
+                                        RouteBackTargetFrameFailureOutcome::NonTarget {
+                                            physical:
+                                                BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                    _,
+                                                ),
+                                            ..
+                                        } => unreachable!(
+                                            "an appended residual must remain Residual when proven non-target"
+                                        ),
                                     }
                                     continue;
                                 }
                                 if expected_child_outlet.is_some() {
                                     let Some(parent) = pending.branch.last_frame() else {
-                                        entry.pending_commit = Some(pending);
+                                        match route_back_target_frame_failure(
+                                            world,
+                                            entry,
+                                            BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                pending,
+                                            ),
+                                            task,
+                                            ViewFailureKind::Apply,
+                                            "parent frame unavailable after realization",
+                                        ) {
+                                            RouteBackTargetFrameFailureOutcome::Handled => {}
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                        pending,
+                                                    ),
+                                                task: _task,
+                                            } => {
+                                                entry.pending_commit = Some(pending);
+                                            }
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Residual(
+                                                        _,
+                                                    ),
+                                                ..
+                                            } => unreachable!(
+                                                "a Pending parent retry must remain Pending when proven non-target"
+                                            ),
+                                        }
                                         continue;
                                     };
                                     if !validate_realized_frame(world, parent) {
-                                        entry.pending_failed_branch = Some(PendingFailedBranch {
-                                            terminal: PendingFailedBranchTerminal::Task {
+                                        match route_back_target_frame_failure(
+                                            world,
+                                            entry,
+                                            BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                pending,
+                                            ),
+                                            task,
+                                            ViewFailureKind::Apply,
+                                            "parent frame preflight rejected",
+                                        ) {
+                                            RouteBackTargetFrameFailureOutcome::Handled => {}
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Pending(
+                                                        pending,
+                                                    ),
                                                 task,
-                                                failure: ViewFailureKind::Apply,
-                                                message: "parent frame preflight rejected",
-                                            },
-                                            branch: failed_prepared_branch(pending, None),
-                                        });
+                                            } => {
+                                                entry.pending_failed_branch =
+                                                    Some(PendingFailedBranch {
+                                                        terminal:
+                                                            PendingFailedBranchTerminal::Task {
+                                                                task,
+                                                                failure: ViewFailureKind::Apply,
+                                                                message: "parent frame preflight rejected",
+                                                            },
+                                                        branch: failed_prepared_branch(pending, None),
+                                                    });
+                                            }
+                                            RouteBackTargetFrameFailureOutcome::NonTarget {
+                                                physical:
+                                                    BackTargetDriverUnverifiedPhysicalOwner::Residual(
+                                                        _,
+                                                    ),
+                                                ..
+                                            } => unreachable!(
+                                                "a Pending parent failure must remain Pending when proven non-target"
+                                            ),
+                                        }
                                         continue;
                                     }
+                                    let report = BackTargetAppliedReport::WithOutlets(
+                                        realized_outlet_keys(parent),
+                                    );
+                                    let (returned_pending, task, outlets) =
+                                        match route_back_target_applied_report(
+                                            world, entry, pending, task, report,
+                                        ) {
+                                            RouteBackTargetAppliedOutcome::Handled => continue,
+                                            RouteBackTargetAppliedOutcome::NonTarget {
+                                                pending,
+                                                task,
+                                                report:
+                                                    BackTargetAppliedReport::WithOutlets(outlets),
+                                            } => (pending, task, outlets),
+                                            RouteBackTargetAppliedOutcome::NonTarget {
+                                                report: BackTargetAppliedReport::LegacyLeaf,
+                                                ..
+                                            } => unreachable!(
+                                                "an intermediate outlet report remains WithOutlets"
+                                            ),
+                                        };
+                                    pending = returned_pending;
                                     if entry
                                         .engine
-                                        .report_applied_with_outlets(
-                                            task,
-                                            realized_outlet_keys(parent),
-                                        )
+                                        .report_applied_with_outlets(task, outlets)
                                         .is_err()
                                     {
                                         let terminal = match entry.engine.action() {
@@ -2303,13 +4005,18 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
                                     branch: failed_prepared_branch(pending, None),
                                 });
                             }
+                            EngineAction::BackResolution(handoff) => {
+                                if bind_back_resolution_handoff(entry, handoff) {
+                                    newly_bound_entries.push(entry_index);
+                                }
+                            }
                         }
                     }
                 },
             );
         },
     );
-    refresh_authority_audits(world);
+    newly_bound_entries
 }
 
 enum ReconciliationPreflightOutcome {
@@ -2323,6 +4030,31 @@ enum ReconciliationPreflightOutcome {
     },
     AuthorityLost {
         splice: SealedReconciliationSplice,
+        evidence: LifecyclePreflightEvidence,
+    },
+}
+
+pub(crate) enum ReconciliationPreparationDecision {
+    Ready(BackTargetReadyAcceptanceOwner),
+    PendingRejected {
+        owner: TargetPreparationOwner,
+        evidence: LifecyclePreflightEvidence,
+    },
+    AuthorityLost {
+        owner: TargetPreparationOwner,
+        evidence: LifecyclePreflightEvidence,
+    },
+    Permanent(PreparationPermanentOwner<TargetPreparationOwner>),
+}
+
+pub(crate) enum ReconciliationPreparationOutcome {
+    Matched(ReconciliationPreparationDecision),
+    PairingMismatch {
+        owner: TargetPreparationOwner,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    EntryMismatch {
+        owner: TargetPreparationOwner,
         evidence: LifecyclePreflightEvidence,
     },
 }
@@ -2485,11 +4217,2076 @@ fn reconciliation_preflight(
     }
 }
 
+pub(crate) fn classify_back_target(
+    world: &World,
+    entry: &mut RouterEntry,
+    owner: TargetPreparationOwner,
+) -> ReconciliationPreparationOutcome {
+    let Some(ticket) = entry
+        .pending_commit
+        .as_ref()
+        .and_then(|pending| pending.ticket.as_ref())
+    else {
+        return ReconciliationPreparationOutcome::EntryMismatch {
+            owner,
+            evidence: LifecyclePreflightEvidence::new(
+                LifecyclePreflightSource::PendingAdmission,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ),
+        };
+    };
+    if let BackTargetExecutionPairingOutcome::Mismatch(mismatch) =
+        entry.engine.validate_back_target_execution_pairing(
+            BackTargetExecutionOwnerRef::Classifying {
+                history: &owner.history,
+                continuation: &owner.continuation,
+            },
+            BackTargetPhysicalOwnerRef::CommitTicket(ticket),
+        )
+    {
+        return ReconciliationPreparationOutcome::PairingMismatch { owner, mismatch };
+    }
+    let TargetPreparationOwner {
+        splice,
+        history,
+        continuation,
+    } = owner;
+    let has_leaving =
+        !splice.leaving().frames().is_empty() || !splice.leaving().child_slots().is_empty();
+    let host_is_current = entry
+        .host
+        .as_ref()
+        .is_some_and(|host| current_host_binding_is_exact(world, host));
+    match reconciliation_preflight(world, host_is_current, has_leaving, splice) {
+        ReconciliationPreflightOutcome::PendingRejected { splice, evidence } => {
+            ReconciliationPreparationOutcome::Matched(
+                ReconciliationPreparationDecision::PendingRejected {
+                    owner: TargetPreparationOwner {
+                        splice,
+                        history,
+                        continuation,
+                    },
+                    evidence,
+                },
+            )
+        }
+        ReconciliationPreflightOutcome::AuthorityLost { splice, evidence } => {
+            ReconciliationPreparationOutcome::Matched(
+                ReconciliationPreparationDecision::AuthorityLost {
+                    owner: TargetPreparationOwner {
+                        splice,
+                        history,
+                        continuation,
+                    },
+                    evidence,
+                },
+            )
+        }
+        ReconciliationPreflightOutcome::Ready {
+            splice,
+            mut focus_leaving,
+        } => {
+            let retained_empty_focus = observed_descendant_closure(
+                world,
+                splice
+                    .slot_roles()
+                    .iter()
+                    .filter(|role| role.kind() == ReconciliationSlotRoleKind::RetainEmpty)
+                    .map(|role| role.entity()),
+            );
+            focus_leaving.extend(retained_empty_focus);
+            focus_leaving.sort_by_key(|entity| entity.to_bits());
+            focus_leaving.dedup();
+
+            let transitions = splice.lifecycle_transitions();
+            let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+                let evidence = LifecyclePreflightEvidence::new(
+                    LifecyclePreflightSource::RequiredResources(
+                        RequiredResourceSet::ROUTE_ENTITY_REGISTRY,
+                    ),
+                    LifecyclePreflightExpectation::ResourcePresent,
+                    LifecyclePreflightObserved::Missing,
+                );
+                return ReconciliationPreparationOutcome::Matched(
+                    ReconciliationPreparationDecision::AuthorityLost {
+                        owner: TargetPreparationOwner {
+                            splice,
+                            history,
+                            continuation,
+                        },
+                        evidence,
+                    },
+                );
+            };
+            let Some(registry_plan) = registry.prepare_lifecycle_mutation(&transitions) else {
+                let evidence = LifecyclePreflightEvidence::new(
+                    LifecyclePreflightSource::TargetPartition,
+                    LifecyclePreflightExpectation::ExactAuthority,
+                    LifecyclePreflightObserved::Contradictory,
+                );
+                return ReconciliationPreparationOutcome::Matched(
+                    ReconciliationPreparationDecision::Permanent(PreparationPermanentOwner {
+                        owner: TargetPreparationOwner {
+                            splice,
+                            history,
+                            continuation,
+                        },
+                        evidence: PreparationPermanentEvidence::PhysicalPreparationContradiction(
+                            evidence,
+                        ),
+                    }),
+                );
+            };
+            let resulting_claims = registry_plan.resulting_claims();
+            let leaving_count = splice.leaving().obligation_count();
+            let frozen_manifest = if leaving_count == 0 {
+                FrozenCleanupManifest::empty()
+            } else {
+                let Some(manifest) = FrozenCleanupManifest::from_leaving_branch(
+                    world,
+                    registry,
+                    splice.leaving(),
+                    resulting_claims,
+                    (!splice.entering().frames().is_empty()).then_some(splice.entering()),
+                ) else {
+                    let evidence = LifecyclePreflightEvidence::new(
+                        LifecyclePreflightSource::TargetPartition,
+                        LifecyclePreflightExpectation::ExactRelationshipClosure,
+                        LifecyclePreflightObserved::Contradictory,
+                    );
+                    return ReconciliationPreparationOutcome::Matched(
+                        ReconciliationPreparationDecision::Permanent(PreparationPermanentOwner {
+                            owner: TargetPreparationOwner {
+                                splice,
+                                history,
+                                continuation,
+                            },
+                            evidence:
+                                PreparationPermanentEvidence::PhysicalPreparationContradiction(
+                                    evidence,
+                                ),
+                        }),
+                    );
+                };
+                manifest
+            };
+            let manifest = CleanupManifest::new(
+                logical_cleanup_roots(splice.leaving()),
+                frozen_manifest.digest(),
+                frozen_manifest.len(),
+            );
+            ReconciliationPreparationOutcome::Matched(ReconciliationPreparationDecision::Ready(
+                BackTargetReadyAcceptanceOwner {
+                    physical: PreparedBackTargetPhysicalOwner {
+                        classified: BackTargetClassifiedPhysicalOwner { splice, history },
+                        focus_leaving,
+                    },
+                    continuation,
+                    frozen_manifest,
+                    manifest,
+                },
+            ))
+        }
+    }
+}
+
+fn normalize_back_target_driver_claims(
+    mut claims: Vec<ExactRegistryClaim>,
+) -> Result<Vec<ExactRegistryClaim>, BackTargetDriverPhysicalIndeterminateReason> {
+    claims.sort_by_key(|claim| claim.entity().to_bits());
+    if claims
+        .windows(2)
+        .any(|pair| pair[0].entity() == pair[1].entity())
+    {
+        return Err(BackTargetDriverPhysicalIndeterminateReason::DuplicateActiveClaim);
+    }
+    Ok(claims)
+}
+
+fn back_target_driver_owner_belongs_to_frames(
+    owner: &RegistryOwner,
+    frames: &[RouteFrameVersion],
+) -> bool {
+    match owner {
+        RegistryOwner::Committed(
+            EntityOwner::FrameShell(frame)
+            | EntityOwner::FrameContentTarget(frame)
+            | EntityOwner::FrameOutput { frame, .. },
+        )
+        | RegistryOwner::Committed(EntityOwner::ChildSlot { parent: frame, .. })
+        | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { parent: frame, .. }) => {
+            frames.iter().any(|expected| expected == frame)
+        }
+        RegistryOwner::Committed(EntityOwner::HostTopSlot { .. })
+        | RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(_)) => false,
+    }
+}
+
+fn observe_back_target_driver_registry_claim(
+    world: &World,
+    claim: ExactRegistryClaim,
+) -> BackTargetDriverObservedRegistryClaim {
+    let state = if world.get_entity(claim.entity()).is_err() {
+        BackTargetDriverObservedClaimState::MissingEntity
+    } else if cleanup_claim_has_exact_authority(world, &claim) {
+        BackTargetDriverObservedClaimState::Exact
+    } else {
+        BackTargetDriverObservedClaimState::AuthorityDrift
+    };
+    BackTargetDriverObservedRegistryClaim { claim, state }
+}
+
+fn observe_back_target_driver_physical_partition(
+    world: &World,
+    entry: &RouterEntry,
+    task: BackTargetDriverTaskPhysicalProjection,
+) -> Result<BackTargetDriverPhysicalPartitionProjection, BackTargetDriverPhysicalIndeterminateReason>
+{
+    let host = entry
+        .host
+        .as_ref()
+        .ok_or(BackTargetDriverPhysicalIndeterminateReason::MissingHost)?;
+    if !validated_host_candidate_is_current(world, &host.candidate) {
+        return Err(BackTargetDriverPhysicalIndeterminateReason::HostAuthorityDrift);
+    }
+    let registry = world
+        .get_resource::<RouteEntityRegistry>()
+        .ok_or(BackTargetDriverPhysicalIndeterminateReason::HostAuthorityDrift)?;
+    if registry
+        .record(host.top_slot)
+        .is_none_or(|record| record.claim() != host.top_slot_claim)
+        || !cleanup_claim_has_exact_authority(world, &host.top_slot_claim)
+        || world
+            .get::<bevy_ecs::hierarchy::ChildOf>(host.top_slot)
+            .map(bevy_ecs::hierarchy::ChildOf::parent)
+            != Some(host.host)
+    {
+        return Err(BackTargetDriverPhysicalIndeterminateReason::HostAuthorityDrift);
+    }
+    let target_frames = std::slice::from_ref(&task.frame);
+    let target_claims = normalize_back_target_driver_claims(
+        registry
+            .records()
+            .iter()
+            .filter(|record| {
+                back_target_driver_owner_belongs_to_frames(record.owner(), target_frames)
+            })
+            .map(|record| record.claim().clone())
+            .collect(),
+    )?;
+    if target_claims
+        .iter()
+        .any(|claim| !cleanup_claim_has_exact_authority(world, claim))
+    {
+        return Err(BackTargetDriverPhysicalIndeterminateReason::TargetRegistryIncomplete);
+    }
+    let target_boundaries = registry
+        .records()
+        .iter()
+        .filter_map(|record| {
+            matches!(
+                record.owner(),
+                RegistryOwner::Committed(EntityOwner::FrameShell(frame))
+                    if frame == &task.frame
+            )
+            .then_some(record.entity())
+        })
+        .collect::<Vec<_>>();
+    if target_boundaries.len() > 1 {
+        return Err(BackTargetDriverPhysicalIndeterminateReason::TargetRegistryIncomplete);
+    }
+    let active = entry
+        .active
+        .as_ref()
+        .ok_or(BackTargetDriverPhysicalIndeterminateReason::MissingActive)?;
+    let mut protected = validate_active_branch_local(world, active, &target_boundaries)
+        .map_err(|_| BackTargetDriverPhysicalIndeterminateReason::ActiveTopologyDrift)?;
+    if active.frames().len() == 1
+        && active.child_slots().is_empty()
+        && !validate_active_frame(world, &active.frames()[0])
+    {
+        return Err(BackTargetDriverPhysicalIndeterminateReason::ActiveTopologyDrift);
+    }
+    protected.extend([host.host, host.top_slot]);
+    protected.sort_by_key(|entity| entity.to_bits());
+    protected.dedup();
+
+    let active_frames = active
+        .frames()
+        .iter()
+        .map(|frame| frame.frame().clone())
+        .collect::<Vec<_>>();
+    let active_root_mount = active.frames().first().map(|frame| {
+        let (physical_parent, claim) = frame.mount_binding().physical_parent();
+        BackTargetDriverRootMountPhysicalProjection {
+            frame: frame.frame().clone(),
+            slot: frame.mount_binding().slot(),
+            slot_claim: frame.mount_binding().slot_claim().clone(),
+            physical_parent: match claim {
+                Some(claim) => BackTargetDriverRootPhysicalParentProjection::Claimed {
+                    entity: physical_parent,
+                    claim: claim.clone(),
+                },
+                None => BackTargetDriverRootPhysicalParentProjection::Host(physical_parent),
+            },
+        }
+    });
+    let mut active_child_slots = active
+        .child_slots()
+        .iter()
+        .map(|slot| BackTargetDriverActiveChildSlotProjection {
+            parent: slot.parent().clone(),
+            outlet: slot.outlet().clone(),
+            slot_id: slot.slot_id(),
+            entity: slot.slot(),
+            claim: slot.slot_claim().clone(),
+            role: active
+                .frames()
+                .iter()
+                .find(|frame| frame.mount_binding().matches_mounted_child_slot(slot))
+                .map_or(
+                    BackTargetDriverActiveChildSlotRole::RetainedEmpty,
+                    |frame| BackTargetDriverActiveChildSlotRole::Occupied(frame.frame().clone()),
+                ),
+        })
+        .collect::<Vec<_>>();
+    active_child_slots.sort_by_key(|slot| slot.entity.to_bits());
+    let expected_active_claims = normalize_back_target_driver_claims(
+        active
+            .claims()
+            .cloned()
+            .chain(std::iter::once(host.top_slot_claim.clone()))
+            .collect(),
+    )?;
+    let mut observed_active_claims = registry
+        .records()
+        .iter()
+        .filter(|record| {
+            back_target_driver_owner_belongs_to_frames(record.owner(), &active_frames)
+                || matches!(
+                    record.owner(),
+                    RegistryOwner::Committed(EntityOwner::HostTopSlot {
+                        host: version,
+                        slot,
+                    }) if version == &host.version && *slot == host.slot_id
+                )
+        })
+        .map(|record| observe_back_target_driver_registry_claim(world, record.claim()))
+        .collect::<Vec<_>>();
+    observed_active_claims.sort_by_key(|observed| observed.claim.entity().to_bits());
+
+    Ok(BackTargetDriverPhysicalPartitionProjection {
+        router: entry.handle,
+        task,
+        target_claims,
+        host: BackTargetDriverHostPhysicalProjection {
+            version: host.version.clone(),
+            slot_id: host.slot_id,
+            host: host.host,
+            top_slot: host.top_slot,
+            top_slot_claim: host.top_slot_claim.clone(),
+        },
+        active_frames,
+        active_root_mount,
+        active_child_slots,
+        expected_active_claims,
+        observed_active_claims,
+        protected,
+    })
+}
+
+pub(crate) fn freeze_back_target_driver_physical_partition_source(
+    world: &World,
+    entry: &RouterEntry,
+    driving: &PendingBackTargetDriving,
+    task: &RootFrameTask,
+) -> Result<
+    BackTargetDriverPhysicalPartitionSource,
+    FrozenBackTargetDriverPhysicalIndeterminateEvidence,
+> {
+    match entry.engine.validate_back_target_execution_pairing(
+        BackTargetExecutionOwnerRef::Driving {
+            history: &driving.history,
+            continuation: &driving.continuation,
+        },
+        BackTargetPhysicalOwnerRef::FrameTask(task),
+    ) {
+        BackTargetExecutionPairingOutcome::Matched => {}
+        BackTargetExecutionPairingOutcome::Mismatch(mismatch) => {
+            return Err(FrozenBackTargetDriverPhysicalIndeterminateEvidence {
+                observation: BackTargetDriverPhysicalIndeterminateObservation::PairingMismatch(
+                    mismatch,
+                ),
+            });
+        }
+    }
+    let task = BackTargetDriverTaskPhysicalProjection {
+        report: task.report_identity(),
+        request: task.request(),
+        sequence: task.view_request_sequence(),
+        frame: task.frame().clone(),
+        mount: task.mount_target(),
+    };
+    let frozen =
+        observe_back_target_driver_physical_partition(world, entry, task).map_err(|reason| {
+            FrozenBackTargetDriverPhysicalIndeterminateEvidence {
+                observation: BackTargetDriverPhysicalIndeterminateObservation::Freeze(reason),
+            }
+        })?;
+    Ok(BackTargetDriverPhysicalPartitionSource { frozen })
+}
+
+fn back_target_driver_indeterminate(
+    original: BackTargetDriverUnverifiedPhysicalOwner,
+    evidence: FrozenBackTargetDriverPhysicalIndeterminateEvidence,
+) -> BackTargetDriverPhysicalClassification {
+    BackTargetDriverPhysicalClassification::Indeterminate(
+        BackTargetDriverPhysicalIndeterminateOwner { original, evidence },
+    )
+}
+
+fn back_target_driver_root_lineage_is_exact(
+    source: &BackTargetDriverPhysicalPartitionProjection,
+) -> bool {
+    let FrameMountTarget::TopSlot { host, slot } = &source.task.mount else {
+        return false;
+    };
+    let Some(root) = source.active_root_mount.as_ref() else {
+        return false;
+    };
+    source.active_frames.len() == 1
+        && source.active_child_slots.is_empty()
+        && host == &source.host.version
+        && *slot == source.host.slot_id
+        && source.task.frame.slot() == source.host.slot_id
+        && root.frame == source.active_frames[0]
+        && root.frame.slot() == source.host.slot_id
+        && bevy_ui_router_core::integration::frame_versions_share_router(
+            &root.frame,
+            &source.task.frame,
+        )
+        && root.frame.host() == source.task.frame.host()
+        && root.slot == source.host.top_slot
+        && root.slot_claim == source.host.top_slot_claim
+        && root.physical_parent
+            == BackTargetDriverRootPhysicalParentProjection::Host(source.host.host)
+}
+
+fn back_target_driver_active_registry_is_complete(
+    source: &BackTargetDriverPhysicalPartitionProjection,
+) -> bool {
+    source.expected_active_claims.len() == source.observed_active_claims.len()
+        && source
+            .expected_active_claims
+            .iter()
+            .zip(&source.observed_active_claims)
+            .all(|(expected, observed)| {
+                expected == &observed.claim
+                    && observed.state == BackTargetDriverObservedClaimState::Exact
+            })
+}
+
+fn back_target_driver_residual_reportable(
+    world: &World,
+    source: &BackTargetDriverPhysicalPartitionProjection,
+    branch: FailedPreparedBranch,
+) -> Result<
+    BackTargetDriverResidualPhysicalOwner,
+    (
+        FailedPreparedBranch,
+        BackTargetDriverPhysicalIndeterminateReason,
+    ),
+> {
+    if branch.frames().len() != 1
+        || !branch.child_slots().is_empty()
+        || !branch.mount_residuals().is_empty()
+        || !branch.detached_frames().is_empty()
+        || !branch.rejected_child_slots().is_empty()
+        || branch.mount_new_allowance().is_some()
+        || branch.frames()[0].frame() != &source.task.frame
+        || validate_prepared_branch(world, branch.realized()).is_err()
+    {
+        return Err((
+            branch,
+            BackTargetDriverPhysicalIndeterminateReason::ResidualTopologyIncomplete,
+        ));
+    }
+    let frame = &branch.frames()[0];
+    let (physical_parent, parent_claim) = frame.mount_binding().physical_parent();
+    if frame.mount_binding().slot() != source.host.top_slot
+        || frame.mount_binding().slot_claim() != &source.host.top_slot_claim
+        || physical_parent != source.host.host
+        || parent_claim.is_some()
+    {
+        return Err((
+            branch,
+            BackTargetDriverPhysicalIndeterminateReason::ResidualTopologyIncomplete,
+        ));
+    }
+    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+        return Err((
+            branch,
+            BackTargetDriverPhysicalIndeterminateReason::TargetRegistryIncomplete,
+        ));
+    };
+    let manifest =
+        match FrozenCleanupManifest::from_failed_prepared_branch(world, registry, &branch) {
+            Ok(manifest) => manifest,
+            Err(_) => {
+                return Err((
+                    branch,
+                    BackTargetDriverPhysicalIndeterminateReason::ResidualTopologyIncomplete,
+                ));
+            }
+        };
+    let target_claims = match normalize_back_target_driver_claims(frame.claims().cloned().collect())
+    {
+        Ok(claims) => claims,
+        Err(_) => {
+            return Err((
+                branch,
+                BackTargetDriverPhysicalIndeterminateReason::ResidualTopologyIncomplete,
+            ));
+        }
+    };
+    if manifest.len() == 0
+        || manifest.len() != target_claims.len()
+        || !manifest.boundary_drifts().is_empty()
+        || !manifest.preflight(world)
+        || !failed_prepared_branch_roots_are_exact(world, &branch, &manifest)
+    {
+        return Err((
+            branch,
+            BackTargetDriverPhysicalIndeterminateReason::ResidualTopologyIncomplete,
+        ));
+    }
+    if target_claims
+        .iter()
+        .any(|claim| source.protected.contains(&claim.entity()))
+    {
+        return Err((
+            branch,
+            BackTargetDriverPhysicalIndeterminateReason::TargetProtectedOverlap,
+        ));
+    }
+    let task_frames = [source.task.frame.clone()];
+    let mut observed_target_claims = registry
+        .records()
+        .iter()
+        .filter(|record| back_target_driver_owner_belongs_to_frames(record.owner(), &task_frames))
+        .map(|record| observe_back_target_driver_registry_claim(world, record.claim()))
+        .collect::<Vec<_>>();
+    observed_target_claims.sort_by_key(|observed| observed.claim.entity().to_bits());
+    if observed_target_claims.len() != target_claims.len()
+        || target_claims
+            .iter()
+            .zip(&observed_target_claims)
+            .any(|(expected, observed)| {
+                expected != &observed.claim
+                    || observed.state != BackTargetDriverObservedClaimState::Exact
+            })
+    {
+        return Err((
+            branch,
+            BackTargetDriverPhysicalIndeterminateReason::TargetRegistryIncomplete,
+        ));
+    }
+    Ok(BackTargetDriverResidualPhysicalOwner {
+        branch,
+        proof: FrozenBackTargetDriverPhysicalPartitionProof {
+            source: source.clone(),
+            manifest,
+            target_claims,
+        },
+    })
+}
+
+fn classify_back_target_driver_frozen_physical(
+    world: &World,
+    entry: &RouterEntry,
+    frozen: &BackTargetDriverPhysicalPartitionProjection,
+    owner: BackTargetDriverUnverifiedPhysicalOwner,
+) -> BackTargetDriverPhysicalClassification {
+    let observed =
+        match observe_back_target_driver_physical_partition(world, entry, frozen.task.clone()) {
+            Ok(observed) => observed,
+            Err(reason) => {
+                return back_target_driver_indeterminate(
+                    owner,
+                    FrozenBackTargetDriverPhysicalIndeterminateEvidence {
+                        observation: BackTargetDriverPhysicalIndeterminateObservation::Refreeze {
+                            expected: frozen.clone(),
+                            observed: None,
+                            reason,
+                        },
+                    },
+                );
+            }
+        };
+    if observed != *frozen {
+        return back_target_driver_indeterminate(
+            owner,
+            FrozenBackTargetDriverPhysicalIndeterminateEvidence {
+                observation: BackTargetDriverPhysicalIndeterminateObservation::Refreeze {
+                    expected: frozen.clone(),
+                    observed: Some(observed),
+                    reason: BackTargetDriverPhysicalIndeterminateReason::SourceDrift,
+                },
+            },
+        );
+    }
+    let classify_indeterminate = |original, reason| {
+        back_target_driver_indeterminate(
+            original,
+            FrozenBackTargetDriverPhysicalIndeterminateEvidence {
+                observation: BackTargetDriverPhysicalIndeterminateObservation::Classification {
+                    source: frozen.clone(),
+                    reason,
+                },
+            },
+        )
+    };
+    if !back_target_driver_root_lineage_is_exact(frozen) {
+        return classify_indeterminate(
+            owner,
+            BackTargetDriverPhysicalIndeterminateReason::UnsupportedRootLineage,
+        );
+    }
+    if !back_target_driver_active_registry_is_complete(frozen) {
+        return classify_indeterminate(
+            owner,
+            BackTargetDriverPhysicalIndeterminateReason::ActiveRegistryIncomplete,
+        );
+    }
+    match owner {
+        BackTargetDriverUnverifiedPhysicalOwner::Pending(pending)
+            if pending.ticket.is_none()
+                && pending.final_task.is_none()
+                && pending.branch.frames().is_empty()
+                && pending.branch.child_slots().is_empty() =>
+        {
+            if !frozen.target_claims.is_empty() {
+                return classify_indeterminate(
+                    BackTargetDriverUnverifiedPhysicalOwner::Pending(pending),
+                    BackTargetDriverPhysicalIndeterminateReason::UnclassifiedTargetClaims,
+                );
+            }
+            BackTargetDriverPhysicalClassification::Reportable(
+                BackTargetDriverReportablePhysicalOwner::ProvenZero(
+                    BackTargetDriverZeroPhysicalOwner {
+                        pending,
+                        proof: FrozenBackTargetDriverZeroPhysicalProof {
+                            source: frozen.clone(),
+                        },
+                    },
+                ),
+            )
+        }
+        BackTargetDriverUnverifiedPhysicalOwner::Pending(pending) => classify_indeterminate(
+            BackTargetDriverUnverifiedPhysicalOwner::Pending(pending),
+            BackTargetDriverPhysicalIndeterminateReason::PendingPhysicalResidual,
+        ),
+        BackTargetDriverUnverifiedPhysicalOwner::Residual(branch) => {
+            match back_target_driver_residual_reportable(world, frozen, branch) {
+                Ok(owner) => BackTargetDriverPhysicalClassification::Reportable(
+                    BackTargetDriverReportablePhysicalOwner::Residual(owner),
+                ),
+                Err((branch, reason)) => classify_indeterminate(
+                    BackTargetDriverUnverifiedPhysicalOwner::Residual(branch),
+                    reason,
+                ),
+            }
+        }
+    }
+}
+
+pub(crate) fn classify_back_target_driver_physical(
+    world: &World,
+    entry: &RouterEntry,
+    source: &BackTargetDriverPhysicalPartitionSource,
+    owner: BackTargetDriverUnverifiedPhysicalOwner,
+) -> BackTargetDriverPhysicalClassification {
+    classify_back_target_driver_frozen_physical(world, entry, &source.frozen, owner)
+}
+
+fn reclassify_back_target_driver_post_report(
+    world: &World,
+    entry: &RouterEntry,
+    source: &BackTargetDriverPostReportRefreezeSource,
+    owner: BackTargetDriverUnverifiedPhysicalOwner,
+) -> BackTargetDriverPhysicalClassification {
+    classify_back_target_driver_frozen_physical(world, entry, &source.frozen, owner)
+}
+
+fn store_back_target_driver_failure(
+    entry: &mut RouterEntry,
+    owner: PendingBackTargetDriverFailure,
+) {
+    entry.pending_back_target_execution = Some(PendingBackTargetExecution::ResumeBlocked(
+        PendingBackTargetResumeBlocked::DriverFailure(owner),
+    ));
+}
+
+#[cfg(test)]
+fn inject_back_target_driver_staging_drift(entry: &mut RouterEntry) {
+    if !entry.back_target_driver_staging_drift_armed {
+        return;
+    }
+    let Some(stage) = entry.pending_back_target_execution.take() else {
+        return;
+    };
+    let PendingBackTargetExecution::Driving(owner) = stage else {
+        entry.pending_back_target_execution = Some(stage);
+        return;
+    };
+    entry.back_target_driver_staging_drift_armed = false;
+    entry.pending_back_target_execution =
+        Some(PendingBackTargetExecution::DriverFailureStagingDrift(owner));
+}
+
+fn consume_back_target_driver_reported(
+    entry: &mut RouterEntry,
+    reported: BackTargetDriverFailureReported,
+) {
+    let BackTargetDriverFailureReported {
+        source,
+        history,
+        physical,
+        outcome,
+    } = reported;
+
+    if matches!(
+        (&physical, &outcome),
+        (
+            BackTargetDriverReportablePhysicalOwner::Residual(_),
+            BackTargetDriverFailureCoreOutcome::Fallback(_)
+                | BackTargetDriverFailureCoreOutcome::Terminal(_)
+        )
+    ) {
+        store_back_target_driver_failure(
+            entry,
+            PendingBackTargetDriverFailure::PhysicalMismatch(
+                PendingBackTargetDriverPhysicalMismatch {
+                    source,
+                    history,
+                    physical: physical.into_unverified(),
+                    outcome,
+                    evidence: BackTargetDriverPhysicalMismatchEvidence { _private: () },
+                },
+            ),
+        );
+        return;
+    }
+
+    #[cfg(test)]
+    if entry.back_target_driver_consume_receiver_drift_armed {
+        entry.back_target_driver_consume_receiver_drift_armed = false;
+        assert!(
+            entry.engine.testing_drift_current_frame_task_identity(),
+            "the consume receiver drift seam requires one current fallback Applying FrameTask"
+        );
+    }
+    match entry.engine.consume_back_target_driver_failure(outcome) {
+        BackTargetDriverFailureConsumeOutcome::Mismatch {
+            owner: outcome,
+            mismatch,
+        } => {
+            store_back_target_driver_failure(
+                entry,
+                PendingBackTargetDriverFailure::ConsumeMismatch(
+                    PendingBackTargetDriverConsumeMismatch {
+                        source,
+                        history,
+                        physical: physical.into_unverified(),
+                        outcome,
+                        mismatch,
+                    },
+                ),
+            );
+        }
+        BackTargetDriverFailureConsumeOutcome::FailureCleanup(request) => match physical {
+            BackTargetDriverReportablePhysicalOwner::ProvenZero(owner) => {
+                drop(source);
+                drop(history);
+                drop(owner.proof);
+                entry.pending_failed_branch = Some(PendingFailedBranch {
+                    terminal: PendingFailedBranchTerminal::Request(request),
+                    branch: failed_prepared_branch(owner.pending, None),
+                });
+            }
+            BackTargetDriverReportablePhysicalOwner::Residual(owner) => {
+                drop(source);
+                drop(history);
+                drop(owner.proof);
+                entry.pending_failed_branch = Some(PendingFailedBranch {
+                    terminal: PendingFailedBranchTerminal::Request(request),
+                    branch: owner.branch,
+                });
+            }
+        },
+        BackTargetDriverFailureConsumeOutcome::FallbackReleased => {
+            let BackTargetDriverReportablePhysicalOwner::ProvenZero(owner) = physical else {
+                unreachable!("a residual driver owner is fail-closed before fallback consumption");
+            };
+            drop(source);
+            drop(history);
+            drop(owner);
+        }
+        BackTargetDriverFailureConsumeOutcome::Terminal(evidence) => {
+            let BackTargetDriverReportablePhysicalOwner::ProvenZero(owner) = physical else {
+                unreachable!("a residual driver owner is fail-closed before terminal consumption");
+            };
+            drop(source);
+            drop(history);
+            drop(owner);
+            drop(evidence);
+        }
+    }
+}
+
+pub(crate) fn drive_back_target_driver_failure(world: &mut World, entry: &mut RouterEntry) {
+    let Some(stage) = entry.pending_back_target_execution.take() else {
+        return;
+    };
+    let PendingBackTargetExecution::ResumeBlocked(PendingBackTargetResumeBlocked::DriverFailure(
+        owner,
+    )) = stage
+    else {
+        entry.pending_back_target_execution = Some(stage);
+        return;
+    };
+    #[cfg(test)]
+    entry
+        .back_target_driver_failure_dispatch_calls
+        .fetch_add(1, Ordering::Relaxed);
+    let PendingBackTargetDriverFailure::AwaitingReport(owner) = owner else {
+        store_back_target_driver_failure(entry, owner);
+        return;
+    };
+    let PendingBackTargetDriverAwaitingReport {
+        driving,
+        task,
+        source,
+        physical,
+        kind,
+        message,
+    } = owner;
+    let physical = match classify_back_target_driver_physical(world, entry, &source, physical) {
+        BackTargetDriverPhysicalClassification::Reportable(physical) => physical,
+        BackTargetDriverPhysicalClassification::Indeterminate(physical) => {
+            store_back_target_driver_failure(
+                entry,
+                PendingBackTargetDriverFailure::PhysicalIndeterminate(
+                    PendingBackTargetDriverPhysicalIndeterminate {
+                        driving,
+                        task,
+                        physical,
+                        kind,
+                        message,
+                    },
+                ),
+            );
+            return;
+        }
+    };
+
+    let report_mode = physical.report_mode();
+    let post_source = source.seal_for_report();
+    let PendingBackTargetDriving {
+        history,
+        continuation,
+    } = driving;
+    #[cfg(test)]
+    if entry.back_target_driver_report_receiver_drift_armed {
+        entry.back_target_driver_report_receiver_drift_armed = false;
+        assert!(
+            entry.engine.testing_drift_current_frame_task_identity(),
+            "the report receiver drift seam requires one current Applying FrameTask"
+        );
+    }
+    let outcome = match entry.engine.report_back_target_failed(
+        &history,
+        continuation,
+        task,
+        kind,
+        message,
+        report_mode,
+    ) {
+        BackTargetDriverFailureReportOutcome::Reported(outcome) => outcome,
+        BackTargetDriverFailureReportOutcome::Mismatch {
+            capacity,
+            task,
+            mismatch,
+        } => {
+            drop(post_source);
+            store_back_target_driver_failure(
+                entry,
+                PendingBackTargetDriverFailure::ReceiverMismatch(
+                    PendingBackTargetDriverReceiverMismatch {
+                        driving: PendingBackTargetDriving {
+                            history,
+                            continuation: capacity,
+                        },
+                        task,
+                        physical: physical.into_unverified(),
+                        kind,
+                        message,
+                        mismatch,
+                    },
+                ),
+            );
+            return;
+        }
+    };
+    consume_back_target_driver_reported(
+        entry,
+        BackTargetDriverFailureReported {
+            source: post_source,
+            history,
+            physical,
+            outcome,
+        },
+    );
+}
+
+enum RouteBackTargetAppliedOutcome {
+    Handled,
+    NonTarget {
+        pending: PendingCommit,
+        task: RootFrameTask,
+        report: BackTargetAppliedReport,
+    },
+}
+
+fn store_back_target_applied_staging_mismatch(
+    entry: &mut RouterEntry,
+    previous: Option<BackTargetDriverStagingOwner>,
+    observed: BackTargetDriverStagingMismatchObservation,
+    pending: PendingCommit,
+    task: RootFrameTask,
+    report: BackTargetAppliedReport,
+) -> RouteBackTargetAppliedOutcome {
+    entry.pending_back_target_execution =
+        Some(PendingBackTargetExecution::AppliedReportStagingMismatch(
+            PendingBackTargetAppliedStagingMismatch {
+                previous,
+                pending,
+                task,
+                report,
+                evidence: BackTargetDriverStagingMismatchEvidence {
+                    observed,
+                    pairing: None,
+                },
+            },
+        ));
+    RouteBackTargetAppliedOutcome::Handled
+}
+
+fn route_back_target_applied_report(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    pending: PendingCommit,
+    task: RootFrameTask,
+    report: BackTargetAppliedReport,
+) -> RouteBackTargetAppliedOutcome {
+    if !entry.engine.is_current_root_back_frame_task(&task) {
+        return RouteBackTargetAppliedOutcome::NonTarget {
+            pending,
+            task,
+            report,
+        };
+    }
+    let Some(stage) = entry.pending_back_target_execution.take() else {
+        return store_back_target_applied_staging_mismatch(
+            entry,
+            None,
+            BackTargetDriverStagingMismatchObservation::Missing,
+            pending,
+            task,
+            report,
+        );
+    };
+    let stage = match stage {
+        PendingBackTargetExecution::AppliedReportStagingMismatch(existing) => {
+            entry.pending_back_target_execution =
+                Some(PendingBackTargetExecution::AppliedReportStagingConflict(
+                    PendingBackTargetAppliedStagingConflict {
+                        existing,
+                        incoming: PendingBackTargetAppliedReportAttempt {
+                            pending,
+                            task,
+                            report,
+                        },
+                        evidence: BackTargetDriverStagingMismatchEvidence {
+                            observed:
+                                BackTargetDriverStagingMismatchObservation::ExistingAppliedMismatch,
+                            pairing: None,
+                        },
+                    },
+                ));
+            return RouteBackTargetAppliedOutcome::Handled;
+        }
+        PendingBackTargetExecution::AppliedReportStagingConflict(_) => {
+            unreachable!(
+                "a flat applied staging conflict already owns the unique current root task"
+            )
+        }
+        stage => stage,
+    };
+    let PendingBackTargetExecution::Driving(driving) = stage else {
+        let (previous, observed) = back_target_driver_non_driving_owner(stage);
+        return store_back_target_applied_staging_mismatch(
+            entry,
+            Some(previous),
+            observed,
+            pending,
+            task,
+            report,
+        );
+    };
+    let owner = PendingBackTargetAppliedReportInput {
+        driving,
+        task,
+        pending,
+        report,
+    };
+    let source = match freeze_back_target_driver_physical_partition_source(
+        world,
+        entry,
+        &owner.driving,
+        &owner.task,
+    ) {
+        Ok(source) => source,
+        Err(evidence) => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::AppliedPhysicalIndeterminate(
+                    PendingBackTargetAppliedPhysicalIndeterminate { owner, evidence },
+                ),
+            ));
+            return RouteBackTargetAppliedOutcome::Handled;
+        }
+    };
+    let post_source = source.seal_for_report();
+    let PendingBackTargetAppliedReportInput {
+        driving,
+        task,
+        pending,
+        report,
+    } = owner;
+    let PendingBackTargetDriving {
+        history,
+        continuation,
+    } = driving;
+    #[cfg(test)]
+    entry
+        .back_target_atomic_applied_dispatch_calls
+        .fetch_add(1, Ordering::Relaxed);
+    match entry
+        .engine
+        .report_back_target_applied(&history, continuation, task, report)
+    {
+        BackTargetAppliedReportOutcome::MountRequest { capacity, request } => {
+            let driving = PendingBackTargetDriving {
+                history,
+                continuation: capacity,
+            };
+            match entry.engine.validate_back_target_execution_pairing(
+                BackTargetExecutionOwnerRef::Driving {
+                    history: &driving.history,
+                    continuation: &driving.continuation,
+                },
+                BackTargetPhysicalOwnerRef::MountRequest(&request),
+            ) {
+                BackTargetExecutionPairingOutcome::Matched => {
+                    drop(post_source);
+                    entry.pending_back_target_execution =
+                        Some(PendingBackTargetExecution::ResumeBlocked(
+                            PendingBackTargetResumeBlocked::AppliedMountRequestPending(
+                                PendingBackTargetAppliedMountRequest {
+                                    driving,
+                                    request,
+                                    pending,
+                                },
+                            ),
+                        ));
+                }
+                BackTargetExecutionPairingOutcome::Mismatch(mismatch) => {
+                    entry.pending_back_target_execution =
+                        Some(PendingBackTargetExecution::ResumeBlocked(
+                            PendingBackTargetResumeBlocked::AppliedMountRequestPairingMismatch(
+                                PendingBackTargetAppliedMountRequestPairingMismatch {
+                                    source: post_source,
+                                    driving,
+                                    request,
+                                    pending,
+                                    mismatch,
+                                },
+                            ),
+                        ));
+                }
+            }
+        }
+        BackTargetAppliedReportOutcome::Commit { capacity, ticket } => {
+            drop(post_source);
+            let owner = PendingBackTargetAppliedCommit {
+                driving: PendingBackTargetDriving {
+                    history,
+                    continuation: capacity,
+                },
+                ticket,
+                pending,
+            };
+            match entry.engine.validate_back_target_execution_pairing(
+                BackTargetExecutionOwnerRef::Driving {
+                    history: &owner.driving.history,
+                    continuation: &owner.driving.continuation,
+                },
+                BackTargetPhysicalOwnerRef::CommitTicket(&owner.ticket),
+            ) {
+                BackTargetExecutionPairingOutcome::Matched => {
+                    entry.pending_back_target_execution =
+                        Some(PendingBackTargetExecution::ResumeBlocked(
+                            PendingBackTargetResumeBlocked::AppliedCommitPending(owner),
+                        ));
+                }
+                BackTargetExecutionPairingOutcome::Mismatch(mismatch) => {
+                    entry.pending_back_target_execution =
+                        Some(PendingBackTargetExecution::ResumeBlocked(
+                            PendingBackTargetResumeBlocked::AppliedCommitPairingMismatch(
+                                PendingBackTargetAppliedCommitPairingMismatch { owner, mismatch },
+                            ),
+                        ));
+                }
+            }
+        }
+        BackTargetAppliedReportOutcome::FailureCleanup(owner) => {
+            let physical = BackTargetDriverUnverifiedPhysicalOwner::Residual(
+                failed_prepared_branch(pending, None),
+            );
+            match reclassify_back_target_driver_post_report(world, entry, &post_source, physical) {
+                BackTargetDriverPhysicalClassification::Reportable(physical) => {
+                    consume_back_target_driver_reported(
+                        entry,
+                        BackTargetDriverFailureReported {
+                            source: post_source,
+                            history,
+                            physical,
+                            outcome: BackTargetDriverFailureCoreOutcome::FailureCleanup(owner),
+                        },
+                    );
+                }
+                BackTargetDriverPhysicalClassification::Indeterminate(indeterminate) => {
+                    let BackTargetDriverPhysicalIndeterminateOwner { original, evidence } =
+                        indeterminate;
+                    store_back_target_driver_failure(
+                        entry,
+                        PendingBackTargetDriverFailure::PostReportPhysicalIndeterminate(
+                            PendingBackTargetDriverPostReportPhysicalIndeterminate {
+                                source: post_source,
+                                history,
+                                physical: original,
+                                outcome: BackTargetDriverFailureCoreOutcome::FailureCleanup(owner),
+                                evidence,
+                            },
+                        ),
+                    );
+                }
+            }
+        }
+        BackTargetAppliedReportOutcome::Mismatch {
+            capacity,
+            task,
+            report,
+            mismatch,
+        } => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::AppliedReportMismatch(
+                    PendingBackTargetAppliedReportMismatch {
+                        source: post_source,
+                        owner: PendingBackTargetAppliedReportInput {
+                            driving: PendingBackTargetDriving {
+                                history,
+                                continuation: capacity,
+                            },
+                            task,
+                            pending,
+                            report,
+                        },
+                        mismatch,
+                    },
+                ),
+            ));
+        }
+    }
+    RouteBackTargetAppliedOutcome::Handled
+}
+
+enum RouteBackTargetFrameFailureOutcome {
+    Handled,
+    NonTarget {
+        physical: BackTargetDriverUnverifiedPhysicalOwner,
+        task: RootFrameTask,
+    },
+}
+
+fn back_target_driver_staging_mismatch(
+    previous: Option<BackTargetDriverStagingOwner>,
+    observed: BackTargetDriverStagingMismatchObservation,
+    pairing: Option<PreparationReceiverMismatchView>,
+    physical: BackTargetDriverUnverifiedPhysicalOwner,
+    task: RootFrameTask,
+    kind: ViewFailureKind,
+    message: &'static str,
+) -> PendingBackTargetDriverStagingMismatch {
+    PendingBackTargetDriverStagingMismatch {
+        previous,
+        physical,
+        task,
+        kind,
+        message,
+        evidence: BackTargetDriverStagingMismatchEvidence { observed, pairing },
+    }
+}
+
+fn store_back_target_driver_staging_mismatch(
+    entry: &mut RouterEntry,
+    owner: PendingBackTargetDriverStagingMismatch,
+) -> RouteBackTargetFrameFailureOutcome {
+    entry.pending_back_target_execution = Some(
+        PendingBackTargetExecution::DriverFailureStagingMismatch(owner),
+    );
+    RouteBackTargetFrameFailureOutcome::Handled
+}
+
+fn back_target_driver_non_driving_owner(
+    stage: PendingBackTargetExecution,
+) -> (
+    BackTargetDriverStagingOwner,
+    BackTargetDriverStagingMismatchObservation,
+) {
+    match stage {
+        PendingBackTargetExecution::ResumeBlocked(owner) => (
+            BackTargetDriverStagingOwner::ResumeBlocked(owner),
+            BackTargetDriverStagingMismatchObservation::ResumeBlocked,
+        ),
+        PendingBackTargetExecution::Classifying(owner) => (
+            BackTargetDriverStagingOwner::Classifying(owner),
+            BackTargetDriverStagingMismatchObservation::Classifying,
+        ),
+        PendingBackTargetExecution::Prepared(owner) => (
+            BackTargetDriverStagingOwner::Prepared(owner),
+            BackTargetDriverStagingMismatchObservation::Prepared,
+        ),
+        PendingBackTargetExecution::CommitFailure(owner) => (
+            BackTargetDriverStagingOwner::CommitFailure(owner),
+            BackTargetDriverStagingMismatchObservation::CommitFailure,
+        ),
+        PendingBackTargetExecution::DriverFailureStagingMismatch(owner) => (
+            BackTargetDriverStagingOwner::ExistingMismatch(Box::new(owner)),
+            BackTargetDriverStagingMismatchObservation::ExistingMismatch,
+        ),
+        PendingBackTargetExecution::AppliedReportStagingMismatch(_) => {
+            unreachable!("an applied staging mismatch is safe-stopped before generic wrapping")
+        }
+        PendingBackTargetExecution::AppliedReportStagingConflict(_) => {
+            unreachable!("an applied staging conflict is safe-stopped before generic wrapping")
+        }
+        #[cfg(test)]
+        PendingBackTargetExecution::DriverFailureStagingDrift(owner) => (
+            BackTargetDriverStagingOwner::TestDrift(owner),
+            BackTargetDriverStagingMismatchObservation::TestDrift,
+        ),
+        PendingBackTargetExecution::Driving(_) => {
+            unreachable!("Driving is separated before staging mismatch ownership")
+        }
+    }
+}
+
+fn route_back_target_frame_failure(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    physical: BackTargetDriverUnverifiedPhysicalOwner,
+    task: RootFrameTask,
+    kind: ViewFailureKind,
+    message: &'static str,
+) -> RouteBackTargetFrameFailureOutcome {
+    let current_root_back_task = entry.engine.is_current_root_back_frame_task(&task);
+    let Some(stage) = entry.pending_back_target_execution.take() else {
+        return if current_root_back_task {
+            let owner = back_target_driver_staging_mismatch(
+                None,
+                BackTargetDriverStagingMismatchObservation::Missing,
+                None,
+                physical,
+                task,
+                kind,
+                message,
+            );
+            store_back_target_driver_staging_mismatch(entry, owner)
+        } else {
+            RouteBackTargetFrameFailureOutcome::NonTarget { physical, task }
+        };
+    };
+    let PendingBackTargetExecution::Driving(driving) = stage else {
+        let (previous, observed) = back_target_driver_non_driving_owner(stage);
+        let owner = back_target_driver_staging_mismatch(
+            Some(previous),
+            observed,
+            None,
+            physical,
+            task,
+            kind,
+            message,
+        );
+        return store_back_target_driver_staging_mismatch(entry, owner);
+    };
+    match entry.engine.validate_back_target_execution_pairing(
+        BackTargetExecutionOwnerRef::Driving {
+            history: &driving.history,
+            continuation: &driving.continuation,
+        },
+        BackTargetPhysicalOwnerRef::FrameTask(&task),
+    ) {
+        BackTargetExecutionPairingOutcome::Mismatch(pairing) => {
+            let owner = back_target_driver_staging_mismatch(
+                Some(BackTargetDriverStagingOwner::Driving(driving)),
+                BackTargetDriverStagingMismatchObservation::PairingMismatch,
+                Some(pairing),
+                physical,
+                task,
+                kind,
+                message,
+            );
+            return store_back_target_driver_staging_mismatch(entry, owner);
+        }
+        BackTargetExecutionPairingOutcome::Matched
+            if matches!(task.mount_target(), FrameMountTarget::TopSlot { .. })
+                && !current_root_back_task =>
+        {
+            let owner = back_target_driver_staging_mismatch(
+                Some(BackTargetDriverStagingOwner::Driving(driving)),
+                BackTargetDriverStagingMismatchObservation::NonCurrentRoot,
+                None,
+                physical,
+                task,
+                kind,
+                message,
+            );
+            return store_back_target_driver_staging_mismatch(entry, owner);
+        }
+        BackTargetExecutionPairingOutcome::Matched => {}
+    }
+
+    let source =
+        match freeze_back_target_driver_physical_partition_source(world, entry, &driving, &task) {
+            Ok(source) => source,
+            Err(evidence) => {
+                entry.pending_back_target_execution =
+                    Some(PendingBackTargetExecution::ResumeBlocked(
+                        PendingBackTargetResumeBlocked::DriverFailure(
+                            PendingBackTargetDriverFailure::PhysicalIndeterminate(
+                                PendingBackTargetDriverPhysicalIndeterminate {
+                                    driving,
+                                    task,
+                                    physical: BackTargetDriverPhysicalIndeterminateOwner {
+                                        original: physical,
+                                        evidence,
+                                    },
+                                    kind,
+                                    message,
+                                },
+                            ),
+                        ),
+                    ));
+                drive_back_target_driver_failure(world, entry);
+                return RouteBackTargetFrameFailureOutcome::Handled;
+            }
+        };
+    let failure = match classify_back_target_driver_physical(world, entry, &source, physical) {
+        BackTargetDriverPhysicalClassification::Reportable(physical) => {
+            PendingBackTargetDriverFailure::AwaitingReport(PendingBackTargetDriverAwaitingReport {
+                driving,
+                task,
+                source,
+                physical: physical.into_unverified(),
+                kind,
+                message,
+            })
+        }
+        BackTargetDriverPhysicalClassification::Indeterminate(physical) => {
+            PendingBackTargetDriverFailure::PhysicalIndeterminate(
+                PendingBackTargetDriverPhysicalIndeterminate {
+                    driving,
+                    task,
+                    physical,
+                    kind,
+                    message,
+                },
+            )
+        }
+    };
+    entry.pending_back_target_execution = Some(PendingBackTargetExecution::ResumeBlocked(
+        PendingBackTargetResumeBlocked::DriverFailure(failure),
+    ));
+    drive_back_target_driver_failure(world, entry);
+    RouteBackTargetFrameFailureOutcome::Handled
+}
+
+fn store_back_target_applied_commit_pairing_mismatch(
+    entry: &mut RouterEntry,
+    owner: PendingBackTargetAppliedCommit,
+    mismatch: PreparationReceiverMismatchView,
+) {
+    entry.pending_back_target_execution = Some(PendingBackTargetExecution::ResumeBlocked(
+        PendingBackTargetResumeBlocked::AppliedCommitPairingMismatch(
+            PendingBackTargetAppliedCommitPairingMismatch { owner, mismatch },
+        ),
+    ));
+}
+
+fn store_back_target_applied_commit_permanent(
+    entry: &mut RouterEntry,
+    owner: PendingBackTargetAppliedCommit,
+    evidence: LifecyclePreflightEvidence,
+) {
+    entry.pending_back_target_execution = Some(PendingBackTargetExecution::ResumeBlocked(
+        PendingBackTargetResumeBlocked::AppliedCommitPermanent(
+            PendingBackTargetAppliedCommitPermanent { owner, evidence },
+        ),
+    ));
+}
+
+fn drive_back_target_applied_commit(world: &mut World, entry: &mut RouterEntry) -> bool {
+    if !matches!(
+        entry.pending_back_target_execution.as_ref(),
+        Some(PendingBackTargetExecution::ResumeBlocked(
+            PendingBackTargetResumeBlocked::AppliedCommitPending(_)
+        ))
+    ) {
+        return false;
+    }
+    let Some(PendingBackTargetExecution::ResumeBlocked(
+        PendingBackTargetResumeBlocked::AppliedCommitPending(mut owner),
+    )) = entry.pending_back_target_execution.take()
+    else {
+        unreachable!("the observed target applied Commit owner remains whole");
+    };
+    match entry.engine.validate_back_target_execution_pairing(
+        BackTargetExecutionOwnerRef::Driving {
+            history: &owner.driving.history,
+            continuation: &owner.driving.continuation,
+        },
+        BackTargetPhysicalOwnerRef::CommitTicket(&owner.ticket),
+    ) {
+        BackTargetExecutionPairingOutcome::Matched => {}
+        BackTargetExecutionPairingOutcome::Mismatch(mismatch) => {
+            store_back_target_applied_commit_pairing_mismatch(entry, owner, mismatch);
+            return true;
+        }
+    }
+
+    let authority_root = entry
+        .active
+        .as_ref()
+        .and_then(RealizedBranch::first_frame)
+        .or_else(|| owner.pending.branch.first_frame());
+    let Some(authority) = authority_root.and_then(|root| {
+        ReconciliationAuthorityIdentity::from_frame(
+            root.frame(),
+            root.frame().host(),
+            root.frame().slot(),
+        )
+    }) else {
+        store_back_target_applied_commit_permanent(
+            entry,
+            owner,
+            LifecyclePreflightEvidence::new(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Missing,
+            ),
+        );
+        return true;
+    };
+    let Ok(projection) = entry
+        .engine
+        .reconciliation_projection_for_commit(&owner.ticket)
+    else {
+        store_back_target_applied_commit_permanent(
+            entry,
+            owner,
+            LifecyclePreflightEvidence::new(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ),
+        );
+        return true;
+    };
+    let Some(facts) = ReconciliationProjectionFacts::from_core(&projection, authority) else {
+        store_back_target_applied_commit_permanent(
+            entry,
+            owner,
+            LifecyclePreflightEvidence::new(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactRelationshipClosure,
+                LifecyclePreflightObserved::Contradictory,
+            ),
+        );
+        return true;
+    };
+
+    let had_active = entry.active.is_some();
+    let active = entry.active.take().unwrap_or_else(RealizedBranch::empty);
+    let sealed = match SealedExistingReconciliation::prepare_from_projection(active, facts) {
+        Ok(sealed) => sealed,
+        Err(failure) => {
+            let (active, _) = failure.into_parts();
+            entry.active = had_active.then_some(active);
+            store_back_target_applied_commit_permanent(
+                entry,
+                owner,
+                LifecyclePreflightEvidence::new(
+                    LifecyclePreflightSource::PreservedCurrent,
+                    LifecyclePreflightExpectation::ExactAuthority,
+                    LifecyclePreflightObserved::Drifted,
+                ),
+            );
+            return true;
+        }
+    };
+    let entering = std::mem::replace(&mut owner.pending.branch, PreparedBranch::empty());
+    let splice = match sealed.bind_entering(entering) {
+        Ok(splice) => splice,
+        Err(failure) => {
+            let (sealed, entering, _) = failure.into_parts();
+            let (active, _, _) = sealed.reject().into_parts();
+            entry.active = had_active.then_some(active);
+            owner.pending.branch = entering;
+            store_back_target_applied_commit_permanent(
+                entry,
+                owner,
+                LifecyclePreflightEvidence::new(
+                    LifecyclePreflightSource::CrossRoleRebase,
+                    LifecyclePreflightExpectation::RebaseCompatible,
+                    LifecyclePreflightObserved::Contradictory,
+                ),
+            );
+            return true;
+        }
+    };
+
+    let PendingBackTargetAppliedCommit {
+        driving,
+        ticket,
+        mut pending,
+    } = owner;
+    pending.ticket = Some(ticket);
+    let PendingBackTargetDriving {
+        history,
+        continuation,
+    } = driving;
+    entry.pending_commit = Some(pending);
+    entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+        PendingBackTargetClassification::Active(TargetPreparationOwner {
+            splice,
+            history,
+            continuation,
+        }),
+    ));
+    let Some(PendingBackTargetExecution::Classifying(PendingBackTargetClassification::Active(
+        owner,
+    ))) = entry.pending_back_target_execution.take()
+    else {
+        return true;
+    };
+    match classify_back_target(world, entry, owner) {
+        ReconciliationPreparationOutcome::Matched(ReconciliationPreparationDecision::Ready(
+            owner,
+        )) => {
+            let Some(pending) = entry.pending_commit.take() else {
+                entry.pending_back_target_execution =
+                    Some(PendingBackTargetExecution::Classifying(
+                        PendingBackTargetClassification::ReadyAwaitingAcceptance(owner),
+                    ));
+                return true;
+            };
+            publish_ready_back_target(world, entry, pending, owner);
+        }
+        ReconciliationPreparationOutcome::Matched(
+            ReconciliationPreparationDecision::PendingRejected { owner, evidence },
+        ) => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::PendingRejectedUnaccepted { owner, evidence },
+            ));
+        }
+        ReconciliationPreparationOutcome::Matched(
+            ReconciliationPreparationDecision::AuthorityLost { owner, evidence },
+        ) => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::AuthorityLostUnaccepted { owner, evidence },
+            ));
+        }
+        ReconciliationPreparationOutcome::Matched(
+            ReconciliationPreparationDecision::Permanent(owner),
+        ) => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::Permanent(owner),
+            ));
+        }
+        ReconciliationPreparationOutcome::PairingMismatch { owner, mismatch } => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::PairingMismatch { owner, mismatch },
+            ));
+        }
+        ReconciliationPreparationOutcome::EntryMismatch { owner, evidence } => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::EntryMismatch { owner, evidence },
+            ));
+        }
+    }
+    true
+}
+
+fn drive_back_target_root_commit(world: &mut World, entry: &mut RouterEntry) -> bool {
+    if drive_back_target_applied_commit(world, entry) {
+        return true;
+    }
+    if !matches!(
+        entry.pending_back_target_execution.as_ref(),
+        Some(PendingBackTargetExecution::Driving(_))
+    ) {
+        return entry.pending_back_target_execution.is_some();
+    }
+    let Some(mut pending) = entry.pending_commit.take() else {
+        return true;
+    };
+    if pending.ticket.is_some() {
+        let Some(PendingBackTargetExecution::Driving(driving)) =
+            entry.pending_back_target_execution.take()
+        else {
+            entry.pending_commit = Some(pending);
+            return true;
+        };
+        let ticket = pending
+            .ticket
+            .take()
+            .expect("the observed target Commit ticket remains held");
+        entry.pending_back_target_execution = Some(PendingBackTargetExecution::ResumeBlocked(
+            PendingBackTargetResumeBlocked::AppliedCommitPending(PendingBackTargetAppliedCommit {
+                driving,
+                ticket,
+                pending,
+            }),
+        ));
+        let _ = drive_back_target_applied_commit(world, entry);
+        return true;
+    }
+    let Some(task) = pending.final_task.take() else {
+        entry.pending_commit = Some(pending);
+        return true;
+    };
+    match route_back_target_applied_report(
+        world,
+        entry,
+        pending,
+        task,
+        BackTargetAppliedReport::LegacyLeaf,
+    ) {
+        RouteBackTargetAppliedOutcome::Handled => {
+            let _ = drive_back_target_applied_commit(world, entry);
+            true
+        }
+        RouteBackTargetAppliedOutcome::NonTarget {
+            mut pending,
+            task,
+            report,
+        } => {
+            drop(report);
+            pending.final_task = Some(task);
+            entry.pending_commit = Some(pending);
+            false
+        }
+    }
+}
+
+fn publish_ready_back_target(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    mut pending: PendingCommit,
+    owner: BackTargetReadyAcceptanceOwner,
+) {
+    entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+        PendingBackTargetClassification::ReadyAwaitingAcceptance(owner),
+    ));
+    let Some(PendingBackTargetExecution::Classifying(
+        PendingBackTargetClassification::ReadyAwaitingAcceptance(owner),
+    )) = entry.pending_back_target_execution.take()
+    else {
+        entry.pending_commit = Some(pending);
+        return;
+    };
+
+    let missing = RequiredResourceSet::missing_from(world);
+    if !missing.is_empty() {
+        let evidence = LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::RequiredResources(missing),
+            LifecyclePreflightExpectation::ResourcePresent,
+            LifecyclePreflightObserved::Missing,
+        );
+        entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::ReadyPlanPermanent(PreparationPermanentOwner {
+                owner,
+                evidence: PreparationPermanentEvidence::PhysicalPreparationContradiction(evidence),
+            }),
+        ));
+        entry.pending_commit = Some(pending);
+        return;
+    }
+    let Some(real_ticket) = pending.ticket.take() else {
+        let evidence = LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::PendingAdmission,
+            LifecyclePreflightExpectation::ExactTaskShape,
+            LifecyclePreflightObserved::Contradictory,
+        );
+        entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::ReadyPlanPermanent(PreparationPermanentOwner {
+                owner,
+                evidence: PreparationPermanentEvidence::PhysicalPreparationContradiction(evidence),
+            }),
+        ));
+        entry.pending_commit = Some(pending);
+        return;
+    };
+
+    let splice = &owner.physical.classified.splice;
+    let gate_before = splice.current_interactive_entities();
+    let gate_after = splice.resulting_interactive_entities();
+    let (targets, isolate_count) = splice.presentation_mutation_targets();
+    let transitions = splice.lifecycle_transitions();
+    let root_rebase = if !splice.leaving().frames().is_empty()
+        && !splice.entering().frames().is_empty()
+    {
+        let Some(rebase) = splice.prepare_root_rebase() else {
+            let evidence = LifecyclePreflightEvidence::new(
+                LifecyclePreflightSource::CrossRoleRebase,
+                LifecyclePreflightExpectation::RebaseCompatible,
+                LifecyclePreflightObserved::Contradictory,
+            );
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::ReadyPlanPermanent(PreparationPermanentOwner {
+                    owner,
+                    evidence: PreparationPermanentEvidence::PhysicalPreparationContradiction(
+                        evidence,
+                    ),
+                }),
+            ));
+            entry.pending_commit = Some(pending);
+            return;
+        };
+        Some(rebase)
+    } else {
+        None
+    };
+
+    let mut ready_owner = Some(owner);
+    let mut ticket = Some(real_ticket);
+    let mut next_stage = None;
+    let committed = world.resource_scope(
+        |world, gate: bevy_ecs::change_detection::Mut<RouterInputGate>| {
+            world.resource_scope(
+                |world, input_focus: bevy_ecs::change_detection::Mut<InputFocus>| {
+                    world.resource_scope(
+                        |world,
+                         route_focus: bevy_ecs::change_detection::Mut<RouteFocusState>| {
+                            world.resource_scope(
+                                |world,
+                                 mut registry: bevy_ecs::change_detection::Mut<
+                                    RouteEntityRegistry,
+                                >| {
+                                    let ready = ready_owner.as_ref()?;
+                                    let splice = &ready.physical.classified.splice;
+                                    let registry_plan =
+                                        registry.prepare_lifecycle_mutation(&transitions)?;
+                                    let resulting_claims =
+                                        registry_plan.resulting_claims().to_vec();
+                                    let frozen_again = if splice.leaving().obligation_count() == 0 {
+                                        FrozenCleanupManifest::empty()
+                                    } else {
+                                        FrozenCleanupManifest::from_leaving_branch(
+                                            world,
+                                            &registry,
+                                            splice.leaving(),
+                                            &resulting_claims,
+                                            (!splice.entering().frames().is_empty())
+                                                .then_some(splice.entering()),
+                                        )?
+                                    };
+                                    if frozen_again != ready.frozen_manifest {
+                                        return None;
+                                    }
+                                    let gate_plan = prepare_input_gate_mutation(
+                                        gate,
+                                        &gate_before,
+                                        gate_after,
+                                    )?;
+                                    let focus_plan = prepare_focus_mutation(
+                                        input_focus,
+                                        route_focus,
+                                        &ready.physical.focus_leaving,
+                                    );
+                                    let claim_rebind =
+                                        splice.prepare_claim_rebind(&resulting_claims)?;
+                                    let presentation_plan =
+                                        prepare_presentation_mutation(world, &targets)?
+                                            .seal_commit(isolate_count)?;
+
+                                    let BackTargetReadyAcceptanceOwner {
+                                        physical,
+                                        continuation,
+                                        frozen_manifest,
+                                        manifest,
+                                    } = ready_owner
+                                        .take()
+                                        .expect("the scoped Ready owner is consumed once");
+                                    let scope = continuation.preparation_boundary_scope();
+                                    let continuation = match entry
+                                        .engine
+                                        .accept_back_target_ready(continuation, scope)
+                                    {
+                                        BackTargetPreparationAcceptance::Matched(continuation) => {
+                                            continuation
+                                        }
+                                        BackTargetPreparationAcceptance::Mismatch {
+                                            capacity,
+                                            mismatch,
+                                        } => {
+                                            next_stage = Some(
+                                                PendingBackTargetExecution::Classifying(
+                                                    PendingBackTargetClassification::ReadyAcceptanceMismatch {
+                                                        owner: BackTargetReadyAcceptanceOwner {
+                                                            physical,
+                                                            continuation: capacity,
+                                                            frozen_manifest,
+                                                            manifest,
+                                                        },
+                                                        mismatch,
+                                                    },
+                                                ),
+                                            );
+                                            return None;
+                                        }
+                                    };
+                                    entry.pending_back_target_execution = Some(
+                                        PendingBackTargetExecution::Classifying(
+                                            PendingBackTargetClassification::ReadyAccepted(
+                                                PendingBackTargetReadyAccepted {
+                                                    physical,
+                                                    continuation,
+                                                    frozen_manifest,
+                                                    manifest,
+                                                },
+                                            ),
+                                        ),
+                                    );
+                                    let Some(PendingBackTargetExecution::Classifying(
+                                        PendingBackTargetClassification::ReadyAccepted(accepted),
+                                    )) = entry.pending_back_target_execution.take()
+                                    else {
+                                        return None;
+                                    };
+                                    let ledger =
+                                        match CleanupLedger::reserve(accepted.frozen_manifest) {
+                                            Ok(ledger) => ledger,
+                                            Err(error) => {
+                                                next_stage = Some(
+                                                    PendingBackTargetExecution::Classifying(
+                                                        PendingBackTargetClassification::ReadyReserveFailure {
+                                                            physical: accepted.physical,
+                                                            continuation: accepted.continuation,
+                                                            manifest: accepted.manifest,
+                                                            error,
+                                                        },
+                                                    ),
+                                                );
+                                                return None;
+                                            }
+                                        };
+                                    entry.pending_back_target_execution =
+                                        Some(PendingBackTargetExecution::Prepared(
+                                            PendingPreparedBackTargetCommit {
+                                                physical: accepted.physical,
+                                                continuation: accepted.continuation,
+                                                ledger,
+                                                manifest: accepted.manifest,
+                                            },
+                                        ));
+
+                                    let ticket_ref = ticket
+                                        .as_ref()
+                                        .expect("the scoped Ready driver retains its real ticket");
+                                    let pairing = {
+                                        let Some(PendingBackTargetExecution::Prepared(prepared)) =
+                                            entry.pending_back_target_execution.as_ref()
+                                        else {
+                                            return None;
+                                        };
+                                        entry.engine.validate_back_target_execution_pairing(
+                                            BackTargetExecutionOwnerRef::Prepared {
+                                                history: &prepared
+                                                    .physical
+                                                    .classified
+                                                    .history,
+                                                continuation: &prepared.continuation,
+                                            },
+                                            BackTargetPhysicalOwnerRef::CommitTicket(ticket_ref),
+                                        )
+                                    };
+                                    if let BackTargetExecutionPairingOutcome::Mismatch(mismatch) =
+                                        pairing
+                                    {
+                                        let Some(PendingBackTargetExecution::Prepared(owner)) =
+                                            entry.pending_back_target_execution.take()
+                                        else {
+                                            return None;
+                                        };
+                                        next_stage =
+                                            Some(PendingBackTargetExecution::CommitFailure(
+                                                PendingBackTargetCommitFailure::PairingMismatch {
+                                                    owner,
+                                                    mismatch,
+                                                },
+                                            ));
+                                        return None;
+                                    }
+                                    let Some(PendingBackTargetExecution::Prepared(prepared)) =
+                                        entry.pending_back_target_execution.take()
+                                    else {
+                                        return None;
+                                    };
+                                    let PendingPreparedBackTargetCommit {
+                                        physical,
+                                        continuation,
+                                        ledger,
+                                        manifest,
+                                    } = prepared;
+                                    match entry.engine.prepare_back_target_commit(
+                                        continuation,
+                                        ticket_ref,
+                                        manifest,
+                                    ) {
+                                        BackTargetCommitPreparationOutcome::Mismatch {
+                                            owner,
+                                            manifest,
+                                            mismatch,
+                                        } => {
+                                            next_stage =
+                                                Some(PendingBackTargetExecution::CommitFailure(
+                                                    PendingBackTargetCommitFailure::ReceiverMismatch {
+                                                        owner: PendingPreparedBackTargetCommit {
+                                                            physical,
+                                                            continuation: owner,
+                                                            ledger,
+                                                            manifest,
+                                                        },
+                                                        mismatch,
+                                                    },
+                                                ));
+                                            None
+                                        }
+                                        BackTargetCommitPreparationOutcome::PreparationFailed(
+                                            failure,
+                                        ) => {
+                                            next_stage =
+                                                Some(PendingBackTargetExecution::CommitFailure(
+                                                    PendingBackTargetCommitFailure::Failed {
+                                                        physical,
+                                                        ledger,
+                                                        failure,
+                                                    },
+                                                ));
+                                            None
+                                        }
+                                        BackTargetCommitPreparationOutcome::Validated(engine) => {
+                                            let cleanup =
+                                                ledger.bind_batch(engine.cleanup().clone());
+                                            drop(
+                                                ticket
+                                                    .take()
+                                                    .expect("successful publication ends the real ticket"),
+                                            );
+                                            let mut splice = physical.classified.splice;
+                                            splice.apply_claim_rebind(claim_rebind);
+                                            if let Some(rebase) = root_rebase {
+                                                splice.apply_root_rebase(rebase);
+                                            }
+                                            let outcome = splice.apply();
+                                            let (active, leaving) =
+                                                outcome.into_active_and_leaving();
+                                            let next_active =
+                                                (!active.frames().is_empty()).then_some(active);
+                                            let next_cleanup = Some(
+                                                CleanupLedger::activate_leaving_branch(
+                                                    cleanup,
+                                                    (!leaving.frames().is_empty()
+                                                        || !leaving.child_slots().is_empty())
+                                                    .then_some(leaving),
+                                                ),
+                                            );
+                                            let active_owner = &mut entry.active;
+                                            let cleanup_owner = &mut entry.cleanup_ledger;
+                                            engine.publish(|| {
+                                                presentation_plan.apply_staged(
+                                                    |_| focus_plan.apply(),
+                                                    |_| registry_plan.apply(&mut registry),
+                                                    |_| gate_plan.apply(),
+                                                );
+                                                *active_owner = next_active;
+                                                *cleanup_owner = next_cleanup;
+                                            });
+                                            Some(())
+                                        }
+                                    }
+                                },
+                            )
+                        },
+                    )
+                },
+            )
+        },
+    );
+    if committed.is_none() {
+        pending.ticket = ticket.take();
+        if let Some(stage) = next_stage {
+            entry.pending_back_target_execution = Some(stage);
+        } else if let Some(owner) = ready_owner {
+            let evidence = LifecyclePreflightEvidence::new(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            );
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::ReadyPlanPermanent(PreparationPermanentOwner {
+                    owner,
+                    evidence: PreparationPermanentEvidence::PhysicalPreparationContradiction(
+                        evidence,
+                    ),
+                }),
+            ));
+        }
+        entry.pending_commit = Some(pending);
+    }
+}
+
 pub(crate) fn commit_presentation_system(world: &mut World) {
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             for entry in &mut navigation.entries {
                 if entry.authority_protocol_residual.is_some() {
+                    continue;
+                }
+                if drive_back_target_root_commit(world, entry) {
                     continue;
                 }
                 if let Some(continuation) = entry.projectionless_fail_close.take() {
@@ -5475,6 +9272,9 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             for entry in &mut navigation.entries {
+                if entry.pending_back_target_execution.is_some() {
+                    continue;
+                }
                 if let Some(failed) = entry.pending_failed_branch.take() {
                     if entry.cleanup_ledger.is_some() {
                         entry.pending_failed_branch = Some(failed);
@@ -5776,7 +9576,9 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                     continue;
                 }
                 match entry.engine.complete_cleanup(completion) {
-                    Ok(()) | Err(IntegrationError::Duplicate) => {}
+                    Ok(()) | Err(IntegrationError::Duplicate) => {
+                        bind_post_cleanup_back_resolution(entry);
+                    }
                     Err(_) => entry.cleanup_ledger = Some(ledger),
                 }
             }
@@ -5824,12 +9626,16 @@ pub(crate) mod tests {
     use super::*;
     #[cfg(feature = "test-support")]
     use crate::audit::RouterAuthorityAudits;
+    #[cfg(feature = "test-support")]
+    use crate::cleanup::BackCapacityRetireError;
     use crate::{
         app_ext::{AppRouterExt, RouterConfig, RouterHostRegistration},
         cleanup::{
             AuthorityLostResidualPhysicalRestoreDrift, AuthorityLostResidualPostwriteDrift,
             AuthorityRemovalRegistryPostwriteDrift, AuthorityResidualPostwriteDrift,
-            CleanupPostcheckDrift, CleanupPostcheckPhase, FailedBoundaryExpectation,
+            BackCapacityDomainIssuer, BackCapacityIssuerInstallError, BackCapacityRetireOutcome,
+            CleanupPostcheckDrift, CleanupPostcheckPhase, EnqueueRejected,
+            FailedBoundaryExpectation,
         },
         components::{
             ChildSlotAuthority, ChildSlotAuthorityProbe, ChildSlotBarrierProbe, ChildSlotLifecycle,
@@ -5881,7 +9687,9 @@ pub(crate) mod tests {
     use bevy_picking::Pickable;
     use bevy_picking::events::{Over, Pointer};
     use bevy_ui::{ComputedNode, Node, UiGlobalTransform, Val};
-    use bevy_ui_router_core::integration::{TestingReservationCounter, ViewReportIdentity};
+    use bevy_ui_router_core::integration::{
+        BackTargetResumeAction, BackTargetStart, TestingReservationCounter, ViewReportIdentity,
+    };
     use bevy_ui_router_core::prelude::{
         ActivePresentationKind, FrameOrigin, NavigationFailureKind, NavigationPhase,
         NavigationTraceEventKind, RequestStatus, RouteNodeOptions, RoutePattern, RouteTree,
@@ -5918,6 +9726,11 @@ pub(crate) mod tests {
         key: ViewDriverKey,
     }
 
+    struct ArmableBackFailureDriver {
+        key: ViewDriverKey,
+        fail_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
     struct ReplayIdentityDriver {
         key: ViewDriverKey,
         replay: std::sync::Arc<std::sync::Mutex<Option<ViewReportIdentity>>>,
@@ -5935,6 +9748,29 @@ pub(crate) mod tests {
             content: &mut FrameContentWriter<'_>,
             report: EcsViewReportSession<'_>,
         ) -> ViewBuildReport {
+            content
+                .spawn_solid_rect(
+                    SolidRect::new(24, 16, ContentColor::srgba8(1, 2, 3, 255)).unwrap(),
+                )
+                .unwrap();
+            report.applied()
+        }
+    }
+
+    impl EcsViewDriver for ArmableBackFailureDriver {
+        fn key(&self) -> ViewDriverKey {
+            self.key.clone()
+        }
+
+        fn apply(
+            &mut self,
+            _effect: &ViewBuildEffect,
+            content: &mut FrameContentWriter<'_>,
+            report: EcsViewReportSession<'_>,
+        ) -> ViewBuildReport {
+            if self.fail_next.swap(false, Ordering::AcqRel) {
+                return report.build_failed("armed Back target driver failure");
+            }
             content
                 .spawn_solid_rect(
                     SolidRect::new(24, 16, ContentColor::srgba8(1, 2, 3, 255)).unwrap(),
@@ -6418,6 +10254,38 @@ pub(crate) mod tests {
         let routes = RouteTree::builder()
             .root_with_options(
                 RoutePattern::path(pattern).unwrap(),
+                RouteNodeOptions::new().with_view(view.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut views = RouteViewRegistry::new();
+        views
+            .insert(view.clone(), RouteViewDescriptor::new(driver))
+            .unwrap();
+        let router = app
+            .add_ui_router(RouterConfig::new(routes, views, view))
+            .unwrap();
+        app.world_mut()
+            .spawn((Node::default(), RouterHostRegistration::new(router)));
+        router
+    }
+
+    fn install_armable_back_failure_router(
+        app: &mut App,
+        label: &str,
+        fail_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> RouterHandle {
+        let driver = ViewDriverKey::new(format!("{label}-driver")).unwrap();
+        app.register_ui_view_driver(ArmableBackFailureDriver {
+            key: driver.clone(),
+            fail_next,
+        })
+        .unwrap();
+        let view = RouteViewKey::new(format!("{label}-view")).unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/:id").unwrap(),
                 RouteNodeOptions::new().with_view(view.clone()),
             )
             .unwrap()
@@ -12045,6 +15913,5265 @@ pub(crate) mod tests {
         assert_eq!(pending.branch.frames().len(), 1);
         assert!(pending.branch.child_slots().is_empty());
         assert!(pending.final_task.is_none());
+    }
+
+    fn vacant_back_capacity_entry(handle: RouterHandle) -> RouterEntry {
+        let fallback = RouteViewKey::new("back-capacity-vacant-entry").unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(fallback.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut engine = RouterEngine::install(routes, fallback).unwrap();
+        let history_admission_world = engine.claim_history_admission_world().unwrap();
+
+        RouterEntry {
+            handle,
+            engine,
+            views: RouteViewRegistry::new(),
+            host: None,
+            host_settlement: None,
+            pending_commit: None,
+            pending_frame_drive: None,
+            pending_mount_frame_task: None,
+            pending_mount_request: None,
+            pending_mount_mutation_rejection: None,
+            pending_failed_branch: None,
+            projectionless_fail_close: None,
+            active: None,
+            cleanup_ledger: None,
+            cleanup_observation: RouterCleanupObservation::default(),
+            authority_protocol_residual: None,
+            back_capacity_enqueue_retire_residual: None,
+            requests: Vec::new(),
+            back_capacity_reservations: Vec::new(),
+            pending_back_resolution_action: None,
+            pending_bound_back_resolution: None,
+            pending_back_target_execution: None,
+            history_admission_world,
+            history_admission_stamp: None,
+            back_capacity_issuer: None,
+            #[cfg(test)]
+            back_resolution_evidence_predicate_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            back_target_driver_failure_dispatch_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            back_target_atomic_applied_dispatch_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            back_target_driver_staging_drift_armed: false,
+            #[cfg(test)]
+            back_target_driver_report_receiver_drift_armed: false,
+            #[cfg(test)]
+            back_target_driver_consume_receiver_drift_armed: false,
+            #[cfg(feature = "test-support")]
+            back_capacity_facade_producer: None,
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn back_capacity_order_observer_same_domain_unknown_is_zero_write() {
+        use crate::test_support::{
+            BackCapacityOrderInstallError, testing_install_back_capacity_order_observer,
+        };
+
+        let fallback = RouteViewKey::new("back-capacity-order-observer").unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(fallback.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut navigation = RouterNavigation::new();
+        let router = navigation
+            .install(routes, RouteViewRegistry::new(), fallback)
+            .unwrap();
+        let unknown = RouterHandle::fixture(navigation.domain, u64::MAX);
+        let entry_count_before = navigation.entries.len();
+        let mut factory_calls = 0;
+
+        let result = install_back_capacity_order_observer_with(&mut navigation, unknown, || {
+            factory_calls += 1;
+            bevy_ui_router_core::test_support::issue_back_capacity_order_channels()
+        });
+
+        assert!(matches!(
+            result,
+            Err(BackCapacityOrderInstallError::UnknownRouter)
+        ));
+        assert_eq!(factory_calls, 0);
+        assert_eq!(navigation.entries.len(), entry_count_before);
+        assert_eq!(navigation.entries[0].handle, router);
+
+        let observer = testing_install_back_capacity_order_observer(&mut navigation, router)
+            .expect("same-domain unknown rejection must leave every producer slot vacant");
+        assert!(observer.snapshot().events().is_empty());
+        assert_eq!(navigation.entries.len(), entry_count_before);
+    }
+
+    #[test]
+    fn back_capacity_issuer_second_install_is_zero_write() {
+        let mut domains = BackCapacityDomainIssuer::new();
+        let mut first = vacant_back_capacity_entry(RouterHandle::fixture(31, 1));
+        let mut second = vacant_back_capacity_entry(RouterHandle::fixture(31, 2));
+
+        first.install_back_capacity_issuer(&mut domains).unwrap();
+        let first_domain = first
+            .back_capacity_issuer
+            .as_ref()
+            .expect("the exact first entry retains its production issuer")
+            .domain_for_test();
+
+        assert!(matches!(
+            first.install_back_capacity_issuer(&mut domains),
+            Err(BackCapacityIssuerInstallError::AlreadyInstalled)
+        ));
+        assert_eq!(
+            first
+                .back_capacity_issuer
+                .as_ref()
+                .expect("a rejected second install must retain the original issuer")
+                .domain_for_test(),
+            first_domain,
+            "the second install must not replace the exact entry issuer"
+        );
+
+        second.install_back_capacity_issuer(&mut domains).unwrap();
+        assert_eq!(
+            second
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the next exact vacant entry receives its production issuer")
+                .domain_for_test(),
+            first_domain + 1,
+            "AlreadyInstalled must return before domain issue consumes an identity"
+        );
+    }
+
+    #[test]
+    fn back_capacity_issuer_second_install_preserves_outstanding() {
+        let mut domains = BackCapacityDomainIssuer::new();
+        let mut first = vacant_back_capacity_entry(RouterHandle::fixture(32, 1));
+        let mut second = vacant_back_capacity_entry(RouterHandle::fixture(32, 2));
+
+        first.install_back_capacity_issuer(&mut domains).unwrap();
+        let permit = first
+            .back_capacity_issuer
+            .as_mut()
+            .expect("the exact installed entry retains its production issuer")
+            .reserve()
+            .expect("the exact installed issuer can reserve one real outstanding permit");
+        let permit_identity = permit.ordinal_identity_for_test();
+        let (domain, cell, owner, generation) = permit_identity;
+        let (issuer_domain_before, issuer_before, backing_before) = {
+            let issuer = first
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the exact installed entry retains the issuer that owns the permit");
+            (
+                issuer.domain_for_test(),
+                issuer.semantic_snapshot_for_test(),
+                issuer.backing_capacities_for_test(),
+            )
+        };
+        assert_eq!(issuer_domain_before, domain);
+
+        assert!(matches!(
+            first.install_back_capacity_issuer(&mut domains),
+            Err(BackCapacityIssuerInstallError::AlreadyInstalled)
+        ));
+
+        let issuer_after = first
+            .back_capacity_issuer
+            .as_ref()
+            .expect("a rejected second install must retain the original issuer");
+        assert_eq!(issuer_after.domain_for_test(), issuer_domain_before);
+        assert_eq!(issuer_after.semantic_snapshot_for_test(), issuer_before);
+        assert_eq!(issuer_after.backing_capacities_for_test(), backing_before);
+        assert_eq!(
+            permit.ordinal_identity_for_test(),
+            (domain, cell, owner, generation),
+            "the retained move-only permit preserves its exact domain, cell, outstanding owner, and generation"
+        );
+
+        assert!(matches!(
+            first
+                .back_capacity_issuer
+                .as_mut()
+                .expect("the rejected install retains the issuer with the exact outstanding owner")
+                .retire_unbound(permit, EnqueueRejected::CoreTokenDrift),
+            BackCapacityRetireOutcome::Retired(_)
+        ));
+
+        second.install_back_capacity_issuer(&mut domains).unwrap();
+        assert_eq!(
+            second
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the next vacant entry receives its production issuer")
+                .domain_for_test(),
+            domain + 1,
+            "AlreadyInstalled must return before domain issue consumes an identity"
+        );
+    }
+
+    #[test]
+    fn back_capacity_growth_failure_is_pre_mint_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router =
+            install_atomic_router_at_pattern(&mut app, "back-capacity-growth", "/items/:id");
+        app.update();
+        for location in ["/items/1", "/items/2"] {
+            app.world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            app.update();
+        }
+
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            navigation.entries[0]
+                .back_capacity_issuer
+                .as_mut()
+                .expect("the exact installed entry retains its production issuer")
+                .set_next_cell_growth_additional_capacity_for_test(usize::MAX);
+        }
+
+        let world_before = authority_world_fingerprint(app.world());
+        let (
+            retained_requests_before,
+            engine_before,
+            core_requests_before,
+            accepted_reservations_before,
+            issuer_before,
+        ) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let core_requests = entry
+                .requests
+                .iter()
+                .map(|request_id| {
+                    let request = entry
+                        .engine
+                        .request(*request_id)
+                        .expect("every retained ECS request has its exact Core record");
+                    (
+                        *request_id,
+                        request.requested().cloned(),
+                        request.matched().cloned(),
+                        request.status().clone(),
+                        request.trace().to_vec(),
+                        request.diagnostics().to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let accepted_reservations = entry
+                .back_capacity_reservations
+                .iter()
+                .map(|(request, reservation)| {
+                    (
+                        *request,
+                        reservation.request(),
+                        reservation.capacity_identity_for_test(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let issuer = entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the exact installed entry retains its production issuer")
+                .semantic_snapshot_for_test();
+            (
+                entry.requests.clone(),
+                entry.engine.snapshot(),
+                core_requests,
+                accepted_reservations,
+                issuer,
+            )
+        };
+        assert_eq!(issuer_before.cell_count(), 0);
+        assert_eq!(issuer_before.outstanding_count(), 0);
+        assert!(accepted_reservations_before.is_empty());
+        let (public_router_before, public_requests_before) = {
+            let snapshots = app.world().resource::<RouterSnapshots>();
+            let router_snapshot = snapshots
+                .get(router)
+                .expect("the Back-eligible router has a published snapshot")
+                .clone();
+            let requests = retained_requests_before
+                .iter()
+                .map(|request| match snapshots.request(router, *request) {
+                    crate::snapshots::RequestLookup::Found(snapshot) => {
+                        (*request, snapshot.clone())
+                    }
+                    crate::snapshots::RequestLookup::NotRetained => {
+                        panic!("the setup request must remain publicly retained")
+                    }
+                    crate::snapshots::RequestLookup::Unknown => {
+                        panic!("the setup request must belong to the installed router")
+                    }
+                })
+                .collect::<Vec<_>>();
+            (router_snapshot, requests)
+        };
+
+        let error = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect_err("the real backing storage must reject usize::MAX additional capacity");
+
+        assert_eq!(error.kind(), NavigationEnqueueErrorKind::IdentityExhausted);
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        let snapshots = app.world().resource::<RouterSnapshots>();
+        assert_eq!(
+            snapshots
+                .get(router)
+                .expect("the router snapshot remains published"),
+            &public_router_before,
+        );
+        for (request, snapshot_before) in &public_requests_before {
+            assert_eq!(
+                snapshots.request(router, *request),
+                crate::snapshots::RequestLookup::Found(snapshot_before),
+                "failed growth must preserve every retained public request snapshot"
+            );
+        }
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        let core_requests_after = entry
+            .requests
+            .iter()
+            .map(|request_id| {
+                let request = entry
+                    .engine
+                    .request(*request_id)
+                    .expect("every retained ECS request still has its exact Core record");
+                (
+                    *request_id,
+                    request.requested().cloned(),
+                    request.matched().cloned(),
+                    request.status().clone(),
+                    request.trace().to_vec(),
+                    request.diagnostics().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let accepted_reservations_after = entry
+            .back_capacity_reservations
+            .iter()
+            .map(|(request, reservation)| {
+                (
+                    *request,
+                    reservation.request(),
+                    reservation.capacity_identity_for_test(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let issuer_after = entry
+            .back_capacity_issuer
+            .as_ref()
+            .expect("the exact installed entry retains its production issuer")
+            .semantic_snapshot_for_test();
+        assert_eq!(entry.requests, retained_requests_before);
+        assert_eq!(entry.engine.snapshot(), engine_before);
+        assert_eq!(core_requests_after, core_requests_before);
+        assert_eq!(
+            accepted_reservations_after, accepted_reservations_before,
+            "failed growth must not create an accepted ECS/Core reservation"
+        );
+        assert_eq!(
+            issuer_after, issuer_before,
+            "failed growth must not mint owner/generation identity or change issuer semantics"
+        );
+        assert_eq!(
+            issuer_after.cell_count(),
+            0,
+            "failed growth must not add a capacity cell"
+        );
+        assert_eq!(
+            issuer_after.outstanding_count(),
+            0,
+            "failed growth must not add an outstanding registry entry"
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn back_capacity_precedes_core_reservation_failure_evidence() {
+        use crate::test_support::testing_install_back_capacity_order_observer;
+        use bevy_ui_router_core::test_support::{BackCapacityIssuerEvent, BackCapacityOrderEvent};
+
+        for (counter_index, counter) in TestingReservationCounter::ALL.into_iter().enumerate() {
+            let mut app = App::new();
+            app.add_plugins(BevyUiRouterPlugin::default());
+            let router = install_atomic_router_at_pattern(
+                &mut app,
+                &format!("back-capacity-core-failure-{counter_index}"),
+                "/items/:id",
+            );
+            app.update();
+
+            let mut setup_requests = Vec::new();
+            for location in ["/items/1", "/items/2"] {
+                let request = app
+                    .world_mut()
+                    .resource_mut::<RouterNavigation>()
+                    .push(router, RouteLocation::new(location))
+                    .expect("the real history setup push must enqueue");
+                app.update();
+                assert!(matches!(
+                    app.world()
+                        .resource::<RouterSnapshots>()
+                        .request(router, request),
+                    crate::snapshots::RequestLookup::Found(snapshot)
+                        if snapshot.status() == &RequestStatus::Succeeded
+                ));
+                setup_requests.push(request);
+            }
+            assert!(
+                app.world()
+                    .resource::<RouterSnapshots>()
+                    .get(router)
+                    .expect("the exact router has a published snapshot")
+                    .history()
+                    .can_back()
+            );
+
+            let observer = testing_install_back_capacity_order_observer(
+                &mut app.world_mut().resource_mut::<RouterNavigation>(),
+                router,
+            )
+            .expect("the fresh exact entry must accept one real producer channel");
+            assert!(observer.snapshot().events().is_empty());
+
+            {
+                let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+                navigation.entries[0]
+                    .engine
+                    .testing_exhaust_reservation_counter(counter);
+            }
+
+            let world_before = authority_world_fingerprint(app.world());
+            let (public_router_before, public_requests_before) = {
+                let snapshots = app.world().resource::<RouterSnapshots>();
+                let router_snapshot = snapshots
+                    .get(router)
+                    .expect("the exact router snapshot remains published")
+                    .clone();
+                let requests = setup_requests
+                    .iter()
+                    .map(|request| match snapshots.request(router, *request) {
+                        crate::snapshots::RequestLookup::Found(snapshot) => {
+                            (*request, snapshot.clone())
+                        }
+                        crate::snapshots::RequestLookup::NotRetained => {
+                            panic!("a settled setup request must remain retained")
+                        }
+                        crate::snapshots::RequestLookup::Unknown => {
+                            panic!("a setup request must remain bound to the exact router")
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                (router_snapshot, requests)
+            };
+            let (
+                ecs_requests_before,
+                reservations_before,
+                pending_before,
+                authority_residual_before,
+                back_capacity_retire_residual_before,
+                issuer_before,
+            ) = {
+                let navigation = app.world().resource::<RouterNavigation>();
+                let entry = &navigation.entries[0];
+                let reservations = entry
+                    .back_capacity_reservations
+                    .iter()
+                    .map(|(request, reservation)| {
+                        (
+                            *request,
+                            reservation.request(),
+                            reservation.capacity_identity_for_test(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let issuer = entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("the exact entry retains its production capacity issuer")
+                    .semantic_snapshot_for_test();
+                (
+                    entry.requests.clone(),
+                    reservations,
+                    (
+                        entry.pending_back_resolution_action.is_some(),
+                        entry.pending_bound_back_resolution.is_some(),
+                    ),
+                    entry.authority_protocol_residual.is_some(),
+                    entry.back_capacity_enqueue_retire_residual.is_some(),
+                    issuer,
+                )
+            };
+            assert!(reservations_before.is_empty());
+            assert_eq!(pending_before, (false, false));
+            assert!(!authority_residual_before);
+            assert!(
+                !back_capacity_retire_residual_before,
+                "normal allocator failure must begin without a fail-closed retire residual"
+            );
+            assert_eq!(issuer_before.cell_count(), 0);
+            assert_eq!(issuer_before.outstanding_count(), 0);
+            assert_eq!(issuer_before.next_owner(), 1);
+            assert_eq!(issuer_before.next_generation(), 1);
+
+            let error = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .back(router)
+                .expect_err("the exhausted real Core counter must reject Back admission");
+            assert_eq!(error.kind(), NavigationEnqueueErrorKind::IdentityExhausted);
+
+            assert_eq!(
+                observer.snapshot().events(),
+                &[
+                    (
+                        0,
+                        BackCapacityOrderEvent::EcsIssuer(BackCapacityIssuerEvent::Issued)
+                    ),
+                    (1, BackCapacityOrderEvent::CoreAllocatorAttempt),
+                    (2, BackCapacityOrderEvent::CoreAllocatorFailure),
+                    (
+                        3,
+                        BackCapacityOrderEvent::EcsIssuer(BackCapacityIssuerEvent::Retired)
+                    ),
+                    (4, BackCapacityOrderEvent::FacadeTypedReturn),
+                ],
+                "the exact counter {counter:?} must preserve the production evidence order"
+            );
+
+            assert_eq!(authority_world_fingerprint(app.world()), world_before);
+            let snapshots = app.world().resource::<RouterSnapshots>();
+            assert_eq!(
+                snapshots
+                    .get(router)
+                    .expect("the exact router snapshot remains published"),
+                &public_router_before,
+            );
+            for (request, snapshot_before) in &public_requests_before {
+                assert_eq!(
+                    snapshots.request(router, *request),
+                    crate::snapshots::RequestLookup::Found(snapshot_before),
+                    "Core allocator failure must preserve every setup request snapshot"
+                );
+            }
+
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let reservations_after = entry
+                .back_capacity_reservations
+                .iter()
+                .map(|(request, reservation)| {
+                    (
+                        *request,
+                        reservation.request(),
+                        reservation.capacity_identity_for_test(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let issuer_after = entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the exact entry retains its production capacity issuer")
+                .semantic_snapshot_for_test();
+            assert_eq!(entry.requests, ecs_requests_before);
+            assert_eq!(reservations_after, reservations_before);
+            assert_eq!(
+                (
+                    entry.pending_back_resolution_action.is_some(),
+                    entry.pending_bound_back_resolution.is_some(),
+                ),
+                pending_before
+            );
+            assert_eq!(
+                entry.authority_protocol_residual.is_some(),
+                authority_residual_before
+            );
+            assert_eq!(
+                entry.back_capacity_enqueue_retire_residual.is_some(),
+                back_capacity_retire_residual_before
+            );
+            assert!(
+                entry.back_capacity_enqueue_retire_residual.is_none(),
+                "successful exact retirement must not install a fail-closed residual"
+            );
+            assert_eq!(issuer_after.cell_count(), 1);
+            assert_eq!(issuer_after.outstanding_count(), 0);
+            assert_eq!(issuer_after.next_owner(), 2);
+            assert_eq!(issuer_after.next_generation(), 2);
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn back_capacity_retire_rejection_owner_is_retained_fail_closed() {
+        use crate::test_support::testing_install_back_capacity_order_observer;
+        use bevy_ui_router_core::test_support::{BackCapacityIssuerEvent, BackCapacityOrderEvent};
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct RetireResidualProjection {
+            owner: (u64, usize, u64, u64),
+            core_failure: EnqueueBackErrorKind,
+            retire_error: BackCapacityRetireError,
+        }
+
+        fn retire_residual_projection(entry: &RouterEntry) -> Option<RetireResidualProjection> {
+            let residual = entry.back_capacity_enqueue_retire_residual.as_ref()?;
+            let core_failure = match &residual.rejection {
+                EnqueueRejected::CoreAllocatorFailure(error) => *error,
+                EnqueueRejected::CoreTokenDrift => {
+                    panic!("the residual must retain the original allocator-failure rejection")
+                }
+            };
+            Some(RetireResidualProjection {
+                owner: residual.owner.ordinal_identity_for_test(),
+                core_failure,
+                retire_error: residual.retire_error,
+            })
+        }
+
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router_at_pattern(
+            &mut app,
+            "back-capacity-retire-rejection",
+            "/items/:id",
+        );
+        app.update();
+        for location in ["/items/1", "/items/2"] {
+            app.world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .expect("the real history setup push must enqueue");
+            app.update();
+        }
+        assert!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .get(router)
+                .expect("the exact router has a published snapshot")
+                .history()
+                .can_back()
+        );
+
+        let observer = testing_install_back_capacity_order_observer(
+            &mut app.world_mut().resource_mut::<RouterNavigation>(),
+            router,
+        )
+        .expect("the fresh exact entry must accept one real producer channel");
+        let expected_owner = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            entry
+                .engine
+                .testing_exhaust_reservation_counter(TestingReservationCounter::Request);
+            let issuer = entry
+                .back_capacity_issuer
+                .as_mut()
+                .expect("the installed exact entry retains its production capacity issuer");
+            let expected = (issuer.domain_for_test(), 0, 1, 1);
+            issuer.drift_next_retire_unbound_generation_for_test();
+            expected
+        };
+
+        let error = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect_err("retire predicate drift must fail closed the current Back");
+        assert_eq!(error.kind(), NavigationEnqueueErrorKind::HostUnavailable);
+
+        let expected_residual = RetireResidualProjection {
+            owner: expected_owner,
+            core_failure: EnqueueBackErrorKind::Exhausted,
+            retire_error: BackCapacityRetireError::StaleGeneration,
+        };
+        let (residual_before, issuer_before, requests_before, reservations_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let residual = retire_residual_projection(entry)
+                .expect("retire rejection must retain the exact owner fail closed");
+            assert_eq!(residual, expected_residual);
+            let issuer = entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the exact entry retains its production capacity issuer")
+                .semantic_snapshot_for_test();
+            assert_eq!(issuer.cell_count(), 1);
+            assert_eq!(issuer.outstanding_count(), 1);
+            assert_eq!(issuer.next_owner(), 2);
+            (
+                residual,
+                issuer,
+                entry.requests.clone(),
+                entry.back_capacity_reservations.len(),
+            )
+        };
+        let events_before = observer.snapshot().events().to_vec();
+        assert_eq!(
+            events_before,
+            vec![
+                (
+                    0,
+                    BackCapacityOrderEvent::EcsIssuer(BackCapacityIssuerEvent::Issued)
+                ),
+                (1, BackCapacityOrderEvent::CoreAllocatorAttempt),
+                (2, BackCapacityOrderEvent::CoreAllocatorFailure),
+                (3, BackCapacityOrderEvent::FacadeTypedReturn),
+            ]
+        );
+        assert_eq!(
+            events_before.last(),
+            Some(&(3, BackCapacityOrderEvent::FacadeTypedReturn))
+        );
+        assert!(events_before.iter().all(|(_, event)| {
+            *event != BackCapacityOrderEvent::EcsIssuer(BackCapacityIssuerEvent::Retired)
+        }));
+
+        let later_error = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect_err("an occupied retire residual must fail closed every later Back");
+        assert_eq!(
+            later_error.kind(),
+            NavigationEnqueueErrorKind::HostUnavailable
+        );
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert_eq!(retire_residual_projection(entry), Some(residual_before));
+        assert_eq!(
+            entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the exact entry retains its production capacity issuer")
+                .semantic_snapshot_for_test(),
+            issuer_before
+        );
+        assert_eq!(entry.requests, requests_before);
+        assert_eq!(entry.back_capacity_reservations.len(), reservations_before);
+        let mut expected_events_after = events_before;
+        expected_events_after.push((4, BackCapacityOrderEvent::FacadeTypedReturn));
+        assert_eq!(
+            observer.snapshot().events(),
+            expected_events_after.as_slice()
+        );
+    }
+
+    #[test]
+    fn accepted_back_reserves_ecs_capacity_before_core_request_identity() {
+        #[cfg(feature = "test-support")]
+        use crate::test_support::testing_install_back_capacity_order_observer;
+        #[cfg(feature = "test-support")]
+        use bevy_ui_router_core::test_support::{BackCapacityIssuerEvent, BackCapacityOrderEvent};
+
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router =
+            install_atomic_router_at_pattern(&mut app, "back-capacity-order", "/items/:id");
+        app.update();
+        let mut setup_requests = Vec::new();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .map(|request| setup_requests.push(request))
+            .unwrap();
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/2"))
+            .map(|request| setup_requests.push(request))
+            .unwrap();
+        app.update();
+
+        #[cfg(feature = "test-support")]
+        let observer = testing_install_back_capacity_order_observer(
+            &mut app.world_mut().resource_mut::<RouterNavigation>(),
+            router,
+        )
+        .expect("the fresh exact entry must accept one real producer channel");
+
+        let (
+            public_router_before,
+            public_requests_before,
+            public_active_before,
+            public_history_before,
+        ) = {
+            let snapshots = app.world().resource::<RouterSnapshots>();
+            let router_snapshot = snapshots
+                .get(router)
+                .expect("the exact router has a published snapshot")
+                .clone();
+            let requests = setup_requests
+                .iter()
+                .map(|request| match snapshots.request(router, *request) {
+                    crate::snapshots::RequestLookup::Found(snapshot) => {
+                        (*request, snapshot.clone())
+                    }
+                    crate::snapshots::RequestLookup::NotRetained => {
+                        panic!("a settled setup request must remain publicly retained")
+                    }
+                    crate::snapshots::RequestLookup::Unknown => {
+                        panic!("a setup request must remain bound to the exact router")
+                    }
+                })
+                .collect::<Vec<_>>();
+            (
+                router_snapshot.clone(),
+                requests,
+                router_snapshot.active().clone(),
+                router_snapshot.history().clone(),
+            )
+        };
+        let (request_count_before, issuer_domain_before, issuer_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let issuer = navigation.entries[0]
+                .back_capacity_issuer
+                .as_ref()
+                .expect("installed exact entry retains its capacity issuer");
+            (
+                navigation.entries[0].requests.len(),
+                issuer.domain_for_test(),
+                issuer.semantic_snapshot_for_test(),
+            )
+        };
+        assert_eq!(issuer_before.cell_count(), 0);
+        assert_eq!(issuer_before.outstanding_count(), 0);
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("eligible back must reserve ECS capacity before Core request identity");
+
+        #[cfg(feature = "test-support")]
+        assert_eq!(
+            observer.snapshot().events(),
+            &[
+                (
+                    0,
+                    BackCapacityOrderEvent::EcsIssuer(BackCapacityIssuerEvent::Issued)
+                ),
+                (1, BackCapacityOrderEvent::CoreAllocatorAttempt),
+            ],
+            "a successful enqueue stops after the exact capacity issue and Core allocator attempt"
+        );
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        let bound = entry
+            .back_capacity_reservations
+            .iter()
+            .find_map(|(bound_request, bound)| (*bound_request == request).then_some(bound))
+            .expect("accepted request must retain its exact bound ECS capacity owner");
+        assert_eq!(
+            bound.request(),
+            request,
+            "the exact bound reservation must retain the same request as its outer key"
+        );
+        assert_eq!(
+            bound.capacity_identity_for_test(),
+            (issuer_domain_before, 0, 1, 1),
+            "the first permit must bind the exact issuer domain, first cell, owner and generation"
+        );
+        let issuer_after = entry
+            .back_capacity_issuer
+            .as_ref()
+            .expect("the exact entry retains the issuer that minted the permit")
+            .semantic_snapshot_for_test();
+        assert_ne!(issuer_after, issuer_before);
+        assert_eq!(issuer_after.cell_count(), 1);
+        assert_eq!(issuer_after.outstanding_count(), 1);
+        assert_eq!(entry.requests.len(), request_count_before + 1);
+        assert_eq!(entry.requests.last(), Some(&request));
+        let core_request = entry
+            .engine
+            .request(request)
+            .expect("the accepted request remains queued in Core before collection");
+        assert_eq!(core_request.status(), &RequestStatus::Queued);
+        assert_eq!(core_request.requested(), None);
+        assert_eq!(core_request.matched(), None);
+        assert!(core_request.trace().is_empty());
+        assert!(core_request.diagnostics().is_empty());
+        assert!(entry.pending_back_resolution_action.is_none());
+        assert!(entry.pending_bound_back_resolution.is_none());
+        assert!(entry.back_capacity_enqueue_retire_residual.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(entry.pending_commit.is_none());
+        assert!(entry.pending_frame_drive.is_none());
+        assert!(entry.pending_mount_frame_task.is_none());
+        assert!(entry.pending_mount_request.is_none());
+        assert!(entry.pending_mount_mutation_rejection.is_none());
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.projectionless_fail_close.is_none());
+        assert!(entry.authority_protocol_residual.is_none());
+
+        let snapshots = app.world().resource::<RouterSnapshots>();
+        let public_router_after = snapshots
+            .get(router)
+            .expect("enqueue alone cannot replace the published router snapshot");
+        assert_eq!(public_router_after, &public_router_before);
+        assert_eq!(public_router_after.active(), &public_active_before);
+        assert_eq!(public_router_after.history(), &public_history_before);
+        for (setup_request, snapshot_before) in public_requests_before {
+            assert_eq!(
+                snapshots.request(router, setup_request),
+                crate::snapshots::RequestLookup::Found(&snapshot_before),
+                "enqueue alone cannot write the public request collection"
+            );
+        }
+        assert!(
+            matches!(
+                snapshots.request(router, request),
+                crate::snapshots::RequestLookup::Unknown
+            ),
+            "enqueue alone cannot publish the newly accepted request into the public collection"
+        );
+    }
+
+    fn bound_back_resolution_capacity_identity(
+        handoff: &BoundBackResolutionHandoff,
+    ) -> (u64, usize, u64, u64) {
+        let reservation = match handoff {
+            BoundBackResolutionHandoff::Target(bound) => &bound.reservation,
+            BoundBackResolutionHandoff::NoTarget(bound) => &bound.reservation,
+            BoundBackResolutionHandoff::Contradiction(bound) => &bound.reservation,
+        };
+        reservation.capacity_identity_for_test()
+    }
+
+    fn take_real_bound_back_target(entry: &mut RouterEntry) -> BoundBackTargetResolution {
+        entry.engine.collect();
+        let Some(EngineAction::BackResolution(handoff)) = entry.engine.action() else {
+            panic!("a real accepted back must yield its raw target resolution owner")
+        };
+        match entry.take_back_resolution_handoff(handoff) {
+            TakeBackResolutionOutcome::Matched(BoundBackResolutionHandoff::Target(bound)) => bound,
+            TakeBackResolutionOutcome::Matched(BoundBackResolutionHandoff::NoTarget(_)) => {
+                panic!("two real history entries must retain one target")
+            }
+            TakeBackResolutionOutcome::Matched(BoundBackResolutionHandoff::Contradiction(_)) => {
+                panic!("an unchanged real target must not become a contradiction")
+            }
+            TakeBackResolutionOutcome::Mismatch {
+                reservation,
+                handoff,
+                evidence,
+            } => {
+                entry.restore_back_resolution_mismatch(reservation, handoff, evidence);
+                panic!("the exact entry must verify its real target resolution owner")
+            }
+        }
+    }
+
+    #[test]
+    fn back_resolution_handoff_foreign_and_duplicate_are_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let exact_router =
+            install_atomic_router_at_pattern(&mut app, "back-resolution-exact", "/:id");
+        let foreign_router =
+            install_atomic_router_at_pattern(&mut app, "back-resolution-foreign", "/:id");
+        app.update();
+        for router in [exact_router, foreign_router] {
+            for location in ["/first", "/second"] {
+                app.world_mut()
+                    .resource_mut::<RouterNavigation>()
+                    .push(router, RouteLocation::new(location))
+                    .unwrap();
+                app.update();
+            }
+        }
+        let exact_request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(exact_router)
+            .expect("the exact router has one real predecessor");
+        let foreign_request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(foreign_router)
+            .expect("the foreign router also owns one real accepted capacity");
+
+        let world_before = authority_world_fingerprint(app.world());
+        let exact_public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(exact_router)
+            .expect("the exact router has a public snapshot")
+            .clone();
+        let foreign_public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(foreign_router)
+            .expect("the foreign router has a public snapshot")
+            .clone();
+
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let exact_index = navigation
+            .entries
+            .iter()
+            .position(|entry| entry.handle == exact_router)
+            .unwrap();
+        let foreign_index = navigation
+            .entries
+            .iter()
+            .position(|entry| entry.handle == foreign_router)
+            .unwrap();
+        let (exact, foreign) = if exact_index < foreign_index {
+            let (before, after) = navigation.entries.split_at_mut(foreign_index);
+            (&mut before[exact_index], &mut after[0])
+        } else {
+            let (before, after) = navigation.entries.split_at_mut(exact_index);
+            (&mut after[0], &mut before[foreign_index])
+        };
+        exact.engine.collect();
+        let Some(EngineAction::BackResolution(handoff)) = exact.engine.action() else {
+            panic!("a real accepted back must yield its raw resolution owner")
+        };
+        let observed_evidence = handoff.evidence();
+        let scope = handoff.scope();
+        let reservation_index = exact
+            .back_capacity_reservations
+            .iter()
+            .position(|(_, reservation)| reservation.matches_resolution_scope(&scope))
+            .expect("the raw handoff must select its exact accepted capacity owner opaquely");
+        let (_, reservation) = exact.back_capacity_reservations.remove(reservation_index);
+        let capacity_identity = reservation.capacity_identity_for_test();
+        foreign
+            .back_capacity_reservations
+            .push((reservation.request(), reservation));
+        let exact_engine_before = exact.engine.snapshot();
+        let foreign_engine_before = foreign.engine.snapshot();
+        let exact_request_before = {
+            let request = exact.engine.request(exact_request).unwrap();
+            (
+                request.requested().cloned(),
+                request.status().clone(),
+                request.trace().to_vec(),
+            )
+        };
+        let foreign_request_before = {
+            let request = foreign.engine.request(foreign_request).unwrap();
+            (
+                request.requested().cloned(),
+                request.status().clone(),
+                request.trace().to_vec(),
+            )
+        };
+
+        assert_eq!(
+            foreign.validate_back_resolution_evidence(&observed_evidence),
+            BackResolutionEvidenceDisposition::Foreign,
+            "the exact raw handoff evidence must remain foreign to another router entry"
+        );
+        assert_eq!(
+            foreign
+                .back_resolution_evidence_predicate_calls
+                .load(Ordering::Relaxed),
+            1
+        );
+        let (reservation, handoff) = match foreign.take_back_resolution_handoff(handoff) {
+            TakeBackResolutionOutcome::Mismatch {
+                reservation,
+                handoff,
+                evidence,
+            } => {
+                assert_eq!(
+                    foreign.validate_back_resolution_evidence(&evidence),
+                    BackResolutionEvidenceDisposition::Foreign,
+                    "foreign mismatch diagnostics must remain foreign to the observing entry"
+                );
+                (reservation, handoff)
+            }
+            TakeBackResolutionOutcome::Matched(_) => {
+                panic!("a foreign entry must not verify the exact Core handoff")
+            }
+        };
+        assert_eq!(
+            foreign
+                .back_resolution_evidence_predicate_calls
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            reservation.capacity_identity_for_test(),
+            capacity_identity,
+            "foreign mismatch must return the complete original bound capacity"
+        );
+        assert_eq!(exact.engine.snapshot(), exact_engine_before);
+        assert_eq!(foreign.engine.snapshot(), foreign_engine_before);
+        {
+            let request = exact.engine.request(exact_request).unwrap();
+            assert_eq!(
+                (
+                    request.requested().cloned(),
+                    request.status().clone(),
+                    request.trace().to_vec(),
+                ),
+                exact_request_before
+            );
+        }
+        {
+            let request = foreign.engine.request(foreign_request).unwrap();
+            assert_eq!(
+                (
+                    request.requested().cloned(),
+                    request.status().clone(),
+                    request.trace().to_vec(),
+                ),
+                foreign_request_before
+            );
+        }
+        exact.restore_back_capacity_reservation(reservation);
+
+        assert_eq!(
+            exact.validate_back_resolution_evidence(&observed_evidence),
+            BackResolutionEvidenceDisposition::Current,
+            "the exact entry must classify its still-current raw handoff evidence as Current"
+        );
+        assert_eq!(
+            exact
+                .back_resolution_evidence_predicate_calls
+                .load(Ordering::Relaxed),
+            1
+        );
+        match exact.take_back_resolution_handoff(handoff) {
+            TakeBackResolutionOutcome::Matched(bound) => {
+                assert_eq!(
+                    bound_back_resolution_capacity_identity(&bound),
+                    capacity_identity
+                );
+                assert!(matches!(bound, BoundBackResolutionHandoff::Target(_)));
+                assert!(exact.engine.action().is_none());
+                assert!(exact.pending_back_resolution_action.is_none());
+            }
+            TakeBackResolutionOutcome::Mismatch {
+                reservation,
+                handoff,
+                evidence,
+            } => {
+                exact.restore_back_resolution_mismatch(reservation, handoff, evidence);
+                panic!(
+                    "the exact entry must preserve complete authority and capacity through a matched handoff"
+                )
+            }
+        }
+        assert_eq!(
+            exact.validate_back_resolution_evidence(&observed_evidence),
+            BackResolutionEvidenceDisposition::ConsumedReplay,
+            "the saved exact evidence must become a non-authorizing consumed replay"
+        );
+        assert_eq!(
+            exact
+                .back_resolution_evidence_predicate_calls
+                .load(Ordering::Relaxed),
+            3,
+            "Current observation, internal take validation, and explicit replay validation must each call the real predicate exactly once"
+        );
+        assert_eq!(exact.engine.snapshot(), exact_engine_before);
+        drop(navigation);
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .get(exact_router)
+                .unwrap(),
+            &exact_public_before
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .get(foreign_router)
+                .unwrap(),
+            &foreign_public_before
+        );
+    }
+
+    #[test]
+    fn back_resolution_pending_owner_blocks_next_collect() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router_at_pattern(&mut app, "back-resolution-collect", "/:id");
+        app.update();
+        for location in ["/first", "/second"] {
+            app.world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            app.update();
+        }
+        let (first, second) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let first = navigation
+                .back(router)
+                .expect("the first real back is accepted against the live predecessor");
+            let second = navigation
+                .back(router)
+                .expect("the second real back is accepted while that predecessor is live");
+            (first, second)
+        };
+
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        publish_snapshots_system(app.world_mut());
+
+        let (core_before, second_before) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            assert!(
+                entry.engine.action().is_none(),
+                "the exact target dispatcher moves the physical action into the existing driver"
+            );
+            assert!(
+                entry.pending_back_resolution_action.is_none(),
+                "an exact Matched take must not retain the old raw mismatch owner"
+            );
+            assert!(
+                entry.pending_bound_back_resolution.is_none(),
+                "Step 8 consumes the exact verified target owner into its single execution stage"
+            );
+            assert!(matches!(
+                entry.pending_back_target_execution.as_ref(),
+                Some(PendingBackTargetExecution::Driving(_))
+            ));
+            assert!(
+                entry
+                    .pending_commit
+                    .as_ref()
+                    .is_some_and(|pending| pending.final_task.is_some()),
+                "the real root frame report remains paired with the target Driving owner"
+            );
+            assert!(
+                entry
+                    .back_capacity_reservations
+                    .iter()
+                    .all(|(request, _)| *request != first),
+                "dispatch retires the first target capacity exactly once"
+            );
+            let second_view = entry
+                .engine
+                .request(second)
+                .expect("the second accepted request remains retained");
+            assert_eq!(second_view.status(), &RequestStatus::Queued);
+            let second_before = (
+                second_view.requested().cloned(),
+                second_view.status().clone(),
+                second_view.trace().to_vec(),
+            );
+            (entry.engine.snapshot(), second_before)
+        };
+        let (public_router_before, public_first_before, public_second_before) = {
+            let snapshots = app.world().resource::<RouterSnapshots>();
+            let public_first_before = match snapshots.request(router, first) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                _ => panic!("the first accepted back has a published request snapshot"),
+            };
+            let public_second_before = match snapshots.request(router, second) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                _ => panic!("the second accepted back has a published request snapshot"),
+            };
+            (
+                snapshots.get(router).unwrap().clone(),
+                public_first_before,
+                public_second_before,
+            )
+        };
+
+        collect_navigation_system(app.world_mut());
+
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            assert_eq!(entry.engine.snapshot(), core_before);
+            let second_view = entry.engine.request(second).unwrap();
+            assert_eq!(
+                (
+                    second_view.requested().cloned(),
+                    second_view.status().clone(),
+                    second_view.trace().to_vec(),
+                ),
+                second_before
+            );
+            assert!(entry.pending_back_resolution_action.is_none());
+            assert!(entry.pending_bound_back_resolution.is_none());
+            assert!(matches!(
+                entry.pending_back_target_execution.as_ref(),
+                Some(PendingBackTargetExecution::Driving(_))
+            ));
+        }
+        {
+            let snapshots = app.world().resource::<RouterSnapshots>();
+            assert_eq!(snapshots.get(router).unwrap(), &public_router_before);
+            assert_eq!(
+                snapshots.request(router, first),
+                crate::snapshots::RequestLookup::Found(&public_first_before)
+            );
+            assert_eq!(
+                snapshots.request(router, second),
+                crate::snapshots::RequestLookup::Found(&public_second_before)
+            );
+        }
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        assert!(
+            navigation.entries[0].engine.action().is_none(),
+            "the target execution owner must block collect before the next queued back becomes a Core action"
+        );
+        drop(navigation);
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum BackTargetDriverUnverifiedObservation {
+        Pending,
+        Residual,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum BackTargetDriverFailureStageObservation {
+        PreReportIndeterminate(BackTargetDriverUnverifiedObservation),
+        AwaitingReport(BackTargetDriverUnverifiedObservation),
+        ReceiverMismatch(BackTargetDriverUnverifiedObservation),
+        ConsumeMismatchFallback(BackTargetDriverUnverifiedObservation),
+        PostReportPhysicalIndeterminateFailureCleanup(BackTargetDriverUnverifiedObservation),
+        StagingDriftTargetOwnerOnly,
+        DriverFailureStagingMismatch(BackTargetDriverUnverifiedObservation),
+        Other,
+    }
+
+    fn observe_back_target_driver_failure_stage(
+        entry: &RouterEntry,
+    ) -> Option<BackTargetDriverFailureStageObservation> {
+        if let Some(PendingBackTargetExecution::DriverFailureStagingMismatch(owner)) =
+            entry.pending_back_target_execution.as_ref()
+        {
+            let unverified = match &owner.physical {
+                BackTargetDriverUnverifiedPhysicalOwner::Pending(pending) => {
+                    let _whole_pending = (&pending.ticket, &pending.final_task, &pending.branch);
+                    BackTargetDriverUnverifiedObservation::Pending
+                }
+                BackTargetDriverUnverifiedPhysicalOwner::Residual(branch) => {
+                    let _whole_residual = branch.realized_for_test();
+                    BackTargetDriverUnverifiedObservation::Residual
+                }
+            };
+            let _whole_mismatch = (
+                &owner.task,
+                owner.kind,
+                owner.message,
+                owner.evidence.observed,
+                &owner.evidence.pairing,
+            );
+            if let Some(previous) = owner.previous.as_ref() {
+                match previous {
+                    BackTargetDriverStagingOwner::ResumeBlocked(previous) => {
+                        let _whole_previous = previous;
+                    }
+                    BackTargetDriverStagingOwner::Driving(previous) => {
+                        let _whole_previous = (&previous.history, &previous.continuation);
+                    }
+                    BackTargetDriverStagingOwner::Classifying(previous) => {
+                        let _whole_previous = previous;
+                    }
+                    BackTargetDriverStagingOwner::Prepared(previous) => {
+                        let _whole_previous = previous;
+                    }
+                    BackTargetDriverStagingOwner::CommitFailure(previous) => {
+                        let _whole_previous = previous;
+                    }
+                    BackTargetDriverStagingOwner::ExistingMismatch(previous) => {
+                        let _whole_previous = previous;
+                    }
+                    #[cfg(test)]
+                    BackTargetDriverStagingOwner::TestDrift(previous) => {
+                        let _whole_previous = (&previous.history, &previous.continuation);
+                    }
+                }
+            }
+            return Some(
+                BackTargetDriverFailureStageObservation::DriverFailureStagingMismatch(unverified),
+            );
+        }
+        #[cfg(test)]
+        if let Some(PendingBackTargetExecution::DriverFailureStagingDrift(owner)) =
+            entry.pending_back_target_execution.as_ref()
+        {
+            let _whole_target_owner = (&owner.history, &owner.continuation);
+            return Some(BackTargetDriverFailureStageObservation::StagingDriftTargetOwnerOnly);
+        }
+        let Some(PendingBackTargetExecution::ResumeBlocked(
+            PendingBackTargetResumeBlocked::DriverFailure(stage),
+        )) = entry.pending_back_target_execution.as_ref()
+        else {
+            return None;
+        };
+        match stage {
+            PendingBackTargetDriverFailure::PhysicalIndeterminate(owner) => {
+                let _whole_owner = (
+                    &owner.driving.history,
+                    &owner.driving.continuation,
+                    &owner.task,
+                    &owner.physical.evidence,
+                    owner.kind,
+                    owner.message,
+                );
+                let unverified = match &owner.physical.original {
+                    BackTargetDriverUnverifiedPhysicalOwner::Pending(pending) => {
+                        let _whole_pending =
+                            (&pending.ticket, &pending.final_task, &pending.branch);
+                        BackTargetDriverUnverifiedObservation::Pending
+                    }
+                    BackTargetDriverUnverifiedPhysicalOwner::Residual(branch) => {
+                        let _whole_residual = branch.realized_for_test();
+                        BackTargetDriverUnverifiedObservation::Residual
+                    }
+                };
+                Some(BackTargetDriverFailureStageObservation::PreReportIndeterminate(unverified))
+            }
+            PendingBackTargetDriverFailure::AwaitingReport(owner) => {
+                let _whole_owner = (
+                    &owner.driving.history,
+                    &owner.driving.continuation,
+                    &owner.task,
+                    &owner.source,
+                    owner.kind,
+                    owner.message,
+                );
+                let unverified = match &owner.physical {
+                    BackTargetDriverUnverifiedPhysicalOwner::Pending(pending) => {
+                        let _whole_pending =
+                            (&pending.ticket, &pending.final_task, &pending.branch);
+                        BackTargetDriverUnverifiedObservation::Pending
+                    }
+                    BackTargetDriverUnverifiedPhysicalOwner::Residual(branch) => {
+                        let _whole_residual = branch.realized_for_test();
+                        BackTargetDriverUnverifiedObservation::Residual
+                    }
+                };
+                Some(BackTargetDriverFailureStageObservation::AwaitingReport(
+                    unverified,
+                ))
+            }
+            PendingBackTargetDriverFailure::ReceiverMismatch(owner) => {
+                let _whole_owner = (
+                    &owner.driving.history,
+                    &owner.driving.continuation,
+                    &owner.task,
+                    owner.kind,
+                    owner.message,
+                    &owner.mismatch,
+                );
+                let unverified = match &owner.physical {
+                    BackTargetDriverUnverifiedPhysicalOwner::Pending(pending) => {
+                        let _whole_pending =
+                            (&pending.ticket, &pending.final_task, &pending.branch);
+                        BackTargetDriverUnverifiedObservation::Pending
+                    }
+                    BackTargetDriverUnverifiedPhysicalOwner::Residual(branch) => {
+                        let _whole_residual = branch.realized_for_test();
+                        BackTargetDriverUnverifiedObservation::Residual
+                    }
+                };
+                Some(BackTargetDriverFailureStageObservation::ReceiverMismatch(
+                    unverified,
+                ))
+            }
+            PendingBackTargetDriverFailure::ConsumeMismatch(owner) => {
+                let _whole_owner = (
+                    &owner.source.frozen,
+                    &owner.history,
+                    &owner.outcome,
+                    &owner.mismatch,
+                );
+                let unverified = match &owner.physical {
+                    BackTargetDriverUnverifiedPhysicalOwner::Pending(pending) => {
+                        let _whole_pending =
+                            (&pending.ticket, &pending.final_task, &pending.branch);
+                        BackTargetDriverUnverifiedObservation::Pending
+                    }
+                    BackTargetDriverUnverifiedPhysicalOwner::Residual(branch) => {
+                        let _whole_residual = branch.realized_for_test();
+                        BackTargetDriverUnverifiedObservation::Residual
+                    }
+                };
+                if matches!(
+                    &owner.outcome,
+                    BackTargetDriverFailureCoreOutcome::Fallback(_)
+                ) {
+                    Some(
+                        BackTargetDriverFailureStageObservation::ConsumeMismatchFallback(
+                            unverified,
+                        ),
+                    )
+                } else {
+                    Some(BackTargetDriverFailureStageObservation::Other)
+                }
+            }
+            PendingBackTargetDriverFailure::PostReportPhysicalIndeterminate(owner) => {
+                let _whole_owner = (&owner.source.frozen, &owner.history);
+                let unverified = match &owner.physical {
+                    BackTargetDriverUnverifiedPhysicalOwner::Pending(pending) => {
+                        let _whole_pending =
+                            (&pending.ticket, &pending.final_task, &pending.branch);
+                        BackTargetDriverUnverifiedObservation::Pending
+                    }
+                    BackTargetDriverUnverifiedPhysicalOwner::Residual(branch) => {
+                        let _whole_residual = branch.realized_for_test();
+                        BackTargetDriverUnverifiedObservation::Residual
+                    }
+                };
+                if matches!(
+                    &owner.outcome,
+                    BackTargetDriverFailureCoreOutcome::FailureCleanup(_)
+                ) {
+                    Some(
+                        BackTargetDriverFailureStageObservation::PostReportPhysicalIndeterminateFailureCleanup(
+                            unverified,
+                        ),
+                    )
+                } else {
+                    Some(BackTargetDriverFailureStageObservation::Other)
+                }
+            }
+            _ => Some(BackTargetDriverFailureStageObservation::Other),
+        }
+    }
+
+    #[test]
+    fn back_target_driver_failure_exact_task_claim_blocks_zero_physical_report() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router =
+            install_atomic_router_at_pattern(&mut app, "back-target-task-claim-zero-red", "/:id");
+        app.update();
+        for location in ["/a", "/b"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            run_updates_until_succeeded(&mut app, request);
+        }
+        let _back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the real active route has one predecessor");
+
+        let task = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            let bound = take_real_bound_back_target(entry);
+            let BackTargetResumeOutcome::Resumed {
+                start: BackTargetStart::Ready(resume),
+                retirement,
+            } = resume_bound_back_target(entry, bound)
+            else {
+                panic!("the exact target must return its real root action")
+            };
+            drop(retirement);
+            let (action, history, continuation) = resume.into_parts();
+            let BackTargetResumeAction::FrameTask(task) = action else {
+                panic!("the changed root target must begin with one real FrameTask")
+            };
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Driving(
+                PendingBackTargetDriving {
+                    history,
+                    continuation,
+                },
+            ));
+            task
+        };
+
+        let residual = app.world_mut().spawn_empty().id();
+        let manifest = ComponentManifest::new([
+            app.world()
+                .components()
+                .component_id::<RouteOwnershipSeal>()
+                .expect("the active branch registers ownership seals"),
+            app.world()
+                .components()
+                .component_id::<FrameLifecycle>()
+                .expect("the active branch registers frame lifecycle"),
+        ]);
+        let seal = {
+            let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
+            let seal = registry.issue_seal();
+            registry
+                .register(
+                    residual,
+                    RegistryOwner::Committed(EntityOwner::FrameOutput {
+                        frame: task.frame().clone(),
+                        output: u64::MAX,
+                        local_index: usize::MAX,
+                    }),
+                    seal,
+                    manifest,
+                    EntityLifecycle::PreparedInert,
+                )
+                .unwrap();
+            seal
+        };
+        app.world_mut().entity_mut(residual).insert((
+            RouteOwnershipSeal::new(seal),
+            FrameLifecycle(EntityLifecycle::PreparedInert),
+        ));
+
+        publish_snapshots_system(app.world_mut());
+        let engine_before = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .snapshot();
+        let history_before = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .history()
+            .clone();
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .clone();
+
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                assert!(matches!(
+                    route_back_target_frame_failure(
+                        world,
+                        &mut navigation.entries[0],
+                        BackTargetDriverUnverifiedPhysicalOwner::Pending(PendingCommit::new()),
+                        task,
+                        ViewFailureKind::Build,
+                        "exact task-owned residual must block zero physical",
+                    ),
+                    RouteBackTargetFrameFailureOutcome::Handled
+                ));
+            },
+        );
+        publish_snapshots_system(app.world_mut());
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert_eq!(
+            observe_back_target_driver_failure_stage(entry),
+            Some(
+                BackTargetDriverFailureStageObservation::PreReportIndeterminate(
+                    BackTargetDriverUnverifiedObservation::Pending,
+                )
+            ),
+            "an exact task-owned Entity must prevent Pending from becoming ProvenZero"
+        );
+        assert_eq!(entry.engine.snapshot(), engine_before);
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .get(router)
+                .unwrap(),
+            &public_before
+        );
+        assert!(cleanup_claim_has_exact_authority(
+            app.world(),
+            &registry_before
+                .iter()
+                .find(|record| record.entity() == residual)
+                .unwrap()
+                .claim()
+        ));
+    }
+
+    #[test]
+    fn back_target_driver_failure_registry_only_residual_safe_stops_pre_report_indeterminate() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let fail_next = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = install_armable_back_failure_router(
+            &mut app,
+            "back-target-driver-registry-only-indeterminate-red",
+            fail_next.clone(),
+        );
+        app.update();
+        for location in ["/a", "/b"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            run_updates_until_succeeded(&mut app, request);
+        }
+
+        let active_root_frame = app.world().resource::<RouterNavigation>().entries[0]
+            .active
+            .as_ref()
+            .unwrap()
+            .frames()[0]
+            .frame()
+            .clone();
+        let registry_only_residual = app.world_mut().spawn_empty().id();
+        assert!(app.world_mut().despawn(registry_only_residual));
+        assert!(app.world().get_entity(registry_only_residual).is_err());
+        {
+            let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
+            let owner = RegistryOwner::Committed(EntityOwner::FrameOutput {
+                frame: active_root_frame,
+                output: u64::MAX,
+                local_index: usize::MAX,
+            });
+            assert!(
+                registry
+                    .records()
+                    .iter()
+                    .all(|record| !record.owner().conflicts_with(&owner)),
+                "the registry-only fixture requires a unique active-root FrameOutput owner"
+            );
+            let seal = registry.issue_seal();
+            registry
+                .register(
+                    registry_only_residual,
+                    owner,
+                    seal,
+                    ComponentManifest::new(Vec::new()),
+                    EntityLifecycle::Active,
+                )
+                .unwrap();
+        }
+
+        let (active_before, history_before, protected_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let active = entry.active.as_ref().unwrap();
+            let mut protected = entry
+                .active
+                .as_ref()
+                .unwrap()
+                .frames()
+                .iter()
+                .flat_map(|frame| frame.claims().map(|claim| claim.entity()))
+                .collect::<Vec<_>>();
+            let host = entry.host.as_ref().unwrap();
+            protected.extend([host.host, host.top_slot]);
+            protected.sort_by_key(|entity| entity.to_bits());
+            protected.dedup();
+            (
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                entry.engine.history().clone(),
+                protected
+                    .into_iter()
+                    .map(|entity| (entity, nested_protected_fingerprint(app.world(), entity)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .clone();
+
+        fail_next.store(true, Ordering::Release);
+        let back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the real active route has one predecessor");
+        for _ in 0..4 {
+            app.update();
+            let calls = app.world().resource::<RouterNavigation>().entries[0]
+                .back_target_driver_failure_dispatch_calls
+                .load(Ordering::Relaxed);
+            if calls > 0 {
+                break;
+            }
+        }
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert_eq!(
+            entry
+                .back_target_driver_failure_dispatch_calls
+                .load(Ordering::Relaxed),
+            1,
+            "the armed real driver failure must reach the sole target failure dispatcher"
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert!(matches!(
+            entry.engine.request(back).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::ApplyingFrame(_))
+        ));
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(
+            entry.active.as_ref().map(|active| {
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>()
+            }),
+            Some(active_before),
+            "the pre-report safe-stop must preserve the real active branch"
+        );
+        assert!(app.world().get_entity(registry_only_residual).is_err());
+        for (entity, before) in &protected_before {
+            assert_eq!(
+                &nested_protected_fingerprint(app.world(), *entity),
+                before,
+                "the pre-report safe-stop must preserve every active/protected entity"
+            );
+        }
+        let public_after = app.world().resource::<RouterSnapshots>();
+        let router_after = public_after.get(router).unwrap();
+        assert_eq!(router_after.active(), public_before.active());
+        assert_eq!(router_after.history(), public_before.history());
+        assert_eq!(router_after.cleanup(), public_before.cleanup());
+        assert!(matches!(
+            public_after.request(router, back),
+            crate::snapshots::RequestLookup::Found(snapshot)
+                if matches!(
+                    snapshot.status(),
+                    RequestStatus::Running(NavigationPhase::ApplyingFrame(_))
+                )
+        ));
+        assert_eq!(
+            observe_back_target_driver_failure_stage(entry),
+            Some(
+                BackTargetDriverFailureStageObservation::PreReportIndeterminate(
+                    BackTargetDriverUnverifiedObservation::Pending,
+                )
+            ),
+            "a registry-only residual must keep the whole real Pending owner in entry-owned pre-report Indeterminate; current scaffold instead leaves an Unaccepted reportable Residual"
+        );
+    }
+
+    #[test]
+    fn back_target_driver_failure_staging_mismatch_does_not_fall_through_generic_report() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let fail_next = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = install_armable_back_failure_router(
+            &mut app,
+            "back-target-driver-staging-mismatch-red",
+            fail_next.clone(),
+        );
+        app.update();
+        for location in ["/a", "/b"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            run_updates_until_succeeded(&mut app, request);
+        }
+
+        let (active_before, history_before, protected_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let active = entry.active.as_ref().unwrap();
+            let mut protected = active
+                .frames()
+                .iter()
+                .flat_map(|frame| frame.claims().map(|claim| claim.entity()))
+                .collect::<Vec<_>>();
+            let host = entry.host.as_ref().unwrap();
+            protected.extend([host.host, host.top_slot]);
+            protected.sort_by_key(|entity| entity.to_bits());
+            protected.dedup();
+            (
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                entry.engine.history().clone(),
+                protected
+                    .into_iter()
+                    .map(|entity| (entity, nested_protected_fingerprint(app.world(), entity)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .clone();
+
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+            .back_target_driver_staging_drift_armed = true;
+        fail_next.store(true, Ordering::Release);
+        let back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the real active route has one predecessor");
+        for _ in 0..4 {
+            app.update();
+            if !fail_next.load(Ordering::Acquire) {
+                break;
+            }
+        }
+
+        assert!(
+            !fail_next.load(Ordering::Acquire),
+            "the real armable driver must consume the failure input"
+        );
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        let staging = observe_back_target_driver_failure_stage(entry);
+        assert!(
+            matches!(
+                staging,
+                Some(
+                    BackTargetDriverFailureStageObservation::StagingDriftTargetOwnerOnly
+                        | BackTargetDriverFailureStageObservation::DriverFailureStagingMismatch(
+                            BackTargetDriverUnverifiedObservation::Pending
+                        )
+                )
+            ),
+            "the predicate-input seam must retain the original target owner"
+        );
+        let request = entry.engine.request(back).unwrap();
+        let status = request.status();
+        assert!(
+            matches!(
+                status,
+                RequestStatus::Running(NavigationPhase::ApplyingFrame(_))
+            ),
+            "a target staging mismatch must stop before generic report mutation; observed {status:?}"
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before,
+            "a target staging mismatch must not mutate the physical registry"
+        );
+        assert_eq!(
+            entry.active.as_ref().map(|active| {
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>()
+            }),
+            Some(active_before),
+            "the original active branch must remain protected"
+        );
+        for (entity, before) in &protected_before {
+            assert_eq!(
+                &nested_protected_fingerprint(app.world(), *entity),
+                before,
+                "a target staging mismatch must preserve every protected Entity"
+            );
+        }
+        let public_after = app.world().resource::<RouterSnapshots>();
+        let router_after = public_after.get(router).unwrap();
+        assert_eq!(router_after.active(), public_before.active());
+        assert_eq!(router_after.history(), public_before.history());
+        assert_eq!(router_after.cleanup(), public_before.cleanup());
+        assert!(matches!(
+            public_after.request(router, back),
+            crate::snapshots::RequestLookup::Found(snapshot)
+                if matches!(
+                    snapshot.status(),
+                    RequestStatus::Running(NavigationPhase::ApplyingFrame(_))
+                )
+        ));
+        assert_eq!(
+            observe_back_target_driver_failure_stage(entry),
+            Some(
+                BackTargetDriverFailureStageObservation::DriverFailureStagingMismatch(
+                    BackTargetDriverUnverifiedObservation::Pending,
+                )
+            ),
+            "the original target owner and real PendingCommit/task owners must remain together in one typed safe-stop"
+        );
+    }
+
+    #[test]
+    fn back_target_root_missing_driver_routes_pending_owner_before_generic_failure() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let label = "back-target-root-missing-driver";
+        let driver_key = ViewDriverKey::new(format!("{label}-driver")).unwrap();
+        let router = install_atomic_router_at_pattern(&mut app, label, "/:id");
+        app.update();
+        for location in ["/a", "/b"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            run_updates_until_succeeded(&mut app, request);
+        }
+
+        let back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the real active route has one predecessor");
+        collect_navigation_system(app.world_mut());
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert!(entry.pending_bound_back_resolution.is_none());
+            assert!(entry.pending_back_target_execution.is_none());
+            assert!(
+                entry
+                    .back_capacity_reservations
+                    .iter()
+                    .any(|(request, _)| *request == back),
+                "collection alone must retain the exact Back capacity before same-call dispatch"
+            );
+        }
+        let world_before = authority_world_fingerprint(app.world());
+        let (active_before, history_before, protected_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let active = entry.active.as_ref().unwrap();
+            let mut protected = active
+                .frames()
+                .iter()
+                .flat_map(|frame| frame.claims().map(|claim| claim.entity()))
+                .collect::<Vec<_>>();
+            let host = entry.host.as_ref().unwrap();
+            protected.extend([host.host, host.top_slot]);
+            protected.sort_by_key(|entity| entity.to_bits());
+            protected.dedup();
+            (
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                entry.engine.history().clone(),
+                protected
+                    .into_iter()
+                    .map(|entity| (entity, nested_protected_fingerprint(app.world(), entity)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .clone();
+        assert!(matches!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .request(router, back),
+            crate::snapshots::RequestLookup::Unknown
+        ));
+
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+            .back_target_driver_report_receiver_drift_armed = true;
+        let removed_driver = app
+            .world_mut()
+            .resource_mut::<ViewDriverStore>()
+            .take_for_test(&driver_key)
+            .expect("the real target driver must be installed before the missing-member input");
+
+        drive_navigation_system(app.world_mut());
+
+        app.world_mut()
+            .resource_mut::<ViewDriverStore>()
+            .restore_for_test(removed_driver);
+
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let stage = observe_back_target_driver_failure_stage(entry);
+            assert_eq!(
+                entry
+                    .back_target_driver_failure_dispatch_calls
+                    .load(Ordering::Relaxed),
+                1,
+                "a missing root Back target driver must enter the target-aware dispatcher before generic report_failed; observed {stage:?}"
+            );
+            assert!(entry.pending_failed_branch.is_none());
+            assert_eq!(
+                stage,
+                Some(BackTargetDriverFailureStageObservation::ReceiverMismatch(
+                    BackTargetDriverUnverifiedObservation::Pending,
+                )),
+                "report receiver drift must retain the complete Pending owner in the target-specific safe-stop"
+            );
+            assert!(!entry.back_target_driver_report_receiver_drift_armed);
+            assert!(matches!(
+                entry.engine.request(back).unwrap().status(),
+                RequestStatus::Running(NavigationPhase::ApplyingFrame(_))
+            ));
+        }
+
+        drive_navigation_system(app.world_mut());
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert_eq!(
+            entry
+                .back_target_driver_failure_dispatch_calls
+                .load(Ordering::Relaxed),
+            1,
+            "the saved receiver mismatch must block redispatch on the next schedule"
+        );
+        assert!(entry.pending_failed_branch.is_none());
+        assert_eq!(
+            observe_back_target_driver_failure_stage(entry),
+            Some(BackTargetDriverFailureStageObservation::ReceiverMismatch(
+                BackTargetDriverUnverifiedObservation::Pending,
+            ))
+        );
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(
+            entry.active.as_ref().map(|active| {
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>()
+            }),
+            Some(active_before)
+        );
+        assert!(entry.cleanup_ledger.is_none());
+        for (entity, before) in &protected_before {
+            assert_eq!(&nested_protected_fingerprint(app.world(), *entity), before);
+        }
+        let public_after = app.world().resource::<RouterSnapshots>();
+        assert_eq!(public_after.get(router).unwrap(), &public_before);
+        assert!(matches!(
+            public_after.request(router, back),
+            crate::snapshots::RequestLookup::Unknown
+        ));
+    }
+
+    #[test]
+    fn back_target_child_outlet_failure_does_not_escape_to_generic_with_driving_owner() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let driver_key = ViewDriverKey::new("nested-driver").unwrap();
+        let item = RouteViewKey::new("item").unwrap();
+        let router = install_nested_router(&mut app, observed.clone(), true);
+        app.update();
+        for location in ["/items/1", "/items/2"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            run_updates_until_succeeded(&mut app, request);
+        }
+
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let active = entry.active.as_ref().unwrap();
+            assert_eq!(entry.engine.history().len(), 2);
+            assert_eq!(
+                entry.engine.history().current(),
+                Some(&RouteLocation::new("/items/2"))
+            );
+            assert_eq!(active.frames().len(), 2);
+            assert_eq!(active.child_slots().len(), 1);
+            assert_eq!(
+                view_integration::driver_key(&entry.views, &item),
+                Some(&driver_key),
+                "the real nested leaf must resolve through the driver removed below"
+            );
+        }
+
+        let back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the real nested history has one predecessor");
+        collect_navigation_system(app.world_mut());
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert!(entry.pending_bound_back_resolution.is_none());
+            assert!(entry.pending_back_target_execution.is_none());
+            assert!(
+                entry
+                    .back_capacity_reservations
+                    .iter()
+                    .any(|(request, _)| *request == back),
+                "collection alone must retain the exact Back capacity before same-call dispatch"
+            );
+        }
+
+        let world_before = authority_world_fingerprint(app.world());
+        let (active_before, history_before, protected_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let active = entry.active.as_ref().unwrap();
+            let frames = active
+                .frames()
+                .iter()
+                .map(|frame| frame.frame().clone())
+                .collect::<Vec<_>>();
+            let child_slots = active
+                .child_slots()
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.parent().clone(),
+                        slot.outlet().clone(),
+                        slot.slot_id(),
+                        slot.slot(),
+                        slot.slot_claim().clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut protected = active
+                .claims()
+                .map(|claim| claim.entity())
+                .collect::<Vec<_>>();
+            let host = entry.host.as_ref().unwrap();
+            protected.extend([host.host, host.top_slot]);
+            protected.sort_by_key(|entity| entity.to_bits());
+            protected.dedup();
+            (
+                (frames, child_slots),
+                entry.engine.history().clone(),
+                protected
+                    .into_iter()
+                    .map(|entity| (entity, nested_protected_fingerprint(app.world(), entity)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .clone();
+        let driver_calls_before = observed.lock().unwrap().clone();
+        let removed_driver = app
+            .world_mut()
+            .resource_mut::<ViewDriverStore>()
+            .take_for_test(&driver_key)
+            .expect("the real nested driver must exist before the missing-member input");
+
+        drive_navigation_system(app.world_mut());
+
+        app.world_mut()
+            .resource_mut::<ViewDriverStore>()
+            .restore_for_test(removed_driver);
+
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let stage = observe_back_target_driver_failure_stage(entry);
+            assert_eq!(
+                entry
+                    .back_target_driver_failure_dispatch_calls
+                    .load(Ordering::Relaxed),
+                1,
+                "the real ChildOutlet missing-driver failure must reach the target-aware dispatcher; observed {stage:?}"
+            );
+            assert!(
+                entry.pending_failed_branch.is_none(),
+                "a target-active ChildOutlet failure must not escape into generic failure cleanup"
+            );
+            assert_eq!(
+                stage,
+                Some(
+                    BackTargetDriverFailureStageObservation::PreReportIndeterminate(
+                        BackTargetDriverUnverifiedObservation::Pending,
+                    )
+                ),
+                "the complete Driving, task and Pending owners must safe-stop until the outlet action slice"
+            );
+            assert!(matches!(
+                entry.engine.request(back).unwrap().status(),
+                RequestStatus::Running(NavigationPhase::ApplyingFrame(1))
+            ));
+        }
+
+        drive_navigation_system(app.world_mut());
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert_eq!(
+            entry
+                .back_target_driver_failure_dispatch_calls
+                .load(Ordering::Relaxed),
+            1,
+            "the saved ChildOutlet safe-stop must block redispatch"
+        );
+        assert!(entry.pending_failed_branch.is_none());
+        assert_eq!(
+            observe_back_target_driver_failure_stage(entry),
+            Some(
+                BackTargetDriverFailureStageObservation::PreReportIndeterminate(
+                    BackTargetDriverUnverifiedObservation::Pending,
+                )
+            )
+        );
+        assert_eq!(*observed.lock().unwrap(), driver_calls_before);
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        let active = entry.active.as_ref().unwrap();
+        assert_eq!(
+            active
+                .frames()
+                .iter()
+                .map(|frame| frame.frame().clone())
+                .collect::<Vec<_>>(),
+            active_before.0
+        );
+        assert_eq!(
+            active
+                .child_slots()
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.parent().clone(),
+                        slot.outlet().clone(),
+                        slot.slot_id(),
+                        slot.slot(),
+                        slot.slot_claim().clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            active_before.1
+        );
+        for (entity, before) in &protected_before {
+            assert_eq!(&nested_protected_fingerprint(app.world(), *entity), before);
+        }
+        let public_after = app.world().resource::<RouterSnapshots>();
+        assert_eq!(public_after.get(router).unwrap(), &public_before);
+        assert!(matches!(
+            public_after.request(router, back),
+            crate::snapshots::RequestLookup::Unknown
+        ));
+    }
+
+    #[test]
+    fn back_target_driver_report_receiver_mismatch_whole_saves_exact_inputs_once() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let fail_next = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = install_armable_back_failure_router(
+            &mut app,
+            "back-target-driver-report-receiver-mismatch",
+            fail_next.clone(),
+        );
+        app.update();
+        for location in ["/a", "/b"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            run_updates_until_succeeded(&mut app, request);
+        }
+
+        let world_before = authority_world_fingerprint(app.world());
+        let (active_before, history_before, protected_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let active = entry.active.as_ref().unwrap();
+            let mut protected = active
+                .frames()
+                .iter()
+                .flat_map(|frame| frame.claims().map(|claim| claim.entity()))
+                .collect::<Vec<_>>();
+            let host = entry.host.as_ref().unwrap();
+            protected.extend([host.host, host.top_slot]);
+            protected.sort_by_key(|entity| entity.to_bits());
+            protected.dedup();
+            (
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                entry.engine.history().clone(),
+                protected
+                    .into_iter()
+                    .map(|entity| (entity, nested_protected_fingerprint(app.world(), entity)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .clone();
+
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+            .back_target_driver_report_receiver_drift_armed = true;
+        fail_next.store(true, Ordering::Release);
+        let back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the real active route has one predecessor");
+        for _ in 0..4 {
+            app.update();
+            let calls = app.world().resource::<RouterNavigation>().entries[0]
+                .back_target_driver_failure_dispatch_calls
+                .load(Ordering::Relaxed);
+            if calls > 0 {
+                break;
+            }
+        }
+
+        assert!(!fail_next.load(Ordering::Acquire));
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert_eq!(
+                entry
+                    .back_target_driver_failure_dispatch_calls
+                    .load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(
+                observe_back_target_driver_failure_stage(entry),
+                Some(BackTargetDriverFailureStageObservation::ReceiverMismatch(
+                    BackTargetDriverUnverifiedObservation::Pending,
+                ))
+            );
+            assert!(!entry.back_target_driver_report_receiver_drift_armed);
+            assert!(matches!(
+                entry.engine.request(back).unwrap().status(),
+                RequestStatus::Running(NavigationPhase::ApplyingFrame(_))
+            ));
+        }
+
+        app.update();
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert_eq!(
+            entry
+                .back_target_driver_failure_dispatch_calls
+                .load(Ordering::Relaxed),
+            1,
+            "the saved receiver mismatch must safe-stop the next schedule without redispatch"
+        );
+        assert_eq!(
+            observe_back_target_driver_failure_stage(entry),
+            Some(BackTargetDriverFailureStageObservation::ReceiverMismatch(
+                BackTargetDriverUnverifiedObservation::Pending,
+            )),
+            "the complete driving owner, task, physical metadata and mismatch must remain saved"
+        );
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(
+            entry.active.as_ref().map(|active| {
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>()
+            }),
+            Some(active_before)
+        );
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        for (entity, before) in &protected_before {
+            assert_eq!(&nested_protected_fingerprint(app.world(), *entity), before);
+        }
+        let public_after = app.world().resource::<RouterSnapshots>();
+        let router_after = public_after.get(router).unwrap();
+        assert_eq!(router_after.active(), public_before.active());
+        assert_eq!(router_after.history(), public_before.history());
+        assert_eq!(router_after.cleanup(), public_before.cleanup());
+        assert!(matches!(
+            public_after.request(router, back),
+            crate::snapshots::RequestLookup::Found(snapshot)
+                if matches!(
+                    snapshot.status(),
+                    RequestStatus::Running(NavigationPhase::ApplyingFrame(_))
+                )
+        ));
+    }
+
+    #[test]
+    fn back_target_driver_consume_receiver_mismatch_whole_saves_fallback_once() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let fail_next = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = install_armable_back_failure_router(
+            &mut app,
+            "back-target-driver-consume-receiver-mismatch",
+            fail_next.clone(),
+        );
+        app.update();
+        for location in ["/a", "/b"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            run_updates_until_succeeded(&mut app, request);
+        }
+
+        let world_before = authority_world_fingerprint(app.world());
+        let (active_before, history_before, protected_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let active = entry.active.as_ref().unwrap();
+            let mut protected = active
+                .frames()
+                .iter()
+                .flat_map(|frame| frame.claims().map(|claim| claim.entity()))
+                .collect::<Vec<_>>();
+            let host = entry.host.as_ref().unwrap();
+            protected.extend([host.host, host.top_slot]);
+            protected.sort_by_key(|entity| entity.to_bits());
+            protected.dedup();
+            (
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                entry.engine.history().clone(),
+                protected
+                    .into_iter()
+                    .map(|entity| (entity, nested_protected_fingerprint(app.world(), entity)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .clone();
+
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+            .back_target_driver_consume_receiver_drift_armed = true;
+        fail_next.store(true, Ordering::Release);
+        let back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the real active route has one predecessor");
+        for _ in 0..4 {
+            app.update();
+            let calls = app.world().resource::<RouterNavigation>().entries[0]
+                .back_target_driver_failure_dispatch_calls
+                .load(Ordering::Relaxed);
+            if calls > 0 {
+                break;
+            }
+        }
+
+        assert!(!fail_next.load(Ordering::Acquire));
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert_eq!(
+                entry
+                    .back_target_driver_failure_dispatch_calls
+                    .load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(
+                observe_back_target_driver_failure_stage(entry),
+                Some(
+                    BackTargetDriverFailureStageObservation::ConsumeMismatchFallback(
+                        BackTargetDriverUnverifiedObservation::Pending,
+                    )
+                )
+            );
+            assert!(!entry.back_target_driver_consume_receiver_drift_armed);
+            assert!(matches!(
+                entry.engine.request(back).unwrap().status(),
+                RequestStatus::Running(NavigationPhase::Recovering)
+            ));
+        }
+
+        app.update();
+
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert_eq!(
+                entry
+                    .back_target_driver_failure_dispatch_calls
+                    .load(Ordering::Relaxed),
+                1,
+                "the saved consume mismatch must safe-stop the next schedule without redispatch"
+            );
+            assert_eq!(
+                observe_back_target_driver_failure_stage(entry),
+                Some(
+                    BackTargetDriverFailureStageObservation::ConsumeMismatchFallback(
+                        BackTargetDriverUnverifiedObservation::Pending,
+                    )
+                ),
+                "the post-report source, history, physical metadata and whole fallback owner must remain saved"
+            );
+            assert_eq!(authority_world_fingerprint(app.world()), world_before);
+            assert_eq!(entry.engine.history(), &history_before);
+            assert_eq!(
+                app.world().resource::<RouteEntityRegistry>().records(),
+                registry_before
+            );
+            assert_eq!(
+                entry.active.as_ref().map(|active| {
+                    active
+                        .frames()
+                        .iter()
+                        .map(|frame| frame.frame().clone())
+                        .collect::<Vec<_>>()
+                }),
+                Some(active_before)
+            );
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            for (entity, before) in &protected_before {
+                assert_eq!(&nested_protected_fingerprint(app.world(), *entity), before);
+            }
+            let public_after = app.world().resource::<RouterSnapshots>();
+            let router_after = public_after.get(router).unwrap();
+            assert_eq!(router_after.active(), public_before.active());
+            assert_eq!(router_after.history(), public_before.history());
+            assert_eq!(router_after.cleanup(), public_before.cleanup());
+            assert!(matches!(
+                public_after.request(router, back),
+                crate::snapshots::RequestLookup::Found(snapshot)
+                    if matches!(
+                        snapshot.status(),
+                        RequestStatus::Running(NavigationPhase::Recovering)
+                    )
+            ));
+        }
+
+        let fallback = app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+            .engine
+            .action()
+            .expect("consume mismatch must leave the engine-held fallback action intact");
+        let EngineAction::FrameTask(fallback) = fallback else {
+            panic!("the retained fallback action must be a frame task")
+        };
+        assert_eq!(fallback.frame().origin(), &FrameOrigin::RouterFallback);
+    }
+
+    #[test]
+    fn back_target_driver_failure_reportable_proof_does_not_cross_schedule() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let fail_next = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = install_armable_back_failure_router(
+            &mut app,
+            "back-target-driver-reportable-proof-schedule-red",
+            fail_next.clone(),
+        );
+        app.update();
+        for location in ["/a", "/b"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            run_updates_until_succeeded(&mut app, request);
+        }
+
+        let (active_before, history_before, protected_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let active = entry.active.as_ref().unwrap();
+            let mut protected = active
+                .frames()
+                .iter()
+                .flat_map(|frame| frame.claims().map(|claim| claim.entity()))
+                .collect::<Vec<_>>();
+            let host = entry.host.as_ref().unwrap();
+            protected.extend([host.host, host.top_slot]);
+            protected.sort_by_key(|entity| entity.to_bits());
+            protected.dedup();
+            (
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                entry.engine.history().clone(),
+                protected
+                    .into_iter()
+                    .map(|entity| (entity, nested_protected_fingerprint(app.world(), entity)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .clone();
+
+        fail_next.store(true, Ordering::Release);
+        let back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the real active route has one predecessor");
+        for _ in 0..4 {
+            app.update();
+            let calls = app.world().resource::<RouterNavigation>().entries[0]
+                .back_target_driver_failure_dispatch_calls
+                .load(Ordering::Relaxed);
+            if calls > 0 {
+                break;
+            }
+        }
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert_eq!(
+            entry
+                .back_target_driver_failure_dispatch_calls
+                .load(Ordering::Relaxed),
+            1,
+            "the real root driver failure must reach the sole dispatcher"
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert!(matches!(
+            entry.engine.request(back).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::Recovering)
+        ));
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before,
+            "the pre-report boundary must not start physical cleanup"
+        );
+        assert_eq!(
+            entry.active.as_ref().map(|active| {
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>()
+            }),
+            Some(active_before),
+            "the pre-report boundary must preserve the active branch"
+        );
+        for (entity, before) in &protected_before {
+            assert_eq!(
+                &nested_protected_fingerprint(app.world(), *entity),
+                before,
+                "the pre-report boundary must preserve every protected entity"
+            );
+        }
+        let public_after = app.world().resource::<RouterSnapshots>();
+        let router_after = public_after.get(router).unwrap();
+        assert_eq!(router_after.active(), public_before.active());
+        assert_eq!(router_after.history(), public_before.history());
+        assert_eq!(router_after.cleanup(), public_before.cleanup());
+        assert!(matches!(
+            public_after.request(router, back),
+            crate::snapshots::RequestLookup::Found(snapshot)
+                if matches!(
+                    snapshot.status(),
+                    RequestStatus::Running(NavigationPhase::Recovering)
+                )
+        ));
+
+        assert!(
+            entry.pending_back_target_execution.is_none(),
+            "the completed same-stack report and consume path must leave no entry-owned Unaccepted or Reported proof at schedule return"
+        );
+    }
+
+    #[test]
+    fn back_target_driver_failure_report_consume_uses_real_dispatcher() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let fail_next = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = install_armable_back_failure_router(
+            &mut app,
+            "back-target-driver-failure-red",
+            fail_next.clone(),
+        );
+        app.update();
+        for location in ["/a", "/b"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            run_updates_until_succeeded(&mut app, request);
+        }
+        let active_before = app.world().resource::<RouterNavigation>().entries[0]
+            .active
+            .as_ref()
+            .map(|active| {
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>()
+            });
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+
+        fail_next.store(true, Ordering::Release);
+        let back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the real active route has one predecessor");
+        for _ in 0..4 {
+            app.update();
+            let calls = app.world().resource::<RouterNavigation>().entries[0]
+                .back_target_driver_failure_dispatch_calls
+                .load(Ordering::Relaxed);
+            if calls > 0 {
+                break;
+            }
+        }
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert_eq!(
+            entry
+                .back_target_driver_failure_dispatch_calls
+                .load(Ordering::Relaxed),
+            1,
+            "the armed real driver failure must reach the sole target failure dispatcher"
+        );
+        assert_eq!(
+            entry.active.as_ref().map(|active| {
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>()
+            }),
+            active_before,
+            "the target failure boundary must keep the existing active branch protected"
+        );
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before,
+            "the pre-report target failure boundary must not mutate the physical registry"
+        );
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(
+            entry.pending_back_target_execution.is_none(),
+            "atomic report plus sole consume must close the target failure stage"
+        );
+        assert!(
+            matches!(
+                entry.engine.request(back).unwrap().status(),
+                RequestStatus::Running(NavigationPhase::Recovering)
+            ),
+            "the consumed zero-physical root failure must enter its real fallback branch"
+        );
+    }
+
+    #[test]
+    fn back_target_driver_failure_transaction_exhaustion_consumes_terminal_without_fallback() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let fail_next = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = install_armable_back_failure_router(
+            &mut app,
+            "back-target-driver-failure-terminal",
+            fail_next.clone(),
+        );
+        app.update();
+        for location in ["/a", "/b"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            run_updates_until_succeeded(&mut app, request);
+        }
+
+        let (active_before, history_before, protected_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let active = entry.active.as_ref().unwrap();
+            let mut protected = active
+                .frames()
+                .iter()
+                .flat_map(|frame| frame.claims().map(|claim| claim.entity()))
+                .collect::<Vec<_>>();
+            let host = entry.host.as_ref().unwrap();
+            protected.extend([host.host, host.top_slot]);
+            protected.sort_by_key(|entity| entity.to_bits());
+            protected.dedup();
+            (
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                entry.engine.history().clone(),
+                protected
+                    .into_iter()
+                    .map(|entity| (entity, nested_protected_fingerprint(app.world(), entity)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .clone();
+
+        let back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the real active route has one predecessor");
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            let issuer = entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the admitted Back retains its exact capacity issuer")
+                .semantic_snapshot_for_test();
+            assert_eq!(
+                issuer.outstanding_count(),
+                1,
+                "Back admission must reserve capacity before fallback exhaustion is armed"
+            );
+            entry
+                .engine
+                .testing_exhaust_reservation_counter(TestingReservationCounter::Transaction);
+        }
+        fail_next.store(true, Ordering::Release);
+
+        for _ in 0..4 {
+            app.update();
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            if matches!(
+                entry.engine.request(back).unwrap().status(),
+                RequestStatus::Failed(_)
+            ) {
+                break;
+            }
+        }
+
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert_eq!(
+                entry
+                    .back_target_driver_failure_dispatch_calls
+                    .load(Ordering::Relaxed),
+                1,
+                "the real root driver failure must reach the sole dispatcher exactly once"
+            );
+            assert!(matches!(
+                entry.engine.request(back).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::RecoveryFailed
+            ));
+            assert_eq!(entry.engine.history(), &history_before);
+            assert_eq!(
+                entry.active.as_ref().map(|active| {
+                    active
+                        .frames()
+                        .iter()
+                        .map(|frame| frame.frame().clone())
+                        .collect::<Vec<_>>()
+                }),
+                Some(active_before),
+                "Terminal must preserve the real active branch"
+            );
+            assert!(entry.pending_back_target_execution.is_none());
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(entry.back_capacity_reservations.is_empty());
+            assert!(entry.pending_back_resolution_action.is_none());
+            assert!(entry.pending_bound_back_resolution.is_none());
+            assert_eq!(
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("the exact router retains its capacity issuer")
+                    .semantic_snapshot_for_test()
+                    .outstanding_count(),
+                0,
+                "Terminal consumption must retire the sole Back capacity owner"
+            );
+            assert_eq!(
+                app.world().resource::<RouteEntityRegistry>().records(),
+                registry_before,
+                "Terminal must not mutate the physical registry"
+            );
+            for (entity, before) in &protected_before {
+                assert_eq!(
+                    &nested_protected_fingerprint(app.world(), *entity),
+                    before,
+                    "Terminal must preserve every active and protected Entity"
+                );
+            }
+
+            let public_after = app.world().resource::<RouterSnapshots>();
+            let router_after = public_after.get(router).unwrap();
+            assert_eq!(router_after.active(), public_before.active());
+            assert_eq!(router_after.history(), public_before.history());
+            assert_eq!(router_after.cleanup(), public_before.cleanup());
+            assert!(matches!(
+                public_after.request(router, back),
+                crate::snapshots::RequestLookup::Found(snapshot)
+                    if matches!(
+                        snapshot.status(),
+                        RequestStatus::Failed(failure)
+                            if failure.kind() == NavigationFailureKind::RecoveryFailed
+                    )
+            ));
+        }
+
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        assert!(
+            navigation.entries[0].engine.action().is_none(),
+            "fallback reservation exhaustion must not leave a fallback action"
+        );
+    }
+
+    struct BackTargetAppliedStagingMismatchView<'a> {
+        previous: Option<&'a PendingBackTargetDriving>,
+        pending: &'a PendingCommit,
+        task: &'a RootFrameTask,
+        report: &'a BackTargetAppliedReport,
+        observed: BackTargetDriverStagingMismatchObservation,
+    }
+
+    fn observe_back_target_applied_staging_mismatch(
+        entry: &RouterEntry,
+    ) -> Option<BackTargetAppliedStagingMismatchView<'_>> {
+        match entry.pending_back_target_execution.as_ref()? {
+            PendingBackTargetExecution::AppliedReportStagingMismatch(owner) => {
+                let previous = match owner.previous.as_ref() {
+                    None => None,
+                    Some(BackTargetDriverStagingOwner::TestDrift(previous)) => Some(previous),
+                    Some(
+                        BackTargetDriverStagingOwner::ResumeBlocked(_)
+                        | BackTargetDriverStagingOwner::Driving(_)
+                        | BackTargetDriverStagingOwner::Classifying(_)
+                        | BackTargetDriverStagingOwner::Prepared(_)
+                        | BackTargetDriverStagingOwner::CommitFailure(_)
+                        | BackTargetDriverStagingOwner::ExistingMismatch(_),
+                    ) => return None,
+                };
+                Some(BackTargetAppliedStagingMismatchView {
+                    previous,
+                    pending: &owner.pending,
+                    task: &owner.task,
+                    report: &owner.report,
+                    observed: owner.evidence.observed,
+                })
+            }
+            PendingBackTargetExecution::ResumeBlocked(_)
+            | PendingBackTargetExecution::Driving(_)
+            | PendingBackTargetExecution::Classifying(_)
+            | PendingBackTargetExecution::Prepared(_)
+            | PendingBackTargetExecution::CommitFailure(_)
+            | PendingBackTargetExecution::DriverFailureStagingMismatch(_)
+            | PendingBackTargetExecution::AppliedReportStagingConflict(_)
+            | PendingBackTargetExecution::DriverFailureStagingDrift(_) => None,
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum BackTargetAppliedStagingMismatchCase {
+        Missing,
+        TestDrift,
+    }
+
+    fn assert_back_target_applied_staging_mismatch_zero_write(
+        label: &str,
+        case: BackTargetAppliedStagingMismatchCase,
+    ) {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router_at_pattern(&mut app, label, "/:id");
+        app.update();
+        for location in ["/a", "/b"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            run_updates_until_succeeded(&mut app, request);
+        }
+
+        let back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the real active route has one predecessor");
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        publish_snapshots_system(app.world_mut());
+
+        let core_before = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .snapshot();
+        let request_before = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let request = navigation.entries[0]
+                .engine
+                .request(back)
+                .expect("the staged Back remains retained");
+            (
+                request.requested().cloned(),
+                request.status().clone(),
+                request.trace().to_vec(),
+            )
+        };
+        let world_before = authority_world_fingerprint(app.world());
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let public_router_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .expect("the exact router has a public snapshot")
+            .clone();
+        let public_request_before = match app
+            .world()
+            .resource::<RouterSnapshots>()
+            .request(router, back)
+        {
+            crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+            _ => panic!("the staged Back has a public request snapshot"),
+        };
+
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the exact router retains its entry");
+                let Some(PendingBackTargetExecution::Driving(driving)) =
+                    entry.pending_back_target_execution.take()
+                else {
+                    panic!("the real root Back must reach its Driving owner before applied report")
+                };
+                match case {
+                    BackTargetAppliedStagingMismatchCase::Missing => {
+                        let _detached_original_owner = driving;
+                    }
+                    BackTargetAppliedStagingMismatchCase::TestDrift => {
+                        entry.pending_back_target_execution = Some(
+                            PendingBackTargetExecution::DriverFailureStagingDrift(driving),
+                        );
+                    }
+                }
+                let mut pending = entry
+                    .pending_commit
+                    .take()
+                    .expect("the real root target retains one pending commit");
+                let task = pending
+                    .final_task
+                    .take()
+                    .expect("the real root target retains its final applied task");
+                assert!(
+                    entry.engine.is_current_root_back_frame_task(&task),
+                    "the predicate-input seam must use the real current root Back FrameTask"
+                );
+
+                assert!(
+                    matches!(
+                        route_back_target_applied_report(
+                            world,
+                            entry,
+                            pending,
+                            task,
+                            BackTargetAppliedReport::LegacyLeaf,
+                        ),
+                        RouteBackTargetAppliedOutcome::Handled
+                    ),
+                    "a current root Back applied report with missing or wrong staging must never be returned to the generic applied path"
+                );
+
+                let mismatch = observe_back_target_applied_staging_mismatch(entry)
+                    .expect("the whole applied input and existing stage must remain in one typed staging mismatch owner");
+                let _whole_pending = (
+                    &mismatch.pending.ticket,
+                    &mismatch.pending.final_task,
+                    &mismatch.pending.branch,
+                );
+                assert!(
+                    entry.engine.is_current_root_back_frame_task(mismatch.task),
+                    "the typed mismatch must retain the exact current root Back task"
+                );
+                assert!(matches!(
+                    mismatch.report,
+                    BackTargetAppliedReport::LegacyLeaf
+                ));
+                match case {
+                    BackTargetAppliedStagingMismatchCase::Missing => {
+                        assert!(mismatch.previous.is_none());
+                        assert!(matches!(
+                            mismatch.observed,
+                            BackTargetDriverStagingMismatchObservation::Missing
+                        ));
+                    }
+                    BackTargetAppliedStagingMismatchCase::TestDrift => {
+                        let previous = mismatch
+                            .previous
+                            .expect("the wrong existing stage must remain linearly owned");
+                        assert!(matches!(
+                            mismatch.observed,
+                            BackTargetDriverStagingMismatchObservation::TestDrift
+                        ));
+                        assert!(matches!(
+                            entry.engine.validate_back_target_execution_pairing(
+                                BackTargetExecutionOwnerRef::Driving {
+                                    history: &previous.history,
+                                    continuation: &previous.continuation,
+                                },
+                                BackTargetPhysicalOwnerRef::FrameTask(mismatch.task),
+                            ),
+                            BackTargetExecutionPairingOutcome::Matched
+                        ));
+                    }
+                }
+            },
+        );
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the exact router retains its entry");
+        assert_eq!(entry.engine.snapshot(), core_before);
+        let request_after = entry
+            .engine
+            .request(back)
+            .expect("the safe-stopped Back remains retained");
+        assert_eq!(
+            (
+                request_after.requested().cloned(),
+                request_after.status().clone(),
+                request_after.trace().to_vec(),
+            ),
+            request_before
+        );
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        let snapshots = app.world().resource::<RouterSnapshots>();
+        assert_eq!(
+            snapshots
+                .get(router)
+                .expect("the public router snapshot remains retained"),
+            &public_router_before
+        );
+        assert!(matches!(
+            snapshots.request(router, back),
+            crate::snapshots::RequestLookup::Found(snapshot)
+                if snapshot == &public_request_before
+        ));
+    }
+
+    #[test]
+    fn back_target_applied_report_missing_stage_is_typed_and_zero_write() {
+        assert_back_target_applied_staging_mismatch_zero_write(
+            "back-target-applied-missing-stage",
+            BackTargetAppliedStagingMismatchCase::Missing,
+        );
+    }
+
+    #[test]
+    fn back_target_applied_report_wrong_stage_is_typed_and_zero_write() {
+        assert_back_target_applied_staging_mismatch_zero_write(
+            "back-target-applied-wrong-stage",
+            BackTargetAppliedStagingMismatchCase::TestDrift,
+        );
+    }
+
+    #[test]
+    fn back_target_applied_report_existing_mismatch_is_bounded_and_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router_at_pattern(
+            &mut app,
+            "back-target-applied-existing-mismatch",
+            "/:id",
+        );
+        app.update();
+        for location in ["/a", "/b"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            run_updates_until_succeeded(&mut app, request);
+        }
+
+        let back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the real active route has one predecessor");
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        publish_snapshots_system(app.world_mut());
+        let placeholder_task =
+            foreign_fallback_task("back-target-applied-existing-mismatch-placeholder");
+
+        let (pending, task) = app.world_mut().resource_scope(
+            |_world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the exact router retains its entry");
+                let Some(PendingBackTargetExecution::Driving(driving)) =
+                    entry.pending_back_target_execution.take()
+                else {
+                    panic!("the real root Back must reach its Driving owner")
+                };
+                let _detached_missing_stage_owner = driving;
+                let mut pending = entry
+                    .pending_commit
+                    .take()
+                    .expect("the real root target retains one pending commit");
+                let task = pending
+                    .final_task
+                    .take()
+                    .expect("the real root target retains its final applied task");
+                assert!(entry.engine.is_current_root_back_frame_task(&task));
+
+                assert!(matches!(
+                    store_back_target_applied_staging_mismatch(
+                        entry,
+                        None,
+                        BackTargetDriverStagingMismatchObservation::Missing,
+                        PendingCommit::new(),
+                        placeholder_task,
+                        BackTargetAppliedReport::LegacyLeaf,
+                    ),
+                    RouteBackTargetAppliedOutcome::Handled
+                ));
+                (pending, task)
+            },
+        );
+
+        let core_before = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .snapshot();
+        let request_before = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let request = navigation.entries[0]
+                .engine
+                .request(back)
+                .expect("the staged Back remains retained");
+            (
+                request.requested().cloned(),
+                request.status().clone(),
+                request.trace().to_vec(),
+            )
+        };
+        let world_before = authority_world_fingerprint(app.world());
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let seal_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .latest_issued_seal();
+        let public_router_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .expect("the exact router has a public snapshot")
+            .clone();
+        let public_request_before = match app
+            .world()
+            .resource::<RouterSnapshots>()
+            .request(router, back)
+        {
+            crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+            _ => panic!("the staged Back has a public request snapshot"),
+        };
+
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the exact router retains its entry");
+                assert!(matches!(
+                    entry.pending_back_target_execution.as_ref(),
+                    Some(PendingBackTargetExecution::AppliedReportStagingMismatch(_))
+                ));
+                assert!(entry.engine.is_current_root_back_frame_task(&task));
+                assert!(matches!(
+                    route_back_target_applied_report(
+                        world,
+                        entry,
+                        pending,
+                        task,
+                        BackTargetAppliedReport::LegacyLeaf,
+                    ),
+                    RouteBackTargetAppliedOutcome::Handled
+                ));
+            },
+        );
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the exact router retains its entry");
+        assert_eq!(entry.engine.snapshot(), core_before);
+        let request_after = entry
+            .engine
+            .request(back)
+            .expect("the safe-stopped Back remains retained");
+        assert_eq!(
+            (
+                request_after.requested().cloned(),
+                request_after.status().clone(),
+                request_after.trace().to_vec(),
+            ),
+            request_before
+        );
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .latest_issued_seal(),
+            seal_before
+        );
+        let snapshots = app.world().resource::<RouterSnapshots>();
+        assert_eq!(
+            snapshots
+                .get(router)
+                .expect("the public router snapshot remains retained"),
+            &public_router_before
+        );
+        assert!(matches!(
+            snapshots.request(router, back),
+            crate::snapshots::RequestLookup::Found(snapshot)
+                if snapshot == &public_request_before
+        ));
+
+        let Some(PendingBackTargetExecution::AppliedReportStagingConflict(conflict)) =
+            entry.pending_back_target_execution.as_ref()
+        else {
+            panic!("re-entry must retain one flat typed applied staging conflict")
+        };
+        let existing = &conflict.existing;
+        let _existing_whole_pending = (
+            &existing.pending.ticket,
+            &existing.pending.final_task,
+            &existing.pending.branch,
+        );
+        assert!(!entry.engine.is_current_root_back_frame_task(&existing.task));
+        assert!(matches!(
+            existing.report,
+            BackTargetAppliedReport::LegacyLeaf
+        ));
+        assert!(matches!(
+            existing.evidence.observed,
+            BackTargetDriverStagingMismatchObservation::Missing
+        ));
+        assert!(existing.previous.is_none());
+        let incoming = &conflict.incoming;
+        let _blocked_whole_pending = (
+            &incoming.pending.ticket,
+            &incoming.pending.final_task,
+            &incoming.pending.branch,
+        );
+        assert!(entry.engine.is_current_root_back_frame_task(&incoming.task));
+        assert!(matches!(
+            incoming.report,
+            BackTargetAppliedReport::LegacyLeaf
+        ));
+        assert!(matches!(
+            conflict.evidence.observed,
+            BackTargetDriverStagingMismatchObservation::ExistingAppliedMismatch
+        ));
+        assert!(
+            conflict.evidence.pairing.is_none(),
+            "staging conflict evidence must not fabricate a receiver pairing mismatch"
+        );
+    }
+
+    fn stage_real_back_target_applied_commit(
+        app: &mut App,
+        router: RouterHandle,
+    ) -> bevy_ui_router_core::prelude::NavigationRequestId {
+        let back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the real active route has one predecessor");
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .unwrap();
+                let mut pending = entry
+                    .pending_commit
+                    .take()
+                    .expect("the real root target driver retains one pending commit");
+                let task = pending
+                    .final_task
+                    .take()
+                    .expect("the applied root target retains its final report task");
+                assert!(matches!(
+                    route_back_target_applied_report(
+                        world,
+                        entry,
+                        pending,
+                        task,
+                        BackTargetAppliedReport::LegacyLeaf,
+                    ),
+                    RouteBackTargetAppliedOutcome::Handled
+                ));
+                assert!(matches!(
+                    entry.pending_back_target_execution.as_ref(),
+                    Some(PendingBackTargetExecution::ResumeBlocked(
+                        PendingBackTargetResumeBlocked::AppliedCommitPending(_)
+                    ))
+                ));
+            },
+        );
+        back
+    }
+
+    #[test]
+    fn back_target_atomic_applied_commit_pairing_mismatch_is_typed_and_not_retried() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router =
+            install_atomic_router_at_pattern(&mut app, "back-applied-commit-pairing", "/:id");
+        app.update();
+        for location in ["/a", "/b"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            run_updates_until_succeeded(&mut app, request);
+        }
+
+        let back = stage_real_back_target_applied_commit(&mut app, router);
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+            .engine
+            .testing_invalidate_commit_action();
+        publish_snapshots_system(app.world_mut());
+        let world_before = authority_world_fingerprint(app.world());
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let engine_before = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .snapshot();
+        let request_before = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .request(back)
+            .unwrap()
+            .status()
+            .clone();
+        let public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .clone();
+        let public_request_before = match app
+            .world()
+            .resource::<RouterSnapshots>()
+            .request(router, back)
+        {
+            crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+            _ => panic!("the staged Back must retain its complete public request snapshot"),
+        };
+
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                assert!(drive_back_target_applied_commit(
+                    world,
+                    &mut navigation.entries[0]
+                ));
+                assert!(!drive_back_target_applied_commit(
+                    world,
+                    &mut navigation.entries[0]
+                ));
+            },
+        );
+        publish_snapshots_system(app.world_mut());
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        let Some(PendingBackTargetExecution::ResumeBlocked(
+            PendingBackTargetResumeBlocked::AppliedCommitPairingMismatch(owner),
+        )) = entry.pending_back_target_execution.as_ref()
+        else {
+            panic!("commit pairing drift must retain one typed whole-owner mismatch")
+        };
+        let _whole_owner = (
+            &owner.owner.driving.history,
+            &owner.owner.driving.continuation,
+            &owner.owner.ticket,
+            &owner.owner.pending,
+            &owner.mismatch,
+        );
+        assert_eq!(
+            entry.engine.request(back).unwrap().status(),
+            &request_before
+        );
+        assert_eq!(entry.engine.snapshot(), engine_before);
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .get(router)
+                .unwrap(),
+            &public_before
+        );
+        assert!(matches!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .request(router, back),
+            crate::snapshots::RequestLookup::Found(snapshot)
+                if snapshot == &public_request_before
+        ));
+    }
+
+    #[test]
+    fn back_target_atomic_applied_commit_pre_splice_drift_is_permanent_once() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let exact =
+            install_atomic_router_at_pattern(&mut app, "back-applied-commit-permanent", "/:id");
+        let foreign =
+            install_atomic_router_at_pattern(&mut app, "back-applied-commit-foreign", "/:id");
+        app.update();
+        for router in [exact, foreign] {
+            for location in ["/a", "/b"] {
+                let request = app
+                    .world_mut()
+                    .resource_mut::<RouterNavigation>()
+                    .push(router, RouteLocation::new(location))
+                    .unwrap();
+                run_updates_until_succeeded(&mut app, request);
+            }
+        }
+
+        let back = stage_real_back_target_applied_commit(&mut app, exact);
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let exact_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == exact)
+                .unwrap();
+            let foreign_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == foreign)
+                .unwrap();
+            let (exact_entry, foreign_entry) = if exact_index < foreign_index {
+                let (before, after) = navigation.entries.split_at_mut(foreign_index);
+                (&mut before[exact_index], &mut after[0])
+            } else {
+                let (before, after) = navigation.entries.split_at_mut(exact_index);
+                (&mut after[0], &mut before[foreign_index])
+            };
+            std::mem::swap(&mut exact_entry.active, &mut foreign_entry.active);
+        }
+        publish_snapshots_system(app.world_mut());
+        let world_before = authority_world_fingerprint(app.world());
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let engine_before = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == exact)
+            .unwrap()
+            .engine
+            .snapshot();
+        let request_before = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == exact)
+            .unwrap()
+            .engine
+            .request(back)
+            .unwrap()
+            .status()
+            .clone();
+        let public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(exact)
+            .unwrap()
+            .clone();
+        let public_request_before = match app
+            .world()
+            .resource::<RouterSnapshots>()
+            .request(exact, back)
+        {
+            crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+            _ => panic!("the staged Back must retain its complete public request snapshot"),
+        };
+
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == exact)
+                    .unwrap();
+                assert!(drive_back_target_applied_commit(world, entry));
+                assert!(!drive_back_target_applied_commit(world, entry));
+            },
+        );
+        publish_snapshots_system(app.world_mut());
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == exact)
+            .unwrap();
+        let Some(PendingBackTargetExecution::ResumeBlocked(
+            PendingBackTargetResumeBlocked::AppliedCommitPermanent(owner),
+        )) = entry.pending_back_target_execution.as_ref()
+        else {
+            panic!("cross-router pre-splice authority must become one typed permanent owner")
+        };
+        let _whole_owner = (
+            &owner.owner.driving.history,
+            &owner.owner.driving.continuation,
+            &owner.owner.ticket,
+            &owner.owner.pending,
+        );
+        assert_eq!(
+            (
+                owner.evidence.source(),
+                owner.evidence.expectation(),
+                owner.evidence.observed(),
+            ),
+            (
+                LifecyclePreflightSource::PreservedCurrent,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            )
+        );
+        assert_eq!(
+            entry.engine.request(back).unwrap().status(),
+            &request_before
+        );
+        assert_eq!(entry.engine.snapshot(), engine_before);
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .get(exact)
+                .unwrap(),
+            &public_before
+        );
+        assert!(matches!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .request(exact, back),
+            crate::snapshots::RequestLookup::Found(snapshot)
+                if snapshot == &public_request_before
+        ));
+    }
+
+    #[test]
+    fn back_target_atomic_applied_report_uses_real_dispatcher() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router =
+            install_atomic_router_at_pattern(&mut app, "back-target-atomic-applied-red", "/:id");
+        app.update();
+        for location in ["/a", "/b"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            run_updates_until_succeeded(&mut app, request);
+        }
+
+        let back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the real active route has one predecessor");
+        for _ in 0..16 {
+            app.update();
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            if matches!(
+                entry.engine.request(back).unwrap().status(),
+                RequestStatus::Succeeded
+            ) {
+                break;
+            }
+        }
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert_eq!(
+            entry
+                .back_target_atomic_applied_dispatch_calls
+                .load(Ordering::Relaxed),
+            1,
+            "the real root final task must reach the atomic applied-report boundary"
+        );
+        assert!(
+            entry
+                .pending_commit
+                .as_ref()
+                .is_none_or(|pending| pending.final_task.is_none()),
+            "the atomic report path must not retain an already-consumed final task"
+        );
+        assert!(
+            entry.pending_back_target_execution.is_none(),
+            "the atomic applied report must return a real ticket and leave Driving"
+        );
+        assert_eq!(
+            entry.engine.request(back).unwrap().status(),
+            &RequestStatus::Succeeded,
+            "the atomic report path must complete the real Back request"
+        );
+    }
+
+    #[test]
+    fn back_target_atomic_applied_mount_request_whole_safe_stops_once() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_deep_nested_router(&mut app);
+        app.update();
+        commit_initial_deep_nested_branch(&mut app, router);
+        let second = prepare_deep_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/sections/b/items/2"),
+        );
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+        publish_snapshots_system(app.world_mut());
+
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert_eq!(
+                entry.engine.request(second).unwrap().status(),
+                &RequestStatus::Succeeded
+            );
+            assert_eq!(entry.engine.history().len(), 2);
+            assert_eq!(
+                entry.engine.history().current(),
+                Some(&RouteLocation::new("/sections/b/items/2"))
+            );
+            assert_eq!(entry.active.as_ref().unwrap().frames().len(), 3);
+            assert_eq!(entry.active.as_ref().unwrap().child_slots().len(), 2);
+        }
+
+        let back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the real deep nested history has one predecessor");
+        collect_navigation_system(app.world_mut());
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .back_target_atomic_applied_dispatch_calls
+                .load(Ordering::Relaxed),
+            0,
+            "the atomic applied dispatcher must remain untouched before the target action runs"
+        );
+        let history_before_applied = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .history()
+            .clone();
+
+        drive_navigation_system(app.world_mut());
+
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let observed_stage = match entry.pending_back_target_execution.as_ref() {
+                Some(PendingBackTargetExecution::ResumeBlocked(
+                    PendingBackTargetResumeBlocked::Start { .. },
+                )) => "ResumeBlocked::Start",
+                Some(PendingBackTargetExecution::ResumeBlocked(
+                    PendingBackTargetResumeBlocked::PairingMismatch { .. },
+                )) => "ResumeBlocked::PairingMismatch",
+                Some(PendingBackTargetExecution::ResumeBlocked(
+                    PendingBackTargetResumeBlocked::DrivingPairingMismatch { .. },
+                )) => "ResumeBlocked::DrivingPairingMismatch",
+                Some(PendingBackTargetExecution::ResumeBlocked(
+                    PendingBackTargetResumeBlocked::DriverFailure(_),
+                )) => "ResumeBlocked::DriverFailure",
+                Some(PendingBackTargetExecution::ResumeBlocked(
+                    PendingBackTargetResumeBlocked::AppliedPhysicalIndeterminate(_),
+                )) => "ResumeBlocked::AppliedPhysicalIndeterminate",
+                Some(PendingBackTargetExecution::ResumeBlocked(
+                    PendingBackTargetResumeBlocked::AppliedReportMismatch(_),
+                )) => "ResumeBlocked::AppliedReportMismatch",
+                Some(PendingBackTargetExecution::ResumeBlocked(
+                    PendingBackTargetResumeBlocked::AppliedMountRequestPending(_),
+                )) => "ResumeBlocked::AppliedMountRequestPending",
+                Some(PendingBackTargetExecution::ResumeBlocked(
+                    PendingBackTargetResumeBlocked::AppliedMountRequestPairingMismatch(_),
+                )) => "ResumeBlocked::AppliedMountRequestPairingMismatch",
+                Some(PendingBackTargetExecution::ResumeBlocked(
+                    PendingBackTargetResumeBlocked::AppliedCommitPending(_),
+                )) => "ResumeBlocked::AppliedCommitPending",
+                Some(PendingBackTargetExecution::ResumeBlocked(
+                    PendingBackTargetResumeBlocked::AppliedCommitPairingMismatch(_),
+                )) => "ResumeBlocked::AppliedCommitPairingMismatch",
+                Some(PendingBackTargetExecution::ResumeBlocked(
+                    PendingBackTargetResumeBlocked::AppliedCommitPermanent(_),
+                )) => "ResumeBlocked::AppliedCommitPermanent",
+                Some(PendingBackTargetExecution::ResumeBlocked(
+                    PendingBackTargetResumeBlocked::Permanent { .. },
+                )) => "ResumeBlocked::Permanent",
+                Some(PendingBackTargetExecution::ResumeBlocked(
+                    PendingBackTargetResumeBlocked::CapacityRejected { .. },
+                )) => "ResumeBlocked::CapacityRejected",
+                Some(PendingBackTargetExecution::ResumeBlocked(
+                    PendingBackTargetResumeBlocked::ReceiverMismatch { .. },
+                )) => "ResumeBlocked::ReceiverMismatch",
+                Some(PendingBackTargetExecution::Driving(_)) => "Driving",
+                Some(PendingBackTargetExecution::Classifying(_)) => "Classifying",
+                Some(PendingBackTargetExecution::Prepared(_)) => "Prepared",
+                Some(PendingBackTargetExecution::CommitFailure(_)) => "CommitFailure",
+                Some(PendingBackTargetExecution::DriverFailureStagingMismatch(_)) => {
+                    "DriverFailureStagingMismatch"
+                }
+                Some(PendingBackTargetExecution::AppliedReportStagingMismatch(_)) => {
+                    "AppliedReportStagingMismatch"
+                }
+                Some(PendingBackTargetExecution::AppliedReportStagingConflict(_)) => {
+                    "AppliedReportStagingConflict"
+                }
+                Some(PendingBackTargetExecution::DriverFailureStagingDrift(_)) => {
+                    "DriverFailureStagingDrift"
+                }
+                None => "None",
+            };
+            assert_eq!(
+                entry
+                    .back_target_atomic_applied_dispatch_calls
+                    .load(Ordering::Relaxed),
+                1,
+                "the real entering section WithOutlets report must reach the atomic applied dispatcher exactly once; observed stage={observed_stage}, pending_commit={}, pending_frame_drive={}, pending_mount_frame_task={}, pending_mount_request={}",
+                entry.pending_commit.is_some(),
+                entry.pending_frame_drive.is_some(),
+                entry.pending_mount_frame_task.is_some(),
+                entry.pending_mount_request.is_some(),
+            );
+            let Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::AppliedMountRequestPending(owner),
+            )) = entry.pending_back_target_execution.as_ref()
+            else {
+                panic!(
+                    "the returned target MountRequest must whole-safe-stop with its history, capacity and pending owner"
+                )
+            };
+            assert!(matches!(
+                entry.engine.validate_back_target_execution_pairing(
+                    BackTargetExecutionOwnerRef::Driving {
+                        history: &owner.driving.history,
+                        continuation: &owner.driving.continuation,
+                    },
+                    BackTargetPhysicalOwnerRef::MountRequest(&owner.request),
+                ),
+                BackTargetExecutionPairingOutcome::Matched
+            ));
+            assert_eq!(owner.request.request(), back);
+            assert_eq!(owner.pending.branch.frames().len(), 1);
+            assert_eq!(
+                owner
+                    .pending
+                    .branch
+                    .last_frame()
+                    .expect("the entering section was realized before its outlet report")
+                    .frame(),
+                owner.request.parent()
+            );
+            assert!(entry.pending_commit.is_none());
+            assert!(entry.pending_mount_request.is_none());
+            assert!(entry.pending_mount_frame_task.is_none());
+            assert_eq!(entry.engine.history(), &history_before_applied);
+        }
+
+        let world_before_safe_stop = authority_world_fingerprint(app.world());
+        let registry_before_safe_stop = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let public_before_safe_stop = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .clone();
+
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert_eq!(
+            entry
+                .back_target_atomic_applied_dispatch_calls
+                .load(Ordering::Relaxed),
+            1,
+            "the saved target MountRequest owner must block atomic applied redispatch"
+        );
+        assert!(matches!(
+            entry.pending_back_target_execution.as_ref(),
+            Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::AppliedMountRequestPending(_)
+            ))
+        ));
+        assert!(entry.pending_commit.is_none());
+        assert!(entry.pending_mount_request.is_none());
+        assert!(entry.pending_mount_frame_task.is_none());
+        assert_eq!(entry.engine.history(), &history_before_applied);
+        assert_eq!(
+            authority_world_fingerprint(app.world()),
+            world_before_safe_stop
+        );
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before_safe_stop
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .get(router)
+                .unwrap(),
+            &public_before_safe_stop
+        );
+    }
+
+    #[test]
+    fn back_target_atomic_applied_mount_exhaustion_safe_stops_post_report_residual_once() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_deep_nested_router(&mut app);
+        app.update();
+        commit_initial_deep_nested_branch(&mut app, router);
+        let second = prepare_deep_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/sections/b/items/2"),
+        );
+        commit_presentation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+        publish_snapshots_system(app.world_mut());
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(second)
+                .unwrap()
+                .status(),
+            &RequestStatus::Succeeded
+        );
+
+        let back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the real deep nested history has one predecessor");
+        collect_navigation_system(app.world_mut());
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            assert_eq!(
+                entry
+                    .back_target_atomic_applied_dispatch_calls
+                    .load(Ordering::Relaxed),
+                0
+            );
+            entry.engine.testing_exhaust_mount_sequence_counter();
+        }
+        let history_before_applied = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .history()
+            .clone();
+        let public_before_applied = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .clone();
+
+        drive_navigation_system(app.world_mut());
+
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert_eq!(
+                entry
+                    .back_target_atomic_applied_dispatch_calls
+                    .load(Ordering::Relaxed),
+                1,
+                "real mount.issue exhaustion must cross the atomic applied dispatcher once"
+            );
+            assert_eq!(
+                observe_back_target_driver_failure_stage(entry),
+                Some(
+                    BackTargetDriverFailureStageObservation::PostReportPhysicalIndeterminateFailureCleanup(
+                        BackTargetDriverUnverifiedObservation::Residual,
+                    ),
+                ),
+                "the post-report source, history, real residual and Core FailureCleanup owner must whole-safe-stop together"
+            );
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.pending_commit.is_none());
+            assert!(entry.pending_mount_request.is_none());
+            assert!(entry.pending_mount_frame_task.is_none());
+            assert_eq!(entry.engine.history(), &history_before_applied);
+            assert_eq!(
+                app.world()
+                    .resource::<RouterSnapshots>()
+                    .get(router)
+                    .unwrap(),
+                &public_before_applied
+            );
+        }
+
+        let world_before_safe_stop = authority_world_fingerprint(app.world());
+        let registry_before_safe_stop = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert_eq!(
+            entry
+                .back_target_atomic_applied_dispatch_calls
+                .load(Ordering::Relaxed),
+            1,
+            "post-report indeterminate must never dispatch the applied report again"
+        );
+        assert_eq!(
+            observe_back_target_driver_failure_stage(entry),
+            Some(
+                BackTargetDriverFailureStageObservation::PostReportPhysicalIndeterminateFailureCleanup(
+                    BackTargetDriverUnverifiedObservation::Residual,
+                ),
+            )
+        );
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.pending_commit.is_none());
+        assert!(entry.pending_mount_request.is_none());
+        assert!(entry.pending_mount_frame_task.is_none());
+        assert_eq!(entry.engine.history(), &history_before_applied);
+        assert_eq!(
+            authority_world_fingerprint(app.world()),
+            world_before_safe_stop
+        );
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before_safe_stop
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .get(router)
+                .unwrap(),
+            &public_before_applied
+        );
+        assert_eq!(
+            entry.engine.request(back).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::CleanupPending)
+        );
+    }
+
+    #[test]
+    fn back_target_dispatcher_consumes_verified_bound_target_through_normal_publication_once() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router_at_pattern(&mut app, "back-target-dispatcher", "/:id");
+        let target = RouteLocation::new("/a");
+
+        app.update();
+        let first_push = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, target.clone())
+            .unwrap();
+        run_updates_until_succeeded(&mut app, first_push);
+        let second_push = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/b"))
+            .unwrap();
+        run_updates_until_succeeded(&mut app, second_push);
+
+        let (back, capacity_identity, issuer_before, request_count_before) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let back = navigation
+                .back(router)
+                .expect("the active second route has the first route as a real Back target");
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the installed router retains its exact entry");
+            let capacity_identity = entry
+                .back_capacity_reservations
+                .iter()
+                .find_map(|(request, reservation)| {
+                    (*request == back).then_some(reservation.capacity_identity_for_test())
+                })
+                .expect("the admitted Back owns one exact capacity reservation");
+            let issuer_before = entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the exact router owns its capacity issuer")
+                .semantic_snapshot_for_test();
+            (back, capacity_identity, issuer_before, entry.requests.len())
+        };
+
+        collect_navigation_system(app.world_mut());
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the installed router retains its exact entry");
+            assert!(
+                entry
+                    .back_capacity_reservations
+                    .iter()
+                    .any(|(request, reservation)| {
+                        *request == back
+                            && reservation.capacity_identity_for_test() == capacity_identity
+                    }),
+                "collection alone must preserve the admitted exact Back capacity"
+            );
+            assert!(entry.pending_bound_back_resolution.is_none());
+            assert!(entry.pending_back_target_execution.is_none());
+        }
+
+        drive_navigation_system(app.world_mut());
+        run_updates_until_succeeded(&mut app, back);
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the installed router retains its exact entry");
+        let request = entry
+            .engine
+            .request(back)
+            .expect("the completed Back remains retained");
+        assert!(matches!(request.status(), RequestStatus::Succeeded));
+        assert_eq!(request.requested(), Some(&target));
+        assert!(
+            entry.pending_bound_back_resolution.is_none(),
+            "the dispatcher must consume the verified bound Target rather than retain it"
+        );
+        assert!(entry.pending_back_resolution_action.is_none());
+        assert!(
+            entry.pending_back_target_execution.is_none(),
+            "normal target publication must close the sole target execution stage"
+        );
+        assert!(
+            entry
+                .back_capacity_reservations
+                .iter()
+                .all(|(request, _)| *request != back),
+            "the completed Back must not retain or replace its exact bound capacity owner"
+        );
+        assert_eq!(entry.requests.len(), request_count_before);
+        let issuer_after = entry
+            .back_capacity_issuer
+            .as_ref()
+            .expect("the exact router retains its capacity issuer")
+            .semantic_snapshot_for_test();
+        assert_eq!(issuer_after.cell_count(), issuer_before.cell_count());
+        assert_eq!(
+            issuer_after.outstanding_count(),
+            issuer_before.outstanding_count().checked_sub(1).unwrap(),
+            "the verified target retires its one live capacity owner exactly once"
+        );
+        assert_eq!(issuer_after.next_owner(), issuer_before.next_owner());
+        assert_eq!(
+            issuer_after.next_generation(),
+            issuer_before.next_generation().checked_add(1).unwrap()
+        );
+
+        let snapshots = app.world().resource::<RouterSnapshots>();
+        let public_request = match snapshots.request(router, back) {
+            crate::snapshots::RequestLookup::Found(snapshot) => snapshot,
+            crate::snapshots::RequestLookup::NotRetained => {
+                panic!("the completed Back must remain publicly retained")
+            }
+            crate::snapshots::RequestLookup::Unknown => {
+                panic!("normal target publication must expose the completed Back")
+            }
+        };
+        assert!(matches!(public_request.status(), RequestStatus::Succeeded));
+        assert_eq!(public_request.requested(), Some(&target));
+    }
+
+    #[test]
+    fn back_target_zero_entering_commit_needs_no_frame_report() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router =
+            install_atomic_router_at_pattern(&mut app, "back-target-zero-entering", "/:id");
+        app.update();
+        let target = RouteLocation::new("/same");
+        for _ in 0..2 {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, target.clone())
+                .unwrap();
+            run_updates_until_succeeded(&mut app, request);
+        }
+
+        let world_before = authority_world_fingerprint(app.world());
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let applied_calls_before = app.world().resource::<RouterNavigation>().entries[0]
+            .back_target_atomic_applied_dispatch_calls
+            .load(Ordering::Relaxed);
+
+        let back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the duplicate exact entry has one Back predecessor");
+        for _ in 0..16 {
+            app.update();
+            if matches!(
+                app.world().resource::<RouterNavigation>().entries[0]
+                    .engine
+                    .request(back)
+                    .unwrap()
+                    .status(),
+                RequestStatus::Succeeded
+            ) {
+                break;
+            }
+        }
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = &navigation.entries[0];
+        assert_eq!(
+            entry.engine.request(back).unwrap().status(),
+            &RequestStatus::Succeeded,
+            "the initial zero-entering Commit must reach the unique target publisher"
+        );
+        assert_eq!(
+            entry
+                .back_target_atomic_applied_dispatch_calls
+                .load(Ordering::Relaxed),
+            applied_calls_before,
+            "zero-entering must consume the real Commit without a frame report"
+        );
+        assert!(entry.pending_back_target_execution.is_none());
+        assert!(entry.pending_commit.is_none());
+        let history = entry.engine.snapshot();
+        assert_eq!(history.history().entries(), &[target.clone(), target]);
+        assert_eq!(history.history().cursor(), Some(0));
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+    }
+
+    #[test]
+    fn back_capacity_bound_retirement_preflight_is_zero_write_and_commit_burns_once() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router_at_pattern(&mut app, "back-capacity-retirement", "/:id");
+        app.update();
+        for location in ["/first", "/second"] {
+            app.world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            app.update();
+        }
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("two real history entries admit one exact bound back capacity");
+
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handle == router)
+            .unwrap();
+        assert_eq!(
+            entry.back_capacity_reservations.len(),
+            1,
+            "the accepted back owns exactly one real bound capacity reservation"
+        );
+        let (stored_request, bound) = entry.back_capacity_reservations.remove(0);
+        assert_eq!(stored_request, request);
+        assert_eq!(bound.request(), request);
+        let bound_identity = bound.capacity_identity_for_test();
+
+        let mut foreign_domains = BackCapacityDomainIssuer::new();
+        let mut foreign_issuer = loop {
+            let candidate = foreign_domains.issue().unwrap();
+            if candidate.domain_for_test() != bound_identity.0 {
+                break candidate;
+            }
+        };
+        let foreign_before = foreign_issuer.semantic_snapshot_for_test();
+        let foreign_result = foreign_issuer.preflight_bound_retirement(
+            &bound,
+            crate::cleanup::BackCapacityRetireDisposition::Target,
+        );
+        assert!(
+            matches!(
+                foreign_result,
+                Err(crate::cleanup::BackCapacityRetireError::ForeignDomain)
+            ),
+            "a foreign issuer must reject the exact bound owner with typed domain evidence"
+        );
+        assert_eq!(
+            foreign_issuer.semantic_snapshot_for_test(),
+            foreign_before,
+            "foreign preflight must not mutate the rejecting issuer"
+        );
+        assert_eq!(
+            bound.capacity_identity_for_test(),
+            bound_identity,
+            "foreign preflight must return without changing the bound identity"
+        );
+
+        let issuer = entry
+            .back_capacity_issuer
+            .as_mut()
+            .expect("the installed entry retains its real capacity issuer");
+        let preflight_before = issuer.semantic_snapshot_for_test();
+        let preflight = issuer.preflight_bound_retirement(
+            &bound,
+            crate::cleanup::BackCapacityRetireDisposition::Target,
+        );
+        assert!(
+            matches!(&preflight, Ok(_)),
+            "the exact outstanding bound reservation must produce a guard and prepared successor; got {:?}",
+            preflight.as_ref().err()
+        );
+        let (guard, prepared_retirement) = preflight
+            .ok()
+            .expect("the preceding behavioral assertion proved exact preflight success");
+        drop((guard, prepared_retirement));
+        assert_eq!(
+            issuer.semantic_snapshot_for_test(),
+            preflight_before,
+            "dropping an uncommitted exact guard and prepared successor must be a semantic zero-write"
+        );
+        assert_eq!(
+            bound.capacity_identity_for_test(),
+            bound_identity,
+            "dropping an uncommitted guard must leave the borrowed move-only bound identity unchanged"
+        );
+
+        let (guard, prepared_retirement) = issuer
+            .preflight_bound_retirement(
+                &bound,
+                crate::cleanup::BackCapacityRetireDisposition::Target,
+            )
+            .expect("the unchanged exact outstanding bound must preflight again");
+        guard.commit();
+        drop(bound);
+        let retirement = prepared_retirement.into_evidence_after_exact_receiver();
+        let committed = issuer.semantic_snapshot_for_test();
+        assert_eq!(committed.cell_count(), preflight_before.cell_count());
+        assert_eq!(
+            committed.outstanding_count(),
+            preflight_before.outstanding_count().checked_sub(1).unwrap(),
+            "commit must remove the exact outstanding owner once"
+        );
+        assert_eq!(committed.next_owner(), preflight_before.next_owner());
+        assert_eq!(
+            committed.next_generation(),
+            preflight_before.next_generation().checked_add(1).unwrap(),
+            "commit must burn the capacity identity by advancing its cell generation"
+        );
+        assert_eq!(
+            retirement.bound_disposition_for_test(),
+            Some(crate::cleanup::BackCapacityRetireDisposition::Target),
+            "bound retirement evidence must retain Target without an enqueue rejection"
+        );
+
+        let replay_before = issuer.semantic_snapshot_for_test();
+        assert_eq!(
+            issuer.classify_retirement_evidence(&retirement),
+            Err(crate::cleanup::BackCapacityRetireError::ConsumedReplay),
+            "the committed identity must classify as a non-authorizing consumed replay"
+        );
+        assert_eq!(
+            issuer.classify_retirement_evidence(&retirement),
+            Err(crate::cleanup::BackCapacityRetireError::ConsumedReplay),
+            "replaying retirement evidence must remain rejected after the single burn"
+        );
+        assert_eq!(
+            issuer.semantic_snapshot_for_test(),
+            replay_before,
+            "replay classification must not mutate the issuer"
+        );
+    }
+
+    #[test]
+    fn verified_back_target_resolution_recomposes_bound_capacity() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router_at_pattern(&mut app, "back-target-resolution", "/:id");
+        app.update();
+        for location in ["/first", "/second"] {
+            app.world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            app.update();
+        }
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("two real history entries produce the currently reachable target branch");
+
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handle == router)
+            .unwrap();
+        entry.engine.collect();
+        let Some(EngineAction::BackResolution(handoff)) = entry.engine.action() else {
+            panic!("the real target producer must emit a raw resolution handoff")
+        };
+        let scope = handoff.scope();
+        let capacity_identity = entry
+            .back_capacity_reservations
+            .iter()
+            .find_map(|(_, reservation)| {
+                reservation
+                    .matches_resolution_scope(&scope)
+                    .then_some(reservation.capacity_identity_for_test())
+            })
+            .expect("the real target handoff opaquely selects its exact bound capacity");
+
+        match entry.take_back_resolution_handoff(handoff) {
+            TakeBackResolutionOutcome::Matched(bound) => {
+                assert_eq!(
+                    bound_back_resolution_capacity_identity(&bound),
+                    capacity_identity,
+                    "the verified target must recompose its returned accepted view with the same capacity owner"
+                );
+                assert!(
+                    matches!(bound, BoundBackResolutionHandoff::Target(_)),
+                    "the real target producer must preserve its typed target owner"
+                );
+            }
+            TakeBackResolutionOutcome::Mismatch {
+                reservation,
+                handoff,
+                evidence,
+            } => {
+                entry.restore_back_resolution_mismatch(reservation, handoff, evidence);
+                panic!(
+                    "the exact target producer must preserve complete authority and capacity through a matched handoff"
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn back_target_receiver_mismatch_returns_complete_bound_without_retirement() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let exact_router =
+            install_atomic_router_at_pattern(&mut app, "back-target-wrong-receiver", "/:id");
+        let foreign_router =
+            install_atomic_router_at_pattern(&mut app, "back-target-foreign-receiver", "/:id");
+        app.update();
+        for router in [exact_router, foreign_router] {
+            for location in ["/first", "/second"] {
+                app.world_mut()
+                    .resource_mut::<RouterNavigation>()
+                    .push(router, RouteLocation::new(location))
+                    .unwrap();
+                app.update();
+            }
+        }
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(exact_router)
+            .expect("the exact router has one real predecessor");
+
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let exact_index = navigation
+            .entries
+            .iter()
+            .position(|entry| entry.handle == exact_router)
+            .unwrap();
+        let foreign_index = navigation
+            .entries
+            .iter()
+            .position(|entry| entry.handle == foreign_router)
+            .unwrap();
+        let (exact, foreign) = if exact_index < foreign_index {
+            let (before, after) = navigation.entries.split_at_mut(foreign_index);
+            (&mut before[exact_index], &mut after[0])
+        } else {
+            let (before, after) = navigation.entries.split_at_mut(exact_index);
+            (&mut after[0], &mut before[foreign_index])
+        };
+        let bound = take_real_bound_back_target(exact);
+        let bound_identity = bound.reservation.capacity_identity_for_test();
+
+        std::mem::swap(&mut exact.engine, &mut foreign.engine);
+        let wrong_engine_before = exact.engine.snapshot();
+        let owner_engine_before = foreign.engine.snapshot();
+        let issuer_before = exact
+            .back_capacity_issuer
+            .as_ref()
+            .expect("the exact entry retains its real capacity issuer")
+            .semantic_snapshot_for_test();
+
+        let bound = match resume_bound_back_target(exact, bound) {
+            BackTargetResumeOutcome::ReceiverMismatch { bound, evidence: _ } => bound,
+            BackTargetResumeOutcome::Resumed { .. } => {
+                panic!("a wrong engine must not resume the exact verified target owner")
+            }
+            BackTargetResumeOutcome::Permanent { .. } => {
+                panic!("receiver mismatch must not consume the target into a permanent owner")
+            }
+            BackTargetResumeOutcome::CapacityRejected { .. } => {
+                panic!("the exact issuer must pass preflight before receiver mismatch")
+            }
+        };
+
+        assert_eq!(
+            bound.reservation.capacity_identity_for_test(),
+            bound_identity
+        );
+        assert_eq!(exact.engine.snapshot(), wrong_engine_before);
+        assert_eq!(foreign.engine.snapshot(), owner_engine_before);
+        assert_eq!(
+            exact
+                .back_capacity_issuer
+                .as_ref()
+                .unwrap()
+                .semantic_snapshot_for_test(),
+            issuer_before,
+            "receiver mismatch must call the retirement callback zero times"
+        );
+
+        std::mem::swap(&mut exact.engine, &mut foreign.engine);
+        assert!(
+            matches!(
+                resume_bound_back_target(exact, bound),
+                BackTargetResumeOutcome::Resumed { .. }
+            ),
+            "the returned complete bound must remain consumable by its exact receiver"
+        );
+    }
+
+    #[test]
+    fn back_target_exact_receiver_retires_target_capacity_once() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router =
+            install_atomic_router_at_pattern(&mut app, "back-target-exact-retirement", "/:id");
+        app.update();
+        for location in ["/first", "/second"] {
+            app.world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            app.update();
+        }
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the exact router has one real predecessor");
+
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handle == router)
+            .unwrap();
+        let bound = take_real_bound_back_target(entry);
+        let issuer_before = entry
+            .back_capacity_issuer
+            .as_ref()
+            .unwrap()
+            .semantic_snapshot_for_test();
+
+        let retirement = match resume_bound_back_target(entry, bound) {
+            BackTargetResumeOutcome::Resumed { start, retirement } => {
+                let BackTargetStart::Ready(resume) = start else {
+                    panic!("the non-exhausted target fixture must return a real resume action")
+                };
+                let (action, _execution, _continuation) = resume.into_parts();
+                assert!(
+                    matches!(
+                        action,
+                        BackTargetResumeAction::FrameTask(_) | BackTargetResumeAction::Commit(_)
+                    ),
+                    "the real atomic target must return its actual FrameTask or Commit branch"
+                );
+                retirement
+            }
+            BackTargetResumeOutcome::Permanent { .. } => {
+                panic!("an unchanged exact target must not become permanent")
+            }
+            BackTargetResumeOutcome::CapacityRejected { .. } => {
+                panic!("the exact outstanding target capacity must pass issuer preflight")
+            }
+            BackTargetResumeOutcome::ReceiverMismatch { .. } => {
+                panic!("the exact engine must consume its verified target owner")
+            }
+        };
+
+        assert_eq!(
+            retirement.bound_disposition_for_test(),
+            Some(crate::cleanup::BackCapacityRetireDisposition::Target)
+        );
+        let issuer = entry.back_capacity_issuer.as_ref().unwrap();
+        let issuer_after = issuer.semantic_snapshot_for_test();
+        assert_eq!(issuer_after.cell_count(), issuer_before.cell_count());
+        assert_eq!(
+            issuer_after.outstanding_count(),
+            issuer_before.outstanding_count().checked_sub(1).unwrap(),
+            "exact resume must retire one outstanding target capacity"
+        );
+        assert_eq!(issuer_after.next_owner(), issuer_before.next_owner());
+        assert_eq!(
+            issuer_after.next_generation(),
+            issuer_before.next_generation().checked_add(1).unwrap(),
+            "exact resume must burn the capacity generation exactly once"
+        );
+        assert_eq!(
+            issuer.classify_retirement_evidence(&retirement),
+            Err(crate::cleanup::BackCapacityRetireError::ConsumedReplay),
+            "the single target retirement must remain non-authorizing on replay"
+        );
+    }
+
+    #[test]
+    fn back_target_issuer_preflight_rejection_preserves_bound_and_core_owner() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let exact_router =
+            install_atomic_router_at_pattern(&mut app, "back-target-issuer-exact", "/:id");
+        let foreign_router =
+            install_atomic_router_at_pattern(&mut app, "back-target-issuer-foreign", "/:id");
+        app.update();
+        for router in [exact_router, foreign_router] {
+            for location in ["/first", "/second"] {
+                app.world_mut()
+                    .resource_mut::<RouterNavigation>()
+                    .push(router, RouteLocation::new(location))
+                    .unwrap();
+                app.update();
+            }
+        }
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(exact_router)
+            .expect("the exact router has one real predecessor");
+
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let exact_index = navigation
+            .entries
+            .iter()
+            .position(|entry| entry.handle == exact_router)
+            .unwrap();
+        let foreign_index = navigation
+            .entries
+            .iter()
+            .position(|entry| entry.handle == foreign_router)
+            .unwrap();
+        let (exact, foreign) = if exact_index < foreign_index {
+            let (before, after) = navigation.entries.split_at_mut(foreign_index);
+            (&mut before[exact_index], &mut after[0])
+        } else {
+            let (before, after) = navigation.entries.split_at_mut(exact_index);
+            (&mut after[0], &mut before[foreign_index])
+        };
+        let bound = take_real_bound_back_target(exact);
+        let bound_identity = bound.reservation.capacity_identity_for_test();
+
+        std::mem::swap(
+            &mut exact.back_capacity_issuer,
+            &mut foreign.back_capacity_issuer,
+        );
+        let engine_before = exact.engine.snapshot();
+        let rejecting_issuer_before = exact
+            .back_capacity_issuer
+            .as_ref()
+            .unwrap()
+            .semantic_snapshot_for_test();
+
+        let bound = match resume_bound_back_target(exact, bound) {
+            BackTargetResumeOutcome::CapacityRejected { bound, error } => {
+                assert_eq!(
+                    error,
+                    crate::cleanup::BackCapacityRetireError::ForeignDomain,
+                    "the foreign issuer must return its typed preflight rejection"
+                );
+                bound
+            }
+            BackTargetResumeOutcome::Resumed { .. } => {
+                panic!("issuer rejection must happen before Core target consumption")
+            }
+            BackTargetResumeOutcome::Permanent { .. } => {
+                panic!("issuer rejection must preserve the verified Core target owner")
+            }
+            BackTargetResumeOutcome::ReceiverMismatch { .. } => {
+                panic!("the exact Core receiver must not be consulted after issuer rejection")
+            }
+        };
+
+        assert_eq!(
+            bound.reservation.capacity_identity_for_test(),
+            bound_identity
+        );
+        assert_eq!(
+            exact.engine.snapshot(),
+            engine_before,
+            "issuer preflight rejection must not consume or mutate the Core target owner"
+        );
+        assert_eq!(
+            exact
+                .back_capacity_issuer
+                .as_ref()
+                .unwrap()
+                .semantic_snapshot_for_test(),
+            rejecting_issuer_before,
+            "typed issuer preflight rejection must be a semantic zero-write"
+        );
+
+        std::mem::swap(
+            &mut exact.back_capacity_issuer,
+            &mut foreign.back_capacity_issuer,
+        );
+        assert!(
+            matches!(
+                resume_bound_back_target(exact, bound),
+                BackTargetResumeOutcome::Resumed { .. }
+            ),
+            "the complete rejected bound and Core owner must remain consumable after restoring the exact issuer"
+        );
+    }
+
+    #[test]
+    fn back_no_target_retry_preserves_owner_and_public_snapshot() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router_at_pattern(&mut app, "back-no-target-retry", "/:id");
+        app.update();
+        for location in ["/first", "/second"] {
+            app.world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .unwrap();
+            app.update();
+        }
+
+        // This ECS coverage observes the exact capacity reservation together with RouterSnapshots.
+        let (first, second, second_capacity_identity) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let first = navigation
+                .back(router)
+                .expect("the active second route has one live predecessor");
+            let second = navigation
+                .back(router)
+                .expect("the queued second back is admitted while that predecessor is live");
+            let owner = navigation.entries[0]
+                .back_capacity_reservations
+                .iter()
+                .find_map(|(request, bound)| {
+                    (*request == second).then_some(bound.capacity_identity_for_test())
+                })
+                .expect("the accepted second back owns an exact ECS cleanup capacity reservation");
+            (first, second, owner)
+        };
+
+        app.update();
+
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert!(
+                matches!(
+                    entry.engine.request(first).unwrap().status(),
+                    RequestStatus::Succeeded
+                ),
+                "first Back stage={} pending_commit={} pending_frame_drive={}",
+                match entry.pending_back_target_execution.as_ref() {
+                    Some(PendingBackTargetExecution::ResumeBlocked(
+                        PendingBackTargetResumeBlocked::AppliedCommitPending(_),
+                    )) => "AppliedCommitPending",
+                    Some(PendingBackTargetExecution::ResumeBlocked(
+                        PendingBackTargetResumeBlocked::AppliedCommitPairingMismatch(_),
+                    )) => "AppliedCommitPairingMismatch",
+                    Some(PendingBackTargetExecution::ResumeBlocked(
+                        PendingBackTargetResumeBlocked::AppliedCommitPermanent(_),
+                    )) => "AppliedCommitPermanent",
+                    Some(PendingBackTargetExecution::ResumeBlocked(_)) => "ResumeBlocked",
+                    Some(PendingBackTargetExecution::Driving(_)) => "Driving",
+                    Some(PendingBackTargetExecution::Classifying(_)) => "Classifying",
+                    Some(PendingBackTargetExecution::Prepared(_)) => "Prepared",
+                    Some(PendingBackTargetExecution::CommitFailure(_)) => "CommitFailure",
+                    Some(PendingBackTargetExecution::DriverFailureStagingMismatch(_)) => {
+                        "DriverFailureStagingMismatch"
+                    }
+                    Some(PendingBackTargetExecution::AppliedReportStagingMismatch(_)) => {
+                        "AppliedReportStagingMismatch"
+                    }
+                    Some(PendingBackTargetExecution::AppliedReportStagingConflict(_)) => {
+                        "AppliedReportStagingConflict"
+                    }
+                    Some(PendingBackTargetExecution::DriverFailureStagingDrift(_)) => {
+                        "DriverFailureStagingDrift"
+                    }
+                    None => "None",
+                },
+                entry.pending_commit.is_some(),
+                entry.pending_frame_drive.is_some(),
+            );
+            let second_request = entry.engine.request(second).expect(
+                "the admitted second back remains retained at its live-resolution boundary",
+            );
+            assert_eq!(second_request.requested(), None);
+            assert_eq!(
+                second_request.status(),
+                &RequestStatus::Queued,
+                "a live no-target back remains at its enqueue-visible state until physical, logical, and canonical zero proof completes"
+            );
+            assert!(second_request.trace().iter().all(|event| {
+                !matches!(
+                    event.kind(),
+                    NavigationTraceEventKind::RequestPhaseChanged
+                        | NavigationTraceEventKind::HistoryIntentRejected
+                        | NavigationTraceEventKind::RequestTerminal
+                )
+            }));
+            assert!(
+                entry
+                    .back_capacity_reservations
+                    .iter()
+                    .all(|(request, _)| *request != second),
+                "the verified no-target handoff must move the unbound capacity into its bound owner"
+            );
+            let Some(BoundBackResolutionHandoff::NoTarget(retained)) =
+                entry.pending_bound_back_resolution.as_ref()
+            else {
+                panic!("the same accepted request must retain one bound no-target owner")
+            };
+            assert_eq!(
+                retained.reservation.capacity_identity_for_test(),
+                second_capacity_identity,
+                "the exact accepted capacity identity must move without replacement"
+            );
+        }
+
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(entry.pending_commit.is_none());
+            assert!(entry.pending_frame_drive.is_none());
+            assert!(entry.pending_mount_frame_task.is_none());
+            assert!(entry.pending_mount_request.is_none());
+            assert!(entry.pending_mount_mutation_rejection.is_none());
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.projectionless_fail_close.is_none());
+            let unexpected_action = entry.engine.action();
+            assert!(
+                unexpected_action.is_none(),
+                "pre-proof no-target handling must not leave an ECS action or continuation: {}",
+                match unexpected_action {
+                    Some(EngineAction::BackResolution(_)) => "BackResolution",
+                    Some(EngineAction::FrameTask(_)) => "FrameTask",
+                    Some(EngineAction::MountRequest(_)) => "MountRequest",
+                    Some(EngineAction::Commit(_)) => "Commit",
+                    Some(EngineAction::FailureCleanup(_)) => "FailureCleanup",
+                    None => "None",
+                }
+            );
+        }
+
+        let snapshots = app.world().resource::<RouterSnapshots>();
+        let public_request = match snapshots.request(router, second) {
+            crate::snapshots::RequestLookup::Found(snapshot) => snapshot,
+            crate::snapshots::RequestLookup::NotRetained => {
+                panic!("the accepted second back must remain publicly retained")
+            }
+            crate::snapshots::RequestLookup::Unknown => {
+                panic!("the installed router must expose the accepted second back")
+            }
+        };
+        assert_eq!(public_request.requested(), None);
+        assert_eq!(public_request.status(), &RequestStatus::Queued);
+        assert!(public_request.trace().iter().all(|event| {
+            !matches!(
+                event.kind(),
+                NavigationTraceEventKind::RequestPhaseChanged
+                    | NavigationTraceEventKind::HistoryIntentRejected
+                    | NavigationTraceEventKind::RequestTerminal
+            )
+        }));
+        let public_router = snapshots
+            .get(router)
+            .expect("the installed router has a published public snapshot");
+        assert_eq!(public_router.requested(), None);
+        assert_eq!(
+            public_router.pending_phase(),
+            None,
+            "pre-proof no-target handling must not publish any pending phase"
+        );
+    }
+
+    #[test]
+    fn no_back_entry_precedes_identity_exhaustion() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let unknown = RouterHandle::from_parts(u64::MAX, u64::MAX);
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<RouterNavigation>()
+                .back(unknown)
+                .unwrap_err()
+                .kind(),
+            NavigationEnqueueErrorKind::UnknownRouter
+        );
+
+        let router = install_atomic_router(&mut app, "back-precedence");
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<RouterNavigation>()
+                .back(router)
+                .unwrap_err()
+                .kind(),
+            NavigationEnqueueErrorKind::HostUnavailable
+        );
+        app.update();
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            navigation.entries[0]
+                .engine
+                .testing_exhaust_reservation_counter(TestingReservationCounter::Request);
+        }
+        let requests_before = app.world().resource::<RouterNavigation>().entries[0]
+            .requests
+            .len();
+        let error = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .unwrap_err();
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .requests
+                .len(),
+            requests_before
+        );
+        assert_eq!(error.kind(), NavigationEnqueueErrorKind::NoBackEntry);
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<RouterNavigation>()
+                .back(router)
+                .unwrap_err()
+                .kind(),
+            NavigationEnqueueErrorKind::NoBackEntry,
+            "the exhausted allocator remains unconsumed behind history eligibility"
+        );
+
+        let mut eligible = App::new();
+        eligible.add_plugins(BevyUiRouterPlugin::default());
+        let eligible_router =
+            install_atomic_router_at_pattern(&mut eligible, "eligible-back-exhaustion", "/:id");
+        eligible.update();
+        for location in ["/first", "/second"] {
+            eligible
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(eligible_router, RouteLocation::new(location))
+                .unwrap();
+            eligible.update();
+        }
+        {
+            let mut navigation = eligible.world_mut().resource_mut::<RouterNavigation>();
+            navigation.entries[0]
+                .engine
+                .testing_exhaust_reservation_counter(TestingReservationCounter::Request);
+        }
+        assert_eq!(
+            eligible
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .back(eligible_router)
+                .unwrap_err()
+                .kind(),
+            NavigationEnqueueErrorKind::IdentityExhausted,
+            "identity exhaustion is observed only after a live predecessor exists"
+        );
     }
 
     #[test]

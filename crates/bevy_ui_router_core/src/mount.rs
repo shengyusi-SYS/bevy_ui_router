@@ -123,6 +123,73 @@ impl OutstandingMount {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MountRequestTokenProjection {
+    identity: MountIdentity,
+    supplied_binding: u64,
+    canonical_binding: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MountIssuerRequestProjection {
+    router: RouterIdentity,
+    outstanding: Option<OutstandingMount>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MountIssuerContextDisposition {
+    Matched,
+    Mismatch,
+}
+
+impl MountIssuerRequestProjection {
+    pub(crate) fn classify_context(
+        &self,
+        host: &HostVersion,
+        request: NavigationRequestId,
+        transaction: TransactionId,
+        parent: &RouteFrameVersion,
+        outlet: &RouteSlotKey,
+    ) -> MountIssuerContextDisposition {
+        if self.outstanding.as_ref().is_some_and(|outstanding| {
+            let identity = outstanding.identity();
+            identity.host == *host
+                && identity.request == request
+                && identity.transaction == transaction
+                && identity.parent == *parent
+                && identity.outlet == *outlet
+        }) {
+            MountIssuerContextDisposition::Matched
+        } else {
+            MountIssuerContextDisposition::Mismatch
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MountRequestReceiverDisposition {
+    Matched,
+    Mismatch(MountError),
+}
+
+pub(crate) struct MountRequestReceiverInspection {
+    expected: MountRequestTokenProjection,
+    observed: MountIssuerRequestProjection,
+    disposition: MountRequestReceiverDisposition,
+}
+
+impl MountRequestReceiverInspection {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        MountRequestTokenProjection,
+        MountIssuerRequestProjection,
+        MountRequestReceiverDisposition,
+    ) {
+        (self.expected, self.observed, self.disposition)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct MountIssuer {
     router: RouterIdentity,
@@ -335,6 +402,34 @@ impl MountIssuer {
         self.validate_requested(&token.identity)
     }
 
+    pub(crate) fn inspect_request_receiver(
+        &self,
+        token: &MountRequestToken,
+    ) -> MountRequestReceiverInspection {
+        let expected = token.receiver_projection();
+        let observed = MountIssuerRequestProjection {
+            router: self.router,
+            outstanding: self.outstanding.clone(),
+        };
+        let disposition = if expected.supplied_binding != expected.canonical_binding
+            || !identity_is_coherent(&expected.identity)
+        {
+            MountRequestReceiverDisposition::Mismatch(MountError::Foreign)
+        } else {
+            match observed.outstanding.as_ref() {
+                Some(OutstandingMount::Requested(identity)) if identity == &expected.identity => {
+                    MountRequestReceiverDisposition::Matched
+                }
+                _ => MountRequestReceiverDisposition::Mismatch(self.mismatch(&expected.identity)),
+            }
+        };
+        MountRequestReceiverInspection {
+            expected,
+            observed,
+            disposition,
+        }
+    }
+
     pub(crate) fn validate_receipt(
         &self,
         receipt: &MountReceiptAttestation,
@@ -490,6 +585,20 @@ impl MountIssuer {
 }
 
 impl MountRequestToken {
+    pub(crate) fn receiver_projection(&self) -> MountRequestTokenProjection {
+        MountRequestTokenProjection {
+            identity: self.identity.clone(),
+            supplied_binding: self.binding,
+            canonical_binding: artifact_binding(
+                MountArtifactStage::Requested,
+                &self.identity,
+                None,
+                None,
+                None,
+            ),
+        }
+    }
+
     fn has_valid_binding(&self) -> bool {
         self.binding
             == artifact_binding(
@@ -499,6 +608,11 @@ impl MountRequestToken {
                 None,
                 None,
             )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_advance_binding(&mut self) {
+        self.binding = self.binding.wrapping_add(1);
     }
 }
 

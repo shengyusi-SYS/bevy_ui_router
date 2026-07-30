@@ -188,6 +188,7 @@ impl RouterSnapshots {
     pub(crate) fn publish(&mut self, entries: &mut [crate::navigation::RouterEntry]) {
         self.requests.clear();
         for entry in entries {
+            entry.publish_history_admission_stamp();
             entry
                 .requests
                 .retain(|request| entry.engine.request(*request).is_some());
@@ -265,6 +266,10 @@ mod tests {
             }
             EngineAction::FailureCleanup(_) => {
                 panic!("depth-one snapshot fixture must not produce nested failure cleanup")
+            }
+            EngineAction::BackResolution(ref handoff) => {
+                let _scope = handoff.scope();
+                panic!("push snapshot fixture must not produce a back resolution action")
             }
         };
         let prepared = engine

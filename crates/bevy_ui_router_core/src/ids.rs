@@ -194,7 +194,7 @@ impl ReservedFrameAttempt {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ReservedBranchAttempt {
     request: NavigationRequestId,
     transaction: TransactionId,
@@ -217,6 +217,11 @@ impl ReservedBranchAttempt {
 
     pub(crate) fn frames(&self) -> &[ReservedFrameAttempt] {
         &self.frames
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_truncate_frames(&mut self, len: usize) {
+        self.frames.truncate(len);
     }
 }
 
@@ -515,7 +520,7 @@ impl CoreIdAllocator {
         self.next_slot = u64::MAX;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn testing_exhaust_mount_sequence_counter(&mut self) {
         self.next_mount_sequence = u64::MAX;
     }

@@ -1,9 +1,135 @@
+use std::sync::{Arc, Mutex};
+
 use crate::{
     meta::ErrorBoundaryKey,
     pattern::RoutePattern,
     route_tree::{RouteNodeOptions, RouteTree},
     view_key::RouteViewKey,
 };
+
+type BackCapacityOrderJournal = Arc<Mutex<Vec<(u64, BackCapacityOrderEvent)>>>;
+
+#[derive(Clone)]
+pub struct BackCapacityOrderObserver {
+    journal: BackCapacityOrderJournal,
+}
+
+pub struct BackCapacityOrderSnapshot {
+    events: Vec<(u64, BackCapacityOrderEvent)>,
+}
+
+#[doc(hidden)]
+pub struct BackCapacityIssuerProducer {
+    journal: BackCapacityOrderJournal,
+}
+
+#[doc(hidden)]
+pub struct BackCapacityCoreProducer {
+    journal: BackCapacityOrderJournal,
+}
+
+#[doc(hidden)]
+pub struct BackCapacityFacadeProducer {
+    journal: BackCapacityOrderJournal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackCapacityIssuerEvent {
+    Issued,
+    Retired,
+    TransferredNoTarget,
+    BoundCanonicalZero,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackCapacityOrderEvent {
+    EcsIssuer(BackCapacityIssuerEvent),
+    CoreAllocatorAttempt,
+    CoreAllocatorFailure,
+    FacadeTypedReturn,
+}
+
+impl BackCapacityOrderObserver {
+    pub fn snapshot(&self) -> BackCapacityOrderSnapshot {
+        let events = self
+            .journal
+            .lock()
+            .expect("back capacity order journal lock must not be poisoned")
+            .clone();
+        BackCapacityOrderSnapshot { events }
+    }
+
+    pub fn observes_same_journal(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.journal, &other.journal)
+    }
+}
+
+impl BackCapacityOrderSnapshot {
+    pub fn events(&self) -> &[(u64, BackCapacityOrderEvent)] {
+        &self.events
+    }
+}
+
+fn record_back_capacity_order_event(
+    journal: &BackCapacityOrderJournal,
+    event: BackCapacityOrderEvent,
+) {
+    let mut journal = journal
+        .lock()
+        .expect("back capacity order journal lock must not be poisoned");
+    let sequence = u64::try_from(journal.len()).expect("back capacity order sequence exhausted");
+    journal.push((sequence, event));
+}
+
+#[doc(hidden)]
+pub fn issue_back_capacity_order_channels() -> (
+    BackCapacityOrderObserver,
+    BackCapacityIssuerProducer,
+    BackCapacityCoreProducer,
+    BackCapacityFacadeProducer,
+) {
+    let journal = Arc::new(Mutex::new(Vec::new()));
+    (
+        BackCapacityOrderObserver {
+            journal: journal.clone(),
+        },
+        BackCapacityIssuerProducer {
+            journal: journal.clone(),
+        },
+        BackCapacityCoreProducer {
+            journal: journal.clone(),
+        },
+        BackCapacityFacadeProducer { journal },
+    )
+}
+
+impl BackCapacityIssuerProducer {
+    pub fn record(&mut self, event: BackCapacityIssuerEvent) {
+        record_back_capacity_order_event(&self.journal, BackCapacityOrderEvent::EcsIssuer(event));
+    }
+}
+
+impl BackCapacityCoreProducer {
+    pub fn allocator_attempt(&mut self) {
+        record_back_capacity_order_event(
+            &self.journal,
+            BackCapacityOrderEvent::CoreAllocatorAttempt,
+        );
+    }
+
+    pub fn allocator_failure(&mut self) {
+        record_back_capacity_order_event(
+            &self.journal,
+            BackCapacityOrderEvent::CoreAllocatorFailure,
+        );
+    }
+}
+
+impl BackCapacityFacadeProducer {
+    pub fn typed_return(&mut self) {
+        record_back_capacity_order_event(&self.journal, BackCapacityOrderEvent::FacadeTypedReturn);
+    }
+}
 
 pub fn options_with_error_boundary(
     options: RouteNodeOptions,

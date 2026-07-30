@@ -185,7 +185,10 @@ fn ecs_manifest_locks_the_dependency_boundary() {
         features,
         BTreeMap::from([
             ("default".to_owned(), BTreeSet::new()),
-            ("test-support".to_owned(), BTreeSet::new())
+            (
+                "test-support".to_owned(),
+                BTreeSet::from(["bevy_ui_router_core/test-support".to_owned()]),
+            )
         ])
     );
 

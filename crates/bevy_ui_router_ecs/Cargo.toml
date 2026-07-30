@@ -5,7 +5,7 @@ edition.workspace = true
 
 [features]
 default = []
-test-support = []
+test-support = ["bevy_ui_router_core/test-support"]
 
 [dependencies]
 bevy_app = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }

@@ -1,5 +1,8 @@
 use std::{
-    collections::HashSet,
+    collections::{
+        HashMap, HashSet,
+        hash_map::{Entry, OccupiedEntry},
+    },
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -11,8 +14,11 @@ use bevy_ecs::{
 };
 use bevy_ui_router_core::{
     frame::{FrameOrigin, RouteFrameVersion},
-    ids::RouteSlotId,
-    integration::{CleanupBatch, CleanupCompletion},
+    ids::{NavigationRequestId, RouteSlotId},
+    integration::{
+        BackAcceptedReservationView, BackResolutionScopeView, CleanupBatch, CleanupCompletion,
+        EnqueueBackErrorKind,
+    },
     slot::RouteSlotKey,
 };
 
@@ -51,6 +57,693 @@ const RECEIPT_DOMAIN: u64 = 0x4543_5352_4543_5054;
 const OBLIGATION_DOMAIN: u64 = 0x4543_534f_424c_4947;
 const COMPLETION_DOMAIN: u64 = 0x4543_5343_4f4d_504c;
 static NEXT_LEDGER_DOMAIN: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparationCapacityDomain(u64);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct PreparationReleaseGeneration(u64);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct BackCapacityOwnerId(u64);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct BackCapacityCellId(usize);
+
+#[derive(Clone, Copy)]
+enum BackCapacityCellState {
+    Free,
+    Outstanding { owner: BackCapacityOwnerId },
+    Leased { owner: BackCapacityOwnerId },
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BackCapacityReuse {
+    Reusable,
+    PermanentlyRetired,
+}
+
+struct BackCapacityCell {
+    generation: PreparationReleaseGeneration,
+    state: BackCapacityCellState,
+    reuse: BackCapacityReuse,
+    ledger: Option<CleanupLedger>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BackCapacityLiveState {
+    Outstanding,
+    Leased,
+}
+
+struct BackCapacityLiveRecord {
+    domain: PreparationCapacityDomain,
+    cell: BackCapacityCellId,
+    owner: BackCapacityOwnerId,
+    generation: PreparationReleaseGeneration,
+    state: BackCapacityLiveState,
+}
+
+pub(crate) struct BackCapacityDomainIssuer {
+    next_domain: u64,
+}
+
+impl BackCapacityDomainIssuer {
+    pub(crate) const fn new() -> Self {
+        Self { next_domain: 1 }
+    }
+
+    pub(crate) fn issue(&mut self) -> Result<BackCapacityIssuer, BackCapacityReserveError> {
+        let next_domain = self
+            .next_domain
+            .checked_add(1)
+            .ok_or(BackCapacityReserveError::DomainExhausted)?;
+        let domain = PreparationCapacityDomain(self.next_domain);
+        self.next_domain = next_domain;
+        Ok(BackCapacityIssuer {
+            domain,
+            cells: Vec::new(),
+            live: HashMap::new(),
+            next_owner: BackCapacityOwnerId(1),
+            #[cfg(feature = "test-support")]
+            back_capacity_order_producer: None,
+            #[cfg(test)]
+            next_cell_growth_additional_capacity: None,
+            #[cfg(test)]
+            next_new_cell_initial_generation: None,
+            #[cfg(test)]
+            drift_next_retire_unbound_generation: false,
+        })
+    }
+}
+
+pub(crate) struct BackCapacityIssuer {
+    domain: PreparationCapacityDomain,
+    cells: Vec<BackCapacityCell>,
+    live: HashMap<BackCapacityOwnerId, BackCapacityLiveRecord>,
+    next_owner: BackCapacityOwnerId,
+    #[cfg(feature = "test-support")]
+    back_capacity_order_producer:
+        Option<bevy_ui_router_core::test_support::BackCapacityIssuerProducer>,
+    #[cfg(test)]
+    next_cell_growth_additional_capacity: Option<usize>,
+    #[cfg(test)]
+    next_new_cell_initial_generation: Option<PreparationReleaseGeneration>,
+    #[cfg(test)]
+    drift_next_retire_unbound_generation: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackCapacityIssuerSemanticSnapshot {
+    cell_count: usize,
+    outstanding_count: usize,
+    next_owner: BackCapacityOwnerId,
+    next_generation: PreparationReleaseGeneration,
+}
+
+#[cfg(test)]
+impl BackCapacityIssuerSemanticSnapshot {
+    pub(crate) const fn cell_count(&self) -> usize {
+        self.cell_count
+    }
+
+    pub(crate) const fn outstanding_count(&self) -> usize {
+        self.outstanding_count
+    }
+
+    pub(crate) const fn next_owner(&self) -> u64 {
+        self.next_owner.0
+    }
+
+    pub(crate) const fn next_generation(&self) -> u64 {
+        self.next_generation.0
+    }
+}
+
+impl BackCapacityIssuer {
+    #[cfg(feature = "test-support")]
+    pub(crate) fn back_capacity_order_producer_slot_is_vacant(&self) -> bool {
+        self.back_capacity_order_producer.is_none()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn install_back_capacity_order_producer(
+        &mut self,
+        producer: bevy_ui_router_core::test_support::BackCapacityIssuerProducer,
+    ) {
+        self.back_capacity_order_producer = Some(producer);
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn domain_for_test(&self) -> u64 {
+        self.domain.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_next_cell_growth_additional_capacity_for_test(
+        &mut self,
+        additional_capacity: usize,
+    ) {
+        self.next_cell_growth_additional_capacity = Some(additional_capacity);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_next_new_cell_initial_generation_for_test(&mut self, generation: u64) {
+        self.next_new_cell_initial_generation = Some(PreparationReleaseGeneration(generation));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drift_next_retire_unbound_generation_for_test(&mut self) {
+        self.drift_next_retire_unbound_generation = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backing_capacities_for_test(&self) -> (usize, usize) {
+        (self.cells.capacity(), self.live.capacity())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn semantic_snapshot_for_test(&self) -> BackCapacityIssuerSemanticSnapshot {
+        let _ = self.next_cell_growth_additional_capacity;
+        let _ = self.next_new_cell_initial_generation;
+        let _ = self.drift_next_retire_unbound_generation;
+        BackCapacityIssuerSemanticSnapshot {
+            cell_count: self.cells.len(),
+            outstanding_count: self.live.len(),
+            next_owner: self.next_owner,
+            next_generation: self
+                .cells
+                .iter()
+                .find_map(|cell| {
+                    (matches!(cell.state, BackCapacityCellState::Free)
+                        && cell.reuse == BackCapacityReuse::Reusable)
+                        .then_some(cell.generation)
+                })
+                .unwrap_or(PreparationReleaseGeneration(1)),
+        }
+    }
+
+    pub(crate) fn reserve(&mut self) -> Result<BackCapacityPermit, BackCapacityReserveError> {
+        let free_cell = self.cells.iter().position(|cell| {
+            matches!(cell.state, BackCapacityCellState::Free)
+                && cell.reuse == BackCapacityReuse::Reusable
+                && cell.ledger.is_none()
+        });
+        let owner = self.next_owner;
+        let next_owner = BackCapacityOwnerId(
+            owner
+                .0
+                .checked_add(1)
+                .ok_or(BackCapacityReserveError::OwnerExhausted)?,
+        );
+        if self.live.contains_key(&owner) {
+            return Err(BackCapacityReserveError::OwnerExhausted);
+        }
+
+        let cell = BackCapacityCellId(free_cell.unwrap_or(self.cells.len()));
+        let generation = free_cell
+            .map(|index| self.cells[index].generation)
+            .unwrap_or_else(|| {
+                #[cfg(test)]
+                {
+                    self.next_new_cell_initial_generation
+                        .unwrap_or(PreparationReleaseGeneration(1))
+                }
+                #[cfg(not(test))]
+                {
+                    PreparationReleaseGeneration(1)
+                }
+            });
+        let vacant_cell = free_cell.is_none().then(|| BackCapacityCell {
+            generation,
+            state: BackCapacityCellState::Free,
+            reuse: BackCapacityReuse::Reusable,
+            ledger: None,
+        });
+        let live = BackCapacityLiveRecord {
+            domain: self.domain,
+            cell,
+            owner,
+            generation,
+            state: BackCapacityLiveState::Outstanding,
+        };
+
+        if vacant_cell.is_some() {
+            #[cfg(test)]
+            let additional_capacity = self
+                .next_cell_growth_additional_capacity
+                .take()
+                .unwrap_or(1);
+            #[cfg(not(test))]
+            let additional_capacity = 1;
+            self.cells
+                .try_reserve_exact(additional_capacity)
+                .map_err(|_| BackCapacityReserveError::LedgerSlotUnavailable)?;
+        }
+        self.live
+            .try_reserve(1)
+            .map_err(|_| BackCapacityReserveError::LedgerSlotUnavailable)?;
+
+        #[cfg(test)]
+        if vacant_cell.is_some() {
+            self.next_new_cell_initial_generation = None;
+        }
+        if let Some(vacant_cell) = vacant_cell {
+            self.cells.push(vacant_cell);
+        }
+        let cell_state = &mut self.cells[cell.0].state;
+        debug_assert!(matches!(cell_state, BackCapacityCellState::Free));
+        *cell_state = BackCapacityCellState::Outstanding { owner };
+        let permit = BackCapacityPermit {
+            domain: self.domain,
+            cell,
+            owner,
+            generation,
+        };
+        let replaced = self.live.insert(owner, live);
+        debug_assert!(replaced.is_none());
+        debug_assert!(self.live.get(&owner).is_some_and(|record| {
+            record.domain == permit.domain
+                && record.cell == permit.cell
+                && record.owner == permit.owner
+                && record.generation == permit.generation
+                && record.state == BackCapacityLiveState::Outstanding
+                && matches!(
+                    self.cells[record.cell.0].state,
+                    BackCapacityCellState::Outstanding { owner: cell_owner }
+                        if cell_owner == record.owner
+                )
+                && self.cells[record.cell.0].generation == record.generation
+        }));
+        self.next_owner = next_owner;
+        #[cfg(feature = "test-support")]
+        if let Some(producer) = self.back_capacity_order_producer.as_mut() {
+            producer.record(bevy_ui_router_core::test_support::BackCapacityIssuerEvent::Issued);
+        }
+        Ok(permit)
+    }
+
+    pub(crate) fn retire_unbound(
+        &mut self,
+        owner: BackCapacityPermit,
+        rejection: EnqueueRejected,
+    ) -> BackCapacityRetireOutcome<BackCapacityPermit> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.drift_next_retire_unbound_generation) {
+            if let Some(cell) = self.cells.get_mut(owner.cell.0) {
+                cell.generation = PreparationReleaseGeneration(cell.generation.0.wrapping_add(1));
+            }
+        }
+        if let Some(error) = self.retire_unbound_error(&owner) {
+            return BackCapacityRetireOutcome::Rejected {
+                owner,
+                rejection,
+                error,
+            };
+        }
+
+        let removed = self
+            .live
+            .remove(&owner.owner)
+            .expect("exact preflight retained the outstanding record");
+        debug_assert!(
+            removed.domain == owner.domain
+                && removed.cell == owner.cell
+                && removed.owner == owner.owner
+                && removed.generation == owner.generation
+        );
+        let cell = &mut self.cells[owner.cell.0];
+        if let Some(next_generation) = owner.generation.0.checked_add(1) {
+            cell.generation = PreparationReleaseGeneration(next_generation);
+            cell.state = BackCapacityCellState::Free;
+            cell.reuse = BackCapacityReuse::Reusable;
+        } else {
+            cell.state = BackCapacityCellState::Free;
+            cell.reuse = BackCapacityReuse::PermanentlyRetired;
+        }
+        let evidence = BackCapacityRetirementEvidence {
+            domain: owner.domain,
+            cell: owner.cell,
+            owner: owner.owner,
+            generation: owner.generation,
+            reason: BackCapacityRetirementReason::EnqueueRejected(rejection),
+        };
+        #[cfg(feature = "test-support")]
+        if let Some(producer) = self.back_capacity_order_producer.as_mut() {
+            producer.record(bevy_ui_router_core::test_support::BackCapacityIssuerEvent::Retired);
+        }
+        BackCapacityRetireOutcome::Retired(evidence)
+    }
+
+    pub(crate) fn preflight_bound_retirement<'issuer, 'owner>(
+        &'issuer mut self,
+        bound: &'owner BoundBackCapacityReservation,
+        disposition: BackCapacityRetireDisposition,
+    ) -> Result<
+        (
+            ExactBackCapacityCommitGuard<'issuer, 'owner, BoundBackCapacityReservation>,
+            PreparedBackCapacityRetirementEvidence,
+        ),
+        BackCapacityRetireError,
+    > {
+        let permit = &bound.permit;
+        if permit.domain != self.domain {
+            return Err(BackCapacityRetireError::ForeignDomain);
+        }
+
+        let (live_registry, cells) = (&mut self.live, &mut self.cells);
+        let live = match live_registry.entry(permit.owner) {
+            Entry::Occupied(live) => live,
+            Entry::Vacant(_) => {
+                let replayed = cells
+                    .get(permit.cell.0)
+                    .is_some_and(|cell| retired_identity_is_current(cell, permit.generation));
+                return Err(if replayed {
+                    BackCapacityRetireError::ConsumedReplay
+                } else {
+                    BackCapacityRetireError::StaleGeneration
+                });
+            }
+        };
+        let record = live.get();
+        if record.domain != permit.domain
+            || record.cell != permit.cell
+            || record.owner != permit.owner
+            || record.generation != permit.generation
+            || record.state != BackCapacityLiveState::Outstanding
+        {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        }
+        let Some(cell) = cells.get_mut(permit.cell.0) else {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        };
+        if cell.generation != permit.generation
+            || cell.reuse != BackCapacityReuse::Reusable
+            || cell.ledger.is_some()
+            || !matches!(
+                cell.state,
+                BackCapacityCellState::Outstanding { owner }
+                    if owner == permit.owner
+            )
+        {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        }
+
+        let next = match permit.generation.0.checked_add(1) {
+            Some(next_generation) => PreparedRetiredCell::ReusableFree {
+                next_generation: PreparationReleaseGeneration(next_generation),
+            },
+            None => PreparedRetiredCell::PermanentlyRetired {
+                generation: permit.generation,
+            },
+        };
+        let prepared = PreparedBackCapacityRetirementEvidence {
+            evidence: BackCapacityRetirementEvidence {
+                domain: permit.domain,
+                cell: permit.cell,
+                owner: permit.owner,
+                generation: permit.generation,
+                reason: BackCapacityRetirementReason::Bound(disposition),
+            },
+        };
+        Ok((
+            ExactBackCapacityCommitGuard {
+                transition: BackCapacityCommitTransition::OutstandingRetire { live, cell, next },
+                owner: bound,
+            },
+            prepared,
+        ))
+    }
+
+    pub(crate) fn classify_retirement_evidence(
+        &self,
+        evidence: &BackCapacityRetirementEvidence,
+    ) -> Result<(), BackCapacityRetireError> {
+        if evidence.domain != self.domain {
+            return Err(BackCapacityRetireError::ForeignDomain);
+        }
+        let _ = &evidence.reason;
+        if self.live.contains_key(&evidence.owner) {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        }
+        let Some(cell) = self.cells.get(evidence.cell.0) else {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        };
+        if retired_identity_is_current(cell, evidence.generation) {
+            Err(BackCapacityRetireError::ConsumedReplay)
+        } else {
+            Err(BackCapacityRetireError::StaleGeneration)
+        }
+    }
+
+    fn retire_unbound_error(&self, owner: &BackCapacityPermit) -> Option<BackCapacityRetireError> {
+        if owner.domain != self.domain {
+            return Some(BackCapacityRetireError::ForeignDomain);
+        }
+        let Some(record) = self.live.get(&owner.owner) else {
+            let replayed = self
+                .cells
+                .get(owner.cell.0)
+                .is_some_and(|cell| retired_identity_is_current(cell, owner.generation));
+            return Some(if replayed {
+                BackCapacityRetireError::ConsumedReplay
+            } else {
+                BackCapacityRetireError::StaleGeneration
+            });
+        };
+        if record.domain != owner.domain
+            || record.cell != owner.cell
+            || record.owner != owner.owner
+            || record.generation != owner.generation
+            || record.state != BackCapacityLiveState::Outstanding
+        {
+            return Some(BackCapacityRetireError::StaleGeneration);
+        }
+        let Some(cell) = self.cells.get(owner.cell.0) else {
+            return Some(BackCapacityRetireError::StaleGeneration);
+        };
+        if cell.generation != owner.generation
+            || cell.reuse != BackCapacityReuse::Reusable
+            || cell.ledger.is_some()
+            || !matches!(
+                cell.state,
+                BackCapacityCellState::Outstanding { owner: cell_owner }
+                    if cell_owner == owner.owner
+            )
+        {
+            return Some(BackCapacityRetireError::StaleGeneration);
+        }
+        None
+    }
+}
+
+fn retired_identity_is_current(
+    cell: &BackCapacityCell,
+    retired_generation: PreparationReleaseGeneration,
+) -> bool {
+    match cell.state {
+        BackCapacityCellState::Free => match cell.reuse {
+            BackCapacityReuse::Reusable => retired_generation
+                .0
+                .checked_add(1)
+                .is_some_and(|successor| cell.generation.0 == successor),
+            BackCapacityReuse::PermanentlyRetired => {
+                retired_generation.0 == u64::MAX && cell.generation == retired_generation
+            }
+        },
+        BackCapacityCellState::Outstanding { .. } | BackCapacityCellState::Leased { .. } => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackCapacityReserveError {
+    DomainExhausted,
+    OwnerExhausted,
+    LedgerSlotUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackCapacityIssuerInstallError {
+    AlreadyInstalled,
+    Reserve(BackCapacityReserveError),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum EnqueueRejected {
+    CoreTokenDrift,
+    CoreAllocatorFailure(EnqueueBackErrorKind),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackCapacityRetireDisposition {
+    Target,
+    Contradiction,
+    AuthorityLost,
+    Permanent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackCapacityRetireError {
+    ForeignDomain,
+    StaleGeneration,
+    ConsumedReplay,
+}
+
+enum BackCapacityRetirementReason {
+    EnqueueRejected(EnqueueRejected),
+    Bound(BackCapacityRetireDisposition),
+}
+
+pub(crate) struct BackCapacityRetirementEvidence {
+    domain: PreparationCapacityDomain,
+    cell: BackCapacityCellId,
+    owner: BackCapacityOwnerId,
+    generation: PreparationReleaseGeneration,
+    reason: BackCapacityRetirementReason,
+}
+
+enum PreparedRetiredCell {
+    ReusableFree {
+        next_generation: PreparationReleaseGeneration,
+    },
+    PermanentlyRetired {
+        generation: PreparationReleaseGeneration,
+    },
+}
+
+pub(crate) struct PreparedBackCapacityRetirementEvidence {
+    evidence: BackCapacityRetirementEvidence,
+}
+
+enum BackCapacityCommitTransition<'issuer> {
+    OutstandingRetire {
+        live: OccupiedEntry<'issuer, BackCapacityOwnerId, BackCapacityLiveRecord>,
+        cell: &'issuer mut BackCapacityCell,
+        next: PreparedRetiredCell,
+    },
+}
+
+pub(crate) struct ExactBackCapacityCommitGuard<'issuer, 'owner, Owner: ?Sized> {
+    transition: BackCapacityCommitTransition<'issuer>,
+    owner: &'owner Owner,
+}
+
+impl<Owner: ?Sized> ExactBackCapacityCommitGuard<'_, '_, Owner> {
+    pub(crate) fn commit(self) {
+        match self.transition {
+            BackCapacityCommitTransition::OutstandingRetire { live, cell, next } => {
+                let _ = live.remove();
+                cell.state = BackCapacityCellState::Free;
+                match next {
+                    PreparedRetiredCell::ReusableFree { next_generation } => {
+                        cell.generation = next_generation;
+                        cell.reuse = BackCapacityReuse::Reusable;
+                    }
+                    PreparedRetiredCell::PermanentlyRetired { generation } => {
+                        cell.generation = generation;
+                        cell.reuse = BackCapacityReuse::PermanentlyRetired;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl PreparedBackCapacityRetirementEvidence {
+    pub(crate) fn into_evidence_after_exact_receiver(self) -> BackCapacityRetirementEvidence {
+        self.evidence
+    }
+}
+
+#[cfg(test)]
+impl BackCapacityRetirementEvidence {
+    pub(crate) fn enqueue_rejection_for_test(&self) -> Option<&EnqueueRejected> {
+        match &self.reason {
+            BackCapacityRetirementReason::EnqueueRejected(rejection) => Some(rejection),
+            BackCapacityRetirementReason::Bound(_) => None,
+        }
+    }
+
+    pub(crate) fn bound_disposition_for_test(&self) -> Option<BackCapacityRetireDisposition> {
+        match &self.reason {
+            BackCapacityRetirementReason::EnqueueRejected(_) => None,
+            BackCapacityRetirementReason::Bound(disposition) => Some(*disposition),
+        }
+    }
+}
+
+pub(crate) enum BackCapacityRetireOutcome<Owner> {
+    Retired(BackCapacityRetirementEvidence),
+    Rejected {
+        owner: Owner,
+        rejection: EnqueueRejected,
+        error: BackCapacityRetireError,
+    },
+}
+
+pub(crate) struct BackCapacityPermit {
+    domain: PreparationCapacityDomain,
+    cell: BackCapacityCellId,
+    owner: BackCapacityOwnerId,
+    generation: PreparationReleaseGeneration,
+}
+
+pub(crate) struct BackCapacityEnqueueRetireResidual {
+    pub(crate) owner: BackCapacityPermit,
+    pub(crate) rejection: EnqueueRejected,
+    pub(crate) retire_error: BackCapacityRetireError,
+}
+
+impl BackCapacityPermit {
+    #[cfg(test)]
+    pub(crate) const fn ordinal_identity_for_test(&self) -> (u64, usize, u64, u64) {
+        (self.domain.0, self.cell.0, self.owner.0, self.generation.0)
+    }
+}
+
+pub(crate) struct BoundBackCapacityReservation {
+    request: NavigationRequestId,
+    permit: BackCapacityPermit,
+    accepted: BackAcceptedReservationView,
+}
+
+impl BoundBackCapacityReservation {
+    pub(crate) fn bind(
+        request: NavigationRequestId,
+        permit: BackCapacityPermit,
+        accepted: BackAcceptedReservationView,
+    ) -> Self {
+        Self {
+            request,
+            permit,
+            accepted,
+        }
+    }
+
+    pub(crate) fn matches_resolution_scope(&self, scope: &BackResolutionScopeView) -> bool {
+        self.accepted.matches_resolution_scope(scope)
+    }
+
+    pub(crate) const fn request(&self) -> NavigationRequestId {
+        self.request
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn capacity_identity_for_test(&self) -> (u64, usize, u64, u64) {
+        self.permit.ordinal_identity_for_test()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        NavigationRequestId,
+        BackCapacityPermit,
+        BackAcceptedReservationView,
+    ) {
+        (self.request, self.permit, self.accepted)
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -7436,6 +8129,163 @@ pub(crate) mod tests {
 
     #[derive(Component)]
     struct ForeignBoundaryMarker;
+
+    #[test]
+    fn back_capacity_reclaimed_cell_advances_generation_and_rejects_aba() {
+        let mut domains = BackCapacityDomainIssuer::new();
+        let mut issuer = domains.issue().unwrap();
+        let mut foreign_issuer = domains.issue().unwrap();
+
+        let first = issuer.reserve().unwrap();
+        let first_identity = first.ordinal_identity_for_test();
+        let first_backing = issuer.backing_capacities_for_test();
+        let first_evidence = match issuer.retire_unbound(first, EnqueueRejected::CoreTokenDrift) {
+            BackCapacityRetireOutcome::Retired(evidence) => evidence,
+            BackCapacityRetireOutcome::Rejected { .. } => {
+                panic!("the exact outstanding owner must retire")
+            }
+        };
+        assert_eq!(
+            first_evidence.enqueue_rejection_for_test(),
+            Some(&EnqueueRejected::CoreTokenDrift),
+            "retirement evidence retains the original rejection"
+        );
+        assert_eq!(issuer.backing_capacities_for_test(), first_backing);
+        assert_eq!(issuer.semantic_snapshot_for_test().cell_count(), 1);
+        assert_eq!(
+            issuer.semantic_snapshot_for_test().outstanding_count(),
+            0,
+            "exact retirement removes the outstanding entry"
+        );
+
+        let replay_before = issuer.semantic_snapshot_for_test();
+        let replay_backing_before = issuer.backing_capacities_for_test();
+        assert_eq!(
+            issuer.classify_retirement_evidence(&first_evidence),
+            Err(BackCapacityRetireError::ConsumedReplay),
+            "retirement evidence is observational and cannot authorize a second retirement"
+        );
+        assert_eq!(issuer.semantic_snapshot_for_test(), replay_before);
+        assert_eq!(issuer.backing_capacities_for_test(), replay_backing_before);
+
+        let second = issuer.reserve().unwrap();
+        let second_identity = second.ordinal_identity_for_test();
+        assert_eq!(second_identity.0, first_identity.0);
+        assert_eq!(second_identity.1, first_identity.1);
+        assert_ne!(second_identity.2, first_identity.2, "owners are burned");
+        assert_eq!(
+            second_identity.3,
+            first_identity.3.checked_add(1).unwrap(),
+            "the reclaimed cell advances by the exact successor generation"
+        );
+        assert_eq!(issuer.backing_capacities_for_test(), first_backing);
+
+        let stale_before = issuer.semantic_snapshot_for_test();
+        let stale_backing_before = issuer.backing_capacities_for_test();
+        assert_eq!(
+            issuer.classify_retirement_evidence(&first_evidence),
+            Err(BackCapacityRetireError::StaleGeneration),
+            "the old generation must not authorize the reused ordinal"
+        );
+        assert_eq!(issuer.semantic_snapshot_for_test(), stale_before);
+        assert_eq!(issuer.backing_capacities_for_test(), stale_backing_before);
+        assert_eq!(second.ordinal_identity_for_test(), second_identity);
+
+        let foreign = foreign_issuer.reserve().unwrap();
+        let foreign_identity = foreign.ordinal_identity_for_test();
+        let local_before_foreign = issuer.semantic_snapshot_for_test();
+        let local_backing_before_foreign = issuer.backing_capacities_for_test();
+        let foreign_before_rejection = foreign_issuer.semantic_snapshot_for_test();
+        let foreign_backing_before_rejection = foreign_issuer.backing_capacities_for_test();
+        let foreign = match issuer.retire_unbound(foreign, EnqueueRejected::CoreTokenDrift) {
+            BackCapacityRetireOutcome::Rejected {
+                owner,
+                rejection,
+                error,
+            } => {
+                assert_eq!(error, BackCapacityRetireError::ForeignDomain);
+                assert_eq!(rejection, EnqueueRejected::CoreTokenDrift);
+                owner
+            }
+            BackCapacityRetireOutcome::Retired(_) => {
+                panic!("a foreign issuer must not retire the move-only owner")
+            }
+        };
+        assert_eq!(foreign.ordinal_identity_for_test(), foreign_identity);
+        assert_eq!(issuer.semantic_snapshot_for_test(), local_before_foreign);
+        assert_eq!(
+            issuer.backing_capacities_for_test(),
+            local_backing_before_foreign
+        );
+        assert_eq!(
+            foreign_issuer.semantic_snapshot_for_test(),
+            foreign_before_rejection
+        );
+        assert_eq!(
+            foreign_issuer.backing_capacities_for_test(),
+            foreign_backing_before_rejection
+        );
+        assert!(matches!(
+            foreign_issuer.retire_unbound(foreign, EnqueueRejected::CoreTokenDrift),
+            BackCapacityRetireOutcome::Retired(_)
+        ));
+
+        issuer.set_next_new_cell_initial_generation_for_test(u64::MAX);
+        let terminal = issuer.reserve().unwrap();
+        let terminal_identity = terminal.ordinal_identity_for_test();
+        assert_ne!(terminal_identity.1, second_identity.1);
+        assert_eq!(terminal_identity.3, u64::MAX);
+        let terminal_backing = issuer.backing_capacities_for_test();
+        let terminal_evidence =
+            match issuer.retire_unbound(terminal, EnqueueRejected::CoreTokenDrift) {
+                BackCapacityRetireOutcome::Retired(evidence) => evidence,
+                BackCapacityRetireOutcome::Rejected { .. } => {
+                    panic!("the exact terminal-generation owner must retire and seal its cell")
+                }
+            };
+        assert_eq!(issuer.backing_capacities_for_test(), terminal_backing);
+        assert_eq!(issuer.semantic_snapshot_for_test().outstanding_count(), 1);
+
+        let terminal_replay_before = issuer.semantic_snapshot_for_test();
+        let terminal_replay_backing_before = issuer.backing_capacities_for_test();
+        assert_eq!(
+            issuer.classify_retirement_evidence(&terminal_evidence),
+            Err(BackCapacityRetireError::ConsumedReplay)
+        );
+        assert_eq!(issuer.semantic_snapshot_for_test(), terminal_replay_before);
+        assert_eq!(
+            issuer.backing_capacities_for_test(),
+            terminal_replay_backing_before
+        );
+
+        let cells_before_successor = issuer.semantic_snapshot_for_test().cell_count();
+        let successor = issuer.reserve().unwrap();
+        let successor_identity = successor.ordinal_identity_for_test();
+        assert_ne!(
+            successor_identity.1, terminal_identity.1,
+            "a no-successor cell is sealed and cannot be reused"
+        );
+        assert_eq!(
+            issuer.semantic_snapshot_for_test().cell_count(),
+            cells_before_successor + 1,
+            "reserve must grow a different real cell"
+        );
+        assert!(matches!(
+            issuer.retire_unbound(successor, EnqueueRejected::CoreTokenDrift),
+            BackCapacityRetireOutcome::Retired(_)
+        ));
+
+        assert_eq!(
+            second.ordinal_identity_for_test(),
+            second_identity,
+            "foreign, stale and replay probes must not alter the live owner"
+        );
+        assert!(matches!(
+            issuer.retire_unbound(second, EnqueueRejected::CoreTokenDrift),
+            BackCapacityRetireOutcome::Retired(_)
+        ));
+        assert_eq!(issuer.semantic_snapshot_for_test().outstanding_count(), 0);
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum CleanupOwnerSnapshot {
