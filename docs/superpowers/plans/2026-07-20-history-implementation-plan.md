@@ -1996,6 +1996,11 @@ pub struct RejectedBackContinuationOwner { inner: CoreRejectedBackContinuation }
 pub struct BackNoTargetCleanupAction { inner: CoreBackNoTargetCleanupAction }
 #[doc(hidden)]
 pub struct BackNoTargetCleanupBatchView { inner: CoreBackNoTargetCleanupBatchProjection }
+impl BackNoTargetCleanupBatchView {
+    pub fn manifest_digest(&self) -> u64;
+    pub fn obligation_count(&self) -> usize;
+    pub fn expected_completion_digest(&self) -> u64;
+}
 #[doc(hidden)]
 pub struct BackNoTargetCleanupInstallation {
     batch: BackNoTargetCleanupBatchOwner,
@@ -2004,13 +2009,25 @@ pub struct BackNoTargetCleanupInstallation {
 }
 impl BackNoTargetCleanupInstallation {
     pub fn batch(&self) -> BackNoTargetCleanupBatchView;
-    pub fn complete(self, completion_digest: u64, settled_count: usize)
+    pub fn complete(
+        self,
+        manifest_digest: u64,
+        obligation_count: usize,
+        completion_digest: u64,
+        settled_count: usize,
+    )
         -> BackNoTargetCleanupCompletionOwner;
+}
+struct CoreBackNoTargetCleanupCompletionFacts {
+    manifest_digest: u64,
+    obligation_count: usize,
+    completion_digest: u64,
+    settled_count: usize,
 }
 #[doc(hidden)]
 pub struct BackNoTargetCleanupCompletionOwner {
     installation: BackNoTargetCleanupInstallation,
-    completion: CleanupCompletion,
+    completion: CoreBackNoTargetCleanupCompletionFacts,
 }
 #[doc(hidden)]
 pub struct BackNoTargetTerminalEvidence { inner: CoreBackNoTargetTerminalProjection }
@@ -2355,26 +2372,41 @@ pub(crate) enum PendingBackTargetExecution {
     CommitFailure(PendingBackTargetCommitFailure),
 }
 pub(crate) struct PreparedBackNoTarget { approved: ApprovedBackNoTargetCandidate, capacity: NoTargetCapacityPermit, projection: ProvenEmptyProjection }
+pub(crate) enum BackNoTargetInstalledInertEvidence {
+    LedgerInvariant(BackNoTargetZeroCompletionPreparationEvidence),
+    IssuerMissing {
+        source: BackNoTargetZeroCompletionSourceIdentity,
+    },
+    ReclaimRejected {
+        source: BackNoTargetZeroCompletionSourceIdentity,
+        error: BackCapacityRetireError,
+    },
+}
 pub(crate) struct InstalledBackNoTargetCleanup {
     ledger: CleanupLedger,
     installation: BackNoTargetCleanupInstallation,
+    inert: Option<BackNoTargetInstalledInertEvidence>,
 }
 pub(crate) struct SettledBackNoTargetCleanup {
-    ledger: CleanupLedger,
+    prepared: PreparedBackNoTargetZeroCompletion,
     completion: BackNoTargetCleanupCompletionOwner,
+    mismatch: PreparationReceiverMismatchView,
+}
+pub(crate) enum PendingBackNoTargetCompletion {
+    Installed(InstalledBackNoTargetCleanup),
+    Settled(SettledBackNoTargetCleanup),
 }
 // Add these exact fields to the existing RouterEntry; no parallel global table.
 pub(crate) struct RouterEntry {
     /* existing fields unchanged */
     pending_back_target_execution: Option<PendingBackTargetExecution>,
-    installed_back_no_target_cleanup: Option<InstalledBackNoTargetCleanup>,
-    pending_back_no_target_completion: Option<SettledBackNoTargetCleanup>,
+    pending_back_no_target_completion: Option<PendingBackNoTargetCompletion>,
     installed_back_no_target_authority: Option<InstalledBackNoTargetAuthoritySettlement>,
     installed_target_preparation_permanent: Option<InstalledTargetPreparationPermanentSettlement>,
 }
 pub(crate) enum BackNoTargetCleanupDriverOutcome {
     Terminal(BackNoTargetTerminalEvidence),
-    ReceiverMismatch { owner: SettledBackNoTargetCleanup, mismatch: PreparationReceiverMismatchView },
+    Inert,
 }
 pub(crate) enum BackNoTargetFinalizationOutcome {
     Published,
@@ -2593,6 +2625,9 @@ impl RouterEngine {
     pub fn accept_back_no_target_ready_with_canonical_zero_bind(
         &mut self,
         approved: ApprovedBackNoTargetCandidate,
+        manifest_digest: u64,
+        obligation_count: usize,
+        expected_completion_digest: u64,
         commit_canonical_zero: impl FnOnce(),
     ) -> BackNoTargetReadyCoreOutcome;
     #[doc(hidden)]
@@ -2612,6 +2647,7 @@ impl RouterEngine {
     pub fn complete_back_no_target_cleanup(
         &mut self,
         owner: BackNoTargetCleanupCompletionOwner,
+        commit_reclaim: impl FnOnce(),
     ) -> BackNoTargetCleanupCompletionOutcome;
     #[doc(hidden)]
     pub fn validate_back_no_target_authority_settlement_receiver(
@@ -2689,15 +2725,19 @@ pub fn host_version_shares_router_with_frame(
 
 `VerifiedBackNoTargetCandidate` owns unresolved lifecycle lineage only; it does not contain a ready/failure continuation or cleanup action. Retry returns that candidate、permit and evidence with no public request-phase/trace write. `PreparedBackNoTarget` contains the Core-issued approved candidate composite + ECS physical projection + permit, but no ledger、continuation or action
 
-`consume_prepared_back_no_target` borrows the exact entry engine + entry-owned issuer once, keeps the complete approved candidate/permit/projection owner outside the callback and runs `preflight_back_canonical_zero(&mut issuer, &permit, &projection)` without mutation. Preflight `Err` creates no guard/successor、does not call Core and returns `CapacityRejected` with that complete owner. Successful preflight returns a `LeasedToCanonicalZeroSlot` guard plus private non-authorizing prepared slot successor. Core `accept_back_no_target_ready_with_canonical_zero_bind` validates receiver + approved composite first；Mismatch returns that composite、invokes the callback zero times、drops guard/successor and returns `ReceiverMismatch` after ECS reconstructs the complete original owner. Matched invokes the closure exactly once to move only `guard.commit()`. The exact outer arm then moves the stale `NoTargetCapacityPermit` into `PreparedManifestNeutralLedgerSlot::into_slot_after_exact_receiver` and returns `PreparedBackNoTargetPublication` without publishing. The later `publish_prepared_back_no_target` installation closure alone consumes that slot、binds it to the non-authorizing batch projection and stores the initialized ledger + whole installation before Core publishes `HistoryIntentRejected → CleanupPending`
+`consume_prepared_back_no_target` borrows the exact entry engine + entry-owned issuer once，keeps the complete approved candidate/permit/projection owner outside the callback，and derives canonical manifest digest/count plus opaque `expected_completion_digest` from the ECS private completion algorithm before `preflight_back_canonical_zero(&mut issuer, &permit, &projection)`. Preflight `Err` creates no guard/successor、does not call Core and returns `CapacityRejected` with that complete owner. Successful preflight returns a `LeasedToCanonicalZeroSlot` guard plus private non-authorizing prepared slot successor. Core `accept_back_no_target_ready_with_canonical_zero_bind(approved, manifest_digest, obligation_count, expected_completion_digest, commit)` validates receiver + approved composite，requires zero count，then freezes all three commitment values with the original Back resolution/cleanup batch/request/transaction/host lineage without recomputing the ECS digest；Mismatch returns that composite、invokes the callback zero times、drops guard/successor and returns `ReceiverMismatch` after ECS reconstructs the complete original owner. Matched invokes the closure exactly once to move only `guard.commit()`. The exact outer arm then moves the stale `NoTargetCapacityPermit` into `PreparedManifestNeutralLedgerSlot::into_slot_after_exact_receiver` and returns `PreparedBackNoTargetPublication` without publishing. The later `publish_prepared_back_no_target` installation closure alone consumes that slot、binds it to the non-authorizing batch projection and stores the initialized ledger + whole installation before Core publishes `HistoryIntentRejected → CleanupPending`；the batch view carries the same frozen expected completion digest into the ledger
 
-`drive_back_no_target_zero_completion` is the same-schedule producer/consumer after that publication. It takes the exact entry field as a whole, proves its ledger has exact zero settled obligations, derives the existing canonical completion digest/count, and calls `BackNoTargetCleanupInstallation::complete` once to form `BackNoTargetCleanupCompletionOwner` without exposing action/continuation fields. `RouterEngine::complete_back_no_target_cleanup` exact-consumes that Core owner into `Failed(BackTargetUnavailable)`. Receiver mismatch returns the complete Core completion owner + `PreparationReceiverMismatchView`; ECS recomposes it with the settled ledger as `SettledBackNoTargetCleanup` and can restore it whole without losing batch/action/continuation. Exact terminal leaves both RouterEntry fields and every Core publication/completion owner empty
+the publication closure installs the canonical live `PendingBackNoTargetCompletion::Installed { inert: None }` holder in the same schedule before `HistoryIntentRejected → CleanupPending`
+
+`settle_cleanup_system` classifies that holder on every update, but `drive_back_no_target_zero_completion` only whole-takes a live `Installed { inert: None }` once. It proves the dedicated ledger has exact-zero settled obligations，derives the actual completion digest with the same ECS private algorithm used for the Ready expectation，freezes manifest digest/count plus actual canonical completion digest/count，then exact-preflights the installed capacity lease into a lifetime-bound reclaim guard. Ledger invariant、missing issuer or reclaim rejection restores `Installed` with its exact typed evidence and does not call Core；`Installed { inert: Some(_) }` and `Settled` return handled before the take and are never automatically redriven. Success calls `BackNoTargetCleanupInstallation::complete` once to form a no-target-specific `BackNoTargetCleanupCompletionOwner` whose opaque facts contain those four values while identity and frozen expected digest remain owned by the whole installation's original Back resolution/cleanup batch lineage；it does not reuse ordinary `CleanupCompletion` or expose action/continuation fields
+
+`RouterEngine::complete_back_no_target_cleanup` exact-validates the Core owner，including every completion fact and actual completion digest 与 Ready-frozen expected value exact equality，and prepares every fallible terminal record/state change before invoking `commit_reclaim`. Receiver mismatch or wrong facts invokes the callback zero times and returns the complete Core completion owner + `PreparationReceiverMismatchView`；ECS drops the uncommitted guard，then restores whole `PendingBackNoTargetCompletion::Settled { prepared: PreparedBackNoTargetZeroCompletion, completion: BackNoTargetCleanupCompletionOwner, mismatch: PreparationReceiverMismatchView }`，其中 mismatch 本身就是 typed receiver evidence. Either occupied variant is inert，blocks collect and is never automatically taken again on later updates；only a future named Recovery/authority trigger may consume it，and current History adds no retry producer. Exact match invokes the callback once，whose body may only commit the prebuilt `Leased -> Free + generation+1 | PermanentlyRetired` transition；after the callback Core performs only its prebuilt `CleanupSettled -> Failed(BackTargetUnavailable) -> RequestTerminal` tail with no query、allocation、validation or fallible work. Exact terminal clears the holder、the issuer lease and every Core publication/completion owner
 
 `classify_back_no_target` returns the specialized `BackNoTargetPreparationOutcome`, not generic `PreparationDecision`: `Ready` carries only `PreparedBackNoTarget`; `Retry` returns the complete original owner + typed evidence; `AuthoritySettlement` carries `BackNoTargetAuthoritySettlementDisposition`; `Permanent` carries the branch permanent owner. It has no ordinary `PendingRejected` variant: that unreachable classifier result converts directly to `Permanent`. Issuer preflight `Err` returns `CapacityRejected` before guard/Core call；a later Core receiver mismatch returns `ReceiverMismatch` after callback zero and guard/successor drop，and both preserve the complete original owner
 
 The pre-proof `AuthorityLost` arm follows the same boundary inside `classify_back_no_target`: ECS freezes `BackNoTargetAuthorityPhysicalSettlementOwner` from the complete source/protected closure、allowed-write set and exact authority manifest. Issuer preflight `Err` creates no guard/evidence、does not call Core and returns `CapacityRejected` with the complete owner. Successful `preflight_no_target_retirement` returns a `LeasedRetire` guard + prepared evidence，then Core exact-matches candidate + scope before the callback. Mismatch calls it zero times、drops guard/evidence and returns `ReceiverMismatch` with the complete owner；exact match calls only `guard.commit()` once，then drops the stale permit and seals evidence into `BackNoTargetAuthoritySettlementDisposition`
 
-`dispatch_back_no_target_authority_settlement` is the sole disposition consumer. It validates the exact entry and calls the Core receiver before mutation; entry/engine mismatch returns the entire disposition. Exact dispatch moves the physical owner + Core settlement owner into the existing failed/scoped authority settlement field, installs only its authority ledger/residual under the frozen allowed-write set, and publishes only authority-specific `Running(Recovering) + requested=None`. It never populates `installed_back_no_target_cleanup`, never records `HistoryIntentRejected`/normal `CleanupPending`, and introduces no publisher. Existing authority cleanup completion consumes the stored physical owner first and then the same stored Core settlement owner to reach the original HostLost/AuthorityLost terminal; retirement evidence remains diagnostic and terminal inventory clears the authority field
+`dispatch_back_no_target_authority_settlement` is the sole disposition consumer. It validates the exact entry and calls the Core receiver before mutation; entry/engine mismatch returns the entire disposition. Exact dispatch moves the physical owner + Core settlement owner into the existing failed/scoped authority settlement field, installs only its authority ledger/residual under the frozen allowed-write set, and publishes only authority-specific `Running(Recovering) + requested=None`. It never populates `pending_back_no_target_completion`, never records `HistoryIntentRejected`/normal `CleanupPending`, and introduces no publisher. Existing authority cleanup completion consumes the stored physical owner first and then the same stored Core settlement owner to reach the original HostLost/AuthorityLost terminal; retirement evidence remains diagnostic and terminal inventory clears the authority field
 
 `PreparationPermanentOwner<TargetPreparationOwner>` is the post-splice ECS physical-preparation owner: it retains the original splice、history binding and continuation together with exact physical evidence. `classify_back_target` exact-matches the `RouterEntry` engine before any Core conversion; cross-router/entry mismatch returns that original `TargetPreparationOwner`. `settle_back_target_preparation_permanent` only prepares `TargetPreparationPermanentDisposition { cleanup, settlement }`; `cleanup` freezes the original authority/permanent branch beside the splice, so later continuation never infers branch from obligation count or disposition
 
@@ -2754,11 +2794,12 @@ Missing symbols、placeholder panics、test setup failures and directly injected
 | `back_no_target_refreeze_receiver_mismatch_never_commits_transfer` | issuer preflight `Err` returns `CapacityRejected` before guard/Core call；wrong engine returns `ReceiverMismatch` with guard commit zero and complete bound owner；exact receiver first rebuilds and exact-refreezes source into `PreparedUnchanged | PreparedDrift`，then calls only `guard.commit()` once，its Core tail moves the prepared branch，and the exact outer arm consumes the stale bound through `into_permit_after_exact_receiver` to produce candidate+permit or drift+permit |
 | `back_no_target_source_drift_terminals_once` | single helper keeps raw drift+permit local；issuer preflight `Err` returns `CapacityRejected` without Core call，Core mismatch returns `ReceiverMismatch` with guard commit zero and the full composite，exact receiver calls guard commit once then terminals and seals retirement evidence |
 | `back_no_target_ready_receiver_or_issuer_mismatch_never_binds` | issuer preflight `Err` creates no guard/successor and returns `CapacityRejected` without Core call；wrong receiver/approval returns `ReceiverMismatch` with guard commit zero and the full `PreparedBackNoTarget`；exact case commits the `LeasedToCanonicalZeroSlot` guard once and converts the stale permit into the prepared slot successor. Batch ledger bind is tested only in the later publication closure |
-| `back_no_target_first_publication_has_installed_owners` | at the first observable `HistoryIntentRejected`, the exact entry already contains one whole `InstalledBackNoTargetCleanup { ledger, installation }`; batch/action/rejected-back continuation remain private inside that same installation. Its header is safely `Installed`, obligation/receipt vectors are initialized empty, and the allocation counter is unchanged. The trusted installation closure runs once before the final Core public tail; no observer can see publication while the whole owner remains only inside `PreparedBackNoTargetPublication` |
+| `back_no_target_first_publication_has_installed_owners` | at the first observable `HistoryIntentRejected`, the exact entry already contains `PendingBackNoTargetCompletion::Installed(whole installed owner)`；batch/action/rejected-back continuation remain private inside that same installation. Its header is safely `Installed`, obligation/receipt vectors are initialized empty, and the allocation counter is unchanged. The trusted installation closure runs once before the final Core public tail; no observer can see publication while the whole owner remains only inside `PreparedBackNoTargetPublication` |
 | `back_no_target_source_is_not_ecs_reachable` | compile/static gate proves ECS compiles without importing `FrozenHistorySource` or inspecting candidate/drift internals; only the public doc-hidden Core refreeze outcome crosses the crate boundary |
 | `core_preparation_receivers_do_not_name_ecs_preflight_evidence` | static source gate proves `LifecyclePreflightEvidence` occurs only in ECS crate-private physical/outcome surfaces and never in Core source、`RouterEngine` inherent signatures or Core-owned outcomes; every Core receiver mismatch uses opaque `PreparationReceiverMismatchView` |
 | `back_no_target_permanent_capacity_contradiction_terminals_once` | permanent domain/capacity contradiction has no live producer、never retries and terminals once |
-| `back_no_target_ready_terminal_closes_all_lifecycle_owners` | canonical-zero bind installs the whole field and drives `HistoryIntentRejected → CleanupPending`; same-schedule driver takes it whole、proves exact-zero digest/count and creates the whole completion owner. Core exact completion reaches `Failed(BackTargetUnavailable)`; mismatch restores the whole settled owner and exact terminal leaves entry fields plus action、ticket、capability、candidate、continuation、reservation、completion and lifecycle owner empty |
+| `back_no_target_ready_terminal_closes_all_lifecycle_owners` | canonical-zero bind freezes opaque expected completion digest with the exact batch lineage，installs live `PendingBackNoTargetCompletion::Installed` and drives `HistoryIntentRejected → CleanupPending`；the same-schedule settle pass takes it once，proves exact-zero facts and forms the whole completion owner. Ledger invariant、missing issuer or reclaim rejection restores typed inert `Installed`；receiver mismatch or wrong completion facts calls reclaim zero times and restores whole `Settled { prepared, completion, mismatch }`；later updates still classify the holder but return before take，so Core receiver and reclaim are not repeated. Exact completion alone reaches `Failed(BackTargetUnavailable)` and clears the holder plus every action、ticket、capability、candidate、continuation、reservation、completion and lifecycle owner |
+| `back_no_target_completion_callback_tail_is_infallible_and_query_free` | static callsite gate proves the completion receiver has one ECS production callsite；first publication writes one canonical holder，settle classifies before the unique take，inert `Installed` and `Settled` return early；reclaim preflight happens before Core，mismatch callback count is zero，exact callback contains only one prebuilt guard commit，and callback 后的 Core terminal tail has no query、allocation、validation、fallible trace/status preparation、owner reconstruction or hook/observer-triggering write |
 | `back_no_target_authority_settlement_terminals_once` | pre-proof AuthorityLost freezes complete physical source/protected/allowed-write/manifest and produces one `{ physical, settlement, retirement }` disposition; unique dispatch mismatch restores it whole, exact dispatch only enters existing authority-specific `Recovering`, and existing scoped completion terminals once with no normal trace/ledger/continuation or outstanding authority owner |
 | `back_target_physical_permanent_terminal_closes_all_lifecycle_owners` | post-splice physical permanent first prepares then uniquely dispatches its whole frozen-cleanup + Core-settlement disposition; mismatch restores it whole, physical completion consumes the pre-frozen branch and stored settlement, and terminal leaves zero action、ticket、capability、splice、continuation、cleanup or settlement owner |
 | max-depth and duplicate entries | real shallow prefix burns unused ids; duplicate-location back completes one exact publication by entry identity |
@@ -2810,6 +2851,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_no_target_first_publication_has_installed_owners -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_no_target_permanent_capacity_contradiction_terminals_once -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_no_target_ready_terminal_closes_all_lifecycle_owners -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --test authority_regression_catalogue back_no_target_completion_callback_tail_is_infallible_and_query_free -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_no_target_authority_settlement_terminals_once -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_target_physical_permanent_terminal_closes_all_lifecycle_owners -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_authority_compile_fail back_no_target_source_is_not_ecs_reachable -j 1
@@ -2891,7 +2933,7 @@ Core never constructs ECS `BackTargetReadyAcceptanceOwner`、`PreparedCleanupLed
 
 Across these helpers, issuer preflight `Err` always occurs before guard construction and Core call，returning `CapacityRejected` with the complete owner；only a later Core mismatch returns `ReceiverMismatch` after callback zero and uncommitted guard/successor drop. Exact callbacks only move `guard.commit()` after all preparation. Guard commit matches a prebuilt operation-specific transition：retire removes the held live entry、returns lifecycle to `Free` and applies `Reusable | PermanentlyRetired` metadata；transfer retains and updates it to `Leased`；canonical-zero consumes the held `Leased` entry and transfers its exact cell lease into the slot. It performs no owner/key lookup、key remove、Vec index/query、allocation、validation、`expect`、`unwrap`、panic or unsafe. Retirement drops its stale owner then seals evidence；transfer and canonical-zero move their stale owner into the prepared successor conversion. This rule applies to target/contradiction retirement、no-target transfer、drift/authority retirement and canonical-zero bind；none may reintroduce owner-by-value + expectation callbacks、Option owner slots or Core-owned issuer guards
 
-Before Step 9, drive all publication/closure gates GREEN: the first normal no-target public observation must already have the exact whole ledger+installation field; that branch must then reach `BackTargetUnavailable` after same-schedule whole-owner exact-zero completion with no outstanding entry field/action/ticket/capability/candidate/continuation/reservation/completion/lifecycle owner. No-target AuthorityLost must uniquely dispatch its whole physical/Core/retirement disposition into authority-only settlement and terminal once without a normal trace. Post-splice target physical permanent must uniquely dispatch and complete its frozen physical cleanup and stored Core authority settlement to terminal with no outstanding splice/cleanup/settlement or lifecycle owner
+Before Step 9, drive all publication/closure gates GREEN: the first normal no-target public observation must already have the exact whole ledger+installation field; that branch must then reach `BackTargetUnavailable` after same-schedule whole-owner exact-zero completion，with installed capacity reclaimed before the prebuilt Core terminal tail and no outstanding entry field/action/ticket/capability/candidate/continuation/reservation/completion/capacity lease/lifecycle owner. No-target AuthorityLost must uniquely dispatch its whole physical/Core/retirement disposition into authority-only settlement and terminal once without a normal trace. Post-splice target physical permanent must uniquely dispatch and complete its frozen physical cleanup and stored Core authority settlement to terminal with no outstanding splice/cleanup/settlement or lifecycle owner
 
 Rerun every Step 4 and Step 7 focused command, including these exact GREEN filters and static contracts
 
@@ -2912,6 +2954,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_no_target_registered_child_slot_extras_use_owner_parent_authority -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_no_target_registered_frame_and_child_extras_preserve_authority_evidence -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_no_target_preparation_branches_preserve_exact_owners -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --test authority_regression_catalogue back_no_target_completion_callback_tail_is_infallible_and_query_free -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_no_target_authority_settlement_terminals_once -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_authority_compile_fail back_no_target_source_is_not_ecs_reachable -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --test authority_regression_catalogue core_preparation_receivers_do_not_name_ecs_preflight_evidence -j 1
@@ -2974,6 +3017,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_no_target_ready_receiver_or_issuer_mismatch_never_binds -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_no_target_first_publication_has_installed_owners -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_no_target_ready_terminal_closes_all_lifecycle_owners -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --test authority_regression_catalogue back_no_target_completion_callback_tail_is_infallible_and_query_free -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_target_physical_permanent_terminal_closes_all_lifecycle_owners -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features test-support --test public_navigation_journeys history_c1_ -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features test-support --test public_navigation_authority_audit history_back_ -j 1
@@ -3012,7 +3056,7 @@ Reviewers verify
 - the persistent World domain issuer signs exactly one issuer per `RouterEntry`; second production install rejects before domain issue without replacement/identity consumption/outstanding drift, while test-support producer `AlreadyInstalled` remains an independent entry-local journal rule
 - capacity cells remain in the exact entry table and have no fixed install-time pool; growth is fail-closed before mint/Core reach, reclaim advances generation, stale ABA evidence returns the live owner and a no-successor cell is never reused
 - reservation storage is fully initialized and safe; canonical-zero installs initialized empty storage without allocation、uninitialized memory or unchecked conversion
-- normal no-target Ready returns a sealed prepared publication with zero public write; its sole installation closure stores one whole `InstalledBackNoTargetCleanup { ledger, installation }` before the first `HistoryIntentRejected`. The same-schedule driver takes it whole、proves exact-zero digest/count and forms the Core completion owner; mismatch restores the whole settled owner and exact terminal clears both entry fields plus all action/ticket/capability/continuation/completion owners
+- normal no-target Ready freezes ECS opaque expected completion digest with manifest digest/count and returns a sealed prepared publication with zero public write；its sole installation closure stores live `PendingBackNoTargetCompletion::Installed` before the first `HistoryIntentRejected`. The same-schedule settle pass takes that live owner once to prove exact-zero facts、preflight reclaim and form the no-target-specific Core completion owner；ledger/issuer/reclaim permanent rejection restores typed inert `Installed`，receiver/wrong-facts rejection restores whole `Settled`，later updates classify either holder but return before take. Exact completion alone reclaims once、runs the prebuilt query/allocation/validation-free terminal tail and clears the holder plus all action/ticket/capability/continuation/completion/capacity owners
 - no-target AuthorityLost freezes complete source/protected closure/allowed-write/manifest, uniquely dispatches the whole physical/Core/retirement disposition into existing authority-only settlement, never creates normal trace/ledger/continuation, and terminals once with no outstanding authority owner
 - post-splice target physical permanent uniquely dispatches the whole frozen-cleanup + Core-settlement disposition, selects only the pre-frozen original branch after cleanup, and reaches terminal with zero outstanding splice、continuation、cleanup、settlement or lifecycle owner before public back exposure
 - protected sparse topology remains zero-write

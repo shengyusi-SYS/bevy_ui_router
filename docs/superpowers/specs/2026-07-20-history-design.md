@@ -419,11 +419,15 @@ resolved no-target 的 reservation 是真实、manifest-neutral 的 ledger heade
 
 `ProvenEmptyApprovalView` 只能由 Core typed producer `approve_back_no_target_logical_zero -> BackNoTargetApprovalOutcome` 签发：producer exact-match 当前 engine 与 verified candidate，从当前 authority 重建完整 source 并验证 logical no-predecessor/zero；Mismatch 返还原 candidate + opaque `PreparationReceiverMismatchView`。ECS 不能构造、clone 或合成 approval；approval 只校验 Core logical facts，不能重建 owner，也不能替代 ECS physical `ProvenEmptyProjection`。`PreparedBackNoTarget` 必须同时持有 Core-issued `ApprovedBackNoTargetCandidate`、原 permit 与独立 physical projection，缺任一都不能进入 Ready
 
-proof 与 Core approval 成功后，唯一 `consume_prepared_back_no_target` helper 在同一个 exact-entry borrow 内先对同一 outstanding issuer reservation 做 canonical-zero non-mutating exact preflight，再把 locally infallible commit closure 交给 Core exact Ready consumer。issuer 或 approved-composite receiver mismatch 调用 closure 零次并返还完整 approved candidate、permit 与 physical projection；exact match 调用 closure 恰好一次，把 reservation 消费为 preflighted manifest-neutral canonical-zero slot，但不公开状态，只返回 sealed move-only `PreparedBackNoTargetPublication`。该 prepared owner 持有 Core publication capability与 opaque `BackNoTargetCleanupInstallation`；installation 私有地整体持有 cleanup batch、rejected-back continuation 与 cleanup action，ECS 只能取得其 read-only `BackNoTargetCleanupBatchView`
+proof 与 Core approval 成功后，唯一 `consume_prepared_back_no_target` helper 在同一个 exact-entry borrow 内先用 ECS 私有 completion 算法计算 opaque `expected_completion_digest`，并连同 canonical manifest digest/count 对同一 outstanding issuer reservation 做 non-mutating exact preflight，再把三项 commitment 与 locally infallible commit closure 交给 Core exact Ready consumer。Core 不重算或解释 ECS digest，只把 expected value 与原 Back resolution、cleanup batch、request、transaction、host lineage 一起冻结。issuer 或 approved-composite receiver mismatch 调用 closure 零次并返还完整 approved candidate、permit 与 physical projection；exact match 调用 closure 恰好一次，把 reservation 消费为 preflighted manifest-neutral canonical-zero slot，但不公开状态，只返回 sealed move-only `PreparedBackNoTargetPublication`。该 prepared owner 持有 Core publication capability与 opaque `BackNoTargetCleanupInstallation`；installation 私有地整体持有 cleanup batch、rejected-back continuation 与 cleanup action，ECS 只能从 read-only `BackNoTargetCleanupBatchView` 取得同一 manifest commitment 与 frozen expected completion digest
 
-仍在同一个 helper/entry borrow 内，prepared publication 的 doc-hidden final consumer 以唯一 ECS installation closure 接收整个 `BackNoTargetCleanupInstallation`，仅用其 batch projection 不可失败地消费 captured canonical-zero slot 并构造 fully bound ledger，再将 `{ ledger, installation }` 作为一个 `InstalledBackNoTargetCleanup` 整体安装到 exact `RouterEntry`；不得拆出 batch/action/continuation。只有整个 field 安装完且 closure 返回后，Core 才发布 `HistoryIntentRejected → CleanupPending`。首个 `HistoryIntentRejected` 观察点必须已经能从 exact entry 找到这一 whole owner。final consumer 不得 query、allocation、validation、hook/observer-triggering write 或执行可失败工作；即使 obligations 为零也不再分配 header/domain/storage，不存在额外 `BindingView`、attestor 或 receipt protocol
+仍在同一个 helper/entry borrow 内，prepared publication 的 doc-hidden final consumer 以唯一 ECS installation closure 接收整个 `BackNoTargetCleanupInstallation`，仅用其 batch projection 不可失败地消费 captured canonical-zero slot并构造 fully bound ledger；ledger 保存 batch view 中的 frozen expected completion digest，并使用产生该 expected value的同一 ECS 私有算法结算实际 completion digest。closure 再将 `{ ledger, installation }` 作为 `PendingBackNoTargetCompletion::Installed(whole installed owner)` 安装到 exact `RouterEntry`；不得拆出 batch/action/continuation。只有整个 holder 安装完且 closure 返回后，Core 才发布 `HistoryIntentRejected → CleanupPending`。首个 `HistoryIntentRejected` 观察点必须已经能从 exact entry 找到这一 whole owner。final consumer 不得 query、allocation、validation、hook/observer-triggering write 或执行可失败工作；即使 obligations 为零也不再分配 header/domain/storage，不存在额外 `BindingView`、attestor 或 receipt protocol
 
-同一 schedule 的唯一 zero-completion driver 必须整体 take 该 installed field，证明 ledger 的 exact-zero settled obligations，计算 canonical completion digest/count，再单次消费 installation 形成 `BackNoTargetCleanupCompletionOwner`。Core exact completion 只接收该 Core owner并到达 `Failed(BackTargetUnavailable)`；receiver mismatch 返回完整 completion owner + opaque mismatch view，ECS 与 settled ledger 重组为 whole owner 后原样恢复。exact terminal 后 installed/pending entry fields、batch、action、continuation、capability、candidate、reservation、completion 与 lifecycle owner 全部为空
+publication closure 在同一 schedule 安装 canonical live `Installed { inert: None }` holder，随后 `settle_cleanup_system` 在每个 update 分类 holder，但 zero-completion driver 只整体 take 并驱动 live `Installed` 一次。它证明 ledger 的 exact-zero settled obligations，计算 manifest digest/count 与实际 canonical completion digest/count，再单次消费 installation 形成 no-target 专用 `BackNoTargetCleanupCompletionOwner`。四项 completion facts 只做结构绑定，identity 继续由 whole installation 内原 Back resolution、cleanup batch、request、transaction 与 host lineage 唯一持有，不复用普通 `CleanupCompletion` 或伪造 frame/task identity
+
+ledger invariant rejection 必须恢复 `Installed { inert: Some(LedgerInvariant(BackNoTargetZeroCompletionPreparationEvidence)) }`；issuer 缺失与 reclaim rejection 分别恢复 `IssuerMissing { source }`、`ReclaimRejected { source, error }`，三者都保留完整 installed owner且不得调用 Core。ECS exact-zero proof 后必须对 ledger 内 installed capacity lease 完成 exact reclaim preflight，预建 `Leased -> Free + generation+1` 或 generation 耗尽时永久退役的不可失败 transition。Core 在 callback 前完成 receiver、全部 completion facts 与 terminal record/state 的可失败准备；receiver mismatch 或 wrong facts 调用 callback 零次并返回完整 completion owner + opaque mismatch view，ECS 丢弃未提交 reclaim guard，再恢复直接持有 whole `PreparedBackNoTargetZeroCompletion`、completion owner 与 mismatch 的 `PendingBackNoTargetCompletion::Settled`。inert `Installed` 与 `Settled` 都在 take 前返回并阻断 collect，后续 update 只分类、不重驱；只有未来具名 Recovery/authority trigger 可以消费，当前 History 不新增 completion retry producer
+
+exact receiver 调用 callback 恰好一次且 callback 只能执行预建 reclaim commit，随后 Core 才发布 `CleanupSettled -> Failed(BackTargetUnavailable) -> RequestTerminal`；callback 后不得 query、allocation、validation 或执行其他可失败工作。exact terminal 后 pending holder、batch、action、continuation、capability、candidate、reservation、completion、capacity lease 与 lifecycle owner 全部为空
 
 proven-empty 前的 `AuthorityLost` 也必须在分类所在的同一个 exact-entry helper 内先冻结 complete source/protected closure、allowed-write set 与 exact authority manifest，形成 ECS physical settlement owner，再做 permit retirement preflight并由 Core exact authority consumer 以同一 closure 规则完成：Mismatch 调用零次并返还完整 candidate、permit、physical owner 与 authority evidence，exact match 调用恰好一次后产生整体 `BackNoTargetAuthoritySettlementDisposition { physical, settlement, retirement }`
 
@@ -494,7 +498,7 @@ running resolution verify 后，no-target 停在 Core-private verified-candidate
 
 normal candidate 与 Retry 在 physical proven-empty + Core logical-zero approval + canonical-zero exact-bind 完成前不得发布 request phase、`HistoryIntentRejected`、`CleanupPending`、ledger、manifest、receipt、continuation、cleanup action 或 terminal，也不得由 `requested=None` 推断状态
 
-canonical-zero bind 后返回的 `PreparedBackNoTargetPublication` 仍保持 public 零写；只有 exact entry 已整体安装 `InstalledBackNoTargetCleanup { ledger, installation }` 后，final consumer 才能产生第一个 `HistoryIntentRejected`，且 installation 的 batch/action/continuation 不得拆开
+canonical-zero bind 后返回的 `PreparedBackNoTargetPublication` 仍保持 public 零写；只有 exact entry 已整体安装 `PendingBackNoTargetCompletion::Installed(whole installed owner)` 后，final consumer 才能产生第一个 `HistoryIntentRejected`，且 installation 的 batch/action/continuation 不得拆开
 
 pre-proof authority loss/permanent fail-closed 仍可进入既有 settlement/terminal，但不得伪装成正常 no-target rejection 或发布其 cleanup trace
 
@@ -553,12 +557,14 @@ raw BackNoTargetCandidate + BoundBackCapacityReservation
 -> Core-issued ApprovedBackNoTargetCandidate + same permit + distinct physical projection
 -> consume helper preflights canonical-zero, then Core exact Ready receiver calls bind once
 -> Core returns sealed PreparedBackNoTargetPublication with publication capability + whole opaque BackNoTargetCleanupInstallation and public zero-write
--> final consumer invokes the sole ECS closure; it reads only the installation batch projection, consumes the captured canonical-zero slot into the fully bound ledger and installs whole InstalledBackNoTargetCleanup into exact RouterEntry
+-> final consumer invokes the sole ECS closure; it reads only the installation batch projection, consumes the captured canonical-zero slot into the fully bound ledger and installs PendingBackNoTargetCompletion::Installed into exact RouterEntry
 -> installation closure returns
 -> HistoryIntentRejected
 -> CleanupPending
--> same-schedule driver takes the whole installed field, proves exact zero and converts the whole installation into BackNoTargetCleanupCompletionOwner
--> Core exact zero completion; mismatch restores whole settled-ledger + completion owner
+-> same-schedule settle classifies the canonical holder and takes live Installed once, proves exact zero, freezes manifest/completion digest+count and preflights exact installed-lease reclaim
+-> whole installation becomes the no-target-specific BackNoTargetCleanupCompletionOwner while the reclaim guard remains uncommitted
+-> ledger/issuer/reclaim permanent rejection restores inert Installed; Core receiver/wrong-facts rejection calls reclaim zero times and restores inert Settled; either blocks collect without per-update retry
+-> exact Core completion compares actual digest with the Ready-frozen expected digest and calls reclaim once before the prebuilt terminal tail
 -> CleanupSettled
 -> Failed(BackTargetUnavailable)
 
@@ -592,9 +598,10 @@ Core completion 只验证
 - batch、request、transaction 与 host epoch binding
 - settled count
 - canonical zero representation
+- actual completion digest 与 batch lineage 内 frozen opaque expected value exact equality
 - completion structural binding
 
-Core 不重算 Entity truth，也不认证 ECS receipt 的物理真实性
+Core 不重算 Entity truth、ECS completion 算法或 receipt 的物理真实性
 
 cleanup target/manifest 与 continuation 分别线性持有
 
@@ -809,7 +816,7 @@ no-target back 的 current/retained slot 必须进入protected并保持零 attem
 | no-target logical-zero approval | Core exact receiver + verified candidate + current source/no-predecessor validation单次签发，与physical projection分离 | mismatch返原candidate；ECS/facade不可构造或用其重建owner | 只与原candidate组成approved composite，不能单独授权Ready |
 | no-target source-drift owner | Core exact refreeze消费verified candidate后opaque返回，与原permit配对 | 单一entry helper先做issuer preflight，再调用Core exact consumer | engine/issuer mismatch时closure零次且返还完整raw pair；exact时closure一次并terminal，不存在prepared owner |
 | prepared no-target publication | canonical-zero bind后的Core exact Ready consumer单次mint，持有publication capability + whole opaque cleanup installation，public零写 | final consumer的唯一ECS closure只读batch projection并把whole installation与ledger安装到exact entry | closure返回后才发布；final tail不可失败且不再validation/query |
-| installed no-target cleanup | exact entry持有`{ canonical-zero ledger, whole installation }`；batch/action/continuation保持私有整体 | same-schedule driver整体take、证明exact-zero digest/count并形成Core completion owner；mismatch与settled ledger整体恢复 | Core exact completion后单次terminal，entry fields与所有publication/completion owner清空 |
+| pending no-target completion | exact entry以单一holder持有live/inert `Installed` 或 whole `Settled { prepared, completion, mismatch }`；batch/action/continuation保持私有整体 | settle每个update先分类holder，只take live `Installed { inert: None }`一次；typed inert `Installed` 与`Settled`在take前返回并阻断collect | 仅exact Core completion单次terminal并清空holder与所有publication/completion owner；未来具名Recovery/authority trigger才可消费inert holder |
 | rejected-back continuation | whole cleanup installation内部持有并在首个public write前整体安装，与zero ledger正交持有 | 不因count/disposition重分类或从installation拆出 | exact zero completion owner由whole installation单次转换并消费 |
 | history capability | frozen exact source/destination | precommit failure cancels | PreparedPublication单次消费，replay零写 |
 | cleanup capacity reservation | manifest-neutral | target exists则unused identity烧毁，authority loss则线性消费 | 只由proven manifest建立ledger |
@@ -988,6 +995,7 @@ History completion 必须显式运行
 - focused `no_back_entry_precedes_identity_exhaustion`
 - focused typed preparation retry owner-return 与永久 contradiction fail-closed
 - focused `back_no_target_ready_terminal_closes_all_lifecycle_owners`
+- focused `back_no_target_completion_callback_tail_is_infallible_and_query_free`
 - focused `back_target_physical_permanent_terminal_closes_all_lifecycle_owners`
 - workspace nextest、check、doctest
 - fmt、diff check 与 clean tree

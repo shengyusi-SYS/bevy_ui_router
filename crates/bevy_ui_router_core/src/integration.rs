@@ -11,6 +11,7 @@ use crate::cleanup::{
 use crate::engine::BackAllocatorBoundary;
 use crate::engine::{
     BackNoTargetApprovalOutcome as CoreBackNoTargetApprovalOutcome,
+    BackNoTargetCleanupCompletionCoreOutcome as CoreBackNoTargetCleanupCompletionCoreOutcome,
     BackNoTargetReadyCoreOutcome as CoreBackNoTargetReadyCoreOutcome,
     BackNoTargetSourceDriftSettlementOutcome as CoreBackNoTargetSourceDriftSettlementOutcome,
     BackNoTargetSourceRefreezeOutcome as CoreBackNoTargetSourceRefreezeOutcome,
@@ -21,7 +22,8 @@ use crate::engine::{
     BeginAuthoritySettlementErrorKind as CoreBeginAuthoritySettlementErrorKind,
     CommitError as CoreCommitError, CommitTicket as CoreCommitTicket,
     CoreBackNoTargetCleanupAction, CoreBackNoTargetCleanupBatchOwner,
-    CoreBackNoTargetCleanupBatchProjection, CoreBackTargetAppliedOutcome,
+    CoreBackNoTargetCleanupBatchProjection, CoreBackNoTargetCleanupCompletionOwner,
+    CoreBackNoTargetTerminalProjection, CoreBackTargetAppliedOutcome,
     CoreBackTargetCommitFailureCleanup, CoreBackTargetCommitRejectedPublication,
     CoreBackTargetCommitRetainedInputProjection, CoreBackTargetDriverFailureCleanup,
     CoreBackTargetDriverFailureReport, CoreBackTargetDriverFailureReportMode,
@@ -1242,6 +1244,10 @@ impl BackNoTargetCleanupBatchView {
     pub fn obligation_count(&self) -> usize {
         self.inner.obligation_count()
     }
+
+    pub fn expected_completion_digest(&self) -> u64 {
+        self.inner.expected_completion_digest()
+    }
 }
 
 #[doc(hidden)]
@@ -1257,6 +1263,48 @@ impl BackNoTargetCleanupInstallation {
             inner: self.batch.inner.projection(),
         }
     }
+
+    pub fn complete(
+        self,
+        manifest_digest: u64,
+        obligation_count: usize,
+        completion_digest: u64,
+        settled_count: usize,
+    ) -> BackNoTargetCleanupCompletionOwner {
+        let installation = crate::engine::CoreBackNoTargetCleanupInstallation::from_parts(
+            self.batch.inner,
+            self.continuation.inner,
+            self.action.inner,
+        );
+        BackNoTargetCleanupCompletionOwner {
+            inner: CoreBackNoTargetCleanupCompletionOwner::new(
+                installation,
+                manifest_digest,
+                obligation_count,
+                completion_digest,
+                settled_count,
+            ),
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct BackNoTargetCleanupCompletionOwner {
+    inner: CoreBackNoTargetCleanupCompletionOwner,
+}
+
+#[doc(hidden)]
+pub struct BackNoTargetTerminalEvidence {
+    inner: CoreBackNoTargetTerminalProjection,
+}
+
+#[doc(hidden)]
+pub enum BackNoTargetCleanupCompletionOutcome {
+    Terminal(BackNoTargetTerminalEvidence),
+    Mismatch {
+        owner: BackNoTargetCleanupCompletionOwner,
+        mismatch: PreparationReceiverMismatchView,
+    },
 }
 
 #[doc(hidden)]
@@ -2152,6 +2200,7 @@ impl RouterEngine {
         approved: ApprovedBackNoTargetCandidate,
         manifest_digest: u64,
         obligation_count: usize,
+        expected_completion_digest: u64,
         commit_canonical_zero: F,
     ) -> BackNoTargetReadyCoreOutcome
     where
@@ -2169,6 +2218,7 @@ impl RouterEngine {
                 approved,
                 manifest_digest,
                 obligation_count,
+                expected_completion_digest,
                 commit_canonical_zero,
             ) {
             CoreBackNoTargetReadyCoreOutcome::Prepared(inner) => {
@@ -2206,6 +2256,33 @@ impl RouterEngine {
                     action: BackNoTargetCleanupAction { inner: action },
                 });
             });
+    }
+
+    #[doc(hidden)]
+    pub fn complete_back_no_target_cleanup<F>(
+        &mut self,
+        owner: BackNoTargetCleanupCompletionOwner,
+        commit_reclaim: F,
+    ) -> BackNoTargetCleanupCompletionOutcome
+    where
+        F: FnOnce(),
+    {
+        match self
+            .inner
+            .complete_back_no_target_cleanup(owner.inner, commit_reclaim)
+        {
+            CoreBackNoTargetCleanupCompletionCoreOutcome::Terminal(inner) => {
+                BackNoTargetCleanupCompletionOutcome::Terminal(BackNoTargetTerminalEvidence {
+                    inner,
+                })
+            }
+            CoreBackNoTargetCleanupCompletionCoreOutcome::Mismatch { owner, mismatch } => {
+                BackNoTargetCleanupCompletionOutcome::Mismatch {
+                    owner: BackNoTargetCleanupCompletionOwner { inner: owner },
+                    mismatch: PreparationReceiverMismatchView { inner: mismatch },
+                }
+            }
+        }
     }
 
     #[doc(hidden)]
@@ -5470,10 +5547,12 @@ mod tests {
         let exact_before = exact.inner.testing_snapshot();
         let exact_callback_calls = std::cell::Cell::new(0usize);
         let manifest_digest = 0x4e4f_5441_5247_4554;
+        let expected_completion_digest = 0x434f_4d50_4c45_5445;
         let prepared = match exact.accept_back_no_target_ready_with_canonical_zero_bind(
             approved,
             manifest_digest,
             0,
+            expected_completion_digest,
             || exact_callback_calls.set(exact_callback_calls.get() + 1),
         ) {
             BackNoTargetReadyCoreOutcome::Prepared(prepared) => prepared,
@@ -5508,6 +5587,7 @@ mod tests {
                 fresh_approved,
                 manifest_digest,
                 0,
+                expected_completion_digest,
                 || foreign_callback_calls.set(foreign_callback_calls.get() + 1),
             ) {
             BackNoTargetReadyCoreOutcome::Mismatch { approved, mismatch } => (approved, mismatch),
@@ -5535,6 +5615,7 @@ mod tests {
             returned_approved,
             manifest_digest,
             0,
+            expected_completion_digest,
             || returned_callback_calls.set(returned_callback_calls.get() + 1),
         ) {
             BackNoTargetReadyCoreOutcome::Prepared(_) => {}
@@ -5556,6 +5637,10 @@ mod tests {
         );
         assert_eq!(prepared.batch().manifest_digest(), manifest_digest);
         assert_eq!(prepared.batch().obligation_count(), 0);
+        assert_eq!(
+            prepared.batch().expected_completion_digest(),
+            expected_completion_digest
+        );
 
         let installed_before_publication = std::cell::Cell::new(false);
         exact.publish_prepared_back_no_target(prepared, |installation| {
@@ -5566,6 +5651,10 @@ mod tests {
             );
             assert_eq!(installation.batch().manifest_digest(), manifest_digest);
             assert_eq!(installation.batch().obligation_count(), 0);
+            assert_eq!(
+                installation.batch().expected_completion_digest(),
+                expected_completion_digest
+            );
             installed_before_publication.set(true);
         });
         assert!(installed_before_publication.get());
@@ -5605,6 +5694,7 @@ mod tests {
             approved,
             manifest_digest,
             1,
+            expected_completion_digest,
             || nonzero_callback_calls.set(nonzero_callback_calls.get() + 1),
         ) {
             BackNoTargetReadyCoreOutcome::Mismatch { approved, mismatch } => {
@@ -5649,6 +5739,7 @@ mod tests {
             approved,
             manifest_digest,
             0,
+            expected_completion_digest,
             || host_drift_callback_calls.set(host_drift_callback_calls.get() + 1),
         ) {
             BackNoTargetReadyCoreOutcome::Mismatch { approved, .. } => drop(approved),
@@ -5660,6 +5751,156 @@ mod tests {
         assert_eq!(
             host_drift_engine.inner.testing_snapshot(),
             host_drift_before
+        );
+    }
+
+    fn take_published_back_no_target_cleanup() -> (
+        RouterEngine,
+        NavigationRequestId,
+        BackNoTargetCleanupInstallation,
+        u64,
+        u64,
+    ) {
+        let (mut engine, candidate) = take_refrozen_back_no_target_candidate();
+        let request = candidate.evidence().request();
+        let approved = match engine.approve_back_no_target_logical_zero(candidate) {
+            BackNoTargetApprovalOutcome::Approved(approved) => approved,
+            BackNoTargetApprovalOutcome::Mismatch { .. } => {
+                panic!("the exact completion fixture must receive logical-zero approval")
+            }
+        };
+        let manifest_digest = 0x4e4f_5441_5247_4554;
+        let completion_digest = 0x434f_4d50_4c45_5445;
+        let prepared = match engine.accept_back_no_target_ready_with_canonical_zero_bind(
+            approved,
+            manifest_digest,
+            0,
+            completion_digest,
+            || {},
+        ) {
+            BackNoTargetReadyCoreOutcome::Prepared(prepared) => prepared,
+            BackNoTargetReadyCoreOutcome::Mismatch { .. } => {
+                panic!("the exact completion fixture must prepare publication")
+            }
+        };
+        let installation = std::cell::RefCell::new(None);
+        engine.publish_prepared_back_no_target(prepared, |owner| {
+            installation.replace(Some(owner));
+        });
+        (
+            engine,
+            request,
+            installation
+                .into_inner()
+                .expect("publication must hand the whole installation to its closure"),
+            manifest_digest,
+            completion_digest,
+        )
+    }
+
+    #[test]
+    fn back_no_target_exact_zero_completion_is_typed_and_terminal_once() {
+        for facts in [
+            (0x4241_444d_414e_4946, 0, 0x434f_4d50_4c45_5445, 0),
+            (0x4e4f_5441_5247_4554, 1, 0x434f_4d50_4c45_5445, 0),
+            (0x4e4f_5441_5247_4554, 0, 0x434f_4d50_4c45_5444, 0),
+            (0x4e4f_5441_5247_4554, 0, 0x434f_4d50_4c45_5445, 1),
+        ] {
+            let (mut engine, _request, installation, _manifest_digest, _completion_digest) =
+                take_published_back_no_target_cleanup();
+            let owner = installation.complete(facts.0, facts.1, facts.2, facts.3);
+            let before = engine.inner.testing_snapshot();
+            let callback_calls = std::cell::Cell::new(0usize);
+            let (owner, mismatch) = match engine.complete_back_no_target_cleanup(owner, || {
+                callback_calls.set(callback_calls.get() + 1)
+            }) {
+                BackNoTargetCleanupCompletionOutcome::Mismatch { owner, mismatch } => {
+                    (owner, mismatch)
+                }
+                BackNoTargetCleanupCompletionOutcome::Terminal(_) => {
+                    panic!("wrong no-target completion facts must fail closed")
+                }
+            };
+            assert_eq!(callback_calls.get(), 0);
+            assert_eq!(engine.inner.testing_snapshot(), before);
+            assert!(matches!(
+                mismatch.inner,
+                CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
+            ));
+
+            let replay_callback_calls = std::cell::Cell::new(0usize);
+            match engine.complete_back_no_target_cleanup(owner, || {
+                replay_callback_calls.set(replay_callback_calls.get() + 1)
+            }) {
+                BackNoTargetCleanupCompletionOutcome::Mismatch { owner, .. } => drop(owner),
+                BackNoTargetCleanupCompletionOutcome::Terminal(_) => {
+                    panic!("an immutable wrong-facts owner must remain fail closed")
+                }
+            }
+            assert_eq!(replay_callback_calls.get(), 0);
+            assert_eq!(engine.inner.testing_snapshot(), before);
+        }
+
+        let (mut exact, request, installation, manifest_digest, completion_digest) =
+            take_published_back_no_target_cleanup();
+        let owner = installation.complete(manifest_digest, 0, completion_digest, 0);
+        let exact_before_foreign = exact.inner.testing_snapshot();
+        let mut foreign = confirmed_engine();
+        let foreign_before = foreign.inner.testing_snapshot();
+        let foreign_callback_calls = std::cell::Cell::new(0usize);
+        let (owner, mismatch) = match foreign.complete_back_no_target_cleanup(owner, || {
+            foreign_callback_calls.set(foreign_callback_calls.get() + 1)
+        }) {
+            BackNoTargetCleanupCompletionOutcome::Mismatch { owner, mismatch } => (owner, mismatch),
+            BackNoTargetCleanupCompletionOutcome::Terminal(_) => {
+                panic!("a foreign engine must return the whole completion owner")
+            }
+        };
+        assert_eq!(foreign_callback_calls.get(), 0);
+        assert_eq!(exact.inner.testing_snapshot(), exact_before_foreign);
+        assert_eq!(foreign.inner.testing_snapshot(), foreign_before);
+        assert!(matches!(
+            mismatch.inner,
+            CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
+        ));
+
+        let before_public = exact.snapshot();
+        let exact_callback_calls = std::cell::Cell::new(0usize);
+        match exact.complete_back_no_target_cleanup(owner, || {
+            exact_callback_calls.set(exact_callback_calls.get() + 1)
+        }) {
+            BackNoTargetCleanupCompletionOutcome::Terminal(terminal) => drop(terminal),
+            BackNoTargetCleanupCompletionOutcome::Mismatch { .. } => {
+                panic!("the returned canonical owner must remain exact for its original engine")
+            }
+        }
+        assert_eq!(exact_callback_calls.get(), 1);
+        let after_public = exact.snapshot();
+        assert_eq!(after_public.active(), before_public.active());
+        assert_eq!(after_public.history(), before_public.history());
+        assert_eq!(after_public.running_request(), None);
+        let terminal = exact
+            .request(request)
+            .expect("the exact no-target terminal remains retained");
+        let RequestStatus::Failed(failure) = terminal.status() else {
+            panic!("exact zero completion must fail the no-target request")
+        };
+        assert_eq!(
+            failure.kind(),
+            crate::request::NavigationFailureKind::BackTargetUnavailable
+        );
+        assert_eq!(
+            terminal
+                .trace()
+                .iter()
+                .rev()
+                .take(2)
+                .map(NavigationTraceEvent::kind)
+                .collect::<Vec<_>>(),
+            vec![
+                NavigationTraceEventKind::RequestTerminal,
+                NavigationTraceEventKind::CleanupSettled,
+            ]
         );
     }
 
@@ -6069,6 +6310,7 @@ mod tests {
             CorePreparationReceiverMismatchProjection::Scope { .. }
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
+            | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -6128,6 +6370,7 @@ mod tests {
             CorePreparationReceiverMismatchProjection::Scope { .. }
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
+            | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -6216,6 +6459,7 @@ mod tests {
             CorePreparationReceiverMismatchProjection::Scope { .. }
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
+            | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -6308,6 +6552,7 @@ mod tests {
             CorePreparationReceiverMismatchProjection::Scope { .. }
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
+            | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -6457,6 +6702,7 @@ mod tests {
             CorePreparationReceiverMismatchProjection::Scope { .. }
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
+            | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -6510,6 +6756,7 @@ mod tests {
             CorePreparationReceiverMismatchProjection::Scope { .. }
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
+            | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -6651,6 +6898,7 @@ mod tests {
             CorePreparationReceiverMismatchProjection::Scope { .. }
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
+            | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
@@ -6726,6 +6974,7 @@ mod tests {
             CorePreparationReceiverMismatchProjection::Scope { .. }
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
+            | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
@@ -6803,6 +7052,7 @@ mod tests {
             CorePreparationReceiverMismatchProjection::Scope { .. }
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
+            | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
@@ -6889,6 +7139,7 @@ mod tests {
             CorePreparationReceiverMismatchProjection::Scope { .. }
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
+            | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
@@ -6962,6 +7213,7 @@ mod tests {
             CorePreparationReceiverMismatchProjection::Scope { .. }
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
+            | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
@@ -7041,6 +7293,7 @@ mod tests {
             CorePreparationReceiverMismatchProjection::Scope { .. }
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
+            | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }

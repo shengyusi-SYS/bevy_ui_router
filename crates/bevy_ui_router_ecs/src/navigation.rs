@@ -8,6 +8,7 @@ use bevy_input_focus::InputFocus;
 use bevy_ui_router_core::{
     integration::{
         ApprovedBackNoTargetCandidate, BackNoTargetApprovalOutcome,
+        BackNoTargetCleanupCompletionOutcome, BackNoTargetCleanupCompletionOwner,
         BackNoTargetCleanupInstallation, BackNoTargetReadyCoreOutcome,
         BackNoTargetSourceDriftOwner, BackNoTargetSourceDriftSettlementOutcome,
         BackNoTargetSourceDriftTerminalEvidence, BackNoTargetSourceRefreezeOutcome,
@@ -50,12 +51,14 @@ use crate::{
         AuthoritySettlementManifestError, BackCapacityDomainIssuer,
         BackCapacityEnqueueRetireResidual, BackCapacityIssuer, BackCapacityIssuerInstallError,
         BackCapacityRetireDisposition, BackCapacityRetireError, BackCapacityRetireOutcome,
-        BackCapacityRetirementEvidence, BoundBackCapacityReservation, CleanupLedger,
+        BackCapacityRetirementEvidence, BackNoTargetZeroCompletionPreparationEvidence,
+        BackNoTargetZeroCompletionSourceIdentity, BoundBackCapacityReservation, CleanupLedger,
         CleanupLedgerReserveError, CleanupLedgerReserveErrorKind, EnqueueRejected,
         FailedAuthorityBoundaryBinding, FailedBoundaryDrift, FailedBoundarySource,
         FailedManifestBuildError, FailedPreparedTopologyError, FrozenCleanupManifest,
         ManifestNeutralLedgerSlot, NoTargetCapacityPermit, PendingBoundaryBinding,
-        PreparedCleanupLedger, RouterCleanupObservation, canonical_zero_manifest_digest,
+        PreparedBackNoTargetZeroCompletion, PreparedCleanupLedger, RouterCleanupObservation,
+        canonical_zero_completion_digest, canonical_zero_manifest_digest,
         cleanup_claim_has_exact_authority, failed_prepared_branch_roots_are_exact,
     },
     components::{
@@ -1018,7 +1021,7 @@ pub(crate) struct RouterEntry {
     pending_back_resolution_action: Option<(BackResolutionOwnerHandoff, BackResolutionEvidence)>,
     pending_bound_back_resolution: Option<BoundBackResolutionHandoff>,
     pending_back_target_execution: Option<PendingBackTargetExecution>,
-    installed_back_no_target_cleanup: Option<InstalledBackNoTargetCleanup>,
+    pending_back_no_target_completion: Option<PendingBackNoTargetCompletion>,
     history_admission_world: HistoryAdmissionWorldSeal,
     history_admission_stamp: Option<HistoryAdmissionStamp>,
     back_capacity_issuer: Option<BackCapacityIssuer>,
@@ -1034,6 +1037,8 @@ pub(crate) struct RouterEntry {
     back_target_driver_report_receiver_drift_armed: bool,
     #[cfg(test)]
     back_target_driver_consume_receiver_drift_armed: bool,
+    #[cfg(test)]
+    back_no_target_completion_fact_drift: Option<BackNoTargetCompletionFactDrift>,
     #[cfg(feature = "test-support")]
     back_capacity_facade_producer:
         Option<bevy_ui_router_core::test_support::BackCapacityFacadeProducer>,
@@ -1042,6 +1047,37 @@ pub(crate) struct RouterEntry {
 pub(crate) struct InstalledBackNoTargetCleanup {
     ledger: CleanupLedger,
     installation: BackNoTargetCleanupInstallation,
+    inert: Option<BackNoTargetInstalledInertEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackNoTargetInstalledInertEvidence {
+    LedgerInvariant(BackNoTargetZeroCompletionPreparationEvidence),
+    IssuerMissing {
+        source: BackNoTargetZeroCompletionSourceIdentity,
+    },
+    ReclaimRejected {
+        source: BackNoTargetZeroCompletionSourceIdentity,
+        error: BackCapacityRetireError,
+    },
+}
+
+pub(crate) struct SettledBackNoTargetCleanup {
+    prepared: PreparedBackNoTargetZeroCompletion,
+    completion: BackNoTargetCleanupCompletionOwner,
+    mismatch: PreparationReceiverMismatchView,
+}
+
+pub(crate) enum PendingBackNoTargetCompletion {
+    Installed(InstalledBackNoTargetCleanup),
+    Settled(SettledBackNoTargetCleanup),
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum BackNoTargetCompletionFactDrift {
+    CompletionDigest,
+    SettledCount,
 }
 
 pub(crate) struct BoundBackTargetResolution {
@@ -1147,7 +1183,7 @@ struct ProvenEmptyAttemptOwnerInventory {
     pending_back_resolution_action_vacant: bool,
     pending_bound_back_resolution_vacant: bool,
     pending_back_target_execution_vacant: bool,
-    installed_back_no_target_cleanup_vacant: bool,
+    pending_back_no_target_completion_vacant: bool,
 }
 
 impl ProvenEmptyAttemptOwnerInventory {
@@ -1173,8 +1209,8 @@ impl ProvenEmptyAttemptOwnerInventory {
             pending_back_resolution_action_vacant: entry.pending_back_resolution_action.is_none(),
             pending_bound_back_resolution_vacant: entry.pending_bound_back_resolution.is_none(),
             pending_back_target_execution_vacant: entry.pending_back_target_execution.is_none(),
-            installed_back_no_target_cleanup_vacant: entry
-                .installed_back_no_target_cleanup
+            pending_back_no_target_completion_vacant: entry
+                .pending_back_no_target_completion
                 .is_none(),
         }
     }
@@ -1195,7 +1231,7 @@ impl ProvenEmptyAttemptOwnerInventory {
             && self.pending_back_resolution_action_vacant
             && self.pending_bound_back_resolution_vacant
             && self.pending_back_target_execution_vacant
-            && self.installed_back_no_target_cleanup_vacant
+            && self.pending_back_no_target_completion_vacant
     }
 }
 
@@ -2856,7 +2892,7 @@ fn consume_prepared_back_no_target_with_installation_observer<F>(
     observe_installed: F,
 ) -> BackNoTargetFinalizationOutcome
 where
-    F: FnOnce(&InstalledBackNoTargetCleanup),
+    F: FnOnce(&PendingBackNoTargetCompletion),
 {
     consume_prepared_back_no_target_with_observers(entry, owner, |_, _| {}, observe_installed)
 }
@@ -2869,7 +2905,7 @@ fn consume_prepared_back_no_target_with_observers<PreparedObserver, Installation
 ) -> BackNoTargetFinalizationOutcome
 where
     PreparedObserver: FnOnce(&RouterEngine, &ManifestNeutralLedgerSlot),
-    InstallationObserver: FnOnce(&InstalledBackNoTargetCleanup),
+    InstallationObserver: FnOnce(&PendingBackNoTargetCompletion),
 {
     let PreparedBackNoTarget {
         approved,
@@ -2890,10 +2926,10 @@ where
     let RouterEntry {
         engine,
         back_capacity_issuer,
-        installed_back_no_target_cleanup,
+        pending_back_no_target_completion,
         ..
     } = entry;
-    if installed_back_no_target_cleanup.is_some() {
+    if pending_back_no_target_completion.is_some() {
         return BackNoTargetFinalizationOutcome::CapacityRejected {
             owner: PreparedBackNoTarget {
                 approved,
@@ -2932,6 +2968,7 @@ where
         approved,
         manifest_digest,
         obligation_count,
+        canonical_zero_completion_digest(),
         move || guard.commit(),
     ) {
         BackNoTargetReadyCoreOutcome::Prepared(publication) => {
@@ -2940,11 +2977,13 @@ where
             engine.publish_prepared_back_no_target(publication, move |installation| {
                 let batch = installation.batch();
                 let ledger = slot.bind_back_no_target(batch);
-                let installed =
-                    installed_back_no_target_cleanup.insert(InstalledBackNoTargetCleanup {
+                let installed = pending_back_no_target_completion.insert(
+                    PendingBackNoTargetCompletion::Installed(InstalledBackNoTargetCleanup {
                         ledger,
                         installation,
-                    });
+                        inert: None,
+                    }),
+                );
                 observe_installed(installed);
             });
             BackNoTargetFinalizationOutcome::Published
@@ -3452,7 +3491,8 @@ impl RouterEntry {
             self.cleanup_ledger.is_some()
                 || self.pending_failed_branch.is_some()
                 || self.pending_mount_mutation_rejection.is_some()
-                || self.host_settlement.is_some(),
+                || self.host_settlement.is_some()
+                || self.pending_back_no_target_completion.is_some(),
         )
     }
 
@@ -3679,7 +3719,7 @@ impl RouterNavigation {
             pending_back_resolution_action: None,
             pending_bound_back_resolution: None,
             pending_back_target_execution: None,
-            installed_back_no_target_cleanup: None,
+            pending_back_no_target_completion: None,
             history_admission_world,
             history_admission_stamp: None,
             back_capacity_issuer: None,
@@ -3695,6 +3735,8 @@ impl RouterNavigation {
             back_target_driver_report_receiver_drift_armed: false,
             #[cfg(test)]
             back_target_driver_consume_receiver_drift_armed: false,
+            #[cfg(test)]
+            back_no_target_completion_fact_drift: None,
             #[cfg(feature = "test-support")]
             back_capacity_facade_producer: None,
         };
@@ -4133,6 +4175,7 @@ pub(crate) fn collect_navigation_system(world: &mut World) {
         if entry.pending_back_resolution_action.is_none()
             && entry.pending_bound_back_resolution.is_none()
             && entry.pending_back_target_execution.is_none()
+            && entry.pending_back_no_target_completion.is_none()
         {
             entry.engine.collect();
         }
@@ -11310,10 +11353,118 @@ fn begin_failed_authority_settlement(
     }
 }
 
+fn drive_back_no_target_zero_completion(entry: &mut RouterEntry) -> bool {
+    match entry.pending_back_no_target_completion.as_ref() {
+        None => return false,
+        Some(PendingBackNoTargetCompletion::Installed(installed)) if installed.inert.is_none() => {}
+        Some(
+            PendingBackNoTargetCompletion::Installed(_) | PendingBackNoTargetCompletion::Settled(_),
+        ) => return true,
+    }
+    #[cfg(test)]
+    let fact_drift = entry.back_no_target_completion_fact_drift.take();
+    let RouterEntry {
+        engine,
+        back_capacity_issuer,
+        pending_back_no_target_completion,
+        ..
+    } = entry;
+    let Some(PendingBackNoTargetCompletion::Installed(InstalledBackNoTargetCleanup {
+        ledger,
+        installation,
+        inert: None,
+    })) = pending_back_no_target_completion.take()
+    else {
+        return true;
+    };
+    let prepared = match ledger.prepare_back_no_target_zero_completion() {
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            let (ledger, evidence) = failure.into_parts();
+            *pending_back_no_target_completion = Some(PendingBackNoTargetCompletion::Installed(
+                InstalledBackNoTargetCleanup {
+                    ledger,
+                    installation,
+                    inert: Some(BackNoTargetInstalledInertEvidence::LedgerInvariant(
+                        evidence,
+                    )),
+                },
+            ));
+            return true;
+        }
+    };
+
+    let source = prepared.source_identity();
+    let Some(issuer) = back_capacity_issuer.as_mut() else {
+        *pending_back_no_target_completion = Some(PendingBackNoTargetCompletion::Installed(
+            InstalledBackNoTargetCleanup {
+                ledger: prepared.into_ledger(),
+                installation,
+                inert: Some(BackNoTargetInstalledInertEvidence::IssuerMissing { source }),
+            },
+        ));
+        return true;
+    };
+    let guard = match issuer.preflight_installed_back_capacity_reclaim(&prepared) {
+        Ok(guard) => guard,
+        Err(error) => {
+            *pending_back_no_target_completion = Some(PendingBackNoTargetCompletion::Installed(
+                InstalledBackNoTargetCleanup {
+                    ledger: prepared.into_ledger(),
+                    installation,
+                    inert: Some(BackNoTargetInstalledInertEvidence::ReclaimRejected {
+                        source,
+                        error,
+                    }),
+                },
+            ));
+            return true;
+        }
+    };
+    let facts = prepared.facts();
+    let manifest_digest = facts.manifest_digest();
+    let obligation_count = facts.obligation_count();
+    let completion_digest = facts.completion_digest();
+    let settled_count = facts.settled_count();
+    #[cfg(test)]
+    let (completion_digest, settled_count) = match fact_drift {
+        Some(BackNoTargetCompletionFactDrift::CompletionDigest) => {
+            (completion_digest ^ 1, settled_count)
+        }
+        Some(BackNoTargetCompletionFactDrift::SettledCount) => {
+            (completion_digest, settled_count.saturating_add(1))
+        }
+        None => (completion_digest, settled_count),
+    };
+    let completion = installation.complete(
+        manifest_digest,
+        obligation_count,
+        completion_digest,
+        settled_count,
+    );
+
+    match engine.complete_back_no_target_cleanup(completion, move || guard.commit()) {
+        BackNoTargetCleanupCompletionOutcome::Terminal(_terminal) => {}
+        BackNoTargetCleanupCompletionOutcome::Mismatch { owner, mismatch } => {
+            *pending_back_no_target_completion = Some(PendingBackNoTargetCompletion::Settled(
+                SettledBackNoTargetCleanup {
+                    prepared,
+                    completion: owner,
+                    mismatch,
+                },
+            ));
+        }
+    }
+    true
+}
+
 pub(crate) fn settle_cleanup_system(world: &mut World) {
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             for entry in &mut navigation.entries {
+                if drive_back_no_target_zero_completion(entry) {
+                    continue;
+                }
                 if entry.pending_back_target_execution.is_some() {
                     continue;
                 }
@@ -11675,7 +11826,9 @@ pub(crate) mod tests {
         cleanup::{
             AuthorityLostResidualPhysicalRestoreDrift, AuthorityLostResidualPostwriteDrift,
             AuthorityRemovalRegistryPostwriteDrift, AuthorityResidualPostwriteDrift,
-            BackCapacityDomainIssuer, BackCapacityIssuerInstallError, BackCapacityRetireOutcome,
+            BackCapacityCellDispositionForTest, BackCapacityDomainIssuer,
+            BackCapacityIssuerInstallError, BackCapacityRetireOutcome,
+            BackNoTargetDedicatedBatchObservation, BackNoTargetInstalledCapacitySource,
             CleanupPostcheckDrift, CleanupPostcheckPhase, EnqueueRejected,
             FailedBoundaryExpectation,
         },
@@ -18005,7 +18158,7 @@ pub(crate) mod tests {
             pending_back_resolution_action: None,
             pending_bound_back_resolution: None,
             pending_back_target_execution: None,
-            installed_back_no_target_cleanup: None,
+            pending_back_no_target_completion: None,
             history_admission_world,
             history_admission_stamp: None,
             back_capacity_issuer: None,
@@ -18021,6 +18174,8 @@ pub(crate) mod tests {
             back_target_driver_report_receiver_drift_armed: false,
             #[cfg(test)]
             back_target_driver_consume_receiver_drift_armed: false,
+            #[cfg(test)]
+            back_no_target_completion_fact_drift: None,
             #[cfg(feature = "test-support")]
             back_capacity_facade_producer: None,
         }
@@ -27034,7 +27189,10 @@ pub(crate) mod tests {
             "LeasedToCanonicalZeroSlot must consume the held live entry exactly once"
         );
         assert!(
-            exact.installed_back_no_target_cleanup.is_some(),
+            matches!(
+                exact.pending_back_no_target_completion.as_ref(),
+                Some(PendingBackNoTargetCompletion::Installed(_))
+            ),
             "the first publication must retain the whole installed cleanup owner"
         );
     }
@@ -27065,7 +27223,11 @@ pub(crate) mod tests {
             let _ = consume_prepared_back_no_target_with_installation_observer(
                 entry,
                 prepared,
-                |installed| {
+                |pending| {
+                    let PendingBackNoTargetCompletion::Installed(installed) = pending else {
+                        panic!("the first publication observer must receive the installed owner")
+                    };
+                    assert!(installed.inert.is_none());
                     let ledger = installed
                         .ledger
                         .back_no_target_projection_for_test()
@@ -27077,8 +27239,17 @@ pub(crate) mod tests {
                     assert_eq!(ledger.manifest_digest, canonical_zero_manifest_digest());
                     assert_eq!(ledger.obligation_count, 0);
                     assert_eq!(ledger.receipt_count, 0);
+                    assert_eq!(ledger.completion_digest, canonical_zero_completion_digest());
                     assert_eq!(ledger.batch_manifest_digest, batch.manifest_digest());
                     assert_eq!(ledger.batch_obligation_count, batch.obligation_count());
+                    assert_eq!(
+                        ledger.batch_expected_completion_digest,
+                        batch.expected_completion_digest()
+                    );
+                    assert_eq!(
+                        batch.expected_completion_digest(),
+                        canonical_zero_completion_digest()
+                    );
                     observed_whole_owner.set(true);
                     panic!("interrupt after whole owner installation");
                 },
@@ -27100,7 +27271,10 @@ pub(crate) mod tests {
             .find(|entry| entry.handle == router)
             .expect("the interrupted no-target router retains its entry");
         assert!(
-            entry.installed_back_no_target_cleanup.is_some(),
+            matches!(
+                entry.pending_back_no_target_completion.as_ref(),
+                Some(PendingBackNoTargetCompletion::Installed(_))
+            ),
             "the interruption occurs only after the whole owner is installed"
         );
         assert_eq!(
@@ -27234,14 +27408,20 @@ pub(crate) mod tests {
             .expect("the exact no-target router retains its entry");
         assert_eq!(entry.engine.active(), &active_before);
         assert_eq!(entry.engine.history(), &history_before);
-        let installed = entry
-            .installed_back_no_target_cleanup
-            .as_ref()
-            .expect("first publication must already expose the whole installed owner");
+        let Some(PendingBackNoTargetCompletion::Installed(installed)) =
+            entry.pending_back_no_target_completion.as_ref()
+        else {
+            panic!("first publication must already expose the whole installed owner")
+        };
+        assert!(installed.inert.is_none());
         assert_eq!(installed.ledger.receipt_count(), 0);
         let batch = installed.installation.batch();
         assert_eq!(batch.obligation_count(), 0);
         assert_eq!(batch.manifest_digest(), canonical_zero_manifest_digest());
+        assert_eq!(
+            batch.expected_completion_digest(),
+            canonical_zero_completion_digest()
+        );
         let ledger = installed
             .ledger
             .back_no_target_projection_for_test()
@@ -27255,11 +27435,16 @@ pub(crate) mod tests {
         assert_eq!(ledger.manifest_digest, canonical_zero_manifest_digest());
         assert_eq!(ledger.obligation_count, 0);
         assert_eq!(ledger.receipt_count, 0);
+        assert_eq!(ledger.completion_digest, canonical_zero_completion_digest());
         assert_eq!(
             ledger.batch_manifest_digest,
             canonical_zero_manifest_digest()
         );
         assert_eq!(ledger.batch_obligation_count, 0);
+        assert_eq!(
+            ledger.batch_expected_completion_digest,
+            canonical_zero_completion_digest()
+        );
         let request = entry
             .engine
             .request(request)
@@ -27290,6 +27475,732 @@ pub(crate) mod tests {
         assert!(
             rejected[0] < cleanup_pending,
             "HistoryIntentRejected must precede the CleanupPending phase event"
+        );
+    }
+
+    fn assert_back_no_target_installed_ledger_invariant_is_bounded() {
+        let (mut app, router, request, prepared) =
+            prepare_back_no_target_finalization_fixture("back-no-target-ledger-invariant");
+        let capacity_identity = prepared.capacity.capacity_identity_for_test();
+        let (engine_before, cell_before, ledger_domain) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the exact no-target router retains its entry");
+            assert!(matches!(
+                consume_prepared_back_no_target(entry, prepared),
+                BackNoTargetFinalizationOutcome::Published
+            ));
+            let Some(PendingBackNoTargetCompletion::Installed(installed)) =
+                entry.pending_back_no_target_completion.as_mut()
+            else {
+                panic!("the first publication installs the whole completion owner")
+            };
+            assert!(installed.inert.is_none());
+            let ledger = installed
+                .ledger
+                .back_no_target_projection_for_test()
+                .expect("the installed owner retains its exact ledger source");
+            installed
+                .ledger
+                .drift_back_no_target_completion_digest_for_test();
+            let cell = entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the exact router retains its capacity issuer")
+                .cell_projection_for_test(capacity_identity)
+                .expect("the installed owner retains its exact leased cell");
+            (entry.engine.snapshot(), cell, ledger.ledger_domain)
+        };
+        publish_snapshots_system(app.world_mut());
+        let (public_before, public_request_before) = {
+            let snapshots = app.world().resource::<RouterSnapshots>();
+            let public = snapshots
+                .get(router)
+                .expect("the published no-target router remains observable")
+                .clone();
+            let request = match snapshots.request(router, request) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                crate::snapshots::RequestLookup::NotRetained
+                | crate::snapshots::RequestLookup::Unknown => {
+                    panic!("the published no-target request remains retained")
+                }
+            };
+            (public, request)
+        };
+        let world_before = authority_world_fingerprint(app.world());
+
+        app.update();
+
+        let evidence = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the exact no-target router retains its entry");
+            assert_eq!(
+                entry.engine.snapshot(),
+                engine_before,
+                "a ledger invariant failure must not call the Core terminal receiver"
+            );
+            let Some(PendingBackNoTargetCompletion::Installed(installed)) =
+                entry.pending_back_no_target_completion.as_ref()
+            else {
+                panic!("a ledger invariant failure must restore the whole installed owner")
+            };
+            let Some(BackNoTargetInstalledInertEvidence::LedgerInvariant(evidence)) =
+                installed.inert
+            else {
+                panic!("the production proof predicate must retain its typed invariant evidence")
+            };
+            assert_eq!(
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("the exact router retains its capacity issuer")
+                    .cell_projection_for_test(capacity_identity),
+                Some(cell_before),
+                "proof rejection must not preflight or reclaim the installed lease"
+            );
+            evidence
+        };
+        let source = evidence.source_identity();
+        assert_eq!(source.ledger_domain(), ledger_domain);
+        assert_eq!(
+            source.capacity(),
+            BackNoTargetInstalledCapacitySource::Present {
+                domain: capacity_identity.0,
+                cell: capacity_identity.1,
+                owner: capacity_identity.2,
+                generation: capacity_identity.3,
+            }
+        );
+        let expected = evidence.expected();
+        assert_eq!(expected.manifest_digest(), canonical_zero_manifest_digest());
+        assert_eq!(expected.obligation_count(), 0);
+        assert_eq!(
+            expected.completion_digest(),
+            canonical_zero_completion_digest()
+        );
+        assert_eq!(expected.settled_count(), 0);
+        let observed = evidence.observed();
+        assert_eq!(
+            observed.dedicated_batch(),
+            BackNoTargetDedicatedBatchObservation::Present {
+                manifest_digest: canonical_zero_manifest_digest(),
+                obligation_count: 0,
+                expected_completion_digest: canonical_zero_completion_digest(),
+            }
+        );
+        assert_eq!(
+            observed.completion_digest(),
+            Some(canonical_zero_completion_digest() ^ 1)
+        );
+        assert_eq!(
+            authority_world_fingerprint(app.world()),
+            world_before,
+            "ledger invariant rejection must preserve the physical World"
+        );
+        {
+            let snapshots = app.world().resource::<RouterSnapshots>();
+            assert_eq!(
+                snapshots
+                    .get(router)
+                    .expect("the invariant router remains publicly observable"),
+                &public_before
+            );
+            assert!(matches!(
+                snapshots.request(router, request),
+                crate::snapshots::RequestLookup::Found(snapshot)
+                    if snapshot == &public_request_before
+            ));
+        }
+
+        app.update();
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the exact no-target router retains its entry");
+        assert_eq!(
+            entry.engine.snapshot(),
+            engine_before,
+            "a later schedule must not redrive an inert installed owner"
+        );
+        let Some(PendingBackNoTargetCompletion::Installed(installed)) =
+            entry.pending_back_no_target_completion.as_ref()
+        else {
+            panic!("the inert installed owner must remain whole")
+        };
+        assert_eq!(
+            installed.inert,
+            Some(BackNoTargetInstalledInertEvidence::LedgerInvariant(
+                evidence
+            ))
+        );
+        assert_eq!(
+            entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the exact router retains its capacity issuer")
+                .cell_projection_for_test(capacity_identity),
+            Some(cell_before)
+        );
+        assert_eq!(
+            authority_world_fingerprint(app.world()),
+            world_before,
+            "a later schedule must preserve the inert installed owner as a physical zero-write"
+        );
+        let snapshots = app.world().resource::<RouterSnapshots>();
+        assert_eq!(
+            snapshots
+                .get(router)
+                .expect("the inert installed router remains publicly observable"),
+            &public_before
+        );
+        assert!(matches!(
+            snapshots.request(router, request),
+            crate::snapshots::RequestLookup::Found(snapshot)
+                if snapshot == &public_request_before
+        ));
+    }
+
+    fn assert_back_no_target_installed_reclaim_rejection_is_bounded() {
+        let (mut app, router, request, prepared) =
+            prepare_back_no_target_finalization_fixture("back-no-target-reclaim-rejected");
+        let capacity_identity = prepared.capacity.capacity_identity_for_test();
+        let (original_issuer, engine_before, foreign_before, source_before) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let foreign = navigation
+                .back_capacity_domain_issuer
+                .issue()
+                .expect("the test domain issuer retains a foreign successor");
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the exact no-target router retains its entry");
+            assert!(matches!(
+                consume_prepared_back_no_target(entry, prepared),
+                BackNoTargetFinalizationOutcome::Published
+            ));
+            let Some(PendingBackNoTargetCompletion::Installed(installed)) =
+                entry.pending_back_no_target_completion.as_ref()
+            else {
+                panic!("the first publication installs the whole completion owner")
+            };
+            let ledger = installed
+                .ledger
+                .back_no_target_projection_for_test()
+                .expect("the installed owner retains its exact source identity");
+            let original = entry
+                .back_capacity_issuer
+                .replace(foreign)
+                .expect("the exact entry retains its original issuer");
+            let foreign_before = entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the exact entry now retains the foreign issuer")
+                .semantic_snapshot_for_test();
+            (
+                original,
+                entry.engine.snapshot(),
+                foreign_before,
+                (ledger.ledger_domain, ledger.capacity_identity),
+            )
+        };
+        let original_cell_before = original_issuer
+            .cell_projection_for_test(capacity_identity)
+            .expect("the original issuer retains the exact leased cell");
+        publish_snapshots_system(app.world_mut());
+        let (public_before, public_request_before) = {
+            let snapshots = app.world().resource::<RouterSnapshots>();
+            let public = snapshots
+                .get(router)
+                .expect("the published no-target router remains observable")
+                .clone();
+            let request = match snapshots.request(router, request) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                crate::snapshots::RequestLookup::NotRetained
+                | crate::snapshots::RequestLookup::Unknown => {
+                    panic!("the published no-target request remains retained")
+                }
+            };
+            (public, request)
+        };
+        let world_before = authority_world_fingerprint(app.world());
+
+        app.update();
+
+        let inert = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the exact no-target router retains its entry");
+            assert_eq!(entry.engine.snapshot(), engine_before);
+            assert_eq!(
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("the exact entry retains the foreign issuer")
+                    .semantic_snapshot_for_test(),
+                foreign_before,
+                "reclaim rejection must be an issuer zero-write"
+            );
+            let Some(PendingBackNoTargetCompletion::Installed(installed)) =
+                entry.pending_back_no_target_completion.as_ref()
+            else {
+                panic!("reclaim rejection must restore the whole installed owner")
+            };
+            installed
+                .inert
+                .expect("reclaim rejection must retain typed inert evidence")
+        };
+        let BackNoTargetInstalledInertEvidence::ReclaimRejected { source, error } = inert else {
+            panic!("the foreign issuer must produce typed reclaim rejection")
+        };
+        assert_eq!(source.ledger_domain(), source_before.0);
+        assert_eq!(
+            source.capacity(),
+            BackNoTargetInstalledCapacitySource::Present {
+                domain: source_before.1.0,
+                cell: source_before.1.1,
+                owner: source_before.1.2,
+                generation: source_before.1.3,
+            }
+        );
+        assert_eq!(error, BackCapacityRetireError::ForeignDomain);
+        assert_eq!(
+            original_issuer.cell_projection_for_test(capacity_identity),
+            Some(original_cell_before),
+            "the foreign preflight must not mutate the original installed lease"
+        );
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        {
+            let snapshots = app.world().resource::<RouterSnapshots>();
+            assert_eq!(
+                snapshots
+                    .get(router)
+                    .expect("the rejected router remains publicly observable"),
+                &public_before
+            );
+            assert!(matches!(
+                snapshots.request(router, request),
+                crate::snapshots::RequestLookup::Found(snapshot)
+                    if snapshot == &public_request_before
+            ));
+        }
+
+        app.update();
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the exact no-target router retains its entry");
+        let Some(PendingBackNoTargetCompletion::Installed(installed)) =
+            entry.pending_back_no_target_completion.as_ref()
+        else {
+            panic!("the inert installed owner must remain whole")
+        };
+        assert_eq!(installed.inert, Some(inert));
+        assert_eq!(entry.engine.snapshot(), engine_before);
+        assert_eq!(
+            entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the exact entry retains the foreign issuer")
+                .semantic_snapshot_for_test(),
+            foreign_before,
+            "a later schedule must not repeat reclaim preflight"
+        );
+        assert_eq!(
+            original_issuer.cell_projection_for_test(capacity_identity),
+            Some(original_cell_before)
+        );
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        let snapshots = app.world().resource::<RouterSnapshots>();
+        assert_eq!(
+            snapshots
+                .get(router)
+                .expect("the inert rejected router remains publicly observable"),
+            &public_before
+        );
+        assert!(matches!(
+            snapshots.request(router, request),
+            crate::snapshots::RequestLookup::Found(snapshot)
+                if snapshot == &public_request_before
+        ));
+    }
+
+    fn assert_back_no_target_completion_fact_drift_is_bounded(
+        name: &'static str,
+        drift: BackNoTargetCompletionFactDrift,
+    ) {
+        let (mut app, router, request, prepared) =
+            prepare_back_no_target_finalization_fixture(name);
+        let capacity_identity = prepared.capacity.capacity_identity_for_test();
+        let (engine_before, cell_before) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the exact no-target router retains its entry");
+            assert!(matches!(
+                consume_prepared_back_no_target(entry, prepared),
+                BackNoTargetFinalizationOutcome::Published
+            ));
+            entry.back_no_target_completion_fact_drift = Some(drift);
+            let cell = entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the exact router retains its capacity issuer")
+                .cell_projection_for_test(capacity_identity)
+                .expect("the installed cleanup retains its exact capacity cell");
+            assert_eq!(
+                cell.disposition,
+                BackCapacityCellDispositionForTest::Leased {
+                    owner: capacity_identity.2
+                }
+            );
+            assert_eq!(cell.current_generation, capacity_identity.3);
+            assert!(!cell.original_owner_live);
+            (entry.engine.snapshot(), cell)
+        };
+        publish_snapshots_system(app.world_mut());
+        let (public_before, public_request_before) = {
+            let snapshots = app.world().resource::<RouterSnapshots>();
+            let public = snapshots
+                .get(router)
+                .expect("the published no-target router remains observable")
+                .clone();
+            let request = match snapshots.request(router, request) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                crate::snapshots::RequestLookup::NotRetained
+                | crate::snapshots::RequestLookup::Unknown => {
+                    panic!("the published no-target request remains retained")
+                }
+            };
+            (public, request)
+        };
+        let world_before = authority_world_fingerprint(app.world());
+
+        app.update();
+
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the exact no-target router retains its entry");
+            assert_eq!(
+                entry.engine.snapshot(),
+                engine_before,
+                "wrong completion facts must be a Core zero-write"
+            );
+            assert!(
+                matches!(
+                    entry.pending_back_no_target_completion.as_ref(),
+                    Some(PendingBackNoTargetCompletion::Settled(_))
+                ),
+                "wrong completion facts must retain the settled ledger and complete Core owner"
+            );
+            assert_eq!(
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("the exact router retains its capacity issuer")
+                    .cell_projection_for_test(capacity_identity),
+                Some(cell_before),
+                "Core mismatch must invoke reclaim zero times"
+            );
+            assert!(matches!(
+                entry
+                    .engine
+                    .request(request)
+                    .map(|record| record.status().clone()),
+                Some(RequestStatus::Running(NavigationPhase::CleanupPending))
+            ));
+        }
+        assert_eq!(
+            authority_world_fingerprint(app.world()),
+            world_before,
+            "wrong completion facts must preserve the physical World"
+        );
+        {
+            let snapshots = app.world().resource::<RouterSnapshots>();
+            assert_eq!(
+                snapshots
+                    .get(router)
+                    .expect("the mismatch router remains publicly observable"),
+                &public_before,
+                "wrong completion facts must be a public router zero-write"
+            );
+            assert!(matches!(
+                snapshots.request(router, request),
+                crate::snapshots::RequestLookup::Found(snapshot)
+                    if snapshot == &public_request_before
+            ));
+        }
+
+        app.update();
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the exact no-target router retains its entry");
+        assert_eq!(
+            entry.engine.snapshot(),
+            engine_before,
+            "a later schedule must not redrive an immutable wrong completion owner"
+        );
+        assert!(
+            matches!(
+                entry.pending_back_no_target_completion.as_ref(),
+                Some(PendingBackNoTargetCompletion::Settled(_))
+            ),
+            "the immutable mismatch residual must remain inert and whole"
+        );
+        assert_eq!(
+            entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the exact router retains its capacity issuer")
+                .cell_projection_for_test(capacity_identity),
+            Some(cell_before),
+            "a later schedule must not attempt to reclaim the inert residual's installed lease"
+        );
+        assert_eq!(
+            authority_world_fingerprint(app.world()),
+            world_before,
+            "a later schedule must leave the inert residual as a physical zero-write"
+        );
+        let snapshots = app.world().resource::<RouterSnapshots>();
+        assert_eq!(
+            snapshots
+                .get(router)
+                .expect("the inert mismatch router remains publicly observable"),
+            &public_before,
+            "a later schedule must leave the public router projection unchanged"
+        );
+        assert!(matches!(
+            snapshots.request(router, request),
+            crate::snapshots::RequestLookup::Found(snapshot)
+                if snapshot == &public_request_before
+        ));
+    }
+
+    #[test]
+    fn back_no_target_ready_terminal_closes_all_lifecycle_owners() {
+        assert_back_no_target_installed_ledger_invariant_is_bounded();
+        assert_back_no_target_installed_reclaim_rejection_is_bounded();
+        assert_back_no_target_completion_fact_drift_is_bounded(
+            "back-no-target-wrong-completion-digest",
+            BackNoTargetCompletionFactDrift::CompletionDigest,
+        );
+        assert_back_no_target_completion_fact_drift_is_bounded(
+            "back-no-target-wrong-settled-count",
+            BackNoTargetCompletionFactDrift::SettledCount,
+        );
+
+        let (mut app, router, request, prepared) =
+            prepare_back_no_target_finalization_fixture("back-no-target-zero-completion");
+        let capacity_identity = prepared.capacity.capacity_identity_for_test();
+        let (active_before, history_before) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the exact no-target router retains its entry");
+            assert!(
+                matches!(
+                    consume_prepared_back_no_target(entry, prepared),
+                    BackNoTargetFinalizationOutcome::Published
+                ),
+                "the exact canonical bind must publish with its whole installed owner"
+            );
+            assert!(matches!(
+                entry.pending_back_no_target_completion.as_ref(),
+                Some(PendingBackNoTargetCompletion::Installed(installed))
+                    if installed.inert.is_none()
+            ));
+            assert_eq!(
+                entry
+                    .engine
+                    .request(request)
+                    .map(|record| record.status().clone()),
+                Some(RequestStatus::Running(NavigationPhase::CleanupPending))
+            );
+            (
+                entry.engine.active().clone(),
+                entry.engine.history().clone(),
+            )
+        };
+        let world_before = authority_world_fingerprint(app.world());
+        let public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .expect("the installed router retains its public snapshot")
+            .clone();
+
+        app.update();
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the exact no-target router retains its entry");
+        let record = entry
+            .engine
+            .request(request)
+            .expect("the no-target request remains retained at terminal");
+        assert!(
+            matches!(
+                record.status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::BackTargetUnavailable
+            ),
+            "RED: the real Router schedule must complete the installed canonical-zero owner, got {:?}",
+            record.status()
+        );
+        assert!(
+            ProvenEmptyAttemptOwnerInventory::capture(entry, request).is_vacant(),
+            "terminal must leave no entry-local lifecycle owner"
+        );
+        let reclaimed = entry
+            .back_capacity_issuer
+            .as_ref()
+            .expect("the exact router retains its capacity issuer")
+            .cell_projection_for_test(capacity_identity)
+            .expect("the terminal issuer retains the original capacity cell");
+        assert!(!reclaimed.original_owner_live);
+        assert_eq!(
+            reclaimed.current_generation,
+            capacity_identity
+                .3
+                .checked_add(1)
+                .expect("the normal fixture generation has one successor")
+        );
+        assert_eq!(
+            reclaimed.disposition,
+            BackCapacityCellDispositionForTest::ReusableFree,
+            "exact completion must reclaim the installed lease as the advanced reusable cell"
+        );
+        assert_eq!(entry.engine.active(), &active_before);
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(record.requested(), None);
+        let rejected = record
+            .trace()
+            .iter()
+            .position(|event| event.kind() == NavigationTraceEventKind::HistoryIntentRejected)
+            .expect("normal no-target publication records its rejected history intent");
+        let cleanup_pending = record
+            .trace()
+            .iter()
+            .position(|event| {
+                event.kind() == NavigationTraceEventKind::RequestPhaseChanged
+                    && event.phase() == Some(&NavigationPhase::CleanupPending)
+            })
+            .expect("normal no-target publication records CleanupPending");
+        let cleanup_settled = record
+            .trace()
+            .iter()
+            .position(|event| event.kind() == NavigationTraceEventKind::CleanupSettled)
+            .expect("canonical zero completion records CleanupSettled");
+        let terminal = record
+            .trace()
+            .iter()
+            .position(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+            .expect("canonical zero completion records its terminal event");
+        assert!(
+            rejected < cleanup_pending
+                && cleanup_pending < cleanup_settled
+                && cleanup_settled < terminal,
+            "normal no-target publication and terminal trace must preserve exact order"
+        );
+        assert_eq!(
+            record
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::CleanupSettled)
+                .count(),
+            1,
+            "the canonical-zero batch must settle exactly once"
+        );
+        assert_eq!(
+            record
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                .count(),
+            1,
+            "the canonical-zero request must terminal exactly once"
+        );
+        let terminal_trace = record.trace().to_vec();
+        assert_eq!(
+            authority_world_fingerprint(app.world()),
+            world_before,
+            "canonical zero completion must preserve the physical World"
+        );
+        {
+            let snapshots = app.world().resource::<RouterSnapshots>();
+            let public_after = snapshots
+                .get(router)
+                .expect("the terminal router remains publicly observable");
+            assert_eq!(public_after.active(), public_before.active());
+            assert_eq!(public_after.history(), public_before.history());
+            assert_eq!(public_after.cleanup(), public_before.cleanup());
+            assert!(matches!(
+                snapshots.request(router, request),
+                crate::snapshots::RequestLookup::Found(snapshot)
+                    if matches!(
+                        snapshot.status(),
+                        RequestStatus::Failed(failure)
+                            if failure.kind() == NavigationFailureKind::BackTargetUnavailable
+                    ) && snapshot.requested().is_none()
+            ));
+        }
+
+        app.update();
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the exact no-target router retains its entry");
+        assert_eq!(
+            entry
+                .engine
+                .request(request)
+                .expect("the terminal request remains retained")
+                .trace(),
+            terminal_trace,
+            "a later Router schedule must not replay completion or terminal"
+        );
+        assert!(
+            ProvenEmptyAttemptOwnerInventory::capture(entry, request).is_vacant(),
+            "a later Router schedule must not recreate a lifecycle owner"
+        );
+        assert_eq!(
+            authority_world_fingerprint(app.world()),
+            world_before,
+            "a later Router schedule must remain a physical zero-write"
         );
     }
 

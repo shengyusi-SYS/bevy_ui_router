@@ -1045,6 +1045,237 @@ fn back_target_callback_tail_is_infallible_and_query_free() {
 }
 
 #[test]
+fn back_no_target_completion_callback_tail_is_infallible_and_query_free() {
+    let navigation = include_str!("../src/navigation.rs");
+    let cleanup = include_str!("../src/cleanup.rs");
+    let core_engine = include_str!("../../bevy_ui_router_core/src/engine.rs");
+    let helper_marker = "fn drive_back_no_target_zero_completion(";
+    let receiver = ".complete_back_no_target_cleanup(";
+    let tests_start = navigation
+        .find("pub(crate) mod tests {")
+        .expect("navigation source retains its crate-private test module");
+    let production_navigation = &navigation[..tests_start];
+
+    assert!(
+        !production_navigation.contains("installed_back_no_target_cleanup"),
+        "no-target completion must use one canonical RouterEntry holder"
+    );
+    let publication = body_after_marker(
+        production_navigation,
+        "fn consume_prepared_back_no_target_with_observers",
+    );
+    assert_eq!(
+        publication
+            .match_indices("pending_back_no_target_completion.insert(")
+            .count(),
+        1,
+        "the first publication closure must install the canonical holder once"
+    );
+    let ledger_bind = publication
+        .find("slot.bind_back_no_target(batch)")
+        .expect("the publication closure must bind the prepared ledger");
+    let installed_holder = publication
+        .find("PendingBackNoTargetCompletion::Installed(")
+        .expect("the publication closure must install the whole Installed variant");
+    let holder_insert = publication
+        .find("pending_back_no_target_completion.insert(")
+        .expect("the publication closure must write the canonical holder");
+    let installation_observer = publication
+        .find("observe_installed(installed);")
+        .expect("the whole holder must be observable before Core publication");
+    assert!(
+        ledger_bind < holder_insert
+            && holder_insert < installed_holder
+            && installed_holder < installation_observer,
+        "ledger bind, single-holder install and observation must remain ordered"
+    );
+
+    assert_eq!(
+        navigation.match_indices(receiver).count(),
+        1,
+        "the no-target completion receiver must have one ECS production callsite"
+    );
+    let helper = body_after_marker(navigation, helper_marker);
+    assert_eq!(
+        helper.match_indices(receiver).count(),
+        1,
+        "the unique receiver callsite must remain in the whole-owner completion driver"
+    );
+    let holder_classification = helper
+        .find("match entry.pending_back_no_target_completion.as_ref()")
+        .expect("the driver must classify the canonical holder before taking it");
+    let live_installed = helper
+        .find("if installed.inert.is_none()")
+        .expect("only a non-inert Installed owner may proceed");
+    let inert_return = helper
+        .find(") => return true,")
+        .expect("inert Installed and Settled holders must return handled");
+    let installed_take = helper
+        .find("pending_back_no_target_completion.take()")
+        .expect("the driver must whole-take the canonical holder");
+    assert!(
+        holder_classification < live_installed
+            && live_installed < inert_return
+            && inert_return < installed_take,
+        "inert Installed and Settled holders must stop before the unique whole take"
+    );
+    assert_eq!(
+        helper
+            .match_indices("pending_back_no_target_completion.take()")
+            .count(),
+        1,
+        "the driver may take the canonical holder only once"
+    );
+    let proof = helper
+        .find(".prepare_back_no_target_zero_completion()")
+        .expect("the driver must prove the installed ledger exact-zero");
+    let preflight = helper
+        .find(".preflight_installed_back_capacity_reclaim(")
+        .expect("the driver must preflight the exact installed lease");
+    let completion = helper
+        .find("installation.complete(")
+        .expect("the driver must form one whole Core completion owner");
+    let core_call = helper
+        .find(receiver)
+        .expect("the driver must call the exact Core receiver");
+    assert!(
+        proof < preflight && preflight < completion && completion < core_call,
+        "proof, reclaim preflight, completion owner construction and Core receive must stay ordered"
+    );
+
+    let callback = callback_after_receiver(helper, receiver);
+    let normalized_callback = callback.split_whitespace().collect::<String>();
+    assert_eq!(
+        callback.match_indices("guard.commit()").count(),
+        1,
+        "the exact receiver callback must commit the prebuilt reclaim once"
+    );
+    assert!(
+        matches!(
+            normalized_callback.as_str(),
+            "guard.commit()" | "guard.commit();"
+        ),
+        "the callback may contain only the single reclaim commit; got {callback:?}"
+    );
+    for forbidden in [
+        "prepared",
+        "completion",
+        "world",
+        ".query",
+        ".resource",
+        ".entry(",
+        ".get(",
+        ".get_mut(",
+        "[",
+        "Vec::",
+        "Box::",
+        "String::",
+        "vec!",
+        ".collect",
+        ".reserve",
+        ".try_reserve",
+        ".sort",
+        ".validate",
+        ".expect",
+        ".unwrap",
+        "panic!",
+        "unreachable!",
+        "unsafe",
+        ".insert",
+        ".remove",
+        "despawn",
+        "entity_mut",
+        "commands",
+        ".trigger",
+        ".observe",
+    ] {
+        assert!(
+            !callback.contains(forbidden),
+            "the no-target reclaim callback contains forbidden work: {forbidden}"
+        );
+    }
+
+    let core_receiver =
+        body_after_marker(core_engine, "pub(crate) fn complete_back_no_target_cleanup");
+    let terminal_preparation = core_receiver
+        .find("self.prepare_back_no_target_cleanup_terminal(")
+        .expect("Core must prepare the complete terminal before reclaim");
+    let reclaim_commit = core_receiver
+        .find("commit_reclaim();")
+        .expect("Core must invoke the reclaim callback once");
+    assert!(
+        terminal_preparation < reclaim_commit,
+        "all fallible terminal preparation must precede reclaim"
+    );
+    let terminal_tail = &core_receiver[reclaim_commit + "commit_reclaim();".len()..];
+    for forbidden in [
+        ".clone(",
+        ".iter(",
+        ".find(",
+        ".retain(",
+        ".remove(",
+        ".push(",
+        ".reserve(",
+        ".try_reserve(",
+        ".transition(",
+        ".append_trace(",
+        ".validate(",
+        ".expect(",
+        ".unwrap(",
+        "panic!",
+        "unreachable!",
+        "unsafe",
+        "?",
+        ".query",
+        ".resource",
+    ] {
+        assert!(
+            !terminal_tail.contains(forbidden),
+            "the Core terminal tail contains forbidden fallible or reconstructive work: {forbidden}"
+        );
+    }
+
+    let commit = body_after_marker(cleanup, "pub(crate) fn commit(self)");
+    let reclaim = match_arm_body_after_marker(
+        commit,
+        "BackCapacityCommitTransition::InstalledLeaseReclaim",
+    );
+    assert_eq!(
+        reclaim
+            .match_indices("cell.state = BackCapacityCellState::Free;")
+            .count(),
+        1,
+        "installed lease reclaim must return the exact held cell to Free once"
+    );
+    for forbidden in [
+        "self.live",
+        "self.cells",
+        ".entry(",
+        ".get(",
+        ".get_mut(",
+        "[",
+        "Vec::",
+        "vec!",
+        ".collect",
+        ".reserve",
+        ".try_reserve",
+        ".validate",
+        ".expect",
+        ".unwrap",
+        "panic!",
+        "unreachable!",
+        "unsafe",
+        ".query",
+        ".resource",
+    ] {
+        assert!(
+            !reclaim.contains(forbidden),
+            "installed lease reclaim must use only its held cell and prepared successor: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn back_target_dispatch_owners_are_linear_and_exact() {
     let navigation = include_str!("../src/navigation.rs");
     let tests_start = navigation

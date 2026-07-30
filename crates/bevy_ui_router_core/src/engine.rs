@@ -682,6 +682,7 @@ pub(crate) struct CoreBackNoTargetCleanupBatchOwner {
     host: HostVersion,
     manifest_digest: u64,
     obligation_count: usize,
+    expected_completion_digest: u64,
 }
 
 impl CoreBackNoTargetCleanupBatchOwner {
@@ -691,6 +692,7 @@ impl CoreBackNoTargetCleanupBatchOwner {
             host: self.host.clone(),
             manifest_digest: self.manifest_digest,
             obligation_count: self.obligation_count,
+            expected_completion_digest: self.expected_completion_digest,
         }
     }
 }
@@ -709,6 +711,7 @@ pub(crate) struct CoreBackNoTargetCleanupBatchProjection {
     host: HostVersion,
     manifest_digest: u64,
     obligation_count: usize,
+    expected_completion_digest: u64,
 }
 
 impl CoreBackNoTargetCleanupBatchProjection {
@@ -723,6 +726,10 @@ impl CoreBackNoTargetCleanupBatchProjection {
     pub(crate) const fn obligation_count(&self) -> usize {
         self.obligation_count
     }
+
+    pub(crate) const fn expected_completion_digest(&self) -> u64 {
+        self.expected_completion_digest
+    }
 }
 
 pub(crate) struct CoreBackNoTargetCleanupInstallation {
@@ -732,6 +739,18 @@ pub(crate) struct CoreBackNoTargetCleanupInstallation {
 }
 
 impl CoreBackNoTargetCleanupInstallation {
+    pub(crate) fn from_parts(
+        batch: CoreBackNoTargetCleanupBatchOwner,
+        continuation: CoreRejectedBackContinuationOwner,
+        action: CoreBackNoTargetCleanupAction,
+    ) -> Self {
+        Self {
+            batch,
+            continuation,
+            action,
+        }
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -741,6 +760,53 @@ impl CoreBackNoTargetCleanupInstallation {
     ) {
         (self.batch, self.continuation, self.action)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackNoTargetCleanupCompletionFacts {
+    manifest_digest: u64,
+    obligation_count: usize,
+    completion_digest: u64,
+    settled_count: usize,
+}
+
+pub(crate) struct CoreBackNoTargetCleanupCompletionOwner {
+    installation: CoreBackNoTargetCleanupInstallation,
+    completion: CoreBackNoTargetCleanupCompletionFacts,
+}
+
+impl CoreBackNoTargetCleanupCompletionOwner {
+    pub(crate) fn new(
+        installation: CoreBackNoTargetCleanupInstallation,
+        manifest_digest: u64,
+        obligation_count: usize,
+        completion_digest: u64,
+        settled_count: usize,
+    ) -> Self {
+        Self {
+            installation,
+            completion: CoreBackNoTargetCleanupCompletionFacts {
+                manifest_digest,
+                obligation_count,
+                completion_digest,
+                settled_count,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackNoTargetTerminalProjection {
+    request: NavigationRequestId,
+    completion: CoreBackNoTargetCleanupCompletionFacts,
+}
+
+pub(crate) enum BackNoTargetCleanupCompletionCoreOutcome {
+    Terminal(CoreBackNoTargetTerminalProjection),
+    Mismatch {
+        owner: CoreBackNoTargetCleanupCompletionOwner,
+        mismatch: CorePreparationReceiverMismatchProjection,
+    },
 }
 
 pub(crate) struct CoreBackNoTargetPublicationCapability {
@@ -1225,6 +1291,49 @@ pub(crate) enum CoreBackNoTargetReadyMismatchProjection {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackNoTargetCompletionExpectedProjection {
+    receiver: BackResolutionEvidence,
+    host: HostVersion,
+    source: CoreFrozenHistorySourceProjection,
+    request: NavigationRequestId,
+    manifest: CoreBackNoTargetManifestCommitmentProjection,
+    settled_count: usize,
+    expected_completion_digest: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoreBackNoTargetCompletionPreparationFailureProjection {
+    MissingRecord,
+    CleanupSettledTrace(RequestRecordError),
+    TerminalTransition(RequestRecordError),
+    RequestTerminalTrace(RequestRecordError),
+    RetentionInvariant,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackNoTargetCompletionObservedProjection {
+    scope: CoreBackTargetEngineScopeProjection,
+    current_host: Option<HostVersion>,
+    current_source: CoreFrozenHistorySourceProjection,
+    candidate_receiver: BackResolutionEvidence,
+    approval_receiver: BackResolutionEvidence,
+    approval_host: Option<HostVersion>,
+    approval_source: CoreFrozenHistorySourceProjection,
+    action_request: NavigationRequestId,
+    request: CoreBackNoTargetLogicalZeroRequestProjection,
+    current_request: Option<RequestStatus>,
+    queued_requests: Vec<NavigationRequestId>,
+    current: Option<FrameTaskIdentity>,
+    action: CoreBackTargetReceiverActionProjection,
+    pending_no_target_back: Option<NavigationRequestId>,
+    current_history_capability: Option<HistoryExecutionBindingProjection>,
+    pending_history_preparation_error: CoreBackNoTargetLogicalZeroPreparationErrorProjection,
+    prepared_publication: Option<SealedCommitEvidence>,
+    completion: CoreBackNoTargetCleanupCompletionFacts,
+    preparation_failure: Option<CoreBackNoTargetCompletionPreparationFailureProjection>,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CorePreparationReceiverMismatchProjection {
     Scope {
@@ -1236,6 +1345,10 @@ pub(crate) enum CorePreparationReceiverMismatchProjection {
         observed: CoreBackNoTargetLogicalZeroObservedProjection,
     },
     BackNoTargetReady(CoreBackNoTargetReadyMismatchProjection),
+    BackNoTargetCompletion {
+        expected: CoreBackNoTargetCompletionExpectedProjection,
+        observed: CoreBackNoTargetCompletionObservedProjection,
+    },
     Continuation {
         expected: CoreBackTargetContinuationExpectedProjection,
         observed: CoreBackTargetContinuationObservedProjection,
@@ -1618,6 +1731,16 @@ struct PreparedBackNoTargetSourceDriftTerminal {
     report_dispositions: Vec<ReportDispositionRecord>,
     completed_cleanup: Vec<CompletedCleanupTombstone>,
     terminal: BackNoTargetSourceDriftTerminalEvidence,
+}
+
+struct PreparedBackNoTargetCleanupTerminal {
+    state: RouterNavigationState,
+    records: VecDeque<NavigationRequestRecord>,
+    evicted_through: Option<u64>,
+    issued_view_tasks: Vec<FrameTaskIdentity>,
+    report_dispositions: Vec<ReportDispositionRecord>,
+    completed_cleanup: Vec<CompletedCleanupTombstone>,
+    terminal: CoreBackNoTargetTerminalProjection,
 }
 
 #[derive(Clone, Debug)]
@@ -2833,6 +2956,7 @@ impl RouterEngine {
         approved: ApprovedBackNoTargetCandidate,
         manifest_digest: u64,
         obligation_count: usize,
+        expected_completion_digest: u64,
         commit_canonical_zero: F,
     ) -> BackNoTargetReadyCoreOutcome
     where
@@ -2909,6 +3033,7 @@ impl RouterEngine {
                     host,
                     manifest_digest,
                     obligation_count,
+                    expected_completion_digest,
                 },
                 continuation: CoreRejectedBackContinuationOwner { approved },
                 action: CoreBackNoTargetCleanupAction { request },
@@ -2933,6 +3058,279 @@ impl RouterEngine {
         install_cleanup(installation);
         self.records = records;
         self.state = state;
+    }
+
+    fn observe_back_no_target_cleanup_completion(
+        &self,
+        owner: &CoreBackNoTargetCleanupCompletionOwner,
+    ) -> (
+        CoreBackNoTargetCompletionExpectedProjection,
+        CoreBackNoTargetCompletionObservedProjection,
+        bool,
+    ) {
+        let installation = &owner.installation;
+        let batch = &installation.batch;
+        let approved = &installation.continuation.approved;
+        let candidate = &approved.candidate;
+        let request = batch.evidence.request();
+        let expected = CoreBackNoTargetCompletionExpectedProjection {
+            receiver: batch.evidence.clone(),
+            host: batch.host.clone(),
+            source: approved.approval.expected.source.clone(),
+            request,
+            manifest: CoreBackNoTargetManifestCommitmentProjection {
+                manifest_digest: batch.manifest_digest,
+                obligation_count: batch.obligation_count,
+            },
+            settled_count: batch.obligation_count,
+            expected_completion_digest: batch.expected_completion_digest,
+        };
+        let preview = self.history.preview_back();
+        let request_projection = match self.request(request) {
+            Some(record) => CoreBackNoTargetLogicalZeroRequestProjection::Retained {
+                request,
+                status: record.status().clone(),
+                requested: record.requested().cloned(),
+                resolution: record.classify_back_resolution(&batch.evidence),
+            },
+            None => CoreBackNoTargetLogicalZeroRequestProjection::Missing { request },
+        };
+        let pending_history_preparation_error = match &self.pending_history_preparation_error {
+            None => CoreBackNoTargetLogicalZeroPreparationErrorProjection::Vacant,
+            Some(HistoryPreparationError::Source(_)) => {
+                CoreBackNoTargetLogicalZeroPreparationErrorProjection::Source
+            }
+            Some(HistoryPreparationError::Binding(_)) => {
+                CoreBackNoTargetLogicalZeroPreparationErrorProjection::Binding
+            }
+        };
+        let candidate_receiver = candidate.evidence();
+        let candidate_source = CoreFrozenHistorySourceProjection::project(candidate.source());
+        let observed = CoreBackNoTargetCompletionObservedProjection {
+            scope: self.back_target_engine_scope_projection(),
+            current_host: self.state.host().cloned(),
+            current_source: CoreFrozenHistorySourceProjection::project(preview.observed_source()),
+            candidate_receiver: candidate_receiver.clone(),
+            approval_receiver: approved.approval.expected.receiver.clone(),
+            approval_host: approved.approval.expected.host.clone(),
+            approval_source: approved.approval.expected.source.clone(),
+            action_request: installation.action.request,
+            request: request_projection,
+            current_request: self.state.current_request().cloned(),
+            queued_requests: self.queue.iter().map(|queued| queued.request).collect(),
+            current: self
+                .current
+                .as_ref()
+                .map(|current| current.identity.clone()),
+            action: Self::back_target_action_projection(self.action.as_ref()),
+            pending_no_target_back: self
+                .pending_no_target_back
+                .as_ref()
+                .map(|pending| pending.request),
+            current_history_capability: self
+                .current_history_capability
+                .as_ref()
+                .map(HistoryCommitCapability::execution_projection),
+            pending_history_preparation_error,
+            prepared_publication: self
+                .prepared_publication_authority
+                .as_ref()
+                .map(|authority| authority.owner().evidence.clone()),
+            completion: owner.completion,
+            preparation_failure: None,
+        };
+        let exact_lineage = candidate_receiver == batch.evidence
+            && approved.approval.expected.receiver == batch.evidence
+            && approved.approval.expected.host.as_ref() == Some(&batch.host)
+            && approved.approval.expected.source == candidate_source
+            && installation.action.request == request;
+        let exact_receiver = candidate.matches_receiver(
+            self.history_admission_world,
+            self.router,
+            self.history.incarnation(),
+        );
+        let exact_source = self
+            .history
+            .refreeze_back_no_target_source(candidate.source())
+            .is_ok()
+            && matches!(
+                &preview,
+                BackPreview::NoTarget(source) if source == candidate.source()
+            );
+        let exact_request = matches!(
+            &observed.request,
+            CoreBackNoTargetLogicalZeroRequestProjection::Retained {
+                status: RequestStatus::Running(NavigationPhase::CleanupPending),
+                requested: None,
+                resolution: BackResolutionEvidenceClassification::ConsumedReplay,
+                ..
+            }
+        ) && observed
+            .queued_requests
+            .iter()
+            .all(|queued| *queued != request);
+        let exact_owner_vacancies = observed.current.is_none()
+            && matches!(
+                &observed.action,
+                CoreBackTargetReceiverActionProjection::Missing
+            )
+            && observed.pending_no_target_back.is_none()
+            && observed.current_history_capability.is_none()
+            && matches!(
+                &observed.pending_history_preparation_error,
+                CoreBackNoTargetLogicalZeroPreparationErrorProjection::Vacant
+            )
+            && observed.prepared_publication.is_none();
+        let exact_state = observed.current_host.as_ref() == Some(&batch.host)
+            && matches!(
+                &observed.current_request,
+                Some(RequestStatus::Running(NavigationPhase::CleanupPending))
+            );
+        let exact_completion = batch.obligation_count == 0
+            && owner.completion.manifest_digest == batch.manifest_digest
+            && owner.completion.obligation_count == batch.obligation_count
+            && owner.completion.settled_count == owner.completion.obligation_count
+            && owner.completion.completion_digest == batch.expected_completion_digest;
+        (
+            expected,
+            observed,
+            exact_lineage
+                && exact_receiver
+                && exact_source
+                && exact_request
+                && exact_owner_vacancies
+                && exact_state
+                && exact_completion,
+        )
+    }
+
+    fn prepare_back_no_target_cleanup_terminal(
+        &self,
+        request: NavigationRequestId,
+        completion: CoreBackNoTargetCleanupCompletionFacts,
+    ) -> Result<
+        PreparedBackNoTargetCleanupTerminal,
+        CoreBackNoTargetCompletionPreparationFailureProjection,
+    > {
+        let mut state = self.state.clone();
+        let mut records = self.records.clone();
+        let Some(record) = records.iter_mut().find(|record| record.id() == request) else {
+            return Err(CoreBackNoTargetCompletionPreparationFailureProjection::MissingRecord);
+        };
+        record
+            .append_trace(NavigationTraceEvent::cleanup_settled(None))
+            .map_err(CoreBackNoTargetCompletionPreparationFailureProjection::CleanupSettledTrace)?;
+        record
+            .transition(RequestStatus::Failed(NavigationFailure::new(
+                NavigationFailureKind::BackTargetUnavailable,
+                "back target became unavailable before execution",
+            )))
+            .map_err(CoreBackNoTargetCompletionPreparationFailureProjection::TerminalTransition)?;
+        record
+            .append_trace(NavigationTraceEvent::request_terminal())
+            .map_err(
+                CoreBackNoTargetCompletionPreparationFailureProjection::RequestTerminalTrace,
+            )?;
+        state.set_request(None);
+
+        let mut issued_view_tasks = self.issued_view_tasks.clone();
+        let mut report_dispositions = self.report_dispositions.clone();
+        let mut completed_cleanup = self.completed_cleanup.clone();
+        let mut evicted_through = self.evicted_through;
+        while records
+            .iter()
+            .filter(|record| is_terminal(record.status()))
+            .count()
+            > TERMINAL_RETENTION
+        {
+            let Some(index) = records
+                .iter()
+                .position(|record| is_terminal(record.status()))
+            else {
+                return Err(
+                    CoreBackNoTargetCompletionPreparationFailureProjection::RetentionInvariant,
+                );
+            };
+            let Some(evicted) = records.remove(index) else {
+                return Err(
+                    CoreBackNoTargetCompletionPreparationFailureProjection::RetentionInvariant,
+                );
+            };
+            let evicted_request = evicted.id();
+            issued_view_tasks.retain(|identity| identity.request != evicted_request);
+            report_dispositions
+                .retain(|record| record.target != DiagnosticTarget::Request(evicted_request));
+            completed_cleanup.retain(|tombstone| tombstone.request != evicted_request);
+            let sequence = evicted_request.sequence();
+            evicted_through =
+                Some(evicted_through.map_or(sequence, |current| current.max(sequence)));
+        }
+
+        Ok(PreparedBackNoTargetCleanupTerminal {
+            state,
+            records,
+            evicted_through,
+            issued_view_tasks,
+            report_dispositions,
+            completed_cleanup,
+            terminal: CoreBackNoTargetTerminalProjection {
+                request,
+                completion,
+            },
+        })
+    }
+
+    pub(crate) fn complete_back_no_target_cleanup<F>(
+        &mut self,
+        owner: CoreBackNoTargetCleanupCompletionOwner,
+        commit_reclaim: F,
+    ) -> BackNoTargetCleanupCompletionCoreOutcome
+    where
+        F: FnOnce(),
+    {
+        let (expected, mut observed, exact) =
+            self.observe_back_no_target_cleanup_completion(&owner);
+        if !exact {
+            return BackNoTargetCleanupCompletionCoreOutcome::Mismatch {
+                owner,
+                mismatch: CorePreparationReceiverMismatchProjection::BackNoTargetCompletion {
+                    expected,
+                    observed,
+                },
+            };
+        }
+        let request = expected.request;
+        let prepared = match self.prepare_back_no_target_cleanup_terminal(request, owner.completion)
+        {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                observed.preparation_failure = Some(failure);
+                return BackNoTargetCleanupCompletionCoreOutcome::Mismatch {
+                    owner,
+                    mismatch: CorePreparationReceiverMismatchProjection::BackNoTargetCompletion {
+                        expected,
+                        observed,
+                    },
+                };
+            }
+        };
+        let PreparedBackNoTargetCleanupTerminal {
+            state,
+            records,
+            evicted_through,
+            issued_view_tasks,
+            report_dispositions,
+            completed_cleanup,
+            terminal,
+        } = prepared;
+        commit_reclaim();
+        self.state = state;
+        self.records = records;
+        self.evicted_through = evicted_through;
+        self.issued_view_tasks = issued_view_tasks;
+        self.report_dispositions = report_dispositions;
+        self.completed_cleanup = completed_cleanup;
+        BackNoTargetCleanupCompletionCoreOutcome::Terminal(terminal)
     }
 
     pub(crate) fn settle_back_no_target_source_drift_with_retirement<F>(

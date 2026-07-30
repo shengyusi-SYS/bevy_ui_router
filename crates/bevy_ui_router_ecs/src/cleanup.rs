@@ -162,6 +162,23 @@ pub(crate) struct BackCapacityIssuerSemanticSnapshot {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackCapacityCellDispositionForTest {
+    Outstanding { owner: u64 },
+    Leased { owner: u64 },
+    ReusableFree,
+    PermanentlyRetired,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackCapacityCellProjectionForTest {
+    pub(crate) current_generation: u64,
+    pub(crate) original_owner_live: bool,
+    pub(crate) disposition: BackCapacityCellDispositionForTest,
+}
+
+#[cfg(test)]
 impl BackCapacityIssuerSemanticSnapshot {
     pub(crate) const fn cell_count(&self) -> usize {
         self.cell_count
@@ -220,6 +237,37 @@ impl BackCapacityIssuer {
     #[cfg(test)]
     pub(crate) fn backing_capacities_for_test(&self) -> (usize, usize) {
         (self.cells.capacity(), self.live.capacity())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cell_projection_for_test(
+        &self,
+        identity: (u64, usize, u64, u64),
+    ) -> Option<BackCapacityCellProjectionForTest> {
+        let (domain, cell, owner, _generation) = identity;
+        if domain != self.domain.0 {
+            return None;
+        }
+        let cell = self.cells.get(cell)?;
+        let disposition = match (cell.state, cell.reuse) {
+            (BackCapacityCellState::Outstanding { owner }, _) => {
+                BackCapacityCellDispositionForTest::Outstanding { owner: owner.0 }
+            }
+            (BackCapacityCellState::Leased { owner }, _) => {
+                BackCapacityCellDispositionForTest::Leased { owner: owner.0 }
+            }
+            (BackCapacityCellState::Free, BackCapacityReuse::Reusable) => {
+                BackCapacityCellDispositionForTest::ReusableFree
+            }
+            (BackCapacityCellState::Free, BackCapacityReuse::PermanentlyRetired) => {
+                BackCapacityCellDispositionForTest::PermanentlyRetired
+            }
+        };
+        Some(BackCapacityCellProjectionForTest {
+            current_generation: cell.generation.0,
+            original_owner_live: self.live.contains_key(&BackCapacityOwnerId(owner)),
+            disposition,
+        })
     }
 
     #[cfg(test)]
@@ -648,6 +696,59 @@ impl BackCapacityIssuer {
         ))
     }
 
+    pub(crate) fn preflight_installed_back_capacity_reclaim<'issuer, 'owner>(
+        &'issuer mut self,
+        prepared: &'owner PreparedBackNoTargetZeroCompletion,
+    ) -> Result<
+        ExactBackCapacityCommitGuard<'issuer, 'owner, PreparedBackNoTargetZeroCompletion>,
+        BackCapacityRetireError,
+    > {
+        let Some(capacity) = prepared.ledger.back_no_target_capacity.as_ref() else {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        };
+        if capacity.domain != self.domain {
+            return Err(BackCapacityRetireError::ForeignDomain);
+        }
+        if self.live.contains_key(&capacity.owner)
+            || self
+                .live
+                .values()
+                .any(|record| record.cell == capacity.cell)
+        {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        }
+        let Some(cell) = self.cells.get_mut(capacity.cell.0) else {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        };
+        if cell.generation != capacity.generation
+            || cell.reuse != BackCapacityReuse::Reusable
+            || !matches!(
+                cell.state,
+                BackCapacityCellState::Leased { owner }
+                    if owner == capacity.owner
+            )
+        {
+            return Err(if retired_identity_is_current(cell, capacity.generation) {
+                BackCapacityRetireError::ConsumedReplay
+            } else {
+                BackCapacityRetireError::StaleGeneration
+            });
+        }
+
+        let next = match capacity.generation.0.checked_add(1) {
+            Some(next_generation) => PreparedRetiredCell::ReusableFree {
+                next_generation: PreparationReleaseGeneration(next_generation),
+            },
+            None => PreparedRetiredCell::PermanentlyRetired {
+                generation: capacity.generation,
+            },
+        };
+        Ok(ExactBackCapacityCommitGuard {
+            transition: BackCapacityCommitTransition::InstalledLeaseReclaim { cell, next },
+            owner: prepared,
+        })
+    }
+
     pub(crate) fn preflight_no_target_retirement<'issuer, 'owner>(
         &'issuer mut self,
         permit: &'owner NoTargetCapacityPermit,
@@ -915,6 +1016,10 @@ enum BackCapacityCommitTransition<'issuer> {
         live: OccupiedEntry<'issuer, BackCapacityOwnerId, BackCapacityLiveRecord>,
         cell: &'issuer mut BackCapacityCell,
     },
+    InstalledLeaseReclaim {
+        cell: &'issuer mut BackCapacityCell,
+        next: PreparedRetiredCell,
+    },
 }
 
 pub(crate) struct ExactBackCapacityCommitGuard<'issuer, 'owner, Owner: ?Sized> {
@@ -960,6 +1065,19 @@ impl<Owner: ?Sized> ExactBackCapacityCommitGuard<'_, '_, Owner> {
             BackCapacityCommitTransition::LeasedToCanonicalZeroSlot { live, cell } => {
                 let _ = live.remove();
                 let _ = cell;
+            }
+            BackCapacityCommitTransition::InstalledLeaseReclaim { cell, next } => {
+                cell.state = BackCapacityCellState::Free;
+                match next {
+                    PreparedRetiredCell::ReusableFree { next_generation } => {
+                        cell.generation = next_generation;
+                        cell.reuse = BackCapacityReuse::Reusable;
+                    }
+                    PreparedRetiredCell::PermanentlyRetired { generation } => {
+                        cell.generation = generation;
+                        cell.reuse = BackCapacityReuse::PermanentlyRetired;
+                    }
+                }
             }
         }
     }
@@ -5294,12 +5412,242 @@ pub(crate) struct CleanupLedger {
     authority_host_children: Option<Vec<Entity>>,
 }
 
-#[derive(Clone, Copy)]
 struct InstalledBackCapacityLease {
     domain: PreparationCapacityDomain,
     cell: BackCapacityCellId,
     owner: BackCapacityOwnerId,
     generation: PreparationReleaseGeneration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackNoTargetZeroCompletionFacts {
+    manifest_digest: u64,
+    obligation_count: usize,
+    completion_digest: u64,
+    settled_count: usize,
+}
+
+impl BackNoTargetZeroCompletionFacts {
+    pub(crate) const fn manifest_digest(self) -> u64 {
+        self.manifest_digest
+    }
+
+    pub(crate) const fn obligation_count(self) -> usize {
+        self.obligation_count
+    }
+
+    pub(crate) const fn completion_digest(self) -> u64 {
+        self.completion_digest
+    }
+
+    pub(crate) const fn settled_count(self) -> usize {
+        self.settled_count
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackNoTargetInstalledCapacitySource {
+    Absent,
+    Present {
+        domain: u64,
+        cell: usize,
+        owner: u64,
+        generation: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackNoTargetZeroCompletionSourceIdentity {
+    ledger_domain: u64,
+    capacity: BackNoTargetInstalledCapacitySource,
+}
+
+impl BackNoTargetZeroCompletionSourceIdentity {
+    pub(crate) const fn ledger_domain(self) -> u64 {
+        self.ledger_domain
+    }
+
+    pub(crate) const fn capacity(self) -> BackNoTargetInstalledCapacitySource {
+        self.capacity
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackNoTargetDedicatedBatchObservation {
+    Absent,
+    Present {
+        manifest_digest: u64,
+        obligation_count: usize,
+        expected_completion_digest: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackNoTargetNormalBatchObservation {
+    Absent,
+    Present {
+        manifest_digest: u64,
+        obligation_count: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackNoTargetCleanupOwnerObservation {
+    Absent,
+    Leaving,
+    FailedPrepared,
+    AuthoritySettlement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackNoTargetCleanupAttemptObservation {
+    Absent,
+    Present {
+        ledger_domain: u64,
+        revision: u64,
+        manifest_digest: u64,
+        unsettled_digest: u64,
+        evidence_count: usize,
+        mount_parents_exact: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackNoTargetAuthorityResidualObservation {
+    Absent,
+    Present { host_child_count: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackNoTargetZeroCompletionObservedFacts {
+    dedicated_batch: BackNoTargetDedicatedBatchObservation,
+    normal_batch: BackNoTargetNormalBatchObservation,
+    owner: BackNoTargetCleanupOwnerObservation,
+    attempt: BackNoTargetCleanupAttemptObservation,
+    manifest_digest: u64,
+    obligation_count: usize,
+    mount_parent_count: usize,
+    receipt_slot_count: usize,
+    settled_count: usize,
+    completion_digest: Option<u64>,
+    next_attempt: u64,
+    quarantine_event_observed: bool,
+    focus_residual_count: usize,
+    authority_residual: BackNoTargetAuthorityResidualObservation,
+}
+
+impl BackNoTargetZeroCompletionObservedFacts {
+    pub(crate) const fn dedicated_batch(self) -> BackNoTargetDedicatedBatchObservation {
+        self.dedicated_batch
+    }
+
+    pub(crate) const fn completion_digest(self) -> Option<u64> {
+        self.completion_digest
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackNoTargetZeroCompletionPreparationEvidence {
+    source: BackNoTargetZeroCompletionSourceIdentity,
+    expected: BackNoTargetZeroCompletionFacts,
+    observed: BackNoTargetZeroCompletionObservedFacts,
+}
+
+impl BackNoTargetZeroCompletionPreparationEvidence {
+    pub(crate) const fn source_identity(self) -> BackNoTargetZeroCompletionSourceIdentity {
+        self.source
+    }
+
+    pub(crate) const fn expected(self) -> BackNoTargetZeroCompletionFacts {
+        self.expected
+    }
+
+    pub(crate) const fn observed(self) -> BackNoTargetZeroCompletionObservedFacts {
+        self.observed
+    }
+
+    fn is_exact(self) -> bool {
+        let BackNoTargetZeroCompletionFacts {
+            manifest_digest,
+            obligation_count,
+            completion_digest,
+            settled_count,
+        } = self.expected;
+        matches!(
+            self.source.capacity,
+            BackNoTargetInstalledCapacitySource::Present { .. }
+        ) && self.observed.dedicated_batch
+            == (BackNoTargetDedicatedBatchObservation::Present {
+                manifest_digest,
+                obligation_count,
+                expected_completion_digest: completion_digest,
+            })
+            && self.observed.normal_batch == BackNoTargetNormalBatchObservation::Absent
+            && self.observed.owner == BackNoTargetCleanupOwnerObservation::Absent
+            && self.observed.attempt == BackNoTargetCleanupAttemptObservation::Absent
+            && self.observed.manifest_digest == manifest_digest
+            && self.observed.obligation_count == obligation_count
+            && self.observed.mount_parent_count == 0
+            && self.observed.receipt_slot_count == obligation_count
+            && self.observed.settled_count == settled_count
+            && self.observed.completion_digest == Some(completion_digest)
+            && self.observed.next_attempt == 1
+            && !self.observed.quarantine_event_observed
+            && self.observed.focus_residual_count == 0
+            && self.observed.authority_residual == BackNoTargetAuthorityResidualObservation::Absent
+    }
+}
+
+pub(crate) struct BackNoTargetZeroCompletionPreparationFailure {
+    ledger: CleanupLedger,
+    evidence: BackNoTargetZeroCompletionPreparationEvidence,
+}
+
+impl BackNoTargetZeroCompletionPreparationFailure {
+    pub(crate) const fn evidence(&self) -> BackNoTargetZeroCompletionPreparationEvidence {
+        self.evidence
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (CleanupLedger, BackNoTargetZeroCompletionPreparationEvidence) {
+        (self.ledger, self.evidence)
+    }
+}
+
+pub(crate) struct PreparedBackNoTargetZeroCompletion {
+    ledger: CleanupLedger,
+    facts: BackNoTargetZeroCompletionFacts,
+    source: BackNoTargetZeroCompletionSourceIdentity,
+}
+
+impl PreparedBackNoTargetZeroCompletion {
+    pub(crate) const fn facts(&self) -> BackNoTargetZeroCompletionFacts {
+        self.facts
+    }
+
+    pub(crate) fn into_ledger(self) -> CleanupLedger {
+        self.ledger
+    }
+
+    pub(crate) const fn source_identity(&self) -> BackNoTargetZeroCompletionSourceIdentity {
+        self.source
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity_identity_for_test(&self) -> (u64, usize, u64, u64) {
+        let capacity = self
+            .ledger
+            .back_no_target_capacity
+            .as_ref()
+            .expect("prepared exact-zero completion retains its installed capacity lease");
+        (
+            capacity.domain.0,
+            capacity.cell.0,
+            capacity.owner.0,
+            capacity.generation.0,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -5311,8 +5659,10 @@ pub(crate) struct BackNoTargetLedgerProjectionForTest {
     pub(crate) manifest_digest: u64,
     pub(crate) obligation_count: usize,
     pub(crate) receipt_count: usize,
+    pub(crate) completion_digest: u64,
     pub(crate) batch_manifest_digest: u64,
     pub(crate) batch_obligation_count: usize,
+    pub(crate) batch_expected_completion_digest: u64,
 }
 
 pub(crate) enum CleanupOwner {
@@ -5606,19 +5956,144 @@ impl CleanupLedger {
             ledger_domain,
             next_attempt: 1,
             issued_attempt: None,
-            completion_digest: Some(canonical_empty_completion_digest()),
+            completion_digest: Some(canonical_zero_completion_digest()),
             quarantine_event_observed: false,
             post_settlement_focus: Vec::new(),
             authority_host_children: None,
         }
     }
 
+    fn back_no_target_zero_completion_source_identity(
+        &self,
+    ) -> BackNoTargetZeroCompletionSourceIdentity {
+        let capacity = match self.back_no_target_capacity.as_ref() {
+            Some(capacity) => BackNoTargetInstalledCapacitySource::Present {
+                domain: capacity.domain.0,
+                cell: capacity.cell.0,
+                owner: capacity.owner.0,
+                generation: capacity.generation.0,
+            },
+            None => BackNoTargetInstalledCapacitySource::Absent,
+        };
+        BackNoTargetZeroCompletionSourceIdentity {
+            ledger_domain: self.ledger_domain,
+            capacity,
+        }
+    }
+
+    fn back_no_target_zero_completion_preparation_evidence(
+        &self,
+    ) -> BackNoTargetZeroCompletionPreparationEvidence {
+        let dedicated_batch = match self.back_no_target_batch.as_ref() {
+            Some(batch) => BackNoTargetDedicatedBatchObservation::Present {
+                manifest_digest: batch.manifest_digest(),
+                obligation_count: batch.obligation_count(),
+                expected_completion_digest: batch.expected_completion_digest(),
+            },
+            None => BackNoTargetDedicatedBatchObservation::Absent,
+        };
+        let normal_batch = match self.batch.as_ref() {
+            Some(batch) => BackNoTargetNormalBatchObservation::Present {
+                manifest_digest: batch.manifest_digest(),
+                obligation_count: batch.obligation_count(),
+            },
+            None => BackNoTargetNormalBatchObservation::Absent,
+        };
+        let owner = match self.owner.as_ref() {
+            Some(CleanupOwner::Leaving(_)) => BackNoTargetCleanupOwnerObservation::Leaving,
+            Some(CleanupOwner::FailedPrepared(_)) => {
+                BackNoTargetCleanupOwnerObservation::FailedPrepared
+            }
+            Some(CleanupOwner::AuthoritySettlement(_)) => {
+                BackNoTargetCleanupOwnerObservation::AuthoritySettlement
+            }
+            None => BackNoTargetCleanupOwnerObservation::Absent,
+        };
+        let attempt = match self.issued_attempt.as_ref() {
+            Some(attempt) => BackNoTargetCleanupAttemptObservation::Present {
+                ledger_domain: attempt.ledger_domain,
+                revision: attempt.revision,
+                manifest_digest: attempt.manifest_digest,
+                unsettled_digest: attempt.unsettled_digest,
+                evidence_count: attempt.evidence.len(),
+                mount_parents_exact: attempt.mount_parents_exact,
+            },
+            None => BackNoTargetCleanupAttemptObservation::Absent,
+        };
+        let authority_residual = match self.authority_host_children.as_ref() {
+            Some(children) => BackNoTargetAuthorityResidualObservation::Present {
+                host_child_count: children.len(),
+            },
+            None => BackNoTargetAuthorityResidualObservation::Absent,
+        };
+        BackNoTargetZeroCompletionPreparationEvidence {
+            source: self.back_no_target_zero_completion_source_identity(),
+            expected: BackNoTargetZeroCompletionFacts {
+                manifest_digest: canonical_zero_manifest_digest(),
+                obligation_count: 0,
+                completion_digest: canonical_zero_completion_digest(),
+                settled_count: 0,
+            },
+            observed: BackNoTargetZeroCompletionObservedFacts {
+                dedicated_batch,
+                normal_batch,
+                owner,
+                attempt,
+                manifest_digest: self.manifest_digest,
+                obligation_count: self.obligations.len(),
+                mount_parent_count: self.mount_parents.len(),
+                receipt_slot_count: self.receipts.len(),
+                settled_count: self.receipts.iter().flatten().count(),
+                completion_digest: self.completion_digest,
+                next_attempt: self.next_attempt,
+                quarantine_event_observed: self.quarantine_event_observed,
+                focus_residual_count: self.post_settlement_focus.len(),
+                authority_residual,
+            },
+        }
+    }
+
+    pub(crate) fn prepare_back_no_target_zero_completion(
+        self,
+    ) -> Result<PreparedBackNoTargetZeroCompletion, BackNoTargetZeroCompletionPreparationFailure>
+    {
+        let evidence = self.back_no_target_zero_completion_preparation_evidence();
+        if !evidence.is_exact() {
+            return Err(BackNoTargetZeroCompletionPreparationFailure {
+                ledger: self,
+                evidence,
+            });
+        }
+
+        Ok(PreparedBackNoTargetZeroCompletion {
+            facts: evidence.expected,
+            source: evidence.source,
+            ledger: self,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drift_back_no_target_completion_digest_for_test(&mut self) {
+        self.completion_digest = self.completion_digest.map(|digest| digest ^ 1);
+    }
+
     #[cfg(test)]
     pub(crate) fn back_no_target_projection_for_test(
         &self,
     ) -> Option<BackNoTargetLedgerProjectionForTest> {
-        let capacity = self.back_no_target_capacity?;
+        let capacity = self.back_no_target_capacity.as_ref()?;
         let batch = self.back_no_target_batch.as_ref()?;
+        let completion_digest = self.completion_digest?;
+        let batch_expected_completion_digest = batch.expected_completion_digest();
+        assert_eq!(
+            completion_digest,
+            canonical_zero_completion_digest(),
+            "the installed no-target ledger stores the canonical zero completion digest"
+        );
+        assert_eq!(
+            batch_expected_completion_digest, completion_digest,
+            "the no-target batch commitment must match the installed ledger completion digest"
+        );
         Some(BackNoTargetLedgerProjectionForTest {
             header_installed: true,
             capacity_identity: (
@@ -5631,8 +6106,10 @@ impl CleanupLedger {
             manifest_digest: self.manifest_digest,
             obligation_count: self.obligations.len(),
             receipt_count: self.receipts.iter().flatten().count(),
+            completion_digest,
             batch_manifest_digest: batch.manifest_digest(),
             batch_obligation_count: batch.obligation_count(),
+            batch_expected_completion_digest,
         })
     }
 
@@ -8482,6 +8959,10 @@ fn canonical_empty_completion_digest() -> u64 {
     StructuredDigest::new(COMPLETION_DOMAIN).finish()
 }
 
+pub(crate) fn canonical_zero_completion_digest() -> u64 {
+    canonical_empty_completion_digest()
+}
+
 pub(crate) const fn canonical_zero_manifest_digest() -> u64 {
     0
 }
@@ -8749,6 +9230,357 @@ pub(crate) mod tests {
             BackCapacityRetireOutcome::Retired(_)
         ));
         assert_eq!(issuer.semantic_snapshot_for_test().outstanding_count(), 0);
+    }
+
+    fn prepared_installed_back_zero_completion(
+        initial_generation: u64,
+    ) -> (
+        BackCapacityIssuer,
+        PreparedBackNoTargetZeroCompletion,
+        (u64, usize, u64, u64),
+    ) {
+        let mut domains = BackCapacityDomainIssuer::new();
+        let mut issuer = domains.issue().unwrap();
+        issuer.set_next_new_cell_initial_generation_for_test(initial_generation);
+        let capacity = issuer.reserve().unwrap();
+        let identity = capacity.ordinal_identity_for_test();
+        let EcsCleanupCapacityReservation {
+            domain,
+            cell,
+            owner,
+            generation,
+            vacant_ledger,
+        } = capacity;
+        issuer
+            .live
+            .get_mut(&owner)
+            .expect("the reserved owner remains live")
+            .state = BackCapacityLiveState::Leased;
+        issuer.cells[cell.0].state = BackCapacityCellState::Leased { owner };
+        let removed = issuer
+            .live
+            .remove(&owner)
+            .expect("canonical-zero installation consumes the live entry");
+        assert_eq!(removed.domain, domain);
+        assert_eq!(removed.cell, cell);
+        assert_eq!(removed.owner, owner);
+        assert_eq!(removed.generation, generation);
+
+        let ManifestNeutralLedgerStorage {
+            obligations,
+            mount_parents,
+            receipts,
+            ledger_domain,
+        } = vacant_ledger;
+        let ledger = CleanupLedger {
+            batch: None,
+            back_no_target_batch: None,
+            back_no_target_capacity: Some(InstalledBackCapacityLease {
+                domain,
+                cell,
+                owner,
+                generation,
+            }),
+            owner: None,
+            obligations,
+            mount_parents,
+            manifest_digest: canonical_zero_manifest_digest(),
+            receipts,
+            ledger_domain,
+            next_attempt: 1,
+            issued_attempt: None,
+            completion_digest: Some(canonical_empty_completion_digest()),
+            quarantine_event_observed: false,
+            post_settlement_focus: Vec::new(),
+            authority_host_children: None,
+        };
+        let source = ledger.back_no_target_zero_completion_source_identity();
+        let prepared = PreparedBackNoTargetZeroCompletion {
+            ledger,
+            facts: BackNoTargetZeroCompletionFacts {
+                manifest_digest: canonical_zero_manifest_digest(),
+                obligation_count: 0,
+                completion_digest: canonical_empty_completion_digest(),
+                settled_count: 0,
+            },
+            source,
+        };
+        (issuer, prepared, identity)
+    }
+
+    #[test]
+    fn back_no_target_zero_completion_reclaim_rejection_is_zero_write() {
+        let (issuer, prepared, identity) = prepared_installed_back_zero_completion(1);
+        let mut domains = BackCapacityDomainIssuer::new();
+        let mut foreign = domains.issue().unwrap();
+        foreign.domain = PreparationCapacityDomain(
+            identity
+                .0
+                .checked_add(1)
+                .expect("the test issuer domain has a foreign successor"),
+        );
+        let before = foreign.semantic_snapshot_for_test();
+        let backing_before = foreign.backing_capacities_for_test();
+
+        assert!(matches!(
+            foreign.preflight_installed_back_capacity_reclaim(&prepared),
+            Err(BackCapacityRetireError::ForeignDomain)
+        ));
+        assert_eq!(foreign.semantic_snapshot_for_test(), before);
+        assert_eq!(foreign.backing_capacities_for_test(), backing_before);
+        assert_eq!(prepared.capacity_identity_for_test(), identity);
+        assert_eq!(issuer.semantic_snapshot_for_test().outstanding_count(), 0);
+    }
+
+    #[test]
+    fn back_no_target_zero_completion_preparation_rejection_returns_whole_ledger() {
+        let (_issuer, prepared, identity) = prepared_installed_back_zero_completion(1);
+        let ledger = prepared.into_ledger();
+        let (returned, evidence) = match ledger.prepare_back_no_target_zero_completion() {
+            Err(failure) => failure.into_parts(),
+            Ok(_) => panic!("a ledger without the dedicated batch must fail closed"),
+        };
+        assert_eq!(
+            evidence.source_identity().capacity(),
+            BackNoTargetInstalledCapacitySource::Present {
+                domain: identity.0,
+                cell: identity.1,
+                owner: identity.2,
+                generation: identity.3,
+            }
+        );
+        assert_eq!(
+            evidence.source_identity().ledger_domain(),
+            returned.ledger_domain
+        );
+        assert_eq!(
+            evidence.expected(),
+            BackNoTargetZeroCompletionFacts {
+                manifest_digest: canonical_zero_manifest_digest(),
+                obligation_count: 0,
+                completion_digest: canonical_zero_completion_digest(),
+                settled_count: 0,
+            }
+        );
+        assert_eq!(
+            evidence.observed().dedicated_batch(),
+            BackNoTargetDedicatedBatchObservation::Absent
+        );
+        assert_eq!(
+            evidence.observed().completion_digest(),
+            Some(canonical_zero_completion_digest())
+        );
+        let capacity = returned
+            .back_no_target_capacity
+            .as_ref()
+            .expect("rejection returns the installed capacity lease");
+        assert_eq!(
+            (
+                capacity.domain.0,
+                capacity.cell.0,
+                capacity.owner.0,
+                capacity.generation.0,
+            ),
+            identity
+        );
+        assert!(returned.batch.is_none());
+        assert!(returned.back_no_target_batch.is_none());
+        assert!(returned.owner.is_none());
+        assert!(returned.obligations.is_empty());
+        assert!(returned.mount_parents.is_empty());
+        assert!(returned.receipts.is_empty());
+        assert_eq!(
+            returned.completion_digest,
+            Some(canonical_empty_completion_digest())
+        );
+    }
+
+    #[test]
+    fn back_no_target_zero_completion_evidence_distinguishes_digest_and_batch_drift() {
+        let (_issuer, prepared, identity) = prepared_installed_back_zero_completion(1);
+        let missing_batch = match prepared
+            .into_ledger()
+            .prepare_back_no_target_zero_completion()
+        {
+            Err(failure) => failure.evidence(),
+            Ok(_) => panic!("missing dedicated batch commitment must reject"),
+        };
+
+        let (_issuer, prepared, _) = prepared_installed_back_zero_completion(1);
+        let mut ledger = prepared.into_ledger();
+        ledger.drift_back_no_target_completion_digest_for_test();
+        let completion_drift = match ledger.prepare_back_no_target_zero_completion() {
+            Err(failure) => failure.evidence(),
+            Ok(_) => panic!("noncanonical stored completion digest must reject"),
+        };
+        let expected = missing_batch.expected();
+        let exact_observed = BackNoTargetZeroCompletionObservedFacts {
+            dedicated_batch: BackNoTargetDedicatedBatchObservation::Present {
+                manifest_digest: expected.manifest_digest(),
+                obligation_count: expected.obligation_count(),
+                expected_completion_digest: expected.completion_digest(),
+            },
+            ..missing_batch.observed()
+        };
+        let exact = BackNoTargetZeroCompletionPreparationEvidence {
+            source: missing_batch.source_identity(),
+            expected,
+            observed: exact_observed,
+        };
+        assert!(exact.is_exact());
+        let batch_commitment_drift = BackNoTargetZeroCompletionPreparationEvidence {
+            observed: BackNoTargetZeroCompletionObservedFacts {
+                dedicated_batch: BackNoTargetDedicatedBatchObservation::Present {
+                    manifest_digest: expected.manifest_digest(),
+                    obligation_count: expected.obligation_count(),
+                    expected_completion_digest: expected.completion_digest() ^ 1,
+                },
+                ..exact_observed
+            },
+            ..exact
+        };
+        assert!(!batch_commitment_drift.is_exact());
+
+        assert_eq!(
+            missing_batch.source_identity().capacity(),
+            BackNoTargetInstalledCapacitySource::Present {
+                domain: identity.0,
+                cell: identity.1,
+                owner: identity.2,
+                generation: identity.3,
+            }
+        );
+        assert_eq!(
+            missing_batch.observed().dedicated_batch(),
+            BackNoTargetDedicatedBatchObservation::Absent
+        );
+        assert_eq!(
+            missing_batch.observed().completion_digest(),
+            Some(canonical_zero_completion_digest())
+        );
+        assert_eq!(
+            completion_drift.observed().dedicated_batch(),
+            BackNoTargetDedicatedBatchObservation::Absent
+        );
+        assert_eq!(
+            completion_drift.observed().completion_digest(),
+            Some(canonical_zero_completion_digest() ^ 1)
+        );
+        assert_eq!(
+            batch_commitment_drift.observed().dedicated_batch(),
+            BackNoTargetDedicatedBatchObservation::Present {
+                manifest_digest: canonical_zero_manifest_digest(),
+                obligation_count: 0,
+                expected_completion_digest: canonical_zero_completion_digest() ^ 1,
+            }
+        );
+        assert_eq!(
+            batch_commitment_drift.observed().completion_digest(),
+            Some(canonical_zero_completion_digest())
+        );
+        assert_ne!(batch_commitment_drift, completion_drift);
+        assert_ne!(missing_batch, completion_drift);
+    }
+
+    #[test]
+    fn back_no_target_zero_completion_exact_reclaim_reuses_the_advanced_cell() {
+        let (mut issuer, prepared, first_identity) = prepared_installed_back_zero_completion(1);
+        let facts = prepared.facts();
+        assert_eq!(facts.manifest_digest(), canonical_zero_manifest_digest());
+        assert_eq!(facts.obligation_count(), 0);
+        assert_eq!(
+            facts.completion_digest(),
+            canonical_empty_completion_digest()
+        );
+        assert_eq!(facts.settled_count(), 0);
+        assert_eq!(
+            prepared.source_identity().capacity(),
+            BackNoTargetInstalledCapacitySource::Present {
+                domain: first_identity.0,
+                cell: first_identity.1,
+                owner: first_identity.2,
+                generation: first_identity.3,
+            }
+        );
+        let cells_before = issuer.semantic_snapshot_for_test().cell_count();
+        let guard = issuer
+            .preflight_installed_back_capacity_reclaim(&prepared)
+            .expect("the exact installed lease must preflight");
+        guard.commit();
+
+        assert_eq!(issuer.semantic_snapshot_for_test().outstanding_count(), 0);
+        let reclaimed = issuer
+            .cell_projection_for_test(first_identity)
+            .expect("the reclaimed cell remains observable");
+        assert_eq!(reclaimed.current_generation, first_identity.3 + 1);
+        assert!(!reclaimed.original_owner_live);
+        assert_eq!(
+            reclaimed.disposition,
+            BackCapacityCellDispositionForTest::ReusableFree
+        );
+        let successor = issuer.reserve().unwrap();
+        let successor_identity = successor.ordinal_identity_for_test();
+        assert_eq!(successor_identity.1, first_identity.1);
+        assert_ne!(successor_identity.2, first_identity.2);
+        assert_eq!(successor_identity.3, first_identity.3 + 1);
+        assert_eq!(
+            issuer.semantic_snapshot_for_test().cell_count(),
+            cells_before
+        );
+    }
+
+    #[test]
+    fn back_no_target_zero_completion_reclaim_replay_is_zero_write() {
+        let (mut issuer, prepared, identity) = prepared_installed_back_zero_completion(1);
+        issuer
+            .preflight_installed_back_capacity_reclaim(&prepared)
+            .expect("the exact installed lease must preflight")
+            .commit();
+        let before = issuer.semantic_snapshot_for_test();
+        let backing_before = issuer.backing_capacities_for_test();
+
+        assert!(matches!(
+            issuer.preflight_installed_back_capacity_reclaim(&prepared),
+            Err(BackCapacityRetireError::ConsumedReplay)
+        ));
+        assert_eq!(issuer.semantic_snapshot_for_test(), before);
+        assert_eq!(issuer.backing_capacities_for_test(), backing_before);
+        assert_eq!(prepared.capacity_identity_for_test(), identity);
+    }
+
+    #[test]
+    fn back_no_target_zero_completion_max_generation_permanently_retires_cell() {
+        let (mut issuer, prepared, terminal_identity) =
+            prepared_installed_back_zero_completion(u64::MAX);
+        issuer
+            .preflight_installed_back_capacity_reclaim(&prepared)
+            .expect("the exact terminal-generation lease must preflight")
+            .commit();
+        let cells_before = issuer.semantic_snapshot_for_test().cell_count();
+        let retired = issuer
+            .cell_projection_for_test(terminal_identity)
+            .expect("the permanently retired cell remains observable");
+        assert_eq!(retired.current_generation, u64::MAX);
+        assert!(!retired.original_owner_live);
+        assert_eq!(
+            retired.disposition,
+            BackCapacityCellDispositionForTest::PermanentlyRetired
+        );
+        assert!(matches!(
+            issuer.preflight_installed_back_capacity_reclaim(&prepared),
+            Err(BackCapacityRetireError::ConsumedReplay)
+        ));
+
+        let successor = issuer.reserve().unwrap();
+        let successor_identity = successor.ordinal_identity_for_test();
+        assert_ne!(
+            successor_identity.1, terminal_identity.1,
+            "a no-successor installed lease cell must remain permanently retired"
+        );
+        assert_eq!(
+            issuer.semantic_snapshot_for_test().cell_count(),
+            cells_before + 1
+        );
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
