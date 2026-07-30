@@ -1764,7 +1764,7 @@ impl RouterEngine {
 
 Target resume and contradiction terminal each accept a caller-provided locally infallible `FnOnce`. Issuer preflight `Err` creates no guard/successor、does not call Core and returns `CapacityRejected` with the complete bound owner. Successful preflight yields a lifetime-bound guard plus private prepared retirement evidence while the complete bound owner remains outside the closure. Core first checks the target receiver identity; `Mismatch` returns the verified owner before preparation and calls the closure zero times, so dropping the uncommitted guard/evidence is zero-write and ECS returns `ReceiverMismatch` after recomposing the untouched bound owner. For an exact target receiver, Core refreezes history source、host/top-slot and active/child-slot baseline, then completes matcher、reconciliation、first-action and mount-issue preparation into private `PreparedReady | PreparedFailureCleanup | PreparedPermanent`. Only after preparation succeeds as one typed branch does Core call the closure exactly once；that closure only moves `guard.commit()`. After the exact outcome returns, ECS drops the now-stale bound owner and converts the prepared non-authorizing evidence into `BackCapacityRetirementEvidence`. Same-engine source/host/baseline drift and generation/depth contradiction are private typed Permanent/AuthorityLost, not Mismatch. Contradiction terminal retains the same zero/one callback rule. No guard、prepared successor or closure is returned or stored
 
-`BackTargetStart` separates `Ready(BackTargetResume)` from `FailureCleanup(FailureCleanupRequest)`. `BackTargetResume` linearly carries one `BackTargetResumeAction` beside the existing execution binding and continuation. Real reconciliation may return `FrameTask` or a nested `MountRequest`; legitimate duplicate/equivalent or pure-truncate zero-entering reconciliation returns the real `CommitTicket` without synthesizing a task. Mount issue exhaustion returns the independent FailureCleanup branch and never enters the normal resume action enum. These doc-hidden types are not reexported by the facade
+`BackTargetStart` separates `Ready(BackTargetResume)` from `FailureCleanup(FailureCleanupRequest)`. `BackTargetResume` linearly carries one `BackTargetResumeAction` beside the existing execution binding and continuation. Real reconciliation may return `FrameTask` or a nested `MountRequest`; legitimate duplicate/equivalent or pure-truncate zero-entering reconciliation returns the real `CommitTicket` without synthesizing a task. Initial Ready `MountRequest` remains whole in `ResumeBlocked::Start` with the generic mount field empty until its target action slice exists. Mount issue exhaustion returns the independent FailureCleanup branch and never enters the normal resume action enum. These doc-hidden types are not reexported by the facade
 
 Every callback-bearing `*_with_*` method is a `#[doc(hidden)]` trusted ECS integration API and is absent from facade reexports. This follows the existing `ValidatedCommit::publish(FnOnce())` boundary: the callback is not authority; the verified/prepared Core owner is authority. Correctness relies on one audited ECS callsite whose conditional callback captures only one lifetime-bound guard and calls `guard.commit()` once. The static gate rejects any owner-by-value capture、owner/key lookup、key-based remove、Vec index/query、allocation、validation、`expect`、`unwrap`、panic、unsafe or hook/observer-triggering write in that callback. It separately audits operation-specific transition behavior：Outstanding/Leased retire consumes the already-held live entry、returns lifecycle to `Free` and applies `Reusable | PermanentlyRetired` metadata；transfer retains that same entry and updates it to `Leased`；canonical-zero consumes the `Leased` entry and moves its exact cell lease into the slot. Retirement evidence seals only after stale-owner drop，while transfer/canonical-zero successor conversion must consume the stale owner by value in the exact outer outcome. Rust visibility/types are not claimed to defeat a malicious direct Core caller; the supported facade/adapter surface cannot obtain the verified owners or name/call these methods
 
@@ -1878,6 +1878,71 @@ pub enum BackTargetPhysicalOwnerRef<'a> {
 pub enum BackTargetExecutionPairingOutcome {
     Matched,
     Mismatch(PreparationReceiverMismatchView),
+}
+#[doc(hidden)]
+pub enum BackTargetDriverFailureReportMode {
+    Normal,
+    PhysicalResidual,
+}
+#[doc(hidden)]
+pub struct BackTargetDriverFailureCleanupOwner { inner: CoreBackTargetDriverFailureCleanup }
+#[doc(hidden)]
+pub struct BackTargetDriverFallbackOwner { inner: CoreBackTargetDriverFallback }
+#[doc(hidden)]
+pub struct BackTargetDriverTerminalOwner { inner: CoreBackTargetDriverTerminal }
+#[doc(hidden)]
+pub struct BackTargetDriverTerminalEvidence { inner: CoreBackTargetDriverTerminalProjection }
+#[doc(hidden)]
+pub enum BackTargetDriverFailureCoreOutcome {
+    FailureCleanup(BackTargetDriverFailureCleanupOwner),
+    Fallback(BackTargetDriverFallbackOwner),
+    Terminal(BackTargetDriverTerminalOwner),
+}
+#[doc(hidden)]
+pub enum BackTargetDriverFailureReportOutcome {
+    Reported(BackTargetDriverFailureCoreOutcome),
+    Mismatch {
+        capacity: LifecycleContinuationCapacity,
+        task: RootFrameTask,
+        mismatch: PreparationReceiverMismatchView,
+    },
+}
+#[doc(hidden)]
+pub enum BackTargetDriverFailureConsumeOutcome {
+    FailureCleanup(FailureCleanupRequest),
+    FallbackReleased,
+    Terminal(BackTargetDriverTerminalEvidence),
+    Mismatch {
+        owner: BackTargetDriverFailureCoreOutcome,
+        mismatch: PreparationReceiverMismatchView,
+    },
+}
+#[doc(hidden)]
+pub enum BackTargetAppliedReport {
+    LegacyLeaf,
+    WithOutlets(Vec<RouteSlotKey>),
+}
+#[doc(hidden)]
+pub enum BackTargetAppliedReportOutcome {
+    FrameTask {
+        capacity: LifecycleContinuationCapacity,
+        task: RootFrameTask,
+    },
+    MountRequest {
+        capacity: LifecycleContinuationCapacity,
+        request: MountRequest,
+    },
+    Commit {
+        capacity: LifecycleContinuationCapacity,
+        ticket: CommitTicket,
+    },
+    FailureCleanup(BackTargetDriverFailureCleanupOwner),
+    Mismatch {
+        capacity: LifecycleContinuationCapacity,
+        task: RootFrameTask,
+        report: BackTargetAppliedReport,
+        mismatch: PreparationReceiverMismatchView,
+    },
 }
 #[doc(hidden)]
 pub struct ProvenEmptyApprovalView { inner: CoreProvenEmptyApprovalProjection }
@@ -2016,6 +2081,66 @@ pub(crate) struct TargetPreparationOwner {
     history: HistoryExecutionBindingView,
     continuation: LifecycleContinuationCapacity,
 }
+pub(crate) struct FrozenBackTargetDriverZeroPhysicalProof {
+    /* task + pending lineage；complete registry/relationship target-protected partition；target failure manifest exact-zero */
+}
+pub(crate) struct BackTargetDriverZeroPhysicalOwner {
+    pending: PendingCommit,
+    proof: FrozenBackTargetDriverZeroPhysicalProof,
+}
+pub(crate) enum BackTargetDriverFailurePhysicalOwner {
+    ProvenZero(BackTargetDriverZeroPhysicalOwner),
+    Residual(FailedPreparedBranch),
+}
+impl BackTargetDriverFailurePhysicalOwner {
+    pub(crate) const fn report_mode(&self) -> BackTargetDriverFailureReportMode;
+}
+pub(crate) struct PendingBackTargetDriverFailureInput {
+    driving: PendingBackTargetDriving,
+    task: RootFrameTask,
+    physical: BackTargetDriverFailurePhysicalOwner,
+    kind: ViewFailureKind,
+    message: &'static str,
+}
+pub(crate) struct PendingBackTargetAppliedReportInput {
+    driving: PendingBackTargetDriving,
+    task: RootFrameTask,
+    pending: PendingCommit,
+    report: BackTargetAppliedReport,
+}
+pub(crate) struct PendingBackTargetAppliedReportMismatch {
+    owner: PendingBackTargetAppliedReportInput,
+    mismatch: PreparationReceiverMismatchView,
+}
+pub(crate) struct PendingBackTargetAppliedMountRequest {
+    driving: PendingBackTargetDriving,
+    request: MountRequest,
+    pending: PendingCommit,
+}
+pub(crate) struct PendingBackTargetDriverFailureReported {
+    history: HistoryExecutionBindingView,
+    physical: BackTargetDriverFailurePhysicalOwner,
+    outcome: BackTargetDriverFailureCoreOutcome,
+}
+pub(crate) enum PendingBackTargetDriverFailure {
+    Unaccepted(PendingBackTargetDriverFailureInput),
+    ReceiverMismatch {
+        owner: PendingBackTargetDriverFailureInput,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    Reported(PendingBackTargetDriverFailureReported),
+    ConsumeMismatch {
+        owner: PendingBackTargetDriverFailureReported,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    PhysicalMismatch {
+        owner: PendingBackTargetDriverFailureReported,
+        evidence: BackTargetDriverPhysicalMismatchEvidence,
+    },
+}
+pub(crate) struct BackTargetDriverPhysicalMismatchEvidence {
+    /* Residual paired with Fallback or Terminal */
+}
 pub(crate) enum PendingBackTargetResumeBlocked {
     Start {
         start: BackTargetStart,
@@ -2030,6 +2155,9 @@ pub(crate) enum PendingBackTargetResumeBlocked {
         owner: PendingBackTargetDriving,
         mismatch: PreparationReceiverMismatchView,
     },
+    DriverFailure(PendingBackTargetDriverFailure),
+    AppliedReportMismatch(PendingBackTargetAppliedReportMismatch),
+    AppliedMountRequestPending(PendingBackTargetAppliedMountRequest),
     Permanent {
         owner: BackTargetPermanentOwner,
         retirement: BackCapacityRetirementEvidence,
@@ -2302,6 +2430,14 @@ pub(crate) fn bind_canonical_zero_ledger_to_batch(
 pub(crate) fn drive_back_no_target_zero_completion(
     entry: &mut RouterEntry,
 ) -> BackNoTargetCleanupDriverOutcome;
+pub(crate) fn drive_back_target_driver_failure(
+    entry: &mut RouterEntry,
+);
+pub(crate) fn prove_back_target_driver_zero_physical(
+    world: &World,
+    pending: PendingCommit,
+    task: &RootFrameTask,
+) -> Result<BackTargetDriverZeroPhysicalOwner, FailedPreparedBranch>;
 ```
 
 Also scaffold the existing exact `PreparationBoundaryScopeView`、two-variant `PreparationRetryEvidence`、`ProvenEmptyProjection`/target-protected source types、`LifecycleContinuationCapacity` and conversion signatures
@@ -2314,6 +2450,29 @@ impl RouterEngine {
         owner: BackTargetExecutionOwnerRef<'_>,
         physical: BackTargetPhysicalOwnerRef<'_>,
     ) -> BackTargetExecutionPairingOutcome;
+    #[doc(hidden)]
+    pub fn report_back_target_failed(
+        &mut self,
+        history: &HistoryExecutionBindingView,
+        capacity: LifecycleContinuationCapacity,
+        task: RootFrameTask,
+        kind: ViewFailureKind,
+        message: &'static str,
+        mode: BackTargetDriverFailureReportMode, // only physical.report_mode() at this atomic callsite
+    ) -> BackTargetDriverFailureReportOutcome;
+    #[doc(hidden)]
+    pub fn consume_back_target_driver_failure(
+        &mut self,
+        owner: BackTargetDriverFailureCoreOutcome,
+    ) -> BackTargetDriverFailureConsumeOutcome;
+    #[doc(hidden)]
+    pub fn report_back_target_applied(
+        &mut self,
+        history: &HistoryExecutionBindingView,
+        capacity: LifecycleContinuationCapacity,
+        task: RootFrameTask,
+        report: BackTargetAppliedReport,
+    ) -> BackTargetAppliedReportOutcome;
     pub fn accept_back_target_ready(
         &mut self,
         capacity: LifecycleContinuationCapacity,
@@ -2389,9 +2548,21 @@ pub(crate) fn settle_back_no_target_physical_permanent(
 
 `PreparationBoundaryScopeView` has one producer: the read-only `LifecycleContinuationCapacity::preparation_boundary_scope` projection from the same capacity passed to the receiver. The view is validation-only；it cannot consume or reconstruct the capacity and grants no mutation or publication authority. `PreparationReceiverMismatchView` is Core-owned、opaque and non-authorizing. Only a Core exact receiver creates it; ECS can retain it for diagnostics but cannot construct it、inspect raw identity or rebuild an owner. The three target acceptance receivers exact-match engine、capacity and that scope and return `BackTargetPreparationAcceptance::Matched | Mismatch`；Mismatch returns the original capacity + opaque view with zero write. `LifecyclePreflightEvidence` remains ECS crate-private and stays paired with the original ECS physical/preparation owner
 
-`RouterEntry::pending_back_target_execution` is the sole entry-local stage owner for target execution and does not extend `PendingCommit`. `ResumeBlocked` retains every uninstalled `{ start/owner/bound, retirement/evidence/error }` dispatcher branch，so no second safe-stop field is needed. `Driving` holds only history + continuation capacity and exact-pairs with the existing physical action owner；real ticket + splice whole-transition it through `Classifying`. That subenum owns every physical-classification、branch-specific acceptance、Ready plan-preparation and ledger-reserve state，including `ReadyPlanRetry | ReadyPlanPermanent` whole pre-accept owners. Accepted PendingRejected/AuthorityLost hold only `BackTargetClassifiedPhysicalOwner { splice, history }` + converted Core continuation/settlement + classifier evidence，never the old capacity or normal Ready ledger. `Prepared` exists only after Ready acceptance and ledger reserve succeed，owning physical、prepared continuation、`PreparedCleanupLedger` and Core `CleanupManifest`. `CommitFailure` retains the same prepared owner on pairing/receiver mismatch or `{ physical, prepared ledger, true Core failure }`. Every transition preflights destination vacancy、whole-takes the current variant and installs exactly one successor；publication、dedicated failure/authority handoff or terminal leaves the field empty
+`RouterEntry::pending_back_target_execution` is the sole entry-local stage owner for target execution and does not extend `PendingCommit`. `ResumeBlocked` retains every uninstalled start/permanent/capacity-rejected/receiver-mismatch/driver-failure/applied-report-mismatch/applied-mount-request whole owner，so no second safe-stop field is needed. `Driving` holds only history + continuation capacity and exact-pairs with the existing physical action owner；real ticket + splice whole-transition it through `Classifying`. That subenum owns every physical-classification、branch-specific acceptance、Ready plan-preparation and ledger-reserve state，including `ReadyPlanRetry | ReadyPlanPermanent` whole pre-accept owners. Accepted PendingRejected/AuthorityLost hold only `BackTargetClassifiedPhysicalOwner { splice, history }` + converted Core continuation/settlement + classifier evidence，never the old capacity or normal Ready ledger. `Prepared` exists only after Ready acceptance and ledger reserve succeed，owning physical、prepared continuation、`PreparedCleanupLedger` and Core `CleanupManifest`. `CommitFailure` retains the same prepared owner on pairing/receiver mismatch or `{ physical, prepared ledger, true Core failure }`. Every transition preflights destination vacancy、whole-takes the current variant and installs exactly one successor；publication、dedicated failure/authority handoff or terminal leaves the field empty
 
 `validate_back_target_execution_pairing` is the single Core opaque exact predicate for action injection、retry restore、final-task → ticket and commit entry. It borrows the current stage authority plus the existing action/frame/mount/ticket owner and exact-matches engine、request、transaction、scope and task/ticket identity without consuming or reconstructing either owner. Mismatch moves the unchanged current whole owner + opaque evidence into `ResumeBlocked::DrivingPairingMismatch`、`Classifying::PairingMismatch` or `CommitFailure::PairingMismatch`；no automatic per-tick retry or public write is allowed
+
+Before any target-active FrameTask failure report，ECS requires ordinary `pending_failed_branch` empty and whole-moves Driving + exact task + typed physical owner + kind/message into `ResumeBlocked::DriverFailure::Unaccepted`. `prove_back_target_driver_zero_physical(world, pending, &task)` is the sole zero producer：it follows task identity + pending target lineage through the same World registry/relationship closure，builds complete target/protected partition and proves only the target failure manifest exact-zero. Existing active/preserved stays protected and may exist. The producer must not reuse `FrozenCleanupManifest::from_failed_prepared_branch` empty-owner shortcut，because that path does not inspect World/registry and cannot detect observer residual. Physical is only `ProvenZero` or `Residual(FailedPreparedBranch)`；`physical.report_mode()` is the sole mode producer
+
+`report_back_target_failed` exact-matches history、raw capacity and task before mutation. Mismatch reports zero times and reconstructs `ReceiverMismatch` whole；Matched keeps any temporary continuation private to that call and returns only a true post-report `FailureCleanup | Fallback | Terminal` owner，never `Option` or raw capacity. Report and consume are synchronous with no intervening World write、schedule boundary or yield，so sealed ProvenZero is not rebuilt
+
+`drive_back_target_driver_failure` whole-takes Reported and is the sole caller of `consume_back_target_driver_failure`. Residual + Fallback/Terminal becomes typed `PhysicalMismatch` without consuming Core owner. Otherwise Core exact consumer validates the bound fresh fallback attempt/action and returns a real cleanup request、`FallbackReleased` with that action still engine-held、terminal evidence or whole-owner Mismatch. ECS reconstructs `ConsumeMismatch` on wrong receiver；exact cleanup alone installs `pending_failed_branch`，exact fallback/terminal clear the stage，after which only the normal action loop may take the released fallback action. The driver never opens private inner、reads `engine.action()` or infers from `Option`/count
+
+`report_back_target_applied` is the only target path for `LegacyLeaf | WithOutlets`. It exact-matches history、capacity、task and report before mutation；Mismatch returns all four owners and installs `ResumeBlocked::AppliedReportMismatch`. `FrameTask | MountRequest | Commit` return the same raw capacity and rerun exact pairing. Applied FailureCleanup directly seals the already realized pending/frame owner as `Residual(FailedPreparedBranch)` and enters `DriverFailure::Reported`；it must not attempt ProvenZero after Core mutation
+
+FrameTask continues this target FrameTask slice and Commit enters Classifying. MountRequest is not sent to generic `pending_mount_request`：ECS installs `AppliedMountRequestPending { driving: history + returned capacity, request, pending }` in the same target field，keeps the ordinary mount field empty and safe-stops before action selection until the target MountRequest owner slice is implemented. Root final task → ticket and intermediate outlet report may not call generic consuming applied APIs or use `expect`
+
+These rules cover identity/expected-outlet contradiction、host/authority loss、binding/driver absence、BuildFailed/ApplyFailed、apply stale、realization with or without residual、`push_frame` failure、parent preflight rejection、applied-outlet reconciliation/mount failure and leaf final-report error. A driver report identity mismatch remains the existing paired `PendingFrameDrive` retry and is not a failure. `MountRequest` follows the same owner rule when that action slice is implemented；Ready/publisher semantics do not change
 
 `classify_back_target(world: &World, entry: &mut RouterEntry, owner)` and `classify_back_no_target(world: &World, entry: &mut RouterEntry, owner)` receive the same World explicitly and read `RouteEntityRegistry` only from it；neither accepts an independently supplied registry/reference. Existing `drive_navigation_system` already uses `World::resource_scope`，so the closure can retain the mutable `RouterNavigation` entry while passing that same World as read-only physical context
 
@@ -2429,7 +2600,7 @@ The pre-proof `AuthorityLost` arm follows the same boundary inside `classify_bac
 
 `settle_back_no_target_source_drift_permanent` keeps the complete `{ raw drift, permit }` outside the callback. Issuer preflight `Err` creates no `LeasedRetire` guard/evidence、does not call Core and returns `CapacityRejected`；Core receiver mismatch after successful preflight calls the callback zero times、drops guard/evidence and returns `ReceiverMismatch` with the full composite. Exact receiver calls only `guard.commit()` once、terminals immediately，then ECS drops the stale permit and seals prepared retirement evidence in that exact arm
 
-Missing symbols、placeholder panics、test setup failures and injected outcomes do not count as RED
+Missing symbols、placeholder panics、test setup failures and directly injected outcomes do not count as RED
 
 | RED/gate | Required production assertion |
 | --- | --- |
@@ -2445,8 +2616,11 @@ Missing symbols、placeholder panics、test setup failures and injected outcomes
 | `back_target_pending_rejected_converts_exact_owner_before_public_state` | PendingRejected converts the exact owner before any public state |
 | `back_target_authority_lost_converts_exact_owner_before_public_state` | AuthorityLost converts the exact owner before any public state |
 | `back_target_retry_returns_exact_owner_capability_and_evidence` | Retry returns the exact live owner、capability、continuation and evidence with zero write |
-| `back_target_resume_action_follows_real_reconciliation` | real direct entering returns `FrameTask`，a nested target whose prior parent/slot is not reusable returns `MountRequest`，duplicate/equivalent and pure-truncate zero-entering return the real `Commit` action；unused reserved frame/task identities remain permanently burned |
-| `back_target_dispatcher_consumes_verified_bound_target_through_normal_publication_once` | one real root FrameTask target stays in one `drive_navigation_system` `World::resource_scope` call stack from pure physical Ready through ECS/Core manifest freeze、borrowed publisher-plan preparation、typed acceptance、ledger reserve、bridge validation and the existing publisher exactly once；the closure only applies prepared plans，normal success leaves no ReadyAccepted/Prepared stage and terminal inventory is empty |
+| `back_target_resume_action_follows_real_reconciliation` | real direct entering returns `FrameTask`，a nested target whose prior parent/slot is not reusable returns `MountRequest`，duplicate/equivalent and pure-truncate zero-entering return the real `Commit` action；the current slice keeps initial Ready MountRequest whole in `ResumeBlocked::Start` with the generic mount field empty；unused reserved frame/task identities remain permanently burned |
+| `back_target_dispatcher_consumes_verified_bound_target_through_normal_publication_once` | one real root FrameTask target uses atomic applied-report outcome and exact pairing to reach a real ticket，then stays in one `drive_navigation_system` `World::resource_scope` call stack from pure physical Ready through manifest freeze、borrowed plans、acceptance、ledger reserve、bridge validation and existing publisher exactly once；normal success leaves no ReadyAccepted/Prepared stage and terminal inventory is empty |
+| `back_target_driver_failure_report_consume_uses_real_dispatcher` | ECS `--lib` dynamic test drives the real dispatcher and production predicates through atomic report + sole consume for cleanup、fallback/terminal and wrong report/consume receiver；same-World ProvenZero rejects observer residual while protected active remains outside the target failure manifest；fixtures may alter predicate inputs but never inject outcomes |
+| `back_target_atomic_applied_report_uses_real_dispatcher` | ECS `--lib` dynamic test drives the real applied-report dispatcher through `FailureCleanup → Residual`、MountRequest target-field safe-stop and Mismatch returning capacity、task、report and opaque evidence；generic mount/failed fields remain empty until the typed owner is consumed |
+| `back_target_frame_task_failures_preserve_one_typed_execution_owner` | static gate audits every named FrameTask failure exit；ProvenZero must scan task lineage + registry/relationship closure、exclude protected active and reject observer residual，removing proof、using empty failed-branch shortcut or allowing independent mode fails；Residual cannot consume Fallback/Terminal；wrong failure/applied/consume receiver returns every owner；applied cleanup is directly Residual，FrameTask/Commit preserve exact pairing，MountRequest stays whole in target safe-stop with generic mount field empty；Fallback action remains unavailable until Core consume + stage clear；no generic consuming report/private-inner/action/Option inference，all outcomes close inventory |
 | `back_target_dispatch_owners_are_linear_and_exact` | static/focused gate proves both classifiers accept the same `&World` and read registry only from it；one RouterEntry field owns mutually exclusive `ResumeBlocked | Driving | Classifying | Prepared | CommitFailure` stages，including typed Ready plan Retry/Permanent whole owners，with no second safe-stop Option；Ready publisher plans are borrowed stack capabilities prepared before acceptance，never stored or rebuilt，and failure drops them before saving the exact stage owner；Matched installs/whole-takes ReadyAccepted then Prepared in one borrow，reserve failure alone persists ReadyReserveFailure with the returned frozen manifest；only `prepare_back_target_commit` reaches the existing publisher，whose atomic tail performs no allocation、query or validation，while every mismatch/failure remains typed and terminal inventory is empty |
 | `back_target_mount_exhaustion_is_failure_cleanup_not_resume_action` | real nested mount issue exhaustion produces `BackTargetStart::FailureCleanup(FailureCleanupRequest)`，never a resume action or panic，and flows only into the existing failure-cleanup owner chain |
 | `back_target_resume_action_is_not_facade_reachable` | compile/static facade fixture proves `BackTargetResumeAction`、`BackTargetStart` and their variants cannot be named or reexported through the facade，while the facade export golden/profile remains unchanged |
@@ -2491,6 +2665,9 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_target_retry_returns_exact_owner_capability_and_evidence -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib back_target_resume_action_follows_real_reconciliation -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_target_dispatcher_consumes_verified_bound_target_through_normal_publication_once -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_target_driver_failure_report_consume_uses_real_dispatcher -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_target_atomic_applied_report_uses_real_dispatcher -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --test authority_regression_catalogue back_target_frame_task_failures_preserve_one_typed_execution_owner -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --test authority_regression_catalogue back_target_dispatch_owners_are_linear_and_exact -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib back_target_mount_exhaustion_is_failure_cleanup_not_resume_action -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_authority_compile_fail back_target_resume_action_is_not_facade_reachable -j 1
@@ -2521,7 +2698,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_authority_compile_fail -j 1
 ```
 
-Expected: scaffold compiles; behavioral groups fail on named production predicates and negative gates pass only for intended privacy/non-Clone reasons
+Expected: scaffold compiles; behavioral groups fail on named production predicates and negative gates pass only for intended privacy/non-Clone reasons. Both new ECS `--lib` focused commands must compile、reach the real dispatcher/predicate and fail on their named missing behavior before implementation；missing symbols、setup failure、placeholder panic or direct outcome injection invalidates the RED
 
 - [ ] **Step 8: Implement live resolution, typed handoff and disposition**
 
@@ -2547,8 +2724,12 @@ ECS exact take retains the complete bound capacity outside the callback
 -> the single entry stage field installs ResumeBlocked or Driving；no second safe-stop Option
 -> Core opaque pairing predicate validates action injection and every later physical owner transition
 -> FrameTask: report/apply the real task to obtain CommitTicket
-   MountRequest: run the existing nested mount handshake until a real CommitTicket
+   MountRequest: keep the complete initial Ready owner in ResumeBlocked::Start and safe-stop until the target action slice exists；do not enter the generic mount handshake
    Commit: use the returned CommitTicket directly with no frame report
+-> target-active FrameTask failure proves ProvenZero or retains Residual，then whole-moves Driving + task + physical + kind/message into ResumeBlocked::DriverFailure::Unaccepted while pending_failed_branch remains empty
+-> report_back_target_failed mismatch reports zero times and restores ReceiverMismatch whole；Matched returns true post-report Cleanup | Fallback | Terminal without raw capacity
+-> DriverFailure Reported rejects Residual+Fallback/Terminal；otherwise consume_back_target_driver_failure returns request | FallbackReleased | terminal evidence | whole-owner mismatch
+-> root leaf and outlet reports use report_back_target_applied only；Mismatch installs AppliedReportMismatch whole，FrameTask/Commit retain capacity and exact pairing，MountRequest enters target-field safe-stop，true cleanup seals pending as Residual and enters DriverFailure::Reported
 -> final-task/ticket pairing exact；Driving whole-transitions to Classifying(TargetPreparationOwner)
 -> drive_navigation_system resource_scope passes the same &World to classify_back_target/classify_back_no_target；registry is read only from that World
 -> classify_back_target performs pure physical classification only
@@ -2570,7 +2751,8 @@ Core never constructs ECS `BackTargetReadyAcceptanceOwner`、`PreparedCleanupLed
 
 - target resolution stays inside `resume_bound_back_target(&mut RouterEntry, bound)`: the entry-owned issuer first performs `preflight_bound_retirement(&mut issuer, &bound, Target)` to create a lifetime-bound guard + private prepared evidence while `bound` remains outside the closure；wrong engine returns the verified target before preparation、calls the closure zero times、drops the uncommitted guard/evidence and lets ECS restore the complete bound branch；exact receiver refreezes history source、host/top-slot and active/child-slot baseline，再完成 matcher、reconciliation、generation/depth validation、first-action construction and mount issue into private `PreparedReady | PreparedFailureCleanup | PreparedPermanent` before invoking a callback that only moves `guard.commit()` once。After the exact outer outcome returns，ECS unconditionally drops the stale bound and seals the prepared evidence into the returned `Resumed | Permanent` retirement evidence；guard commit never performs lookup/index/query、allocation、validation、`expect`、`unwrap`、unsafe or action-domain `unreachable!`
 - the exact-entry dispatcher treats returned `BackCapacityRetirementEvidence` as non-authorizing terminal evidence，requires the existing issuer classifier to report exact `ConsumedReplay` and explicitly ends it in the same dispatch that installs Ready、FailureCleanup or Permanent. Any branch not installed immediately enters the same field's `ResumeBlocked { complete start/owner/bound + retirement/evidence/error }` subenum；retirement never enters `TargetPreparationOwner` or the failure-cleanup chain，and no second dispatch safe-stop field is allowed
-- `Resumed(BackTargetStart::Ready)` carries one linear `FrameTask | MountRequest | Commit` action with the same execution binding and continuation. ECS installs `Driving` only after `validate_back_target_execution_pairing` exact-matches the returned action；retry restore、pending frame/final task → real ticket and commit entry rerun the same borrowed predicate. Mismatch retains the complete unchanged stage owner + opaque view，never reconstructs authority or retries every tick. FrameTask obtains its commit through real report/apply，MountRequest enters the existing nested mount handshake and follows subsequent real actions until commit，direct Commit performs no frame report
+- `Resumed(BackTargetStart::Ready)` carries one linear `FrameTask | MountRequest | Commit` action with the same execution binding and continuation. ECS installs `Driving` only after `validate_back_target_execution_pairing` exact-matches `FrameTask | Commit`；retry restore、pending frame/final task → real ticket and commit entry rerun the same borrowed predicate. Mismatch retains the complete unchanged stage owner + opaque view，never reconstructs authority or retries every tick. FrameTask obtains its commit through real report/apply and direct Commit performs no frame report. Initial Ready MountRequest remains whole as `ResumeBlocked::Start` with ordinary mount fields empty and safe-stops until the target MountRequest action slice is implemented；the generic handshake never holds this owner
+- every target-active FrameTask failure first freezes same-World physical as `ProvenZero { PendingCommit, proof } | Residual(FailedPreparedBranch)`，derives mode only from that variant and installs `DriverFailure::Unaccepted` with ordinary failed field empty. ProvenZero scans task lineage + registry/relationship closure，proves target failure manifest zero and excludes protected active；the empty failed-branch shortcut is forbidden. Atomic failure/consume returns exact typed owners，Residual+Fallback/Terminal fail-closes without consume. Atomic applied report exclusively handles leaf/outlets；cleanup directly becomes Residual，FrameTask/Commit keep exact pairing，MountRequest safe-stops whole in the target field with ordinary mount field empty. Generic consuming report、`expect`、private-inner/action/Option inference are forbidden；paired `PendingFrameDrive` identity retry remains non-failure
 - the minimum root FrameTask slice must reach a real `CommitTicket`、exact splice、physical classifier and typed Core Ready acceptance before commit preparation. Every variant transition is one whole-take；other resume/classifier/acceptance branches remain in `ResumeBlocked | Classifying | CommitFailure` with public zero-write until their dedicated consumer exists
 - `Resumed(BackTargetStart::FailureCleanup)` either atomically moves the real `FailureCleanupRequest` into the existing failure-cleanup chain or remains whole in `ResumeBlocked::Start`；it never constructs `TargetPreparationOwner`、splice or publication owner，and mount issue exhaustion reaches only this branch
 - same-engine source/host/baseline drift and generation/depth contradiction return typed `Permanent/AuthorityLost` after the exact receiver calls retirement once，not `Mismatch`，only this pre-splice branch enters `settle_back_target_permanent`，which delegates to Core `settle_back_target_permanent_exact`，settlement wrong engine preserves the Core owner + evidence and exact success returns existing AuthorityLost terminal/settlement evidence
@@ -2592,6 +2774,9 @@ Rerun every Step 4 and Step 7 focused command, including these exact GREEN filte
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib back_target_resume_action_follows_real_reconciliation -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_target_dispatcher_consumes_verified_bound_target_through_normal_publication_once -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_target_driver_failure_report_consume_uses_real_dispatcher -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --lib back_target_atomic_applied_report_uses_real_dispatcher -j 1
+cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --test authority_regression_catalogue back_target_frame_task_failures_preserve_one_typed_execution_owner -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --test authority_regression_catalogue back_target_dispatch_owners_are_linear_and_exact -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib back_target_mount_exhaustion_is_failure_cleanup_not_resume_action -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core --lib back_target_receiver_mismatch_calls_zero_and_exact_receiver_calls_once -j 1

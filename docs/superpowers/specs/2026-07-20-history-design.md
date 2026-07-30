@@ -308,9 +308,29 @@ contradiction terminal 与 no-target transfer/refreeze 继续遵循 wrong receiv
 
 `BackTargetResume` 的 action、execution 与 continuation 是同一个 move-only resume 结果，并与 engine-held history capability 保持唯一关联
 
-ECS 使用唯一 `RouterEntry::pending_back_target_execution` 阶段 enum 线性持有完整 target lifecycle owner，不扩展通用 `PendingCommit`。`ResumeBlocked` 保存所有未安装的 start/permanent/capacity-rejected/receiver-mismatch 完整分支，禁止第二 dispatch safe-stop field；`Driving` 只持 history execution + continuation capacity 并与既有 physical action owner exact 配对；real ticket + splice 后 whole-transition 为 `Classifying`，该阶段完整持有 pure physical classification、branch-specific acceptance、Ready plan retry/permanent、Ready accepted 与 ledger reserve failure owner。只有 Ready acceptance 与 ledger reserve 均成功后才进入同时持有完整 physical owner、prepared continuation、`PreparedCleanupLedger` 与 Core `CleanupManifest` 的 `Prepared`；bridge mismatch/failure 进入保留同一 physical/ledger/Core owner 的 `CommitFailure`。各 variant 互斥，每次转换只能 whole-take 后单次安装；进入 post-accept variant 后不得重建旧 capacity，也不得同时保留 `Driving`、`TargetPreparationOwner` 或 prepared owner。任何尚未接线的 typed 分支原样 safe-stop，publication、failure/authority handoff 或 terminal 后该字段必须为空
+ECS 使用唯一 `RouterEntry::pending_back_target_execution` 阶段 enum 线性持有完整 target lifecycle owner，不扩展通用 `PendingCommit`。`ResumeBlocked` 保存所有未安装的 start/permanent/capacity-rejected/receiver-mismatch/driver-failure/applied-report-mismatch/applied-mount-request 完整分支，禁止第二 dispatch safe-stop field；`Driving` 只持 history execution + continuation capacity 并与既有 physical action owner exact 配对；real ticket + splice 后 whole-transition 为 `Classifying`，该阶段完整持有 pure physical classification、branch-specific acceptance、Ready plan retry/permanent、Ready accepted 与 ledger reserve failure owner。只有 Ready acceptance 与 ledger reserve 均成功后才进入同时持有完整 physical owner、prepared continuation、`PreparedCleanupLedger` 与 Core `CleanupManifest` 的 `Prepared`；bridge mismatch/failure 进入保留同一 physical/ledger/Core owner 的 `CommitFailure`。各 variant 互斥，每次转换只能 whole-take 后单次安装；进入 post-accept variant 后不得重建旧 capacity，也不得同时保留 `Driving`、`TargetPreparationOwner` 或 prepared owner。任何尚未接线的 typed 分支原样 safe-stop，publication、failure/authority handoff 或 terminal 后该字段必须为空
 
-`FrameTask` 分支经真实 frame report/apply 取得 commit，`MountRequest` 分支进入既有 nested mount handshake，`Commit` 分支不产生 frame report，三者取得 commit 后完成 physical preparation 并进入既有 `prepare_commit`
+`FrameTask` 分支经真实 frame report/apply 取得 commit，`Commit` 分支不产生 frame report，两者取得 commit 后完成 physical preparation 并进入既有 `prepare_commit`。initial Ready 的 `MountRequest` 在当前 slice 必须连同完整 start owner 保留为 `ResumeBlocked::Start` 并 safe-stop，普通 mount field 保持空，等待 target MountRequest action slice
+
+target-active `FrameTask` 的任何真实失败在 report 前必须整体持有 `PendingBackTargetDriving`、exact `RootFrameTask`、typed physical owner 与 kind/message，并要求普通 `pending_failed_branch` 为空。physical owner 只能是 `ProvenZero(BackTargetDriverZeroPhysicalOwner)` 或 `Residual(FailedPreparedBranch)`；`Normal | PhysicalResidual` mode 不得由 callsite 独立构造或保存，只能由 `physical.report_mode()` 临时导出并传入同一次 atomic report
+
+`ProvenZero` 的唯一 producer 必须按 task identity + pending target lineage 扫描同一 `world: &World` 的 registry/relationship closure，完成 authorized target 与 protected/preserved partition，并只证明 target failure exact Entity manifest 为零。既有 active current 可以存在且必须留在 protected，不能进入 failure manifest。`FrozenCleanupManifest::from_failed_prepared_branch` 的空-owner 快捷路径不读取 World/registry，禁止作为该 proof producer，否则 observer residual 会伪造 zero。proof 与整个 `PendingCommit` 封装，report 到 consume 之间不得有 World write、schedule boundary 或 yield
+
+唯一 target-specific Core receiver `report_back_target_failed` 必须在 report mutation 前 exact-match history、raw continuation capacity 与 task。Mismatch report 零次并返还 capacity、task 与 opaque mismatch；Matched 在同一调用栈把 capacity 转成私有临时 continuation 后立即执行真实 report，不得跨 schedule 保存 `RouteFailureContinuationOwner`。Core 只能按真实 post-report state 返回 `FailureCleanup | Fallback | Terminal` owner/evidence，不返回 `Option`，post-report owner 不再含 raw capacity
+
+target applied report 同样只能调用统一 atomic `report_back_target_applied(history, capacity, task, LegacyLeaf | WithOutlets)`。该 API 在 mutation 前 exact-match history、capacity、task 并验证 report 输入；Mismatch 零写返还 capacity、task、report 与 opaque mismatch并保存为 `AppliedReportMismatch`。真实 outcome 必须是 `FrameTask | MountRequest | Commit` 并返还同一 raw capacity，或 `FailureCleanup` 并返回真实 post-report cleanup owner且不返 raw capacity；不得消费 generic applied report 后再查询 action
+
+root final task → ticket 与 applied-with-outlets 均只能经过该 API。FrameTask/Commit 继续走 existing exact pairing；FailureCleanup 必须把已实现 frame/pending 直接封为 `Residual(FailedPreparedBranch)` 并进入 `DriverFailure::Reported`，不得在 Core mutation 后尝试 ProvenZero。MountRequest 必须把 history、returned capacity、request 与 pending whole-save 为 target-field `AppliedMountRequestPending`，普通 mount field 保持空并在 action selection 前 safe-stop，等待对应 action slice。reconciliation drift、mount issue 或内部 reissue 必须由 typed outcome 表达，不能使用 `expect`、`Option` 或事后 action 推断
+
+`DriverFailure` 至少持有 `Unaccepted | ReceiverMismatch | Reported { history, physical, true Core outcome } | ConsumeMismatch | PhysicalMismatch`。dedicated consumer whole-take Reported，且只能调用 `RouterEngine::consume_back_target_driver_failure`，不能拆 private inner、读取 `engine.action()` 或 `Option`
+
+Core consumer exact 验证 outcome receiver：FailureCleanup 解封真实 request；Fallback 验证绑定的 fresh fallback attempt/action 后返回 `FallbackReleased`，action 仍由 engine 持有，ECS 清 stage 后才由正常 action 驱动取走；Terminal 返回真实 opaque evidence；wrong receiver 零写返还 whole Core owner + mismatch，ECS 与 preserved history/physical 重组 `ConsumeMismatch`
+
+FailureCleanup 才可把真实 request 与 physical owner移入既有 `pending_failed_branch` 并清 stage。Fallback/Terminal 只接受 `ProvenZero`；`Residual` 与二者配对时不得调用 Core consumer，必须把完整 Reported owner 保存为 typed `PhysicalMismatch` 并 fail closed。exact Fallback/Terminal consume 后清 stage；任何 mismatch 保留完整 owner。generic `report_failed*`、`Option`、obligation count 或事后 `engine.action()` 不得参与 target failure 分类
+
+上述规则覆盖 identity/expected outlet、host/authority、binding/driver、BuildFailed/ApplyFailed、apply stale、realization 有无 residual、`push_frame`、parent preflight、原 `report_applied_with_outlets` failure-action 条件与 leaf final report error。report identity mismatch 仍是 paired `PendingFrameDrive` retry，不属于 failure。`MountRequest` 在其 action slice 采用同一规则，本次不提前实现；existing Ready/publisher 语义不变
+
+driver failure 与 atomic applied report 在实现前必须各有真实 ECS `--lib` 动态 RED，经真实 dispatcher 与生产 predicate 覆盖代表性 report/consume、zero proof、cleanup、fallback/terminal、wrong receiver、applied residual、MountRequest safe-stop 与全 owner Mismatch；authority catalogue 静态 gate 继续审计全部出口，但不能替代动态证据。missing symbol、setup failure、placeholder panic 或直接注入 outcome 均不算 RED
 
 `FailureCleanup` 只进入既有失败清理链，不能进入正常 publisher
 
@@ -680,7 +700,7 @@ x host epoch
 
 Back target 的正常 action domain 是 `FrameTask | MountRequest | Commit`
 
-nested entering 可以先产生 `MountRequest` 并沿用既有 mount handshake
+nested entering 可以先产生 `MountRequest`；当前 slice 将 initial Ready owner 保留为 `ResumeBlocked::Start`，applied owner 保留为 `AppliedMountRequestPending`，均不进入 generic mount handshake，等待 target MountRequest action slice
 
 mount issue exhaustion 独立产生 `FailureCleanupRequest`，不得伪装为 resume action
 
