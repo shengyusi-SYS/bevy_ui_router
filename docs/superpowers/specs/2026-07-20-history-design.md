@@ -518,6 +518,8 @@ logical roots 为空不能推导 Entity obligations 为零
 
 retained-empty、slot-only 或其他稀疏 topology 也不能绕过 proven-empty
 
+slot-only 指合法 branch/lifecycle partition 中 slot Entity 独立按 exact role、binding 与 obligation 分类，即使该 partition 没有 frame obligation；不得据此构造 zero-frame standalone current branch
+
 只有 proven-empty 且 authority valid 后，才允许不可失败配对转换
 
 ```text
@@ -761,6 +763,8 @@ current 与 next 分别冻结和验证
 retained-empty、slot-only 与其他 sparse topology 必须按每个 Entity 自身的 parent、outlet、slot identity、mount binding、owner、seal 与 lifecycle role 分类
 
 不得从 frame/slot 数量、数组位置或关联 frame/slot 的 lifecycle 并集推导 authority
+
+`MountedChildSlot` 的 exact parent/outlet/slot/anchor/claims 只锚定 support closure 复验；shell/content/output owner 仍来自 exact current/preserved `RealizedFrame`，registry projection 不得重建 owner
 
 ### 7.3.1 Sparse slot obligation derivation
 
