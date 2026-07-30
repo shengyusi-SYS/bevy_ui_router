@@ -514,6 +514,23 @@ ECS 必须产生 typed `ProvenEmptyProjection`
 
 完整 observed closure 不等同于 registered branch exact child set：unregistered app-owned/foreign 和明确 other-authority non-target descendant 归入 protected，这类合法 extras 本身不阻止 zero-obligation proof，exact anchor/claim/lifecycle/relationship invariant drift、cycle 或 unexpected same-authority Router-owned Entity 仍按 Matrix fail closed
 
+registered extra 必须按固定顺序分类
+
+1. 先冻结并校验 exact registry claim/owner、record lifecycle、registry manifest ⊆ physical manifest、seal、role-specific lifecycle/authority 和 observed parent/relationship
+2. 任一 physical fact 漂移立即返回 `BackNoTargetPhysicalFreezeOutcome::Indeterminate`，携带 registered-extra-specific typed cause 与完整 expected + observed physical projection，不调用 authority comparator
+3. physical facts 全部 exact 后才执行 same/other authority comparator；无法取得 opaque authority relation 时 cause 必须为 `OpaqueAuthorityRelationUnavailable`
+
+| owner kind | exact physical prerequisites | authority classification |
+| --- | --- | --- |
+| committed `FrameShell` / `FrameContentTarget` / `FrameOutput` | exact registry claim/owner/record lifecycle、registered manifest ⊆ physical manifest、seal、`FrameLifecycle`、observed parent/relationship | 使用 Core `frame_versions_share_router` 比较 owner frame 与 current authority |
+| committed/provisional `ChildSlot` | exact registry claim/owner/record lifecycle、registered manifest ⊆ physical manifest、seal、`ChildSlotLifecycle`、`ChildSlotAuthority`、observed parent/relationship | 使用 owner parent frame 与 Core frame comparator；不得从 anchor、binding 或 relationship 重建 owner |
+| committed `HostTopSlot` | exact registry claim/owner/record lifecycle、registered manifest ⊆ physical manifest、seal、matching `ProvisionalSlotLifecycle`、observed parent/relationship | 仅使用 Core doc-hidden `host_version_shares_router_with_frame` 比较 opaque `RouterIdentity`；不要求 `HostId` 相同 |
+| provisional `HostTopSlot` | exact registry claim/owner/record lifecycle、registered manifest ⊆ physical manifest、seal、matching `ProvisionalSlotLifecycle`、owner candidate revision、observed parent/relationship | 即使 physical facts exact 仍返回 `BackNoTargetPhysicalFreezeOutcome::Indeterminate` + `OpaqueAuthorityRelationUnavailable`；revision 仅是 observed owner fact，禁止据此反查 authority |
+
+exact same-authority extra 返回携带完整 observed authority projection 的 `UnexpectedSameAuthorityDescendant`，exact other-authority extra 进入 protected 并保留同一完整 projection；same-authority、physical drift 与 provisional Indeterminate 都返还完整原 `BackPreparationOwner`，other-authority `ProvenEmpty` 移动同一原 owner
+
+任一 registered extra 都不得成为 cleanup target 或 authority owner，也不得用于重建 owner/target，`authorized_targets` 始终为空
+
 logical roots 为空不能推导 Entity obligations 为零
 
 retained-empty、slot-only 或其他稀疏 topology 也不能绕过 proven-empty
