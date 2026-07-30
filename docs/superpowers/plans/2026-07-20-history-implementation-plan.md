@@ -2082,23 +2082,75 @@ pub(crate) struct TargetPreparationOwner {
     continuation: LifecycleContinuationCapacity,
 }
 pub(crate) struct FrozenBackTargetDriverZeroPhysicalProof {
-    /* task + pending lineage；complete registry/relationship target-protected partition；target failure manifest exact-zero */
+    /* exact root task/pending lineage + same-World complete partition + target failure manifest exact-zero */
 }
 pub(crate) struct BackTargetDriverZeroPhysicalOwner {
     pending: PendingCommit,
     proof: FrozenBackTargetDriverZeroPhysicalProof,
 }
-pub(crate) enum BackTargetDriverFailurePhysicalOwner {
-    ProvenZero(BackTargetDriverZeroPhysicalOwner),
+pub(crate) struct BackTargetDriverPhysicalPartitionSource {
+    /* non-authorizing exact task lineage、host/top-slot、active/protected、mount/role/reconciliation、owner correlation */
+}
+pub(crate) struct BackTargetDriverPostReportRefreezeSource {
+    /* linearly sealed from the exact pre-report source before report；non-authorizing */
+}
+pub(crate) struct FrozenBackTargetDriverPhysicalPartitionProof {
+    /* registry + World + relationship completeness；target/protected disjoint */
+}
+pub(crate) struct FrozenBackTargetDriverPhysicalIndeterminateEvidence {
+    /* exact source/expectation/observed drift + owner correlation */
+}
+pub(crate) enum BackTargetDriverUnverifiedPhysicalOwner {
+    Pending(PendingCommit),
     Residual(FailedPreparedBranch),
 }
-impl BackTargetDriverFailurePhysicalOwner {
+pub(crate) struct BackTargetDriverResidualPhysicalOwner {
+    branch: FailedPreparedBranch,
+    proof: FrozenBackTargetDriverPhysicalPartitionProof,
+}
+pub(crate) enum BackTargetDriverReportablePhysicalOwner {
+    ProvenZero(BackTargetDriverZeroPhysicalOwner),
+    Residual(BackTargetDriverResidualPhysicalOwner),
+}
+impl BackTargetDriverReportablePhysicalOwner {
     pub(crate) const fn report_mode(&self) -> BackTargetDriverFailureReportMode;
+    pub(crate) fn into_unverified(self) -> BackTargetDriverUnverifiedPhysicalOwner;
+}
+pub(crate) struct BackTargetDriverPhysicalIndeterminateOwner {
+    original: BackTargetDriverUnverifiedPhysicalOwner,
+    evidence: FrozenBackTargetDriverPhysicalIndeterminateEvidence,
+}
+pub(crate) enum BackTargetDriverPhysicalClassification {
+    Reportable(BackTargetDriverReportablePhysicalOwner),
+    Indeterminate(BackTargetDriverPhysicalIndeterminateOwner),
+}
+pub(crate) struct PendingBackTargetDriverFailureUnverifiedInput {
+    driving: PendingBackTargetDriving,
+    task: RootFrameTask,
+    physical: BackTargetDriverUnverifiedPhysicalOwner,
+    kind: ViewFailureKind,
+    message: &'static str,
+}
+pub(crate) enum PendingBackTargetDriverPhysicalIndeterminate {
+    DriverFailure {
+        driving: PendingBackTargetDriving,
+        task: RootFrameTask,
+        physical: BackTargetDriverPhysicalIndeterminateOwner,
+        kind: ViewFailureKind,
+        message: &'static str,
+    },
+    AppliedReport {
+        driving: PendingBackTargetDriving,
+        task: RootFrameTask,
+        physical: BackTargetDriverPhysicalIndeterminateOwner,
+        report: BackTargetAppliedReport,
+    },
 }
 pub(crate) struct PendingBackTargetDriverFailureInput {
     driving: PendingBackTargetDriving,
     task: RootFrameTask,
-    physical: BackTargetDriverFailurePhysicalOwner,
+    physical: BackTargetDriverReportablePhysicalOwner,
+    post_refreeze: BackTargetDriverPostReportRefreezeSource,
     kind: ViewFailureKind,
     message: &'static str,
 }
@@ -2107,6 +2159,7 @@ pub(crate) struct PendingBackTargetAppliedReportInput {
     task: RootFrameTask,
     pending: PendingCommit,
     report: BackTargetAppliedReport,
+    post_refreeze: BackTargetDriverPostReportRefreezeSource,
 }
 pub(crate) struct PendingBackTargetAppliedReportMismatch {
     owner: PendingBackTargetAppliedReportInput,
@@ -2119,22 +2172,41 @@ pub(crate) struct PendingBackTargetAppliedMountRequest {
 }
 pub(crate) struct PendingBackTargetDriverFailureReported {
     history: HistoryExecutionBindingView,
-    physical: BackTargetDriverFailurePhysicalOwner,
+    physical: BackTargetDriverReportablePhysicalOwner,
+    post_refreeze: BackTargetDriverPostReportRefreezeSource,
     outcome: BackTargetDriverFailureCoreOutcome,
 }
+pub(crate) struct PendingBackTargetDriverFailurePostReport {
+    history: HistoryExecutionBindingView,
+    physical: BackTargetDriverUnverifiedPhysicalOwner,
+    post_refreeze: BackTargetDriverPostReportRefreezeSource,
+    outcome: BackTargetDriverFailureCoreOutcome,
+}
+pub(crate) struct PendingBackTargetDriverPostReportPhysicalIndeterminate {
+    history: HistoryExecutionBindingView,
+    physical: BackTargetDriverPhysicalIndeterminateOwner,
+    post_refreeze: BackTargetDriverPostReportRefreezeSource,
+    outcome: BackTargetDriverFailureCoreOutcome,
+}
+pub(crate) enum BackTargetDriverPostReportPhysicalClassification {
+    Reportable(BackTargetDriverReportablePhysicalOwner),
+    PostReportIndeterminate(BackTargetDriverPhysicalIndeterminateOwner),
+}
 pub(crate) enum PendingBackTargetDriverFailure {
+    PhysicalIndeterminate(PendingBackTargetDriverPhysicalIndeterminate),
     Unaccepted(PendingBackTargetDriverFailureInput),
     ReceiverMismatch {
-        owner: PendingBackTargetDriverFailureInput,
+        owner: PendingBackTargetDriverFailureUnverifiedInput,
         mismatch: PreparationReceiverMismatchView,
     },
     Reported(PendingBackTargetDriverFailureReported),
     ConsumeMismatch {
-        owner: PendingBackTargetDriverFailureReported,
+        owner: PendingBackTargetDriverFailurePostReport,
         mismatch: PreparationReceiverMismatchView,
     },
+    PostReportPhysicalIndeterminate(PendingBackTargetDriverPostReportPhysicalIndeterminate),
     PhysicalMismatch {
-        owner: PendingBackTargetDriverFailureReported,
+        owner: PendingBackTargetDriverFailurePostReport,
         evidence: BackTargetDriverPhysicalMismatchEvidence,
     },
 }
@@ -2433,11 +2505,30 @@ pub(crate) fn drive_back_no_target_zero_completion(
 pub(crate) fn drive_back_target_driver_failure(
     entry: &mut RouterEntry,
 );
-pub(crate) fn prove_back_target_driver_zero_physical(
+pub(crate) fn freeze_back_target_driver_physical_partition_source(
     world: &World,
-    pending: PendingCommit,
+    entry: &RouterEntry,
+    driving: &PendingBackTargetDriving,
     task: &RootFrameTask,
-) -> Result<BackTargetDriverZeroPhysicalOwner, FailedPreparedBranch>;
+) -> Result<
+    BackTargetDriverPhysicalPartitionSource,
+    FrozenBackTargetDriverPhysicalIndeterminateEvidence,
+>;
+pub(crate) fn classify_back_target_driver_physical(
+    world: &World,
+    entry: &RouterEntry,
+    source: &BackTargetDriverPhysicalPartitionSource,
+    owner: BackTargetDriverUnverifiedPhysicalOwner,
+) -> BackTargetDriverPhysicalClassification;
+pub(crate) fn seal_back_target_driver_post_report_refreeze_source(
+    source: BackTargetDriverPhysicalPartitionSource,
+) -> BackTargetDriverPostReportRefreezeSource;
+pub(crate) fn reclassify_back_target_driver_post_report(
+    world: &World,
+    entry: &RouterEntry,
+    source: &BackTargetDriverPostReportRefreezeSource,
+    owner: BackTargetDriverUnverifiedPhysicalOwner,
+) -> BackTargetDriverPostReportPhysicalClassification;
 ```
 
 Also scaffold the existing exact `PreparationBoundaryScopeView`、two-variant `PreparationRetryEvidence`、`ProvenEmptyProjection`/target-protected source types、`LifecycleContinuationCapacity` and conversion signatures
@@ -2458,7 +2549,7 @@ impl RouterEngine {
         task: RootFrameTask,
         kind: ViewFailureKind,
         message: &'static str,
-        mode: BackTargetDriverFailureReportMode, // only physical.report_mode() at this atomic callsite
+        mode: BackTargetDriverFailureReportMode, // only reportable.report_mode() in this atomic call stack
     ) -> BackTargetDriverFailureReportOutcome;
     #[doc(hidden)]
     pub fn consume_back_target_driver_failure(
@@ -2552,13 +2643,21 @@ pub(crate) fn settle_back_no_target_physical_permanent(
 
 `validate_back_target_execution_pairing` is the single Core opaque exact predicate for action injection、retry restore、final-task → ticket and commit entry. It borrows the current stage authority plus the existing action/frame/mount/ticket owner and exact-matches engine、request、transaction、scope and task/ticket identity without consuming or reconstructing either owner. Mismatch moves the unchanged current whole owner + opaque evidence into `ResumeBlocked::DrivingPairingMismatch`、`Classifying::PairingMismatch` or `CommitFailure::PairingMismatch`；no automatic per-tick retry or public write is allowed
 
-Before any target-active FrameTask failure report，ECS requires ordinary `pending_failed_branch` empty and whole-moves Driving + exact task + typed physical owner + kind/message into `ResumeBlocked::DriverFailure::Unaccepted`. `prove_back_target_driver_zero_physical(world, pending, &task)` is the sole zero producer：it follows task identity + pending target lineage through the same World registry/relationship closure，builds complete target/protected partition and proves only the target failure manifest exact-zero. Existing active/preserved stays protected and may exist. The producer must not reuse `FrozenCleanupManifest::from_failed_prepared_branch` empty-owner shortcut，because that path does not inspect World/registry and cannot detect observer residual. Physical is only `ProvenZero` or `Residual(FailedPreparedBranch)`；`physical.report_mode()` is the sole mode producer
+After the last possible physical write at every target-active FrameTask failure callsite，ECS retains the real `BackTargetDriverUnverifiedPhysicalOwner::Pending(PendingCommit) | Residual(FailedPreparedBranch)` beside Driving + exact task + kind/message；no scanner reconstructs either owner. The sole `freeze_back_target_driver_physical_partition_source(world, entry, &driving, &task)` producer is zero-write、non-authorizing and does not consume that physical owner；it freezes exact task lineage、host/top-slot、active/protected complete closure、mount/role/reconciliation and owner correlation. Freeze Err combines with the untouched Unverified owner into pre-report `PhysicalIndeterminate`
 
-`report_back_target_failed` exact-matches history、raw capacity and task before mutation. Mismatch reports zero times and reconstructs `ReceiverMismatch` whole；Matched keeps any temporary continuation private to that call and returns only a true post-report `FailureCleanup | Fallback | Terminal` owner，never `Option` or raw capacity. Report and consume are synchronous with no intervening World write、schedule boundary or yield，so sealed ProvenZero is not rebuilt
+`classify_back_target_driver_physical(world, entry, &source, owner)` consumes the real owner、uses the same World and exact current entry context to refreeze the source and never accepts or reconstructs `RootFrameTask`. Both Pending and Residual require complete registry/World/relationship agreement and target/protected disjointness
 
-`drive_back_target_driver_failure` whole-takes Reported and is the sole caller of `consume_back_target_driver_failure`. Residual + Fallback/Terminal becomes typed `PhysicalMismatch` without consuming Core owner. Otherwise Core exact consumer validates the bound fresh fallback attempt/action and returns a real cleanup request、`FallbackReleased` with that action still engine-held、terminal evidence or whole-owner Mismatch. ECS reconstructs `ConsumeMismatch` on wrong receiver；exact cleanup alone installs `pending_failed_branch`，exact fallback/terminal clear the stage，after which only the normal action loop may take the released fallback action. The driver never opens private inner、reads `engine.action()` or infers from `Option`/count
+The only output is `Reportable(ProvenZero | Residual)` or `Indeterminate { whole original owner, frozen typed evidence }`. Scanner-only、registry-only or World-only residual、unclassified router-owned Entity、relationship/seal/lifecycle drift and protected overlap are Indeterminate. The current root FrameTask slice permits ProvenZero only for exact TopSlot/root lineage；nested、registered-child and incomplete sparse-mount roles safe-stop as `DriverFailure::PhysicalIndeterminate` until their action slice exists. The empty `FrozenCleanupManifest::from_failed_prepared_branch` shortcut remains forbidden. Only Reportable implements total `report_mode()` and may enter same-call-stack transient `Unaccepted`
 
-`report_back_target_applied` is the only target path for `LegacyLeaf | WithOutlets`. It exact-matches history、capacity、task and report before mutation；Mismatch returns all four owners and installs `ResumeBlocked::AppliedReportMismatch`. `FrameTask | MountRequest | Commit` return the same raw capacity and rerun exact pairing. Applied FailureCleanup directly seals the already realized pending/frame owner as `Residual(FailedPreparedBranch)` and enters `DriverFailure::Reported`；it must not attempt ProvenZero after Core mutation
+Immediately before `report_back_target_failed`，ECS linearly seals the exact pre-report source into `BackTargetDriverPostReportRefreezeSource`. The receiver exact-matches history、raw capacity and task before mutation. Mismatch reports zero times、drops the non-authorizing post source、converts Reportable back to its real Unverified owner and stores task + `ReceiverMismatch` whole；Matched transfers the post source into Reported beside history、Reportable physical and the true `FailureCleanup | Fallback | Terminal` Core owner. Classification、report and consume are synchronous with no intervening World write、schedule boundary or yield；`Unaccepted` and `Reported` must be empty when the schedule returns
+
+`drive_back_target_driver_failure` whole-takes transient Reported and is the sole caller of `consume_back_target_driver_failure`. Reportable Residual + Fallback/Terminal becomes typed `PhysicalMismatch` without consuming Core owner. Otherwise Core exact consumer validates the bound fresh fallback attempt/action and returns a real cleanup request、`FallbackReleased` with that action still engine-held、terminal evidence or whole-owner Mismatch. Reported、ConsumeMismatch、PhysicalMismatch and PostReportPhysicalIndeterminate all retain the same post-report source. Every post-report safe-stop drops the old proof：ConsumeMismatch stores post source + Core owner + history + physical converted to Unverified + mismatch；PhysicalMismatch stores the same post-report owner
+
+A later dedicated consumer may only call `reclassify_back_target_driver_post_report(world, entry, &post_source, unverified)`，which exact-refreezes the same World/current entry context without `RootFrameTask` and returns only consume-ready Reportable or `PostReportIndeterminate`. The latter enters its distinct stage and can never call report again. Exact cleanup alone installs `pending_failed_branch`，exact fallback/terminal clear the stage，after which only the normal action loop may take the released fallback action
+
+Before `report_back_target_applied`，ECS retains the real pending owner while the unique freezer reads World/entry/driving/task，then linearly seals the source into `BackTargetDriverPostReportRefreezeSource` and stores it in `PendingBackTargetAppliedReportInput`. Freeze Err keeps the whole applied context as `PhysicalIndeterminate::AppliedReport`. The atomic API exact-matches history、capacity、task and report before mutation；Mismatch returns its four Core-facing owners while ECS restores the whole input including the sealed post source as `AppliedReportMismatch`
+
+`FrameTask | MountRequest | Commit` return the same raw capacity and rerun exact pairing；their non-authorizing post source is dropped after the exact outcome is installed. Applied FailureCleanup retains the real already-realized owner as `Unverified::Residual(FailedPreparedBranch)` plus that same sealed post source，then uses only `reclassify_back_target_driver_post_report` before consume；Reportable Residual may enter transient Reported，PostReportIndeterminate enters its distinct stage，and neither may attempt ProvenZero or call report again
 
 FrameTask continues this target FrameTask slice and Commit enters Classifying. MountRequest is not sent to generic `pending_mount_request`：ECS installs `AppliedMountRequestPending { driving: history + returned capacity, request, pending }` in the same target field，keeps the ordinary mount field empty and safe-stops before action selection until the target MountRequest owner slice is implemented. Root final task → ticket and intermediate outlet report may not call generic consuming applied APIs or use `expect`
 
@@ -2618,9 +2717,9 @@ Missing symbols、placeholder panics、test setup failures and directly injected
 | `back_target_retry_returns_exact_owner_capability_and_evidence` | Retry returns the exact live owner、capability、continuation and evidence with zero write |
 | `back_target_resume_action_follows_real_reconciliation` | real direct entering returns `FrameTask`，a nested target whose prior parent/slot is not reusable returns `MountRequest`，duplicate/equivalent and pure-truncate zero-entering return the real `Commit` action；the current slice keeps initial Ready MountRequest whole in `ResumeBlocked::Start` with the generic mount field empty；unused reserved frame/task identities remain permanently burned |
 | `back_target_dispatcher_consumes_verified_bound_target_through_normal_publication_once` | one real root FrameTask target uses atomic applied-report outcome and exact pairing to reach a real ticket，then stays in one `drive_navigation_system` `World::resource_scope` call stack from pure physical Ready through manifest freeze、borrowed plans、acceptance、ledger reserve、bridge validation and existing publisher exactly once；normal success leaves no ReadyAccepted/Prepared stage and terminal inventory is empty |
-| `back_target_driver_failure_report_consume_uses_real_dispatcher` | ECS `--lib` dynamic test drives the real dispatcher and production predicates through atomic report + sole consume for cleanup、fallback/terminal and wrong report/consume receiver；same-World ProvenZero rejects observer residual while protected active remains outside the target failure manifest；fixtures may alter predicate inputs but never inject outcomes |
-| `back_target_atomic_applied_report_uses_real_dispatcher` | ECS `--lib` dynamic test drives the real applied-report dispatcher through `FailureCleanup → Residual`、MountRequest target-field safe-stop and Mismatch returning capacity、task、report and opaque evidence；generic mount/failed fields remain empty until the typed owner is consumed |
-| `back_target_frame_task_failures_preserve_one_typed_execution_owner` | static gate audits every named FrameTask failure exit；ProvenZero must scan task lineage + registry/relationship closure、exclude protected active and reject observer residual，removing proof、using empty failed-branch shortcut or allowing independent mode fails；Residual cannot consume Fallback/Terminal；wrong failure/applied/consume receiver returns every owner；applied cleanup is directly Residual，FrameTask/Commit preserve exact pairing，MountRequest stays whole in target safe-stop with generic mount field empty；Fallback action remains unavailable until Core consume + stage clear；no generic consuming report/private-inner/action/Option inference，all outcomes close inventory |
+| `back_target_driver_failure_report_consume_uses_real_dispatcher` | first ECS `--lib` dynamic RED drives the unique source freezer + real pre classifier and proves freeze/classify Indeterminate preserves the whole real Unverified owner before report；the completed group proves exact success transfers the sealed post source through Reported and consume，while receiver/consume mismatch preserves the required unverified or post-report tuple. Add real observer-residual and protected-overlap RED fixtures before implementing those branches；fixtures may alter predicate inputs but never inject owner or outcome |
+| `back_target_atomic_applied_report_uses_real_dispatcher` | ECS `--lib` dynamic test drives the real applied-report dispatcher through FailureCleanup retaining the real Unverified Residual + post source and dedicated post-report reclassifier into consume-ready Reportable or distinct PostReportIndeterminate、MountRequest target-field safe-stop and Mismatch returning capacity、task、report and opaque evidence；no post-report branch rebuilds task or calls report |
+| `back_target_frame_task_failures_preserve_one_typed_execution_owner` | static gate audits every named failure exit and rejects binary `Result<zero,residual>`、scanner owner reconstruction、a second source producer or a mode outside Reportable. The unique zero-write freezer consumes no physical owner；the pre classifier accepts same World + exact current entry + Source + Unverified without task and validates Pending/Residual completeness、disjointness and drift. Only exact TopSlot/root may ProvenZero in this slice；all incomplete nested/sparse roles and partial observations retain whole owner as pre-report Indeterminate. Exact report success transfers one sealed post source into every post-report owner；ReceiverMismatch retains task + Unverified，ConsumeMismatch retains post source + Core + history + Unverified. Only the dedicated no-task post-report reclassifier can authorize consume，and PostReportIndeterminate cannot report again. `Unaccepted | Reported` cannot survive a schedule return；all applied/fallback/mount owner rules and terminal inventory remain closed |
 | `back_target_dispatch_owners_are_linear_and_exact` | static/focused gate proves both classifiers accept the same `&World` and read registry only from it；one RouterEntry field owns mutually exclusive `ResumeBlocked | Driving | Classifying | Prepared | CommitFailure` stages，including typed Ready plan Retry/Permanent whole owners，with no second safe-stop Option；Ready publisher plans are borrowed stack capabilities prepared before acceptance，never stored or rebuilt，and failure drops them before saving the exact stage owner；Matched installs/whole-takes ReadyAccepted then Prepared in one borrow，reserve failure alone persists ReadyReserveFailure with the returned frozen manifest；only `prepare_back_target_commit` reaches the existing publisher，whose atomic tail performs no allocation、query or validation，while every mismatch/failure remains typed and terminal inventory is empty |
 | `back_target_mount_exhaustion_is_failure_cleanup_not_resume_action` | real nested mount issue exhaustion produces `BackTargetStart::FailureCleanup(FailureCleanupRequest)`，never a resume action or panic，and flows only into the existing failure-cleanup owner chain |
 | `back_target_resume_action_is_not_facade_reachable` | compile/static facade fixture proves `BackTargetResumeAction`、`BackTargetStart` and their variants cannot be named or reexported through the facade，while the facade export golden/profile remains unchanged |
@@ -2698,7 +2797,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_authority_compile_fail -j 1
 ```
 
-Expected: scaffold compiles; behavioral groups fail on named production predicates and negative gates pass only for intended privacy/non-Clone reasons. Both new ECS `--lib` focused commands must compile、reach the real dispatcher/predicate and fail on their named missing behavior before implementation；missing symbols、setup failure、placeholder panic or direct outcome injection invalidates the RED
+Expected: scaffold compiles; behavioral groups fail on named production predicates and negative gates pass only for intended privacy/non-Clone reasons. Both new ECS `--lib` focused commands must compile、reach the real dispatcher/predicate and fail on their named missing behavior before implementation；the first driver RED proves pre-report Indeterminate preserves the whole Unverified owner，then observer-residual and protected-overlap REDs are added before those branches. Missing symbols、setup failure、placeholder panic or direct outcome injection invalidates the RED
 
 - [ ] **Step 8: Implement live resolution, typed handoff and disposition**
 
@@ -2726,10 +2825,13 @@ ECS exact take retains the complete bound capacity outside the callback
 -> FrameTask: report/apply the real task to obtain CommitTicket
    MountRequest: keep the complete initial Ready owner in ResumeBlocked::Start and safe-stop until the target action slice exists；do not enter the generic mount handshake
    Commit: use the returned CommitTicket directly with no frame report
--> target-active FrameTask failure proves ProvenZero or retains Residual，then whole-moves Driving + task + physical + kind/message into ResumeBlocked::DriverFailure::Unaccepted while pending_failed_branch remains empty
--> report_back_target_failed mismatch reports zero times and restores ReceiverMismatch whole；Matched returns true post-report Cleanup | Fallback | Terminal without raw capacity
--> DriverFailure Reported rejects Residual+Fallback/Terminal；otherwise consume_back_target_driver_failure returns request | FallbackReleased | terminal evidence | whole-owner mismatch
--> root leaf and outlet reports use report_back_target_applied only；Mismatch installs AppliedReportMismatch whole，FrameTask/Commit retain capacity and exact pairing，MountRequest enters target-field safe-stop，true cleanup seals pending as Residual and enters DriverFailure::Reported
+-> target-active FrameTask failure retains real Unverified Pending | Residual after the last physical write；the unique zero-write freezer consumes no owner and Err whole-safe-stops
+-> pre classifier accepts same World + exact current entry + Source + Unverified，never RootFrameTask
+-> Reportable ProvenZero | Residual enters same-call-stack transient DriverFailure::Unaccepted；Indeterminate whole-safe-stops before report
+-> before report，Source linearly seals into PostReportRefreezeSource；mismatch restores task + Unverified，success transfers source into Reported
+-> DriverFailure transient Reported rejects Residual+Fallback/Terminal；otherwise consume_back_target_driver_failure returns request | FallbackReleased | terminal evidence | whole-owner mismatch
+-> all post-report owners retain PostReportRefreezeSource；safe-stop drops old proof and only dedicated no-task post reclassifier can authorize consume，never report
+-> root leaf/outlet freezes and seals source before report_back_target_applied；Mismatch keeps whole applied input，FailureCleanup keeps source + real Unverified Residual，other outcomes follow exact pairing/safe-stop
 -> final-task/ticket pairing exact；Driving whole-transitions to Classifying(TargetPreparationOwner)
 -> drive_navigation_system resource_scope passes the same &World to classify_back_target/classify_back_no_target；registry is read only from that World
 -> classify_back_target performs pure physical classification only
@@ -2752,7 +2854,8 @@ Core never constructs ECS `BackTargetReadyAcceptanceOwner`、`PreparedCleanupLed
 - target resolution stays inside `resume_bound_back_target(&mut RouterEntry, bound)`: the entry-owned issuer first performs `preflight_bound_retirement(&mut issuer, &bound, Target)` to create a lifetime-bound guard + private prepared evidence while `bound` remains outside the closure；wrong engine returns the verified target before preparation、calls the closure zero times、drops the uncommitted guard/evidence and lets ECS restore the complete bound branch；exact receiver refreezes history source、host/top-slot and active/child-slot baseline，再完成 matcher、reconciliation、generation/depth validation、first-action construction and mount issue into private `PreparedReady | PreparedFailureCleanup | PreparedPermanent` before invoking a callback that only moves `guard.commit()` once。After the exact outer outcome returns，ECS unconditionally drops the stale bound and seals the prepared evidence into the returned `Resumed | Permanent` retirement evidence；guard commit never performs lookup/index/query、allocation、validation、`expect`、`unwrap`、unsafe or action-domain `unreachable!`
 - the exact-entry dispatcher treats returned `BackCapacityRetirementEvidence` as non-authorizing terminal evidence，requires the existing issuer classifier to report exact `ConsumedReplay` and explicitly ends it in the same dispatch that installs Ready、FailureCleanup or Permanent. Any branch not installed immediately enters the same field's `ResumeBlocked { complete start/owner/bound + retirement/evidence/error }` subenum；retirement never enters `TargetPreparationOwner` or the failure-cleanup chain，and no second dispatch safe-stop field is allowed
 - `Resumed(BackTargetStart::Ready)` carries one linear `FrameTask | MountRequest | Commit` action with the same execution binding and continuation. ECS installs `Driving` only after `validate_back_target_execution_pairing` exact-matches `FrameTask | Commit`；retry restore、pending frame/final task → real ticket and commit entry rerun the same borrowed predicate. Mismatch retains the complete unchanged stage owner + opaque view，never reconstructs authority or retries every tick. FrameTask obtains its commit through real report/apply and direct Commit performs no frame report. Initial Ready MountRequest remains whole as `ResumeBlocked::Start` with ordinary mount fields empty and safe-stops until the target MountRequest action slice is implemented；the generic handshake never holds this owner
-- every target-active FrameTask failure first freezes same-World physical as `ProvenZero { PendingCommit, proof } | Residual(FailedPreparedBranch)`，derives mode only from that variant and installs `DriverFailure::Unaccepted` with ordinary failed field empty. ProvenZero scans task lineage + registry/relationship closure，proves target failure manifest zero and excludes protected active；the empty failed-branch shortcut is forbidden. Atomic failure/consume returns exact typed owners，Residual+Fallback/Terminal fail-closes without consume. Atomic applied report exclusively handles leaf/outlets；cleanup directly becomes Residual，FrameTask/Commit keep exact pairing，MountRequest safe-stops whole in the target field with ordinary mount field empty. Generic consuming report、`expect`、private-inner/action/Option inference are forbidden；paired `PendingFrameDrive` identity retry remains non-failure
+- every target-active FrameTask failure preserves a real Unverified Pending | Residual owner after the last possible physical write. The unique zero-write freezer consumes no owner and freezes exact task/entry facts；its Err whole-safe-stops. The pre classifier consumes same World + exact current entry + Source + Unverified without a task argument. Reportable alone enters transient Unaccepted/Reported；Indeterminate whole-safe-stops before report. Exact root TopSlot is the only current ProvenZero lineage，while incomplete nested/registered-child/sparse roles remain Indeterminate
+- immediately before report，the pre source is linearly sealed as PostReportRefreezeSource；exact report success transfers it into Reported，while receiver mismatch retains task + Unverified and no proof. Every post-report owner carries that source. ConsumeMismatch preserves source + Core outcome + history + Unverified，and only the dedicated no-task post-report reclassifier can authorize consume；PostReportIndeterminate never reports again. Atomic applied report freezes/seals its source before Core mutation and keeps it in the whole mismatch or FailureCleanup path；applied cleanup retains its real residual and uses only the post reclassifier. Residual+Fallback/Terminal still fail-closes without consume，FrameTask/Commit keep exact pairing and MountRequest safe-stops whole in the target field
 - the minimum root FrameTask slice must reach a real `CommitTicket`、exact splice、physical classifier and typed Core Ready acceptance before commit preparation. Every variant transition is one whole-take；other resume/classifier/acceptance branches remain in `ResumeBlocked | Classifying | CommitFailure` with public zero-write until their dedicated consumer exists
 - `Resumed(BackTargetStart::FailureCleanup)` either atomically moves the real `FailureCleanupRequest` into the existing failure-cleanup chain or remains whole in `ResumeBlocked::Start`；it never constructs `TargetPreparationOwner`、splice or publication owner，and mount issue exhaustion reaches only this branch
 - same-engine source/host/baseline drift and generation/depth contradiction return typed `Permanent/AuthorityLost` after the exact receiver calls retirement once，not `Mismatch`，only this pre-splice branch enters `settle_back_target_permanent`，which delegates to Core `settle_back_target_permanent_exact`，settlement wrong engine preserves the Core owner + evidence and exact success returns existing AuthorityLost terminal/settlement evidence
