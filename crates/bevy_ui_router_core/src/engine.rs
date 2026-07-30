@@ -16,7 +16,9 @@ use crate::frame::{
 use crate::history::MemoryHistory;
 use crate::history_authority::{
     AcceptedBackReservation, BackAcceptedReservationView, BackAdmissionToken, BackDestination,
-    BackResolutionEvidence, BackResolutionEvidenceClassification, BackResolutionOwnerHandoff,
+    BackNoTargetSourceDriftEvidence, BackNoTargetSourceDriftOwner,
+    BackNoTargetSourceDriftTerminalEvidence, BackResolutionEvidence,
+    BackResolutionEvidenceClassification, BackResolutionOwnerHandoff,
     BackResolutionScopeProjection, BackResolutionVerifyOutcome, BackTargetAuthorityLossCause,
     BackTargetPermanentOwner, BackTargetPreparationBaseline, CanonicalHistory,
     ClaimHistoryAdmissionWorldError, CoreIssuedWorldSeal, CoreIssuedWorldSealProjection,
@@ -24,7 +26,8 @@ use crate::history_authority::{
     HistoryCommitCapability, HistoryEffect, HistoryExecutionBinding,
     HistoryExecutionBindingProjection, HistoryIncarnation, HistoryPreparationError,
     HistoryRevision, HistorySourceDrift, NormalAttemptIdentity, PrepareBackAdmissionErrorKind,
-    PreparedHistoryPublication, PreparedPresentationBinding, VerifiedBackTargetExecutionOwner,
+    PreparedHistoryPublication, PreparedPresentationBinding, VerifiedBackNoTargetCandidate,
+    VerifiedBackTargetExecutionOwner,
 };
 #[cfg(test)]
 use crate::history_authority::{
@@ -625,6 +628,23 @@ pub(crate) enum BackTargetResumeOutcome {
     Resumed(BackTargetStart),
     Permanent(BackTargetPermanentOwner),
     Mismatch(VerifiedBackTargetExecutionOwner),
+}
+
+pub(crate) enum BackNoTargetSourceRefreezeOutcome {
+    Unchanged(VerifiedBackNoTargetCandidate),
+    Drift(BackNoTargetSourceDriftOwner),
+    Mismatch {
+        candidate: VerifiedBackNoTargetCandidate,
+        evidence: BackResolutionEvidence,
+    },
+}
+
+pub(crate) enum BackNoTargetSourceDriftSettlementOutcome {
+    Settled(BackNoTargetSourceDriftTerminalEvidence),
+    Mismatch {
+        owner: BackNoTargetSourceDriftOwner,
+        evidence: BackNoTargetSourceDriftEvidence,
+    },
 }
 
 enum StartReconciledRequestOutcome {
@@ -1379,6 +1399,21 @@ enum PreparedBackTargetStart {
     Ready(PreparedBackTargetReady),
     FailureCleanup(PreparedBackTargetFailureCleanup),
     Permanent(BackTargetPermanentOwner),
+}
+
+enum PreparedBackNoTargetSourceRefreeze {
+    Unchanged(VerifiedBackNoTargetCandidate),
+    Drift(BackNoTargetSourceDriftOwner),
+}
+
+struct PreparedBackNoTargetSourceDriftTerminal {
+    state: RouterNavigationState,
+    records: VecDeque<NavigationRequestRecord>,
+    evicted_through: Option<u64>,
+    issued_view_tasks: Vec<FrameTaskIdentity>,
+    report_dispositions: Vec<ReportDispositionRecord>,
+    completed_cleanup: Vec<CompletedCleanupTombstone>,
+    terminal: BackNoTargetSourceDriftTerminalEvidence,
 }
 
 #[derive(Clone, Debug)]
@@ -2357,6 +2392,192 @@ impl RouterEngine {
         let prepared = self.prepare_back_target_start(owner);
         commit_retirement();
         self.install_prepared_back_target_start(prepared)
+    }
+
+    pub(crate) fn refreeze_back_no_target_source_with_transfer<F>(
+        &mut self,
+        candidate: VerifiedBackNoTargetCandidate,
+        commit_transfer: F,
+    ) -> BackNoTargetSourceRefreezeOutcome
+    where
+        F: FnOnce(),
+    {
+        let evidence = candidate.evidence();
+        let request = evidence.request();
+        let exact_receiver = candidate.matches_receiver(
+            self.history_admission_world,
+            self.router,
+            self.history.incarnation(),
+        ) && self.action.is_none()
+            && self.current.is_none()
+            && self.pending_no_target_back.is_none()
+            && self.current_history_capability.is_none()
+            && self.state.current_request().is_none()
+            && self.request(request).is_some_and(|record| {
+                record.classify_back_resolution(&evidence)
+                    == BackResolutionEvidenceClassification::ConsumedReplay
+                    && matches!(record.status(), RequestStatus::Queued)
+                    && record.requested().is_none()
+            });
+        if !exact_receiver {
+            return BackNoTargetSourceRefreezeOutcome::Mismatch {
+                candidate,
+                evidence,
+            };
+        }
+
+        let prepared = match self
+            .history
+            .refreeze_back_no_target_source(candidate.source())
+        {
+            Ok(()) => PreparedBackNoTargetSourceRefreeze::Unchanged(candidate),
+            Err(observed) => PreparedBackNoTargetSourceRefreeze::Drift(
+                candidate.into_source_drift_owner(observed),
+            ),
+        };
+        commit_transfer();
+        match prepared {
+            PreparedBackNoTargetSourceRefreeze::Unchanged(candidate) => {
+                BackNoTargetSourceRefreezeOutcome::Unchanged(candidate)
+            }
+            PreparedBackNoTargetSourceRefreeze::Drift(owner) => {
+                BackNoTargetSourceRefreezeOutcome::Drift(owner)
+            }
+        }
+    }
+
+    pub(crate) fn settle_back_no_target_source_drift_with_retirement<F>(
+        &mut self,
+        owner: BackNoTargetSourceDriftOwner,
+        commit_retirement: F,
+    ) -> BackNoTargetSourceDriftSettlementOutcome
+    where
+        F: FnOnce(),
+    {
+        let prepared = match self.prepare_back_no_target_source_drift_terminal(owner) {
+            Ok(prepared) => prepared,
+            Err(owner) => {
+                let evidence = owner.evidence();
+                return BackNoTargetSourceDriftSettlementOutcome::Mismatch { owner, evidence };
+            }
+        };
+        commit_retirement();
+        BackNoTargetSourceDriftSettlementOutcome::Settled(
+            self.install_prepared_back_no_target_source_drift_terminal(prepared),
+        )
+    }
+
+    fn prepare_back_no_target_source_drift_terminal(
+        &self,
+        owner: BackNoTargetSourceDriftOwner,
+    ) -> Result<PreparedBackNoTargetSourceDriftTerminal, BackNoTargetSourceDriftOwner> {
+        let request = owner.request();
+        let resolution = owner.resolution_evidence();
+        let exact_receiver = owner.matches_receiver(
+            self.history_admission_world,
+            self.router,
+            self.history.incarnation(),
+        ) && owner.observed_source_is_current(&self.history)
+            && self.action.is_none()
+            && self.current.is_none()
+            && self.pending_no_target_back.is_none()
+            && self.current_history_capability.is_none()
+            && self.pending_history_preparation_error.is_none()
+            && self.prepared_publication_authority.is_none()
+            && self.state.current_request().is_none()
+            && self.queue.iter().all(|queued| queued.request != request);
+        if !exact_receiver {
+            return Err(owner);
+        }
+
+        let Some(record_index) = self.records.iter().position(|record| {
+            record.id() == request
+                && record.classify_back_resolution(&resolution)
+                    == BackResolutionEvidenceClassification::ConsumedReplay
+                && matches!(record.status(), RequestStatus::Queued)
+                && record.requested().is_none()
+        }) else {
+            return Err(owner);
+        };
+
+        let state = self.state.clone();
+        let mut records = self.records.clone();
+        let Some(record) = records.get_mut(record_index) else {
+            return Err(owner);
+        };
+        if record
+            .transition(RequestStatus::Failed(NavigationFailure::new(
+                NavigationFailureKind::AuthorityLost,
+                "back no-target source drifted before physical proof",
+            )))
+            .is_err()
+            || record
+                .append_trace(NavigationTraceEvent::request_terminal())
+                .is_err()
+        {
+            return Err(owner);
+        }
+
+        let mut issued_view_tasks = self.issued_view_tasks.clone();
+        let mut report_dispositions = self.report_dispositions.clone();
+        let mut completed_cleanup = self.completed_cleanup.clone();
+        let mut evicted_through = self.evicted_through;
+        while records
+            .iter()
+            .filter(|record| is_terminal(record.status()))
+            .count()
+            > TERMINAL_RETENTION
+        {
+            let Some(index) = records
+                .iter()
+                .position(|record| is_terminal(record.status()))
+            else {
+                return Err(owner);
+            };
+            let Some(evicted) = records.remove(index) else {
+                return Err(owner);
+            };
+            let evicted_request = evicted.id();
+            issued_view_tasks.retain(|identity| identity.request != evicted_request);
+            report_dispositions
+                .retain(|record| record.target != DiagnosticTarget::Request(evicted_request));
+            completed_cleanup.retain(|tombstone| tombstone.request != evicted_request);
+            let sequence = evicted_request.sequence();
+            evicted_through =
+                Some(evicted_through.map_or(sequence, |current| current.max(sequence)));
+        }
+
+        Ok(PreparedBackNoTargetSourceDriftTerminal {
+            state,
+            records,
+            evicted_through,
+            issued_view_tasks,
+            report_dispositions,
+            completed_cleanup,
+            terminal: owner.into_terminal_evidence(),
+        })
+    }
+
+    fn install_prepared_back_no_target_source_drift_terminal(
+        &mut self,
+        prepared: PreparedBackNoTargetSourceDriftTerminal,
+    ) -> BackNoTargetSourceDriftTerminalEvidence {
+        let PreparedBackNoTargetSourceDriftTerminal {
+            state,
+            records,
+            evicted_through,
+            issued_view_tasks,
+            report_dispositions,
+            completed_cleanup,
+            terminal,
+        } = prepared;
+        self.state = state;
+        self.records = records;
+        self.evicted_through = evicted_through;
+        self.issued_view_tasks = issued_view_tasks;
+        self.report_dispositions = report_dispositions;
+        self.completed_cleanup = completed_cleanup;
+        terminal
     }
 
     fn prepare_back_target_start(
@@ -7757,7 +7978,9 @@ impl EngineSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionSnapshot, CleanupError, CommitError, EngineAction, MountError, NavigationCommand,
+        ActionSnapshot, BackNoTargetSourceDriftSettlementOutcome,
+        BackNoTargetSourceRefreezeOutcome, BackTargetResumeAction, BackTargetResumeOutcome,
+        BackTargetStart, CleanupError, CommitError, EngineAction, MountError, NavigationCommand,
         PrivateRequestLookup, PushError, QueuedNavigation, QueuedReservation,
         ROUTER_DIAGNOSTIC_RETENTION, ReportError, RootTaskIdentity, RouterEngine,
         TERMINAL_RETENTION, WorkStage, occupied_child_slots,
@@ -7771,6 +7994,10 @@ mod tests {
     use crate::frame::{
         FrameOrigin, LogicalChildSlotBinding, ProjectedChildSlotRoleKind, ProjectedEnteringSlot,
         RouteFrameVersion,
+    };
+    use crate::history_authority::{
+        BackResolutionEvidenceClassification, BackResolutionVerifyOutcome,
+        VerifiedBackResolutionOwnerHandoff,
     };
     use crate::ids::{
         CleanupBatchId, ReservationCounter, RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId,
@@ -9642,6 +9869,240 @@ mod tests {
         assert_eq!(
             engine.testing_evicted_watermark(),
             Some(requests[1].sequence())
+        );
+    }
+
+    #[test]
+    fn back_no_target_source_drift_prepared_terminal_evicts_exact_oldest_retention_state() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/")).unwrap();
+        settle_current(&mut engine);
+        engine.push(RouteLocation::new("/about")).unwrap();
+        settle_current(&mut engine);
+        for index in 0..(TERMINAL_RETENTION - 2) {
+            engine
+                .replace(RouteLocation::new(format!("/items/{index}")))
+                .unwrap();
+            settle_current(&mut engine);
+        }
+        assert_eq!(
+            engine
+                .records
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.status(),
+                        RequestStatus::Succeeded | RequestStatus::Failed(_)
+                    )
+                })
+                .count(),
+            TERMINAL_RETENTION,
+            "real push/replace cleanup must fill retention before Back resolution"
+        );
+        assert_eq!(engine.history().len(), 2);
+
+        let world = engine
+            .claim_history_admission_world()
+            .expect("the confirmed engine issues one real history world seal");
+        let stamp = engine
+            .history_admission_stamp(&world)
+            .expect("the two-entry history admits Back");
+        let first_admission = engine
+            .prepare_back_admission(&world, &stamp)
+            .expect("the first Back exact-refreezes the live history");
+        let second_admission = engine
+            .prepare_back_admission(&world, &stamp)
+            .expect("the second Back shares the same pre-publication source");
+        let first_accepted = engine.enqueue_back(first_admission).unwrap();
+        let second_accepted = engine.enqueue_back(second_admission).unwrap();
+        let source_drift_request = second_accepted.request();
+
+        engine.collect();
+        let first_handoff = match engine.action().unwrap() {
+            EngineAction::BackResolution(handoff) => handoff,
+            _ => panic!("the first accepted Back must produce a real resolution handoff"),
+        };
+        let (_first_request, first_view) = first_accepted.into_parts();
+        let first_verified = match engine.verify_back_resolution_handoff(first_view, first_handoff)
+        {
+            BackResolutionVerifyOutcome::Matched(verified) => verified,
+            BackResolutionVerifyOutcome::Mismatch { .. } => {
+                panic!("the exact first Back lineage must verify")
+            }
+        };
+        let (_first_view, first_owner) = first_verified.into_parts();
+        let target = match first_owner {
+            VerifiedBackResolutionOwnerHandoff::Target(owner) => owner,
+            VerifiedBackResolutionOwnerHandoff::NoTarget(_)
+            | VerifiedBackResolutionOwnerHandoff::Contradiction(_) => {
+                panic!("the first Back from a two-entry history must resolve its predecessor")
+            }
+        };
+        let start = match engine.resume_back_target_with_retirement(target, || {}) {
+            BackTargetResumeOutcome::Resumed(start) => start,
+            BackTargetResumeOutcome::Permanent(_) | BackTargetResumeOutcome::Mismatch(_) => {
+                panic!("the exact first Back target must resume")
+            }
+        };
+        let resume = match start {
+            BackTargetStart::Ready(resume) => resume,
+            BackTargetStart::FailureCleanup(_) => {
+                panic!("the real predecessor must reach a normal target action")
+            }
+        };
+        let target_action = match resume.action {
+            BackTargetResumeAction::FrameTask(task) => EngineAction::FrameTask(task),
+            BackTargetResumeAction::MountRequest(request) => EngineAction::MountRequest(request),
+            BackTargetResumeAction::Commit(ticket) => EngineAction::Commit(ticket),
+        };
+        let first_cleanup = publish_action(&mut engine, target_action);
+        engine
+            .complete_cleanup(valid_completion(&first_cleanup))
+            .unwrap();
+        assert_eq!(engine.history_snapshot().cursor(), Some(0));
+
+        let second_handoff = match engine.action().unwrap() {
+            EngineAction::BackResolution(handoff) => handoff,
+            _ => panic!("the queued second Back must resolve after the first terminal"),
+        };
+        let (_second_request, second_view) = second_accepted.into_parts();
+        let second_verified =
+            match engine.verify_back_resolution_handoff(second_view, second_handoff) {
+                BackResolutionVerifyOutcome::Matched(verified) => verified,
+                BackResolutionVerifyOutcome::Mismatch { .. } => {
+                    panic!("the exact second Back lineage must verify")
+                }
+            };
+        let (_second_view, second_owner) = second_verified.into_parts();
+        let candidate = match second_owner {
+            VerifiedBackResolutionOwnerHandoff::NoTarget(candidate) => candidate,
+            VerifiedBackResolutionOwnerHandoff::Target(_)
+            | VerifiedBackResolutionOwnerHandoff::Contradiction(_) => {
+                panic!("the second live Back at cursor zero must resolve NoTarget")
+            }
+        };
+        let source_resolution = candidate.evidence();
+
+        engine
+            .replace(RouteLocation::new("/items/drifted"))
+            .unwrap();
+        settle_current(&mut engine);
+        let transfer_calls = std::cell::Cell::new(0usize);
+        let drift = match engine.refreeze_back_no_target_source_with_transfer(candidate, || {
+            transfer_calls.set(transfer_calls.get() + 1);
+        }) {
+            BackNoTargetSourceRefreezeOutcome::Drift(owner) => owner,
+            BackNoTargetSourceRefreezeOutcome::Unchanged(_)
+            | BackNoTargetSourceRefreezeOutcome::Mismatch { .. } => {
+                panic!("the real replacement must produce an exact source-drift owner")
+            }
+        };
+        assert_eq!(transfer_calls.get(), 1);
+
+        let mut retained_requests = engine
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.status(),
+                    RequestStatus::Succeeded | RequestStatus::Failed(_)
+                )
+            })
+            .map(|record| record.id())
+            .collect::<Vec<_>>();
+        retained_requests.sort_by_key(|request| request.sequence());
+        assert_eq!(
+            retained_requests.len(),
+            TERMINAL_RETENTION,
+            "the drift settlement must begin with a full terminal retention window"
+        );
+        let evicted_request = retained_requests[0];
+        let expected_earliest_after = retained_requests[1].sequence();
+        let watermark_before = engine.testing_evicted_watermark();
+        assert!(
+            engine
+                .issued_view_tasks
+                .iter()
+                .any(|identity| identity.request == evicted_request),
+            "the oldest real terminal must retain issued task inventory before eviction"
+        );
+        assert!(
+            engine
+                .completed_cleanup
+                .iter()
+                .any(|tombstone| tombstone.request == evicted_request),
+            "the oldest real successful terminal must retain cleanup inventory before eviction"
+        );
+
+        let retirement_calls = std::cell::Cell::new(0usize);
+        let _terminal =
+            match engine.settle_back_no_target_source_drift_with_retirement(drift, || {
+                retirement_calls.set(retirement_calls.get() + 1);
+            }) {
+                BackNoTargetSourceDriftSettlementOutcome::Settled(terminal) => terminal,
+                BackNoTargetSourceDriftSettlementOutcome::Mismatch { .. } => {
+                    panic!("the exact observed drift must terminal under retention pressure")
+                }
+            };
+        assert_eq!(retirement_calls.get(), 1);
+        assert!(matches!(
+            engine.private_lookup(evicted_request),
+            PrivateRequestLookup::Evicted
+        ));
+        assert_eq!(
+            engine.testing_evicted_watermark(),
+            Some(evicted_request.sequence()),
+            "prepared retention must advance through the exact oldest retained request"
+        );
+        assert!(
+            watermark_before.is_none_or(|watermark| watermark < evicted_request.sequence()),
+            "the prepared eviction must strictly advance the existing watermark"
+        );
+        assert_eq!(
+            engine.earliest_retained_sequence(),
+            Some(expected_earliest_after)
+        );
+        assert!(
+            engine
+                .issued_view_tasks
+                .iter()
+                .all(|identity| identity.request != evicted_request)
+        );
+        assert!(
+            engine
+                .report_dispositions
+                .iter()
+                .all(|record| record.target != super::DiagnosticTarget::Request(evicted_request))
+        );
+        assert!(
+            engine
+                .completed_cleanup
+                .iter()
+                .all(|tombstone| tombstone.request != evicted_request)
+        );
+        assert!(engine.completed_cleanup.len() <= TERMINAL_RETENTION);
+        assert!(
+            engine.report_dispositions.len() <= TERMINAL_RETENTION + ROUTER_DIAGNOSTIC_RETENTION
+        );
+        let drift_record = engine
+            .request(source_drift_request)
+            .expect("the newest source-drift request remains retained");
+        assert!(matches!(
+            drift_record.status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        assert_eq!(
+            drift_record
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                .count(),
+            1
+        );
+        assert_eq!(
+            engine.classify_back_resolution_evidence(&source_resolution),
+            BackResolutionEvidenceClassification::ConsumedReplay
         );
     }
 

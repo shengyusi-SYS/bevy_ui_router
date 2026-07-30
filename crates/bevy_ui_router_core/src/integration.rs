@@ -10,6 +10,8 @@ use crate::cleanup::{
 #[cfg(feature = "test-support")]
 use crate::engine::BackAllocatorBoundary;
 use crate::engine::{
+    BackNoTargetSourceDriftSettlementOutcome as CoreBackNoTargetSourceDriftSettlementOutcome,
+    BackNoTargetSourceRefreezeOutcome as CoreBackNoTargetSourceRefreezeOutcome,
     BackTargetCommitOperationFailure as CoreBackTargetCommitOperationFailure,
     BackTargetCommitOperationOutcome as CoreBackTargetCommitOperationOutcome,
     BackTargetResumeAction as CoreBackTargetResumeAction,
@@ -1992,15 +1994,28 @@ impl RouterEngine {
     pub fn refreeze_back_no_target_source_with_transfer<F>(
         &mut self,
         candidate: VerifiedBackNoTargetCandidate,
-        _commit_transfer: F,
+        commit_transfer: F,
     ) -> BackNoTargetSourceRefreezeOutcome
     where
         F: FnOnce(),
     {
-        let evidence = candidate.evidence();
-        BackNoTargetSourceRefreezeOutcome::Mismatch {
-            candidate,
-            evidence,
+        match self
+            .inner
+            .refreeze_back_no_target_source_with_transfer(candidate, commit_transfer)
+        {
+            CoreBackNoTargetSourceRefreezeOutcome::Unchanged(candidate) => {
+                BackNoTargetSourceRefreezeOutcome::Unchanged(candidate)
+            }
+            CoreBackNoTargetSourceRefreezeOutcome::Drift(owner) => {
+                BackNoTargetSourceRefreezeOutcome::Drift(owner)
+            }
+            CoreBackNoTargetSourceRefreezeOutcome::Mismatch {
+                candidate,
+                evidence,
+            } => BackNoTargetSourceRefreezeOutcome::Mismatch {
+                candidate,
+                evidence,
+            },
         }
     }
 
@@ -2008,13 +2023,22 @@ impl RouterEngine {
     pub fn settle_back_no_target_source_drift_with_retirement<F>(
         &mut self,
         owner: BackNoTargetSourceDriftOwner,
-        _commit_retirement: F,
+        commit_retirement: F,
     ) -> BackNoTargetSourceDriftSettlementOutcome
     where
         F: FnOnce(),
     {
-        let evidence = owner.evidence();
-        BackNoTargetSourceDriftSettlementOutcome::Mismatch { owner, evidence }
+        match self
+            .inner
+            .settle_back_no_target_source_drift_with_retirement(owner, commit_retirement)
+        {
+            CoreBackNoTargetSourceDriftSettlementOutcome::Settled(terminal) => {
+                BackNoTargetSourceDriftSettlementOutcome::Settled(terminal)
+            }
+            CoreBackNoTargetSourceDriftSettlementOutcome::Mismatch { owner, evidence } => {
+                BackNoTargetSourceDriftSettlementOutcome::Mismatch { owner, evidence }
+            }
+        }
     }
 
     #[doc(hidden)]

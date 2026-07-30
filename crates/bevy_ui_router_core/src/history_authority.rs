@@ -744,6 +744,35 @@ impl VerifiedBackNoTargetCandidate {
     pub(crate) fn evidence(&self) -> BackResolutionEvidence {
         BackResolutionEvidence::observed(&self.inner.raw.scope)
     }
+
+    pub(crate) fn matches_receiver(
+        &self,
+        world: Option<CoreIssuedWorldSealProjection>,
+        router: RouterIdentity,
+        history: HistoryIncarnation,
+    ) -> bool {
+        let scope = &self.inner.raw.scope;
+        world == Some(scope.world)
+            && scope.router == router
+            && scope.history == history
+            && scope.request.router_identity() == router
+    }
+
+    pub(crate) const fn source(&self) -> &FrozenHistorySource {
+        &self.inner.raw.source
+    }
+
+    pub(crate) fn into_source_drift_owner(
+        self,
+        observed: FrozenHistorySource,
+    ) -> BackNoTargetSourceDriftOwner {
+        BackNoTargetSourceDriftOwner {
+            inner: CoreBackNoTargetSourceDriftOwner {
+                candidate: self.inner,
+                observed,
+            },
+        }
+    }
 }
 
 impl VerifiedBackResolutionContradiction {
@@ -827,14 +856,51 @@ impl BackTargetPermanentOwner {
 }
 
 impl BackNoTargetSourceDriftOwner {
+    fn projection(&self) -> CoreBackNoTargetSourceDriftProjection {
+        CoreBackNoTargetSourceDriftProjection {
+            scope: self.inner.candidate.raw.scope.clone(),
+            expected: CoreFrozenHistorySourceProjection::project(&self.inner.candidate.raw.source),
+            observed: CoreFrozenHistorySourceProjection::project(&self.inner.observed),
+        }
+    }
+
     pub fn evidence(&self) -> BackNoTargetSourceDriftEvidence {
         BackNoTargetSourceDriftEvidence {
-            inner: CoreBackNoTargetSourceDriftProjection {
-                scope: self.inner.candidate.raw.scope.clone(),
-                expected: CoreFrozenHistorySourceProjection::project(
-                    &self.inner.candidate.raw.source,
-                ),
-                observed: CoreFrozenHistorySourceProjection::project(&self.inner.observed),
+            inner: self.projection(),
+        }
+    }
+
+    pub(crate) const fn request(&self) -> NavigationRequestId {
+        self.inner.candidate.raw.scope.request
+    }
+
+    pub(crate) fn resolution_evidence(&self) -> BackResolutionEvidence {
+        BackResolutionEvidence::observed(&self.inner.candidate.raw.scope)
+    }
+
+    pub(crate) fn matches_receiver(
+        &self,
+        world: Option<CoreIssuedWorldSealProjection>,
+        router: RouterIdentity,
+        history: HistoryIncarnation,
+    ) -> bool {
+        let scope = &self.inner.candidate.raw.scope;
+        world == Some(scope.world)
+            && scope.router == router
+            && scope.history == history
+            && scope.request.router_identity() == router
+    }
+
+    pub(crate) fn observed_source_is_current(&self, history: &CanonicalHistory) -> bool {
+        history
+            .refreeze_back_no_target_source(&self.inner.observed)
+            .is_ok()
+    }
+
+    pub(crate) fn into_terminal_evidence(self) -> BackNoTargetSourceDriftTerminalEvidence {
+        BackNoTargetSourceDriftTerminalEvidence {
+            inner: CoreBackNoTargetSourceDriftTerminalProjection {
+                drift: self.projection(),
             },
         }
     }
@@ -1480,6 +1546,18 @@ impl CanonicalHistory {
     ) -> Result<(), FrozenHistorySource> {
         let observed = self.freeze_source();
         if destination.source == observed {
+            Ok(())
+        } else {
+            Err(observed)
+        }
+    }
+
+    pub(crate) fn refreeze_back_no_target_source(
+        &self,
+        expected: &FrozenHistorySource,
+    ) -> Result<(), FrozenHistorySource> {
+        let observed = self.freeze_source();
+        if expected == &observed {
             Ok(())
         } else {
             Err(observed)

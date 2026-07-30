@@ -244,7 +244,9 @@ impl BackCapacityIssuer {
         }
     }
 
-    pub(crate) fn reserve(&mut self) -> Result<BackCapacityPermit, BackCapacityReserveError> {
+    pub(crate) fn reserve(
+        &mut self,
+    ) -> Result<EcsCleanupCapacityReservation, BackCapacityReserveError> {
         let free_cell = self.cells.iter().position(|cell| {
             matches!(cell.state, BackCapacityCellState::Free)
                 && cell.reuse == BackCapacityReuse::Reusable
@@ -315,7 +317,7 @@ impl BackCapacityIssuer {
         let cell_state = &mut self.cells[cell.0].state;
         debug_assert!(matches!(cell_state, BackCapacityCellState::Free));
         *cell_state = BackCapacityCellState::Outstanding { owner };
-        let permit = BackCapacityPermit {
+        let permit = EcsCleanupCapacityReservation {
             domain: self.domain,
             cell,
             owner,
@@ -346,9 +348,9 @@ impl BackCapacityIssuer {
 
     pub(crate) fn retire_unbound(
         &mut self,
-        owner: BackCapacityPermit,
+        owner: EcsCleanupCapacityReservation,
         rejection: EnqueueRejected,
-    ) -> BackCapacityRetireOutcome<BackCapacityPermit> {
+    ) -> BackCapacityRetireOutcome<EcsCleanupCapacityReservation> {
         #[cfg(test)]
         if std::mem::take(&mut self.drift_next_retire_unbound_generation) {
             if let Some(cell) = self.cells.get_mut(owner.cell.0) {
@@ -476,6 +478,188 @@ impl BackCapacityIssuer {
         ))
     }
 
+    pub(crate) fn preflight_no_target_transfer<'issuer, 'owner>(
+        &'issuer mut self,
+        bound: &'owner BoundBackCapacityReservation,
+    ) -> Result<
+        (
+            ExactBackCapacityCommitGuard<'issuer, 'owner, BoundBackCapacityReservation>,
+            PreparedNoTargetCapacityPermit,
+        ),
+        BackCapacityRetireError,
+    > {
+        let capacity = &bound.permit;
+        if capacity.domain != self.domain {
+            return Err(BackCapacityRetireError::ForeignDomain);
+        }
+
+        let (live_registry, cells) = (&mut self.live, &mut self.cells);
+        let live = match live_registry.entry(capacity.owner) {
+            Entry::Occupied(live) => live,
+            Entry::Vacant(_) => {
+                let replayed = cells
+                    .get(capacity.cell.0)
+                    .is_some_and(|cell| retired_identity_is_current(cell, capacity.generation));
+                return Err(if replayed {
+                    BackCapacityRetireError::ConsumedReplay
+                } else {
+                    BackCapacityRetireError::StaleGeneration
+                });
+            }
+        };
+        let record = live.get();
+        if record.domain != capacity.domain
+            || record.cell != capacity.cell
+            || record.owner != capacity.owner
+            || record.generation != capacity.generation
+            || record.state != BackCapacityLiveState::Outstanding
+        {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        }
+        let Some(cell) = cells.get_mut(capacity.cell.0) else {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        };
+        if cell.generation != capacity.generation
+            || cell.reuse != BackCapacityReuse::Reusable
+            || cell.ledger.is_some()
+            || !matches!(
+                cell.state,
+                BackCapacityCellState::Outstanding { owner }
+                    if owner == capacity.owner
+            )
+        {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        }
+
+        Ok((
+            ExactBackCapacityCommitGuard {
+                transition: BackCapacityCommitTransition::OutstandingToLeased {
+                    live,
+                    cell,
+                    owner: capacity.owner,
+                },
+                owner: bound,
+            },
+            PreparedNoTargetCapacityPermit { private: () },
+        ))
+    }
+
+    pub(crate) fn validate_no_target_capacity(
+        &self,
+        permit: &NoTargetCapacityPermit,
+    ) -> Result<(), BackCapacityRetireError> {
+        let capacity = &permit.capacity;
+        if capacity.domain != self.domain {
+            return Err(BackCapacityRetireError::ForeignDomain);
+        }
+        let Some(record) = self.live.get(&capacity.owner) else {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        };
+        if record.domain != capacity.domain
+            || record.cell != capacity.cell
+            || record.owner != capacity.owner
+            || record.generation != capacity.generation
+            || record.state != BackCapacityLiveState::Leased
+        {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        }
+        let Some(cell) = self.cells.get(capacity.cell.0) else {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        };
+        if cell.generation != capacity.generation
+            || cell.reuse != BackCapacityReuse::Reusable
+            || cell.ledger.is_some()
+            || !matches!(
+                cell.state,
+                BackCapacityCellState::Leased { owner }
+                    if owner == capacity.owner
+            )
+        {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn preflight_no_target_retirement<'issuer, 'owner>(
+        &'issuer mut self,
+        permit: &'owner NoTargetCapacityPermit,
+        disposition: BackCapacityRetireDisposition,
+    ) -> Result<
+        (
+            ExactBackCapacityCommitGuard<'issuer, 'owner, NoTargetCapacityPermit>,
+            PreparedBackCapacityRetirementEvidence,
+        ),
+        BackCapacityRetireError,
+    > {
+        let capacity = &permit.capacity;
+        if capacity.domain != self.domain {
+            return Err(BackCapacityRetireError::ForeignDomain);
+        }
+
+        let (live_registry, cells) = (&mut self.live, &mut self.cells);
+        let live = match live_registry.entry(capacity.owner) {
+            Entry::Occupied(live) => live,
+            Entry::Vacant(_) => {
+                let replayed = cells
+                    .get(capacity.cell.0)
+                    .is_some_and(|cell| retired_identity_is_current(cell, capacity.generation));
+                return Err(if replayed {
+                    BackCapacityRetireError::ConsumedReplay
+                } else {
+                    BackCapacityRetireError::StaleGeneration
+                });
+            }
+        };
+        let record = live.get();
+        if record.domain != capacity.domain
+            || record.cell != capacity.cell
+            || record.owner != capacity.owner
+            || record.generation != capacity.generation
+            || record.state != BackCapacityLiveState::Leased
+        {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        }
+        let Some(cell) = cells.get_mut(capacity.cell.0) else {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        };
+        if cell.generation != capacity.generation
+            || cell.reuse != BackCapacityReuse::Reusable
+            || cell.ledger.is_some()
+            || !matches!(
+                cell.state,
+                BackCapacityCellState::Leased { owner }
+                    if owner == capacity.owner
+            )
+        {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        }
+
+        let next = match capacity.generation.0.checked_add(1) {
+            Some(next_generation) => PreparedRetiredCell::ReusableFree {
+                next_generation: PreparationReleaseGeneration(next_generation),
+            },
+            None => PreparedRetiredCell::PermanentlyRetired {
+                generation: capacity.generation,
+            },
+        };
+        let prepared = PreparedBackCapacityRetirementEvidence {
+            evidence: BackCapacityRetirementEvidence {
+                domain: capacity.domain,
+                cell: capacity.cell,
+                owner: capacity.owner,
+                generation: capacity.generation,
+                reason: BackCapacityRetirementReason::Bound(disposition),
+            },
+        };
+        Ok((
+            ExactBackCapacityCommitGuard {
+                transition: BackCapacityCommitTransition::LeasedRetire { live, cell, next },
+                owner: permit,
+            },
+            prepared,
+        ))
+    }
+
     pub(crate) fn classify_retirement_evidence(
         &self,
         evidence: &BackCapacityRetirementEvidence,
@@ -497,7 +681,10 @@ impl BackCapacityIssuer {
         }
     }
 
-    fn retire_unbound_error(&self, owner: &BackCapacityPermit) -> Option<BackCapacityRetireError> {
+    fn retire_unbound_error(
+        &self,
+        owner: &EcsCleanupCapacityReservation,
+    ) -> Option<BackCapacityRetireError> {
         if owner.domain != self.domain {
             return Some(BackCapacityRetireError::ForeignDomain);
         }
@@ -622,6 +809,16 @@ enum BackCapacityCommitTransition<'issuer> {
         cell: &'issuer mut BackCapacityCell,
         next: PreparedRetiredCell,
     },
+    OutstandingToLeased {
+        live: OccupiedEntry<'issuer, BackCapacityOwnerId, BackCapacityLiveRecord>,
+        cell: &'issuer mut BackCapacityCell,
+        owner: BackCapacityOwnerId,
+    },
+    LeasedRetire {
+        live: OccupiedEntry<'issuer, BackCapacityOwnerId, BackCapacityLiveRecord>,
+        cell: &'issuer mut BackCapacityCell,
+        next: PreparedRetiredCell,
+    },
 }
 
 pub(crate) struct ExactBackCapacityCommitGuard<'issuer, 'owner, Owner: ?Sized> {
@@ -633,6 +830,24 @@ impl<Owner: ?Sized> ExactBackCapacityCommitGuard<'_, '_, Owner> {
     pub(crate) fn commit(self) {
         match self.transition {
             BackCapacityCommitTransition::OutstandingRetire { live, cell, next } => {
+                let _ = live.remove();
+                cell.state = BackCapacityCellState::Free;
+                match next {
+                    PreparedRetiredCell::ReusableFree { next_generation } => {
+                        cell.generation = next_generation;
+                        cell.reuse = BackCapacityReuse::Reusable;
+                    }
+                    PreparedRetiredCell::PermanentlyRetired { generation } => {
+                        cell.generation = generation;
+                        cell.reuse = BackCapacityReuse::PermanentlyRetired;
+                    }
+                }
+            }
+            BackCapacityCommitTransition::OutstandingToLeased { live, cell, owner } => {
+                live.into_mut().state = BackCapacityLiveState::Leased;
+                cell.state = BackCapacityCellState::Leased { owner };
+            }
+            BackCapacityCommitTransition::LeasedRetire { live, cell, next } => {
                 let _ = live.remove();
                 cell.state = BackCapacityCellState::Free;
                 match next {
@@ -682,7 +897,7 @@ pub(crate) enum BackCapacityRetireOutcome<Owner> {
     },
 }
 
-pub(crate) struct BackCapacityPermit {
+pub(crate) struct EcsCleanupCapacityReservation {
     domain: PreparationCapacityDomain,
     cell: BackCapacityCellId,
     owner: BackCapacityOwnerId,
@@ -690,12 +905,12 @@ pub(crate) struct BackCapacityPermit {
 }
 
 pub(crate) struct BackCapacityEnqueueRetireResidual {
-    pub(crate) owner: BackCapacityPermit,
+    pub(crate) owner: EcsCleanupCapacityReservation,
     pub(crate) rejection: EnqueueRejected,
     pub(crate) retire_error: BackCapacityRetireError,
 }
 
-impl BackCapacityPermit {
+impl EcsCleanupCapacityReservation {
     #[cfg(test)]
     pub(crate) const fn ordinal_identity_for_test(&self) -> (u64, usize, u64, u64) {
         (self.domain.0, self.cell.0, self.owner.0, self.generation.0)
@@ -704,14 +919,14 @@ impl BackCapacityPermit {
 
 pub(crate) struct BoundBackCapacityReservation {
     request: NavigationRequestId,
-    permit: BackCapacityPermit,
+    permit: EcsCleanupCapacityReservation,
     accepted: BackAcceptedReservationView,
 }
 
 impl BoundBackCapacityReservation {
     pub(crate) fn bind(
         request: NavigationRequestId,
-        permit: BackCapacityPermit,
+        permit: EcsCleanupCapacityReservation,
         accepted: BackAcceptedReservationView,
     ) -> Self {
         Self {
@@ -738,10 +953,36 @@ impl BoundBackCapacityReservation {
         self,
     ) -> (
         NavigationRequestId,
-        BackCapacityPermit,
+        EcsCleanupCapacityReservation,
         BackAcceptedReservationView,
     ) {
         (self.request, self.permit, self.accepted)
+    }
+}
+
+pub(crate) struct PreparedNoTargetCapacityPermit {
+    private: (),
+}
+
+pub(crate) struct NoTargetCapacityPermit {
+    capacity: EcsCleanupCapacityReservation,
+}
+
+impl PreparedNoTargetCapacityPermit {
+    pub(crate) fn into_permit_after_exact_receiver(
+        self,
+        stale_bound: BoundBackCapacityReservation,
+    ) -> NoTargetCapacityPermit {
+        let Self { private: () } = self;
+        let (_request, capacity, _accepted) = stale_bound.into_parts();
+        NoTargetCapacityPermit { capacity }
+    }
+}
+
+#[cfg(test)]
+impl NoTargetCapacityPermit {
+    pub(crate) const fn capacity_identity_for_test(&self) -> (u64, usize, u64, u64) {
+        self.capacity.ordinal_identity_for_test()
     }
 }
 

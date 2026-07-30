@@ -7,6 +7,8 @@ use bevy_ecs::{prelude::World, resource::Resource};
 use bevy_input_focus::InputFocus;
 use bevy_ui_router_core::{
     integration::{
+        BackNoTargetSourceDriftOwner, BackNoTargetSourceDriftSettlementOutcome,
+        BackNoTargetSourceDriftTerminalEvidence, BackNoTargetSourceRefreezeOutcome,
         BackResolutionEvidence, BackResolutionEvidenceClassification, BackResolutionOwnerHandoff,
         BackResolutionVerifyOutcome, BackTargetAppliedReport, BackTargetAppliedReportOutcome,
         BackTargetCommitPreparationFailure, BackTargetCommitPreparationOutcome,
@@ -50,8 +52,9 @@ use crate::{
         CleanupLedgerReserveError, CleanupLedgerReserveErrorKind, EnqueueRejected,
         FailedAuthorityBoundaryBinding, FailedBoundaryDrift, FailedBoundarySource,
         FailedManifestBuildError, FailedPreparedTopologyError, FrozenCleanupManifest,
-        PendingBoundaryBinding, PreparedCleanupLedger, RouterCleanupObservation,
-        cleanup_claim_has_exact_authority, failed_prepared_branch_roots_are_exact,
+        NoTargetCapacityPermit, PendingBoundaryBinding, PreparedCleanupLedger,
+        RouterCleanupObservation, cleanup_claim_has_exact_authority,
+        failed_prepared_branch_roots_are_exact,
     },
     content::{ContentPlan, FrameContentWriter},
     driver::{EcsViewReportSession, ReportSeal, ViewBuildReport, ViewBuildReportKind},
@@ -1059,6 +1062,44 @@ pub(crate) struct BoundBackNoTargetResolution {
     reservation: BoundBackCapacityReservation,
 }
 
+pub(crate) struct BackPreparationOwner {
+    candidate: VerifiedBackNoTargetCandidate,
+    capacity: NoTargetCapacityPermit,
+}
+
+pub(crate) struct BackNoTargetSourceDriftPermanentOwner {
+    drift: BackNoTargetSourceDriftOwner,
+    capacity: NoTargetCapacityPermit,
+}
+
+pub(crate) enum BackNoTargetSourceDriftPermanentSettlementOutcome {
+    Settled {
+        retirement: BackCapacityRetirementEvidence,
+        terminal: BackNoTargetSourceDriftTerminalEvidence,
+    },
+    ReceiverMismatch {
+        owner: BackNoTargetSourceDriftPermanentOwner,
+        evidence: bevy_ui_router_core::integration::BackNoTargetSourceDriftEvidence,
+    },
+    CapacityRejected {
+        owner: BackNoTargetSourceDriftPermanentOwner,
+        error: BackCapacityRetireError,
+    },
+}
+
+pub(crate) enum BackNoTargetBeginOutcome {
+    Begun(BackPreparationOwner),
+    Permanent(BackNoTargetSourceDriftPermanentOwner),
+    CapacityRejected {
+        bound: BoundBackNoTargetResolution,
+        error: BackCapacityRetireError,
+    },
+    ReceiverMismatch {
+        bound: BoundBackNoTargetResolution,
+        evidence: BackResolutionEvidence,
+    },
+}
+
 pub(crate) struct BoundBackContradictionResolution {
     owner: VerifiedBackResolutionContradiction,
     reservation: BoundBackCapacityReservation,
@@ -1126,6 +1167,109 @@ pub(crate) fn resume_bound_back_target(
             BackTargetResumeOutcome::ReceiverMismatch {
                 bound: BoundBackTargetResolution { owner, reservation },
                 evidence,
+            }
+        }
+    }
+}
+
+pub(crate) fn begin_bound_back_no_target(
+    entry: &mut RouterEntry,
+    bound: BoundBackNoTargetResolution,
+) -> BackNoTargetBeginOutcome {
+    let BoundBackNoTargetResolution {
+        candidate,
+        reservation,
+    } = bound;
+    let RouterEntry {
+        engine,
+        back_capacity_issuer,
+        ..
+    } = entry;
+    let issuer = back_capacity_issuer
+        .as_mut()
+        .expect("an installed RouterEntry retains its exact back capacity issuer");
+    let (guard, prepared_capacity) = match issuer.preflight_no_target_transfer(&reservation) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return BackNoTargetBeginOutcome::CapacityRejected {
+                bound: BoundBackNoTargetResolution {
+                    candidate,
+                    reservation,
+                },
+                error,
+            };
+        }
+    };
+
+    match engine.refreeze_back_no_target_source_with_transfer(candidate, move || guard.commit()) {
+        BackNoTargetSourceRefreezeOutcome::Unchanged(candidate) => {
+            let capacity = prepared_capacity.into_permit_after_exact_receiver(reservation);
+            BackNoTargetBeginOutcome::Begun(BackPreparationOwner {
+                candidate,
+                capacity,
+            })
+        }
+        BackNoTargetSourceRefreezeOutcome::Drift(drift) => {
+            let capacity = prepared_capacity.into_permit_after_exact_receiver(reservation);
+            BackNoTargetBeginOutcome::Permanent(BackNoTargetSourceDriftPermanentOwner {
+                drift,
+                capacity,
+            })
+        }
+        BackNoTargetSourceRefreezeOutcome::Mismatch {
+            candidate,
+            evidence,
+        } => BackNoTargetBeginOutcome::ReceiverMismatch {
+            bound: BoundBackNoTargetResolution {
+                candidate,
+                reservation,
+            },
+            evidence,
+        },
+    }
+}
+
+pub(crate) fn settle_back_no_target_source_drift_permanent(
+    entry: &mut RouterEntry,
+    owner: BackNoTargetSourceDriftPermanentOwner,
+) -> BackNoTargetSourceDriftPermanentSettlementOutcome {
+    let BackNoTargetSourceDriftPermanentOwner { drift, capacity } = owner;
+    let RouterEntry {
+        engine,
+        back_capacity_issuer,
+        ..
+    } = entry;
+    let issuer = back_capacity_issuer
+        .as_mut()
+        .expect("an installed RouterEntry retains its exact back capacity issuer");
+    let (guard, prepared_retirement) = match issuer
+        .preflight_no_target_retirement(&capacity, BackCapacityRetireDisposition::Permanent)
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return BackNoTargetSourceDriftPermanentSettlementOutcome::CapacityRejected {
+                owner: BackNoTargetSourceDriftPermanentOwner { drift, capacity },
+                error,
+            };
+        }
+    };
+
+    match engine.settle_back_no_target_source_drift_with_retirement(drift, move || guard.commit()) {
+        BackNoTargetSourceDriftSettlementOutcome::Mismatch { owner, evidence } => {
+            BackNoTargetSourceDriftPermanentSettlementOutcome::ReceiverMismatch {
+                owner: BackNoTargetSourceDriftPermanentOwner {
+                    drift: owner,
+                    capacity,
+                },
+                evidence,
+            }
+        }
+        BackNoTargetSourceDriftSettlementOutcome::Settled(terminal) => {
+            drop(capacity);
+            let retirement = prepared_retirement.into_evidence_after_exact_receiver();
+            BackNoTargetSourceDriftPermanentSettlementOutcome::Settled {
+                retirement,
+                terminal,
             }
         }
     }
@@ -16881,6 +17025,55 @@ pub(crate) mod tests {
         }
     }
 
+    fn take_real_bound_back_no_target(
+        app: &mut App,
+        router: RouterHandle,
+    ) -> (NavigationRequestId, BoundBackNoTargetResolution) {
+        for location in ["/first", "/second"] {
+            app.world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .expect("the real no-target fixture accepts each setup route");
+            app.update();
+        }
+        let (first, second) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let first = navigation
+                .back(router)
+                .expect("the active second route has one real predecessor");
+            let second = navigation
+                .back(router)
+                .expect("the second Back is accepted before the first changes history");
+            (first, second)
+        };
+
+        app.update();
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handle == router)
+            .expect("the installed router retains its exact entry");
+        assert!(
+            entry
+                .engine
+                .request(first)
+                .is_some_and(|request| matches!(request.status(), RequestStatus::Succeeded)),
+            "the first real Back must publish before the second resolves without a target"
+        );
+        let Some(BoundBackResolutionHandoff::NoTarget(bound)) =
+            entry.pending_bound_back_resolution.take()
+        else {
+            panic!("the second real Back must retain one verified no-target bound owner")
+        };
+        assert_eq!(
+            bound.reservation.request(),
+            second,
+            "the verified no-target owner must remain paired with its exact accepted request"
+        );
+        (second, bound)
+    }
+
     #[test]
     fn back_resolution_handoff_foreign_and_duplicate_are_zero_write() {
         let mut app = App::new();
@@ -20916,6 +21109,548 @@ pub(crate) mod tests {
                 BackTargetResumeOutcome::Resumed { .. }
             ),
             "the complete rejected bound and Core owner must remain consumable after restoring the exact issuer"
+        );
+    }
+
+    #[test]
+    fn back_no_target_refreeze_receiver_mismatch_never_commits_transfer() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let exact_router =
+            install_atomic_router_at_pattern(&mut app, "back-no-target-transfer-exact", "/:id");
+        let foreign_router =
+            install_atomic_router_at_pattern(&mut app, "back-no-target-transfer-foreign", "/:id");
+        app.update();
+        let (_request, bound) = take_real_bound_back_no_target(&mut app, exact_router);
+        let bound_identity = bound.reservation.capacity_identity_for_test();
+
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let exact_index = navigation
+            .entries
+            .iter()
+            .position(|entry| entry.handle == exact_router)
+            .expect("the exact router retains its entry");
+        let foreign_index = navigation
+            .entries
+            .iter()
+            .position(|entry| entry.handle == foreign_router)
+            .expect("the foreign router retains its entry");
+        let (exact, foreign) = if exact_index < foreign_index {
+            let (before, after) = navigation.entries.split_at_mut(foreign_index);
+            (&mut before[exact_index], &mut after[0])
+        } else {
+            let (before, after) = navigation.entries.split_at_mut(exact_index);
+            (&mut after[0], &mut before[foreign_index])
+        };
+
+        std::mem::swap(
+            &mut exact.back_capacity_issuer,
+            &mut foreign.back_capacity_issuer,
+        );
+        let engine_before_rejection = exact.engine.snapshot();
+        let rejecting_issuer_before = exact
+            .back_capacity_issuer
+            .as_ref()
+            .expect("the foreign issuer is installed for the real rejection")
+            .semantic_snapshot_for_test();
+        let bound = match begin_bound_back_no_target(exact, bound) {
+            BackNoTargetBeginOutcome::CapacityRejected { bound, error } => {
+                assert_eq!(
+                    error,
+                    BackCapacityRetireError::ForeignDomain,
+                    "the real foreign domain predicate must reject before Core refreeze"
+                );
+                bound
+            }
+            BackNoTargetBeginOutcome::Begun(_) | BackNoTargetBeginOutcome::Permanent(_) => {
+                panic!("issuer rejection must preserve the complete bound no-target owner")
+            }
+            BackNoTargetBeginOutcome::ReceiverMismatch { .. } => {
+                panic!("Core must not be called after issuer preflight rejection")
+            }
+        };
+        assert_eq!(
+            bound.reservation.capacity_identity_for_test(),
+            bound_identity,
+            "issuer rejection must return the exact bound capacity owner"
+        );
+        assert_eq!(
+            exact.engine.snapshot(),
+            engine_before_rejection,
+            "issuer rejection must happen before any Core mutation"
+        );
+        assert_eq!(
+            exact
+                .back_capacity_issuer
+                .as_ref()
+                .unwrap()
+                .semantic_snapshot_for_test(),
+            rejecting_issuer_before,
+            "issuer rejection must be a semantic zero-write"
+        );
+
+        std::mem::swap(
+            &mut exact.back_capacity_issuer,
+            &mut foreign.back_capacity_issuer,
+        );
+        std::mem::swap(&mut exact.engine, &mut foreign.engine);
+        let wrong_engine_before = exact.engine.snapshot();
+        let owner_engine_before = foreign.engine.snapshot();
+        let issuer_before_mismatch = exact
+            .back_capacity_issuer
+            .as_ref()
+            .unwrap()
+            .semantic_snapshot_for_test();
+        let bound = match begin_bound_back_no_target(exact, bound) {
+            BackNoTargetBeginOutcome::ReceiverMismatch { bound, evidence: _ } => bound,
+            BackNoTargetBeginOutcome::Begun(_) | BackNoTargetBeginOutcome::Permanent(_) => {
+                panic!("a wrong engine must not consume the verified no-target candidate")
+            }
+            BackNoTargetBeginOutcome::CapacityRejected { .. } => {
+                panic!("the exact issuer must pass before the real receiver predicate")
+            }
+        };
+        assert_eq!(
+            bound.reservation.capacity_identity_for_test(),
+            bound_identity,
+            "receiver mismatch must return the complete exact bound owner"
+        );
+        assert_eq!(exact.engine.snapshot(), wrong_engine_before);
+        assert_eq!(foreign.engine.snapshot(), owner_engine_before);
+        assert_eq!(
+            exact
+                .back_capacity_issuer
+                .as_ref()
+                .unwrap()
+                .semantic_snapshot_for_test(),
+            issuer_before_mismatch,
+            "wrong receiver must call the transfer callback zero times"
+        );
+
+        std::mem::swap(&mut exact.engine, &mut foreign.engine);
+        let begun = match begin_bound_back_no_target(exact, bound) {
+            BackNoTargetBeginOutcome::Begun(owner) => owner,
+            BackNoTargetBeginOutcome::Permanent(_) => {
+                panic!("an unchanged exact source must preserve the verified candidate")
+            }
+            BackNoTargetBeginOutcome::CapacityRejected { .. } => {
+                panic!("the restored exact issuer must pass transfer preflight")
+            }
+            BackNoTargetBeginOutcome::ReceiverMismatch { .. } => {
+                panic!("RED: the exact Core no-target refreeze receiver must consume its candidate")
+            }
+        };
+        assert_eq!(
+            begun.capacity.capacity_identity_for_test(),
+            bound_identity,
+            "the exact outer arm must consume the stale bound into the same permit identity"
+        );
+        assert_eq!(
+            exact
+                .back_capacity_issuer
+                .as_ref()
+                .unwrap()
+                .validate_no_target_capacity(&begun.capacity),
+            Ok(()),
+            "RED: OutstandingToLeased commit must make the exact permit authorizing once"
+        );
+        let _ = begun.candidate;
+    }
+
+    #[test]
+    fn back_no_target_current_owner_drift_never_commits_transfer() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router =
+            install_atomic_router_at_pattern(&mut app, "back-no-target-current-owner", "/:id");
+        app.update();
+        let (_request, bound) = take_real_bound_back_no_target(&mut app, router);
+        let bound_identity = bound.reservation.capacity_identity_for_test();
+
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handle == router)
+            .expect("the exact router retains its entry");
+        let history_before_occupant = entry.engine.snapshot().history().clone();
+        let occupant = entry
+            .engine
+            .push(RouteLocation::new("/occupant"))
+            .expect("the real production entry accepts another request");
+        entry.engine.collect();
+        assert_eq!(
+            entry.engine.snapshot().history(),
+            &history_before_occupant,
+            "starting the real occupant must not publish canonical history"
+        );
+        assert_eq!(
+            entry.engine.snapshot().running_request(),
+            Some(occupant),
+            "the real occupant must own the current engine execution"
+        );
+        assert!(
+            entry
+                .engine
+                .request(occupant)
+                .is_some_and(|request| { matches!(request.status(), RequestStatus::Running(_)) }),
+            "the real production request must be running before no-target refreeze"
+        );
+
+        let engine_before_mismatch = entry.engine.snapshot();
+        let issuer_before_mismatch = entry
+            .back_capacity_issuer
+            .as_ref()
+            .expect("the exact issuer remains installed")
+            .semantic_snapshot_for_test();
+        let bound = match begin_bound_back_no_target(entry, bound) {
+            BackNoTargetBeginOutcome::ReceiverMismatch { bound, evidence: _ } => bound,
+            BackNoTargetBeginOutcome::Begun(_) => {
+                panic!("RED: current owner drift must be rejected before the transfer callback")
+            }
+            BackNoTargetBeginOutcome::Permanent(_) => {
+                panic!("unchanged canonical history must not be classified as source drift")
+            }
+            BackNoTargetBeginOutcome::CapacityRejected { .. } => {
+                panic!("the exact outstanding capacity must pass issuer preflight")
+            }
+        };
+        assert_eq!(
+            bound.reservation.capacity_identity_for_test(),
+            bound_identity,
+            "current owner mismatch must return the complete bound capacity owner"
+        );
+        assert_eq!(
+            entry.engine.snapshot(),
+            engine_before_mismatch,
+            "current owner mismatch must be a Core semantic zero-write"
+        );
+        assert_eq!(
+            entry
+                .back_capacity_issuer
+                .as_ref()
+                .unwrap()
+                .semantic_snapshot_for_test(),
+            issuer_before_mismatch,
+            "current owner mismatch must call the transfer callback zero times"
+        );
+        assert!(
+            entry
+                .back_capacity_issuer
+                .as_mut()
+                .unwrap()
+                .preflight_no_target_transfer(&bound.reservation)
+                .is_ok(),
+            "current owner mismatch must leave the exact capacity Outstanding"
+        );
+    }
+
+    #[test]
+    fn back_no_target_source_drift_terminals_once() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router =
+            install_atomic_router_at_pattern(&mut app, "back-no-target-source-drift-exact", "/:id");
+        let foreign_router = install_atomic_router_at_pattern(
+            &mut app,
+            "back-no-target-source-drift-foreign",
+            "/:id",
+        );
+        app.update();
+        let (request, bound) = take_real_bound_back_no_target(&mut app, router);
+        let bound_identity = bound.reservation.capacity_identity_for_test();
+
+        let replacement = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .replace(router, RouteLocation::new("/drifted"))
+            .expect("the real replacement changes the live canonical history source");
+        run_updates_until_succeeded(&mut app, replacement);
+
+        let world_before_terminal = authority_world_fingerprint(app.world());
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let exact_index = navigation
+            .entries
+            .iter()
+            .position(|entry| entry.handle == router)
+            .expect("the exact router retains its entry");
+        let foreign_index = navigation
+            .entries
+            .iter()
+            .position(|entry| entry.handle == foreign_router)
+            .expect("the foreign router retains its entry");
+        let (exact, foreign) = if exact_index < foreign_index {
+            let (before, after) = navigation.entries.split_at_mut(foreign_index);
+            (&mut before[exact_index], &mut after[0])
+        } else {
+            let (before, after) = navigation.entries.split_at_mut(exact_index);
+            (&mut after[0], &mut before[foreign_index])
+        };
+        let permanent = match begin_bound_back_no_target(exact, bound) {
+            BackNoTargetBeginOutcome::Permanent(owner) => owner,
+            BackNoTargetBeginOutcome::Begun(_) => {
+                panic!("the real replacement must invalidate the frozen no-target source")
+            }
+            BackNoTargetBeginOutcome::CapacityRejected { .. } => {
+                panic!("the exact outstanding capacity must pass transfer preflight")
+            }
+            BackNoTargetBeginOutcome::ReceiverMismatch { .. } => {
+                panic!("the exact receiver must classify source drift rather than mismatch")
+            }
+        };
+        assert_eq!(
+            permanent.capacity.capacity_identity_for_test(),
+            bound_identity,
+            "the opaque source-drift owner and exact permit must be produced together"
+        );
+        assert_eq!(
+            exact
+                .back_capacity_issuer
+                .as_ref()
+                .unwrap()
+                .validate_no_target_capacity(&permanent.capacity),
+            Ok(()),
+            "the source-drift composite must retain the exact leased permit"
+        );
+
+        std::mem::swap(
+            &mut exact.back_capacity_issuer,
+            &mut foreign.back_capacity_issuer,
+        );
+        let engine_before_rejection = exact.engine.snapshot();
+        let rejecting_issuer_before = exact
+            .back_capacity_issuer
+            .as_ref()
+            .expect("the foreign issuer is installed for the real rejection")
+            .semantic_snapshot_for_test();
+        let request_status_before = exact.engine.request(request).unwrap().status().clone();
+        let request_trace_before = exact.engine.request(request).unwrap().trace().to_vec();
+        let permanent = match settle_back_no_target_source_drift_permanent(exact, permanent) {
+            BackNoTargetSourceDriftPermanentSettlementOutcome::CapacityRejected {
+                owner,
+                error,
+            } => {
+                assert_eq!(
+                    error,
+                    BackCapacityRetireError::ForeignDomain,
+                    "the wrong issuer must reject before Core settlement"
+                );
+                owner
+            }
+            BackNoTargetSourceDriftPermanentSettlementOutcome::ReceiverMismatch { .. }
+            | BackNoTargetSourceDriftPermanentSettlementOutcome::Settled { .. } => {
+                panic!("issuer rejection must return the whole drift-plus-permit owner")
+            }
+        };
+        assert_eq!(
+            permanent.capacity.capacity_identity_for_test(),
+            bound_identity,
+            "issuer rejection must preserve the exact leased identity"
+        );
+        assert_eq!(exact.engine.snapshot(), engine_before_rejection);
+        assert_eq!(
+            exact.engine.request(request).unwrap().status(),
+            &request_status_before
+        );
+        assert_eq!(
+            exact.engine.request(request).unwrap().trace(),
+            request_trace_before
+        );
+        assert_eq!(
+            exact
+                .back_capacity_issuer
+                .as_ref()
+                .unwrap()
+                .semantic_snapshot_for_test(),
+            rejecting_issuer_before,
+            "wrong-issuer preflight must be a semantic zero-write"
+        );
+
+        std::mem::swap(
+            &mut exact.back_capacity_issuer,
+            &mut foreign.back_capacity_issuer,
+        );
+        std::mem::swap(&mut exact.engine, &mut foreign.engine);
+        let wrong_engine_before = exact.engine.snapshot();
+        let owner_engine_before = foreign.engine.snapshot();
+        let issuer_before_mismatch = exact
+            .back_capacity_issuer
+            .as_ref()
+            .unwrap()
+            .semantic_snapshot_for_test();
+        let expected_drift_evidence = permanent.drift.evidence();
+        let permanent = match settle_back_no_target_source_drift_permanent(exact, permanent) {
+            BackNoTargetSourceDriftPermanentSettlementOutcome::ReceiverMismatch {
+                owner,
+                evidence,
+            } => {
+                assert_eq!(
+                    evidence, expected_drift_evidence,
+                    "the wrong Core receiver must return typed opaque source-drift evidence"
+                );
+                owner
+            }
+            BackNoTargetSourceDriftPermanentSettlementOutcome::CapacityRejected { .. } => {
+                panic!("the restored exact issuer must accept the leased permit")
+            }
+            BackNoTargetSourceDriftPermanentSettlementOutcome::Settled { .. } => {
+                panic!("the wrong Core receiver must not terminal the request")
+            }
+        };
+        assert_eq!(
+            permanent.capacity.capacity_identity_for_test(),
+            bound_identity,
+            "Core mismatch must return the complete drift-plus-permit owner"
+        );
+        assert_eq!(permanent.drift.evidence(), expected_drift_evidence);
+        assert_eq!(exact.engine.snapshot(), wrong_engine_before);
+        assert_eq!(foreign.engine.snapshot(), owner_engine_before);
+        assert_eq!(
+            exact
+                .back_capacity_issuer
+                .as_ref()
+                .unwrap()
+                .semantic_snapshot_for_test(),
+            issuer_before_mismatch,
+            "wrong Core receiver must call the retirement callback zero times"
+        );
+        assert_eq!(
+            exact
+                .back_capacity_issuer
+                .as_ref()
+                .unwrap()
+                .validate_no_target_capacity(&permanent.capacity),
+            Ok(()),
+            "wrong Core receiver must leave the exact permit Leased"
+        );
+
+        std::mem::swap(&mut exact.engine, &mut foreign.engine);
+        let history_before_terminal = exact.engine.snapshot().history().clone();
+        let active_before_terminal = exact.engine.snapshot().active().clone();
+        let (retirement, _terminal) =
+            match settle_back_no_target_source_drift_permanent(exact, permanent) {
+                BackNoTargetSourceDriftPermanentSettlementOutcome::Settled {
+                    retirement,
+                    terminal,
+                } => (retirement, terminal),
+                BackNoTargetSourceDriftPermanentSettlementOutcome::ReceiverMismatch { .. } => {
+                    panic!("RED: the exact Core source-drift terminal consumer is not implemented")
+                }
+                BackNoTargetSourceDriftPermanentSettlementOutcome::CapacityRejected { .. } => {
+                    panic!("the exact leased retirement preflight must accept once")
+                }
+            };
+        assert_eq!(
+            exact
+                .back_capacity_issuer
+                .as_ref()
+                .unwrap()
+                .classify_retirement_evidence(&retirement),
+            Err(BackCapacityRetireError::ConsumedReplay),
+            "the retired permit must remain exact non-authorizing replay evidence"
+        );
+        let request_after = exact.engine.request(request).unwrap();
+        assert!(matches!(
+            request_after.status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        assert_eq!(request_after.requested(), None);
+        assert_eq!(
+            request_after
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                .count(),
+            1,
+            "the source-drift request must terminal exactly once"
+        );
+        assert!(request_after.trace().iter().all(|event| {
+            event.kind() != NavigationTraceEventKind::HistoryIntentRejected
+                && event.kind() != NavigationTraceEventKind::CleanupSettled
+                && !matches!(event.phase(), Some(NavigationPhase::CleanupPending))
+        }));
+        assert_eq!(exact.engine.snapshot().history(), &history_before_terminal);
+        assert_eq!(exact.engine.snapshot().active(), &active_before_terminal);
+        let terminal_trace = request_after.trace().to_vec();
+        drop(navigation);
+
+        app.update();
+        let exact = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .unwrap();
+        assert_eq!(
+            exact.engine.request(request).unwrap().trace(),
+            terminal_trace,
+            "a later unrelated update must not append a second terminal event"
+        );
+        assert_eq!(
+            authority_world_fingerprint(app.world()),
+            world_before_terminal,
+            "source-drift settlement must not mutate the World"
+        );
+
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let exact = navigation
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handle == router)
+            .unwrap();
+        let issuer = exact.back_capacity_issuer.as_mut().unwrap();
+        let reservation_bound = issuer.semantic_snapshot_for_test().cell_count();
+        assert!(
+            bound_identity.1 < reservation_bound,
+            "the retired source-drift cell must remain inside the existing capacity"
+        );
+        let mut reservations = Vec::with_capacity(reservation_bound);
+        let mut reused_identity = None;
+        for _ in 0..reservation_bound {
+            let reservation = issuer
+                .reserve()
+                .expect("an existing reusable capacity cell accepts a real new reservation");
+            let identity = reservation.ordinal_identity_for_test();
+            let reused_source_drift_cell = identity.1 == bound_identity.1;
+            reservations.push(reservation);
+            if reused_source_drift_cell {
+                reused_identity = Some(identity);
+                break;
+            }
+        }
+        let reused_identity = reused_identity.expect(
+            "holding earlier reservations must reach the retired source-drift cell within the existing cell count",
+        );
+        assert!(
+            reused_identity.2 != bound_identity.2 || reused_identity.3 != bound_identity.3,
+            "reusing the same cell must mint a distinct owner or generation identity"
+        );
+        assert_eq!(
+            issuer.classify_retirement_evidence(&retirement),
+            Err(BackCapacityRetireError::StaleGeneration),
+            "old retirement evidence must stop classifying as the current retired identity after reuse"
+        );
+        for reservation in reservations {
+            let reused_retirement =
+                match issuer.retire_unbound(reservation, EnqueueRejected::CoreTokenDrift) {
+                    BackCapacityRetireOutcome::Retired(evidence) => evidence,
+                    BackCapacityRetireOutcome::Rejected { .. } => {
+                        panic!("each real reservation must exact-retire without leaking capacity")
+                    }
+                };
+            assert_eq!(
+                issuer.classify_retirement_evidence(&reused_retirement),
+                Err(BackCapacityRetireError::ConsumedReplay),
+                "each cleanup retirement must leave only non-authorizing replay evidence"
+            );
+        }
+        drop(navigation);
+        assert_eq!(
+            authority_world_fingerprint(app.world()),
+            world_before_terminal,
+            "real capacity reuse and cleanup must not mutate the World"
         );
     }
 
