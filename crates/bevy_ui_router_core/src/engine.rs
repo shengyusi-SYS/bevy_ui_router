@@ -48,7 +48,7 @@ use crate::mount::{
 use crate::presentation::{ActivePresentation, ActivePresentationKind, RouterNavigationState};
 use crate::request::{
     NavigationFailure, NavigationFailureKind, NavigationPhase, NavigationRequestRecord,
-    RequestStatus,
+    RequestRecordError, RequestStatus,
 };
 use crate::route_tree::RouteTree;
 use crate::trace::{MountRejectionKind, NavigationTraceEvent, NavigationTraceEventKind};
@@ -679,12 +679,18 @@ pub(crate) enum BackNoTargetApprovalOutcome {
 
 pub(crate) struct CoreBackNoTargetCleanupBatchOwner {
     evidence: BackResolutionEvidence,
+    host: HostVersion,
+    manifest_digest: u64,
+    obligation_count: usize,
 }
 
 impl CoreBackNoTargetCleanupBatchOwner {
     pub(crate) fn projection(&self) -> CoreBackNoTargetCleanupBatchProjection {
         CoreBackNoTargetCleanupBatchProjection {
             evidence: self.evidence.clone(),
+            host: self.host.clone(),
+            manifest_digest: self.manifest_digest,
+            obligation_count: self.obligation_count,
         }
     }
 }
@@ -700,11 +706,22 @@ pub(crate) struct CoreBackNoTargetCleanupAction {
 #[derive(Clone)]
 pub(crate) struct CoreBackNoTargetCleanupBatchProjection {
     evidence: BackResolutionEvidence,
+    host: HostVersion,
+    manifest_digest: u64,
+    obligation_count: usize,
 }
 
 impl CoreBackNoTargetCleanupBatchProjection {
     pub(crate) fn matches_resolution_evidence(&self, evidence: &BackResolutionEvidence) -> bool {
         &self.evidence == evidence
+    }
+
+    pub(crate) const fn manifest_digest(&self) -> u64 {
+        self.manifest_digest
+    }
+
+    pub(crate) const fn obligation_count(&self) -> usize {
+        self.obligation_count
     }
 }
 
@@ -727,7 +744,8 @@ impl CoreBackNoTargetCleanupInstallation {
 }
 
 pub(crate) struct CoreBackNoTargetPublicationCapability {
-    request: NavigationRequestId,
+    records: VecDeque<NavigationRequestRecord>,
+    state: RouterNavigationState,
 }
 
 pub(crate) struct CorePreparedBackNoTargetPublication {
@@ -736,13 +754,8 @@ pub(crate) struct CorePreparedBackNoTargetPublication {
 }
 
 impl CorePreparedBackNoTargetPublication {
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        CoreBackNoTargetPublicationCapability,
-        CoreBackNoTargetCleanupInstallation,
-    ) {
-        (self.publication, self.installation)
+    pub(crate) fn batch_projection(&self) -> CoreBackNoTargetCleanupBatchProjection {
+        self.installation.batch.projection()
     }
 }
 
@@ -1145,6 +1158,7 @@ pub(crate) struct CoreBackTargetDriverTerminalObservedProjection {
 pub(crate) struct CoreBackNoTargetLogicalZeroExpectedProjection {
     receiver: BackResolutionEvidence,
     source: CoreFrozenHistorySourceProjection,
+    host: Option<HostVersion>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1171,6 +1185,7 @@ pub(crate) enum CoreBackNoTargetLogicalZeroPreparationErrorProjection {
 pub(crate) struct CoreBackNoTargetLogicalZeroObservedProjection {
     scope: CoreBackTargetEngineScopeProjection,
     source: CoreFrozenHistorySourceProjection,
+    host: Option<HostVersion>,
     request: CoreBackNoTargetLogicalZeroRequestProjection,
     queued_requests: Vec<NavigationRequestId>,
     current: Option<FrameTaskIdentity>,
@@ -1183,6 +1198,33 @@ pub(crate) struct CoreBackNoTargetLogicalZeroObservedProjection {
     preview: BackPreview,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackNoTargetManifestCommitmentProjection {
+    pub(crate) manifest_digest: u64,
+    pub(crate) obligation_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoreBackNoTargetPublicationPreparationFailureProjection {
+    MissingRecord,
+    HistoryIntentRejectedTrace(RequestRecordError),
+    CleanupPendingTransition(RequestRecordError),
+    CleanupPendingTrace(RequestRecordError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoreBackNoTargetReadyMismatchProjection {
+    Manifest {
+        request: NavigationRequestId,
+        expected: CoreBackNoTargetManifestCommitmentProjection,
+        observed: CoreBackNoTargetManifestCommitmentProjection,
+    },
+    PublicationPreparation {
+        request: NavigationRequestId,
+        failure: CoreBackNoTargetPublicationPreparationFailureProjection,
+    },
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CorePreparationReceiverMismatchProjection {
     Scope {
@@ -1193,6 +1235,7 @@ pub(crate) enum CorePreparationReceiverMismatchProjection {
         expected: CoreBackNoTargetLogicalZeroExpectedProjection,
         observed: CoreBackNoTargetLogicalZeroObservedProjection,
     },
+    BackNoTargetReady(CoreBackNoTargetReadyMismatchProjection),
     Continuation {
         expected: CoreBackTargetContinuationExpectedProjection,
         observed: CoreBackTargetContinuationObservedProjection,
@@ -2620,6 +2663,7 @@ impl RouterEngine {
         let expected = CoreBackNoTargetLogicalZeroExpectedProjection {
             receiver: receiver.clone(),
             source: CoreFrozenHistorySourceProjection::project(candidate.source()),
+            host: self.state.host().cloned(),
         };
         let preview = self.history.preview_back();
         let request_projection = match self.request(request) {
@@ -2643,6 +2687,7 @@ impl RouterEngine {
         let observed = CoreBackNoTargetLogicalZeroObservedProjection {
             scope: self.back_target_engine_scope_projection(),
             source: CoreFrozenHistorySourceProjection::project(preview.observed_source()),
+            host: self.state.host().cloned(),
             request: request_projection,
             queued_requests: self.queue.iter().map(|queued| queued.request).collect(),
             current: self
@@ -2700,6 +2745,7 @@ impl RouterEngine {
             .history
             .refreeze_back_no_target_source(candidate.source())
             .is_ok();
+        let exact_host = expected.host.is_some() && observed.host == expected.host;
         let logical_zero = matches!(
             &observed.preview,
             BackPreview::NoTarget(source) if source == candidate.source()
@@ -2711,6 +2757,7 @@ impl RouterEngine {
                 && exact_request
                 && exact_owner_vacancies
                 && exact_source
+                && exact_host
                 && logical_zero,
         )
     }
@@ -2736,9 +2783,56 @@ impl RouterEngine {
         }
     }
 
+    fn prepare_back_no_target_publication(
+        mut records: VecDeque<NavigationRequestRecord>,
+        mut state: RouterNavigationState,
+        request: NavigationRequestId,
+    ) -> Result<
+        CoreBackNoTargetPublicationCapability,
+        CoreBackNoTargetPublicationPreparationFailureProjection,
+    > {
+        let Some(record) = records.iter_mut().find(|record| record.id() == request) else {
+            return Err(CoreBackNoTargetPublicationPreparationFailureProjection::MissingRecord);
+        };
+        record
+            .transition(RequestStatus::Running(NavigationPhase::CleanupPending))
+            .map_err(
+                CoreBackNoTargetPublicationPreparationFailureProjection::CleanupPendingTransition,
+            )?;
+        record
+            .append_trace(NavigationTraceEvent::new(
+                NavigationTraceEventKind::HistoryIntentRejected,
+            ))
+            .map_err(
+                CoreBackNoTargetPublicationPreparationFailureProjection::HistoryIntentRejectedTrace,
+            )?;
+        record
+            .append_trace(NavigationTraceEvent::request_phase_changed(
+                NavigationPhase::CleanupPending,
+            ))
+            .map_err(
+                CoreBackNoTargetPublicationPreparationFailureProjection::CleanupPendingTrace,
+            )?;
+        state.set_request(Some(RequestStatus::Running(
+            NavigationPhase::CleanupPending,
+        )));
+        Ok(CoreBackNoTargetPublicationCapability { records, state })
+    }
+
+    fn back_no_target_publication_preparation_mismatch(
+        request: NavigationRequestId,
+        failure: CoreBackNoTargetPublicationPreparationFailureProjection,
+    ) -> CorePreparationReceiverMismatchProjection {
+        CorePreparationReceiverMismatchProjection::BackNoTargetReady(
+            CoreBackNoTargetReadyMismatchProjection::PublicationPreparation { request, failure },
+        )
+    }
+
     pub(crate) fn accept_back_no_target_ready_with_canonical_zero_bind<F>(
         &mut self,
         approved: ApprovedBackNoTargetCandidate,
+        manifest_digest: u64,
+        obligation_count: usize,
         commit_canonical_zero: F,
     ) -> BackNoTargetReadyCoreOutcome
     where
@@ -2762,18 +2856,83 @@ impl RouterEngine {
             };
         }
 
+        if obligation_count != 0 {
+            return BackNoTargetReadyCoreOutcome::Mismatch {
+                approved,
+                mismatch: CorePreparationReceiverMismatchProjection::BackNoTargetReady(
+                    CoreBackNoTargetReadyMismatchProjection::Manifest {
+                        request: expected.receiver.request(),
+                        expected: CoreBackNoTargetManifestCommitmentProjection {
+                            manifest_digest,
+                            obligation_count: 0,
+                        },
+                        observed: CoreBackNoTargetManifestCommitmentProjection {
+                            manifest_digest,
+                            obligation_count,
+                        },
+                    },
+                ),
+            };
+        }
+
+        let Some(host) = approved.approval.expected.host.clone() else {
+            return BackNoTargetReadyCoreOutcome::Mismatch {
+                approved,
+                mismatch: CorePreparationReceiverMismatchProjection::LogicalZero {
+                    expected,
+                    observed,
+                },
+            };
+        };
         let evidence = approved.approval.expected.receiver.clone();
         let request = evidence.request();
+        let publication = match Self::prepare_back_no_target_publication(
+            self.records.clone(),
+            self.state.clone(),
+            request,
+        ) {
+            Ok(publication) => publication,
+            Err(failure) => {
+                return BackNoTargetReadyCoreOutcome::Mismatch {
+                    approved,
+                    mismatch: Self::back_no_target_publication_preparation_mismatch(
+                        request, failure,
+                    ),
+                };
+            }
+        };
         let prepared = CorePreparedBackNoTargetPublication {
-            publication: CoreBackNoTargetPublicationCapability { request },
+            publication,
             installation: CoreBackNoTargetCleanupInstallation {
-                batch: CoreBackNoTargetCleanupBatchOwner { evidence },
+                batch: CoreBackNoTargetCleanupBatchOwner {
+                    evidence,
+                    host,
+                    manifest_digest,
+                    obligation_count,
+                },
                 continuation: CoreRejectedBackContinuationOwner { approved },
                 action: CoreBackNoTargetCleanupAction { request },
             },
         };
         commit_canonical_zero();
         BackNoTargetReadyCoreOutcome::Prepared(prepared)
+    }
+
+    pub(crate) fn publish_prepared_back_no_target<F>(
+        &mut self,
+        prepared: CorePreparedBackNoTargetPublication,
+        install_cleanup: F,
+    ) where
+        F: FnOnce(CoreBackNoTargetCleanupInstallation),
+    {
+        let CorePreparedBackNoTargetPublication {
+            publication,
+            installation,
+        } = prepared;
+        let CoreBackNoTargetPublicationCapability { records, state } = publication;
+        install_cleanup(installation);
+        self.records = records;
+        self.state = state;
     }
 
     pub(crate) fn settle_back_no_target_source_drift_with_retirement<F>(
@@ -7462,6 +7621,18 @@ impl RouterEngine {
     }
 
     #[cfg(test)]
+    pub(crate) fn testing_remove_back_no_target_host(&mut self) -> bool {
+        let Some(host) = self.state.host().cloned() else {
+            return false;
+        };
+        let Some(top_slot) = self.state.top_slot() else {
+            return false;
+        };
+        self.state.begin_authority_recovery(&host, top_slot)
+            && self.state.complete_authority_settlement(&host, top_slot)
+    }
+
+    #[cfg(test)]
     pub(crate) fn testing_set_mount_registration_context_live(&mut self, live: bool) {
         self.current
             .as_mut()
@@ -8307,13 +8478,17 @@ impl EngineSnapshot {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::{
         ActionSnapshot, BackNoTargetSourceDriftSettlementOutcome,
         BackNoTargetSourceRefreezeOutcome, BackTargetResumeAction, BackTargetResumeOutcome,
-        BackTargetStart, CleanupError, CommitError, EngineAction, MountError, NavigationCommand,
-        PrivateRequestLookup, PushError, QueuedNavigation, QueuedReservation,
-        ROUTER_DIAGNOSTIC_RETENTION, ReportError, RootTaskIdentity, RouterEngine,
-        TERMINAL_RETENTION, WorkStage, occupied_child_slots,
+        BackTargetStart, CleanupError, CommitError,
+        CoreBackNoTargetPublicationPreparationFailureProjection,
+        CoreBackNoTargetReadyMismatchProjection, CorePreparationReceiverMismatchProjection,
+        EngineAction, MountError, NavigationCommand, PrivateRequestLookup, PushError,
+        QueuedNavigation, QueuedReservation, ROUTER_DIAGNOSTIC_RETENTION, ReportError,
+        RootTaskIdentity, RouterEngine, TERMINAL_RETENTION, WorkStage, occupied_child_slots,
     };
     use crate::admission::{AdmissionError, HostAdmissionIssuer};
     use crate::cleanup::{
@@ -8336,7 +8511,8 @@ mod tests {
     use crate::pattern::RoutePattern;
     use crate::presentation::{ActivePresentation, ActivePresentationKind};
     use crate::request::{
-        NavigationFailure, NavigationFailureKind, NavigationPhase, RequestStatus,
+        NavigationFailure, NavigationFailureKind, NavigationPhase, RequestRecordError,
+        RequestStatus,
     };
     use crate::route_tree::{RouteNodeOptions, RouteTree};
     use crate::slot::RouteSlotKey;
@@ -8424,6 +8600,100 @@ mod tests {
         let cleanup = sealed.cleanup().clone();
         publish_sealed(engine, sealed, || {}).unwrap();
         cleanup
+    }
+
+    #[test]
+    fn back_no_target_publication_preparation_retains_typed_failure_evidence() {
+        let mut engine = ready_engine();
+        let request = engine.push(RouteLocation::new("/items/1")).unwrap();
+
+        let missing = match RouterEngine::prepare_back_no_target_publication(
+            VecDeque::new(),
+            engine.state.clone(),
+            request,
+        ) {
+            Err(failure) => failure,
+            Ok(_) => panic!("a missing request record must not prepare publication"),
+        };
+        assert_eq!(
+            RouterEngine::back_no_target_publication_preparation_mismatch(request, missing),
+            CorePreparationReceiverMismatchProjection::BackNoTargetReady(
+                CoreBackNoTargetReadyMismatchProjection::PublicationPreparation {
+                    request,
+                    failure: CoreBackNoTargetPublicationPreparationFailureProjection::MissingRecord,
+                }
+            )
+        );
+
+        let trace = RouterEngine::back_no_target_publication_preparation_mismatch(
+            request,
+            CoreBackNoTargetPublicationPreparationFailureProjection::HistoryIntentRejectedTrace(
+                RequestRecordError::TraceClosed,
+            ),
+        );
+        assert_eq!(
+            trace,
+            CorePreparationReceiverMismatchProjection::BackNoTargetReady(
+                CoreBackNoTargetReadyMismatchProjection::PublicationPreparation {
+                    request,
+                    failure:
+                        CoreBackNoTargetPublicationPreparationFailureProjection::HistoryIntentRejectedTrace(
+                            RequestRecordError::TraceClosed
+                        ),
+                }
+            )
+        );
+
+        let cleanup_pending_trace = RouterEngine::back_no_target_publication_preparation_mismatch(
+            request,
+            CoreBackNoTargetPublicationPreparationFailureProjection::CleanupPendingTrace(
+                RequestRecordError::TraceClosed,
+            ),
+        );
+        assert_eq!(
+            cleanup_pending_trace,
+            CorePreparationReceiverMismatchProjection::BackNoTargetReady(
+                CoreBackNoTargetReadyMismatchProjection::PublicationPreparation {
+                    request,
+                    failure:
+                        CoreBackNoTargetPublicationPreparationFailureProjection::CleanupPendingTrace(
+                            RequestRecordError::TraceClosed
+                        ),
+                }
+            )
+        );
+
+        let mut terminal_records = engine.records.clone();
+        let record = terminal_records
+            .iter_mut()
+            .find(|record| record.id() == request)
+            .expect("the real request record remains retained");
+        record
+            .transition(RequestStatus::Failed(NavigationFailure::new(
+                NavigationFailureKind::AuthorityLost,
+                "typed preparation failure fixture",
+            )))
+            .unwrap();
+        let transition = match RouterEngine::prepare_back_no_target_publication(
+            terminal_records,
+            engine.state.clone(),
+            request,
+        ) {
+            Err(failure) => failure,
+            Ok(_) => panic!("a terminal request record must not re-enter CleanupPending"),
+        };
+        assert_eq!(
+            RouterEngine::back_no_target_publication_preparation_mismatch(request, transition),
+            CorePreparationReceiverMismatchProjection::BackNoTargetReady(
+                CoreBackNoTargetReadyMismatchProjection::PublicationPreparation {
+                    request,
+                    failure:
+                        CoreBackNoTargetPublicationPreparationFailureProjection::CleanupPendingTransition(
+                            RequestRecordError::AlreadyTerminal
+                        ),
+                }
+            )
+        );
     }
 
     fn drive_to_commit(engine: &mut RouterEngine, mut action: EngineAction) -> super::CommitTicket {

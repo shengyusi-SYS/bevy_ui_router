@@ -16,8 +16,8 @@ use bevy_ui_router_core::{
     frame::{FrameOrigin, RouteFrameVersion},
     ids::{NavigationRequestId, RouteSlotId},
     integration::{
-        BackAcceptedReservationView, BackResolutionScopeView, CleanupBatch, CleanupCompletion,
-        EnqueueBackErrorKind,
+        BackAcceptedReservationView, BackNoTargetCleanupBatchView, BackResolutionScopeView,
+        CleanupBatch, CleanupCompletion, EnqueueBackErrorKind,
     },
     slot::RouteSlotKey,
 };
@@ -87,7 +87,6 @@ struct BackCapacityCell {
     generation: PreparationReleaseGeneration,
     state: BackCapacityCellState,
     reuse: BackCapacityReuse,
-    ledger: Option<CleanupLedger>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -250,7 +249,6 @@ impl BackCapacityIssuer {
         let free_cell = self.cells.iter().position(|cell| {
             matches!(cell.state, BackCapacityCellState::Free)
                 && cell.reuse == BackCapacityReuse::Reusable
-                && cell.ledger.is_none()
         });
         let owner = self.next_owner;
         let next_owner = BackCapacityOwnerId(
@@ -281,7 +279,6 @@ impl BackCapacityIssuer {
             generation,
             state: BackCapacityCellState::Free,
             reuse: BackCapacityReuse::Reusable,
-            ledger: None,
         });
         let live = BackCapacityLiveRecord {
             domain: self.domain,
@@ -306,6 +303,14 @@ impl BackCapacityIssuer {
         self.live
             .try_reserve(1)
             .map_err(|_| BackCapacityReserveError::LedgerSlotUnavailable)?;
+        if ledger_domain_fault_injected() {
+            return Err(BackCapacityReserveError::DomainExhausted);
+        }
+        let Some(ledger_domain) = allocate_ledger_domain(&NEXT_LEDGER_DOMAIN) else {
+            return Err(BackCapacityReserveError::DomainExhausted);
+        };
+        observe_ledger_domain_allocation();
+        let vacant_ledger = ManifestNeutralLedgerStorage::new(ledger_domain);
 
         #[cfg(test)]
         if vacant_cell.is_some() {
@@ -322,6 +327,7 @@ impl BackCapacityIssuer {
             cell,
             owner,
             generation,
+            vacant_ledger,
         };
         let replaced = self.live.insert(owner, live);
         debug_assert!(replaced.is_none());
@@ -442,7 +448,6 @@ impl BackCapacityIssuer {
         };
         if cell.generation != permit.generation
             || cell.reuse != BackCapacityReuse::Reusable
-            || cell.ledger.is_some()
             || !matches!(
                 cell.state,
                 BackCapacityCellState::Outstanding { owner }
@@ -521,7 +526,6 @@ impl BackCapacityIssuer {
         };
         if cell.generation != capacity.generation
             || cell.reuse != BackCapacityReuse::Reusable
-            || cell.ledger.is_some()
             || !matches!(
                 cell.state,
                 BackCapacityCellState::Outstanding { owner }
@@ -568,7 +572,6 @@ impl BackCapacityIssuer {
         };
         if cell.generation != capacity.generation
             || cell.reuse != BackCapacityReuse::Reusable
-            || cell.ledger.is_some()
             || !matches!(
                 cell.state,
                 BackCapacityCellState::Leased { owner }
@@ -627,7 +630,6 @@ impl BackCapacityIssuer {
         };
         if cell.generation != capacity.generation
             || cell.reuse != BackCapacityReuse::Reusable
-            || cell.ledger.is_some()
             || !matches!(
                 cell.state,
                 BackCapacityCellState::Leased { owner }
@@ -637,21 +639,9 @@ impl BackCapacityIssuer {
             return Err(BackCapacityRetireError::StaleGeneration);
         }
 
-        let prepared_slot_cell = BackCapacityCell {
-            generation: cell.generation,
-            state: BackCapacityCellState::Leased {
-                owner: capacity.owner,
-            },
-            reuse: cell.reuse,
-            ledger: None,
-        };
         Ok((
             ExactBackCapacityCommitGuard {
-                transition: BackCapacityCommitTransition::LeasedToCanonicalZeroSlot {
-                    live,
-                    cell,
-                    prepared_slot_cell,
-                },
+                transition: BackCapacityCommitTransition::LeasedToCanonicalZeroSlot { live, cell },
                 owner: permit,
             },
             PreparedManifestNeutralLedgerSlot { private: () },
@@ -702,7 +692,6 @@ impl BackCapacityIssuer {
         };
         if cell.generation != capacity.generation
             || cell.reuse != BackCapacityReuse::Reusable
-            || cell.ledger.is_some()
             || !matches!(
                 cell.state,
                 BackCapacityCellState::Leased { owner }
@@ -790,7 +779,6 @@ impl BackCapacityIssuer {
         };
         if cell.generation != owner.generation
             || cell.reuse != BackCapacityReuse::Reusable
-            || cell.ledger.is_some()
             || !matches!(
                 cell.state,
                 BackCapacityCellState::Outstanding { owner: cell_owner }
@@ -889,6 +877,24 @@ pub(crate) struct ManifestNeutralLedgerSlot {
     capacity: EcsCleanupCapacityReservation,
 }
 
+struct ManifestNeutralLedgerStorage {
+    obligations: Vec<CleanupObligation>,
+    mount_parents: Vec<CleanupMountParentSettlement>,
+    receipts: Vec<Option<CleanupReceipt>>,
+    ledger_domain: u64,
+}
+
+impl ManifestNeutralLedgerStorage {
+    fn new(ledger_domain: u64) -> Self {
+        Self {
+            obligations: Vec::new(),
+            mount_parents: Vec::new(),
+            receipts: Vec::new(),
+            ledger_domain,
+        }
+    }
+}
+
 enum BackCapacityCommitTransition<'issuer> {
     OutstandingRetire {
         live: OccupiedEntry<'issuer, BackCapacityOwnerId, BackCapacityLiveRecord>,
@@ -908,7 +914,6 @@ enum BackCapacityCommitTransition<'issuer> {
     LeasedToCanonicalZeroSlot {
         live: OccupiedEntry<'issuer, BackCapacityOwnerId, BackCapacityLiveRecord>,
         cell: &'issuer mut BackCapacityCell,
-        prepared_slot_cell: BackCapacityCell,
     },
 }
 
@@ -952,13 +957,9 @@ impl<Owner: ?Sized> ExactBackCapacityCommitGuard<'_, '_, Owner> {
                     }
                 }
             }
-            BackCapacityCommitTransition::LeasedToCanonicalZeroSlot {
-                live,
-                cell,
-                prepared_slot_cell,
-            } => {
+            BackCapacityCommitTransition::LeasedToCanonicalZeroSlot { live, cell } => {
                 let _ = live.remove();
-                *cell = prepared_slot_cell;
+                let _ = cell;
             }
         }
     }
@@ -981,8 +982,29 @@ impl PreparedManifestNeutralLedgerSlot {
     }
 }
 
-#[cfg(test)]
 impl ManifestNeutralLedgerSlot {
+    pub(crate) fn bind_back_no_target(self, batch: BackNoTargetCleanupBatchView) -> CleanupLedger {
+        let Self { capacity } = self;
+        let EcsCleanupCapacityReservation {
+            domain,
+            cell,
+            owner,
+            generation,
+            vacant_ledger,
+        } = capacity;
+        CleanupLedger::activate_back_no_target(
+            vacant_ledger,
+            batch,
+            InstalledBackCapacityLease {
+                domain,
+                cell,
+                owner,
+                generation,
+            },
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) const fn capacity_identity_for_test(&self) -> (u64, usize, u64, u64) {
         self.capacity.ordinal_identity_for_test()
     }
@@ -1019,6 +1041,7 @@ pub(crate) struct EcsCleanupCapacityReservation {
     cell: BackCapacityCellId,
     owner: BackCapacityOwnerId,
     generation: PreparationReleaseGeneration,
+    vacant_ledger: ManifestNeutralLedgerStorage,
 }
 
 pub(crate) struct BackCapacityEnqueueRetireResidual {
@@ -5255,6 +5278,8 @@ impl PreparedCleanupLedger {
 
 pub(crate) struct CleanupLedger {
     batch: Option<CleanupBatch>,
+    back_no_target_batch: Option<BackNoTargetCleanupBatchView>,
+    back_no_target_capacity: Option<InstalledBackCapacityLease>,
     owner: Option<CleanupOwner>,
     obligations: Vec<CleanupObligation>,
     mount_parents: Vec<CleanupMountParentSettlement>,
@@ -5267,6 +5292,27 @@ pub(crate) struct CleanupLedger {
     quarantine_event_observed: bool,
     post_settlement_focus: Vec<PostSettlementFocusRoot>,
     authority_host_children: Option<Vec<Entity>>,
+}
+
+#[derive(Clone, Copy)]
+struct InstalledBackCapacityLease {
+    domain: PreparationCapacityDomain,
+    cell: BackCapacityCellId,
+    owner: BackCapacityOwnerId,
+    generation: PreparationReleaseGeneration,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackNoTargetLedgerProjectionForTest {
+    pub(crate) header_installed: bool,
+    pub(crate) capacity_identity: (u64, usize, u64, u64),
+    pub(crate) ledger_domain: u64,
+    pub(crate) manifest_digest: u64,
+    pub(crate) obligation_count: usize,
+    pub(crate) receipt_count: usize,
+    pub(crate) batch_manifest_digest: u64,
+    pub(crate) batch_obligation_count: usize,
 }
 
 pub(crate) enum CleanupOwner {
@@ -5519,6 +5565,8 @@ impl CleanupLedger {
             .then_some(canonical_empty_completion_digest());
         Self {
             batch: prepared.batch,
+            back_no_target_batch: None,
+            back_no_target_capacity: None,
             owner,
             obligations: prepared.obligations,
             mount_parents: prepared.mount_parents,
@@ -5532,6 +5580,60 @@ impl CleanupLedger {
             post_settlement_focus: Vec::new(),
             authority_host_children: None,
         }
+    }
+
+    fn activate_back_no_target(
+        vacant: ManifestNeutralLedgerStorage,
+        batch: BackNoTargetCleanupBatchView,
+        capacity: InstalledBackCapacityLease,
+    ) -> Self {
+        let ManifestNeutralLedgerStorage {
+            obligations,
+            mount_parents,
+            receipts,
+            ledger_domain,
+        } = vacant;
+        let manifest_digest = batch.manifest_digest();
+        Self {
+            batch: None,
+            back_no_target_batch: Some(batch),
+            back_no_target_capacity: Some(capacity),
+            owner: None,
+            obligations,
+            mount_parents,
+            manifest_digest,
+            receipts,
+            ledger_domain,
+            next_attempt: 1,
+            issued_attempt: None,
+            completion_digest: Some(canonical_empty_completion_digest()),
+            quarantine_event_observed: false,
+            post_settlement_focus: Vec::new(),
+            authority_host_children: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn back_no_target_projection_for_test(
+        &self,
+    ) -> Option<BackNoTargetLedgerProjectionForTest> {
+        let capacity = self.back_no_target_capacity?;
+        let batch = self.back_no_target_batch.as_ref()?;
+        Some(BackNoTargetLedgerProjectionForTest {
+            header_installed: true,
+            capacity_identity: (
+                capacity.domain.0,
+                capacity.cell.0,
+                capacity.owner.0,
+                capacity.generation.0,
+            ),
+            ledger_domain: self.ledger_domain,
+            manifest_digest: self.manifest_digest,
+            obligation_count: self.obligations.len(),
+            receipt_count: self.receipts.iter().flatten().count(),
+            batch_manifest_digest: batch.manifest_digest(),
+            batch_obligation_count: batch.obligation_count(),
+        })
     }
 
     pub(crate) fn pending_completion(&self) -> Option<CleanupCompletion> {
@@ -8378,6 +8480,10 @@ fn completion_digest(receipts: &[Option<CleanupReceipt>]) -> u64 {
 
 fn canonical_empty_completion_digest() -> u64 {
     StructuredDigest::new(COMPLETION_DOMAIN).finish()
+}
+
+pub(crate) const fn canonical_zero_manifest_digest() -> u64 {
+    0
 }
 
 struct StructuredDigest(u64);

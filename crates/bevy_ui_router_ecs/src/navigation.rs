@@ -7,7 +7,8 @@ use bevy_ecs::{prelude::World, resource::Resource};
 use bevy_input_focus::InputFocus;
 use bevy_ui_router_core::{
     integration::{
-        ApprovedBackNoTargetCandidate, BackNoTargetApprovalOutcome, BackNoTargetReadyCoreOutcome,
+        ApprovedBackNoTargetCandidate, BackNoTargetApprovalOutcome,
+        BackNoTargetCleanupInstallation, BackNoTargetReadyCoreOutcome,
         BackNoTargetSourceDriftOwner, BackNoTargetSourceDriftSettlementOutcome,
         BackNoTargetSourceDriftTerminalEvidence, BackNoTargetSourceRefreezeOutcome,
         BackResolutionEvidence, BackResolutionEvidenceClassification, BackResolutionOwnerHandoff,
@@ -24,8 +25,8 @@ use bevy_ui_router_core::{
         HistoryExecutionBindingView, HostLease, IntegrationError, LifecycleContinuationCapacity,
         MountMutationArtifact, MountReceiptProof, MountRegistrationBeginError, MountRequest,
         PreparationReceiverMismatchView, PrepareBackAdmissionErrorKind,
-        PreparedBackNoTargetPublication, PreparedPostCommitContinuationOwner, ResolveMountOwner,
-        RootFrameTask, RouteFailureContinuationOwner, RouterEngine, TargetAuthoritySettlementOwner,
+        PreparedPostCommitContinuationOwner, ResolveMountOwner, RootFrameTask,
+        RouteFailureContinuationOwner, RouterEngine, TargetAuthoritySettlementOwner,
         VerifiedBackNoTargetCandidate, VerifiedBackResolutionContradiction,
         VerifiedBackResolutionOwnerHandoff, VerifiedBackTargetExecutionOwner, ViewFailureKind,
         ViewReportIdentity,
@@ -54,8 +55,8 @@ use crate::{
         FailedAuthorityBoundaryBinding, FailedBoundaryDrift, FailedBoundarySource,
         FailedManifestBuildError, FailedPreparedTopologyError, FrozenCleanupManifest,
         ManifestNeutralLedgerSlot, NoTargetCapacityPermit, PendingBoundaryBinding,
-        PreparedCleanupLedger, RouterCleanupObservation, cleanup_claim_has_exact_authority,
-        failed_prepared_branch_roots_are_exact,
+        PreparedCleanupLedger, RouterCleanupObservation, canonical_zero_manifest_digest,
+        cleanup_claim_has_exact_authority, failed_prepared_branch_roots_are_exact,
     },
     components::{
         ChildSlotAuthority, ChildSlotLifecycle, ProvisionalSlotLifecycle, RouteOwnershipSeal,
@@ -1017,6 +1018,7 @@ pub(crate) struct RouterEntry {
     pending_back_resolution_action: Option<(BackResolutionOwnerHandoff, BackResolutionEvidence)>,
     pending_bound_back_resolution: Option<BoundBackResolutionHandoff>,
     pending_back_target_execution: Option<PendingBackTargetExecution>,
+    installed_back_no_target_cleanup: Option<InstalledBackNoTargetCleanup>,
     history_admission_world: HistoryAdmissionWorldSeal,
     history_admission_stamp: Option<HistoryAdmissionStamp>,
     back_capacity_issuer: Option<BackCapacityIssuer>,
@@ -1035,6 +1037,11 @@ pub(crate) struct RouterEntry {
     #[cfg(feature = "test-support")]
     back_capacity_facade_producer:
         Option<bevy_ui_router_core::test_support::BackCapacityFacadeProducer>,
+}
+
+pub(crate) struct InstalledBackNoTargetCleanup {
+    ledger: CleanupLedger,
+    installation: BackNoTargetCleanupInstallation,
 }
 
 pub(crate) struct BoundBackTargetResolution {
@@ -1140,6 +1147,7 @@ struct ProvenEmptyAttemptOwnerInventory {
     pending_back_resolution_action_vacant: bool,
     pending_bound_back_resolution_vacant: bool,
     pending_back_target_execution_vacant: bool,
+    installed_back_no_target_cleanup_vacant: bool,
 }
 
 impl ProvenEmptyAttemptOwnerInventory {
@@ -1165,6 +1173,9 @@ impl ProvenEmptyAttemptOwnerInventory {
             pending_back_resolution_action_vacant: entry.pending_back_resolution_action.is_none(),
             pending_bound_back_resolution_vacant: entry.pending_bound_back_resolution.is_none(),
             pending_back_target_execution_vacant: entry.pending_back_target_execution.is_none(),
+            installed_back_no_target_cleanup_vacant: entry
+                .installed_back_no_target_cleanup
+                .is_none(),
         }
     }
 
@@ -1184,6 +1195,7 @@ impl ProvenEmptyAttemptOwnerInventory {
             && self.pending_back_resolution_action_vacant
             && self.pending_bound_back_resolution_vacant
             && self.pending_back_target_execution_vacant
+            && self.installed_back_no_target_cleanup_vacant
     }
 }
 
@@ -1218,6 +1230,11 @@ impl ProvenEmptyProjection {
             && self.attempt_owner_inventory.is_vacant()
             && self.authorized_targets.is_empty()
     }
+
+    fn canonical_manifest_commitment(&self) -> Option<(u64, usize)> {
+        self.is_canonical_zero()
+            .then(|| (canonical_zero_manifest_digest(), 0))
+    }
 }
 
 pub(crate) struct BackNoTargetProvenEmptyOwner {
@@ -1239,13 +1256,8 @@ pub(crate) enum BackNoTargetProvenEmptyApprovalOutcome {
     },
 }
 
-pub(crate) struct PreparedBackNoTargetCanonicalZeroBind {
-    publication: PreparedBackNoTargetPublication,
-    slot: ManifestNeutralLedgerSlot,
-}
-
 pub(crate) enum BackNoTargetFinalizationOutcome {
-    Prepared(PreparedBackNoTargetCanonicalZeroBind),
+    Published,
     CapacityRejected {
         owner: PreparedBackNoTarget,
         error: BackCapacityRetireError,
@@ -2822,16 +2834,75 @@ pub(crate) fn consume_prepared_back_no_target(
     entry: &mut RouterEntry,
     owner: PreparedBackNoTarget,
 ) -> BackNoTargetFinalizationOutcome {
+    consume_prepared_back_no_target_with_observers(entry, owner, |_, _| {}, |_| {})
+}
+
+#[cfg(test)]
+fn consume_prepared_back_no_target_with_prepared_observer<F>(
+    entry: &mut RouterEntry,
+    owner: PreparedBackNoTarget,
+    observe_prepared: F,
+) -> BackNoTargetFinalizationOutcome
+where
+    F: FnOnce(&RouterEngine, &ManifestNeutralLedgerSlot),
+{
+    consume_prepared_back_no_target_with_observers(entry, owner, observe_prepared, |_| {})
+}
+
+#[cfg(test)]
+fn consume_prepared_back_no_target_with_installation_observer<F>(
+    entry: &mut RouterEntry,
+    owner: PreparedBackNoTarget,
+    observe_installed: F,
+) -> BackNoTargetFinalizationOutcome
+where
+    F: FnOnce(&InstalledBackNoTargetCleanup),
+{
+    consume_prepared_back_no_target_with_observers(entry, owner, |_, _| {}, observe_installed)
+}
+
+fn consume_prepared_back_no_target_with_observers<PreparedObserver, InstallationObserver>(
+    entry: &mut RouterEntry,
+    owner: PreparedBackNoTarget,
+    observe_prepared: PreparedObserver,
+    observe_installed: InstallationObserver,
+) -> BackNoTargetFinalizationOutcome
+where
+    PreparedObserver: FnOnce(&RouterEngine, &ManifestNeutralLedgerSlot),
+    InstallationObserver: FnOnce(&InstalledBackNoTargetCleanup),
+{
     let PreparedBackNoTarget {
         approved,
         capacity,
         projection,
     } = owner;
+    let Some((manifest_digest, obligation_count)) = projection.canonical_manifest_commitment()
+    else {
+        return BackNoTargetFinalizationOutcome::CapacityRejected {
+            owner: PreparedBackNoTarget {
+                approved,
+                capacity,
+                projection,
+            },
+            error: BackCapacityRetireError::StaleGeneration,
+        };
+    };
     let RouterEntry {
         engine,
         back_capacity_issuer,
+        installed_back_no_target_cleanup,
         ..
     } = entry;
+    if installed_back_no_target_cleanup.is_some() {
+        return BackNoTargetFinalizationOutcome::CapacityRejected {
+            owner: PreparedBackNoTarget {
+                approved,
+                capacity,
+                projection,
+            },
+            error: BackCapacityRetireError::StaleGeneration,
+        };
+    }
     let Some(issuer) = back_capacity_issuer.as_mut() else {
         return BackNoTargetFinalizationOutcome::CapacityRejected {
             owner: PreparedBackNoTarget {
@@ -2857,15 +2928,26 @@ pub(crate) fn consume_prepared_back_no_target(
         }
     };
 
-    match engine
-        .accept_back_no_target_ready_with_canonical_zero_bind(approved, move || guard.commit())
-    {
+    match engine.accept_back_no_target_ready_with_canonical_zero_bind(
+        approved,
+        manifest_digest,
+        obligation_count,
+        move || guard.commit(),
+    ) {
         BackNoTargetReadyCoreOutcome::Prepared(publication) => {
             let slot = prepared_slot.into_slot_after_exact_receiver(capacity);
-            BackNoTargetFinalizationOutcome::Prepared(PreparedBackNoTargetCanonicalZeroBind {
-                publication,
-                slot,
-            })
+            observe_prepared(engine, &slot);
+            engine.publish_prepared_back_no_target(publication, move |installation| {
+                let batch = installation.batch();
+                let ledger = slot.bind_back_no_target(batch);
+                let installed =
+                    installed_back_no_target_cleanup.insert(InstalledBackNoTargetCleanup {
+                        ledger,
+                        installation,
+                    });
+                observe_installed(installed);
+            });
+            BackNoTargetFinalizationOutcome::Published
         }
         BackNoTargetReadyCoreOutcome::Mismatch { approved, mismatch } => {
             BackNoTargetFinalizationOutcome::ReceiverMismatch {
@@ -3597,6 +3679,7 @@ impl RouterNavigation {
             pending_back_resolution_action: None,
             pending_bound_back_resolution: None,
             pending_back_target_execution: None,
+            installed_back_no_target_cleanup: None,
             history_admission_world,
             history_admission_stamp: None,
             back_capacity_issuer: None,
@@ -17922,6 +18005,7 @@ pub(crate) mod tests {
             pending_back_resolution_action: None,
             pending_bound_back_resolution: None,
             pending_back_target_execution: None,
+            installed_back_no_target_cleanup: None,
             history_admission_world,
             history_admission_stamp: None,
             back_capacity_issuer: None,
@@ -18906,6 +18990,69 @@ pub(crate) mod tests {
             "the verified no-target owner must remain paired with its exact accepted request"
         );
         (second, bound)
+    }
+
+    fn prepare_back_no_target_finalization_fixture(
+        name: &'static str,
+    ) -> (App, RouterHandle, NavigationRequestId, PreparedBackNoTarget) {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router_at_pattern(&mut app, name, "/:id");
+        app.update();
+        let (request, bound) = take_real_bound_back_no_target(&mut app, router);
+        let owner = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the no-target finalization fixture retains its exact entry");
+            match begin_bound_back_no_target(entry, bound) {
+                BackNoTargetBeginOutcome::Begun(owner) => owner,
+                BackNoTargetBeginOutcome::Permanent(_) => {
+                    panic!("the unchanged no-target source must retain its candidate")
+                }
+                BackNoTargetBeginOutcome::CapacityRejected { .. } => {
+                    panic!("the exact outstanding reservation must transfer to Leased")
+                }
+                BackNoTargetBeginOutcome::ReceiverMismatch { .. } => {
+                    panic!("the exact refreeze receiver must accept the real candidate")
+                }
+            }
+        };
+        let proven = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the no-target finalization fixture retains its exact entry");
+            match freeze_back_no_target_proven_empty(world, entry, owner) {
+                BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(owner) => owner,
+                BackNoTargetPhysicalFreezeOutcome::Indeterminate { evidence, .. } => {
+                    panic!(
+                        "the unmodified no-target topology must prove empty: {:?}",
+                        evidence.reason
+                    )
+                }
+            }
+        };
+        let prepared = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the no-target finalization fixture retains its exact entry");
+            match approve_back_no_target_proven_empty(entry, proven) {
+                BackNoTargetProvenEmptyApprovalOutcome::Prepared(prepared) => prepared,
+                BackNoTargetProvenEmptyApprovalOutcome::ReceiverMismatch { .. } => {
+                    panic!("the proven-empty candidate must receive logical-zero approval")
+                }
+            }
+        };
+        (app, router, request, prepared)
     }
 
     #[derive(Clone, Copy)]
@@ -26776,7 +26923,7 @@ pub(crate) mod tests {
                 );
                 owner
             }
-            BackNoTargetFinalizationOutcome::Prepared(_)
+            BackNoTargetFinalizationOutcome::Published
             | BackNoTargetFinalizationOutcome::ReceiverMismatch { .. } => {
                 panic!(
                     "foreign issuer rejection must return the complete approved/projection/permit owner"
@@ -26812,7 +26959,7 @@ pub(crate) mod tests {
             .semantic_snapshot_for_test();
         let prepared = match consume_prepared_back_no_target(exact, prepared) {
             BackNoTargetFinalizationOutcome::ReceiverMismatch { owner, mismatch: _ } => owner,
-            BackNoTargetFinalizationOutcome::Prepared(_)
+            BackNoTargetFinalizationOutcome::Published
             | BackNoTargetFinalizationOutcome::CapacityRejected { .. } => {
                 panic!("the exact issuer must pass before the wrong Core receiver rejects")
             }
@@ -26849,18 +26996,25 @@ pub(crate) mod tests {
             .as_ref()
             .expect("the exact leased issuer remains installed")
             .semantic_snapshot_for_test();
-        let outcome = consume_prepared_back_no_target(exact, prepared);
-        assert!(
-            matches!(&outcome, BackNoTargetFinalizationOutcome::Prepared(_)),
-            "RED: the exact production receiver must call the canonical-zero guard once and return the sealed publication plus slot successor"
+        let outcome = consume_prepared_back_no_target_with_prepared_observer(
+            exact,
+            prepared,
+            |engine, slot| {
+                assert_eq!(
+                    slot.capacity_identity_for_test(),
+                    capacity_identity,
+                    "the successor conversion must retain the stale permit's exact cell lease identity"
+                );
+                assert_eq!(
+                    engine.snapshot(),
+                    exact_engine_before,
+                    "sealed prepared publication construction must remain public and engine zero-write"
+                );
+            },
         );
-        let BackNoTargetFinalizationOutcome::Prepared(prepared_bind) = outcome else {
-            return;
-        };
-        assert_eq!(
-            prepared_bind.slot.capacity_identity_for_test(),
-            capacity_identity,
-            "the successor conversion must retain the stale permit's exact cell lease identity"
+        assert!(
+            matches!(&outcome, BackNoTargetFinalizationOutcome::Published),
+            "the exact production receiver must install the whole owner before first publication"
         );
         let issuer_after_exact = exact
             .back_capacity_issuer
@@ -26879,12 +27033,264 @@ pub(crate) mod tests {
                 .unwrap(),
             "LeasedToCanonicalZeroSlot must consume the held live entry exactly once"
         );
-        assert_eq!(
-            exact.engine.snapshot(),
-            exact_engine_before,
-            "sealed prepared publication construction must remain public and engine zero-write"
+        assert!(
+            exact.installed_back_no_target_cleanup.is_some(),
+            "the first publication must retain the whole installed cleanup owner"
         );
-        let _sealed_whole_publication = &prepared_bind.publication;
+    }
+
+    #[test]
+    fn back_no_target_first_publication_observes_whole_owner_before_core_write() {
+        let (mut app, router, request, prepared) =
+            prepare_back_no_target_finalization_fixture("back-no-target-install-observer");
+        let capacity_identity = prepared.capacity.capacity_identity_for_test();
+        let engine_before = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the exact no-target router retains its entry")
+                .engine
+                .snapshot()
+        };
+        let observed_whole_owner = std::cell::Cell::new(false);
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the exact no-target router retains its entry");
+            let _ = consume_prepared_back_no_target_with_installation_observer(
+                entry,
+                prepared,
+                |installed| {
+                    let ledger = installed
+                        .ledger
+                        .back_no_target_projection_for_test()
+                        .expect("the installation observer sees the complete ledger header");
+                    let batch = installed.installation.batch();
+                    assert!(ledger.header_installed);
+                    assert_eq!(ledger.capacity_identity, capacity_identity);
+                    assert_ne!(ledger.ledger_domain, 0);
+                    assert_eq!(ledger.manifest_digest, canonical_zero_manifest_digest());
+                    assert_eq!(ledger.obligation_count, 0);
+                    assert_eq!(ledger.receipt_count, 0);
+                    assert_eq!(ledger.batch_manifest_digest, batch.manifest_digest());
+                    assert_eq!(ledger.batch_obligation_count, batch.obligation_count());
+                    observed_whole_owner.set(true);
+                    panic!("interrupt after whole owner installation");
+                },
+            );
+        }));
+        assert!(
+            interrupted.is_err(),
+            "the test seam must interrupt the final consumer after installation"
+        );
+        assert!(
+            observed_whole_owner.get(),
+            "the final consumer must expose the complete installed owner before publication"
+        );
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the interrupted no-target router retains its entry");
+        assert!(
+            entry.installed_back_no_target_cleanup.is_some(),
+            "the interruption occurs only after the whole owner is installed"
+        );
+        assert_eq!(
+            entry.engine.snapshot(),
+            engine_before,
+            "interrupting immediately after installation must precede every Core publication write"
+        );
+        let request = entry
+            .engine
+            .request(request)
+            .expect("the interrupted request remains retained");
+        assert_eq!(request.status(), &RequestStatus::Queued);
+        assert!(
+            request
+                .trace()
+                .iter()
+                .all(|event| event.kind() != NavigationTraceEventKind::HistoryIntentRejected),
+            "HistoryIntentRejected cannot become observable before whole owner installation returns"
+        );
+    }
+
+    #[test]
+    fn back_no_target_first_publication_has_installed_owners() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router =
+            install_atomic_router_at_pattern(&mut app, "back-no-target-first-publication", "/:id");
+        app.update();
+        let (request, bound) = take_real_bound_back_no_target(&mut app, router);
+
+        let owner = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the exact no-target router retains its entry");
+            match begin_bound_back_no_target(entry, bound) {
+                BackNoTargetBeginOutcome::Begun(owner) => owner,
+                BackNoTargetBeginOutcome::Permanent(_) => {
+                    panic!("the unchanged real no-target source must retain its candidate")
+                }
+                BackNoTargetBeginOutcome::CapacityRejected { .. } => {
+                    panic!("the exact outstanding reservation must transfer to Leased")
+                }
+                BackNoTargetBeginOutcome::ReceiverMismatch { .. } => {
+                    panic!("the exact refreeze receiver must accept the real candidate")
+                }
+            }
+        };
+        let proven = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the exact no-target router retains its entry");
+            match freeze_back_no_target_proven_empty(world, entry, owner) {
+                BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(owner) => owner,
+                BackNoTargetPhysicalFreezeOutcome::Indeterminate { evidence, .. } => {
+                    panic!(
+                        "the unmodified real root no-target topology must prove empty: {:?}",
+                        evidence.reason
+                    )
+                }
+            }
+        };
+        let prepared = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the exact no-target router retains its entry");
+            match approve_back_no_target_proven_empty(entry, proven) {
+                BackNoTargetProvenEmptyApprovalOutcome::Prepared(prepared) => prepared,
+                BackNoTargetProvenEmptyApprovalOutcome::ReceiverMismatch { .. } => {
+                    panic!(
+                        "the real proven-empty candidate must receive Core logical-zero approval"
+                    )
+                }
+            }
+        };
+        let capacity_identity = prepared.capacity.capacity_identity_for_test();
+        let (active_before, history_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the exact no-target router retains its entry");
+            (
+                entry.engine.active().clone(),
+                entry.engine.history().clone(),
+            )
+        };
+        let world_before = authority_world_fingerprint(app.world());
+        crate::cleanup::reset_ledger_domain_allocations_for_test();
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the exact no-target router retains its entry");
+            assert!(
+                matches!(
+                    consume_prepared_back_no_target(entry, prepared),
+                    BackNoTargetFinalizationOutcome::Published
+                ),
+                "the exact production receiver must install before publishing"
+            );
+        }
+        assert_eq!(
+            crate::cleanup::ledger_domain_allocations_for_test(),
+            0,
+            "canonical publication must consume the domain reserved with capacity"
+        );
+        assert_eq!(
+            authority_world_fingerprint(app.world()),
+            world_before,
+            "no-target publication must not mutate the physical World"
+        );
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the exact no-target router retains its entry");
+        assert_eq!(entry.engine.active(), &active_before);
+        assert_eq!(entry.engine.history(), &history_before);
+        let installed = entry
+            .installed_back_no_target_cleanup
+            .as_ref()
+            .expect("first publication must already expose the whole installed owner");
+        assert_eq!(installed.ledger.receipt_count(), 0);
+        let batch = installed.installation.batch();
+        assert_eq!(batch.obligation_count(), 0);
+        assert_eq!(batch.manifest_digest(), canonical_zero_manifest_digest());
+        let ledger = installed
+            .ledger
+            .back_no_target_projection_for_test()
+            .expect("the canonical zero ledger installs its dedicated header");
+        assert!(ledger.header_installed);
+        assert_eq!(
+            ledger.capacity_identity, capacity_identity,
+            "the installed ledger must retain the exact reserved capacity identity"
+        );
+        assert_ne!(ledger.ledger_domain, 0);
+        assert_eq!(ledger.manifest_digest, canonical_zero_manifest_digest());
+        assert_eq!(ledger.obligation_count, 0);
+        assert_eq!(ledger.receipt_count, 0);
+        assert_eq!(
+            ledger.batch_manifest_digest,
+            canonical_zero_manifest_digest()
+        );
+        assert_eq!(ledger.batch_obligation_count, 0);
+        let request = entry
+            .engine
+            .request(request)
+            .expect("the exact back request remains observable");
+        assert_eq!(
+            request.status(),
+            &RequestStatus::Running(NavigationPhase::CleanupPending)
+        );
+        let trace = request.trace();
+        let rejected = trace
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.kind() == NavigationTraceEventKind::HistoryIntentRejected)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rejected.len(),
+            1,
+            "first publication emits one HistoryIntentRejected event"
+        );
+        let cleanup_pending = trace
+            .iter()
+            .position(|event| {
+                event.kind() == NavigationTraceEventKind::RequestPhaseChanged
+                    && event.phase() == Some(&NavigationPhase::CleanupPending)
+            })
+            .expect("first publication emits the CleanupPending phase event");
+        assert!(
+            rejected[0] < cleanup_pending,
+            "HistoryIntentRejected must precede the CleanupPending phase event"
+        );
     }
 
     #[test]
