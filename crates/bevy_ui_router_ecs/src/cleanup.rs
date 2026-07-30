@@ -30,7 +30,7 @@ use crate::{
     },
     input::{RouteFocusState, prepare_focus_mutation},
     mount::{ChildSlotResidual, MountedChildSlot, residual_child_slot_is_isolated},
-    navigation::{HostBinding, PendingFailedBranch, RetiredHostBinding},
+    navigation::{HostBinding, PendingFailedBranch, ProvenEmptyProjection, RetiredHostBinding},
     presentation::{FrameContentTarget, FrameLifecycle, FrameOutput, RealizedFrame},
     registry::{
         ComponentManifest, EntityLifecycle, EntityOwner, ExactRegistryClaim,
@@ -580,6 +580,84 @@ impl BackCapacityIssuer {
         Ok(())
     }
 
+    pub(crate) fn preflight_back_canonical_zero<'issuer, 'owner>(
+        &'issuer mut self,
+        permit: &'owner NoTargetCapacityPermit,
+        projection: &ProvenEmptyProjection,
+    ) -> Result<
+        (
+            ExactBackCapacityCommitGuard<'issuer, 'owner, NoTargetCapacityPermit>,
+            PreparedManifestNeutralLedgerSlot,
+        ),
+        BackCapacityRetireError,
+    > {
+        let capacity = &permit.capacity;
+        if capacity.domain != self.domain {
+            return Err(BackCapacityRetireError::ForeignDomain);
+        }
+        if !projection.is_canonical_zero() {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        }
+
+        let (live_registry, cells) = (&mut self.live, &mut self.cells);
+        let live = match live_registry.entry(capacity.owner) {
+            Entry::Occupied(live) => live,
+            Entry::Vacant(_) => {
+                let replayed = cells
+                    .get(capacity.cell.0)
+                    .is_some_and(|cell| retired_identity_is_current(cell, capacity.generation));
+                return Err(if replayed {
+                    BackCapacityRetireError::ConsumedReplay
+                } else {
+                    BackCapacityRetireError::StaleGeneration
+                });
+            }
+        };
+        let record = live.get();
+        if record.domain != capacity.domain
+            || record.cell != capacity.cell
+            || record.owner != capacity.owner
+            || record.generation != capacity.generation
+            || record.state != BackCapacityLiveState::Leased
+        {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        }
+        let Some(cell) = cells.get_mut(capacity.cell.0) else {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        };
+        if cell.generation != capacity.generation
+            || cell.reuse != BackCapacityReuse::Reusable
+            || cell.ledger.is_some()
+            || !matches!(
+                cell.state,
+                BackCapacityCellState::Leased { owner }
+                    if owner == capacity.owner
+            )
+        {
+            return Err(BackCapacityRetireError::StaleGeneration);
+        }
+
+        let prepared_slot_cell = BackCapacityCell {
+            generation: cell.generation,
+            state: BackCapacityCellState::Leased {
+                owner: capacity.owner,
+            },
+            reuse: cell.reuse,
+            ledger: None,
+        };
+        Ok((
+            ExactBackCapacityCommitGuard {
+                transition: BackCapacityCommitTransition::LeasedToCanonicalZeroSlot {
+                    live,
+                    cell,
+                    prepared_slot_cell,
+                },
+                owner: permit,
+            },
+            PreparedManifestNeutralLedgerSlot { private: () },
+        ))
+    }
+
     pub(crate) fn preflight_no_target_retirement<'issuer, 'owner>(
         &'issuer mut self,
         permit: &'owner NoTargetCapacityPermit,
@@ -803,6 +881,14 @@ pub(crate) struct PreparedBackCapacityRetirementEvidence {
     evidence: BackCapacityRetirementEvidence,
 }
 
+pub(crate) struct PreparedManifestNeutralLedgerSlot {
+    private: (),
+}
+
+pub(crate) struct ManifestNeutralLedgerSlot {
+    capacity: EcsCleanupCapacityReservation,
+}
+
 enum BackCapacityCommitTransition<'issuer> {
     OutstandingRetire {
         live: OccupiedEntry<'issuer, BackCapacityOwnerId, BackCapacityLiveRecord>,
@@ -818,6 +904,11 @@ enum BackCapacityCommitTransition<'issuer> {
         live: OccupiedEntry<'issuer, BackCapacityOwnerId, BackCapacityLiveRecord>,
         cell: &'issuer mut BackCapacityCell,
         next: PreparedRetiredCell,
+    },
+    LeasedToCanonicalZeroSlot {
+        live: OccupiedEntry<'issuer, BackCapacityOwnerId, BackCapacityLiveRecord>,
+        cell: &'issuer mut BackCapacityCell,
+        prepared_slot_cell: BackCapacityCell,
     },
 }
 
@@ -861,6 +952,14 @@ impl<Owner: ?Sized> ExactBackCapacityCommitGuard<'_, '_, Owner> {
                     }
                 }
             }
+            BackCapacityCommitTransition::LeasedToCanonicalZeroSlot {
+                live,
+                cell,
+                prepared_slot_cell,
+            } => {
+                let _ = live.remove();
+                *cell = prepared_slot_cell;
+            }
         }
     }
 }
@@ -868,6 +967,24 @@ impl<Owner: ?Sized> ExactBackCapacityCommitGuard<'_, '_, Owner> {
 impl PreparedBackCapacityRetirementEvidence {
     pub(crate) fn into_evidence_after_exact_receiver(self) -> BackCapacityRetirementEvidence {
         self.evidence
+    }
+}
+
+impl PreparedManifestNeutralLedgerSlot {
+    pub(crate) fn into_slot_after_exact_receiver(
+        self,
+        stale_permit: NoTargetCapacityPermit,
+    ) -> ManifestNeutralLedgerSlot {
+        let Self { private: () } = self;
+        let NoTargetCapacityPermit { capacity } = stale_permit;
+        ManifestNeutralLedgerSlot { capacity }
+    }
+}
+
+#[cfg(test)]
+impl ManifestNeutralLedgerSlot {
+    pub(crate) const fn capacity_identity_for_test(&self) -> (u64, usize, u64, u64) {
+        self.capacity.ordinal_identity_for_test()
     }
 }
 

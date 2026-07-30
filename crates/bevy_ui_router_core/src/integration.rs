@@ -11,6 +11,7 @@ use crate::cleanup::{
 use crate::engine::BackAllocatorBoundary;
 use crate::engine::{
     BackNoTargetApprovalOutcome as CoreBackNoTargetApprovalOutcome,
+    BackNoTargetReadyCoreOutcome as CoreBackNoTargetReadyCoreOutcome,
     BackNoTargetSourceDriftSettlementOutcome as CoreBackNoTargetSourceDriftSettlementOutcome,
     BackNoTargetSourceRefreezeOutcome as CoreBackNoTargetSourceRefreezeOutcome,
     BackTargetCommitOperationFailure as CoreBackTargetCommitOperationFailure,
@@ -18,13 +19,16 @@ use crate::engine::{
     BackTargetResumeAction as CoreBackTargetResumeAction,
     BackTargetResumeOutcome as CoreBackTargetResumeOutcome,
     BeginAuthoritySettlementErrorKind as CoreBeginAuthoritySettlementErrorKind,
-    CommitError as CoreCommitError, CommitTicket as CoreCommitTicket, CoreBackTargetAppliedOutcome,
-    CoreBackTargetCommitFailureCleanup, CoreBackTargetCommitRejectedPublication,
-    CoreBackTargetCommitRetainedInputProjection, CoreBackTargetDriverFailureCleanup,
-    CoreBackTargetDriverFailureReport, CoreBackTargetDriverFailureReportMode,
-    CoreBackTargetDriverFallback, CoreBackTargetDriverTerminal,
-    CoreBackTargetDriverTerminalProjection, CoreBackTargetPhysicalReceiverRef,
-    CorePreparationReceiverMismatchProjection, CoreProvenEmptyApprovalProjection,
+    CommitError as CoreCommitError, CommitTicket as CoreCommitTicket,
+    CoreBackNoTargetCleanupAction, CoreBackNoTargetCleanupBatchOwner,
+    CoreBackNoTargetCleanupBatchProjection, CoreBackNoTargetPublicationCapability,
+    CoreBackTargetAppliedOutcome, CoreBackTargetCommitFailureCleanup,
+    CoreBackTargetCommitRejectedPublication, CoreBackTargetCommitRetainedInputProjection,
+    CoreBackTargetDriverFailureCleanup, CoreBackTargetDriverFailureReport,
+    CoreBackTargetDriverFailureReportMode, CoreBackTargetDriverFallback,
+    CoreBackTargetDriverTerminal, CoreBackTargetDriverTerminalProjection,
+    CoreBackTargetPhysicalReceiverRef, CorePreparationReceiverMismatchProjection,
+    CoreProvenEmptyApprovalProjection, CoreRejectedBackContinuationOwner,
     EngineAction as CoreEngineAction, EngineInstallError as CoreEngineInstallError,
     FailedAuthoritySettlementTrigger as CoreFailedAuthoritySettlementTrigger,
     FailedAuthorityTriggerError as CoreFailedAuthorityTriggerError,
@@ -1207,6 +1211,62 @@ pub enum BackNoTargetApprovalOutcome {
 }
 
 #[doc(hidden)]
+pub struct BackNoTargetCleanupBatchOwner {
+    inner: CoreBackNoTargetCleanupBatchOwner,
+}
+
+#[doc(hidden)]
+pub struct RejectedBackContinuationOwner {
+    inner: CoreRejectedBackContinuationOwner,
+}
+
+#[doc(hidden)]
+pub struct BackNoTargetCleanupAction {
+    inner: CoreBackNoTargetCleanupAction,
+}
+
+#[doc(hidden)]
+pub struct BackNoTargetCleanupBatchView {
+    inner: CoreBackNoTargetCleanupBatchProjection,
+}
+
+impl BackNoTargetCleanupBatchView {
+    pub(crate) fn matches_resolution_evidence(&self, evidence: &BackResolutionEvidence) -> bool {
+        self.inner.matches_resolution_evidence(evidence)
+    }
+}
+
+#[doc(hidden)]
+pub struct BackNoTargetCleanupInstallation {
+    batch: BackNoTargetCleanupBatchOwner,
+    continuation: RejectedBackContinuationOwner,
+    action: BackNoTargetCleanupAction,
+}
+
+impl BackNoTargetCleanupInstallation {
+    pub fn batch(&self) -> BackNoTargetCleanupBatchView {
+        BackNoTargetCleanupBatchView {
+            inner: self.batch.inner.projection(),
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct PreparedBackNoTargetPublication {
+    publication: CoreBackNoTargetPublicationCapability,
+    installation: BackNoTargetCleanupInstallation,
+}
+
+#[doc(hidden)]
+pub enum BackNoTargetReadyCoreOutcome {
+    Prepared(PreparedBackNoTargetPublication),
+    Mismatch {
+        approved: ApprovedBackNoTargetCandidate,
+        mismatch: PreparationReceiverMismatchView,
+    },
+}
+
+#[doc(hidden)]
 pub enum BackNoTargetSourceDriftSettlementOutcome {
     Settled(BackNoTargetSourceDriftTerminalEvidence),
     Mismatch {
@@ -2068,6 +2128,52 @@ impl RouterEngine {
                 candidate,
                 mismatch: PreparationReceiverMismatchView { inner: mismatch },
             },
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn accept_back_no_target_ready_with_canonical_zero_bind<F>(
+        &mut self,
+        approved: ApprovedBackNoTargetCandidate,
+        commit_canonical_zero: F,
+    ) -> BackNoTargetReadyCoreOutcome
+    where
+        F: FnOnce(),
+    {
+        let ApprovedBackNoTargetCandidate {
+            candidate,
+            approval,
+        } = approved;
+        let approved =
+            crate::engine::ApprovedBackNoTargetCandidate::from_parts(candidate, approval.inner);
+        match self
+            .inner
+            .accept_back_no_target_ready_with_canonical_zero_bind(approved, commit_canonical_zero)
+        {
+            CoreBackNoTargetReadyCoreOutcome::Prepared(prepared) => {
+                let (publication, installation) = prepared.into_parts();
+                let (batch, continuation, action) = installation.into_parts();
+                BackNoTargetReadyCoreOutcome::Prepared(PreparedBackNoTargetPublication {
+                    publication,
+                    installation: BackNoTargetCleanupInstallation {
+                        batch: BackNoTargetCleanupBatchOwner { inner: batch },
+                        continuation: RejectedBackContinuationOwner {
+                            inner: continuation,
+                        },
+                        action: BackNoTargetCleanupAction { inner: action },
+                    },
+                })
+            }
+            CoreBackNoTargetReadyCoreOutcome::Mismatch { approved, mismatch } => {
+                let (candidate, approval) = approved.into_parts();
+                BackNoTargetReadyCoreOutcome::Mismatch {
+                    approved: ApprovedBackNoTargetCandidate {
+                        candidate,
+                        approval: ProvenEmptyApprovalView { inner: approval },
+                    },
+                    mismatch: PreparationReceiverMismatchView { inner: mismatch },
+                }
+            }
         }
     }
 
@@ -5317,6 +5423,98 @@ mod tests {
         assert_eq!(
             source_drift.inner.testing_snapshot(),
             before_source_mismatch
+        );
+    }
+
+    #[test]
+    fn back_no_target_ready_batch_projection_preserves_exact_resolution_evidence() {
+        let (mut exact, candidate) = take_refrozen_back_no_target_candidate();
+        let expected_evidence = candidate.evidence();
+        let approved = match exact.approve_back_no_target_logical_zero(candidate) {
+            BackNoTargetApprovalOutcome::Approved(approved) => approved,
+            BackNoTargetApprovalOutcome::Mismatch { .. } => {
+                panic!("the real exact candidate must receive logical-zero approval")
+            }
+        };
+        let exact_before = exact.inner.testing_snapshot();
+        let exact_callback_calls = std::cell::Cell::new(0usize);
+        let prepared = match exact
+            .accept_back_no_target_ready_with_canonical_zero_bind(approved, || {
+                exact_callback_calls.set(exact_callback_calls.get() + 1)
+            }) {
+            BackNoTargetReadyCoreOutcome::Prepared(prepared) => prepared,
+            BackNoTargetReadyCoreOutcome::Mismatch { .. } => {
+                panic!("the unchanged exact approved candidate must prepare publication")
+            }
+        };
+        assert_eq!(
+            exact_callback_calls.get(),
+            1,
+            "the exact Ready receiver must invoke the canonical-zero callback once"
+        );
+        assert_eq!(
+            exact.inner.testing_snapshot(),
+            exact_before,
+            "sealed Ready preparation must leave Core public and semantic state zero-write"
+        );
+
+        let (mut owner_engine, candidate) = take_refrozen_back_no_target_candidate();
+        let fresh_approved = match owner_engine.approve_back_no_target_logical_zero(candidate) {
+            BackNoTargetApprovalOutcome::Approved(approved) => approved,
+            BackNoTargetApprovalOutcome::Mismatch { .. } => {
+                panic!("the fresh real candidate must receive logical-zero approval")
+            }
+        };
+        let mut foreign = confirmed_engine();
+        let owner_before_foreign = owner_engine.inner.testing_snapshot();
+        let foreign_before = foreign.inner.testing_snapshot();
+        let foreign_callback_calls = std::cell::Cell::new(0usize);
+        let (returned_approved, mismatch) = match foreign
+            .accept_back_no_target_ready_with_canonical_zero_bind(fresh_approved, || {
+                foreign_callback_calls.set(foreign_callback_calls.get() + 1);
+            }) {
+            BackNoTargetReadyCoreOutcome::Mismatch { approved, mismatch } => (approved, mismatch),
+            BackNoTargetReadyCoreOutcome::Prepared(_) => {
+                panic!("a foreign Ready receiver must not prepare another engine's publication")
+            }
+        };
+        assert_eq!(
+            foreign_callback_calls.get(),
+            0,
+            "foreign Ready receiver mismatch must invoke the callback zero times"
+        );
+        match mismatch.inner {
+            CorePreparationReceiverMismatchProjection::LogicalZero {
+                expected: _,
+                observed: _,
+            } => {}
+            _ => panic!("foreign Ready mismatch must retain logical-zero expected/observed"),
+        }
+        assert_eq!(owner_engine.inner.testing_snapshot(), owner_before_foreign);
+        assert_eq!(foreign.inner.testing_snapshot(), foreign_before);
+
+        let returned_callback_calls = std::cell::Cell::new(0usize);
+        match owner_engine
+            .accept_back_no_target_ready_with_canonical_zero_bind(returned_approved, || {
+                returned_callback_calls.set(returned_callback_calls.get() + 1)
+            }) {
+            BackNoTargetReadyCoreOutcome::Prepared(_) => {}
+            BackNoTargetReadyCoreOutcome::Mismatch { .. } => {
+                panic!("the complete returned approved owner must remain exactly consumable")
+            }
+        }
+        assert_eq!(
+            returned_callback_calls.get(),
+            1,
+            "the restored exact receiver must consume the returned approved owner once"
+        );
+
+        assert!(
+            prepared
+                .installation
+                .batch()
+                .matches_resolution_evidence(&expected_evidence),
+            "RED: prepared no-target cleanup batch projection must freeze the candidate's complete BackResolutionEvidence"
         );
     }
 

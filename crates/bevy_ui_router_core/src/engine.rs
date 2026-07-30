@@ -639,7 +639,9 @@ pub(crate) enum BackNoTargetSourceRefreezeOutcome {
     },
 }
 
-pub(crate) struct CoreProvenEmptyApprovalProjection;
+pub(crate) struct CoreProvenEmptyApprovalProjection {
+    expected: CoreBackNoTargetLogicalZeroExpectedProjection,
+}
 
 pub(crate) struct ApprovedBackNoTargetCandidate {
     candidate: VerifiedBackNoTargetCandidate,
@@ -647,6 +649,16 @@ pub(crate) struct ApprovedBackNoTargetCandidate {
 }
 
 impl ApprovedBackNoTargetCandidate {
+    pub(crate) fn from_parts(
+        candidate: VerifiedBackNoTargetCandidate,
+        approval: CoreProvenEmptyApprovalProjection,
+    ) -> Self {
+        Self {
+            candidate,
+            approval,
+        }
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -661,6 +673,83 @@ pub(crate) enum BackNoTargetApprovalOutcome {
     Approved(ApprovedBackNoTargetCandidate),
     Mismatch {
         candidate: VerifiedBackNoTargetCandidate,
+        mismatch: CorePreparationReceiverMismatchProjection,
+    },
+}
+
+pub(crate) struct CoreBackNoTargetCleanupBatchOwner {
+    evidence: BackResolutionEvidence,
+}
+
+impl CoreBackNoTargetCleanupBatchOwner {
+    pub(crate) fn projection(&self) -> CoreBackNoTargetCleanupBatchProjection {
+        CoreBackNoTargetCleanupBatchProjection {
+            evidence: self.evidence.clone(),
+        }
+    }
+}
+
+pub(crate) struct CoreRejectedBackContinuationOwner {
+    approved: ApprovedBackNoTargetCandidate,
+}
+
+pub(crate) struct CoreBackNoTargetCleanupAction {
+    request: NavigationRequestId,
+}
+
+#[derive(Clone)]
+pub(crate) struct CoreBackNoTargetCleanupBatchProjection {
+    evidence: BackResolutionEvidence,
+}
+
+impl CoreBackNoTargetCleanupBatchProjection {
+    pub(crate) fn matches_resolution_evidence(&self, evidence: &BackResolutionEvidence) -> bool {
+        &self.evidence == evidence
+    }
+}
+
+pub(crate) struct CoreBackNoTargetCleanupInstallation {
+    batch: CoreBackNoTargetCleanupBatchOwner,
+    continuation: CoreRejectedBackContinuationOwner,
+    action: CoreBackNoTargetCleanupAction,
+}
+
+impl CoreBackNoTargetCleanupInstallation {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CoreBackNoTargetCleanupBatchOwner,
+        CoreRejectedBackContinuationOwner,
+        CoreBackNoTargetCleanupAction,
+    ) {
+        (self.batch, self.continuation, self.action)
+    }
+}
+
+pub(crate) struct CoreBackNoTargetPublicationCapability {
+    request: NavigationRequestId,
+}
+
+pub(crate) struct CorePreparedBackNoTargetPublication {
+    publication: CoreBackNoTargetPublicationCapability,
+    installation: CoreBackNoTargetCleanupInstallation,
+}
+
+impl CorePreparedBackNoTargetPublication {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CoreBackNoTargetPublicationCapability,
+        CoreBackNoTargetCleanupInstallation,
+    ) {
+        (self.publication, self.installation)
+    }
+}
+
+pub(crate) enum BackNoTargetReadyCoreOutcome {
+    Prepared(CorePreparedBackNoTargetPublication),
+    Mismatch {
+        approved: ApprovedBackNoTargetCandidate,
         mismatch: CorePreparationReceiverMismatchProjection,
     },
 }
@@ -1052,7 +1141,7 @@ pub(crate) struct CoreBackTargetDriverTerminalObservedProjection {
     pub(crate) request: CoreBackTargetDriverTerminalObservedRequestProjection,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CoreBackNoTargetLogicalZeroExpectedProjection {
     receiver: BackResolutionEvidence,
     source: CoreFrozenHistorySourceProjection,
@@ -2518,10 +2607,14 @@ impl RouterEngine {
         }
     }
 
-    pub(crate) fn approve_back_no_target_logical_zero(
-        &mut self,
-        candidate: VerifiedBackNoTargetCandidate,
-    ) -> BackNoTargetApprovalOutcome {
+    fn observe_back_no_target_logical_zero(
+        &self,
+        candidate: &VerifiedBackNoTargetCandidate,
+    ) -> (
+        CoreBackNoTargetLogicalZeroExpectedProjection,
+        CoreBackNoTargetLogicalZeroObservedProjection,
+        bool,
+    ) {
         let receiver = candidate.evidence();
         let request = receiver.request();
         let expected = CoreBackNoTargetLogicalZeroExpectedProjection {
@@ -2611,11 +2704,26 @@ impl RouterEngine {
             &observed.preview,
             BackPreview::NoTarget(source) if source == candidate.source()
         );
-        if exact_receiver && exact_request && exact_owner_vacancies && exact_source && logical_zero
-        {
+        (
+            expected,
+            observed,
+            exact_receiver
+                && exact_request
+                && exact_owner_vacancies
+                && exact_source
+                && logical_zero,
+        )
+    }
+
+    pub(crate) fn approve_back_no_target_logical_zero(
+        &mut self,
+        candidate: VerifiedBackNoTargetCandidate,
+    ) -> BackNoTargetApprovalOutcome {
+        let (expected, observed, exact) = self.observe_back_no_target_logical_zero(&candidate);
+        if exact {
             BackNoTargetApprovalOutcome::Approved(ApprovedBackNoTargetCandidate {
                 candidate,
-                approval: CoreProvenEmptyApprovalProjection,
+                approval: CoreProvenEmptyApprovalProjection { expected },
             })
         } else {
             BackNoTargetApprovalOutcome::Mismatch {
@@ -2626,6 +2734,46 @@ impl RouterEngine {
                 },
             }
         }
+    }
+
+    pub(crate) fn accept_back_no_target_ready_with_canonical_zero_bind<F>(
+        &mut self,
+        approved: ApprovedBackNoTargetCandidate,
+        commit_canonical_zero: F,
+    ) -> BackNoTargetReadyCoreOutcome
+    where
+        F: FnOnce(),
+    {
+        let (expected, observed, exact) =
+            self.observe_back_no_target_logical_zero(&approved.candidate);
+        let exact_approval_lineage = approved.approval.expected == expected;
+        if !exact || !exact_approval_lineage {
+            let expected = if exact_approval_lineage {
+                expected
+            } else {
+                approved.approval.expected.clone()
+            };
+            return BackNoTargetReadyCoreOutcome::Mismatch {
+                approved,
+                mismatch: CorePreparationReceiverMismatchProjection::LogicalZero {
+                    expected,
+                    observed,
+                },
+            };
+        }
+
+        let evidence = approved.approval.expected.receiver.clone();
+        let request = evidence.request();
+        let prepared = CorePreparedBackNoTargetPublication {
+            publication: CoreBackNoTargetPublicationCapability { request },
+            installation: CoreBackNoTargetCleanupInstallation {
+                batch: CoreBackNoTargetCleanupBatchOwner { evidence },
+                continuation: CoreRejectedBackContinuationOwner { approved },
+                action: CoreBackNoTargetCleanupAction { request },
+            },
+        };
+        commit_canonical_zero();
+        BackNoTargetReadyCoreOutcome::Prepared(prepared)
     }
 
     pub(crate) fn settle_back_no_target_source_drift_with_retirement<F>(
