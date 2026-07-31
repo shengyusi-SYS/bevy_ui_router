@@ -8,11 +8,17 @@ use bevy_input_focus::InputFocus;
 use bevy_ui_router_core::{
     integration::{
         ApprovedBackNoTargetCandidate, BackNoTargetApprovalOutcome,
-        BackNoTargetCleanupCompletionOutcome, BackNoTargetCleanupCompletionOwner,
-        BackNoTargetCleanupInstallation, BackNoTargetReadyCoreOutcome,
-        BackNoTargetSourceDriftOwner, BackNoTargetSourceDriftSettlementOutcome,
-        BackNoTargetSourceDriftTerminalEvidence, BackNoTargetSourceRefreezeOutcome,
-        BackResolutionEvidence, BackResolutionEvidenceClassification, BackResolutionOwnerHandoff,
+        BackNoTargetAuthorityBeginOutcome, BackNoTargetAuthorityBeginOwner,
+        BackNoTargetAuthorityBeginPermanentEvidence, BackNoTargetAuthorityBeginRetryEvidence,
+        BackNoTargetAuthorityCleanupBatchOwner, BackNoTargetAuthorityCleanupCompletionOutcome,
+        BackNoTargetAuthorityCleanupCompletionOwner, BackNoTargetAuthorityCleanupMismatchEvidence,
+        BackNoTargetAuthorityCoreOutcome, BackNoTargetAuthorityManifest,
+        BackNoTargetAuthoritySettlementOwner, BackNoTargetCleanupCompletionOutcome,
+        BackNoTargetCleanupCompletionOwner, BackNoTargetCleanupInstallation,
+        BackNoTargetReadyCoreOutcome, BackNoTargetSourceDriftOwner,
+        BackNoTargetSourceDriftSettlementOutcome, BackNoTargetSourceDriftTerminalEvidence,
+        BackNoTargetSourceRefreezeOutcome, BackResolutionEvidence,
+        BackResolutionEvidenceClassification, BackResolutionOwnerHandoff,
         BackResolutionVerifyOutcome, BackTargetAppliedReport, BackTargetAppliedReportOutcome,
         BackTargetCommitPreparationFailure, BackTargetCommitPreparationOutcome,
         BackTargetCoreResumeOutcome, BackTargetDriverFailureConsumeOutcome,
@@ -55,8 +61,9 @@ use crate::{
         BackNoTargetZeroCompletionSourceIdentity, BoundBackCapacityReservation, CleanupLedger,
         CleanupLedgerReserveError, CleanupLedgerReserveErrorKind, EnqueueRejected,
         FailedAuthorityBoundaryBinding, FailedBoundaryDrift, FailedBoundarySource,
-        FailedManifestBuildError, FailedPreparedTopologyError, FrozenCleanupManifest,
-        ManifestNeutralLedgerSlot, NoTargetCapacityPermit, PendingBoundaryBinding,
+        FailedManifestBuildError, FailedPreparedTopologyError,
+        FrozenBackNoTargetAuthorityPartition, FrozenCleanupManifest, ManifestNeutralLedgerSlot,
+        NoTargetCapacityPermit, PendingBoundaryBinding, PreparedBackNoTargetAuthorityCleanupLedger,
         PreparedBackNoTargetZeroCompletion, PreparedCleanupLedger, RouterCleanupObservation,
         canonical_zero_completion_digest, canonical_zero_manifest_digest,
         cleanup_claim_has_exact_authority, failed_prepared_branch_roots_are_exact,
@@ -1022,6 +1029,8 @@ pub(crate) struct RouterEntry {
     pending_bound_back_resolution: Option<BoundBackResolutionHandoff>,
     pending_back_target_execution: Option<PendingBackTargetExecution>,
     pending_back_no_target_completion: Option<PendingBackNoTargetCompletion>,
+    pending_back_no_target_preparation: Option<PendingBackNoTargetPreparation>,
+    pending_back_no_target_authority_cleanup: Option<PendingBackNoTargetAuthorityCleanup>,
     history_admission_world: HistoryAdmissionWorldSeal,
     history_admission_stamp: Option<HistoryAdmissionStamp>,
     back_capacity_issuer: Option<BackCapacityIssuer>,
@@ -1071,6 +1080,260 @@ pub(crate) struct SettledBackNoTargetCleanup {
 pub(crate) enum PendingBackNoTargetCompletion {
     Installed(InstalledBackNoTargetCleanup),
     Settled(SettledBackNoTargetCleanup),
+}
+
+struct FrozenBackNoTargetAuthoritySource {
+    request: NavigationRequestId,
+    host: ProjectionlessHostProjection,
+    active_frames: Vec<RouteFrameVersion>,
+    active_claims: Vec<ExactRegistryClaim>,
+}
+
+struct BackNoTargetAuthorityPhysicalPreparation {
+    source: FrozenBackNoTargetAuthoritySource,
+    partition: Option<FrozenBackNoTargetAuthorityPartition>,
+    reserved: PreparedCleanupLedger,
+    active: RealizedBranch,
+    isolation: Option<PreparedAuthorityIsolation>,
+    host_children: Vec<bevy_ecs::entity::Entity>,
+}
+
+pub(crate) struct BackNoTargetAuthorityPhysicalSettlementOwner {
+    preparation: BackNoTargetAuthorityPhysicalPreparation,
+}
+
+pub(crate) struct BackNoTargetAuthoritySettlementDisposition {
+    settlement: BackNoTargetAuthoritySettlementOwner,
+    retirement: BackCapacityRetirementEvidence,
+    physical: BackNoTargetAuthorityPhysicalSettlementOwner,
+    manifest: BackNoTargetAuthorityManifest,
+}
+
+pub(crate) struct InstalledBackNoTargetAuthorityCleanup {
+    source: FrozenBackNoTargetAuthoritySource,
+    retirement: BackCapacityRetirementEvidence,
+    ledger: BackNoTargetAuthorityLedgerHolder,
+    batch: Option<BackNoTargetAuthorityCleanupBatchOwner>,
+    inert: Option<BackNoTargetAuthorityInertEvidence>,
+}
+
+enum BackNoTargetAuthorityLedgerHolder {
+    Prepared(PreparedBackNoTargetAuthorityCleanupLedger),
+    Active(CleanupLedger),
+}
+
+impl BackNoTargetAuthorityLedgerHolder {
+    #[cfg(any(test, feature = "test-support"))]
+    fn leaving_frames(&self) -> &[RealizedFrame] {
+        match self {
+            Self::Prepared(ledger) => ledger.leaving_frames(),
+            Self::Active(ledger) => ledger.leaving_frames(),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
+        match self {
+            Self::Prepared(ledger) => ledger.tracked_child_slots(),
+            Self::Active(ledger) => ledger.tracked_child_slots(),
+        }
+    }
+}
+
+pub(crate) struct PreparedBackNoTargetAuthorityPhysicalCompletion {
+    source: FrozenBackNoTargetAuthoritySource,
+    retirement: BackCapacityRetirementEvidence,
+    ledger: CleanupLedger,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackNoTargetAuthorityInertEvidence {
+    PartitionDrift,
+    MissingBatch,
+    ReceiptObservationRejected,
+    AttemptUnavailable,
+    SettlementRejected,
+    CompletionFactsUnavailable,
+}
+
+pub(crate) struct SettledBackNoTargetAuthorityCleanup {
+    prepared: PreparedBackNoTargetAuthorityPhysicalCompletion,
+    completion: BackNoTargetAuthorityCleanupCompletionOwner,
+    mismatch: BackNoTargetAuthorityCleanupMismatchEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackNoTargetAuthorityBeginInertEvidence {
+    MissingSlot,
+    WrongPhase,
+    BatchInstalledOnRejection,
+    InertInstallation,
+    ActiveLedgerOnRejection,
+}
+
+pub(crate) enum BackNoTargetAuthorityBeginInertPhysical {
+    Installed(InstalledBackNoTargetAuthorityCleanup),
+    Completing(PreparedBackNoTargetAuthorityPhysicalCompletion),
+    Settled(SettledBackNoTargetAuthorityCleanup),
+    PriorInert(Box<BackNoTargetAuthorityBeginInert>),
+    CompletionInert(Box<BackNoTargetAuthorityCompletionInert>),
+}
+
+pub(crate) enum BackNoTargetAuthorityBeginInertCause {
+    NotDispatched,
+    ReceiverMismatch(PreparationReceiverMismatchView),
+    Retryable(BackNoTargetAuthorityBeginRetryEvidence),
+    Permanent(BackNoTargetAuthorityBeginPermanentEvidence),
+}
+
+pub(crate) struct BackNoTargetAuthorityBeginInert {
+    begin: BackNoTargetAuthorityBeginOwner,
+    physical: Option<BackNoTargetAuthorityBeginInertPhysical>,
+    evidence: BackNoTargetAuthorityBeginInertEvidence,
+    cause: BackNoTargetAuthorityBeginInertCause,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackNoTargetAuthorityCompletionInertEvidence {
+    MissingCompletingHolder,
+    WrongPhase,
+}
+
+pub(crate) enum BackNoTargetAuthorityCompletionInertPhysical {
+    Installed(InstalledBackNoTargetAuthorityCleanup),
+    Completing(PreparedBackNoTargetAuthorityPhysicalCompletion),
+    Settled(SettledBackNoTargetAuthorityCleanup),
+    AuthorityBeginInert(BackNoTargetAuthorityBeginInert),
+    PriorCompletionInert(Box<BackNoTargetAuthorityCompletionInert>),
+}
+
+pub(crate) struct BackNoTargetAuthorityCompletionInert {
+    completion: BackNoTargetAuthorityCleanupCompletionOwner,
+    mismatch: BackNoTargetAuthorityCleanupMismatchEvidence,
+    physical: Option<BackNoTargetAuthorityCompletionInertPhysical>,
+    evidence: BackNoTargetAuthorityCompletionInertEvidence,
+}
+
+impl BackNoTargetAuthorityBeginInertPhysical {
+    #[cfg(any(test, feature = "test-support"))]
+    fn leaving_frames(&self) -> &[RealizedFrame] {
+        match self {
+            Self::Installed(installed) => installed.ledger.leaving_frames(),
+            Self::Completing(completing) => completing.ledger.leaving_frames(),
+            Self::Settled(settled) => settled.prepared.ledger.leaving_frames(),
+            Self::PriorInert(inert) => inert.leaving_frames(),
+            Self::CompletionInert(inert) => inert.leaving_frames(),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
+        match self {
+            Self::Installed(installed) => installed.ledger.tracked_child_slots(),
+            Self::Completing(completing) => completing.ledger.tracked_child_slots(),
+            Self::Settled(settled) => settled.prepared.ledger.tracked_child_slots(),
+            Self::PriorInert(inert) => inert.tracked_child_slots(),
+            Self::CompletionInert(inert) => inert.tracked_child_slots(),
+        }
+    }
+}
+
+impl BackNoTargetAuthorityBeginInert {
+    #[cfg(any(test, feature = "test-support"))]
+    fn leaving_frames(&self) -> &[RealizedFrame] {
+        self.physical
+            .as_ref()
+            .map(BackNoTargetAuthorityBeginInertPhysical::leaving_frames)
+            .unwrap_or(&[])
+    }
+
+    #[cfg(feature = "test-support")]
+    fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
+        self.physical
+            .as_ref()
+            .map(BackNoTargetAuthorityBeginInertPhysical::tracked_child_slots)
+            .unwrap_or_default()
+    }
+}
+
+impl BackNoTargetAuthorityCompletionInertPhysical {
+    #[cfg(any(test, feature = "test-support"))]
+    fn leaving_frames(&self) -> &[RealizedFrame] {
+        match self {
+            Self::Installed(installed) => installed.ledger.leaving_frames(),
+            Self::Completing(completing) => completing.ledger.leaving_frames(),
+            Self::Settled(settled) => settled.prepared.ledger.leaving_frames(),
+            Self::AuthorityBeginInert(inert) => inert.leaving_frames(),
+            Self::PriorCompletionInert(inert) => inert.leaving_frames(),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
+        match self {
+            Self::Installed(installed) => installed.ledger.tracked_child_slots(),
+            Self::Completing(completing) => completing.ledger.tracked_child_slots(),
+            Self::Settled(settled) => settled.prepared.ledger.tracked_child_slots(),
+            Self::AuthorityBeginInert(inert) => inert.tracked_child_slots(),
+            Self::PriorCompletionInert(inert) => inert.tracked_child_slots(),
+        }
+    }
+}
+
+impl BackNoTargetAuthorityCompletionInert {
+    #[cfg(any(test, feature = "test-support"))]
+    fn leaving_frames(&self) -> &[RealizedFrame] {
+        self.physical
+            .as_ref()
+            .map(BackNoTargetAuthorityCompletionInertPhysical::leaving_frames)
+            .unwrap_or(&[])
+    }
+
+    #[cfg(feature = "test-support")]
+    fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
+        self.physical
+            .as_ref()
+            .map(BackNoTargetAuthorityCompletionInertPhysical::tracked_child_slots)
+            .unwrap_or_default()
+    }
+}
+
+pub(crate) enum PendingBackNoTargetAuthorityCleanup {
+    Installed(InstalledBackNoTargetAuthorityCleanup),
+    Completing(PreparedBackNoTargetAuthorityPhysicalCompletion),
+    Settled(SettledBackNoTargetAuthorityCleanup),
+    AuthorityBeginInert(BackNoTargetAuthorityBeginInert),
+    CompletionInert(BackNoTargetAuthorityCompletionInert),
+}
+
+enum PendingBackNoTargetPreparation {
+    PhysicalIndeterminate {
+        owner: BackPreparationOwner,
+        evidence: BackNoTargetPhysicalIndeterminateEvidence,
+    },
+    AuthorityPermanent(BackNoTargetAuthorityPermanentOwner),
+    CapacityRejected {
+        owner: BackPreparationOwner,
+        error: BackCapacityRetireError,
+    },
+    ReceiverMismatch {
+        owner: BackPreparationOwner,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    ReadyCapacityRejected {
+        owner: PreparedBackNoTarget,
+        error: BackCapacityRetireError,
+    },
+    ReadyReceiverMismatch {
+        owner: PreparedBackNoTarget,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    AuthorityDispatchBlocked {
+        disposition: BackNoTargetAuthoritySettlementDisposition,
+    },
+    SourceDriftBlocked {
+        owner: BackNoTargetSourceDriftPermanentOwner,
+    },
 }
 
 #[cfg(test)]
@@ -1184,6 +1447,8 @@ struct ProvenEmptyAttemptOwnerInventory {
     pending_bound_back_resolution_vacant: bool,
     pending_back_target_execution_vacant: bool,
     pending_back_no_target_completion_vacant: bool,
+    pending_back_no_target_preparation_vacant: bool,
+    pending_back_no_target_authority_cleanup_vacant: bool,
 }
 
 impl ProvenEmptyAttemptOwnerInventory {
@@ -1212,6 +1477,12 @@ impl ProvenEmptyAttemptOwnerInventory {
             pending_back_no_target_completion_vacant: entry
                 .pending_back_no_target_completion
                 .is_none(),
+            pending_back_no_target_preparation_vacant: entry
+                .pending_back_no_target_preparation
+                .is_none(),
+            pending_back_no_target_authority_cleanup_vacant: entry
+                .pending_back_no_target_authority_cleanup
+                .is_none(),
         }
     }
 
@@ -1232,6 +1503,8 @@ impl ProvenEmptyAttemptOwnerInventory {
             && self.pending_bound_back_resolution_vacant
             && self.pending_back_target_execution_vacant
             && self.pending_back_no_target_completion_vacant
+            && self.pending_back_no_target_preparation_vacant
+            && self.pending_back_no_target_authority_cleanup_vacant
     }
 }
 
@@ -1846,6 +2119,9 @@ enum BackNoTargetPhysicalIndeterminateReason {
     ConflictingAttemptOwners(ProvenEmptyAttemptOwnerInventory),
     HostAuthorityDrift,
     ActiveTopologyDrift,
+    AuthorityManifest,
+    AuthorityLedger,
+    AuthorityIsolation,
     ActiveRegistryDrift {
         expected: Vec<ExactRegistryClaim>,
         observed: Vec<ExactRegistryClaim>,
@@ -1874,11 +2150,57 @@ pub(crate) struct BackNoTargetPhysicalIndeterminateEvidence {
     reason: BackNoTargetPhysicalIndeterminateReason,
 }
 
+enum BackNoTargetAuthorityPermanentEvidence {
+    Manifest(AuthoritySettlementManifestError),
+    Partition {
+        manifest: FrozenCleanupManifest,
+    },
+    Isolation {
+        manifest: FrozenCleanupManifest,
+        contradiction: AuthorityIsolationContradiction,
+    },
+    Ledger {
+        kind: CleanupLedgerReserveErrorKind,
+        manifest: FrozenCleanupManifest,
+    },
+    ActiveOwnerDrift {
+        observed_frames: Vec<RouteFrameVersion>,
+        observed_claims: Vec<ExactRegistryClaim>,
+    },
+}
+
+pub(crate) struct BackNoTargetAuthorityPermanentOwner {
+    owner: BackPreparationOwner,
+    source: FrozenBackNoTargetAuthoritySource,
+    partition: Option<FrozenBackNoTargetAuthorityPartition>,
+    isolation: Option<PreparedAuthorityIsolation>,
+    reserved: Option<PreparedCleanupLedger>,
+    evidence: BackNoTargetAuthorityPermanentEvidence,
+}
+
 pub(crate) enum BackNoTargetPhysicalFreezeOutcome {
     ProvenEmpty(BackNoTargetProvenEmptyOwner),
     Indeterminate {
         owner: BackPreparationOwner,
         evidence: BackNoTargetPhysicalIndeterminateEvidence,
+    },
+}
+
+pub(crate) enum BackNoTargetPreparationOutcome {
+    Ready(PreparedBackNoTarget),
+    AuthoritySettlement(BackNoTargetAuthoritySettlementDisposition),
+    AuthorityPermanent(BackNoTargetAuthorityPermanentOwner),
+    Retry {
+        owner: BackPreparationOwner,
+        evidence: BackNoTargetPhysicalIndeterminateEvidence,
+    },
+    CapacityRejected {
+        owner: BackPreparationOwner,
+        error: BackCapacityRetireError,
+    },
+    ReceiverMismatch {
+        owner: BackPreparationOwner,
+        mismatch: PreparationReceiverMismatchView,
     },
 }
 
@@ -2828,6 +3150,696 @@ pub(crate) fn freeze_back_no_target_proven_empty(
     })
 }
 
+fn back_no_target_current_authority_is_exact(
+    world: &World,
+    registry: &RouteEntityRegistry,
+    host: &HostBinding,
+    active: &RealizedBranch,
+) -> bool {
+    current_host_binding_is_exact(world, host)
+        && active.claims().all(|claim| {
+            registry
+                .record(claim.entity())
+                .is_some_and(|record| record.claim() == *claim)
+                && cleanup_claim_has_exact_authority(world, claim)
+        })
+        && active.child_slots().iter().all(|slot| {
+            world
+                .get::<bevy_ecs::hierarchy::ChildOf>(slot.slot())
+                .map(bevy_ecs::hierarchy::ChildOf::parent)
+                == Some(slot.anchor())
+                && slot.expected_anchor_children().iter().all(|expected| {
+                    world
+                        .get::<bevy_ecs::hierarchy::Children>(slot.anchor())
+                        .is_some_and(|children| children.contains(expected))
+                })
+        })
+}
+
+pub(crate) fn classify_back_no_target(
+    world: &World,
+    entry: &mut RouterEntry,
+    owner: BackPreparationOwner,
+) -> BackNoTargetPreparationOutcome {
+    let request = owner.request;
+    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+        return BackNoTargetPreparationOutcome::Retry {
+            owner,
+            evidence: BackNoTargetPhysicalIndeterminateEvidence {
+                request,
+                reason: BackNoTargetPhysicalIndeterminateReason::MissingRegistry,
+            },
+        };
+    };
+    let Some(host) = entry.host.as_ref() else {
+        return BackNoTargetPreparationOutcome::Retry {
+            owner,
+            evidence: BackNoTargetPhysicalIndeterminateEvidence {
+                request,
+                reason: BackNoTargetPhysicalIndeterminateReason::MissingHost,
+            },
+        };
+    };
+    let Some(active) = entry.active.as_ref() else {
+        return BackNoTargetPreparationOutcome::Retry {
+            owner,
+            evidence: BackNoTargetPhysicalIndeterminateEvidence {
+                request,
+                reason: BackNoTargetPhysicalIndeterminateReason::MissingActive,
+            },
+        };
+    };
+    if back_no_target_current_authority_is_exact(world, registry, host, active) {
+        return match freeze_back_no_target_proven_empty(world, entry, owner) {
+            BackNoTargetPhysicalFreezeOutcome::ProvenEmpty(proven) => {
+                match approve_back_no_target_proven_empty(entry, proven) {
+                    BackNoTargetProvenEmptyApprovalOutcome::Prepared(prepared) => {
+                        BackNoTargetPreparationOutcome::Ready(prepared)
+                    }
+                    BackNoTargetProvenEmptyApprovalOutcome::ReceiverMismatch {
+                        owner,
+                        mismatch,
+                    } => {
+                        let BackNoTargetProvenEmptyOwner { owner, .. } = owner;
+                        BackNoTargetPreparationOutcome::ReceiverMismatch { owner, mismatch }
+                    }
+                }
+            }
+            BackNoTargetPhysicalFreezeOutcome::Indeterminate { owner, evidence } => {
+                BackNoTargetPreparationOutcome::Retry { owner, evidence }
+            }
+        };
+    }
+    if entry
+        .requests
+        .iter()
+        .filter(|indexed| **indexed == request)
+        .count()
+        != 1
+    {
+        return BackNoTargetPreparationOutcome::Retry {
+            owner,
+            evidence: BackNoTargetPhysicalIndeterminateEvidence {
+                request,
+                reason: BackNoTargetPhysicalIndeterminateReason::RequestIndexDrift,
+            },
+        };
+    }
+    let inventory = ProvenEmptyAttemptOwnerInventory::capture(entry, request);
+    if !inventory.is_vacant() {
+        return BackNoTargetPreparationOutcome::Retry {
+            owner,
+            evidence: BackNoTargetPhysicalIndeterminateEvidence {
+                request,
+                reason: BackNoTargetPhysicalIndeterminateReason::ConflictingAttemptOwners(
+                    inventory,
+                ),
+            },
+        };
+    }
+    let source = FrozenBackNoTargetAuthoritySource {
+        request,
+        host: ProjectionlessHostProjection::from(host),
+        active_frames: active
+            .frames()
+            .iter()
+            .map(|frame| frame.frame().clone())
+            .collect(),
+        active_claims: active.claims().cloned().collect(),
+    };
+    let host_children = world
+        .get::<bevy_ecs::hierarchy::Children>(host.host)
+        .map(|children| children.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let frozen =
+        match FrozenCleanupManifest::from_back_no_target_authority(world, registry, active, host) {
+            Ok(frozen) => frozen,
+            Err(AuthoritySettlementManifestError::RetryableCapacity) => {
+                return BackNoTargetPreparationOutcome::Retry {
+                    owner,
+                    evidence: BackNoTargetPhysicalIndeterminateEvidence {
+                        request,
+                        reason: BackNoTargetPhysicalIndeterminateReason::AuthorityManifest,
+                    },
+                };
+            }
+            Err(
+                error @ (AuthoritySettlementManifestError::InvalidAuthority
+                | AuthoritySettlementManifestError::InvalidTopology),
+            ) => {
+                return BackNoTargetPreparationOutcome::AuthorityPermanent(
+                    BackNoTargetAuthorityPermanentOwner {
+                        owner,
+                        source,
+                        partition: None,
+                        isolation: None,
+                        reserved: None,
+                        evidence: BackNoTargetAuthorityPermanentEvidence::Manifest(error),
+                    },
+                );
+            }
+        };
+    let partition = match frozen.freeze_back_no_target_authority_partition(world, registry, host) {
+        Some(partition) => partition,
+        None => {
+            return BackNoTargetPreparationOutcome::AuthorityPermanent(
+                BackNoTargetAuthorityPermanentOwner {
+                    owner,
+                    source,
+                    partition: None,
+                    isolation: None,
+                    reserved: None,
+                    evidence: BackNoTargetAuthorityPermanentEvidence::Partition {
+                        manifest: frozen,
+                    },
+                },
+            );
+        }
+    };
+    let manifest_digest = frozen.digest();
+    let obligation_count = frozen.len();
+    let isolation = match prepare_authority_isolation_targets(
+        world,
+        active.claims().chain(std::iter::once(&host.top_slot_claim)),
+        active
+            .interactive_entities()
+            .into_iter()
+            .chain(std::iter::once(host.top_slot)),
+        0,
+    ) {
+        AuthorityIsolationPreparation::Ready(isolation) => isolation,
+        AuthorityIsolationPreparation::RetryableCapacity => {
+            return BackNoTargetPreparationOutcome::Retry {
+                owner,
+                evidence: BackNoTargetPhysicalIndeterminateEvidence {
+                    request,
+                    reason: BackNoTargetPhysicalIndeterminateReason::AuthorityIsolation,
+                },
+            };
+        }
+        AuthorityIsolationPreparation::PermanentContradiction {
+            contradiction,
+            fail_closed,
+        } => {
+            return BackNoTargetPreparationOutcome::AuthorityPermanent(
+                BackNoTargetAuthorityPermanentOwner {
+                    owner,
+                    source,
+                    partition: Some(partition),
+                    isolation: Some(fail_closed),
+                    reserved: None,
+                    evidence: BackNoTargetAuthorityPermanentEvidence::Isolation {
+                        manifest: frozen,
+                        contradiction,
+                    },
+                },
+            );
+        }
+    };
+    let reserved = match CleanupLedger::reserve(frozen) {
+        Ok(reserved) => reserved,
+        Err(error) => match error.kind() {
+            CleanupLedgerReserveErrorKind::RetryableCapacity => {
+                return BackNoTargetPreparationOutcome::Retry {
+                    owner,
+                    evidence: BackNoTargetPhysicalIndeterminateEvidence {
+                        request,
+                        reason: BackNoTargetPhysicalIndeterminateReason::AuthorityLedger,
+                    },
+                };
+            }
+            kind @ (CleanupLedgerReserveErrorKind::DomainExhausted
+            | CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts) => {
+                return BackNoTargetPreparationOutcome::AuthorityPermanent(
+                    BackNoTargetAuthorityPermanentOwner {
+                        owner,
+                        source,
+                        partition: Some(partition),
+                        isolation: Some(isolation),
+                        reserved: None,
+                        evidence: BackNoTargetAuthorityPermanentEvidence::Ledger {
+                            kind,
+                            manifest: error.into_manifest(),
+                        },
+                    },
+                );
+            }
+        },
+    };
+    let logical_roots = logical_cleanup_roots(active);
+    let BackPreparationOwner {
+        candidate,
+        capacity,
+        request,
+    } = owner;
+    let Some(issuer) = entry.back_capacity_issuer.as_mut() else {
+        return BackNoTargetPreparationOutcome::CapacityRejected {
+            owner: BackPreparationOwner {
+                candidate,
+                capacity,
+                request,
+            },
+            error: BackCapacityRetireError::StaleGeneration,
+        };
+    };
+    let (guard, prepared_retirement) = match issuer
+        .preflight_no_target_retirement(&capacity, BackCapacityRetireDisposition::AuthorityLost)
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return BackNoTargetPreparationOutcome::CapacityRejected {
+                owner: BackPreparationOwner {
+                    candidate,
+                    capacity,
+                    request,
+                },
+                error,
+            };
+        }
+    };
+    let active = match entry.active.take() {
+        Some(active)
+            if source
+                .active_frames
+                .iter()
+                .eq(active.frames().iter().map(RealizedFrame::frame))
+                && source.active_claims.iter().eq(active.claims()) =>
+        {
+            active
+        }
+        observed => {
+            let observed_frames = observed
+                .as_ref()
+                .map(|active| {
+                    active
+                        .frames()
+                        .iter()
+                        .map(|frame| frame.frame().clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let observed_claims = observed
+                .as_ref()
+                .map(|active| active.claims().cloned().collect())
+                .unwrap_or_default();
+            entry.active = observed;
+            drop(guard);
+            drop(prepared_retirement);
+            return BackNoTargetPreparationOutcome::AuthorityPermanent(
+                BackNoTargetAuthorityPermanentOwner {
+                    owner: BackPreparationOwner {
+                        candidate,
+                        capacity,
+                        request,
+                    },
+                    source,
+                    partition: Some(partition),
+                    isolation: Some(isolation),
+                    reserved: Some(reserved),
+                    evidence: BackNoTargetAuthorityPermanentEvidence::ActiveOwnerDrift {
+                        observed_frames,
+                        observed_claims,
+                    },
+                },
+            );
+        }
+    };
+    match entry
+        .engine
+        .accept_back_no_target_authority_lost_with_retirement(candidate, move || guard.commit())
+    {
+        BackNoTargetAuthorityCoreOutcome::Accepted(settlement) => {
+            drop(capacity);
+            let retirement = prepared_retirement.into_evidence_after_exact_receiver();
+            BackNoTargetPreparationOutcome::AuthoritySettlement(
+                BackNoTargetAuthoritySettlementDisposition {
+                    settlement,
+                    retirement,
+                    physical: BackNoTargetAuthorityPhysicalSettlementOwner {
+                        preparation: BackNoTargetAuthorityPhysicalPreparation {
+                            source,
+                            partition: Some(partition),
+                            reserved,
+                            active,
+                            isolation: Some(isolation),
+                            host_children,
+                        },
+                    },
+                    manifest: BackNoTargetAuthorityManifest::new(CleanupManifest::new(
+                        logical_roots,
+                        manifest_digest,
+                        obligation_count,
+                    )),
+                },
+            )
+        }
+        BackNoTargetAuthorityCoreOutcome::Mismatch {
+            candidate,
+            mismatch,
+        } => {
+            entry.active = Some(active);
+            BackNoTargetPreparationOutcome::ReceiverMismatch {
+                owner: BackPreparationOwner {
+                    candidate,
+                    capacity,
+                    request,
+                },
+                mismatch,
+            }
+        }
+    }
+}
+
+pub(crate) enum BackNoTargetAuthoritySettlementDispatchOutcome {
+    Dispatched,
+    Inert,
+    EntryMismatch {
+        disposition: BackNoTargetAuthoritySettlementDisposition,
+    },
+    ReceiverMismatch {
+        disposition: BackNoTargetAuthoritySettlementDisposition,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    Retryable {
+        disposition: BackNoTargetAuthoritySettlementDisposition,
+        evidence: BackNoTargetAuthorityBeginRetryEvidence,
+    },
+    Permanent {
+        disposition: BackNoTargetAuthoritySettlementDisposition,
+        evidence: BackNoTargetAuthorityBeginPermanentEvidence,
+    },
+}
+
+fn back_no_target_authority_begin_inert_evidence(
+    pending: Option<&PendingBackNoTargetAuthorityCleanup>,
+) -> BackNoTargetAuthorityBeginInertEvidence {
+    match pending {
+        None => BackNoTargetAuthorityBeginInertEvidence::MissingSlot,
+        Some(PendingBackNoTargetAuthorityCleanup::Installed(installed)) => {
+            if installed.batch.is_some() {
+                BackNoTargetAuthorityBeginInertEvidence::BatchInstalledOnRejection
+            } else if installed.inert.is_some() {
+                BackNoTargetAuthorityBeginInertEvidence::InertInstallation
+            } else if matches!(
+                &installed.ledger,
+                BackNoTargetAuthorityLedgerHolder::Active(_)
+            ) {
+                BackNoTargetAuthorityBeginInertEvidence::ActiveLedgerOnRejection
+            } else {
+                BackNoTargetAuthorityBeginInertEvidence::WrongPhase
+            }
+        }
+        Some(
+            PendingBackNoTargetAuthorityCleanup::Completing(_)
+            | PendingBackNoTargetAuthorityCleanup::Settled(_)
+            | PendingBackNoTargetAuthorityCleanup::AuthorityBeginInert(_)
+            | PendingBackNoTargetAuthorityCleanup::CompletionInert(_),
+        ) => BackNoTargetAuthorityBeginInertEvidence::WrongPhase,
+    }
+}
+
+fn retain_back_no_target_authority_begin_inert(
+    pending: &mut Option<PendingBackNoTargetAuthorityCleanup>,
+    begin: BackNoTargetAuthorityBeginOwner,
+    current: Option<PendingBackNoTargetAuthorityCleanup>,
+    evidence: BackNoTargetAuthorityBeginInertEvidence,
+    cause: BackNoTargetAuthorityBeginInertCause,
+) {
+    let physical = current.map(|current| match current {
+        PendingBackNoTargetAuthorityCleanup::Installed(installed) => {
+            BackNoTargetAuthorityBeginInertPhysical::Installed(installed)
+        }
+        PendingBackNoTargetAuthorityCleanup::Completing(completing) => {
+            BackNoTargetAuthorityBeginInertPhysical::Completing(completing)
+        }
+        PendingBackNoTargetAuthorityCleanup::Settled(settled) => {
+            BackNoTargetAuthorityBeginInertPhysical::Settled(settled)
+        }
+        PendingBackNoTargetAuthorityCleanup::AuthorityBeginInert(inert) => {
+            BackNoTargetAuthorityBeginInertPhysical::PriorInert(Box::new(inert))
+        }
+        PendingBackNoTargetAuthorityCleanup::CompletionInert(inert) => {
+            BackNoTargetAuthorityBeginInertPhysical::CompletionInert(Box::new(inert))
+        }
+    });
+    *pending = Some(PendingBackNoTargetAuthorityCleanup::AuthorityBeginInert(
+        BackNoTargetAuthorityBeginInert {
+            begin,
+            physical,
+            evidence,
+            cause,
+        },
+    ));
+}
+
+fn rebuild_unstarted_back_no_target_authority_disposition(
+    pending: &mut Option<PendingBackNoTargetAuthorityCleanup>,
+    host: &mut Option<HostBinding>,
+    begin: BackNoTargetAuthorityBeginOwner,
+) -> Result<
+    BackNoTargetAuthoritySettlementDisposition,
+    (
+        BackNoTargetAuthorityBeginOwner,
+        Option<PendingBackNoTargetAuthorityCleanup>,
+        BackNoTargetAuthorityBeginInertEvidence,
+    ),
+> {
+    let current = pending.take();
+    let evidence = back_no_target_authority_begin_inert_evidence(current.as_ref());
+    let (source, retirement, ledger) = match current {
+        Some(PendingBackNoTargetAuthorityCleanup::Installed(
+            InstalledBackNoTargetAuthorityCleanup {
+                source,
+                retirement,
+                ledger: BackNoTargetAuthorityLedgerHolder::Prepared(ledger),
+                batch: None,
+                inert: None,
+            },
+        )) => (source, retirement, ledger),
+        current => return Err((begin, current, evidence)),
+    };
+    let (reserved, owner, host_children, partition) = ledger.into_unstarted_parts();
+    let (active, retired_host) = owner.into_parts();
+    let (settlement, lease, manifest) = begin.into_parts();
+    *host = Some(retired_host.restore(lease));
+    Ok(BackNoTargetAuthoritySettlementDisposition {
+        settlement,
+        retirement,
+        physical: BackNoTargetAuthorityPhysicalSettlementOwner {
+            preparation: BackNoTargetAuthorityPhysicalPreparation {
+                source,
+                partition: Some(partition),
+                reserved,
+                active,
+                isolation: None,
+                host_children,
+            },
+        },
+        manifest,
+    })
+}
+
+pub(crate) fn dispatch_back_no_target_authority_settlement(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    disposition: BackNoTargetAuthoritySettlementDisposition,
+) -> BackNoTargetAuthoritySettlementDispatchOutcome {
+    let BackNoTargetAuthoritySettlementDisposition {
+        settlement,
+        retirement,
+        physical,
+        manifest,
+    } = disposition;
+    let BackNoTargetAuthorityPhysicalSettlementOwner { mut preparation } = physical;
+    let exact_entry = entry.pending_back_no_target_authority_cleanup.is_none()
+        && entry.pending_back_no_target_completion.is_none()
+        && entry.cleanup_ledger.is_none()
+        && entry.active.is_none()
+        && entry.host.as_ref().is_some_and(|host| {
+            ProjectionlessHostProjection::from(host) == preparation.source.host
+        })
+        && entry
+            .requests
+            .iter()
+            .filter(|request| **request == preparation.source.request)
+            .count()
+            == 1
+        && entry
+            .engine
+            .request(preparation.source.request)
+            .is_some_and(|record| {
+                matches!(
+                    record.status(),
+                    bevy_ui_router_core::prelude::RequestStatus::Queued
+                )
+            })
+        && preparation.source.active_frames.iter().eq(preparation
+            .active
+            .frames()
+            .iter()
+            .map(RealizedFrame::frame))
+        && preparation
+            .source
+            .active_claims
+            .iter()
+            .eq(preparation.active.claims())
+        && preparation
+            .partition
+            .as_ref()
+            .is_some_and(|partition| partition.refreeze_unstarted(world));
+    if !exact_entry {
+        return BackNoTargetAuthoritySettlementDispatchOutcome::EntryMismatch {
+            disposition: BackNoTargetAuthoritySettlementDisposition {
+                settlement,
+                retirement,
+                physical: BackNoTargetAuthorityPhysicalSettlementOwner { preparation },
+                manifest,
+            },
+        };
+    }
+    if let Some(isolation) = preparation.isolation.take() {
+        isolation.apply(world);
+    }
+    if preparation
+        .partition
+        .as_ref()
+        .is_none_or(|partition| !partition.refreeze_unstarted(world))
+    {
+        return BackNoTargetAuthoritySettlementDispatchOutcome::EntryMismatch {
+            disposition: BackNoTargetAuthoritySettlementDisposition {
+                settlement,
+                retirement,
+                physical: BackNoTargetAuthorityPhysicalSettlementOwner { preparation },
+                manifest,
+            },
+        };
+    }
+    let Some(partition) = preparation.partition.take() else {
+        return BackNoTargetAuthoritySettlementDispatchOutcome::EntryMismatch {
+            disposition: BackNoTargetAuthoritySettlementDisposition {
+                settlement,
+                retirement,
+                physical: BackNoTargetAuthorityPhysicalSettlementOwner { preparation },
+                manifest,
+            },
+        };
+    };
+    let Some(host) = entry.host.take() else {
+        preparation.partition = Some(partition);
+        return BackNoTargetAuthoritySettlementDispatchOutcome::EntryMismatch {
+            disposition: BackNoTargetAuthoritySettlementDisposition {
+                settlement,
+                retirement,
+                physical: BackNoTargetAuthorityPhysicalSettlementOwner { preparation },
+                manifest,
+            },
+        };
+    };
+    let (retired_host, lease) = host.into_retired();
+    let ledger = PreparedBackNoTargetAuthorityCleanupLedger::new(
+        preparation.reserved,
+        preparation.active,
+        retired_host,
+        preparation.host_children,
+        partition,
+    );
+    entry.pending_back_no_target_authority_cleanup = Some(
+        PendingBackNoTargetAuthorityCleanup::Installed(InstalledBackNoTargetAuthorityCleanup {
+            source: preparation.source,
+            retirement,
+            ledger: BackNoTargetAuthorityLedgerHolder::Prepared(ledger),
+            batch: None,
+            inert: None,
+        }),
+    );
+    let begin = BackNoTargetAuthorityBeginOwner::new(settlement, lease, manifest);
+    let RouterEntry {
+        engine,
+        host: host_slot,
+        pending_back_no_target_authority_cleanup: pending,
+        ..
+    } = entry;
+    let Some(PendingBackNoTargetAuthorityCleanup::Installed(installed)) = pending.as_mut() else {
+        let current = pending.take();
+        let evidence = back_no_target_authority_begin_inert_evidence(current.as_ref());
+        retain_back_no_target_authority_begin_inert(
+            pending,
+            begin,
+            current,
+            evidence,
+            BackNoTargetAuthorityBeginInertCause::NotDispatched,
+        );
+        return BackNoTargetAuthoritySettlementDispatchOutcome::Inert;
+    };
+    let batch_slot = &mut installed.batch;
+    let outcome =
+        engine.begin_back_no_target_authority_settlement(begin, |batch| *batch_slot = Some(batch));
+    match outcome {
+        BackNoTargetAuthorityBeginOutcome::Begun => {
+            BackNoTargetAuthoritySettlementDispatchOutcome::Dispatched
+        }
+        BackNoTargetAuthorityBeginOutcome::ReceiverMismatch { owner, mismatch } => {
+            match rebuild_unstarted_back_no_target_authority_disposition(pending, host_slot, owner)
+            {
+                Ok(disposition) => {
+                    BackNoTargetAuthoritySettlementDispatchOutcome::ReceiverMismatch {
+                        disposition,
+                        mismatch,
+                    }
+                }
+                Err((owner, current, evidence)) => {
+                    retain_back_no_target_authority_begin_inert(
+                        pending,
+                        owner,
+                        current,
+                        evidence,
+                        BackNoTargetAuthorityBeginInertCause::ReceiverMismatch(mismatch),
+                    );
+                    BackNoTargetAuthoritySettlementDispatchOutcome::Inert
+                }
+            }
+        }
+        BackNoTargetAuthorityBeginOutcome::Retryable { owner, evidence } => {
+            match rebuild_unstarted_back_no_target_authority_disposition(pending, host_slot, owner)
+            {
+                Ok(disposition) => BackNoTargetAuthoritySettlementDispatchOutcome::Retryable {
+                    disposition,
+                    evidence,
+                },
+                Err((owner, current, observed)) => {
+                    retain_back_no_target_authority_begin_inert(
+                        pending,
+                        owner,
+                        current,
+                        observed,
+                        BackNoTargetAuthorityBeginInertCause::Retryable(evidence),
+                    );
+                    BackNoTargetAuthoritySettlementDispatchOutcome::Inert
+                }
+            }
+        }
+        BackNoTargetAuthorityBeginOutcome::Permanent { owner, evidence } => {
+            match rebuild_unstarted_back_no_target_authority_disposition(pending, host_slot, owner)
+            {
+                Ok(disposition) => BackNoTargetAuthoritySettlementDispatchOutcome::Permanent {
+                    disposition,
+                    evidence,
+                },
+                Err((owner, current, observed)) => {
+                    retain_back_no_target_authority_begin_inert(
+                        pending,
+                        owner,
+                        current,
+                        observed,
+                        BackNoTargetAuthorityBeginInertCause::Permanent(evidence),
+                    );
+                    BackNoTargetAuthoritySettlementDispatchOutcome::Inert
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn approve_back_no_target_proven_empty(
     entry: &mut RouterEntry,
     owner: BackNoTargetProvenEmptyOwner,
@@ -3492,7 +4504,9 @@ impl RouterEntry {
                 || self.pending_failed_branch.is_some()
                 || self.pending_mount_mutation_rejection.is_some()
                 || self.host_settlement.is_some()
-                || self.pending_back_no_target_completion.is_some(),
+                || self.pending_back_no_target_completion.is_some()
+                || self.pending_back_no_target_preparation.is_some()
+                || self.pending_back_no_target_authority_cleanup.is_some(),
         )
     }
 
@@ -3557,9 +4571,30 @@ impl RouterEntry {
 
     #[cfg(feature = "test-support")]
     pub(crate) fn leaving_cleanup_frames(&self) -> &[RealizedFrame] {
-        self.cleanup_ledger
+        self.pending_back_no_target_authority_cleanup
             .as_ref()
-            .map(CleanupLedger::leaving_frames)
+            .and_then(|pending| match pending {
+                PendingBackNoTargetAuthorityCleanup::Installed(installed) => {
+                    Some(installed.ledger.leaving_frames())
+                }
+                PendingBackNoTargetAuthorityCleanup::Completing(completing) => {
+                    Some(completing.ledger.leaving_frames())
+                }
+                PendingBackNoTargetAuthorityCleanup::Settled(settled) => {
+                    Some(settled.prepared.ledger.leaving_frames())
+                }
+                PendingBackNoTargetAuthorityCleanup::AuthorityBeginInert(inert) => {
+                    Some(inert.leaving_frames())
+                }
+                PendingBackNoTargetAuthorityCleanup::CompletionInert(inert) => {
+                    Some(inert.leaving_frames())
+                }
+            })
+            .or_else(|| {
+                self.cleanup_ledger
+                    .as_ref()
+                    .map(CleanupLedger::leaving_frames)
+            })
             .unwrap_or(&[])
     }
 
@@ -3657,6 +4692,25 @@ impl RouterEntry {
         if let Some(ledger) = &self.cleanup_ledger {
             slots.extend(ledger.tracked_child_slots());
         }
+        if let Some(pending) = &self.pending_back_no_target_authority_cleanup {
+            match pending {
+                PendingBackNoTargetAuthorityCleanup::Installed(installed) => {
+                    slots.extend(installed.ledger.tracked_child_slots());
+                }
+                PendingBackNoTargetAuthorityCleanup::Completing(completing) => {
+                    slots.extend(completing.ledger.tracked_child_slots());
+                }
+                PendingBackNoTargetAuthorityCleanup::Settled(settled) => {
+                    slots.extend(settled.prepared.ledger.tracked_child_slots());
+                }
+                PendingBackNoTargetAuthorityCleanup::AuthorityBeginInert(inert) => {
+                    slots.extend(inert.tracked_child_slots());
+                }
+                PendingBackNoTargetAuthorityCleanup::CompletionInert(inert) => {
+                    slots.extend(inert.tracked_child_slots());
+                }
+            }
+        }
         slots
     }
 }
@@ -3720,6 +4774,8 @@ impl RouterNavigation {
             pending_bound_back_resolution: None,
             pending_back_target_execution: None,
             pending_back_no_target_completion: None,
+            pending_back_no_target_preparation: None,
+            pending_back_no_target_authority_cleanup: None,
             history_admission_world,
             history_admission_stamp: None,
             back_capacity_issuer: None,
@@ -4095,6 +5151,8 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                             .cleanup_ledger
                             .as_ref()
                             .is_some_and(CleanupLedger::is_authority_settlement)
+                        || entry.pending_back_no_target_authority_cleanup.is_some()
+                        || entry.pending_back_no_target_preparation.is_some()
                     {
                         continue;
                     }
@@ -4176,6 +5234,8 @@ pub(crate) fn collect_navigation_system(world: &mut World) {
             && entry.pending_bound_back_resolution.is_none()
             && entry.pending_back_target_execution.is_none()
             && entry.pending_back_no_target_completion.is_none()
+            && entry.pending_back_no_target_preparation.is_none()
+            && entry.pending_back_no_target_authority_cleanup.is_none()
         {
             entry.engine.collect();
         }
@@ -5006,6 +6066,160 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                             BackTargetDispatchOutcome::SafeStopped => continue,
                             BackTargetDispatchOutcome::NoTargetPending => None,
                         };
+                        if entry.pending_back_no_target_preparation.is_some()
+                            || entry.pending_back_no_target_authority_cleanup.is_some()
+                            || entry.pending_back_no_target_completion.is_some()
+                        {
+                            continue;
+                        }
+                        if matches!(
+                            entry.pending_bound_back_resolution.as_ref(),
+                            Some(BoundBackResolutionHandoff::NoTarget(_))
+                        ) {
+                            let Some(BoundBackResolutionHandoff::NoTarget(bound)) =
+                                entry.pending_bound_back_resolution.take()
+                            else {
+                                continue;
+                            };
+                            match begin_bound_back_no_target(entry, bound) {
+                                BackNoTargetBeginOutcome::Begun(owner) => {
+                                    match classify_back_no_target(world, entry, owner) {
+                                        BackNoTargetPreparationOutcome::Ready(prepared) => {
+                                            match consume_prepared_back_no_target(entry, prepared) {
+                                                BackNoTargetFinalizationOutcome::Published => {}
+                                                BackNoTargetFinalizationOutcome::CapacityRejected {
+                                                    owner,
+                                                    error,
+                                                } => {
+                                                    entry.pending_back_no_target_preparation =
+                                                        Some(
+                                                            PendingBackNoTargetPreparation::ReadyCapacityRejected {
+                                                                owner,
+                                                                error,
+                                                            },
+                                                        );
+                                                }
+                                                BackNoTargetFinalizationOutcome::ReceiverMismatch {
+                                                    owner,
+                                                    mismatch,
+                                                } => {
+                                                    entry.pending_back_no_target_preparation =
+                                                        Some(
+                                                            PendingBackNoTargetPreparation::ReadyReceiverMismatch {
+                                                                owner,
+                                                                mismatch,
+                                                            },
+                                                        );
+                                                }
+                                            }
+                                        }
+                                        BackNoTargetPreparationOutcome::AuthoritySettlement(
+                                            disposition,
+                                        ) => {
+                                            match dispatch_back_no_target_authority_settlement(
+                                                world,
+                                                entry,
+                                                disposition,
+                                            ) {
+                                                BackNoTargetAuthoritySettlementDispatchOutcome::Dispatched
+                                                | BackNoTargetAuthoritySettlementDispatchOutcome::Inert => {}
+                                                BackNoTargetAuthoritySettlementDispatchOutcome::EntryMismatch {
+                                                    disposition,
+                                                }
+                                                | BackNoTargetAuthoritySettlementDispatchOutcome::ReceiverMismatch {
+                                                    disposition,
+                                                    ..
+                                                }
+                                                | BackNoTargetAuthoritySettlementDispatchOutcome::Retryable {
+                                                    disposition,
+                                                    ..
+                                                }
+                                                | BackNoTargetAuthoritySettlementDispatchOutcome::Permanent {
+                                                    disposition,
+                                                    ..
+                                                } => {
+                                                    entry.pending_back_no_target_preparation = Some(
+                                                        PendingBackNoTargetPreparation::AuthorityDispatchBlocked {
+                                                            disposition,
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        BackNoTargetPreparationOutcome::AuthorityPermanent(
+                                            permanent,
+                                        ) => {
+                                            entry.pending_back_no_target_preparation = Some(
+                                                PendingBackNoTargetPreparation::AuthorityPermanent(
+                                                    permanent,
+                                                ),
+                                            );
+                                        }
+                                        BackNoTargetPreparationOutcome::Retry {
+                                            owner,
+                                            evidence,
+                                        } => {
+                                            entry.pending_back_no_target_preparation = Some(
+                                                PendingBackNoTargetPreparation::PhysicalIndeterminate {
+                                                    owner,
+                                                    evidence,
+                                                },
+                                            );
+                                        }
+                                        BackNoTargetPreparationOutcome::CapacityRejected {
+                                            owner,
+                                            error,
+                                        } => {
+                                            entry.pending_back_no_target_preparation = Some(
+                                                PendingBackNoTargetPreparation::CapacityRejected {
+                                                    owner,
+                                                    error,
+                                                },
+                                            );
+                                        }
+                                        BackNoTargetPreparationOutcome::ReceiverMismatch {
+                                            owner,
+                                            mismatch,
+                                        } => {
+                                            entry.pending_back_no_target_preparation = Some(
+                                                PendingBackNoTargetPreparation::ReceiverMismatch {
+                                                    owner,
+                                                    mismatch,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                                BackNoTargetBeginOutcome::Permanent(owner) => {
+                                    match settle_back_no_target_source_drift_permanent(entry, owner)
+                                    {
+                                        BackNoTargetSourceDriftPermanentSettlementOutcome::Settled {
+                                            ..
+                                        } => {}
+                                        BackNoTargetSourceDriftPermanentSettlementOutcome::ReceiverMismatch {
+                                            owner,
+                                            ..
+                                        }
+                                        | BackNoTargetSourceDriftPermanentSettlementOutcome::CapacityRejected {
+                                            owner,
+                                            ..
+                                        } => {
+                                            entry.pending_back_no_target_preparation = Some(
+                                                PendingBackNoTargetPreparation::SourceDriftBlocked {
+                                                    owner,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                                BackNoTargetBeginOutcome::CapacityRejected { bound, .. }
+                                | BackNoTargetBeginOutcome::ReceiverMismatch { bound, .. } => {
+                                    entry.pending_bound_back_resolution =
+                                        Some(BoundBackResolutionHandoff::NoTarget(bound));
+                                }
+                            }
+                            continue;
+                        }
                         if entry.pending_back_resolution_action.is_some()
                             || entry.pending_bound_back_resolution.is_some()
                         {
@@ -11353,6 +12567,237 @@ fn begin_failed_authority_settlement(
     }
 }
 
+fn retain_installed_back_no_target_authority_cleanup(
+    entry: &mut RouterEntry,
+    source: FrozenBackNoTargetAuthoritySource,
+    retirement: BackCapacityRetirementEvidence,
+    ledger: CleanupLedger,
+    batch: BackNoTargetAuthorityCleanupBatchOwner,
+    inert: Option<BackNoTargetAuthorityInertEvidence>,
+) {
+    entry.pending_back_no_target_authority_cleanup = Some(
+        PendingBackNoTargetAuthorityCleanup::Installed(InstalledBackNoTargetAuthorityCleanup {
+            source,
+            retirement,
+            ledger: BackNoTargetAuthorityLedgerHolder::Active(ledger),
+            batch: Some(batch),
+            inert,
+        }),
+    );
+}
+
+fn retain_back_no_target_authority_completion_inert(
+    pending: &mut Option<PendingBackNoTargetAuthorityCleanup>,
+    completion: BackNoTargetAuthorityCleanupCompletionOwner,
+    mismatch: BackNoTargetAuthorityCleanupMismatchEvidence,
+    current: Option<PendingBackNoTargetAuthorityCleanup>,
+) {
+    let evidence = if current.is_none() {
+        BackNoTargetAuthorityCompletionInertEvidence::MissingCompletingHolder
+    } else {
+        BackNoTargetAuthorityCompletionInertEvidence::WrongPhase
+    };
+    let physical = current.map(|current| match current {
+        PendingBackNoTargetAuthorityCleanup::Installed(installed) => {
+            BackNoTargetAuthorityCompletionInertPhysical::Installed(installed)
+        }
+        PendingBackNoTargetAuthorityCleanup::Completing(completing) => {
+            BackNoTargetAuthorityCompletionInertPhysical::Completing(completing)
+        }
+        PendingBackNoTargetAuthorityCleanup::Settled(settled) => {
+            BackNoTargetAuthorityCompletionInertPhysical::Settled(settled)
+        }
+        PendingBackNoTargetAuthorityCleanup::AuthorityBeginInert(inert) => {
+            BackNoTargetAuthorityCompletionInertPhysical::AuthorityBeginInert(inert)
+        }
+        PendingBackNoTargetAuthorityCleanup::CompletionInert(inert) => {
+            BackNoTargetAuthorityCompletionInertPhysical::PriorCompletionInert(Box::new(inert))
+        }
+    });
+    *pending = Some(PendingBackNoTargetAuthorityCleanup::CompletionInert(
+        BackNoTargetAuthorityCompletionInert {
+            completion,
+            mismatch,
+            physical,
+            evidence,
+        },
+    ));
+}
+
+fn drive_back_no_target_authority_cleanup(world: &mut World, entry: &mut RouterEntry) -> bool {
+    match entry.pending_back_no_target_authority_cleanup.as_ref() {
+        None => return false,
+        Some(PendingBackNoTargetAuthorityCleanup::Installed(installed))
+            if installed.inert.is_none() && installed.batch.is_some() => {}
+        Some(
+            PendingBackNoTargetAuthorityCleanup::Installed(_)
+            | PendingBackNoTargetAuthorityCleanup::Completing(_)
+            | PendingBackNoTargetAuthorityCleanup::Settled(_)
+            | PendingBackNoTargetAuthorityCleanup::AuthorityBeginInert(_)
+            | PendingBackNoTargetAuthorityCleanup::CompletionInert(_),
+        ) => return true,
+    }
+    let current = entry.pending_back_no_target_authority_cleanup.take();
+    let installed = match current {
+        Some(PendingBackNoTargetAuthorityCleanup::Installed(installed)) => installed,
+        current => {
+            entry.pending_back_no_target_authority_cleanup = current;
+            return true;
+        }
+    };
+    let InstalledBackNoTargetAuthorityCleanup {
+        source,
+        retirement,
+        ledger,
+        batch,
+        inert: _,
+    } = installed;
+    let Some(batch) = batch else {
+        entry.pending_back_no_target_authority_cleanup = Some(
+            PendingBackNoTargetAuthorityCleanup::Installed(InstalledBackNoTargetAuthorityCleanup {
+                source,
+                retirement,
+                ledger,
+                batch: None,
+                inert: Some(BackNoTargetAuthorityInertEvidence::MissingBatch),
+            }),
+        );
+        return true;
+    };
+    let mut ledger = match ledger {
+        BackNoTargetAuthorityLedgerHolder::Prepared(ledger) => ledger.into_active(),
+        BackNoTargetAuthorityLedgerHolder::Active(ledger) => ledger,
+    };
+    if source.active_frames.is_empty()
+        || source.active_claims.is_empty()
+        || !ledger.back_no_target_authority_partition_is_current(world)
+    {
+        retain_installed_back_no_target_authority_cleanup(
+            entry,
+            source,
+            retirement,
+            ledger,
+            batch,
+            Some(BackNoTargetAuthorityInertEvidence::PartitionDrift),
+        );
+        return true;
+    }
+    let receipts_observed = entry.observe_cleanup_receipts(&mut ledger);
+    let partition_is_current = ledger.back_no_target_authority_partition_is_current(world);
+    if !receipts_observed || !partition_is_current {
+        retain_installed_back_no_target_authority_cleanup(
+            entry,
+            source,
+            retirement,
+            ledger,
+            batch,
+            Some(if !receipts_observed {
+                BackNoTargetAuthorityInertEvidence::ReceiptObservationRejected
+            } else {
+                BackNoTargetAuthorityInertEvidence::PartitionDrift
+            }),
+        );
+        return true;
+    }
+    if !ledger.is_settled() {
+        let Some(attempt) = ledger.attempt(world) else {
+            retain_installed_back_no_target_authority_cleanup(
+                entry,
+                source,
+                retirement,
+                ledger,
+                batch,
+                Some(BackNoTargetAuthorityInertEvidence::AttemptUnavailable),
+            );
+            return true;
+        };
+        let settled = ledger.settle(world, attempt);
+        let receipts_observed = entry.observe_cleanup_receipts(&mut ledger);
+        let partition_is_current = ledger.back_no_target_authority_partition_is_current(world);
+        if !receipts_observed || !settled || !partition_is_current {
+            let inert = if !receipts_observed {
+                BackNoTargetAuthorityInertEvidence::ReceiptObservationRejected
+            } else if !settled {
+                BackNoTargetAuthorityInertEvidence::SettlementRejected
+            } else {
+                BackNoTargetAuthorityInertEvidence::PartitionDrift
+            };
+            retain_installed_back_no_target_authority_cleanup(
+                entry,
+                source,
+                retirement,
+                ledger,
+                batch,
+                Some(inert),
+            );
+            return true;
+        }
+    }
+    let Some(facts) = ledger.back_no_target_authority_completion_facts() else {
+        retain_installed_back_no_target_authority_cleanup(
+            entry,
+            source,
+            retirement,
+            ledger,
+            batch,
+            Some(BackNoTargetAuthorityInertEvidence::CompletionFactsUnavailable),
+        );
+        return true;
+    };
+    if !ledger.back_no_target_authority_partition_is_current(world) {
+        retain_installed_back_no_target_authority_cleanup(
+            entry,
+            source,
+            retirement,
+            ledger,
+            batch,
+            Some(BackNoTargetAuthorityInertEvidence::PartitionDrift),
+        );
+        return true;
+    }
+    let completion = batch.complete(
+        facts.manifest_digest(),
+        facts.obligation_count(),
+        facts.completion_digest(),
+        facts.settled_count(),
+    );
+    entry.pending_back_no_target_authority_cleanup =
+        Some(PendingBackNoTargetAuthorityCleanup::Completing(
+            PreparedBackNoTargetAuthorityPhysicalCompletion {
+                source,
+                retirement,
+                ledger,
+            },
+        ));
+    let RouterEntry {
+        engine,
+        pending_back_no_target_authority_cleanup: pending,
+        ..
+    } = entry;
+    let outcome = engine.complete_back_no_target_authority_cleanup(completion, || *pending = None);
+    match outcome {
+        BackNoTargetAuthorityCleanupCompletionOutcome::Terminal(_) => {}
+        BackNoTargetAuthorityCleanupCompletionOutcome::Mismatch { owner, evidence } => {
+            let current = pending.take();
+            match current {
+                Some(PendingBackNoTargetAuthorityCleanup::Completing(prepared)) => {
+                    *pending = Some(PendingBackNoTargetAuthorityCleanup::Settled(
+                        SettledBackNoTargetAuthorityCleanup {
+                            prepared,
+                            completion: owner,
+                            mismatch: evidence,
+                        },
+                    ));
+                }
+                current => retain_back_no_target_authority_completion_inert(
+                    pending, owner, evidence, current,
+                ),
+            }
+        }
+    }
+    true
+}
+
 fn drive_back_no_target_zero_completion(entry: &mut RouterEntry) -> bool {
     match entry.pending_back_no_target_completion.as_ref() {
         None => return false,
@@ -11462,6 +12907,9 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             for entry in &mut navigation.entries {
+                if drive_back_no_target_authority_cleanup(world, entry) {
+                    continue;
+                }
                 if drive_back_no_target_zero_completion(entry) {
                     continue;
                 }
@@ -18159,6 +19607,8 @@ pub(crate) mod tests {
             pending_bound_back_resolution: None,
             pending_back_target_execution: None,
             pending_back_no_target_completion: None,
+            pending_back_no_target_preparation: None,
+            pending_back_no_target_authority_cleanup: None,
             history_admission_world,
             history_admission_stamp: None,
             back_capacity_issuer: None,
@@ -28202,6 +29652,1072 @@ pub(crate) mod tests {
             world_before,
             "a later Router schedule must remain a physical zero-write"
         );
+    }
+
+    fn stage_real_back_no_target_authority_bound(
+        app: &mut App,
+        router: RouterHandle,
+    ) -> (NavigationRequestId, Entity, Entity) {
+        let (request, bound) = take_real_bound_back_no_target(app, router);
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handle == router)
+            .expect("the exact no-target router retains its entry");
+        assert_eq!(
+            entry.engine.request(request).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        entry.pending_bound_back_resolution = Some(BoundBackResolutionHandoff::NoTarget(bound));
+        let host = entry
+            .host
+            .as_ref()
+            .expect("the exact no-target router retains its host");
+        (request, host.host, host.top_slot)
+    }
+
+    fn drift_staged_back_no_target_authority_host_and_begin(
+        app: &mut App,
+        router: RouterHandle,
+        request: NavigationRequestId,
+        host: Entity,
+    ) {
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .expect("the exact host retains its registration");
+        app.world_mut().entity_mut(host).insert(registration);
+        drive_navigation_system(app.world_mut());
+
+        let world = app.world();
+        let navigation = world.resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the exact no-target router retains its entry");
+        assert!(
+            entry.host.is_none(),
+            "begin must move the exact HostBinding"
+        );
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::Recovering)
+        ));
+        let Some(PendingBackNoTargetAuthorityCleanup::Installed(installed)) =
+            entry.pending_back_no_target_authority_cleanup.as_ref()
+        else {
+            panic!("dedicated authority begin must install its whole ECS holder")
+        };
+        assert!(installed.batch.is_some());
+        assert!(installed.inert.is_none());
+        assert!(!installed.ledger.leaving_frames().is_empty());
+    }
+
+    #[test]
+    fn back_no_target_authority_begin_rejection_restores_whole_disposition_and_host_once() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router =
+            install_atomic_router_at_pattern(&mut app, "back-no-target-begin-rejection", "/:id");
+        app.update();
+        let (request, host, _) = stage_real_back_no_target_authority_bound(&mut app, router);
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .expect("the exact host retains its registration");
+        app.world_mut().entity_mut(host).insert(registration);
+
+        let (host_after_rejection, active_frames, active_claims, trace_after_rejection) = app
+            .world_mut()
+            .resource_scope(
+                |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                    let entry = navigation
+                        .entries
+                        .iter_mut()
+                        .find(|entry| entry.handle == router)
+                        .unwrap();
+                    let Some(BoundBackResolutionHandoff::NoTarget(bound)) =
+                        entry.pending_bound_back_resolution.take()
+                    else {
+                        panic!("the real fixture must retain its exact no-target bound owner")
+                    };
+                    let owner = match begin_bound_back_no_target(entry, bound) {
+                        BackNoTargetBeginOutcome::Begun(owner) => owner,
+                        BackNoTargetBeginOutcome::Permanent(_)
+                        | BackNoTargetBeginOutcome::CapacityRejected { .. }
+                        | BackNoTargetBeginOutcome::ReceiverMismatch { .. } => {
+                            panic!("the unchanged source must reach physical authority classification")
+                        }
+                    };
+                    let disposition = match classify_back_no_target(world, entry, owner) {
+                        BackNoTargetPreparationOutcome::AuthoritySettlement(disposition) => {
+                            disposition
+                        }
+                        _ => {
+                            panic!("the real host revision drift must produce one whole authority disposition")
+                        }
+                    };
+                    let logical_active_before = entry.engine.active().clone();
+                    let host_before = ProjectionlessHostProjection::from(
+                        entry
+                            .host
+                            .as_ref()
+                            .expect("dispatch has not moved the HostBinding yet"),
+                    );
+                    assert!(entry.active.is_none());
+                    assert!(
+                        entry
+                            .engine
+                            .testing_replace_host_admission_with_non_owning_issuer(),
+                        "the test-support seam must install a real non-owning issuer"
+                    );
+                    let snapshot_before = entry.engine.snapshot();
+
+                    let disposition =
+                        match dispatch_back_no_target_authority_settlement(world, entry, disposition)
+                        {
+                            BackNoTargetAuthoritySettlementDispatchOutcome::Permanent {
+                                disposition,
+                                evidence,
+                            } => {
+                                assert_eq!(
+                                    evidence,
+                                    BackNoTargetAuthorityBeginPermanentEvidence::HostRetirementRejected
+                                );
+                                disposition
+                            }
+                            BackNoTargetAuthoritySettlementDispatchOutcome::Dispatched
+                            | BackNoTargetAuthoritySettlementDispatchOutcome::Inert
+                            | BackNoTargetAuthoritySettlementDispatchOutcome::EntryMismatch { .. }
+                            | BackNoTargetAuthoritySettlementDispatchOutcome::ReceiverMismatch {
+                                ..
+                            }
+                            | BackNoTargetAuthoritySettlementDispatchOutcome::Retryable { .. } => {
+                                panic!(
+                                    "RED: the real non-owning issuer must reject exact host retirement"
+                                )
+                            }
+                        };
+
+                    assert_eq!(entry.engine.snapshot(), snapshot_before);
+                    assert_eq!(entry.engine.active(), &logical_active_before);
+                    assert!(matches!(
+                        entry.engine.request(request).unwrap().status(),
+                        RequestStatus::Queued
+                    ));
+                    assert!(
+                        entry.pending_back_no_target_authority_cleanup.is_none(),
+                        "rejection must call the batch installation callback zero times"
+                    );
+                    let host_after = ProjectionlessHostProjection::from(
+                        entry
+                            .host
+                            .as_ref()
+                            .expect("rejection must restore the exact HostBinding"),
+                    );
+                    assert_eq!(host_after, host_before);
+                    let active_frames = disposition
+                        .physical
+                        .preparation
+                        .active
+                        .frames()
+                        .iter()
+                        .map(|frame| frame.frame().clone())
+                        .collect::<Vec<_>>();
+                    let active_claims = disposition
+                        .physical
+                        .preparation
+                        .active
+                        .claims()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    assert!(!active_frames.is_empty());
+                    assert!(!active_claims.is_empty());
+                    let trace = entry.engine.request(request).unwrap().trace().to_vec();
+                    entry.pending_back_no_target_preparation = Some(
+                        PendingBackNoTargetPreparation::AuthorityDispatchBlocked { disposition },
+                    );
+                    (host_after, active_frames, active_claims, trace)
+                },
+            );
+        let world_after_rejection = authority_world_fingerprint(app.world());
+
+        drive_navigation_system(app.world_mut());
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .unwrap();
+        assert_eq!(
+            ProjectionlessHostProjection::from(entry.host.as_ref().unwrap()),
+            host_after_rejection
+        );
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Queued
+        ));
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace(),
+            trace_after_rejection
+        );
+        let Some(PendingBackNoTargetPreparation::AuthorityDispatchBlocked { disposition }) =
+            entry.pending_back_no_target_preparation.as_ref()
+        else {
+            panic!("a later drive must not consume or rebuild the returned whole disposition")
+        };
+        assert_eq!(
+            disposition
+                .physical
+                .preparation
+                .active
+                .frames()
+                .iter()
+                .map(|frame| frame.frame().clone())
+                .collect::<Vec<_>>(),
+            active_frames
+        );
+        assert_eq!(
+            disposition
+                .physical
+                .preparation
+                .active
+                .claims()
+                .cloned()
+                .collect::<Vec<_>>(),
+            active_claims
+        );
+        assert!(entry.pending_back_no_target_authority_cleanup.is_none());
+        assert_eq!(
+            authority_world_fingerprint(app.world()),
+            world_after_rejection
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum BackNoTargetAuthorityPermanentFixture {
+        IsolationContradiction,
+        LedgerDomainExhausted,
+        UnfinalizedLedgerFacts,
+    }
+
+    fn assert_back_no_target_authority_permanent_holder(
+        pending: Option<&PendingBackNoTargetPreparation>,
+        fixture: BackNoTargetAuthorityPermanentFixture,
+    ) {
+        let Some(pending) = pending else {
+            panic!("a permanent physical contradiction must retain its whole owner")
+        };
+        let owner = match pending {
+            PendingBackNoTargetPreparation::AuthorityPermanent(owner) => owner,
+            PendingBackNoTargetPreparation::PhysicalIndeterminate { .. } => {
+                panic!("RED: a permanent physical contradiction must never enter Retry")
+            }
+            PendingBackNoTargetPreparation::CapacityRejected { .. }
+            | PendingBackNoTargetPreparation::ReceiverMismatch { .. }
+            | PendingBackNoTargetPreparation::ReadyCapacityRejected { .. }
+            | PendingBackNoTargetPreparation::ReadyReceiverMismatch { .. }
+            | PendingBackNoTargetPreparation::AuthorityDispatchBlocked { .. }
+            | PendingBackNoTargetPreparation::SourceDriftBlocked { .. } => {
+                panic!("RED: a permanent physical contradiction needs its own linear holder")
+            }
+        };
+        match (fixture, &owner.evidence) {
+            (
+                BackNoTargetAuthorityPermanentFixture::IsolationContradiction,
+                BackNoTargetAuthorityPermanentEvidence::Isolation { contradiction, .. },
+            ) => {
+                assert!(
+                    !contradiction.violations.is_empty(),
+                    "the isolation evidence must retain the real predicate violations"
+                );
+            }
+            (
+                BackNoTargetAuthorityPermanentFixture::LedgerDomainExhausted,
+                BackNoTargetAuthorityPermanentEvidence::Ledger {
+                    kind: CleanupLedgerReserveErrorKind::DomainExhausted,
+                    manifest,
+                },
+            ) => {
+                assert!(
+                    manifest.boundary_drifts().is_empty(),
+                    "domain exhaustion evidence must retain a finalized manifest"
+                );
+            }
+            (
+                BackNoTargetAuthorityPermanentFixture::UnfinalizedLedgerFacts,
+                BackNoTargetAuthorityPermanentEvidence::Ledger {
+                    kind: CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts,
+                    manifest,
+                },
+            ) => {
+                assert!(
+                    !manifest.boundary_drifts().is_empty(),
+                    "unfinalized evidence must retain the boundary drift that drove its predicate"
+                );
+            }
+            _ => panic!(
+                "the permanent holder must retain the exact evidence branch derived by its fixture"
+            ),
+        }
+    }
+
+    fn assert_back_no_target_authority_permanent_predicate_is_bounded(
+        name: &'static str,
+        fixture: BackNoTargetAuthorityPermanentFixture,
+    ) {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router_at_pattern(&mut app, name, "/:id");
+        app.update();
+        let (request, host, top_slot) = stage_real_back_no_target_authority_bound(&mut app, router);
+        if matches!(
+            fixture,
+            BackNoTargetAuthorityPermanentFixture::IsolationContradiction
+        ) {
+            let target = {
+                let world = app.world();
+                let navigation = world.resource::<RouterNavigation>();
+                let entry = navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == router)
+                    .unwrap();
+                entry
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .claims()
+                    .find(|claim| {
+                        claim.entity() != top_slot
+                            && world.get::<Visibility>(claim.entity()).is_some()
+                    })
+                    .expect("the real active branch retains a visible exact target")
+                    .entity()
+            };
+            app.world_mut().entity_mut(target).remove::<Visibility>();
+            app.world_mut().flush();
+        }
+        match fixture {
+            BackNoTargetAuthorityPermanentFixture::IsolationContradiction => {}
+            BackNoTargetAuthorityPermanentFixture::LedgerDomainExhausted => {
+                crate::cleanup::fail_next_ledger_domain_for_test();
+            }
+            BackNoTargetAuthorityPermanentFixture::UnfinalizedLedgerFacts => {
+                crate::cleanup::fail_next_unfinalized_ledger_for_test();
+            }
+        }
+        let registration = app
+            .world_mut()
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .expect("the exact host retains its registration");
+        app.world_mut().entity_mut(host).insert(registration);
+        let (active_before, host_before, trace_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .unwrap();
+            (
+                entry
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                ProjectionlessHostProjection::from(entry.host.as_ref().unwrap()),
+                entry.engine.request(request).unwrap().trace().to_vec(),
+            )
+        };
+        let ledger_domain_allocations_before = matches!(
+            fixture,
+            BackNoTargetAuthorityPermanentFixture::LedgerDomainExhausted
+        )
+        .then(crate::cleanup::ledger_domain_allocations_for_test);
+
+        drive_navigation_system(app.world_mut());
+        if let Some(before) = ledger_domain_allocations_before {
+            assert_eq!(
+                crate::cleanup::ledger_domain_allocations_for_test(),
+                before,
+                "the exhausted counter input must not record a successful ledger-domain allocation"
+            );
+        }
+
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .unwrap();
+            assert_back_no_target_authority_permanent_holder(
+                entry.pending_back_no_target_preparation.as_ref(),
+                fixture,
+            );
+            assert_eq!(
+                entry
+                    .active
+                    .as_ref()
+                    .expect("pre-accept permanent classification must preserve active")
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                active_before
+            );
+            assert_eq!(
+                ProjectionlessHostProjection::from(entry.host.as_ref().unwrap()),
+                host_before
+            );
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Queued
+            ));
+            assert_eq!(entry.engine.request(request).unwrap().trace(), trace_before);
+            assert!(entry.pending_back_no_target_authority_cleanup.is_none());
+            assert!(entry.pending_back_no_target_completion.is_none());
+        }
+        let world_after_first = authority_world_fingerprint(app.world());
+
+        drive_navigation_system(app.world_mut());
+        if let Some(before) = ledger_domain_allocations_before {
+            assert_eq!(
+                crate::cleanup::ledger_domain_allocations_for_test(),
+                before,
+                "the retained permanent holder must not retry or allocate a ledger domain"
+            );
+        }
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .unwrap();
+        assert_back_no_target_authority_permanent_holder(
+            entry.pending_back_no_target_preparation.as_ref(),
+            fixture,
+        );
+        assert_eq!(
+            entry
+                .active
+                .as_ref()
+                .unwrap()
+                .frames()
+                .iter()
+                .map(|frame| frame.frame().clone())
+                .collect::<Vec<_>>(),
+            active_before
+        );
+        assert_eq!(
+            ProjectionlessHostProjection::from(entry.host.as_ref().unwrap()),
+            host_before
+        );
+        assert_eq!(entry.engine.request(request).unwrap().trace(), trace_before);
+        assert_eq!(authority_world_fingerprint(app.world()), world_after_first);
+    }
+
+    #[test]
+    fn back_no_target_authority_isolation_contradiction_is_permanent_once() {
+        assert_back_no_target_authority_permanent_predicate_is_bounded(
+            "back-no-target-isolation-permanent",
+            BackNoTargetAuthorityPermanentFixture::IsolationContradiction,
+        );
+    }
+
+    #[test]
+    fn back_no_target_authority_ledger_domain_exhaustion_is_permanent_once() {
+        assert_back_no_target_authority_permanent_predicate_is_bounded(
+            "back-no-target-ledger-domain-permanent",
+            BackNoTargetAuthorityPermanentFixture::LedgerDomainExhausted,
+        );
+    }
+
+    #[test]
+    fn back_no_target_authority_unfinalized_ledger_facts_are_permanent_once() {
+        assert_back_no_target_authority_permanent_predicate_is_bounded(
+            "back-no-target-ledger-unfinalized-permanent",
+            BackNoTargetAuthorityPermanentFixture::UnfinalizedLedgerFacts,
+        );
+    }
+
+    #[test]
+    fn back_no_target_authority_residual_postwrite_drift_becomes_installed_inert_once() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router =
+            install_atomic_router_at_pattern(&mut app, "back-no-target-residual-drift", "/:id");
+        app.update();
+        let (request, host, top_slot) = stage_real_back_no_target_authority_bound(&mut app, router);
+        let (target, active_before) = {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .unwrap();
+            let target = entry
+                .active
+                .as_ref()
+                .unwrap()
+                .claims()
+                .find(|claim| {
+                    claim.entity() != top_slot && world.get::<ChildOf>(claim.entity()).is_some()
+                })
+                .expect("the real active branch retains a parented cleanup target")
+                .entity();
+            (target, entry.engine.active().clone())
+        };
+        app.world_mut().entity_mut(target).remove::<ChildOf>();
+        let stale_seal = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_seal();
+        app.world_mut()
+            .entity_mut(target)
+            .insert(RouteOwnershipSeal::new(stale_seal));
+        app.world_mut().flush();
+        let drift_parent = app
+            .world_mut()
+            .spawn(NestedAppHostSentinel(0xbac0_1001))
+            .id();
+
+        drift_staged_back_no_target_authority_host_and_begin(&mut app, router, request, host);
+        app.world_mut().insert_resource(
+            AuthorityLostResidualPostwriteDrift::reparent_after_first_closure(
+                [target, target, target],
+                drift_parent,
+            ),
+        );
+
+        settle_cleanup_system(app.world_mut());
+
+        let (trace_after_first, receipts_after_first, inert_after_first) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .unwrap();
+            let record = entry.engine.request(request).unwrap();
+            assert_eq!(entry.engine.active(), &active_before);
+            assert!(entry.host.is_none());
+            assert!(matches!(
+                record.status(),
+                RequestStatus::Running(NavigationPhase::Recovering)
+            ));
+            assert_eq!(
+                record
+                    .trace()
+                    .iter()
+                    .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                    .count(),
+                0
+            );
+            let Some(PendingBackNoTargetAuthorityCleanup::Installed(installed)) =
+                entry.pending_back_no_target_authority_cleanup.as_ref()
+            else {
+                panic!(
+                    "RED: terminal retained-target postwrite drift must preserve the whole Installed owner"
+                )
+            };
+            let inert = installed.inert;
+            assert!(
+                inert.is_some(),
+                "RED: terminal retained-target postwrite drift must install typed inert evidence"
+            );
+            assert!(!installed.ledger.leaving_frames().is_empty());
+            let receipts = match &installed.ledger {
+                BackNoTargetAuthorityLedgerHolder::Active(ledger) => ledger.receipt_count(),
+                BackNoTargetAuthorityLedgerHolder::Prepared(_) => {
+                    panic!("the real settlement attempt must activate its ledger")
+                }
+            };
+            (record.trace().to_vec(), receipts, inert)
+        };
+        assert_eq!(
+            app.world().get::<ChildOf>(target).map(ChildOf::parent),
+            Some(drift_parent),
+            "the test seam must change the real postwrite relationship predicate"
+        );
+        let world_after_first = authority_world_fingerprint(app.world());
+
+        settle_cleanup_system(app.world_mut());
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .unwrap();
+        let record = entry.engine.request(request).unwrap();
+        let Some(PendingBackNoTargetAuthorityCleanup::Installed(installed)) =
+            entry.pending_back_no_target_authority_cleanup.as_ref()
+        else {
+            panic!("a later settle must not redrive or consume the inert owner")
+        };
+        assert_eq!(installed.inert, inert_after_first);
+        assert_eq!(record.trace(), trace_after_first);
+        assert_eq!(
+            match &installed.ledger {
+                BackNoTargetAuthorityLedgerHolder::Active(ledger) => ledger.receipt_count(),
+                BackNoTargetAuthorityLedgerHolder::Prepared(_) => 0,
+            },
+            receipts_after_first
+        );
+        assert_eq!(
+            app.world().get::<ChildOf>(target).map(ChildOf::parent),
+            Some(drift_parent)
+        );
+        assert_eq!(authority_world_fingerprint(app.world()), world_after_first);
+    }
+
+    #[test]
+    fn back_no_target_authority_host_edge_reattach_after_commit_is_inert_once() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router =
+            install_atomic_router_at_pattern(&mut app, "back-no-target-host-edge-drift", "/:id");
+        app.update();
+        let (request, host, top_slot) = stage_real_back_no_target_authority_bound(&mut app, router);
+        let active_before = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .active()
+            .clone();
+        drift_staged_back_no_target_authority_host_and_begin(&mut app, router, request, host);
+        app.world_mut()
+            .insert_resource(crate::cleanup::AuthorityHostEdgePostwriteDrift::reattach(
+                top_slot, host,
+            ));
+
+        settle_cleanup_system(app.world_mut());
+
+        let (trace_after_first, receipts_after_first, inert_after_first) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .unwrap();
+            let record = entry.engine.request(request).unwrap();
+            assert_eq!(entry.engine.active(), &active_before);
+            assert!(entry.host.is_none());
+            assert!(matches!(
+                record.status(),
+                RequestStatus::Running(NavigationPhase::Recovering)
+            ));
+            assert_eq!(
+                record
+                    .trace()
+                    .iter()
+                    .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                    .count(),
+                0
+            );
+            let Some(PendingBackNoTargetAuthorityCleanup::Installed(installed)) =
+                entry.pending_back_no_target_authority_cleanup.as_ref()
+            else {
+                panic!(
+                    "RED: a top-slot reattach after committed detach must preserve the whole Installed owner"
+                )
+            };
+            let inert = installed.inert;
+            assert!(
+                inert.is_some(),
+                "RED: committed host-edge reattach must install typed inert evidence"
+            );
+            assert!(!installed.ledger.leaving_frames().is_empty());
+            let receipts = match &installed.ledger {
+                BackNoTargetAuthorityLedgerHolder::Active(ledger) => ledger.receipt_count(),
+                BackNoTargetAuthorityLedgerHolder::Prepared(_) => {
+                    panic!("the real settlement attempt must activate its ledger")
+                }
+            };
+            (record.trace().to_vec(), receipts, inert)
+        };
+        assert_eq!(
+            app.world().get::<ChildOf>(top_slot).map(ChildOf::parent),
+            Some(host),
+            "the test seam must reattach the real host edge after its committed detach"
+        );
+        assert!(
+            app.world()
+                .get::<Children>(host)
+                .is_some_and(|children| children.contains(&top_slot))
+        );
+        let world_after_first = authority_world_fingerprint(app.world());
+
+        settle_cleanup_system(app.world_mut());
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .unwrap();
+        let record = entry.engine.request(request).unwrap();
+        let Some(PendingBackNoTargetAuthorityCleanup::Installed(installed)) =
+            entry.pending_back_no_target_authority_cleanup.as_ref()
+        else {
+            panic!("a later settle must not redrive or consume the inert host-edge owner")
+        };
+        assert_eq!(installed.inert, inert_after_first);
+        assert_eq!(record.trace(), trace_after_first);
+        assert_eq!(
+            match &installed.ledger {
+                BackNoTargetAuthorityLedgerHolder::Active(ledger) => ledger.receipt_count(),
+                BackNoTargetAuthorityLedgerHolder::Prepared(_) => 0,
+            },
+            receipts_after_first
+        );
+        assert_eq!(
+            app.world().get::<ChildOf>(top_slot).map(ChildOf::parent),
+            Some(host)
+        );
+        assert_eq!(authority_world_fingerprint(app.world()), world_after_first);
+    }
+
+    #[test]
+    fn back_no_target_authority_completion_receiver_mismatch_retains_settled_once() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let exact_router =
+            install_atomic_router_at_pattern(&mut app, "back-no-target-completion-exact", "/:id");
+        let foreign_router =
+            install_atomic_router_at_pattern(&mut app, "back-no-target-completion-foreign", "/:id");
+        app.update();
+        let (request, host, _) = stage_real_back_no_target_authority_bound(&mut app, exact_router);
+        let active_before = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == exact_router)
+                .unwrap()
+                .engine
+                .active()
+                .clone()
+        };
+        drift_staged_back_no_target_authority_host_and_begin(&mut app, exact_router, request, host);
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let exact_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == exact_router)
+                .unwrap();
+            let foreign_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == foreign_router)
+                .unwrap();
+            let (exact, foreign) = if exact_index < foreign_index {
+                let (before, after) = navigation.entries.split_at_mut(foreign_index);
+                (&mut before[exact_index], &mut after[0])
+            } else {
+                let (before, after) = navigation.entries.split_at_mut(exact_index);
+                (&mut after[0], &mut before[foreign_index])
+            };
+            std::mem::swap(&mut exact.engine, &mut foreign.engine);
+        }
+
+        settle_cleanup_system(app.world_mut());
+
+        let (trace_after_first, receipts_after_first) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let exact = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == exact_router)
+                .unwrap();
+            let owner = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == foreign_router)
+                .unwrap();
+            assert!(exact.host.is_none());
+            let record = owner
+                .engine
+                .request(request)
+                .expect("the swapped owner engine retains the exact request");
+            assert_eq!(owner.engine.active(), &active_before);
+            assert!(matches!(
+                record.status(),
+                RequestStatus::Running(NavigationPhase::Recovering)
+            ));
+            assert_eq!(
+                record
+                    .trace()
+                    .iter()
+                    .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                    .count(),
+                0,
+                "a foreign completion receiver must call the terminal callback zero times"
+            );
+            let Some(PendingBackNoTargetAuthorityCleanup::Settled(settled)) =
+                exact.pending_back_no_target_authority_cleanup.as_ref()
+            else {
+                panic!(
+                    "RED: a foreign completion receiver must retain physical and completion owners as Settled"
+                )
+            };
+            assert!(matches!(
+                &settled.mismatch,
+                BackNoTargetAuthorityCleanupMismatchEvidence::Receiver(_)
+            ));
+            assert!(!settled.prepared.ledger.leaving_frames().is_empty());
+            let _completion_owner = &settled.completion;
+            (
+                record.trace().to_vec(),
+                settled.prepared.ledger.receipt_count(),
+            )
+        };
+        let world_after_first = authority_world_fingerprint(app.world());
+
+        settle_cleanup_system(app.world_mut());
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let exact = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == exact_router)
+            .unwrap();
+        let owner = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == foreign_router)
+            .unwrap();
+        let record = owner.engine.request(request).unwrap();
+        let Some(PendingBackNoTargetAuthorityCleanup::Settled(settled)) =
+            exact.pending_back_no_target_authority_cleanup.as_ref()
+        else {
+            panic!("a later settle must not redrive or consume the Settled owners")
+        };
+        assert!(matches!(
+            &settled.mismatch,
+            BackNoTargetAuthorityCleanupMismatchEvidence::Receiver(_)
+        ));
+        assert_eq!(
+            settled.prepared.ledger.receipt_count(),
+            receipts_after_first
+        );
+        assert_eq!(record.trace(), trace_after_first);
+        assert!(matches!(
+            record.status(),
+            RequestStatus::Running(NavigationPhase::Recovering)
+        ));
+        assert_eq!(authority_world_fingerprint(app.world()), world_after_first);
+    }
+
+    #[test]
+    fn back_no_target_authority_settlement_terminals_once() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router =
+            install_atomic_router_at_pattern(&mut app, "back-no-target-authority-loss", "/:id");
+        app.update();
+        let (request, bound) = take_real_bound_back_no_target(&mut app, router);
+        let capacity_identity = bound.reservation.capacity_identity_for_test();
+        let (history_before, active_before, host_entity) = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[0];
+            assert_eq!(
+                entry.engine.request(request).unwrap().status(),
+                &RequestStatus::Queued
+            );
+            entry.pending_bound_back_resolution = Some(BoundBackResolutionHandoff::NoTarget(bound));
+            (
+                entry.engine.history().clone(),
+                entry.engine.active().clone(),
+                entry.host.as_ref().unwrap().host,
+            )
+        };
+
+        let registration = app
+            .world_mut()
+            .entity_mut(host_entity)
+            .take::<RouterHostRegistration>()
+            .expect("the exact host retains its registration");
+        app.world_mut().entity_mut(host_entity).insert(registration);
+        {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert!(
+                !current_host_binding_is_exact(world, entry.host.as_ref().unwrap()),
+                "the real registration revision change must drift the production host predicate"
+            );
+        }
+
+        drive_navigation_system(app.world_mut());
+
+        let retirement_after_begin = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let record = entry.engine.request(request).unwrap();
+            assert!(
+                matches!(
+                    record.status(),
+                    RequestStatus::Running(NavigationPhase::Recovering)
+                ),
+                "RED: the real no-target authority classifier and dispatcher must begin dedicated recovery, got {:?}",
+                record.status()
+            );
+            assert_eq!(entry.engine.history(), &history_before);
+            assert_eq!(
+                entry.engine.active(),
+                &active_before,
+                "logical active must remain frozen until authority settlement completes"
+            );
+            assert!(record.trace().iter().all(|event| {
+                event.kind() != NavigationTraceEventKind::HistoryIntentRejected
+                    && !matches!(event.phase(), Some(NavigationPhase::CleanupPending))
+            }));
+            assert!(
+                entry.pending_back_no_target_completion.is_none(),
+                "authority loss must not enter the normal no-target completion holder"
+            );
+            entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the exact entry retains its capacity issuer")
+                .cell_projection_for_test(capacity_identity)
+                .expect("the authority retirement leaves exact cell evidence")
+        };
+        assert!(!retirement_after_begin.original_owner_live);
+        assert_eq!(
+            retirement_after_begin.current_generation,
+            capacity_identity
+                .3
+                .checked_add(1)
+                .expect("the fixture generation has one retirement successor")
+        );
+        assert_eq!(
+            retirement_after_begin.disposition,
+            BackCapacityCellDispositionForTest::ReusableFree
+        );
+
+        for _ in 0..8 {
+            settle_cleanup_system(app.world_mut());
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let terminal = entry
+                .engine
+                .request(request)
+                .is_some_and(|record| matches!(record.status(), RequestStatus::Failed(_)));
+            if terminal {
+                break;
+            }
+        }
+
+        let (terminal_trace, retirement_after_terminal) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            let record = entry.engine.request(request).unwrap();
+            let authority_holder = match entry.pending_back_no_target_authority_cleanup.as_ref() {
+                None => "vacant".to_owned(),
+                Some(PendingBackNoTargetAuthorityCleanup::Installed(installed)) => format!(
+                    "installed(batch={}, inert={:?}, ledger={})",
+                    installed.batch.is_some(),
+                    installed.inert,
+                    match installed.ledger {
+                        BackNoTargetAuthorityLedgerHolder::Prepared(_) => "prepared",
+                        BackNoTargetAuthorityLedgerHolder::Active(_) => "active",
+                    }
+                ),
+                Some(PendingBackNoTargetAuthorityCleanup::Completing(_)) => "completing".to_owned(),
+                Some(PendingBackNoTargetAuthorityCleanup::Settled(_)) => "settled".to_owned(),
+                Some(PendingBackNoTargetAuthorityCleanup::AuthorityBeginInert(_)) => {
+                    "begin-inert".to_owned()
+                }
+                Some(PendingBackNoTargetAuthorityCleanup::CompletionInert(_)) => {
+                    "completion-inert".to_owned()
+                }
+            };
+            assert!(
+                matches!(
+                    record.status(),
+                    RequestStatus::Failed(failure)
+                        if failure.kind() == NavigationFailureKind::AuthorityLost
+                ),
+                "dedicated authority settlement must terminal once, got {:?} with {authority_holder}",
+                record.status()
+            );
+            assert_eq!(entry.engine.history(), &history_before);
+            assert_eq!(entry.engine.active().kind(), ActivePresentationKind::None);
+            assert_eq!(
+                record
+                    .trace()
+                    .iter()
+                    .filter(|event| {
+                        event.kind() == NavigationTraceEventKind::RequestPhaseChanged
+                            && event.phase() == Some(&NavigationPhase::Recovering)
+                    })
+                    .count(),
+                1
+            );
+            assert_eq!(
+                record
+                    .trace()
+                    .iter()
+                    .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                    .count(),
+                1
+            );
+            assert!(record.trace().iter().all(|event| {
+                event.kind() != NavigationTraceEventKind::HistoryIntentRejected
+                    && !matches!(event.phase(), Some(NavigationPhase::CleanupPending))
+            }));
+            assert!(
+                ProvenEmptyAttemptOwnerInventory::capture(entry, request).is_vacant(),
+                "terminal must leave no entry-local candidate, reservation, cleanup, or settlement owner"
+            );
+            assert!(entry.pending_back_no_target_completion.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(entry.authority_protocol_residual.is_none());
+            (
+                record.trace().to_vec(),
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .unwrap()
+                    .cell_projection_for_test(capacity_identity)
+                    .unwrap(),
+            )
+        };
+        assert_eq!(retirement_after_terminal, retirement_after_begin);
+
+        settle_cleanup_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let entry = &mut navigation.entries[0];
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace(),
+            terminal_trace
+        );
+        assert_eq!(
+            entry
+                .back_capacity_issuer
+                .as_ref()
+                .unwrap()
+                .cell_projection_for_test(capacity_identity)
+                .unwrap(),
+            retirement_after_terminal,
+            "later schedules must not retire the same permit twice"
+        );
+        assert!(entry.engine.action().is_none());
+        assert!(ProvenEmptyAttemptOwnerInventory::capture(entry, request).is_vacant());
     }
 
     #[test]

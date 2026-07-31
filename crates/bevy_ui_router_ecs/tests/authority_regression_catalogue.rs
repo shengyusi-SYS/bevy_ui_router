@@ -742,6 +742,42 @@ fn callback_after_receiver<'a>(source: &'a str, receiver: &str) -> &'a str {
     panic!("the trusted Core receiver callback must close")
 }
 
+fn closure_body_after_receiver<'a>(
+    source: &'a str,
+    receiver: &str,
+    closure_marker: &str,
+) -> &'a str {
+    let receiver_tail = source
+        .split_once(receiver)
+        .unwrap_or_else(|| panic!("missing audited receiver: {receiver}"))
+        .1;
+    let closure_tail = receiver_tail
+        .split_once(closure_marker)
+        .unwrap_or_else(|| panic!("audited receiver must receive {closure_marker}"))
+        .1
+        .trim_start();
+    if closure_tail.starts_with('{') {
+        return braced_body(closure_tail);
+    }
+
+    let mut parentheses = 0usize;
+    let mut brackets = 0usize;
+    for (offset, character) in closure_tail.char_indices() {
+        match character {
+            '(' => parentheses += 1,
+            ')' if parentheses > 0 => parentheses -= 1,
+            ')' if brackets == 0 => return closure_tail[..offset].trim(),
+            '[' => brackets += 1,
+            ']' => brackets -= 1,
+            ',' if parentheses == 0 && brackets == 0 => {
+                return closure_tail[..offset].trim();
+            }
+            _ => {}
+        }
+    }
+    panic!("audited receiver callback must close: {receiver}")
+}
+
 fn assert_stale_reservation_drops_before_evidence_seal(helper: &str, arm_marker: &str) {
     let arm = match_arm_body_after_marker(helper, arm_marker);
     assert_eq!(
@@ -1042,6 +1078,395 @@ fn back_target_callback_tail_is_infallible_and_query_free() {
             "OutstandingRetire must use only its held live entry, exact cell and prepared successor: {forbidden}"
         );
     }
+}
+
+#[test]
+fn back_no_target_authority_callbacks_only_publish_prepared_state() {
+    let navigation = include_str!("../src/navigation.rs");
+    let core_integration = include_str!("../../bevy_ui_router_core/src/integration.rs");
+    let tests_start = navigation
+        .find("pub(crate) mod tests {")
+        .expect("navigation source retains its crate-private test module");
+    let production_navigation = &navigation[..tests_start];
+
+    let accept_receiver = ".accept_back_no_target_authority_lost_with_retirement(";
+    let begin_receiver = ".begin_back_no_target_authority_settlement(";
+    let completion_receiver = ".complete_back_no_target_authority_cleanup(";
+    assert_eq!(
+        production_navigation.match_indices(accept_receiver).count(),
+        1,
+        "ECS must keep one audited no-target authority accept callsite"
+    );
+    assert_eq!(
+        production_navigation.match_indices(begin_receiver).count(),
+        1,
+        "ECS must keep one audited no-target authority begin callsite"
+    );
+    assert_eq!(
+        production_navigation
+            .match_indices(completion_receiver)
+            .count(),
+        1,
+        "ECS must keep one audited no-target authority completion callsite"
+    );
+
+    let accept = body_after_marker(
+        production_navigation,
+        "pub(crate) fn classify_back_no_target(",
+    );
+    let accept_callback = closure_body_after_receiver(accept, accept_receiver, "move ||");
+    assert_eq!(
+        compact_static_source(accept_callback),
+        "guard.commit()",
+        "the no-target authority accept callback may only consume its prepared guard"
+    );
+
+    let begin = body_after_marker(
+        production_navigation,
+        "pub(crate) fn dispatch_back_no_target_authority_settlement(",
+    );
+    let begin_callback = closure_body_after_receiver(begin, begin_receiver, "|batch|");
+    assert_eq!(
+        compact_static_source(begin_callback),
+        "*batch_slot=Some(batch)",
+        "the ECS authority begin callback may only install the prepared batch"
+    );
+
+    let completion = body_after_marker(
+        production_navigation,
+        "fn drive_back_no_target_authority_cleanup(",
+    );
+    let completion_callback = closure_body_after_receiver(completion, completion_receiver, "||");
+    assert_eq!(
+        compact_static_source(completion_callback),
+        "*pending=None",
+        "the ECS authority completion callback may only clear the prepared holder"
+    );
+
+    let core_begin = body_after_marker(
+        core_integration,
+        "pub fn begin_back_no_target_authority_settlement<F>(",
+    );
+    assert_eq!(
+        core_begin.match_indices(begin_receiver).count(),
+        1,
+        "Core integration must keep one audited inner authority begin callsite"
+    );
+    let core_begin_callback = closure_body_after_receiver(core_begin, begin_receiver, "|batch|");
+    assert_eq!(
+        compact_static_source(core_begin_callback),
+        "install(BackNoTargetAuthorityCleanupBatchOwner{inner:batch});",
+        "the Core integration callback may only install the prepared batch owner"
+    );
+    let begin_receiver_index = core_begin
+        .find(begin_receiver)
+        .expect("the inner begin receiver was counted");
+    let settlement_started_marker = "let settlement_started";
+    assert_eq!(
+        core_begin.match_indices(settlement_started_marker).count(),
+        1,
+        "Core integration must prepare exactly one SettlementStarted event"
+    );
+    let settlement_started_index = core_begin
+        .find(settlement_started_marker)
+        .expect("the prepared SettlementStarted event was counted");
+    assert!(
+        settlement_started_index < begin_receiver_index,
+        "SettlementStarted must be prepared before entering the inner begin receiver"
+    );
+    let prepared_event = &core_begin[settlement_started_index..begin_receiver_index];
+    assert_eq!(
+        prepared_event
+            .match_indices("HostTraceEvent::project(")
+            .count(),
+        1,
+        "the settlement_started binding must prepare exactly one host-trace event"
+    );
+    assert_eq!(
+        prepared_event
+            .match_indices("HostTraceEventKind::SettlementStarted")
+            .count(),
+        1,
+        "the event prepared before begin must be SettlementStarted"
+    );
+    let begun =
+        match_arm_body_after_marker(core_begin, "CoreBackNoTargetAuthorityBeginOutcome::Begun");
+    assert_eq!(
+        begun
+            .match_indices("host_trace.push(settlement_started);")
+            .count(),
+        1,
+        "the outer Begun arm must publish the prepared SettlementStarted event exactly once"
+    );
+    assert!(
+        !begun.contains("HostTraceEvent::project("),
+        "the outer Begun arm must not rebuild the prepared event"
+    );
+
+    for (callback_name, callback) in [
+        ("ECS accept", accept_callback),
+        ("ECS begin", begin_callback),
+        ("ECS completion", completion_callback),
+        ("Core integration begin", core_begin_callback),
+    ] {
+        for forbidden in [
+            "world",
+            ".query",
+            ".resource",
+            ".get(",
+            ".get_mut(",
+            "Vec::",
+            "Box::",
+            "String::",
+            "vec!",
+            ".collect",
+            ".reserve",
+            ".try_reserve",
+            ".sort",
+            ".validate",
+            ".expect",
+            ".unwrap",
+            "panic!",
+            "unreachable!",
+            "unsafe",
+            ".push",
+            ".insert",
+            ".remove",
+            "despawn",
+            "entity_mut",
+            "commands",
+            ".trigger",
+            ".observe",
+            "add_child",
+            "replace_children",
+            "set_parent",
+        ] {
+            assert!(
+                !callback.contains(forbidden),
+                "{callback_name} callback contains forbidden query, allocation, validation, failure or hookful work: {forbidden}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cleanup_ledger_fault_seams_only_change_real_predicate_inputs() {
+    let cleanup = include_str!("../src/cleanup.rs");
+    let back_capacity_impl = cleanup
+        .split_once("impl BackCapacityIssuer {")
+        .expect("cleanup source retains the BackCapacityIssuer implementation")
+        .1;
+    let capacity_reserve = body_after_marker(back_capacity_impl, "pub(crate) fn reserve(");
+    let cleanup_ledger_impl = cleanup
+        .split_once("impl CleanupLedger {")
+        .expect("cleanup source retains the CleanupLedger implementation")
+        .1;
+    let reserve = body_after_marker(cleanup_ledger_impl, "fn reserve_with_domain_counter(");
+    let prepare_physical = body_after_marker(cleanup_ledger_impl, "fn prepare_physical(");
+    let inject_unfinalized = body_after_marker(cleanup, "fn inject_unfinalized_boundary_drift(");
+    let ledger_domain_counter_input = body_after_marker(cleanup, "fn ledger_domain_counter_input(");
+
+    assert!(
+        !reserve.contains("unfinalized_ledger_fault_injected()"),
+        "unfinalized cleanup facts must be classified only from the manifest input"
+    );
+    assert_eq!(
+        reserve
+            .match_indices("!manifest.boundary_drifts.is_empty()")
+            .count(),
+        1,
+        "cleanup reserve must use the real manifest boundary-drift predicate exactly once"
+    );
+    assert_eq!(
+        reserve
+            .match_indices("inject_unfinalized_boundary_drift(&mut manifest);")
+            .count(),
+        1,
+        "cleanup reserve must apply its test seam to the manifest input exactly once"
+    );
+    let inject_index = reserve
+        .find("inject_unfinalized_boundary_drift(&mut manifest);")
+        .expect("the manifest-input seam call was counted");
+    let unfinalized_predicate_index = reserve
+        .find("if !manifest.boundary_drifts.is_empty()")
+        .expect("the real unfinalized predicate was counted");
+    assert!(
+        inject_index < unfinalized_predicate_index,
+        "the seam may only alter manifest input before the real unfinalized predicate"
+    );
+    let unfinalized_branch = body_after_marker(reserve, "if !manifest.boundary_drifts.is_empty()");
+    assert_eq!(
+        reserve
+            .match_indices("CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts")
+            .count(),
+        1,
+        "cleanup reserve must contain one UnfinalizedBoundaryFacts classification"
+    );
+    assert_eq!(
+        unfinalized_branch
+            .match_indices("CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts")
+            .count(),
+        1,
+        "UnfinalizedBoundaryFacts must be derived only inside the real boundary-drift branch"
+    );
+
+    assert_eq!(
+        inject_unfinalized
+            .match_indices("FAIL_NEXT_UNFINALIZED_LEDGER.replace(false)")
+            .count(),
+        1,
+        "the unfinalized seam helper must consume its one-shot input exactly once"
+    );
+    for required in [
+        "manifest.obligations.iter().find_map(|obligation|",
+        "RegistryOwner::Committed(EntityOwner::FrameShell(frame)) = obligation.claim.owner()",
+        "obligation.expected_parent",
+        "removed_child: claim.entity()",
+        "expected: FailedBoundaryExpectation::ExactClaim(claim)",
+        "manifest.boundary_drifts.push(FailedBoundaryDrift {",
+    ] {
+        assert!(
+            inject_unfinalized.contains(required),
+            "the unfinalized seam helper must derive drift from one exact committed frame-shell obligation: {required}"
+        );
+    }
+    assert_eq!(
+        inject_unfinalized
+            .match_indices("manifest.boundary_drifts.push(FailedBoundaryDrift {")
+            .count(),
+        1,
+        "the unfinalized seam helper must append one predicate input"
+    );
+    for forbidden in [
+        "CleanupLedgerReserveError",
+        "UnfinalizedBoundaryFacts",
+        "DomainExhausted",
+        "Result<",
+        "Err(",
+        "return Err",
+        "Entity::",
+        "from_raw(",
+        "from_bits(",
+        "PLACEHOLDER",
+        ".unwrap_or(",
+        ".unwrap_or_else(",
+        ".unwrap_or_default(",
+        ".unwrap(",
+        ".expect(",
+        "world",
+        ".query(",
+        ".query::<",
+        ".resource(",
+        ".resource::<",
+        ".get(",
+        ".get_mut(",
+        "allocate_ledger_domain",
+        "NEXT_LEDGER_DOMAIN",
+        "observe_ledger_domain_allocation",
+        ".insert(",
+        ".remove(",
+        ".remove::<",
+        "despawn(",
+    ] {
+        assert!(
+            !inject_unfinalized.contains(forbidden),
+            "the unfinalized seam helper must not fabricate identity or classify the result: {forbidden}"
+        );
+    }
+
+    assert_eq!(
+        compact_static_source(ledger_domain_counter_input),
+        "ifledger_domain_fault_injected(){&EXHAUSTED_LEDGER_DOMAIN_COUNTER}else{counter}",
+        "the ledger-domain seam helper may only select the exhausted or supplied counter input"
+    );
+    for forbidden in [
+        "DomainExhausted",
+        "CleanupLedgerReserveError",
+        "BackCapacityReserveError",
+        "Result<",
+        "Err(",
+        "allocate_ledger_domain",
+        "NEXT_LEDGER_DOMAIN",
+        "LEDGER_DOMAIN_ALLOCATIONS",
+        "observe_ledger_domain_allocation",
+        ".fetch_",
+        ".store(",
+        ".swap(",
+        ".compare_exchange",
+        "Ordering::",
+    ] {
+        assert!(
+            !ledger_domain_counter_input.contains(forbidden),
+            "the ledger-domain seam helper must not allocate, advance, observe or classify: {forbidden}"
+        );
+    }
+
+    for (owner, allocation) in [
+        ("capacity reserve", capacity_reserve),
+        ("cleanup ledger prepare", prepare_physical),
+    ] {
+        assert!(
+            !allocation.contains("ledger_domain_fault_injected()"),
+            "{owner} must not inject DomainExhausted as a classification"
+        );
+        assert_eq!(
+            allocation.match_indices("allocate_ledger_domain(").count(),
+            1,
+            "{owner} must derive its ledger domain from one real allocation"
+        );
+        assert_eq!(
+            allocation
+                .match_indices("BackCapacityReserveError::DomainExhausted")
+                .count()
+                + allocation
+                    .match_indices("CleanupLedgerReserveErrorKind::DomainExhausted")
+                    .count(),
+            1,
+            "{owner} must derive DomainExhausted only from the failed real allocation"
+        );
+        let allocator_index = allocation
+            .find("allocate_ledger_domain(")
+            .expect("the real allocator call was counted");
+        let binding_index = allocation
+            .find("let Some(ledger_domain)")
+            .unwrap_or_else(|| panic!("{owner} must use a let-else allocation binding"));
+        assert!(
+            binding_index < allocator_index,
+            "{owner} must classify only after its real allocation binding"
+        );
+        let binding_prefix = compact_static_source(&allocation[binding_index..allocator_index]);
+        assert_eq!(
+            binding_prefix, "letSome(ledger_domain)=",
+            "{owner} must bind the real allocator result directly"
+        );
+        let exhausted_branch = body_after_marker(&allocation[allocator_index..], "else");
+        assert_eq!(
+            exhausted_branch
+                .match_indices("BackCapacityReserveError::DomainExhausted")
+                .count()
+                + exhausted_branch
+                    .match_indices("CleanupLedgerReserveErrorKind::DomainExhausted")
+                    .count(),
+            1,
+            "{owner} must return its unique DomainExhausted only from the allocator let-else"
+        );
+    }
+    let compact_capacity_reserve = compact_static_source(capacity_reserve);
+    assert!(
+        compact_capacity_reserve
+            .contains("allocate_ledger_domain(ledger_domain_counter_input(&NEXT_LEDGER_DOMAIN))"),
+        "capacity reserve must pass its real issuer counter through the test-input seam before allocation"
+    );
+    let compact_prepare_physical = compact_static_source(prepare_physical);
+    assert!(
+        compact_prepare_physical
+            .contains("letallocation_counter=ledger_domain_counter_input(domain_counter);"),
+        "cleanup ledger prepare must derive its local allocation counter from the supplied counter input"
+    );
+    assert!(
+        compact_prepare_physical.contains("allocate_ledger_domain(allocation_counter)"),
+        "cleanup ledger prepare must classify exhaustion through the seam-derived real allocation"
+    );
 }
 
 #[test]

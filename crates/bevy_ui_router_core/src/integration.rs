@@ -11,6 +11,10 @@ use crate::cleanup::{
 use crate::engine::BackAllocatorBoundary;
 use crate::engine::{
     BackNoTargetApprovalOutcome as CoreBackNoTargetApprovalOutcome,
+    BackNoTargetAuthorityBeginCoreOutcome as CoreBackNoTargetAuthorityBeginOutcome,
+    BackNoTargetAuthorityCleanupCompletionCoreOutcome as CoreBackNoTargetAuthorityCleanupCompletionOutcome,
+    BackNoTargetAuthorityCoreOutcome as CoreBackNoTargetAuthorityCoreOutcome,
+    BackNoTargetAuthoritySettlementOwner as CoreBackNoTargetAuthoritySettlementOwner,
     BackNoTargetCleanupCompletionCoreOutcome as CoreBackNoTargetCleanupCompletionCoreOutcome,
     BackNoTargetReadyCoreOutcome as CoreBackNoTargetReadyCoreOutcome,
     BackNoTargetSourceDriftSettlementOutcome as CoreBackNoTargetSourceDriftSettlementOutcome,
@@ -21,17 +25,22 @@ use crate::engine::{
     BackTargetResumeOutcome as CoreBackTargetResumeOutcome,
     BeginAuthoritySettlementErrorKind as CoreBeginAuthoritySettlementErrorKind,
     CommitError as CoreCommitError, CommitTicket as CoreCommitTicket,
-    CoreBackNoTargetCleanupAction, CoreBackNoTargetCleanupBatchOwner,
-    CoreBackNoTargetCleanupBatchProjection, CoreBackNoTargetCleanupCompletionOwner,
-    CoreBackNoTargetTerminalProjection, CoreBackTargetAppliedOutcome,
-    CoreBackTargetCommitFailureCleanup, CoreBackTargetCommitRejectedPublication,
-    CoreBackTargetCommitRetainedInputProjection, CoreBackTargetDriverFailureCleanup,
-    CoreBackTargetDriverFailureReport, CoreBackTargetDriverFailureReportMode,
-    CoreBackTargetDriverFallback, CoreBackTargetDriverTerminal,
-    CoreBackTargetDriverTerminalProjection, CoreBackTargetPhysicalReceiverRef,
-    CorePreparationReceiverMismatchProjection, CoreProvenEmptyApprovalProjection,
-    CoreRejectedBackContinuationOwner, EngineAction as CoreEngineAction,
-    EngineInstallError as CoreEngineInstallError,
+    CoreBackNoTargetAuthorityBeginOwner, CoreBackNoTargetAuthorityBeginPermanentEvidence,
+    CoreBackNoTargetAuthorityBeginRetryEvidence, CoreBackNoTargetAuthorityCleanupBatch,
+    CoreBackNoTargetAuthorityCleanupCompletionOwner,
+    CoreBackNoTargetAuthorityCleanupMismatchEvidence,
+    CoreBackNoTargetAuthorityCompletionFactsMismatchProjection as InnerBackNoTargetAuthorityCompletionFactsMismatchProjection,
+    CoreBackNoTargetAuthorityTerminalProjection, CoreBackNoTargetCleanupAction,
+    CoreBackNoTargetCleanupBatchOwner, CoreBackNoTargetCleanupBatchProjection,
+    CoreBackNoTargetCleanupCompletionOwner, CoreBackNoTargetTerminalProjection,
+    CoreBackTargetAppliedOutcome, CoreBackTargetCommitFailureCleanup,
+    CoreBackTargetCommitRejectedPublication, CoreBackTargetCommitRetainedInputProjection,
+    CoreBackTargetDriverFailureCleanup, CoreBackTargetDriverFailureReport,
+    CoreBackTargetDriverFailureReportMode, CoreBackTargetDriverFallback,
+    CoreBackTargetDriverTerminal, CoreBackTargetDriverTerminalProjection,
+    CoreBackTargetPhysicalReceiverRef, CorePreparationReceiverMismatchProjection,
+    CoreProvenEmptyApprovalProjection, CoreRejectedBackContinuationOwner,
+    EngineAction as CoreEngineAction, EngineInstallError as CoreEngineInstallError,
     FailedAuthoritySettlementTrigger as CoreFailedAuthoritySettlementTrigger,
     FailedAuthorityTriggerError as CoreFailedAuthorityTriggerError,
     FailureCleanupError as CoreFailureCleanupError,
@@ -1213,6 +1222,169 @@ pub enum BackNoTargetApprovalOutcome {
 }
 
 #[doc(hidden)]
+pub struct BackNoTargetAuthoritySettlementOwner {
+    inner: CoreBackNoTargetAuthoritySettlementOwner,
+}
+
+#[doc(hidden)]
+pub enum BackNoTargetAuthorityCoreOutcome {
+    Accepted(BackNoTargetAuthoritySettlementOwner),
+    Mismatch {
+        candidate: VerifiedBackNoTargetCandidate,
+        mismatch: PreparationReceiverMismatchView,
+    },
+}
+
+#[doc(hidden)]
+pub struct BackNoTargetAuthorityManifest {
+    cleanup: CleanupManifest,
+}
+
+impl BackNoTargetAuthorityManifest {
+    pub fn new(cleanup: CleanupManifest) -> Self {
+        Self { cleanup }
+    }
+}
+
+#[doc(hidden)]
+pub struct BackNoTargetAuthorityBeginOwner {
+    settlement: BackNoTargetAuthoritySettlementOwner,
+    host: HostLease,
+    manifest: BackNoTargetAuthorityManifest,
+}
+
+impl BackNoTargetAuthorityBeginOwner {
+    pub fn new(
+        settlement: BackNoTargetAuthoritySettlementOwner,
+        host: HostLease,
+        manifest: BackNoTargetAuthorityManifest,
+    ) -> Self {
+        Self {
+            settlement,
+            host,
+            manifest,
+        }
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        BackNoTargetAuthoritySettlementOwner,
+        HostLease,
+        BackNoTargetAuthorityManifest,
+    ) {
+        (self.settlement, self.host, self.manifest)
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackNoTargetAuthorityBeginRetryEvidence {
+    Capacity,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackNoTargetAuthorityBeginPermanentEvidence {
+    HostManifestContradiction,
+    PendingStateContradiction,
+    HostRetirementRejected,
+}
+
+#[doc(hidden)]
+pub struct BackNoTargetAuthorityCleanupBatchOwner {
+    inner: CoreBackNoTargetAuthorityCleanupBatch,
+}
+
+#[doc(hidden)]
+pub struct BackNoTargetAuthorityCleanupBatchView {
+    inner: crate::engine::CoreBackNoTargetAuthorityCleanupProjection,
+}
+
+impl BackNoTargetAuthorityCleanupBatchView {
+    pub fn manifest_digest(&self) -> u64 {
+        self.inner.manifest_digest()
+    }
+
+    pub fn obligation_count(&self) -> usize {
+        self.inner.obligation_count()
+    }
+}
+
+impl BackNoTargetAuthorityCleanupBatchOwner {
+    pub fn batch(&self) -> BackNoTargetAuthorityCleanupBatchView {
+        BackNoTargetAuthorityCleanupBatchView {
+            inner: self.inner.projection(),
+        }
+    }
+
+    pub fn complete(
+        self,
+        manifest_digest: u64,
+        obligation_count: usize,
+        completion_digest: u64,
+        settled_count: usize,
+    ) -> BackNoTargetAuthorityCleanupCompletionOwner {
+        BackNoTargetAuthorityCleanupCompletionOwner {
+            inner: CoreBackNoTargetAuthorityCleanupCompletionOwner::new(
+                self.inner,
+                manifest_digest,
+                obligation_count,
+                completion_digest,
+                settled_count,
+            ),
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct BackNoTargetAuthorityCleanupCompletionOwner {
+    inner: CoreBackNoTargetAuthorityCleanupCompletionOwner,
+}
+
+#[doc(hidden)]
+pub enum BackNoTargetAuthorityCleanupMismatchEvidence {
+    Receiver(PreparationReceiverMismatchView),
+    Facts(CoreBackNoTargetAuthorityCompletionFactsMismatchProjection),
+}
+
+#[doc(hidden)]
+pub struct CoreBackNoTargetAuthorityCompletionFactsMismatchProjection {
+    inner: InnerBackNoTargetAuthorityCompletionFactsMismatchProjection,
+}
+
+#[doc(hidden)]
+pub struct BackNoTargetAuthorityTerminalEvidence {
+    inner: CoreBackNoTargetAuthorityTerminalProjection,
+}
+
+#[doc(hidden)]
+pub enum BackNoTargetAuthorityBeginOutcome {
+    Begun,
+    ReceiverMismatch {
+        owner: BackNoTargetAuthorityBeginOwner,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    Retryable {
+        owner: BackNoTargetAuthorityBeginOwner,
+        evidence: BackNoTargetAuthorityBeginRetryEvidence,
+    },
+    Permanent {
+        owner: BackNoTargetAuthorityBeginOwner,
+        evidence: BackNoTargetAuthorityBeginPermanentEvidence,
+    },
+}
+
+#[doc(hidden)]
+pub enum BackNoTargetAuthorityCleanupCompletionOutcome {
+    Terminal(BackNoTargetAuthorityTerminalEvidence),
+    Mismatch {
+        owner: BackNoTargetAuthorityCleanupCompletionOwner,
+        evidence: BackNoTargetAuthorityCleanupMismatchEvidence,
+    },
+}
+
+#[doc(hidden)]
 pub struct BackNoTargetCleanupBatchOwner {
     inner: CoreBackNoTargetCleanupBatchOwner,
 }
@@ -1732,6 +1904,16 @@ impl RouterEngine {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn testing_replace_host_admission_with_non_owning_issuer(&mut self) -> bool {
+        let Ok(non_owning) = HostAdmissionIssuer::new() else {
+            return false;
+        };
+        self.admission = non_owning;
+        true
+    }
+
     pub fn request_host_admission(&mut self) -> Result<HostAdmissionToken, IntegrationError> {
         let inner = self
             .inner
@@ -2168,6 +2350,186 @@ impl RouterEngine {
                 candidate,
                 evidence,
             },
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn accept_back_no_target_authority_lost_with_retirement<F>(
+        &mut self,
+        candidate: VerifiedBackNoTargetCandidate,
+        commit_retirement: F,
+    ) -> BackNoTargetAuthorityCoreOutcome
+    where
+        F: FnOnce(),
+    {
+        match self
+            .inner
+            .accept_back_no_target_authority_lost_with_retirement(candidate, commit_retirement)
+        {
+            CoreBackNoTargetAuthorityCoreOutcome::Accepted(inner) => {
+                BackNoTargetAuthorityCoreOutcome::Accepted(BackNoTargetAuthoritySettlementOwner {
+                    inner,
+                })
+            }
+            CoreBackNoTargetAuthorityCoreOutcome::Mismatch {
+                candidate,
+                mismatch,
+            } => BackNoTargetAuthorityCoreOutcome::Mismatch {
+                candidate,
+                mismatch: PreparationReceiverMismatchView { inner: mismatch },
+            },
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn begin_back_no_target_authority_settlement<F>(
+        &mut self,
+        owner: BackNoTargetAuthorityBeginOwner,
+        install: F,
+    ) -> BackNoTargetAuthorityBeginOutcome
+    where
+        F: FnOnce(BackNoTargetAuthorityCleanupBatchOwner),
+    {
+        if self.host_trace.try_reserve(2).is_err() {
+            return BackNoTargetAuthorityBeginOutcome::Retryable {
+                owner,
+                evidence: BackNoTargetAuthorityBeginRetryEvidence::Capacity,
+            };
+        }
+        let BackNoTargetAuthorityBeginOwner {
+            settlement,
+            host,
+            manifest,
+        } = owner;
+        let CleanupManifest {
+            logical_roots,
+            manifest_digest,
+            obligation_count,
+        } = &manifest.cleanup;
+        let seal = CleanupManifestSeal::new(
+            logical_roots.clone(),
+            CleanupManifestDigest::from_opaque(*manifest_digest),
+            *obligation_count,
+        );
+        let core_owner = CoreBackNoTargetAuthorityBeginOwner::new(
+            settlement.inner,
+            host.inner,
+            seal,
+            *manifest_digest,
+        );
+        let version = self.inner.host().cloned();
+        let slot = self.inner.top_slot();
+        let settlement_started =
+            HostTraceEvent::project(HostTraceEventKind::SettlementStarted, version, slot);
+        let inner = &mut self.inner;
+        let admission = &mut self.admission;
+        let host_trace = &mut self.host_trace;
+        let outcome =
+            inner.begin_back_no_target_authority_settlement(admission, core_owner, |batch| {
+                install(BackNoTargetAuthorityCleanupBatchOwner { inner: batch });
+            });
+        match outcome {
+            CoreBackNoTargetAuthorityBeginOutcome::Begun => {
+                host_trace.push(settlement_started);
+                BackNoTargetAuthorityBeginOutcome::Begun
+            }
+            CoreBackNoTargetAuthorityBeginOutcome::ReceiverMismatch { owner, mismatch } => {
+                let (settlement, host, _seal, _digest) = owner.into_parts();
+                BackNoTargetAuthorityBeginOutcome::ReceiverMismatch {
+                    owner: BackNoTargetAuthorityBeginOwner {
+                        settlement: BackNoTargetAuthoritySettlementOwner { inner: settlement },
+                        host: HostLease { inner: host },
+                        manifest,
+                    },
+                    mismatch: PreparationReceiverMismatchView { inner: mismatch },
+                }
+            }
+            CoreBackNoTargetAuthorityBeginOutcome::Retryable { owner, evidence } => {
+                let (settlement, host, _seal, _digest) = owner.into_parts();
+                let evidence = match evidence {
+                    CoreBackNoTargetAuthorityBeginRetryEvidence::Capacity => {
+                        BackNoTargetAuthorityBeginRetryEvidence::Capacity
+                    }
+                };
+                BackNoTargetAuthorityBeginOutcome::Retryable {
+                    owner: BackNoTargetAuthorityBeginOwner {
+                        settlement: BackNoTargetAuthoritySettlementOwner { inner: settlement },
+                        host: HostLease { inner: host },
+                        manifest,
+                    },
+                    evidence,
+                }
+            }
+            CoreBackNoTargetAuthorityBeginOutcome::Permanent { owner, evidence } => {
+                let (settlement, host, _seal, _digest) = owner.into_parts();
+                let evidence = match evidence {
+                    CoreBackNoTargetAuthorityBeginPermanentEvidence::HostManifestContradiction => {
+                        BackNoTargetAuthorityBeginPermanentEvidence::HostManifestContradiction
+                    }
+                    CoreBackNoTargetAuthorityBeginPermanentEvidence::PendingStateContradiction => {
+                        BackNoTargetAuthorityBeginPermanentEvidence::PendingStateContradiction
+                    }
+                    CoreBackNoTargetAuthorityBeginPermanentEvidence::HostRetirementRejected => {
+                        BackNoTargetAuthorityBeginPermanentEvidence::HostRetirementRejected
+                    }
+                };
+                BackNoTargetAuthorityBeginOutcome::Permanent {
+                    owner: BackNoTargetAuthorityBeginOwner {
+                        settlement: BackNoTargetAuthoritySettlementOwner { inner: settlement },
+                        host: HostLease { inner: host },
+                        manifest,
+                    },
+                    evidence,
+                }
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn complete_back_no_target_authority_cleanup<F>(
+        &mut self,
+        owner: BackNoTargetAuthorityCleanupCompletionOwner,
+        commit_physical_and_clear_holder: F,
+    ) -> BackNoTargetAuthorityCleanupCompletionOutcome
+    where
+        F: FnOnce(),
+    {
+        let version = self.inner.host().cloned();
+        let slot = self.inner.top_slot();
+        let inner = &mut self.inner;
+        let host_trace = &mut self.host_trace;
+        match inner.complete_back_no_target_authority_cleanup(
+            owner.inner,
+            commit_physical_and_clear_holder,
+        ) {
+            CoreBackNoTargetAuthorityCleanupCompletionOutcome::Terminal(inner) => {
+                host_trace.push(HostTraceEvent::project(
+                    HostTraceEventKind::SettlementCompleted,
+                    version,
+                    slot,
+                ));
+                BackNoTargetAuthorityCleanupCompletionOutcome::Terminal(
+                    BackNoTargetAuthorityTerminalEvidence { inner },
+                )
+            }
+            CoreBackNoTargetAuthorityCleanupCompletionOutcome::Mismatch { owner, evidence } => {
+                let evidence = match evidence {
+                    CoreBackNoTargetAuthorityCleanupMismatchEvidence::Receiver(inner) => {
+                        BackNoTargetAuthorityCleanupMismatchEvidence::Receiver(
+                            PreparationReceiverMismatchView { inner },
+                        )
+                    }
+                    CoreBackNoTargetAuthorityCleanupMismatchEvidence::Facts(inner) => {
+                        BackNoTargetAuthorityCleanupMismatchEvidence::Facts(
+                            CoreBackNoTargetAuthorityCompletionFactsMismatchProjection { inner },
+                        )
+                    }
+                };
+                BackNoTargetAuthorityCleanupCompletionOutcome::Mismatch {
+                    owner: BackNoTargetAuthorityCleanupCompletionOwner { inner: owner },
+                    evidence,
+                }
+            }
         }
     }
 
@@ -5315,7 +5677,33 @@ mod tests {
     }
 
     fn take_refrozen_back_no_target_candidate() -> (RouterEngine, VerifiedBackNoTargetCandidate) {
-        let mut engine = confirmed_engine();
+        take_refrozen_back_no_target_candidate_from(confirmed_engine())
+    }
+
+    fn take_refrozen_back_no_target_candidate_with_lease()
+    -> (RouterEngine, VerifiedBackNoTargetCandidate, HostLease) {
+        let (mut engine, grant) = ready_engine();
+        engine.record_top_slot_registered(&grant).unwrap();
+        let lease = engine.confirm_host(grant);
+        let (engine, candidate) = take_refrozen_back_no_target_candidate_from(engine);
+        (engine, candidate, lease)
+    }
+
+    fn take_refrozen_back_no_target_candidate_from(
+        engine: RouterEngine,
+    ) -> (RouterEngine, VerifiedBackNoTargetCandidate) {
+        let (engine, candidate, _world) =
+            take_refrozen_back_no_target_candidate_from_with_world(engine);
+        (engine, candidate)
+    }
+
+    fn take_refrozen_back_no_target_candidate_from_with_world(
+        mut engine: RouterEngine,
+    ) -> (
+        RouterEngine,
+        VerifiedBackNoTargetCandidate,
+        HistoryAdmissionWorldSeal,
+    ) {
         settle_push(
             &mut engine,
             RouteLocation::new("/").with_fragment("logical-zero-target"),
@@ -5442,7 +5830,414 @@ mod tests {
             }
         };
 
-        (engine, candidate)
+        (engine, candidate, world)
+    }
+
+    fn take_accepted_back_no_target_authority() -> (
+        RouterEngine,
+        NavigationRequestId,
+        HostLease,
+        BackNoTargetAuthoritySettlementOwner,
+    ) {
+        let (mut engine, candidate, lease) = take_refrozen_back_no_target_candidate_with_lease();
+        let request = candidate.evidence().request();
+        let callback_calls = std::cell::Cell::new(0usize);
+        let owner = match engine
+            .accept_back_no_target_authority_lost_with_retirement(candidate, || {
+                callback_calls.set(callback_calls.get() + 1)
+            }) {
+            BackNoTargetAuthorityCoreOutcome::Accepted(owner) => owner,
+            BackNoTargetAuthorityCoreOutcome::Mismatch { .. } => {
+                panic!("the exact no-target authority candidate must be accepted")
+            }
+        };
+        assert_eq!(callback_calls.get(), 1);
+        (engine, request, lease, owner)
+    }
+
+    fn exact_back_no_target_authority_begin_owner(
+        engine: &RouterEngine,
+        lease: HostLease,
+        settlement: BackNoTargetAuthoritySettlementOwner,
+        manifest_digest: u64,
+    ) -> (BackNoTargetAuthorityBeginOwner, usize) {
+        let obligation_count = engine.active().frames().len();
+        let roots = engine.active().frames().iter().rev().cloned().collect();
+        (
+            BackNoTargetAuthorityBeginOwner::new(
+                settlement,
+                lease,
+                BackNoTargetAuthorityManifest::new(CleanupManifest::new(
+                    roots,
+                    manifest_digest,
+                    obligation_count,
+                )),
+            ),
+            obligation_count,
+        )
+    }
+
+    fn begin_exact_back_no_target_authority() -> (
+        RouterEngine,
+        NavigationRequestId,
+        BackNoTargetAuthorityCleanupBatchOwner,
+        u64,
+        usize,
+    ) {
+        let (mut engine, request, lease, settlement) = take_accepted_back_no_target_authority();
+        let manifest_digest = 0x4155_5448_4e4f_5441;
+        let (owner, obligation_count) =
+            exact_back_no_target_authority_begin_owner(&engine, lease, settlement, manifest_digest);
+        let installed = std::cell::RefCell::new(None);
+        assert!(
+            engine.inner.testing_back_no_target_authority_is_accepted(),
+            "begin must start from the private Accepted state"
+        );
+        match engine.begin_back_no_target_authority_settlement(owner, |batch| {
+            installed.replace(Some(batch));
+        }) {
+            BackNoTargetAuthorityBeginOutcome::Begun => {}
+            BackNoTargetAuthorityBeginOutcome::ReceiverMismatch { .. }
+            | BackNoTargetAuthorityBeginOutcome::Retryable { .. }
+            | BackNoTargetAuthorityBeginOutcome::Permanent { .. } => {
+                panic!("the exact begin owner must enter dedicated authority cleanup")
+            }
+        }
+        assert!(engine.inner.testing_back_no_target_authority_is_cleanup());
+        (
+            engine,
+            request,
+            installed
+                .into_inner()
+                .expect("begin must hand its unique batch to ECS"),
+            manifest_digest,
+            obligation_count,
+        )
+    }
+
+    #[test]
+    fn back_no_target_authority_accept_is_exact_and_installs_only_private_accepted() {
+        let (mut exact, candidate, _lease) = take_refrozen_back_no_target_candidate_with_lease();
+        let mut foreign = confirmed_engine();
+        let exact_before = exact.snapshot();
+        let foreign_before = foreign.snapshot();
+        let foreign_calls = std::cell::Cell::new(0usize);
+        let (candidate, mismatch) = match foreign
+            .accept_back_no_target_authority_lost_with_retirement(candidate, || {
+                foreign_calls.set(foreign_calls.get() + 1)
+            }) {
+            BackNoTargetAuthorityCoreOutcome::Mismatch {
+                candidate,
+                mismatch,
+            } => (candidate, mismatch),
+            BackNoTargetAuthorityCoreOutcome::Accepted(_) => {
+                panic!("a foreign engine must not consume the candidate")
+            }
+        };
+        assert_eq!(foreign_calls.get(), 0);
+        assert!(matches!(
+            mismatch.inner,
+            CorePreparationReceiverMismatchProjection::LogicalZero { .. }
+        ));
+        assert_eq!(exact.snapshot(), exact_before);
+        assert_eq!(foreign.snapshot(), foreign_before);
+
+        let exact_calls = std::cell::Cell::new(0usize);
+        let owner = match exact
+            .accept_back_no_target_authority_lost_with_retirement(candidate, || {
+                exact_calls.set(exact_calls.get() + 1)
+            }) {
+            BackNoTargetAuthorityCoreOutcome::Accepted(owner) => owner,
+            BackNoTargetAuthorityCoreOutcome::Mismatch { .. } => {
+                panic!("the returned candidate must remain exact for its own engine")
+            }
+        };
+        assert_eq!(exact_calls.get(), 1);
+        assert_eq!(exact.snapshot(), exact_before);
+        assert!(exact.inner.testing_back_no_target_authority_is_accepted());
+        drop(owner);
+    }
+
+    #[test]
+    fn back_no_target_authority_begin_foreign_receiver_returns_whole_owner() {
+        let (mut exact, request, lease, settlement) = take_accepted_back_no_target_authority();
+        let manifest_digest = 0x4155_5448_464f_5245;
+        let (owner, obligation_count) =
+            exact_back_no_target_authority_begin_owner(&exact, lease, settlement, manifest_digest);
+        let mut foreign = confirmed_engine();
+        let foreign_before = foreign.snapshot();
+        let callback_calls = std::cell::Cell::new(0usize);
+
+        let owner = match foreign.begin_back_no_target_authority_settlement(owner, |_| {
+            callback_calls.set(callback_calls.get() + 1);
+        }) {
+            BackNoTargetAuthorityBeginOutcome::ReceiverMismatch { owner, mismatch } => {
+                assert!(matches!(
+                    mismatch.inner,
+                    CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityBegin { .. }
+                ));
+                owner
+            }
+            BackNoTargetAuthorityBeginOutcome::Begun
+            | BackNoTargetAuthorityBeginOutcome::Retryable { .. }
+            | BackNoTargetAuthorityBeginOutcome::Permanent { .. } => {
+                panic!("a foreign receiver must return the whole begin owner")
+            }
+        };
+
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(foreign.snapshot(), foreign_before);
+        assert!(exact.inner.testing_back_no_target_authority_is_accepted());
+        assert_eq!(
+            exact.request(request).unwrap().status(),
+            &RequestStatus::Queued
+        );
+
+        let (settlement, lease, manifest) = owner.into_parts();
+        assert_eq!(manifest.cleanup.manifest_digest, manifest_digest);
+        assert_eq!(manifest.cleanup.obligation_count, obligation_count);
+        let owner = BackNoTargetAuthorityBeginOwner::new(settlement, lease, manifest);
+        let installed = std::cell::RefCell::new(None);
+        assert!(matches!(
+            exact.begin_back_no_target_authority_settlement(owner, |batch| {
+                installed.replace(Some(batch));
+            }),
+            BackNoTargetAuthorityBeginOutcome::Begun
+        ));
+        let batch = installed.into_inner().unwrap();
+        assert_eq!(batch.batch().manifest_digest(), manifest_digest);
+        assert_eq!(batch.batch().obligation_count(), obligation_count);
+    }
+
+    #[test]
+    fn back_no_target_authority_host_retirement_rejection_returns_whole_owner() {
+        let (mut engine, request, lease, settlement) = take_accepted_back_no_target_authority();
+        let manifest_digest = 0x4155_5448_5245_5449;
+        let (owner, obligation_count) =
+            exact_back_no_target_authority_begin_owner(&engine, lease, settlement, manifest_digest);
+        let snapshot_before = engine.snapshot();
+        let owning_admission =
+            std::mem::replace(&mut engine.admission, HostAdmissionIssuer::new().unwrap());
+        let callback_calls = std::cell::Cell::new(0usize);
+
+        let owner = match engine.begin_back_no_target_authority_settlement(owner, |_| {
+            callback_calls.set(callback_calls.get() + 1);
+        }) {
+            BackNoTargetAuthorityBeginOutcome::Permanent { owner, evidence } => {
+                assert_eq!(
+                    evidence,
+                    BackNoTargetAuthorityBeginPermanentEvidence::HostRetirementRejected
+                );
+                owner
+            }
+            BackNoTargetAuthorityBeginOutcome::Begun
+            | BackNoTargetAuthorityBeginOutcome::ReceiverMismatch { .. }
+            | BackNoTargetAuthorityBeginOutcome::Retryable { .. } => {
+                panic!("the real non-owning issuer must reject exact host retirement")
+            }
+        };
+
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(engine.snapshot(), snapshot_before);
+        assert!(engine.inner.testing_back_no_target_authority_is_accepted());
+        assert!(!engine.inner.testing_back_no_target_authority_is_cleanup());
+        assert_eq!(engine.snapshot().availability(), &RouterAvailability::Ready);
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Queued
+        );
+
+        engine.admission = owning_admission;
+        let installed = std::cell::RefCell::new(None);
+        assert!(matches!(
+            engine.begin_back_no_target_authority_settlement(owner, |batch| {
+                installed.replace(Some(batch));
+            }),
+            BackNoTargetAuthorityBeginOutcome::Begun
+        ));
+        let batch = installed.into_inner().unwrap();
+        assert_eq!(batch.batch().manifest_digest(), manifest_digest);
+        assert_eq!(batch.batch().obligation_count(), obligation_count);
+    }
+
+    #[test]
+    fn back_no_target_authority_accepted_blocks_collect_and_new_admission() {
+        let (mut engine, grant) = ready_engine();
+        engine.record_top_slot_registered(&grant).unwrap();
+        let lease = engine.confirm_host(grant);
+        let (mut engine, candidate, world) =
+            take_refrozen_back_no_target_candidate_from_with_world(engine);
+        let request = candidate.evidence().request();
+        let stamp = engine.history_admission_stamp(&world).unwrap();
+        let queued = engine
+            .push(RouteLocation::new("/").with_fragment("blocked-by-accepted"))
+            .unwrap();
+        let settlement =
+            match engine.accept_back_no_target_authority_lost_with_retirement(candidate, || {}) {
+                BackNoTargetAuthorityCoreOutcome::Accepted(owner) => owner,
+                BackNoTargetAuthorityCoreOutcome::Mismatch { .. } => {
+                    panic!("the exact authority candidate must install Accepted")
+                }
+            };
+
+        engine.collect();
+
+        assert!(engine.action().is_none());
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        assert_eq!(
+            engine.request(queued).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        assert_eq!(
+            engine.push(RouteLocation::new("/blocked")),
+            Err(IntegrationError::AuthorityExists)
+        );
+        assert!(matches!(
+            engine.prepare_back_admission(&world, &stamp),
+            Err(PrepareBackAdmissionErrorKind::AuthorityRecovering)
+        ));
+        assert!(engine.inner.testing_back_no_target_authority_is_accepted());
+        drop((lease, settlement));
+    }
+
+    #[test]
+    fn back_no_target_authority_completion_foreign_receiver_returns_whole_owner() {
+        let (mut exact, request, batch, manifest_digest, obligation_count) =
+            begin_exact_back_no_target_authority();
+        let completion = batch.complete(
+            manifest_digest,
+            obligation_count,
+            0x4155_5448_464f_5243,
+            obligation_count,
+        );
+        let exact_before = exact.snapshot();
+        let mut foreign = confirmed_engine();
+        let foreign_before = foreign.snapshot();
+        let callback_calls = std::cell::Cell::new(0usize);
+
+        let completion = match foreign.complete_back_no_target_authority_cleanup(completion, || {
+            callback_calls.set(callback_calls.get() + 1);
+        }) {
+            BackNoTargetAuthorityCleanupCompletionOutcome::Mismatch { owner, evidence } => {
+                assert!(matches!(
+                    evidence,
+                    BackNoTargetAuthorityCleanupMismatchEvidence::Receiver(_)
+                ));
+                owner
+            }
+            BackNoTargetAuthorityCleanupCompletionOutcome::Terminal(_) => {
+                panic!("a foreign receiver must return the whole completion owner")
+            }
+        };
+
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(foreign.snapshot(), foreign_before);
+        assert_eq!(exact.snapshot(), exact_before);
+        assert!(exact.inner.testing_back_no_target_authority_is_cleanup());
+
+        let exact_calls = std::cell::Cell::new(0usize);
+        assert!(matches!(
+            exact.complete_back_no_target_authority_cleanup(completion, || {
+                exact_calls.set(exact_calls.get() + 1);
+            }),
+            BackNoTargetAuthorityCleanupCompletionOutcome::Terminal(_)
+        ));
+        assert_eq!(exact_calls.get(), 1);
+        assert!(
+            !exact
+                .inner
+                .testing_back_no_target_authority_is_outstanding()
+        );
+        assert!(matches!(
+            exact.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == crate::request::NavigationFailureKind::AuthorityLost
+        ));
+    }
+
+    #[test]
+    fn back_no_target_authority_begin_orders_callback_before_cleanup_assignment() {
+        let (engine, request, batch, manifest_digest, obligation_count) =
+            begin_exact_back_no_target_authority();
+        assert_eq!(batch.batch().manifest_digest(), manifest_digest);
+        assert_eq!(batch.batch().obligation_count(), obligation_count);
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::Recovering)
+        );
+        assert_eq!(engine.snapshot().requested(), None);
+    }
+
+    #[test]
+    fn back_no_target_authority_completion_is_typed_and_consumes_retired_host_once() {
+        let (mut mismatch_engine, _request, batch, manifest_digest, obligation_count) =
+            begin_exact_back_no_target_authority();
+        let wrong = batch.complete(
+            manifest_digest,
+            obligation_count,
+            0x4155_5448_4241_4444,
+            obligation_count.saturating_sub(1),
+        );
+        let mismatch_calls = std::cell::Cell::new(0usize);
+        let (wrong, evidence) = match mismatch_engine
+            .complete_back_no_target_authority_cleanup(wrong, || {
+                mismatch_calls.set(mismatch_calls.get() + 1)
+            }) {
+            BackNoTargetAuthorityCleanupCompletionOutcome::Mismatch { owner, evidence } => {
+                (owner, evidence)
+            }
+            BackNoTargetAuthorityCleanupCompletionOutcome::Terminal(_) => {
+                panic!("wrong settlement facts must fail closed")
+            }
+        };
+        assert_eq!(mismatch_calls.get(), 0);
+        assert!(matches!(
+            evidence,
+            BackNoTargetAuthorityCleanupMismatchEvidence::Facts(_)
+        ));
+        assert!(
+            mismatch_engine
+                .inner
+                .testing_back_no_target_authority_is_cleanup()
+        );
+        drop(wrong);
+
+        let (mut engine, request, batch, manifest_digest, obligation_count) =
+            begin_exact_back_no_target_authority();
+        let completion = batch.complete(
+            manifest_digest,
+            obligation_count,
+            0x4155_5448_4449_4745,
+            obligation_count,
+        );
+        let callback_calls = std::cell::Cell::new(0usize);
+        assert!(engine.inner.testing_back_no_target_authority_is_cleanup());
+        match engine.complete_back_no_target_authority_cleanup(completion, || {
+            callback_calls.set(callback_calls.get() + 1);
+        }) {
+            BackNoTargetAuthorityCleanupCompletionOutcome::Terminal(_) => {}
+            BackNoTargetAuthorityCleanupCompletionOutcome::Mismatch { .. } => {
+                panic!("exact structural completion must terminal once")
+            }
+        }
+        assert_eq!(callback_calls.get(), 1);
+        assert!(
+            !engine
+                .inner
+                .testing_back_no_target_authority_is_outstanding()
+        );
+        let record = engine.request(request).unwrap();
+        let RequestStatus::Failed(failure) = record.status() else {
+            panic!("authority completion must publish the original terminal")
+        };
+        assert_eq!(
+            failure.kind(),
+            crate::request::NavigationFailureKind::AuthorityLost
+        );
+        assert_eq!(engine.snapshot().running_request(), None);
     }
 
     fn assert_logical_zero_mismatch(mismatch: PreparationReceiverMismatchView) {
@@ -6311,6 +7106,10 @@ mod tests {
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
             | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityBegin { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityCompletion {
+                ..
+            }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -6371,6 +7170,10 @@ mod tests {
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
             | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityBegin { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityCompletion {
+                ..
+            }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -6460,6 +7263,10 @@ mod tests {
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
             | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityBegin { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityCompletion {
+                ..
+            }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -6553,6 +7360,10 @@ mod tests {
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
             | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityBegin { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityCompletion {
+                ..
+            }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -6703,6 +7514,10 @@ mod tests {
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
             | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityBegin { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityCompletion {
+                ..
+            }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -6757,6 +7572,10 @@ mod tests {
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
             | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityBegin { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityCompletion {
+                ..
+            }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
             | CorePreparationReceiverMismatchProjection::DriverFailureCleanup { .. }
@@ -6899,6 +7718,10 @@ mod tests {
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
             | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityBegin { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityCompletion {
+                ..
+            }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
@@ -6975,6 +7798,10 @@ mod tests {
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
             | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityBegin { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityCompletion {
+                ..
+            }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
@@ -7053,6 +7880,10 @@ mod tests {
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
             | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityBegin { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityCompletion {
+                ..
+            }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
@@ -7140,6 +7971,10 @@ mod tests {
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
             | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityBegin { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityCompletion {
+                ..
+            }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
@@ -7214,6 +8049,10 @@ mod tests {
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
             | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityBegin { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityCompletion {
+                ..
+            }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }
@@ -7294,6 +8133,10 @@ mod tests {
             | CorePreparationReceiverMismatchProjection::LogicalZero { .. }
             | CorePreparationReceiverMismatchProjection::BackNoTargetReady(_)
             | CorePreparationReceiverMismatchProjection::BackNoTargetCompletion { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityBegin { .. }
+            | CorePreparationReceiverMismatchProjection::BackNoTargetAuthorityCompletion {
+                ..
+            }
             | CorePreparationReceiverMismatchProjection::Continuation { .. }
             | CorePreparationReceiverMismatchProjection::Execution { .. }
             | CorePreparationReceiverMismatchProjection::Applied { .. }

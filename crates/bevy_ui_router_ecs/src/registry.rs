@@ -890,6 +890,23 @@ impl AuthorityLostTombstone<'_> {
     pub(crate) const fn former_claim(&self) -> &ExactRegistryClaim {
         &self.residual.retired_claim
     }
+
+    pub(crate) fn matches_prepared_terminal(
+        &self,
+        expected: &PreparedAuthorityLostResidualTerminalProjection,
+    ) -> bool {
+        self.residual.id == expected.id
+            && self.residual.generation == expected.generation
+            && self.residual.operation_sequence == expected.operation_sequence
+            && self.residual.provenance == expected.provenance
+            && self.residual.retired_claim == expected.retired_claim
+            && self.residual.frozen_expected_manifest == expected.frozen_expected_manifest
+            && self.residual.observed_manifest == expected.observed_manifest
+            && self.residual.entity_present_at_receipt == expected.entity_present_at_receipt
+            && self.residual.observed_registry_claim == expected.observed_registry_claim
+            && self.residual.actual_parent_at_receipt == expected.actual_parent_at_receipt
+            && self.residual.facts == expected.facts
+    }
 }
 
 pub(crate) struct PreparedAuthorityLostResidualTransfer {
@@ -897,7 +914,104 @@ pub(crate) struct PreparedAuthorityLostResidualTransfer {
     residuals: Vec<AuthorityLostResidual>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedAuthorityLostResidualTerminalProjection {
+    id: ResidualLeaseId,
+    generation: u64,
+    operation_sequence: u64,
+    provenance: AuthorityLostResidualProvenance,
+    retired_claim: ExactRegistryClaim,
+    frozen_expected_manifest: ComponentManifest,
+    observed_manifest: Option<ComponentManifest>,
+    entity_present_at_receipt: bool,
+    observed_registry_claim: Option<ExactRegistryClaim>,
+    actual_parent_at_receipt: Option<Entity>,
+    facts: QuarantineFacts,
+}
+
+impl PreparedAuthorityLostResidualTerminalProjection {
+    pub(crate) const fn id(&self) -> ResidualLeaseId {
+        self.id
+    }
+
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) const fn operation_sequence(&self) -> u64 {
+        self.operation_sequence
+    }
+
+    pub(crate) const fn ledger_domain(&self) -> u64 {
+        self.provenance.ledger_domain
+    }
+
+    pub(crate) const fn manifest_digest(&self) -> u64 {
+        self.provenance.manifest_digest
+    }
+
+    pub(crate) const fn attempt_revision(&self) -> u64 {
+        self.provenance.attempt_revision
+    }
+
+    pub(crate) const fn obligation(&self) -> usize {
+        self.provenance.obligation
+    }
+
+    pub(crate) const fn obligation_binding(&self) -> u64 {
+        self.provenance.obligation_binding
+    }
+
+    pub(crate) const fn terminal_receipt_binding(&self) -> u64 {
+        self.provenance.terminal_receipt_binding
+    }
+
+    pub(crate) const fn retired_claim(&self) -> &ExactRegistryClaim {
+        &self.retired_claim
+    }
+
+    pub(crate) const fn frozen_expected_manifest(&self) -> &ComponentManifest {
+        &self.frozen_expected_manifest
+    }
+
+    pub(crate) const fn observed_manifest(&self) -> Option<&ComponentManifest> {
+        self.observed_manifest.as_ref()
+    }
+
+    pub(crate) const fn entity_present_at_receipt(&self) -> bool {
+        self.entity_present_at_receipt
+    }
+
+    pub(crate) const fn observed_registry_claim(&self) -> Option<&ExactRegistryClaim> {
+        self.observed_registry_claim.as_ref()
+    }
+
+    pub(crate) const fn actual_parent_at_receipt(&self) -> Option<Entity> {
+        self.actual_parent_at_receipt
+    }
+}
+
 impl PreparedAuthorityLostResidualTransfer {
+    pub(crate) fn terminal_projections(
+        &self,
+    ) -> impl ExactSizeIterator<Item = PreparedAuthorityLostResidualTerminalProjection> + '_ {
+        self.residuals
+            .iter()
+            .map(|residual| PreparedAuthorityLostResidualTerminalProjection {
+                id: residual.id,
+                generation: residual.generation,
+                operation_sequence: residual.operation_sequence,
+                provenance: residual.provenance.clone(),
+                retired_claim: residual.retired_claim.clone(),
+                frozen_expected_manifest: residual.frozen_expected_manifest.clone(),
+                observed_manifest: residual.observed_manifest.clone(),
+                entity_present_at_receipt: residual.entity_present_at_receipt,
+                observed_registry_claim: residual.observed_registry_claim.clone(),
+                actual_parent_at_receipt: residual.actual_parent_at_receipt,
+                facts: residual.facts.clone(),
+            })
+    }
+
     pub(crate) fn is_current(&self, world: &World) -> bool {
         let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
             return false;

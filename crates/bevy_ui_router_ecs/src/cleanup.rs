@@ -28,15 +28,16 @@ use crate::{
         ChildSlotAuthority, ChildSlotLifecycle, ProvisionalSlotLifecycle, RouteOwnershipSeal,
         RouterInputBarrier,
     },
-    input::{RouteFocusState, prepare_focus_mutation},
+    input::{RouteFocusState, observed_descendant_closure, prepare_focus_mutation},
     mount::{ChildSlotResidual, MountedChildSlot, residual_child_slot_is_isolated},
     navigation::{HostBinding, PendingFailedBranch, ProvenEmptyProjection, RetiredHostBinding},
     presentation::{FrameContentTarget, FrameLifecycle, FrameOutput, RealizedFrame},
     registry::{
         ComponentManifest, EntityLifecycle, EntityOwner, ExactRegistryClaim,
-        PreparedAuthorityLostResidualTransfer, PreparedAuthorityPublicationCapacity,
-        PreparedExactRegistryRetirement, PreparedQuarantineTransfer, ProvisionalOwner,
-        QuarantineFacts, QuarantineLeaseTable, RegistryOwner, RouteEntityRegistry,
+        PreparedAuthorityLostResidualTerminalProjection, PreparedAuthorityLostResidualTransfer,
+        PreparedAuthorityPublicationCapacity, PreparedExactRegistryRetirement,
+        PreparedQuarantineTransfer, ProvisionalOwner, QuarantineFacts, QuarantineLeaseId,
+        QuarantineLeaseTable, RegistryOwner, RouteEntityRegistry,
         apply_prepared_authority_lost_residual_transfer, apply_prepared_exact_registry_retirement,
         apply_prepared_quarantine_transfer, apply_prepared_unresolved_residual_transfer,
         prepare_authority_lost_residual_transfer,
@@ -351,10 +352,9 @@ impl BackCapacityIssuer {
         self.live
             .try_reserve(1)
             .map_err(|_| BackCapacityReserveError::LedgerSlotUnavailable)?;
-        if ledger_domain_fault_injected() {
-            return Err(BackCapacityReserveError::DomainExhausted);
-        }
-        let Some(ledger_domain) = allocate_ledger_domain(&NEXT_LEDGER_DOMAIN) else {
+        let Some(ledger_domain) =
+            allocate_ledger_domain(ledger_domain_counter_input(&NEXT_LEDGER_DOMAIN))
+        else {
             return Err(BackCapacityReserveError::DomainExhausted);
         };
         observe_ledger_domain_allocation();
@@ -1253,6 +1253,9 @@ thread_local! {
 }
 
 #[cfg(test)]
+static EXHAUSTED_LEDGER_DOMAIN_COUNTER: AtomicU64 = AtomicU64::new(u64::MAX);
+
+#[cfg(test)]
 pub(crate) fn fail_next_reservation_for_test() {
     FAIL_NEXT_RESERVATION.set(true);
 }
@@ -1288,8 +1291,42 @@ fn ledger_domain_fault_injected() -> bool {
 }
 
 #[cfg(test)]
-fn unfinalized_ledger_fault_injected() -> bool {
-    FAIL_NEXT_UNFINALIZED_LEDGER.replace(false)
+fn ledger_domain_counter_input(counter: &AtomicU64) -> &AtomicU64 {
+    if ledger_domain_fault_injected() {
+        &EXHAUSTED_LEDGER_DOMAIN_COUNTER
+    } else {
+        counter
+    }
+}
+
+#[cfg(test)]
+fn inject_unfinalized_boundary_drift(manifest: &mut FrozenCleanupManifest) {
+    if !FAIL_NEXT_UNFINALIZED_LEDGER.replace(false) {
+        return;
+    }
+    let Some((frame, claim, mount_slot)) = manifest.obligations.iter().find_map(|obligation| {
+        let RegistryOwner::Committed(EntityOwner::FrameShell(frame)) = obligation.claim.owner()
+        else {
+            return None;
+        };
+        Some((
+            frame.clone(),
+            obligation.claim.clone(),
+            obligation.expected_parent,
+        ))
+    }) else {
+        return;
+    };
+    manifest.boundary_drifts.push(FailedBoundaryDrift {
+        source: FailedBoundarySource::FramePhysicalParent {
+            frame,
+            mount_slot,
+            removed_child: claim.entity(),
+        },
+        expected: FailedBoundaryExpectation::ExactClaim(claim),
+        state: FailedManifestClaimState::PhysicalDrift,
+        predicate: FailedMountParentFreezePredicate::PhysicalAuthority,
+    });
 }
 
 #[cfg(test)]
@@ -1303,14 +1340,12 @@ const fn reservation_fault_injected() -> bool {
 }
 
 #[cfg(not(test))]
-const fn ledger_domain_fault_injected() -> bool {
-    false
+const fn ledger_domain_counter_input(counter: &AtomicU64) -> &AtomicU64 {
+    counter
 }
 
 #[cfg(not(test))]
-const fn unfinalized_ledger_fault_injected() -> bool {
-    false
-}
+fn inject_unfinalized_boundary_drift(_manifest: &mut FrozenCleanupManifest) {}
 
 #[cfg(not(test))]
 const fn observe_ledger_domain_allocation() {}
@@ -1792,6 +1827,532 @@ pub(crate) struct FrozenCleanupManifest {
     digest: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FrozenBackNoTargetAuthorityEntity {
+    entity: Entity,
+    parent: Option<Entity>,
+    children: Vec<Entity>,
+    registry_claim: Option<ExactRegistryClaim>,
+    ownership_seal: Option<RouteOwnershipSeal>,
+    manifest: Option<ComponentManifest>,
+}
+
+impl FrozenBackNoTargetAuthorityEntity {
+    fn observe(world: &World, registry: &RouteEntityRegistry, entity: Entity) -> Self {
+        Self {
+            entity,
+            parent: world.get::<ChildOf>(entity).map(ChildOf::parent),
+            children: world
+                .get::<Children>(entity)
+                .map(|children| children.iter().copied().collect())
+                .unwrap_or_default(),
+            registry_claim: registry.record(entity).map(|record| record.claim()),
+            ownership_seal: world.get::<RouteOwnershipSeal>(entity).copied(),
+            manifest: ComponentManifest::from_world(world, entity),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FrozenBackNoTargetHostEdgeDelta {
+    host: Entity,
+    top_slot: Entity,
+    before: Vec<Entity>,
+    after: Vec<Entity>,
+    phase: BackNoTargetHostEdgePhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackNoTargetHostEdgePhase {
+    UnstartedBefore,
+    CommittedAfter,
+    CommittedRetainedLostBefore,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FrozenBackNoTargetAllowedWriteSet {
+    targets: Vec<Entity>,
+    host_edge: FrozenBackNoTargetHostEdgeDelta,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FrozenBackNoTargetAuthorityPartition {
+    roots: Vec<Entity>,
+    target_observed: Vec<FrozenBackNoTargetAuthorityEntity>,
+    protected_observed: Vec<FrozenBackNoTargetAuthorityEntity>,
+    allowed: FrozenBackNoTargetAllowedWriteSet,
+    terminal: Option<Vec<PreparedBackNoTargetAuthorityTerminalProjection>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PreparedBackNoTargetAuthorityTerminalPresence {
+    Absent,
+    Retained {
+        parent: Option<Entity>,
+        children: Vec<Entity>,
+        ownership_seal: Option<RouteOwnershipSeal>,
+        manifest: ComponentManifest,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PreparedBackNoTargetAuthorityTerminalAuthority {
+    None,
+    Quarantine {
+        lease: QuarantineLeaseId,
+        lease_entities: Vec<Entity>,
+        owner: RegistryOwner,
+        seal: crate::registry::OwnershipSeal,
+        manifest: ComponentManifest,
+    },
+    AuthorityLostTombstone {
+        projection: PreparedAuthorityLostResidualTerminalProjection,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedBackNoTargetAuthorityTerminalProjection {
+    obligation: usize,
+    entity: Entity,
+    ledger_domain: u64,
+    attempt_revision: u64,
+    disposition: CleanupDisposition,
+    receipt_binding: u64,
+    registry_claim: Option<ExactRegistryClaim>,
+    presence: PreparedBackNoTargetAuthorityTerminalPresence,
+    authority: PreparedBackNoTargetAuthorityTerminalAuthority,
+}
+
+impl PreparedBackNoTargetAuthorityTerminalProjection {
+    fn matches_receipt(&self, receipt: &CleanupReceipt) -> bool {
+        receipt.ledger_domain == self.ledger_domain
+            && receipt.attempt_revision == self.attempt_revision
+            && receipt.obligation == self.obligation
+            && receipt.disposition == self.disposition
+            && receipt.binding == self.receipt_binding
+    }
+
+    fn is_current(&self, world: &World) -> bool {
+        let registry = world.resource::<RouteEntityRegistry>();
+        let Some(table) = world.get_resource::<QuarantineLeaseTable>() else {
+            return false;
+        };
+        if registry.record(self.entity).map(|record| record.claim()) != self.registry_claim {
+            return false;
+        }
+        let presence_is_current = match &self.presence {
+            PreparedBackNoTargetAuthorityTerminalPresence::Absent => {
+                world.get_entity(self.entity).is_err()
+            }
+            PreparedBackNoTargetAuthorityTerminalPresence::Retained {
+                parent,
+                children,
+                ownership_seal,
+                manifest,
+            } => {
+                world.get_entity(self.entity).is_ok()
+                    && world.get::<ChildOf>(self.entity).map(ChildOf::parent) == *parent
+                    && observed_children(world, self.entity) == *children
+                    && world.get::<RouteOwnershipSeal>(self.entity).copied() == *ownership_seal
+                    && ComponentManifest::from_world(world, self.entity).as_ref() == Some(manifest)
+            }
+        };
+        if !presence_is_current {
+            return false;
+        }
+        match &self.authority {
+            PreparedBackNoTargetAuthorityTerminalAuthority::None => {
+                table.record(self.entity).is_none()
+                    && table.unresolved_record(self.entity).is_none()
+                    && table.authority_lost_tombstone(self.entity).is_none()
+            }
+            PreparedBackNoTargetAuthorityTerminalAuthority::Quarantine {
+                lease,
+                lease_entities,
+                owner,
+                seal,
+                manifest,
+            } => {
+                let Some(record) = table.record(self.entity) else {
+                    return false;
+                };
+                table
+                    .lease(*lease)
+                    .is_some_and(|lease| lease.owned_entities() == *lease_entities)
+                    && record.owner() == owner
+                    && record.seal() == *seal
+                    && record.lifecycle() == EntityLifecycle::Quarantined
+                    && record.manifest() == manifest
+                    && table.unresolved_record(self.entity).is_none()
+                    && table.authority_lost_tombstone(self.entity).is_none()
+                    && terminal_quarantine_root_is_inert(world, &record.claim())
+            }
+            PreparedBackNoTargetAuthorityTerminalAuthority::AuthorityLostTombstone {
+                projection,
+            } => {
+                table.record(self.entity).is_none()
+                    && table.unresolved_record(self.entity).is_none()
+                    && table
+                        .authority_lost_tombstone(self.entity)
+                        .is_some_and(|tombstone| tombstone.matches_prepared_terminal(projection))
+                    && match &self.presence {
+                        PreparedBackNoTargetAuthorityTerminalPresence::Absent => true,
+                        PreparedBackNoTargetAuthorityTerminalPresence::Retained { .. } => {
+                            terminal_authority_lost_entity_is_inert(world, self.entity)
+                        }
+                    }
+            }
+        }
+    }
+}
+
+impl FrozenBackNoTargetAuthorityPartition {
+    fn freeze(
+        world: &World,
+        registry: &RouteEntityRegistry,
+        host: &HostBinding,
+        mut targets: Vec<Entity>,
+    ) -> Option<Self> {
+        targets.sort_by_key(|entity| entity.to_bits());
+        targets.dedup();
+        if !targets.contains(&host.top_slot) {
+            return None;
+        }
+        let before = world
+            .get::<Children>(host.host)
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut after = before.clone();
+        after.retain(|entity| *entity != host.top_slot);
+        let membership = before
+            .iter()
+            .filter(|entity| **entity == host.top_slot)
+            .count();
+        let parent = world.get::<ChildOf>(host.top_slot).map(ChildOf::parent);
+        if (parent == Some(host.host) && membership != 1)
+            || (parent != Some(host.host) && membership != 0)
+        {
+            return None;
+        }
+        let mut roots = targets.clone();
+        roots.push(host.host);
+        roots.sort_by_key(|entity| entity.to_bits());
+        roots.dedup();
+        let closure = observed_descendant_closure(world, roots.iter().copied());
+        let mut closure = closure.into_iter().collect::<Vec<_>>();
+        closure.sort_by_key(|entity| entity.to_bits());
+        let target_observed = targets
+            .iter()
+            .copied()
+            .map(|entity| FrozenBackNoTargetAuthorityEntity::observe(world, registry, entity))
+            .collect::<Vec<_>>();
+        let protected_observed = closure
+            .iter()
+            .copied()
+            .filter(|entity| !targets.contains(entity))
+            .map(|entity| FrozenBackNoTargetAuthorityEntity::observe(world, registry, entity))
+            .collect::<Vec<_>>();
+        if protected_observed
+            .iter()
+            .any(|protected| targets.contains(&protected.entity))
+        {
+            return None;
+        }
+        Some(Self {
+            roots,
+            target_observed,
+            protected_observed,
+            allowed: FrozenBackNoTargetAllowedWriteSet {
+                targets,
+                host_edge: FrozenBackNoTargetHostEdgeDelta {
+                    host: host.host,
+                    top_slot: host.top_slot,
+                    before,
+                    after,
+                    phase: BackNoTargetHostEdgePhase::UnstartedBefore,
+                },
+            },
+            terminal: None,
+        })
+    }
+
+    fn install_terminal_projections(
+        &mut self,
+        obligations: &[CleanupObligation],
+        mut projections: Vec<PreparedBackNoTargetAuthorityTerminalProjection>,
+    ) -> bool {
+        projections.sort_by_key(|projection| projection.obligation);
+        if self.terminal.is_some()
+            || projections.len() != obligations.len()
+            || projections.iter().enumerate().any(|(index, projection)| {
+                let Some(obligation) = obligations.get(index) else {
+                    return true;
+                };
+                projection.obligation != index
+                    || projection.entity != obligation.claim.entity()
+                    || !self.allowed.targets.contains(&projection.entity)
+                    || projection.receipt_binding
+                        != receipt_binding(
+                            projection.ledger_domain,
+                            projection.attempt_revision,
+                            projection.obligation,
+                            projection.disposition,
+                            obligation,
+                        )
+            })
+        {
+            return false;
+        }
+        self.terminal = Some(projections);
+        true
+    }
+
+    fn commit_host_edge_phase(&mut self, phase: BackNoTargetHostEdgePhase, world: &World) -> bool {
+        if self.allowed.host_edge.phase != BackNoTargetHostEdgePhase::UnstartedBefore
+            || phase == BackNoTargetHostEdgePhase::UnstartedBefore
+        {
+            return false;
+        }
+        let children = observed_children(world, self.allowed.host_edge.host);
+        let parent = world
+            .get::<ChildOf>(self.allowed.host_edge.top_slot)
+            .map(ChildOf::parent);
+        let exact = match phase {
+            BackNoTargetHostEdgePhase::UnstartedBefore => false,
+            BackNoTargetHostEdgePhase::CommittedAfter => {
+                children == self.allowed.host_edge.after
+                    && parent != Some(self.allowed.host_edge.host)
+            }
+            BackNoTargetHostEdgePhase::CommittedRetainedLostBefore => {
+                children == self.allowed.host_edge.before
+                    && parent == Some(self.allowed.host_edge.host)
+            }
+        };
+        if exact {
+            self.allowed.host_edge.phase = phase;
+        }
+        exact
+    }
+
+    pub(crate) fn refreeze_unstarted(&self, world: &World) -> bool {
+        if self.allowed.host_edge.phase != BackNoTargetHostEdgePhase::UnstartedBefore
+            || self.terminal.is_some()
+        {
+            return false;
+        }
+        let registry = world.resource::<RouteEntityRegistry>();
+        let mut closure = observed_descendant_closure(world, self.roots.iter().copied())
+            .into_iter()
+            .collect::<Vec<_>>();
+        closure.sort_by_key(|entity| entity.to_bits());
+        let mut expected = self.allowed.targets.clone();
+        expected.extend(
+            self.protected_observed
+                .iter()
+                .map(|protected| protected.entity),
+        );
+        expected.sort_by_key(|entity| entity.to_bits());
+        expected.dedup();
+        closure == expected
+            && self.protected_observed.iter().all(|expected| {
+                FrozenBackNoTargetAuthorityEntity::observe(world, &registry, expected.entity)
+                    == *expected
+            })
+            && self.target_observed.iter().all(|expected| {
+                FrozenBackNoTargetAuthorityEntity::observe(world, &registry, expected.entity)
+                    == *expected
+            })
+            && world
+                .get::<Children>(self.allowed.host_edge.host)
+                .map(|children| children.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default()
+                == self.allowed.host_edge.before
+    }
+
+    fn refreeze(
+        &self,
+        world: &World,
+        obligations: &[CleanupObligation],
+        receipts: &[Option<CleanupReceipt>],
+    ) -> bool {
+        let Some(terminal) = self.terminal.as_ref() else {
+            return receipts.iter().all(Option::is_none) && self.refreeze_unstarted(world);
+        };
+        if obligations.len() != receipts.len()
+            || terminal.len() != obligations.len()
+            || obligations.iter().enumerate().any(|(index, obligation)| {
+                let Some(projection) = terminal.get(index) else {
+                    return true;
+                };
+                projection.obligation != index
+                    || projection.entity != obligation.claim.entity()
+                    || receipts
+                        .get(index)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|receipt| {
+                            !projection.matches_receipt(receipt) || !projection.is_current(world)
+                        })
+            })
+        {
+            return false;
+        }
+        let registry = world.resource::<RouteEntityRegistry>();
+        let mut remaining = obligations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, obligation)| {
+                receipts
+                    .get(index)
+                    .is_some_and(Option::is_none)
+                    .then_some(obligation.claim.entity())
+            })
+            .collect::<Vec<_>>();
+        remaining.sort_by_key(|entity| entity.to_bits());
+        remaining.dedup();
+        if remaining
+            .iter()
+            .any(|entity| !self.allowed.targets.contains(entity))
+        {
+            return false;
+        }
+        let mut present_targets = self
+            .allowed
+            .targets
+            .iter()
+            .copied()
+            .filter(|entity| world.get_entity(*entity).is_ok())
+            .collect::<Vec<_>>();
+        present_targets.sort_by_key(|entity| entity.to_bits());
+        let mut roots = present_targets.clone();
+        roots.push(self.allowed.host_edge.host);
+        roots.sort_by_key(|entity| entity.to_bits());
+        roots.dedup();
+        let mut closure = observed_descendant_closure(world, roots.iter().copied())
+            .into_iter()
+            .collect::<Vec<_>>();
+        closure.sort_by_key(|entity| entity.to_bits());
+        let protected = self
+            .protected_observed
+            .iter()
+            .map(|observed| observed.entity)
+            .collect::<Vec<_>>();
+        let mut expected_closure = present_targets.clone();
+        expected_closure.extend(protected.iter().copied());
+        expected_closure.sort_by_key(|entity| entity.to_bits());
+        expected_closure.dedup();
+        if closure != expected_closure {
+            return false;
+        }
+        if self.protected_observed.iter().any(|expected| {
+            let observed =
+                FrozenBackNoTargetAuthorityEntity::observe(world, &registry, expected.entity);
+            if expected.entity != self.allowed.host_edge.host {
+                return observed != *expected;
+            }
+            let expected_children = match self.allowed.host_edge.phase {
+                BackNoTargetHostEdgePhase::UnstartedBefore
+                | BackNoTargetHostEdgePhase::CommittedRetainedLostBefore => {
+                    &self.allowed.host_edge.before
+                }
+                BackNoTargetHostEdgePhase::CommittedAfter => &self.allowed.host_edge.after,
+            };
+            let children_changed = expected_children != &expected.children;
+            observed.entity != expected.entity
+                || observed.parent != expected.parent
+                || observed.children != *expected_children
+                || observed.registry_claim != expected.registry_claim
+                || observed.ownership_seal != expected.ownership_seal
+                || (observed.manifest != expected.manifest
+                    && (!children_changed
+                        || expected.manifest.as_ref().is_none_or(|manifest| {
+                            !observed_parent_manifest_differs_only_by_children(
+                                world,
+                                expected.entity,
+                                manifest,
+                            )
+                        })))
+        }) {
+            return false;
+        }
+        let host_children = world
+            .get::<Children>(self.allowed.host_edge.host)
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let top_parent = world
+            .get::<ChildOf>(self.allowed.host_edge.top_slot)
+            .map(ChildOf::parent);
+        let host_edge_is_current = match self.allowed.host_edge.phase {
+            BackNoTargetHostEdgePhase::UnstartedBefore => {
+                host_children == self.allowed.host_edge.before
+            }
+            BackNoTargetHostEdgePhase::CommittedAfter => {
+                host_children == self.allowed.host_edge.after
+                    && top_parent != Some(self.allowed.host_edge.host)
+            }
+            BackNoTargetHostEdgePhase::CommittedRetainedLostBefore => {
+                host_children == self.allowed.host_edge.before
+                    && top_parent == Some(self.allowed.host_edge.host)
+            }
+        };
+        if !host_edge_is_current {
+            return false;
+        }
+        self.target_observed
+            .iter()
+            .filter(|expected| remaining.contains(&expected.entity))
+            .all(|expected| {
+                let observed =
+                    FrozenBackNoTargetAuthorityEntity::observe(world, &registry, expected.entity);
+                let projected_children = expected
+                    .children
+                    .iter()
+                    .copied()
+                    .filter(|child| {
+                        !obligations.iter().enumerate().any(|(index, obligation)| {
+                            obligation.claim.entity() == *child
+                                && obligation.expected_parent == expected.entity
+                                && receipts.get(index).and_then(Option::as_ref).is_some_and(
+                                    |receipt| {
+                                        matches!(
+                                            receipt.disposition,
+                                            CleanupDisposition::Removed
+                                                | CleanupDisposition::RemovedDetached
+                                                | CleanupDisposition::AlreadyAbsent
+                                        )
+                                    },
+                                )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let children_changed = projected_children != expected.children;
+                let projected_parent = if expected.entity == self.allowed.host_edge.top_slot
+                    && expected.parent == Some(self.allowed.host_edge.host)
+                    && self.allowed.host_edge.phase == BackNoTargetHostEdgePhase::CommittedAfter
+                {
+                    None
+                } else {
+                    expected.parent
+                };
+                let child_of_changed = projected_parent != expected.parent;
+                observed.entity == expected.entity
+                    && observed.parent == projected_parent
+                    && observed.children == projected_children
+                    && observed.registry_claim == expected.registry_claim
+                    && observed.ownership_seal == expected.ownership_seal
+                    && (observed.manifest == expected.manifest
+                        || expected.manifest.as_ref().is_some_and(|manifest| {
+                            observed_manifest_differs_only_by_allowed_relationships(
+                                world,
+                                expected.entity,
+                                manifest,
+                                children_changed,
+                                child_of_changed,
+                            )
+                        }))
+            })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AuthoritySettlementManifestError {
     RetryableCapacity,
@@ -2220,6 +2781,44 @@ impl FrozenCleanupManifest {
         })
     }
 
+    pub(crate) fn from_back_no_target_authority(
+        world: &World,
+        registry: &RouteEntityRegistry,
+        active: &RealizedBranch,
+        host: &HostBinding,
+    ) -> Result<Self, AuthoritySettlementManifestError> {
+        let mut obligations = Vec::new();
+        append_exact_authority_branch(
+            world,
+            registry,
+            active.frames(),
+            active.child_slots(),
+            &mut obligations,
+        )?;
+        normalize_authority_obligations(&mut obligations)?;
+        if host.top_slot_claim.entity() != host.top_slot
+            || host.candidate.host() != host.host
+            || !matches!(
+                host.top_slot_claim.owner(),
+                RegistryOwner::Committed(EntityOwner::HostTopSlot { host: version, slot })
+                    if version == &host.version && *slot == host.slot_id
+            )
+        {
+            return Err(AuthoritySettlementManifestError::InvalidAuthority);
+        }
+        obligations.push(authority_host_obligation(world, registry, host));
+        normalize_authority_obligations(&mut obligations)?;
+        let mount_parents = Vec::new();
+        let digest = frozen_manifest_digest(&obligations, &mount_parents);
+        Ok(Self {
+            obligations,
+            mount_parents,
+            boundary_drifts: Vec::new(),
+            pending_boundary_loss_claims: Vec::new(),
+            digest,
+        })
+    }
+
     pub(crate) fn finalize_failed_authority_settlement(
         mut self,
         world: &World,
@@ -2337,6 +2936,27 @@ impl FrozenCleanupManifest {
 
     pub(crate) fn len(&self) -> usize {
         self.obligations.len()
+    }
+
+    pub(crate) fn obligation_entities(&self) -> Vec<Entity> {
+        self.obligations
+            .iter()
+            .map(|obligation| obligation.claim.entity())
+            .collect()
+    }
+
+    pub(crate) fn freeze_back_no_target_authority_partition(
+        &self,
+        world: &World,
+        registry: &RouteEntityRegistry,
+        host: &HostBinding,
+    ) -> Option<FrozenBackNoTargetAuthorityPartition> {
+        FrozenBackNoTargetAuthorityPartition::freeze(
+            world,
+            registry,
+            host,
+            self.obligation_entities(),
+        )
     }
 
     pub(crate) fn boundary_drifts(&self) -> &[FailedBoundaryDrift] {
@@ -4766,6 +5386,34 @@ fn observed_parent_manifest_differs_only_by_children(
         .all(|component| Some(*component) == children)
 }
 
+fn observed_manifest_differs_only_by_allowed_relationships(
+    world: &World,
+    entity: Entity,
+    frozen: &ComponentManifest,
+    allow_children: bool,
+    allow_child_of: bool,
+) -> bool {
+    let Some(actual) = ComponentManifest::from_world(world, entity) else {
+        return false;
+    };
+    let children = world.components().component_id::<Children>();
+    let child_of = world.components().component_id::<ChildOf>();
+    actual
+        .component_ids()
+        .iter()
+        .filter(|component| !frozen.component_ids().contains(component))
+        .chain(
+            frozen
+                .component_ids()
+                .iter()
+                .filter(|component| !actual.component_ids().contains(component)),
+        )
+        .all(|component| {
+            (allow_children && Some(*component) == children)
+                || (allow_child_of && Some(*component) == child_of)
+        })
+}
+
 fn manifest_contains_required_allowing_children(
     world: &World,
     actual: &ComponentManifest,
@@ -5042,6 +5690,15 @@ enum PreparedAuthorityHostEdge {
 }
 
 impl PreparedAuthorityHostEdge {
+    fn partition_phase(&self) -> BackNoTargetHostEdgePhase {
+        match self {
+            Self::RetainedLost { .. } => BackNoTargetHostEdgePhase::CommittedRetainedLostBefore,
+            Self::Existing { .. } | Self::Missing { .. } => {
+                BackNoTargetHostEdgePhase::CommittedAfter
+            }
+        }
+    }
+
     fn project_attempt(&self, attempt: &CleanupAttempt) -> Option<CleanupAttempt> {
         let mut projected = attempt.clone();
         let Self::Existing { index, detach, .. } = self else {
@@ -5291,7 +5948,9 @@ impl PreparedAuthorityRemoval {
 }
 
 struct PreparedAuthorityResidualGroup {
+    indices: Vec<usize>,
     manifests: Vec<(Entity, ComponentManifest)>,
+    verified_lease: Option<QuarantineLeaseId>,
     presentation: PreparedAuthorityPresentation,
     transfers: PreparedAuthorityRegistryTransfers,
     receipts: PreparedCleanupReceiptBatch,
@@ -5329,6 +5988,7 @@ struct PreparedAuthoritySettlement {
     publication_capacity: PreparedAuthorityPublicationCapacity,
     pickable_repair: PreparedAuthorityPickableRepair,
     prepublication_evidence: Vec<(usize, CleanupEvidence)>,
+    terminal_projections: Vec<PreparedBackNoTargetAuthorityTerminalProjection>,
     host_edge: PreparedAuthorityHostEdge,
     absent: Vec<PreparedAuthorityRemoval>,
     removed: Vec<PreparedAuthorityRemoval>,
@@ -5410,6 +6070,7 @@ pub(crate) struct CleanupLedger {
     quarantine_event_observed: bool,
     post_settlement_focus: Vec<PostSettlementFocusRoot>,
     authority_host_children: Option<Vec<Entity>>,
+    back_no_target_authority_partition: Option<FrozenBackNoTargetAuthorityPartition>,
 }
 
 struct InstalledBackCapacityLease {
@@ -5428,6 +6089,32 @@ pub(crate) struct BackNoTargetZeroCompletionFacts {
 }
 
 impl BackNoTargetZeroCompletionFacts {
+    pub(crate) const fn manifest_digest(self) -> u64 {
+        self.manifest_digest
+    }
+
+    pub(crate) const fn obligation_count(self) -> usize {
+        self.obligation_count
+    }
+
+    pub(crate) const fn completion_digest(self) -> u64 {
+        self.completion_digest
+    }
+
+    pub(crate) const fn settled_count(self) -> usize {
+        self.settled_count
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackNoTargetAuthorityCompletionFacts {
+    manifest_digest: u64,
+    obligation_count: usize,
+    completion_digest: u64,
+    settled_count: usize,
+}
+
+impl BackNoTargetAuthorityCompletionFacts {
     pub(crate) const fn manifest_digest(self) -> u64 {
         self.manifest_digest
     }
@@ -5669,12 +6356,92 @@ pub(crate) enum CleanupOwner {
     Leaving(RealizedBranch),
     FailedPrepared(FailedPreparedBranch),
     AuthoritySettlement(AuthoritySettlementOwner),
+    BackNoTargetAuthority(BackNoTargetAuthorityCleanupOwner),
 }
 
 pub(crate) struct AuthoritySettlementOwner {
     active: Option<RealizedBranch>,
     pending: AuthoritySettlementPendingOwner,
     host: RetiredHostBinding,
+}
+
+pub(crate) struct BackNoTargetAuthorityCleanupOwner {
+    active: RealizedBranch,
+    host: RetiredHostBinding,
+}
+
+pub(crate) struct PreparedBackNoTargetAuthorityCleanupLedger {
+    prepared: PreparedCleanupLedger,
+    owner: BackNoTargetAuthorityCleanupOwner,
+    host_children: Vec<Entity>,
+    partition: FrozenBackNoTargetAuthorityPartition,
+}
+
+impl PreparedBackNoTargetAuthorityCleanupLedger {
+    pub(crate) fn new(
+        prepared: PreparedCleanupLedger,
+        active: RealizedBranch,
+        host: RetiredHostBinding,
+        host_children: Vec<Entity>,
+        partition: FrozenBackNoTargetAuthorityPartition,
+    ) -> Self {
+        Self {
+            prepared,
+            owner: BackNoTargetAuthorityCleanupOwner { active, host },
+            host_children,
+            partition,
+        }
+    }
+
+    pub(crate) fn into_active(self) -> CleanupLedger {
+        CleanupLedger::activate_back_no_target_authority(
+            self.prepared,
+            self.owner.active,
+            self.owner.host,
+            self.host_children,
+            self.partition,
+        )
+    }
+
+    pub(crate) fn into_unstarted_parts(
+        self,
+    ) -> (
+        PreparedCleanupLedger,
+        BackNoTargetAuthorityCleanupOwner,
+        Vec<Entity>,
+        FrozenBackNoTargetAuthorityPartition,
+    ) {
+        (
+            self.prepared,
+            self.owner,
+            self.host_children,
+            self.partition,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn leaving_frames(&self) -> &[RealizedFrame] {
+        self.owner.active.frames()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
+        self.owner.active.tracked_child_slots()
+    }
+}
+
+impl BackNoTargetAuthorityCleanupOwner {
+    pub(crate) fn active(&self) -> &RealizedBranch {
+        &self.active
+    }
+
+    pub(crate) fn host(&self) -> &RetiredHostBinding {
+        &self.host
+    }
+
+    pub(crate) fn into_parts(self) -> (RealizedBranch, RetiredHostBinding) {
+        (self.active, self.host)
+    }
 }
 
 enum AuthoritySettlementPendingOwner {
@@ -5712,10 +6479,11 @@ impl CleanupLedger {
     }
 
     fn reserve_with_domain_counter(
-        manifest: FrozenCleanupManifest,
+        mut manifest: FrozenCleanupManifest,
         domain_counter: &AtomicU64,
     ) -> Result<PreparedCleanupLedger, CleanupLedgerReserveError> {
-        if !manifest.boundary_drifts.is_empty() || unfinalized_ledger_fault_injected() {
+        inject_unfinalized_boundary_drift(&mut manifest);
+        if !manifest.boundary_drifts.is_empty() {
             return Err(CleanupLedgerReserveError::new(
                 CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts,
                 manifest,
@@ -5746,19 +6514,14 @@ impl CleanupLedger {
             ));
         }
         receipts.resize(manifest.obligations.len(), None);
-        if ledger_domain_fault_injected() {
-            return Err(CleanupLedgerReserveError::new(
-                CleanupLedgerReserveErrorKind::DomainExhausted,
-                manifest,
-            ));
-        }
-        let Some(ledger_domain) = allocate_ledger_domain(domain_counter) else {
+        let allocation_counter = ledger_domain_counter_input(domain_counter);
+        let Some(ledger_domain) = allocate_ledger_domain(allocation_counter) else {
             return Err(CleanupLedgerReserveError::new(
                 CleanupLedgerReserveErrorKind::DomainExhausted,
                 manifest,
             ));
         };
-        if std::ptr::eq(domain_counter, &NEXT_LEDGER_DOMAIN) {
+        if std::ptr::eq(allocation_counter, &NEXT_LEDGER_DOMAIN) {
             observe_ledger_domain_allocation();
         }
         Ok(PreparedCleanupLedger {
@@ -5888,8 +6651,43 @@ impl CleanupLedger {
         ledger
     }
 
+    pub(crate) fn activate_back_no_target_authority(
+        prepared: PreparedCleanupLedger,
+        active: RealizedBranch,
+        host: RetiredHostBinding,
+        host_children: Vec<Entity>,
+        partition: FrozenBackNoTargetAuthorityPartition,
+    ) -> Self {
+        let mut ledger = Self::activate_owner(
+            prepared,
+            Some(CleanupOwner::BackNoTargetAuthority(
+                BackNoTargetAuthorityCleanupOwner { active, host },
+            )),
+        );
+        ledger.authority_host_children = Some(host_children);
+        ledger.back_no_target_authority_partition = Some(partition);
+        ledger
+    }
+
     pub(crate) fn is_authority_settlement(&self) -> bool {
         matches!(self.owner, Some(CleanupOwner::AuthoritySettlement(_)))
+    }
+
+    fn is_physical_authority_settlement(&self) -> bool {
+        matches!(
+            self.owner,
+            Some(CleanupOwner::AuthoritySettlement(_) | CleanupOwner::BackNoTargetAuthority(_))
+        )
+    }
+
+    pub(crate) fn back_no_target_authority_partition_is_current(&self, world: &World) -> bool {
+        self.back_no_target_authority_partition
+            .as_ref()
+            .is_some_and(|partition| partition.refreeze(world, &self.obligations, &self.receipts))
+            && self
+                .post_settlement_focus
+                .iter()
+                .all(|root| self.post_settlement_focus_root_is_current(world, root))
     }
 
     pub(crate) fn take_authority_settlement_owner(&mut self) -> Option<AuthoritySettlementOwner> {
@@ -5903,7 +6701,7 @@ impl CleanupLedger {
     }
 
     fn release_settled_owner(&mut self) {
-        if !self.is_authority_settlement() {
+        if !self.is_physical_authority_settlement() {
             self.owner.take();
         }
     }
@@ -5929,6 +6727,7 @@ impl CleanupLedger {
             quarantine_event_observed: false,
             post_settlement_focus: Vec::new(),
             authority_host_children: None,
+            back_no_target_authority_partition: None,
         }
     }
 
@@ -5960,6 +6759,7 @@ impl CleanupLedger {
             quarantine_event_observed: false,
             post_settlement_focus: Vec::new(),
             authority_host_children: None,
+            back_no_target_authority_partition: None,
         }
     }
 
@@ -6005,6 +6805,9 @@ impl CleanupLedger {
                 BackNoTargetCleanupOwnerObservation::FailedPrepared
             }
             Some(CleanupOwner::AuthoritySettlement(_)) => {
+                BackNoTargetCleanupOwnerObservation::AuthoritySettlement
+            }
+            Some(CleanupOwner::BackNoTargetAuthority(_)) => {
                 BackNoTargetCleanupOwnerObservation::AuthoritySettlement
             }
             None => BackNoTargetCleanupOwnerObservation::Absent,
@@ -6123,6 +6926,26 @@ impl CleanupLedger {
         })
     }
 
+    pub(crate) fn back_no_target_authority_completion_facts(
+        &self,
+    ) -> Option<BackNoTargetAuthorityCompletionFacts> {
+        if !matches!(self.owner, Some(CleanupOwner::BackNoTargetAuthority(_)))
+            || self.batch.is_some()
+            || self.back_no_target_batch.is_some()
+            || self.back_no_target_capacity.is_some()
+            || self.mount_parents.len() != 0
+            || self.receipts.iter().any(|receipt| receipt.is_none())
+        {
+            return None;
+        }
+        Some(BackNoTargetAuthorityCompletionFacts {
+            manifest_digest: self.manifest_digest,
+            obligation_count: self.obligations.len(),
+            completion_digest: self.completion_digest?,
+            settled_count: self.receipts.iter().flatten().count(),
+        })
+    }
+
     pub(crate) fn batch(&self) -> Option<&CleanupBatch> {
         self.batch.as_ref()
     }
@@ -6136,6 +6959,7 @@ impl CleanupLedger {
                 .as_ref()
                 .map(RealizedBranch::frames)
                 .unwrap_or_default(),
+            Some(CleanupOwner::BackNoTargetAuthority(owner)) => owner.active.frames(),
             Some(CleanupOwner::FailedPrepared(_)) | None => &[],
         }
     }
@@ -6145,7 +6969,7 @@ impl CleanupLedger {
         match self.owner.as_ref() {
             Some(CleanupOwner::FailedPrepared(branch)) => branch.frames(),
             Some(CleanupOwner::AuthoritySettlement(owner)) => owner.pending.branch().frames(),
-            Some(CleanupOwner::Leaving(_)) | None => &[],
+            Some(CleanupOwner::Leaving(_) | CleanupOwner::BackNoTargetAuthority(_)) | None => &[],
         }
     }
 
@@ -6153,6 +6977,7 @@ impl CleanupLedger {
     pub(crate) fn authority_settlement_host(&self) -> Option<&RetiredHostBinding> {
         match self.owner.as_ref() {
             Some(CleanupOwner::AuthoritySettlement(owner)) => Some(&owner.host),
+            Some(CleanupOwner::BackNoTargetAuthority(owner)) => Some(&owner.host),
             Some(CleanupOwner::Leaving(_) | CleanupOwner::FailedPrepared(_)) | None => None,
         }
     }
@@ -6162,9 +6987,12 @@ impl CleanupLedger {
     ) -> Option<&crate::branch_transaction::SealedMountNewStagingAllowance> {
         match self.owner.as_ref() {
             Some(CleanupOwner::FailedPrepared(branch)) => branch.mount_new_allowance(),
-            Some(CleanupOwner::AuthoritySettlement(_)) | Some(CleanupOwner::Leaving(_)) | None => {
-                None
-            }
+            Some(
+                CleanupOwner::AuthoritySettlement(_)
+                | CleanupOwner::BackNoTargetAuthority(_)
+                | CleanupOwner::Leaving(_),
+            )
+            | None => None,
         }
     }
 
@@ -6182,6 +7010,7 @@ impl CleanupLedger {
                 slots.extend(owner.pending.branch().tracked_child_slots());
                 slots
             }
+            Some(CleanupOwner::BackNoTargetAuthority(owner)) => owner.active.tracked_child_slots(),
             None => Vec::new(),
         }
     }
@@ -6224,6 +7053,12 @@ impl CleanupLedger {
         {
             return false;
         }
+        if self.back_no_target_authority_partition.is_some()
+            && !self.back_no_target_authority_partition_is_current(world)
+        {
+            self.issued_attempt = None;
+            return false;
+        }
         let current_evidence = collect_evidence(world, &self.obligations, &self.receipts);
         if current_evidence != attempt.evidence
             || current_evidence
@@ -6242,7 +7077,7 @@ impl CleanupLedger {
             quarantine_focus_closure(&current_evidence, &self.obligations),
         );
 
-        if self.is_authority_settlement() {
+        if self.is_physical_authority_settlement() {
             if !self.settle_authority_evidence(world, &attempt, focus_closure) {
                 self.issued_attempt = None;
                 return false;
@@ -6385,20 +7220,24 @@ impl CleanupLedger {
         world: &World,
         attempt: &CleanupAttempt,
     ) -> Result<PreparedAuthorityHostEdge, ()> {
-        let Some(CleanupOwner::AuthoritySettlement(owner)) = self.owner.as_ref() else {
-            return Err(());
+        let owner = match self.owner.as_ref() {
+            Some(CleanupOwner::AuthoritySettlement(owner)) => &owner.host,
+            Some(CleanupOwner::BackNoTargetAuthority(owner)) => &owner.host,
+            Some(CleanupOwner::Leaving(_) | CleanupOwner::FailedPrepared(_)) | None => {
+                return Err(());
+            }
         };
         let Some(children_before) = self.authority_host_children.as_ref() else {
             return Err(());
         };
-        let host = owner.host.host;
-        let top_slot = owner.host.top_slot;
-        let claim = &owner.host.top_slot_claim;
+        let host = owner.host;
+        let top_slot = owner.top_slot;
+        let claim = &owner.top_slot_claim;
         if !matches!(
             claim.owner(),
             RegistryOwner::Committed(EntityOwner::HostTopSlot { host, slot })
-                if host == &owner.host.version && *slot == owner.host.slot_id
-        ) || owner.host.candidate.host() != host
+                if host == &owner.version && *slot == owner.slot_id
+        ) || owner.candidate.host() != host
         {
             return Err(());
         }
@@ -6477,7 +7316,7 @@ impl CleanupLedger {
         focus_closure: Vec<Entity>,
     ) -> bool {
         debug_assert!(self.mount_parents.is_empty());
-        let Some(prepared) = self.prepare_authority_settlement(world, attempt, &focus_closure)
+        let Some(mut prepared) = self.prepare_authority_settlement(world, attempt, &focus_closure)
         else {
             return false;
         };
@@ -6492,12 +7331,38 @@ impl CleanupLedger {
         {
             return false;
         }
+        if let Some(partition) = self.back_no_target_authority_partition.as_mut() {
+            if !partition.install_terminal_projections(
+                &self.obligations,
+                std::mem::take(&mut prepared.terminal_projections),
+            ) {
+                return false;
+            }
+            if !self.back_no_target_authority_partition_is_current(world) {
+                return false;
+            }
+        }
         #[cfg(test)]
         let _mutation_marker = crate::registry::begin_authority_publication_mutation_for_test();
         if !prepared.pickable_repair.apply(world) {
             return false;
         }
+        if self.back_no_target_authority_partition.is_some()
+            && !self.back_no_target_authority_partition_is_current(world)
+        {
+            return false;
+        }
         if !prepared.host_edge.apply_and_validate(world) {
+            return false;
+        }
+        if let Some(partition) = self.back_no_target_authority_partition.as_mut()
+            && !partition.commit_host_edge_phase(prepared.host_edge.partition_phase(), world)
+        {
+            return false;
+        }
+        if self.back_no_target_authority_partition.is_some()
+            && !self.back_no_target_authority_partition_is_current(world)
+        {
             return false;
         }
         release_cleanup_focus(world, &focus_closure);
@@ -6513,6 +7378,11 @@ impl CleanupLedger {
                 );
             }
             self.commit_receipt_batch(removal.receipt);
+            if self.back_no_target_authority_partition.is_some()
+                && !self.back_no_target_authority_partition_is_current(world)
+            {
+                return false;
+            }
         }
 
         let mut removals = prepared.removed.into_iter();
@@ -6543,6 +7413,11 @@ impl CleanupLedger {
             }
             release_cleanup_focus(world, &focus_closure);
             self.commit_receipt_batch(removal.receipt);
+            if self.back_no_target_authority_partition.is_some()
+                && !self.back_no_target_authority_partition_is_current(world)
+            {
+                return false;
+            }
             let completed_after = &prepared.removal_order[..=completed_count];
             if !focus_is_released(world, &focus_closure)
                 || !removals
@@ -6558,11 +7433,21 @@ impl CleanupLedger {
             if !residual.is_current(world) {
                 return false;
             }
+            let indices = residual.indices;
             release_cleanup_focus(world, &focus_closure);
             residual.presentation.apply(world);
             apply_authority_registry_transfers(world, residual.transfers);
             self.commit_receipt_batch(residual.receipts);
+            let Some(focus_roots) = self.terminal_focus_roots(world, &indices) else {
+                return false;
+            };
+            self.remember_post_settlement_focus(focus_roots);
             apply_authority_residual_postwrite_drift(world);
+            if self.back_no_target_authority_partition.is_some()
+                && !self.back_no_target_authority_partition_is_current(world)
+            {
+                return false;
+            }
             if !focus_is_released(world, &focus_closure) {
                 return false;
             }
@@ -6788,6 +7673,11 @@ impl CleanupLedger {
                         .clone(),
                 );
             }
+            let verified_lease = if claims.is_empty() {
+                None
+            } else {
+                publication_capacity.verified_id(verified_ordinal)
+            };
             let transfers = prepare_authority_registry_transfers(
                 world,
                 &publication_capacity,
@@ -6799,7 +7689,9 @@ impl CleanupLedger {
                 quarantine_facts(&group_evidence),
             )?;
             residuals.push(PreparedAuthorityResidualGroup {
+                indices,
                 manifests,
+                verified_lease,
                 presentation,
                 transfers,
                 receipts,
@@ -6808,10 +7700,147 @@ impl CleanupLedger {
         if verified_ordinal != verified_group_count || lost_offset != lost_fact_count {
             return None;
         }
+        let terminal_projections = if self.back_no_target_authority_partition.is_some() {
+            dispositions
+                .iter()
+                .map(|plan| {
+                    let obligation = self.obligations.get(plan.index)?;
+                    let entity = obligation.claim.entity();
+                    let receipt_binding = receipt_binding(
+                        self.ledger_domain,
+                        attempt.revision,
+                        plan.index,
+                        plan.disposition,
+                        obligation,
+                    );
+                    let (registry_claim, presence, authority) = match plan.action {
+                        AuthoritySettlementAction::AlreadyAbsent
+                        | AuthoritySettlementAction::Remove => (
+                            None,
+                            PreparedBackNoTargetAuthorityTerminalPresence::Absent,
+                            PreparedBackNoTargetAuthorityTerminalAuthority::None,
+                        ),
+                        AuthoritySettlementAction::VerifiedResidual => {
+                            let residual = residuals
+                                .iter()
+                                .find(|residual| residual.indices.contains(&plan.index))?;
+                            let lease = residual.verified_lease?;
+                            let mut lease_entities = residual
+                                .indices
+                                .iter()
+                                .filter_map(|index| {
+                                    dispositions
+                                        .iter()
+                                        .find(|candidate| candidate.index == *index)
+                                        .is_some_and(|candidate| {
+                                            candidate.action
+                                                == AuthoritySettlementAction::VerifiedResidual
+                                        })
+                                        .then_some(self.obligations[*index].claim.entity())
+                                })
+                                .collect::<Vec<_>>();
+                            lease_entities.sort_by_key(|entity| entity.to_bits());
+                            let manifest =
+                                residual
+                                    .manifests
+                                    .iter()
+                                    .find_map(|(candidate, manifest)| {
+                                        (*candidate == entity).then_some(manifest.clone())
+                                    })?;
+                            let parent = authority_projected_parent(world, entity, &host_edge);
+                            let children =
+                                authority_projected_children(world, entity, &removal_entities);
+                            let ownership_seal = world.get::<RouteOwnershipSeal>(entity).copied();
+                            (
+                                None,
+                                PreparedBackNoTargetAuthorityTerminalPresence::Retained {
+                                    parent,
+                                    children,
+                                    ownership_seal,
+                                    manifest: manifest.clone(),
+                                },
+                                PreparedBackNoTargetAuthorityTerminalAuthority::Quarantine {
+                                    lease,
+                                    lease_entities,
+                                    owner: obligation.claim.owner().clone(),
+                                    seal: obligation.claim.seal(),
+                                    manifest,
+                                },
+                            )
+                        }
+                        AuthoritySettlementAction::LostResidual => {
+                            let residual = residuals
+                                .iter()
+                                .find(|residual| residual.indices.contains(&plan.index))?;
+                            let projection = residual
+                                .transfers
+                                .lost
+                                .as_ref()?
+                                .terminal_projections()
+                                .find(|projection| projection.obligation() == plan.index)?;
+                            if projection.ledger_domain() != self.ledger_domain
+                                || projection.manifest_digest() != self.manifest_digest
+                                || projection.attempt_revision() != attempt.revision
+                                || projection.obligation_binding()
+                                    != cleanup_obligation_binding(obligation)
+                                || projection.terminal_receipt_binding() != receipt_binding
+                                || projection.retired_claim() != &obligation.claim
+                            {
+                                return None;
+                            }
+                            let registry_claim = projection.observed_registry_claim().cloned();
+                            let presence = if projection.entity_present_at_receipt() {
+                                PreparedBackNoTargetAuthorityTerminalPresence::Retained {
+                                    parent: authority_projected_parent(world, entity, &host_edge),
+                                    children: authority_projected_children(
+                                        world,
+                                        entity,
+                                        &removal_entities,
+                                    ),
+                                    ownership_seal: world
+                                        .get::<RouteOwnershipSeal>(entity)
+                                        .copied(),
+                                    manifest: authority_projected_manifest(
+                                        world,
+                                        entity,
+                                        &host_edge,
+                                        &removal_entities,
+                                        &pickable_repair,
+                                    )?,
+                                }
+                            } else {
+                                PreparedBackNoTargetAuthorityTerminalPresence::Absent
+                            };
+                            (
+                            registry_claim,
+                            presence,
+                            PreparedBackNoTargetAuthorityTerminalAuthority::AuthorityLostTombstone {
+                                projection,
+                            },
+                        )
+                        }
+                    };
+                    Some(PreparedBackNoTargetAuthorityTerminalProjection {
+                        obligation: plan.index,
+                        entity,
+                        ledger_domain: self.ledger_domain,
+                        attempt_revision: attempt.revision,
+                        disposition: plan.disposition,
+                        receipt_binding,
+                        registry_claim,
+                        presence,
+                        authority,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         Some(PreparedAuthoritySettlement {
             publication_capacity,
             pickable_repair,
             prepublication_evidence,
+            terminal_projections,
             host_edge,
             absent,
             removed,
@@ -7878,6 +8907,14 @@ fn terminal_quarantine_root_is_inert(world: &World, claim: &ExactRegistryClaim) 
             .is_some_and(RouterInputBarrier::denies_all)
 }
 
+fn terminal_authority_lost_entity_is_inert(world: &World, entity: Entity) -> bool {
+    world.get::<Visibility>(entity) == Some(&Visibility::Hidden)
+        && world.get::<Pickable>(entity) == Some(&Pickable::IGNORE)
+        && world
+            .get::<RouterInputBarrier>(entity)
+            .is_some_and(RouterInputBarrier::denies_all)
+}
+
 fn terminal_unresolved_root_is_inert(
     world: &World,
     claim: &ExactRegistryClaim,
@@ -8736,6 +9773,27 @@ fn authority_projected_manifest(
     ))
 }
 
+fn authority_projected_parent(
+    world: &World,
+    entity: Entity,
+    host_edge: &PreparedAuthorityHostEdge,
+) -> Option<Entity> {
+    (!host_edge.removes_child_of(entity))
+        .then(|| world.get::<ChildOf>(entity).map(ChildOf::parent))
+        .flatten()
+}
+
+fn authority_projected_children(
+    world: &World,
+    entity: Entity,
+    removal_entities: &HashSet<Entity>,
+) -> Vec<Entity> {
+    observed_children(world, entity)
+        .into_iter()
+        .filter(|child| !removal_entities.contains(child))
+        .collect()
+}
+
 fn project_cleanup_evidence_after_pickable_repair(
     evidence: CleanupEvidence,
     pickable: ComponentId,
@@ -9293,6 +10351,7 @@ pub(crate) mod tests {
             quarantine_event_observed: false,
             post_settlement_focus: Vec::new(),
             authority_host_children: None,
+            back_no_target_authority_partition: None,
         };
         let source = ledger.back_no_target_zero_completion_source_identity();
         let prepared = PreparedBackNoTargetZeroCompletion {
@@ -9599,6 +10658,12 @@ pub(crate) mod tests {
             top_slot: Entity,
             top_slot_claim: ExactRegistryClaim,
         },
+        BackNoTargetAuthority {
+            active_claims: Vec<ExactRegistryClaim>,
+            host: Entity,
+            top_slot: Entity,
+            top_slot_claim: ExactRegistryClaim,
+        },
     }
 
     fn cleanup_owner_snapshot(owner: Option<&CleanupOwner>) -> CleanupOwnerSnapshot {
@@ -9620,6 +10685,14 @@ pub(crate) mod tests {
                     top_slot_claim: owner.host.top_slot_claim.clone(),
                 }
             }
+            Some(CleanupOwner::BackNoTargetAuthority(owner)) => {
+                CleanupOwnerSnapshot::BackNoTargetAuthority {
+                    active_claims: claims(&owner.active),
+                    host: owner.host.host,
+                    top_slot: owner.host.top_slot,
+                    top_slot_claim: owner.host.top_slot_claim.clone(),
+                }
+            }
         }
     }
 
@@ -9633,6 +10706,7 @@ pub(crate) mod tests {
         quarantine_event_observed: bool,
         post_settlement_focus: Vec<PostSettlementFocusRoot>,
         authority_host_children: Option<Vec<Entity>>,
+        back_no_target_authority_partition: Option<FrozenBackNoTargetAuthorityPartition>,
         quarantine_sequences: Option<(u64, u64, usize)>,
         entity_claim: Option<ExactRegistryClaim>,
         entity_seal: Option<RouteOwnershipSeal>,
@@ -9685,6 +10759,7 @@ pub(crate) mod tests {
             quarantine_event_observed: ledger.quarantine_event_observed,
             post_settlement_focus: ledger.post_settlement_focus.clone(),
             authority_host_children: ledger.authority_host_children.clone(),
+            back_no_target_authority_partition: ledger.back_no_target_authority_partition.clone(),
             quarantine_sequences: quarantine.map(|table| {
                 (
                     table.next_sequence_for_test(),
