@@ -31,9 +31,9 @@ use bevy_ui_router_core::{
         FrameMountTarget, HistoryAdmissionStamp, HistoryAdmissionWorldSeal,
         HistoryExecutionBindingView, HostLease, IntegrationError, LifecycleContinuationCapacity,
         MountMutationArtifact, MountReceiptProof, MountRegistrationBeginError, MountRequest,
-        PreparationReceiverMismatchView, PrepareBackAdmissionErrorKind,
-        PreparedPostCommitContinuationOwner, ResolveMountOwner, RootFrameTask,
-        RouteFailureContinuationOwner, RouterEngine, TargetAuthoritySettlementOwner,
+        PreparationBoundaryScopeView, PreparationReceiverMismatchView,
+        PrepareBackAdmissionErrorKind, PreparedPostCommitContinuationOwner, ResolveMountOwner,
+        RootFrameTask, RouteFailureContinuationOwner, RouterEngine, TargetAuthoritySettlementOwner,
         VerifiedBackNoTargetCandidate, VerifiedBackResolutionContradiction,
         VerifiedBackResolutionOwnerHandoff, VerifiedBackTargetExecutionOwner, ViewFailureKind,
         ViewReportIdentity,
@@ -107,8 +107,8 @@ use crate::{
         validate_realized_frame,
     },
     registry::{
-        EntityLifecycle, EntityOwner, ExactRegistryClaim, ProvisionalOwner, RegistryOwner,
-        RouteEntityRegistry,
+        ComponentManifest, EntityLifecycle, EntityOwner, ExactRegistryClaim, ProvisionalOwner,
+        RegistryOwner, RouteEntityRegistry,
     },
     snapshots::RouterSnapshots,
 };
@@ -709,6 +709,82 @@ pub(crate) enum PreparationPermanentEvidence {
 pub(crate) struct PreparationPermanentOwner<Owner> {
     owner: Owner,
     evidence: PreparationPermanentEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FrozenTargetPreparationPermanentObservedEntity {
+    entity: bevy_ecs::entity::Entity,
+    parent: Option<bevy_ecs::entity::Entity>,
+    children: Vec<bevy_ecs::entity::Entity>,
+    registry_claim: Option<ExactRegistryClaim>,
+    ownership_seal: Option<RouteOwnershipSeal>,
+    manifest: Option<ComponentManifest>,
+}
+
+#[derive(Clone)]
+pub(crate) struct FrozenTargetPreparationPermanentLineage {
+    router: RouterHandle,
+    host: bevy_ecs::entity::Entity,
+    scope: PreparationBoundaryScopeView,
+}
+
+#[derive(Clone)]
+pub(crate) struct FrozenTargetPreparationPermanentProtectedClosures {
+    roots: Vec<bevy_ecs::entity::Entity>,
+    observed: Vec<FrozenTargetPreparationPermanentObservedEntity>,
+}
+
+#[derive(Clone)]
+pub(crate) struct FrozenTargetPreparationPermanentAllowedWriteSet {
+    targets: Vec<bevy_ecs::entity::Entity>,
+}
+
+pub(crate) enum FrozenTargetPreparationPermanentBranch {
+    Classifier {
+        physical: BackTargetClassifiedPhysicalOwner,
+        frozen_manifest: FrozenCleanupManifest,
+        evidence: PreparationPermanentEvidence,
+    },
+    ReadyPlan {
+        physical: PreparedBackTargetPhysicalOwner,
+        frozen_manifest: FrozenCleanupManifest,
+        evidence: PreparationPermanentEvidence,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) struct FrozenTargetPreparationPermanentPhysicalManifest {
+    lineage: FrozenTargetPreparationPermanentLineage,
+    target_observed: Vec<FrozenTargetPreparationPermanentObservedEntity>,
+    protected: FrozenTargetPreparationPermanentProtectedClosures,
+    allowed_write: FrozenTargetPreparationPermanentAllowedWriteSet,
+}
+
+pub(crate) struct TargetPreparationPermanentCleanupOwner {
+    physical: FrozenTargetPreparationPermanentPhysicalManifest,
+    branch: FrozenTargetPreparationPermanentBranch,
+}
+
+pub(crate) struct BackTargetPermanentAuthorityManifest {
+    cleanup: CleanupManifest,
+}
+
+pub(crate) struct TargetPreparationPermanentDisposition {
+    cleanup: TargetPreparationPermanentCleanupOwner,
+    settlement: TargetAuthoritySettlementOwner,
+    manifest: BackTargetPermanentAuthorityManifest,
+}
+
+pub(crate) enum BackTargetClassifierPermanentPreparationOutcome {
+    Prepared(TargetPreparationPermanentDisposition),
+    PhysicalMismatch {
+        owner: PreparationPermanentOwner<TargetPreparationOwner>,
+        evidence: LifecyclePreflightEvidence,
+    },
+    ReceiverMismatch {
+        owner: PreparationPermanentOwner<TargetPreparationOwner>,
+        mismatch: PreparationReceiverMismatchView,
+    },
 }
 
 pub(crate) enum PendingBackTargetClassification {
@@ -7688,6 +7764,582 @@ pub(crate) fn classify_back_target(
             ))
         }
     }
+}
+
+pub(crate) fn prepare_back_target_classifier_permanent(
+    world: &World,
+    entry: &mut RouterEntry,
+    owner: PreparationPermanentOwner<TargetPreparationOwner>,
+) -> BackTargetClassifierPermanentPreparationOutcome {
+    fn mismatch(
+        source: LifecyclePreflightSource,
+        expectation: LifecyclePreflightExpectation,
+        observed: LifecyclePreflightObserved,
+    ) -> LifecyclePreflightEvidence {
+        LifecyclePreflightEvidence::new(source, expectation, observed)
+    }
+
+    fn observe(
+        world: &World,
+        registry: &RouteEntityRegistry,
+        entity: bevy_ecs::entity::Entity,
+    ) -> FrozenTargetPreparationPermanentObservedEntity {
+        FrozenTargetPreparationPermanentObservedEntity {
+            entity,
+            parent: world
+                .get::<bevy_ecs::hierarchy::ChildOf>(entity)
+                .map(bevy_ecs::hierarchy::ChildOf::parent),
+            children: world
+                .get::<bevy_ecs::hierarchy::Children>(entity)
+                .map(|children| children.iter().copied().collect())
+                .unwrap_or_default(),
+            registry_claim: registry.record(entity).map(|record| record.claim()),
+            ownership_seal: world.get::<RouteOwnershipSeal>(entity).copied(),
+            manifest: ComponentManifest::from_world(world, entity),
+        }
+    }
+
+    fn claim_belongs_to_host(host: &HostBinding, claim: &ExactRegistryClaim) -> bool {
+        match claim.owner() {
+            RegistryOwner::Committed(
+                EntityOwner::FrameShell(frame)
+                | EntityOwner::FrameContentTarget(frame)
+                | EntityOwner::FrameOutput { frame, .. },
+            )
+            | RegistryOwner::Committed(EntityOwner::ChildSlot { parent: frame, .. })
+            | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { parent: frame, .. }) => {
+                bevy_ui_router_core::integration::host_version_matches_frame(&host.version, frame)
+            }
+            RegistryOwner::Committed(EntityOwner::HostTopSlot {
+                host: version,
+                slot,
+            }) => version == &host.version && *slot == host.slot_id,
+            RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(_)) => false,
+        }
+    }
+
+    fn relationship_closure_is_exact(
+        world: &World,
+        closure: &std::collections::HashSet<bevy_ecs::entity::Entity>,
+    ) -> bool {
+        for parent in closure.iter().copied() {
+            let children = world
+                .get::<bevy_ecs::hierarchy::Children>(parent)
+                .map(|children| children.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let unique = children
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            if unique.len() != children.len()
+                || children.iter().any(|child| {
+                    !closure.contains(child)
+                        || world
+                            .get::<bevy_ecs::hierarchy::ChildOf>(*child)
+                            .map(bevy_ecs::hierarchy::ChildOf::parent)
+                            != Some(parent)
+                })
+            {
+                return false;
+            }
+        }
+        world.iter_entities().all(|entity| {
+            let Some(parent) = entity
+                .get::<bevy_ecs::hierarchy::ChildOf>()
+                .map(bevy_ecs::hierarchy::ChildOf::parent)
+            else {
+                return true;
+            };
+            !closure.contains(&parent)
+                || closure.contains(&entity.id())
+                    && world
+                        .get::<bevy_ecs::hierarchy::Children>(parent)
+                        .is_some_and(|children| {
+                            children
+                                .iter()
+                                .filter(|child| **child == entity.id())
+                                .count()
+                                == 1
+                        })
+        })
+    }
+
+    let Some(ticket) = entry
+        .pending_commit
+        .as_ref()
+        .and_then(|pending| pending.ticket.as_ref())
+    else {
+        return BackTargetClassifierPermanentPreparationOutcome::PhysicalMismatch {
+            owner,
+            evidence: mismatch(
+                LifecyclePreflightSource::PendingAdmission,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ),
+        };
+    };
+    if let BackTargetExecutionPairingOutcome::Mismatch(mismatch) =
+        entry.engine.validate_back_target_execution_pairing(
+            BackTargetExecutionOwnerRef::Classifying {
+                history: &owner.owner.history,
+                continuation: &owner.owner.continuation,
+            },
+            BackTargetPhysicalOwnerRef::CommitTicket(ticket),
+        )
+    {
+        return BackTargetClassifierPermanentPreparationOutcome::ReceiverMismatch {
+            owner,
+            mismatch,
+        };
+    }
+
+    let physical = (|| {
+        if entry.pending_back_target_execution.is_some()
+            || entry.active.is_some()
+            || entry.pending_commit.as_ref().is_none_or(|pending| {
+                pending.ticket.is_none()
+                    || pending.final_task.is_some()
+                    || !pending.branch.frames().is_empty()
+                    || !pending.branch.child_slots().is_empty()
+            })
+        {
+            return Err(mismatch(
+                LifecyclePreflightSource::PendingAdmission,
+                LifecyclePreflightExpectation::ExactTaskShape,
+                LifecyclePreflightObserved::Drifted,
+            ));
+        }
+        let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+            return Err(mismatch(
+                LifecyclePreflightSource::RequiredResources(
+                    RequiredResourceSet::ROUTE_ENTITY_REGISTRY,
+                ),
+                LifecyclePreflightExpectation::ResourcePresent,
+                LifecyclePreflightObserved::Missing,
+            ));
+        };
+        let Some(host) = entry.host.as_ref() else {
+            return Err(mismatch(
+                LifecyclePreflightSource::HostBinding,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Missing,
+            ));
+        };
+        if world
+            .get::<crate::app_ext::RouterHostRegistration>(host.host)
+            .is_none_or(|registration| registration.router() != entry.handle)
+            || !current_host_binding_is_exact(world, host)
+        {
+            return Err(mismatch(
+                LifecyclePreflightSource::HostBinding,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ));
+        }
+        if registry.record(host.host).is_some()
+            || world.get::<RouteOwnershipSeal>(host.host).is_some()
+        {
+            return Err(mismatch(
+                LifecyclePreflightSource::HostBinding,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ));
+        }
+
+        let splice = &owner.owner.splice;
+        let entering_boundaries = splice
+            .entering()
+            .claims()
+            .map(ExactRegistryClaim::entity)
+            .collect::<Vec<_>>();
+        if validate_preserved_branch_local(
+            world,
+            splice.preserved(),
+            splice.slot_roles(),
+            &entering_boundaries,
+        )
+        .is_err()
+        {
+            return Err(mismatch(
+                LifecyclePreflightSource::PreservedCurrent,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ));
+        }
+        if validate_leaving_branch_for_splice(world, splice.leaving(), splice.slot_roles()).is_err()
+        {
+            return Err(mismatch(
+                LifecyclePreflightSource::LeavingCurrent,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ));
+        }
+        if validate_reconciliation_entering_branch(
+            world,
+            splice.entering(),
+            splice.preserved(),
+            splice.leaving(),
+        )
+        .is_err()
+        {
+            return Err(mismatch(
+                LifecyclePreflightSource::PendingEntering,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ));
+        }
+        if validate_active_branch_for_splice(
+            world,
+            splice.preserved(),
+            splice.entering(),
+            splice.slot_roles(),
+        )
+        .is_err()
+        {
+            return Err(mismatch(
+                LifecyclePreflightSource::CrossRoleRebase,
+                LifecyclePreflightExpectation::RebaseCompatible,
+                LifecyclePreflightObserved::Contradictory,
+            ));
+        }
+
+        let transitions = splice.lifecycle_transitions();
+        let Some(registry_plan) = registry.prepare_lifecycle_mutation(&transitions) else {
+            return Err(mismatch(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Contradictory,
+            ));
+        };
+        let host_closure = observed_descendant_closure(world, [host.host]);
+        if !host_closure.contains(&host.top_slot)
+            || !relationship_closure_is_exact(world, &host_closure)
+        {
+            return Err(mismatch(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactRelationshipClosure,
+                LifecyclePreflightObserved::Drifted,
+            ));
+        }
+
+        let mut accepted_roles = std::collections::HashMap::new();
+        for claim in splice
+            .preserved()
+            .claims()
+            .chain(splice.entering().claims())
+            .chain(splice.leaving().claims())
+            .chain(splice.slot_roles().iter().map(|role| role.claim()))
+            .chain(std::iter::once(&host.top_slot_claim))
+        {
+            if accepted_roles
+                .insert(claim.entity(), claim.clone())
+                .is_some_and(|previous| previous != *claim)
+            {
+                return Err(mismatch(
+                    LifecyclePreflightSource::TargetPartition,
+                    LifecyclePreflightExpectation::ExactAuthority,
+                    LifecyclePreflightObserved::Contradictory,
+                ));
+            }
+        }
+        if accepted_roles.iter().any(|(entity, claim)| {
+            *entity == host.host
+                || !host_closure.contains(entity)
+                || !claim_belongs_to_host(host, claim)
+                || !registered_claim_has_exact_authority_and_manifest_coverage(
+                    world,
+                    registry,
+                    claim,
+                    *entity == host.top_slot,
+                )
+        }) {
+            return Err(mismatch(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ));
+        }
+
+        let mut targets = transitions
+            .iter()
+            .map(|(claim, _)| claim.entity())
+            .collect::<Vec<_>>();
+        targets.sort_by_key(|entity| entity.to_bits());
+        targets.dedup();
+        if targets.len() != transitions.len()
+            || targets.iter().any(|target| {
+                *target == host.host || *target == host.top_slot || !host_closure.contains(target)
+            })
+            || transitions.iter().any(|(claim, _)| {
+                accepted_roles.get(&claim.entity()) != Some(claim)
+                    || !registered_claim_has_exact_authority_and_manifest_coverage(
+                        world, registry, claim, false,
+                    )
+            })
+        {
+            return Err(mismatch(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ));
+        }
+
+        let target_set = targets
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let mut target_observed = targets
+            .iter()
+            .copied()
+            .map(|entity| observe(world, registry, entity))
+            .collect::<Vec<_>>();
+        target_observed.sort_by_key(|observed| observed.entity.to_bits());
+
+        let mut closure_entities = host_closure.iter().copied().collect::<Vec<_>>();
+        closure_entities.sort_by_key(|entity| entity.to_bits());
+        let mut protected_entities = Vec::new();
+        for entity in closure_entities {
+            if entity == host.host || target_set.contains(&entity) {
+                continue;
+            }
+            if accepted_roles.contains_key(&entity) {
+                protected_entities.push(entity);
+                continue;
+            }
+            match registry.record(entity) {
+                None if world.get::<RouteOwnershipSeal>(entity).is_none() => {
+                    protected_entities.push(entity);
+                }
+                None => {
+                    return Err(mismatch(
+                        LifecyclePreflightSource::TargetPartition,
+                        LifecyclePreflightExpectation::ExactAuthority,
+                        LifecyclePreflightObserved::Drifted,
+                    ));
+                }
+                Some(record) => {
+                    let claim = record.claim();
+                    if !registered_claim_has_exact_authority_and_manifest_coverage(
+                        world, registry, &claim, false,
+                    ) {
+                        return Err(mismatch(
+                            LifecyclePreflightSource::TargetPartition,
+                            LifecyclePreflightExpectation::ExactAuthority,
+                            LifecyclePreflightObserved::Drifted,
+                        ));
+                    }
+                    if claim_belongs_to_host(host, &claim) {
+                        return Err(mismatch(
+                            LifecyclePreflightSource::TargetPartition,
+                            LifecyclePreflightExpectation::ExactAuthority,
+                            LifecyclePreflightObserved::Contradictory,
+                        ));
+                    }
+                    protected_entities.push(entity);
+                }
+            }
+        }
+        protected_entities.sort_by_key(|entity| entity.to_bits());
+        let protected_set = protected_entities
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let subtree_has_target = |entity| {
+            observed_descendant_closure(world, [entity])
+                .iter()
+                .any(|descendant| target_set.contains(descendant))
+        };
+        let mut protected_roots = protected_entities
+            .iter()
+            .copied()
+            .filter(|entity| {
+                if subtree_has_target(*entity) {
+                    return false;
+                }
+                world
+                    .get::<bevy_ecs::hierarchy::ChildOf>(*entity)
+                    .map(bevy_ecs::hierarchy::ChildOf::parent)
+                    .is_none_or(|parent| {
+                        !protected_set.contains(&parent) || subtree_has_target(parent)
+                    })
+            })
+            .collect::<Vec<_>>();
+        protected_roots.sort_by_key(|entity| entity.to_bits());
+        let protected_root_closure =
+            observed_descendant_closure(world, protected_roots.iter().copied());
+        if protected_root_closure
+            .iter()
+            .any(|entity| target_set.contains(entity) || !protected_set.contains(entity))
+            || protected_entities.iter().any(|entity| {
+                !subtree_has_target(*entity) && !protected_root_closure.contains(entity)
+            })
+        {
+            return Err(mismatch(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactRelationshipClosure,
+                LifecyclePreflightObserved::Contradictory,
+            ));
+        }
+        let protected_observed = protected_entities
+            .iter()
+            .copied()
+            .map(|entity| observe(world, registry, entity))
+            .collect::<Vec<_>>();
+
+        let frozen_manifest = if splice.leaving().obligation_count() == 0 {
+            FrozenCleanupManifest::empty()
+        } else {
+            let Some(manifest) = FrozenCleanupManifest::from_leaving_branch(
+                world,
+                registry,
+                splice.leaving(),
+                registry_plan.resulting_claims(),
+                (!splice.entering().frames().is_empty()).then_some(splice.entering()),
+            ) else {
+                return Err(mismatch(
+                    LifecyclePreflightSource::TargetPartition,
+                    LifecyclePreflightExpectation::ExactRelationshipClosure,
+                    LifecyclePreflightObserved::Contradictory,
+                ));
+            };
+            manifest
+        };
+        let manifest = CleanupManifest::new(
+            logical_cleanup_roots(splice.leaving()),
+            frozen_manifest.digest(),
+            frozen_manifest.len(),
+        );
+        let scope = owner.owner.continuation.preparation_boundary_scope();
+        Ok((
+            FrozenTargetPreparationPermanentPhysicalManifest {
+                lineage: FrozenTargetPreparationPermanentLineage {
+                    router: entry.handle,
+                    host: host.host,
+                    scope: scope.clone(),
+                },
+                target_observed,
+                protected: FrozenTargetPreparationPermanentProtectedClosures {
+                    roots: protected_roots,
+                    observed: protected_observed,
+                },
+                allowed_write: FrozenTargetPreparationPermanentAllowedWriteSet { targets },
+            },
+            frozen_manifest,
+            manifest,
+            scope,
+        ))
+    })();
+
+    let (physical, frozen_manifest, manifest, scope) = match physical {
+        Ok(physical) => physical,
+        Err(evidence) => {
+            return BackTargetClassifierPermanentPreparationOutcome::PhysicalMismatch {
+                owner,
+                evidence,
+            };
+        }
+    };
+    let PreparationPermanentOwner {
+        owner:
+            TargetPreparationOwner {
+                splice,
+                history,
+                continuation,
+            },
+        evidence,
+    } = owner;
+    let cleanup = TargetPreparationPermanentCleanupOwner {
+        physical,
+        branch: FrozenTargetPreparationPermanentBranch::Classifier {
+            physical: BackTargetClassifiedPhysicalOwner { splice, history },
+            frozen_manifest,
+            evidence,
+        },
+    };
+    match entry
+        .engine
+        .accept_back_target_authority_lost(continuation, scope)
+    {
+        BackTargetPreparationAcceptance::Matched(settlement) => {
+            BackTargetClassifierPermanentPreparationOutcome::Prepared(
+                TargetPreparationPermanentDisposition {
+                    cleanup,
+                    settlement,
+                    manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+                },
+            )
+        }
+        BackTargetPreparationAcceptance::Mismatch { capacity, mismatch } => {
+            let TargetPreparationPermanentCleanupOwner {
+                physical: _,
+                branch,
+            } = cleanup;
+            let FrozenTargetPreparationPermanentBranch::Classifier {
+                physical: BackTargetClassifiedPhysicalOwner { splice, history },
+                frozen_manifest: _,
+                evidence,
+            } = branch
+            else {
+                unreachable!("the classifier adapter retains its branch-specific owner")
+            };
+            BackTargetClassifierPermanentPreparationOutcome::ReceiverMismatch {
+                owner: PreparationPermanentOwner {
+                    owner: TargetPreparationOwner {
+                        splice,
+                        history,
+                        continuation: capacity,
+                    },
+                    evidence,
+                },
+                mismatch,
+            }
+        }
+    }
+}
+
+fn registered_claim_has_exact_authority_and_manifest_coverage(
+    world: &World,
+    registry: &RouteEntityRegistry,
+    claim: &ExactRegistryClaim,
+    relationship_carrier: bool,
+) -> bool {
+    let Some(record) = registry.record(claim.entity()) else {
+        return false;
+    };
+    let Some(actual) = ComponentManifest::from_world(world, claim.entity()) else {
+        return false;
+    };
+    let child_of = world
+        .components()
+        .component_id::<bevy_ecs::hierarchy::ChildOf>();
+    let children = world
+        .components()
+        .component_id::<bevy_ecs::hierarchy::Children>();
+    let normalized = |manifest: &ComponentManifest| {
+        ComponentManifest::new(
+            manifest
+                .component_ids()
+                .iter()
+                .copied()
+                .filter(|component| Some(*component) != child_of)
+                .filter(|component| Some(*component) != children),
+        )
+    };
+    let required_manifest_is_covered =
+        |required: &ComponentManifest, actual: &ComponentManifest| {
+            required
+                .component_ids()
+                .iter()
+                .all(|component| actual.component_ids().contains(component))
+        };
+    let manifest_has_required_coverage = if relationship_carrier {
+        required_manifest_is_covered(&normalized(record.manifest()), &normalized(&actual))
+    } else {
+        required_manifest_is_covered(record.manifest(), &actual)
+    };
+    record.claim() == *claim
+        && cleanup_claim_has_exact_authority(world, claim)
+        && manifest_has_required_coverage
 }
 
 fn normalize_back_target_driver_claims(
@@ -26825,6 +27477,2120 @@ pub(crate) mod tests {
             },
         );
         back
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ClassifierPermanentSourceProjection {
+        history: HistoryExecutionBindingView,
+        preserved: Vec<ExactRegistryClaim>,
+        entering: Vec<ExactRegistryClaim>,
+        leaving: Vec<ExactRegistryClaim>,
+        allowed_write_targets: Vec<Entity>,
+        evidence: (
+            LifecyclePreflightSource,
+            LifecyclePreflightExpectation,
+            LifecyclePreflightObserved,
+        ),
+    }
+
+    impl ClassifierPermanentSourceProjection {
+        fn capture(owner: &PreparationPermanentOwner<TargetPreparationOwner>) -> Self {
+            Self::capture_parts(&owner.owner.splice, &owner.owner.history, &owner.evidence)
+        }
+
+        fn capture_parts(
+            splice: &SealedReconciliationSplice,
+            history: &HistoryExecutionBindingView,
+            permanent: &PreparationPermanentEvidence,
+        ) -> Self {
+            let mut allowed_write_targets = splice
+                .leaving()
+                .claims()
+                .chain(splice.entering().claims())
+                .map(ExactRegistryClaim::entity)
+                .collect::<Vec<_>>();
+            allowed_write_targets.sort_by_key(|entity| entity.to_bits());
+            allowed_write_targets.dedup();
+            let PreparationPermanentEvidence::PhysicalPreparationContradiction(evidence) =
+                permanent;
+            Self {
+                history: history.clone(),
+                preserved: splice.preserved().claims().cloned().collect(),
+                entering: splice.entering().claims().cloned().collect(),
+                leaving: splice.leaving().claims().cloned().collect(),
+                allowed_write_targets,
+                evidence: (
+                    evidence.source(),
+                    evidence.expectation(),
+                    evidence.observed(),
+                ),
+            }
+        }
+    }
+
+    struct StagedClassifierPermanent {
+        request: NavigationRequestId,
+        owner: PreparationPermanentOwner<TargetPreparationOwner>,
+        host: Entity,
+        top_slot: Entity,
+        protected: [Entity; 2],
+        drifted_mount_children: Vec<Entity>,
+    }
+
+    #[derive(Clone, Eq, PartialEq)]
+    struct ClassifierPermanentPendingCommitProjection {
+        ticket: Option<ViewReportIdentity>,
+        final_task: Option<ViewReportIdentity>,
+        frames: Vec<RouteFrameVersion>,
+        claims: Vec<ExactRegistryClaim>,
+    }
+
+    #[derive(Clone, Eq, PartialEq)]
+    struct ClassifierPermanentEntryLocalProjection {
+        pending_commit: Option<ClassifierPermanentPendingCommitProjection>,
+        pending_back_target_execution_occupied: bool,
+        cleanup_ledger_occupied: bool,
+        authority_protocol_residual_occupied: bool,
+        pending_back_no_target_completion_occupied: bool,
+        pending_back_no_target_preparation_occupied: bool,
+        pending_back_no_target_authority_cleanup_occupied: bool,
+    }
+
+    impl ClassifierPermanentEntryLocalProjection {
+        fn capture(entry: &RouterEntry) -> Self {
+            Self {
+                pending_commit: entry.pending_commit.as_ref().map(|pending| {
+                    ClassifierPermanentPendingCommitProjection {
+                        ticket: pending.ticket.as_ref().map(CommitTicket::report_identity),
+                        final_task: pending
+                            .final_task
+                            .as_ref()
+                            .map(RootFrameTask::report_identity),
+                        frames: pending
+                            .branch
+                            .frames()
+                            .iter()
+                            .map(|frame| frame.frame().clone())
+                            .collect(),
+                        claims: pending.branch.as_realized().claims().cloned().collect(),
+                    }
+                }),
+                pending_back_target_execution_occupied: entry
+                    .pending_back_target_execution
+                    .is_some(),
+                cleanup_ledger_occupied: entry.cleanup_ledger.is_some(),
+                authority_protocol_residual_occupied: entry.authority_protocol_residual.is_some(),
+                pending_back_no_target_completion_occupied: entry
+                    .pending_back_no_target_completion
+                    .is_some(),
+                pending_back_no_target_preparation_occupied: entry
+                    .pending_back_no_target_preparation
+                    .is_some(),
+                pending_back_no_target_authority_cleanup_occupied: entry
+                    .pending_back_no_target_authority_cleanup
+                    .is_some(),
+            }
+        }
+    }
+
+    fn move_hierarchy_child_to_end(world: &mut World, child: Entity) {
+        let parent = world
+            .get::<ChildOf>(child)
+            .map(ChildOf::parent)
+            .expect("the real mounted shell retains its physical parent");
+        let relationship = world
+            .entity_mut(child)
+            .take::<ChildOf>()
+            .expect("the real mounted shell retains its ChildOf owner");
+        world.entity_mut(child).insert(relationship);
+        world.flush();
+        assert_eq!(
+            world.get::<ChildOf>(child).map(ChildOf::parent),
+            Some(parent),
+            "the source-fact drift changes only real sibling order"
+        );
+    }
+
+    fn install_classifier_permanent_fixture(
+        app: &mut App,
+        name: &'static str,
+    ) -> (RouterHandle, [Entity; 2]) {
+        let router = install_atomic_router_at_pattern(app, name, "/:id");
+        app.update();
+        let host = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the admitted router retains its exact entry")
+            .host
+            .as_ref()
+            .expect("the admitted router retains its app-owned host")
+            .host;
+        let protected_root = app.world_mut().spawn(ChildOf(host)).id();
+        let protected_leaf = app.world_mut().spawn(ChildOf(protected_root)).id();
+        for location in ["/a", "/b"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .expect("the real fixture accepts its forward request");
+            run_updates_until_succeeded(app, request);
+        }
+        (router, [protected_root, protected_leaf])
+    }
+
+    fn stage_real_back_target_classifier_permanent(
+        app: &mut App,
+        router: RouterHandle,
+        protected: [Entity; 2],
+        restore_exact_physical_facts: bool,
+    ) -> StagedClassifierPermanent {
+        let request = stage_real_back_target_applied_commit(app, router);
+        let (host, top_slot, leaving_shell, entering_shell, exact_mount_children) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the real classifier fixture retains its entry");
+            let host = entry
+                .host
+                .as_ref()
+                .expect("the real classifier fixture retains its HostBinding");
+            let leaving_shell = entry
+                .active
+                .as_ref()
+                .and_then(RealizedBranch::first_frame)
+                .expect("the real classifier fixture retains one active leaving frame")
+                .shell();
+            let Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::AppliedCommitPending(applied),
+            )) = entry.pending_back_target_execution.as_ref()
+            else {
+                panic!("the real applied commit must retain its whole pending owner")
+            };
+            let entering_shell = applied
+                .pending
+                .branch
+                .last_frame()
+                .expect("the real applied commit retains one entering frame")
+                .shell();
+            let exact_mount_children = app
+                .world()
+                .get::<Children>(host.top_slot)
+                .expect("the exact top slot contains leaving and entering shells")
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            (
+                host.host,
+                host.top_slot,
+                leaving_shell,
+                entering_shell,
+                exact_mount_children,
+            )
+        };
+        assert_eq!(
+            exact_mount_children,
+            vec![leaving_shell, entering_shell],
+            "the real splice starts with the canonical replacement ordering"
+        );
+
+        move_hierarchy_child_to_end(app.world_mut(), leaving_shell);
+        let drifted_mount_children = app
+            .world()
+            .get::<Children>(top_slot)
+            .expect("the drifted top slot still retains both exact shells")
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            drifted_mount_children,
+            vec![entering_shell, leaving_shell],
+            "the real classifier predicate input is independently drifted"
+        );
+
+        let owner = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the real classifier fixture retains its entry");
+                assert!(
+                    drive_back_target_applied_commit(world, entry),
+                    "the real applied commit must reach the production classifier"
+                );
+                let Some(PendingBackTargetExecution::Classifying(
+                    PendingBackTargetClassification::Permanent(owner),
+                )) = entry.pending_back_target_execution.take()
+                else {
+                    panic!(
+                        "the real mount-order contradiction must produce the whole classifier permanent owner"
+                    )
+                };
+                owner
+            },
+        );
+        assert_eq!(
+            ClassifierPermanentSourceProjection::capture(&owner).evidence,
+            (
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactRelationshipClosure,
+                LifecyclePreflightObserved::Contradictory,
+            ),
+            "the source must come from the real classifier physical-manifest predicate"
+        );
+
+        if restore_exact_physical_facts {
+            move_hierarchy_child_to_end(app.world_mut(), entering_shell);
+            assert_eq!(
+                app.world()
+                    .get::<Children>(top_slot)
+                    .expect("the restored top slot retains both exact shells")
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                exact_mount_children,
+                "the exact adapter fixture restores the real World fact before refreeze"
+            );
+        }
+
+        StagedClassifierPermanent {
+            request,
+            owner,
+            host,
+            top_slot,
+            protected,
+            drifted_mount_children,
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ClassifierPermanentAuthorityObservedEntity {
+        entity: Entity,
+        parent: Option<Entity>,
+        children: Vec<Entity>,
+        registry_claim: Option<ExactRegistryClaim>,
+        ownership_seal: Option<RouteOwnershipSeal>,
+        manifest: Option<ComponentManifest>,
+        frame_lifecycle: Option<FrameLifecycle>,
+        provisional_slot_lifecycle: Option<ProvisionalSlotLifecycle>,
+        host_registration_router: Option<RouterHandle>,
+        visibility: Option<Visibility>,
+        pickable: Option<(bool, bool)>,
+        input_barrier: Option<RouterInputBarrier>,
+    }
+
+    impl From<&ClassifierPermanentAuthorityObservedEntity>
+        for FrozenTargetPreparationPermanentObservedEntity
+    {
+        fn from(observed: &ClassifierPermanentAuthorityObservedEntity) -> Self {
+            Self {
+                entity: observed.entity,
+                parent: observed.parent,
+                children: observed.children.clone(),
+                registry_claim: observed.registry_claim.clone(),
+                ownership_seal: observed.ownership_seal,
+                manifest: observed.manifest.clone(),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ClassifierPermanentAuthorityStateProjection {
+        observed: Vec<ClassifierPermanentAuthorityObservedEntity>,
+    }
+
+    impl ClassifierPermanentAuthorityStateProjection {
+        fn capture(world: &World, host: Entity) -> Self {
+            let mut entities = observed_descendant_closure(world, [host])
+                .into_iter()
+                .collect::<Vec<_>>();
+            entities.sort_by_key(|entity| entity.to_bits());
+            Self {
+                observed: entities
+                    .into_iter()
+                    .map(|entity| ClassifierPermanentAuthorityObservedEntity {
+                        entity,
+                        parent: world.get::<ChildOf>(entity).map(ChildOf::parent),
+                        children: world
+                            .get::<Children>(entity)
+                            .map(|children| children.iter().copied().collect())
+                            .unwrap_or_default(),
+                        registry_claim: world
+                            .resource::<RouteEntityRegistry>()
+                            .record(entity)
+                            .map(|record| record.claim()),
+                        ownership_seal: world.get::<RouteOwnershipSeal>(entity).copied(),
+                        manifest: ComponentManifest::from_world(world, entity),
+                        frame_lifecycle: world.get::<FrameLifecycle>(entity).copied(),
+                        provisional_slot_lifecycle: world
+                            .get::<ProvisionalSlotLifecycle>(entity)
+                            .copied(),
+                        host_registration_router: world
+                            .get::<RouterHostRegistration>(entity)
+                            .map(|registration| registration.router()),
+                        visibility: world.get::<Visibility>(entity).copied(),
+                        pickable: world
+                            .get::<Pickable>(entity)
+                            .map(|pickable| (pickable.should_block_lower, pickable.is_hoverable)),
+                        input_barrier: world.get::<RouterInputBarrier>(entity).copied(),
+                    })
+                    .collect(),
+            }
+        }
+
+        fn observed_for(
+            &self,
+            entities: impl IntoIterator<Item = Entity>,
+        ) -> Vec<FrozenTargetPreparationPermanentObservedEntity> {
+            let expected = entities
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            let mut observed = self
+                .observed
+                .iter()
+                .filter(|observed| expected.contains(&observed.entity))
+                .map(FrozenTargetPreparationPermanentObservedEntity::from)
+                .collect::<Vec<_>>();
+            observed.sort_by_key(|observed| observed.entity.to_bits());
+            assert_eq!(
+                observed.len(),
+                expected.len(),
+                "every expected classifier authority Entity must have been captured before the production call"
+            );
+            observed
+        }
+
+        fn protected_for(
+            &self,
+            host: Entity,
+            targets: impl IntoIterator<Item = Entity>,
+        ) -> Vec<FrozenTargetPreparationPermanentObservedEntity> {
+            let targets = targets
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            self.observed_for(
+                self.observed
+                    .iter()
+                    .map(|observed| observed.entity)
+                    .filter(|entity| *entity != host && !targets.contains(entity)),
+            )
+        }
+    }
+
+    fn assert_classifier_permanent_returned_owner_pairs_exact_ticket(
+        app: &App,
+        router: RouterHandle,
+        owner: &PreparationPermanentOwner<TargetPreparationOwner>,
+    ) {
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the classifier rejection retains its exact RouterEntry");
+        let ticket = entry
+            .pending_commit
+            .as_ref()
+            .and_then(|pending| pending.ticket.as_ref())
+            .expect("the classifier rejection retains its exact CommitTicket");
+        assert!(
+            matches!(
+                entry.engine.validate_back_target_execution_pairing(
+                    BackTargetExecutionOwnerRef::Classifying {
+                        history: &owner.owner.history,
+                        continuation: &owner.owner.continuation,
+                    },
+                    BackTargetPhysicalOwnerRef::CommitTicket(ticket),
+                ),
+                BackTargetExecutionPairingOutcome::Matched
+            ),
+            "the returned classifier continuation must remain paired with the original exact history/receiver scope"
+        );
+    }
+
+    fn classifier_permanent_same_authority_frame(
+        owner: &PreparationPermanentOwner<TargetPreparationOwner>,
+    ) -> RouteFrameVersion {
+        owner
+            .owner
+            .splice
+            .leaving()
+            .claims()
+            .find_map(|claim| match claim.owner() {
+                RegistryOwner::Committed(
+                    EntityOwner::FrameShell(frame)
+                    | EntityOwner::FrameContentTarget(frame)
+                    | EntityOwner::FrameOutput { frame, .. },
+                ) => Some(frame.clone()),
+                _ => None,
+            })
+            .expect("the root replacement leaving role retains one exact frame authority")
+    }
+
+    fn spawn_exact_unclassified_same_authority_descendant(
+        app: &mut App,
+        parent: Entity,
+        frame: RouteFrameVersion,
+    ) -> (Entity, ExactRegistryClaim) {
+        let entity = app.world_mut().spawn_empty().id();
+        let manifest = ComponentManifest::new([
+            app.world()
+                .components()
+                .component_id::<RouteOwnershipSeal>()
+                .expect("the real router registers ownership seals"),
+            app.world()
+                .components()
+                .component_id::<FrameLifecycle>()
+                .expect("the real router registers frame lifecycle"),
+            app.world()
+                .components()
+                .component_id::<ChildOf>()
+                .expect("the real router registers hierarchy relationships"),
+        ]);
+        let seal = {
+            let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
+            let seal = registry.issue_seal();
+            registry
+                .register(
+                    entity,
+                    RegistryOwner::Committed(EntityOwner::FrameOutput {
+                        frame,
+                        output: u64::MAX,
+                        local_index: usize::MAX,
+                    }),
+                    seal,
+                    manifest.clone(),
+                    EntityLifecycle::PreparedInert,
+                )
+                .expect("one exact same-authority unclassified Entity must be registrable");
+            seal
+        };
+        app.world_mut().entity_mut(entity).insert((
+            RouteOwnershipSeal::new(seal),
+            FrameLifecycle(EntityLifecycle::PreparedInert),
+            ChildOf(parent),
+        ));
+        app.world_mut().flush();
+
+        let claim = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(entity)
+            .map(|record| record.claim())
+            .expect("the unclassified same-authority Entity retains its exact claim");
+        assert_eq!(
+            ComponentManifest::from_world(app.world(), entity),
+            Some(manifest),
+            "the registered manifest must equal the real physical manifest"
+        );
+        assert!(cleanup_claim_has_exact_authority(app.world(), &claim));
+        assert_eq!(
+            app.world().get::<ChildOf>(entity).map(ChildOf::parent),
+            Some(parent)
+        );
+        (entity, claim)
+    }
+
+    #[derive(Component)]
+    struct ClassifierPermanentForeignMarker;
+
+    #[test]
+    fn classifier_permanent_top_slot_manifest_normalizes_only_relationship_carriers() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, protected) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-classifier-permanent-top-slot-manifest-normalization",
+        );
+        let staged = stage_real_back_target_classifier_permanent(&mut app, router, protected, true);
+        let child_of = app
+            .world()
+            .components()
+            .component_id::<ChildOf>()
+            .expect("the real top slot registers ChildOf");
+        let node = app
+            .world()
+            .components()
+            .component_id::<Node>()
+            .expect("the real top slot registers Node");
+        let top_slot_claim = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(staged.top_slot)
+            .expect("the real top slot retains its exact registry claim")
+            .claim();
+        {
+            let world = app.world();
+            let registry = world.resource::<RouteEntityRegistry>();
+            let record = registry
+                .record(staged.top_slot)
+                .expect("the exact top slot remains registered");
+            assert_eq!(record.claim(), top_slot_claim);
+            assert!(
+                record.manifest().component_ids().contains(&child_of),
+                "ChildOf is a registry-recorded relationship carrier on the exact top-slot claim"
+            );
+            assert!(
+                record.manifest().component_ids().contains(&node),
+                "Node is a non-relationship requirement on the exact top-slot claim"
+            );
+            assert!(registered_claim_has_exact_authority_and_manifest_coverage(
+                world,
+                registry,
+                &top_slot_claim,
+                false,
+            ));
+        }
+
+        app.world_mut()
+            .entity_mut(staged.top_slot)
+            .remove::<ChildOf>();
+        app.world_mut().flush();
+        {
+            let world = app.world();
+            let registry = world.resource::<RouteEntityRegistry>();
+            assert!(cleanup_claim_has_exact_authority(world, &top_slot_claim));
+            assert!(world.get::<ChildOf>(staged.top_slot).is_none());
+            assert!(
+                !registered_claim_has_exact_authority_and_manifest_coverage(
+                    world,
+                    registry,
+                    &top_slot_claim,
+                    false,
+                ),
+                "without relationship-carrier routing, a missing registered ChildOf must fail manifest coverage"
+            );
+            assert!(
+                registered_claim_has_exact_authority_and_manifest_coverage(
+                    world,
+                    registry,
+                    &top_slot_claim,
+                    true,
+                ),
+                "relationship-carrier normalization must exclude the exact top-slot ChildOf without relaxing authority"
+            );
+        }
+
+        app.world_mut().entity_mut(staged.top_slot).remove::<Node>();
+        let world = app.world();
+        let registry = world.resource::<RouteEntityRegistry>();
+        assert!(
+            !registered_claim_has_exact_authority_and_manifest_coverage(
+                world,
+                registry,
+                &top_slot_claim,
+                true,
+            ),
+            "relationship-carrier normalization must not authorize a missing non-relationship requirement"
+        );
+    }
+
+    #[test]
+    fn back_target_classifier_permanent_accepts_foreign_component_additions() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, protected) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-classifier-permanent-foreign-component",
+        );
+        let staged = stage_real_back_target_classifier_permanent(&mut app, router, protected, true);
+        publish_snapshots_system(app.world_mut());
+        let source_before = ClassifierPermanentSourceProjection::capture(&staged.owner);
+        let leaving_shell_claim = staged
+            .owner
+            .owner
+            .splice
+            .leaving()
+            .claims()
+            .find(|claim| {
+                matches!(
+                    claim.owner(),
+                    RegistryOwner::Committed(EntityOwner::FrameShell(_))
+                )
+            })
+            .cloned()
+            .expect("the real replacement retains one leaving shell role");
+        let leaving_shell = leaving_shell_claim.entity();
+        let (registered_manifest, seal_before, lifecycle_before, parent_before, children_before) = {
+            let world = app.world();
+            let record = world
+                .resource::<RouteEntityRegistry>()
+                .record(leaving_shell)
+                .expect("the leaving shell retains its exact registry record");
+            assert_eq!(record.claim(), leaving_shell_claim);
+            assert_eq!(
+                ComponentManifest::from_world(world, leaving_shell).as_ref(),
+                Some(record.manifest()),
+                "the real leaving shell starts with no unregistered component"
+            );
+            (
+                record.manifest().clone(),
+                *world
+                    .get::<RouteOwnershipSeal>(leaving_shell)
+                    .expect("the leaving shell retains its ownership seal"),
+                *world
+                    .get::<FrameLifecycle>(leaving_shell)
+                    .expect("the leaving shell retains its lifecycle"),
+                world.get::<ChildOf>(leaving_shell).map(ChildOf::parent),
+                world
+                    .get::<Children>(leaving_shell)
+                    .map(|children| children.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            )
+        };
+
+        app.world_mut()
+            .entity_mut(leaving_shell)
+            .insert(ClassifierPermanentForeignMarker);
+        let marker_component = app
+            .world()
+            .components()
+            .component_id::<ClassifierPermanentForeignMarker>()
+            .expect("inserting the foreign marker registers its component type");
+        let actual_manifest = ComponentManifest::from_world(app.world(), leaving_shell)
+            .expect("the marked leaving shell remains observable");
+        let additions = actual_manifest
+            .component_ids()
+            .iter()
+            .copied()
+            .filter(|component| !registered_manifest.component_ids().contains(component))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            additions,
+            vec![marker_component],
+            "only the non-authoritative foreign marker may extend the physical manifest"
+        );
+        assert!(
+            registered_manifest
+                .component_ids()
+                .iter()
+                .all(|component| actual_manifest.component_ids().contains(component)),
+            "every registry-required component must remain physically present"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(leaving_shell)
+                .map(|record| (record.claim(), record.manifest().clone())),
+            Some((leaving_shell_claim.clone(), registered_manifest.clone())),
+            "the foreign component must not rewrite the exact registry claim or manifest"
+        );
+        assert_eq!(
+            app.world().get::<RouteOwnershipSeal>(leaving_shell),
+            Some(&seal_before)
+        );
+        assert_eq!(
+            app.world().get::<FrameLifecycle>(leaving_shell),
+            Some(&lifecycle_before)
+        );
+        assert!(cleanup_claim_has_exact_authority(
+            app.world(),
+            &leaving_shell_claim
+        ));
+        assert_eq!(
+            app.world()
+                .get::<ChildOf>(leaving_shell)
+                .map(ChildOf::parent),
+            parent_before
+        );
+        assert_eq!(
+            app.world()
+                .get::<Children>(leaving_shell)
+                .map(|children| children.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            children_before
+        );
+
+        let authority_before =
+            ClassifierPermanentAuthorityStateProjection::capture(app.world(), staged.host);
+        let expected_frozen_targets =
+            authority_before.observed_for(source_before.allowed_write_targets.iter().copied());
+        let expected_frozen_protected = authority_before.protected_for(
+            staged.host,
+            source_before.allowed_write_targets.iter().copied(),
+        );
+        let world_before = authority_world_fingerprint(app.world());
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .expect("the marked fixture retains its public snapshot")
+            .clone();
+        let public_request_before = match app
+            .world()
+            .resource::<RouterSnapshots>()
+            .request(router, staged.request)
+        {
+            crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+            _ => panic!("the marked fixture retains its public Back request snapshot"),
+        };
+        let (entry_local_before, core_before, request_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the marked fixture retains its exact entry");
+            (
+                ClassifierPermanentEntryLocalProjection::capture(entry),
+                entry.engine.snapshot(),
+                entry
+                    .engine
+                    .request(staged.request)
+                    .expect("the marked fixture retains its Back request")
+                    .status()
+                    .clone(),
+            )
+        };
+        if let Err(error) = validate_leaving_branch_for_splice(
+            app.world(),
+            staged.owner.owner.splice.leaving(),
+            staged.owner.owner.splice.slot_roles(),
+        ) {
+            let entity = match error {
+                crate::frame_local::FrameLocalError::MissingRoot(entity)
+                | crate::frame_local::FrameLocalError::OwnershipDrift(entity)
+                | crate::frame_local::FrameLocalError::RelationshipCycle(entity)
+                | crate::frame_local::FrameLocalError::ForeignChildSlot(entity) => entity,
+            };
+            panic!(
+                "RED-DIAGNOSTIC: ManifestPolicy::Observed leaving validation must accept the foreign addition; error={error:?}; entity={entity:?}; marked_leaving_shell={leaving_shell:?}"
+            );
+        }
+        if let Err(error) = validate_reconciliation_entering_branch(
+            app.world(),
+            staged.owner.owner.splice.entering(),
+            staged.owner.owner.splice.preserved(),
+            staged.owner.owner.splice.leaving(),
+        ) {
+            let entity = match error {
+                crate::frame_local::FrameLocalError::MissingRoot(entity)
+                | crate::frame_local::FrameLocalError::OwnershipDrift(entity)
+                | crate::frame_local::FrameLocalError::RelationshipCycle(entity)
+                | crate::frame_local::FrameLocalError::ForeignChildSlot(entity) => entity,
+            };
+            panic!(
+                "RED-DIAGNOSTIC-2: reconciliation entering validation must observe the exact leaving sibling's foreign addition; error={error:?}; entity={entity:?}; marked_leaving_shell={leaving_shell:?}"
+            );
+        }
+        let disposition = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the marked fixture retains its exact entry");
+                match prepare_back_target_classifier_permanent(world, entry, staged.owner) {
+                    BackTargetClassifierPermanentPreparationOutcome::Prepared(disposition) => {
+                        disposition
+                    }
+                    BackTargetClassifierPermanentPreparationOutcome::PhysicalMismatch {
+                        owner,
+                        evidence,
+                    } => {
+                        assert_eq!(
+                            ClassifierPermanentSourceProjection::capture(&owner),
+                            source_before,
+                            "manifest-policy rejection must return the whole classifier source"
+                        );
+                        panic!(
+                            "RED: an added foreign component on an exact accepted role must remain observable and prepare; evidence={:?}",
+                            (evidence.source(), evidence.expectation(), evidence.observed())
+                        )
+                    }
+                    BackTargetClassifierPermanentPreparationOutcome::ReceiverMismatch { .. } => {
+                        panic!("the original Core receiver remains exactly paired")
+                    }
+                }
+            },
+        );
+
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            ClassifierPermanentAuthorityStateProjection::capture(app.world(), staged.host),
+            authority_before,
+            "foreign-component preparation must preserve every pre-call authority fact"
+        );
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .get(router)
+                .expect("preparation retains the public snapshot"),
+            &public_before
+        );
+        assert!(matches!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .request(router, staged.request),
+            crate::snapshots::RequestLookup::Found(snapshot)
+                if snapshot == &public_request_before
+        ));
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("preparation retains the exact entry");
+        assert_eq!(entry.engine.snapshot(), core_before);
+        assert_eq!(
+            entry
+                .engine
+                .request(staged.request)
+                .expect("preparation retains the Back request")
+                .status(),
+            &request_before
+        );
+        assert!(
+            ClassifierPermanentEntryLocalProjection::capture(entry) == entry_local_before,
+            "preparation must preserve the pending ticket, branch and holder shape"
+        );
+
+        let TargetPreparationPermanentDisposition {
+            cleanup,
+            settlement: _settlement,
+            manifest: _manifest,
+        } = disposition;
+        let TargetPreparationPermanentCleanupOwner {
+            physical,
+            branch: _branch,
+        } = cleanup;
+        let marked = physical
+            .target_observed
+            .iter()
+            .find(|observed| observed.entity == leaving_shell)
+            .expect("the marked leaving target must remain in the frozen target partition");
+        assert_eq!(marked.registry_claim.as_ref(), Some(&leaving_shell_claim));
+        assert_eq!(marked.ownership_seal, Some(seal_before));
+        assert_eq!(marked.parent, parent_before);
+        assert_eq!(marked.children, children_before);
+        assert_eq!(marked.manifest.as_ref(), Some(&actual_manifest));
+        assert!(
+            marked
+                .manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.component_ids().contains(&marker_component)),
+            "the accepted target observation must retain the real foreign component fact"
+        );
+        let mut observed_targets = physical
+            .target_observed
+            .iter()
+            .map(|observed| observed.entity)
+            .collect::<Vec<_>>();
+        observed_targets.sort_by_key(|entity| entity.to_bits());
+        let mut allowed_write = physical.allowed_write.targets.clone();
+        allowed_write.sort_by_key(|entity| entity.to_bits());
+        assert_eq!(allowed_write, source_before.allowed_write_targets);
+        assert_eq!(observed_targets, allowed_write);
+        assert_eq!(physical.target_observed, expected_frozen_targets);
+        assert_eq!(physical.protected.observed, expected_frozen_protected);
+        assert!(
+            physical
+                .protected
+                .observed
+                .iter()
+                .all(|observed| !allowed_write.contains(&observed.entity)),
+            "foreign component additions must not widen or overlap the protected partition"
+        );
+    }
+
+    #[test]
+    fn back_target_classifier_permanent_rejects_missing_required_component() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, protected) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-classifier-permanent-missing-required-component",
+        );
+        let staged = stage_real_back_target_classifier_permanent(&mut app, router, protected, true);
+        publish_snapshots_system(app.world_mut());
+        let source_before = ClassifierPermanentSourceProjection::capture(&staged.owner);
+        let leaving_shell_claim = staged
+            .owner
+            .owner
+            .splice
+            .leaving()
+            .claims()
+            .find(|claim| {
+                matches!(
+                    claim.owner(),
+                    RegistryOwner::Committed(EntityOwner::FrameShell(_))
+                )
+            })
+            .cloned()
+            .expect("the real replacement retains one leaving shell role");
+        let leaving_shell = leaving_shell_claim.entity();
+        let node_component = app
+            .world()
+            .components()
+            .component_id::<Node>()
+            .expect("the real leaving shell registers Node");
+        {
+            let world = app.world();
+            let record = world
+                .resource::<RouteEntityRegistry>()
+                .record(leaving_shell)
+                .expect("the leaving shell retains its exact registry record");
+            assert_eq!(record.claim(), leaving_shell_claim);
+            assert!(
+                record.manifest().component_ids().contains(&node_component),
+                "Node is a non-relationship registry requirement for the leaving shell"
+            );
+            assert!(
+                ComponentManifest::from_world(world, leaving_shell)
+                    .is_some_and(|actual| actual == *record.manifest()),
+                "the real leaving shell begins with its exact physical manifest"
+            );
+        }
+        assert!(
+            app.world().get::<Node>(leaving_shell).is_some(),
+            "the single-variable perturbation requires the real leaving-shell Node"
+        );
+        app.world_mut().entity_mut(leaving_shell).remove::<Node>();
+
+        let (authority_before, world_before, registry_before, entry_local_before) = {
+            let world = app.world();
+            let actual = ComponentManifest::from_world(world, leaving_shell)
+                .expect("the missing-Node shell remains physically observable");
+            let record = world
+                .resource::<RouteEntityRegistry>()
+                .record(leaving_shell)
+                .expect("removing Node cannot rewrite the registry record");
+            assert!(
+                !actual.component_ids().contains(&node_component)
+                    && record.manifest().component_ids().contains(&node_component),
+                "the perturbation leaves one registry-required, non-relationship component absent"
+            );
+            assert!(cleanup_claim_has_exact_authority(
+                world,
+                &leaving_shell_claim
+            ));
+            let entry = world
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the missing-component fixture retains its exact entry");
+            (
+                ClassifierPermanentAuthorityStateProjection::capture(world, staged.host),
+                authority_world_fingerprint(world),
+                world.resource::<RouteEntityRegistry>().records().to_vec(),
+                ClassifierPermanentEntryLocalProjection::capture(entry),
+            )
+        };
+
+        let returned = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the missing-component fixture retains its exact entry");
+                match prepare_back_target_classifier_permanent(world, entry, staged.owner) {
+                    BackTargetClassifierPermanentPreparationOutcome::PhysicalMismatch {
+                        owner,
+                        ..
+                    } => owner,
+                    BackTargetClassifierPermanentPreparationOutcome::Prepared(_) => panic!(
+                        "a missing registry-required component must permanently reject before mutation"
+                    ),
+                    BackTargetClassifierPermanentPreparationOutcome::ReceiverMismatch { .. } => {
+                        panic!("the original Core receiver remains exactly paired")
+                    }
+                }
+            },
+        );
+
+        assert_eq!(
+            ClassifierPermanentSourceProjection::capture(&returned),
+            source_before,
+            "missing required manifest coverage must return the whole classifier source"
+        );
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            ClassifierPermanentAuthorityStateProjection::capture(app.world(), staged.host),
+            authority_before,
+            "missing required manifest rejection must preserve every pre-call authority fact"
+        );
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the rejection retains its exact entry");
+        assert!(
+            ClassifierPermanentEntryLocalProjection::capture(entry) == entry_local_before,
+            "missing required manifest coverage must leave entry-local state unchanged"
+        );
+        assert_classifier_permanent_returned_owner_pairs_exact_ticket(&app, router, &returned);
+    }
+
+    #[test]
+    fn back_target_classifier_permanent_freezes_exact_world_physical_facts() {
+        let mut physical_app = App::new();
+        physical_app.add_plugins(BevyUiRouterPlugin::default());
+        let (physical_router, physical_protected) = install_classifier_permanent_fixture(
+            &mut physical_app,
+            "back-classifier-permanent-physical",
+        );
+        let physical = stage_real_back_target_classifier_permanent(
+            &mut physical_app,
+            physical_router,
+            physical_protected,
+            false,
+        );
+        let physical_source = ClassifierPermanentSourceProjection::capture(&physical.owner);
+        let physical_authority_before = ClassifierPermanentAuthorityStateProjection::capture(
+            physical_app.world(),
+            physical.host,
+        );
+        let physical_world_before = authority_world_fingerprint(physical_app.world());
+        let physical_registry_before = physical_app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let physical_engine_before = physical_app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == physical_router)
+            .expect("the physical mismatch fixture retains its entry")
+            .engine
+            .snapshot();
+        let physical_entry_local_before = {
+            let navigation = physical_app.world().resource::<RouterNavigation>();
+            ClassifierPermanentEntryLocalProjection::capture(
+                navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == physical_router)
+                    .expect("the physical mismatch fixture retains its entry-local owner slots"),
+            )
+        };
+        let physical_public_before = physical_app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(physical_router)
+            .expect("the physical mismatch fixture retains its public snapshot")
+            .clone();
+        let physical_request_before = physical_app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == physical_router)
+            .and_then(|entry| entry.engine.request(physical.request))
+            .expect("the physical mismatch fixture retains its Back request")
+            .status()
+            .clone();
+        let physical_mount_before = physical_app
+            .world()
+            .get::<Children>(physical.top_slot)
+            .expect("the drifted top slot remains observable")
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(physical_mount_before, physical.drifted_mount_children);
+        let physical_owner = physical_app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == physical_router)
+                    .expect("the physical mismatch fixture retains its entry");
+                match prepare_back_target_classifier_permanent(world, entry, physical.owner) {
+                    BackTargetClassifierPermanentPreparationOutcome::PhysicalMismatch {
+                        owner,
+                        evidence,
+                    } => {
+                        assert_eq!(
+                            (evidence.source(), evidence.expectation()),
+                            (
+                                LifecyclePreflightSource::TargetPartition,
+                                LifecyclePreflightExpectation::ExactRelationshipClosure,
+                            ),
+                            "physical rejection must retain typed non-authorizing boundary evidence"
+                        );
+                        owner
+                    }
+                    BackTargetClassifierPermanentPreparationOutcome::Prepared(_)
+                    | BackTargetClassifierPermanentPreparationOutcome::ReceiverMismatch {
+                        ..
+                    } => panic!(
+                        "real physical drift must whole-return the classifier source before Core acceptance"
+                    ),
+                }
+            },
+        );
+        assert_eq!(
+            ClassifierPermanentSourceProjection::capture(&physical_owner),
+            physical_source,
+            "physical mismatch must conserve the whole original typed source"
+        );
+        assert_eq!(
+            authority_world_fingerprint(physical_app.world()),
+            physical_world_before
+        );
+        assert_eq!(
+            ClassifierPermanentAuthorityStateProjection::capture(
+                physical_app.world(),
+                physical.host,
+            ),
+            physical_authority_before,
+            "physical relationship rejection must preserve every pre-call authority fact"
+        );
+        assert_eq!(
+            physical_app
+                .world()
+                .resource::<RouteEntityRegistry>()
+                .records(),
+            physical_registry_before
+        );
+        let physical_entry = physical_app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == physical_router)
+            .expect("the physical mismatch fixture retains its entry");
+        assert_eq!(physical_entry.engine.snapshot(), physical_engine_before);
+        assert!(
+            ClassifierPermanentEntryLocalProjection::capture(physical_entry)
+                == physical_entry_local_before,
+            "physical mismatch must preserve the pending ticket, branch and holder shape"
+        );
+        assert_eq!(
+            physical_entry
+                .engine
+                .request(physical.request)
+                .expect("physical mismatch retains the Back request")
+                .status(),
+            &physical_request_before
+        );
+        assert_eq!(
+            physical_app
+                .world()
+                .resource::<RouterSnapshots>()
+                .get(physical_router)
+                .expect("physical mismatch retains the public snapshot"),
+            &physical_public_before
+        );
+        assert_eq!(
+            physical_app
+                .world()
+                .get::<Children>(physical.top_slot)
+                .expect("physical mismatch retains the drifted relationship fact")
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            physical_mount_before
+        );
+        assert_classifier_permanent_returned_owner_pairs_exact_ticket(
+            &physical_app,
+            physical_router,
+            &physical_owner,
+        );
+
+        let mut exact_app = App::new();
+        exact_app.add_plugins(BevyUiRouterPlugin::default());
+        let (exact_router, exact_protected) =
+            install_classifier_permanent_fixture(&mut exact_app, "back-classifier-permanent-exact");
+        let exact = stage_real_back_target_classifier_permanent(
+            &mut exact_app,
+            exact_router,
+            exact_protected,
+            true,
+        );
+        let exact_source = ClassifierPermanentSourceProjection::capture(&exact.owner);
+        let exact_authority_before =
+            ClassifierPermanentAuthorityStateProjection::capture(exact_app.world(), exact.host);
+        let expected_frozen_targets =
+            exact_authority_before.observed_for(exact_source.allowed_write_targets.iter().copied());
+        let expected_frozen_protected = exact_authority_before.protected_for(
+            exact.host,
+            exact_source.allowed_write_targets.iter().copied(),
+        );
+        let exact_world_before = authority_world_fingerprint(exact_app.world());
+        let exact_registry_before = exact_app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let exact_engine_before = exact_app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == exact_router)
+            .expect("the exact fixture retains its entry")
+            .engine
+            .snapshot();
+        let exact_entry_local_before = {
+            let navigation = exact_app.world().resource::<RouterNavigation>();
+            ClassifierPermanentEntryLocalProjection::capture(
+                navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == exact_router)
+                    .expect("the exact fixture retains its entry-local owner slots"),
+            )
+        };
+        let exact_public_before = exact_app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(exact_router)
+            .expect("the exact fixture retains its public snapshot")
+            .clone();
+        let exact_request_before = exact_app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == exact_router)
+            .and_then(|entry| entry.engine.request(exact.request))
+            .expect("the exact fixture retains its Back request")
+            .status()
+            .clone();
+        let disposition = exact_app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == exact_router)
+                    .expect("the exact fixture retains its entry");
+                match prepare_back_target_classifier_permanent(world, entry, exact.owner) {
+                    BackTargetClassifierPermanentPreparationOutcome::Prepared(disposition) => {
+                        disposition
+                    }
+                    BackTargetClassifierPermanentPreparationOutcome::PhysicalMismatch {
+                        owner,
+                        evidence,
+                    } => {
+                        assert_eq!(
+                            ClassifierPermanentSourceProjection::capture(&owner),
+                            exact_source,
+                            "the RED scaffold must not lose the exact whole source"
+                        );
+                        panic!(
+                            "RED: exact classifier permanent preparation must freeze physical facts and accept only the original continuation; scaffold evidence={:?}",
+                            (evidence.source(), evidence.expectation(), evidence.observed())
+                        )
+                    }
+                    BackTargetClassifierPermanentPreparationOutcome::ReceiverMismatch { .. } => {
+                        panic!("the exact original Core receiver must accept its continuation")
+                    }
+                }
+            },
+        );
+        assert_eq!(
+            authority_world_fingerprint(exact_app.world()),
+            exact_world_before,
+            "exact preparation must be a World zero-write"
+        );
+        assert_eq!(
+            ClassifierPermanentAuthorityStateProjection::capture(exact_app.world(), exact.host),
+            exact_authority_before,
+            "exact preparation must preserve every pre-call authority fact, including relationships, claims, seals, manifests, lifecycle, visibility, pickability and input barriers"
+        );
+        assert_eq!(
+            exact_app
+                .world()
+                .resource::<RouteEntityRegistry>()
+                .records(),
+            exact_registry_before
+        );
+        assert_eq!(
+            exact_app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == exact_router)
+                .expect("the exact fixture retains its entry")
+                .engine
+                .snapshot(),
+            exact_engine_before,
+            "exact acceptance prepares a linear settlement without a semantic Core write"
+        );
+        assert!(
+            ClassifierPermanentEntryLocalProjection::capture(
+                exact_app
+                    .world()
+                    .resource::<RouterNavigation>()
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == exact_router)
+                    .expect("exact preparation retains its entry-local owner slots"),
+            ) == exact_entry_local_before,
+            "exact preparation must preserve the pending ticket, branch and holder shape"
+        );
+        assert_eq!(
+            exact_app
+                .world()
+                .resource::<RouterSnapshots>()
+                .get(exact_router)
+                .expect("exact preparation retains the public snapshot"),
+            &exact_public_before
+        );
+        assert_eq!(
+            exact_app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == exact_router)
+                .and_then(|entry| entry.engine.request(exact.request))
+                .expect("exact preparation retains the Back request")
+                .status(),
+            &exact_request_before
+        );
+        let TargetPreparationPermanentDisposition {
+            cleanup,
+            settlement: _settlement,
+            manifest,
+        } = disposition;
+        let TargetPreparationPermanentCleanupOwner { physical, branch } = cleanup;
+        assert_eq!(physical.lineage.router, exact_router);
+        assert_eq!(physical.lineage.host, exact.host);
+        let _exact_scope = &physical.lineage.scope;
+        let mut target_observed = physical
+            .target_observed
+            .iter()
+            .map(|observed| observed.entity)
+            .collect::<Vec<_>>();
+        target_observed.sort_by_key(|entity| entity.to_bits());
+        let mut allowed_write = physical.allowed_write.targets.clone();
+        allowed_write.sort_by_key(|entity| entity.to_bits());
+        assert_eq!(allowed_write, exact_source.allowed_write_targets);
+        assert_eq!(target_observed, allowed_write);
+        assert_eq!(
+            physical.target_observed, expected_frozen_targets,
+            "frozen target evidence must equal the independently captured pre-call target facts"
+        );
+        assert_eq!(
+            physical.protected.observed, expected_frozen_protected,
+            "frozen protected evidence must equal the independently captured pre-call protected facts"
+        );
+        assert!(
+            physical
+                .protected
+                .observed
+                .iter()
+                .all(|protected| !allowed_write.contains(&protected.entity)),
+            "every protected closure must be disjoint from the allowed write set"
+        );
+        let frozen_top_slot = physical
+            .protected
+            .observed
+            .iter()
+            .find(|observed| observed.entity == exact.top_slot)
+            .expect("the exact current top slot must be frozen as a mixed carrier");
+        assert!(
+            expected_frozen_protected.contains(frozen_top_slot),
+            "the pre-call projection must include the mixed top-slot carrier"
+        );
+        assert!(
+            !physical.protected.roots.contains(&exact.top_slot),
+            "the mixed top-slot carrier contains targets and must not become a protected root"
+        );
+        for protected in exact.protected {
+            assert!(
+                physical
+                    .protected
+                    .observed
+                    .iter()
+                    .any(|observed| observed.entity == protected),
+                "every nested app-owned protected Entity must be frozen from pre-call evidence"
+            );
+        }
+        for root in &physical.protected.roots {
+            for entity in observed_descendant_closure(exact_app.world(), [*root]) {
+                assert!(
+                    physical
+                        .protected
+                        .observed
+                        .iter()
+                        .any(|observed| observed.entity == entity),
+                    "every Entity in every protected root closure must be frozen"
+                );
+            }
+        }
+        let BackTargetPermanentAuthorityManifest {
+            cleanup: _core_manifest,
+        } = manifest;
+        match branch {
+            FrozenTargetPreparationPermanentBranch::Classifier {
+                physical,
+                frozen_manifest,
+                evidence,
+            } => {
+                let reconstructed_projection = ClassifierPermanentSourceProjection::capture_parts(
+                    &physical.splice,
+                    &physical.history,
+                    &evidence,
+                );
+                assert_eq!(reconstructed_projection.history, exact_source.history);
+                assert_eq!(reconstructed_projection.preserved, exact_source.preserved);
+                assert_eq!(reconstructed_projection.entering, exact_source.entering);
+                assert_eq!(reconstructed_projection.leaving, exact_source.leaving);
+                assert_eq!(frozen_manifest.len(), exact_source.leaving.len());
+            }
+            FrozenTargetPreparationPermanentBranch::ReadyPlan { .. } => {
+                panic!("a classifier source must never become a Ready-plan permanent branch")
+            }
+        }
+
+        let mut receiver_app = App::new();
+        receiver_app.add_plugins(BevyUiRouterPlugin::default());
+        let (receiver_router, receiver_protected) = install_classifier_permanent_fixture(
+            &mut receiver_app,
+            "back-classifier-permanent-receiver",
+        );
+        let (foreign_router, _) = install_classifier_permanent_fixture(
+            &mut receiver_app,
+            "back-classifier-permanent-foreign",
+        );
+        let receiver = stage_real_back_target_classifier_permanent(
+            &mut receiver_app,
+            receiver_router,
+            receiver_protected,
+            true,
+        );
+        let receiver_source = ClassifierPermanentSourceProjection::capture(&receiver.owner);
+        {
+            let mut navigation = receiver_app.world_mut().resource_mut::<RouterNavigation>();
+            let exact_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == receiver_router)
+                .expect("the receiver fixture retains its exact entry");
+            let foreign_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == foreign_router)
+                .expect("the receiver fixture retains its foreign entry");
+            let (exact, foreign) = if exact_index < foreign_index {
+                let (before, after) = navigation.entries.split_at_mut(foreign_index);
+                (&mut before[exact_index], &mut after[0])
+            } else {
+                let (before, after) = navigation.entries.split_at_mut(exact_index);
+                (&mut after[0], &mut before[foreign_index])
+            };
+            std::mem::swap(&mut exact.engine, &mut foreign.engine);
+        }
+        let receiver_authority_before = ClassifierPermanentAuthorityStateProjection::capture(
+            receiver_app.world(),
+            receiver.host,
+        );
+        let receiver_world_before = authority_world_fingerprint(receiver_app.world());
+        let receiver_registry_before = receiver_app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let receiver_public_before = receiver_app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(receiver_router)
+            .expect("the receiver mismatch fixture retains its public snapshot")
+            .clone();
+        let receiver_mount_before = receiver_app
+            .world()
+            .get::<Children>(receiver.top_slot)
+            .expect("the receiver mismatch fixture retains exact mount facts")
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let (wrong_engine_before, owner_engine_before) = {
+            let navigation = receiver_app.world().resource::<RouterNavigation>();
+            (
+                navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == receiver_router)
+                    .expect("the receiver fixture retains its exact entry")
+                    .engine
+                    .snapshot(),
+                navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == foreign_router)
+                    .expect("the receiver fixture retains its foreign entry")
+                    .engine
+                    .snapshot(),
+            )
+        };
+        let receiver_entry_local_before = {
+            let navigation = receiver_app.world().resource::<RouterNavigation>();
+            ClassifierPermanentEntryLocalProjection::capture(
+                navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == receiver_router)
+                    .expect("the receiver mismatch fixture retains its entry-local owner slots"),
+            )
+        };
+        let returned_receiver_owner = receiver_app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == receiver_router)
+                    .expect("the receiver fixture retains its exact entry");
+                match prepare_back_target_classifier_permanent(world, entry, receiver.owner) {
+                    BackTargetClassifierPermanentPreparationOutcome::ReceiverMismatch {
+                        owner,
+                        mismatch: _mismatch,
+                    } => owner,
+                    BackTargetClassifierPermanentPreparationOutcome::Prepared(_)
+                    | BackTargetClassifierPermanentPreparationOutcome::PhysicalMismatch {
+                        ..
+                    } => panic!(
+                        "an exact physical refreeze with a foreign Core receiver must whole-return typed receiver mismatch"
+                    ),
+                }
+            },
+        );
+        assert_eq!(
+            ClassifierPermanentSourceProjection::capture(&returned_receiver_owner),
+            receiver_source,
+            "Core mismatch must reassemble the same whole classifier source"
+        );
+        assert_eq!(
+            authority_world_fingerprint(receiver_app.world()),
+            receiver_world_before
+        );
+        assert_eq!(
+            ClassifierPermanentAuthorityStateProjection::capture(
+                receiver_app.world(),
+                receiver.host,
+            ),
+            receiver_authority_before,
+            "Core receiver mismatch must preserve every pre-call authority fact"
+        );
+        assert_eq!(
+            receiver_app
+                .world()
+                .resource::<RouteEntityRegistry>()
+                .records(),
+            receiver_registry_before
+        );
+        assert_eq!(
+            receiver_app
+                .world()
+                .resource::<RouterSnapshots>()
+                .get(receiver_router)
+                .expect("Core mismatch retains the public snapshot"),
+            &receiver_public_before
+        );
+        assert_eq!(
+            receiver_app
+                .world()
+                .get::<Children>(receiver.top_slot)
+                .expect("Core mismatch retains exact mount facts")
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            receiver_mount_before
+        );
+        let navigation = receiver_app.world().resource::<RouterNavigation>();
+        assert_eq!(
+            navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == receiver_router)
+                .expect("the receiver fixture retains its exact entry")
+                .engine
+                .snapshot(),
+            wrong_engine_before
+        );
+        assert!(
+            ClassifierPermanentEntryLocalProjection::capture(
+                navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == receiver_router)
+                    .expect("Core mismatch retains its entry-local owner slots"),
+            ) == receiver_entry_local_before,
+            "Core mismatch must preserve the pending ticket, branch and holder shape"
+        );
+        assert_eq!(
+            navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == foreign_router)
+                .expect("the receiver fixture retains its foreign entry")
+                .engine
+                .snapshot(),
+            owner_engine_before
+        );
+        {
+            let mut navigation = receiver_app.world_mut().resource_mut::<RouterNavigation>();
+            let exact_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == receiver_router)
+                .expect("the receiver fixture retains its exact entry");
+            let foreign_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == foreign_router)
+                .expect("the receiver fixture retains its foreign entry");
+            let (exact, foreign) = if exact_index < foreign_index {
+                let (before, after) = navigation.entries.split_at_mut(foreign_index);
+                (&mut before[exact_index], &mut after[0])
+            } else {
+                let (before, after) = navigation.entries.split_at_mut(exact_index);
+                (&mut after[0], &mut before[foreign_index])
+            };
+            std::mem::swap(&mut exact.engine, &mut foreign.engine);
+        }
+        assert_classifier_permanent_returned_owner_pairs_exact_ticket(
+            &receiver_app,
+            receiver_router,
+            &returned_receiver_owner,
+        );
+    }
+
+    #[test]
+    fn back_target_classifier_permanent_exact_pairs_the_retained_commit_ticket() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, protected) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-classifier-permanent-ticket-pairing",
+        );
+        let (foreign_router, foreign_protected) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-classifier-permanent-ticket-pairing-foreign",
+        );
+        let staged = stage_real_back_target_classifier_permanent(&mut app, router, protected, true);
+        let _foreign_staged = stage_real_back_target_classifier_permanent(
+            &mut app,
+            foreign_router,
+            foreign_protected,
+            true,
+        );
+        let source_before = ClassifierPermanentSourceProjection::capture(&staged.owner);
+        let (exact_ticket_identity, foreign_ticket_identity, exact_engine_before_swap) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let exact = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the exact ticket fixture retains its entry");
+            let foreign = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == foreign_router)
+                .expect("the foreign ticket fixture retains its entry");
+            (
+                exact
+                    .pending_commit
+                    .as_ref()
+                    .and_then(|pending| pending.ticket.as_ref())
+                    .expect("the exact classifier source retains its real CommitTicket")
+                    .report_identity(),
+                foreign
+                    .pending_commit
+                    .as_ref()
+                    .and_then(|pending| pending.ticket.as_ref())
+                    .expect("the foreign classifier source retains its real CommitTicket")
+                    .report_identity(),
+                exact.engine.snapshot(),
+            )
+        };
+        assert!(
+            exact_ticket_identity != foreign_ticket_identity,
+            "the pairing drift must use a distinct real CommitTicket"
+        );
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let exact_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == router)
+                .expect("the exact ticket fixture retains its entry");
+            let foreign_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == foreign_router)
+                .expect("the foreign ticket fixture retains its entry");
+            let (exact, foreign) = if exact_index < foreign_index {
+                let (before, after) = navigation.entries.split_at_mut(foreign_index);
+                (&mut before[exact_index], &mut after[0])
+            } else {
+                let (before, after) = navigation.entries.split_at_mut(exact_index);
+                (&mut after[0], &mut before[foreign_index])
+            };
+            std::mem::swap(
+                &mut exact
+                    .pending_commit
+                    .as_mut()
+                    .expect("the exact entry retains its pending Commit holder")
+                    .ticket,
+                &mut foreign
+                    .pending_commit
+                    .as_mut()
+                    .expect("the foreign entry retains its pending Commit holder")
+                    .ticket,
+            );
+            assert_eq!(exact.engine.snapshot(), exact_engine_before_swap);
+            assert_eq!(
+                exact.host.as_ref().map(|host| (host.host, host.top_slot)),
+                Some((staged.host, staged.top_slot)),
+                "replacing only the ticket must retain the original engine and HostBinding"
+            );
+            assert!(
+                exact
+                    .pending_commit
+                    .as_ref()
+                    .and_then(|pending| pending.ticket.as_ref())
+                    .is_some_and(|ticket| ticket.report_identity() == foreign_ticket_identity),
+                "the exact entry must now retain the real foreign ticket"
+            );
+        }
+
+        let authority_before =
+            ClassifierPermanentAuthorityStateProjection::capture(app.world(), staged.host);
+        let world_before = authority_world_fingerprint(app.world());
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .expect("the ticket pairing fixture retains its public snapshot")
+            .clone();
+        let request_before = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .and_then(|entry| entry.engine.request(staged.request))
+            .expect("the ticket pairing fixture retains its Back request")
+            .status()
+            .clone();
+        let (
+            entry_local_before,
+            exact_engine_before,
+            foreign_entry_local_before,
+            foreign_engine_before,
+        ) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let exact = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the ticket pairing fixture retains its exact entry");
+            let foreign = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == foreign_router)
+                .expect("the ticket pairing fixture retains its foreign entry");
+            (
+                ClassifierPermanentEntryLocalProjection::capture(exact),
+                exact.engine.snapshot(),
+                ClassifierPermanentEntryLocalProjection::capture(foreign),
+                foreign.engine.snapshot(),
+            )
+        };
+        let returned = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the ticket pairing fixture retains its exact entry");
+                match prepare_back_target_classifier_permanent(world, entry, staged.owner) {
+                    BackTargetClassifierPermanentPreparationOutcome::ReceiverMismatch {
+                        owner,
+                        mismatch,
+                    } => {
+                        let _typed_pairing_mismatch: PreparationReceiverMismatchView = mismatch;
+                        owner
+                    }
+                    BackTargetClassifierPermanentPreparationOutcome::Prepared(_) => panic!(
+                        "RED: a real foreign retained CommitTicket must fail exact entry pairing before physical acceptance"
+                    ),
+                    BackTargetClassifierPermanentPreparationOutcome::PhysicalMismatch { .. } => {
+                        panic!(
+                            "a ticket/source pairing contradiction must use the typed receiver mismatch channel"
+                        )
+                    }
+                }
+            },
+        );
+        assert_eq!(
+            ClassifierPermanentSourceProjection::capture(&returned),
+            source_before,
+            "ticket pairing mismatch must return the whole classifier owner"
+        );
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            ClassifierPermanentAuthorityStateProjection::capture(app.world(), staged.host),
+            authority_before,
+            "retained-ticket mismatch must preserve every pre-call authority fact"
+        );
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .get(router)
+                .expect("ticket pairing mismatch retains the public snapshot"),
+            &public_before
+        );
+        let navigation = app.world().resource::<RouterNavigation>();
+        let exact = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("ticket pairing mismatch retains the exact entry");
+        let foreign = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == foreign_router)
+            .expect("ticket pairing mismatch retains the foreign entry");
+        assert_eq!(exact.engine.snapshot(), exact_engine_before);
+        assert_eq!(foreign.engine.snapshot(), foreign_engine_before);
+        assert_eq!(
+            exact
+                .engine
+                .request(staged.request)
+                .expect("ticket pairing mismatch retains the Back request")
+                .status(),
+            &request_before
+        );
+        assert!(
+            ClassifierPermanentEntryLocalProjection::capture(exact) == entry_local_before,
+            "ticket pairing mismatch must preserve the foreign ticket and exact branch/holder shape"
+        );
+        assert!(
+            ClassifierPermanentEntryLocalProjection::capture(foreign) == foreign_entry_local_before,
+            "ticket pairing mismatch must not disturb the foreign ticket holder"
+        );
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let exact_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == router)
+                .expect("the ticket pairing fixture retains its exact entry");
+            let foreign_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == foreign_router)
+                .expect("the ticket pairing fixture retains its foreign entry");
+            let (exact, foreign) = if exact_index < foreign_index {
+                let (before, after) = navigation.entries.split_at_mut(foreign_index);
+                (&mut before[exact_index], &mut after[0])
+            } else {
+                let (before, after) = navigation.entries.split_at_mut(exact_index);
+                (&mut after[0], &mut before[foreign_index])
+            };
+            std::mem::swap(
+                &mut exact
+                    .pending_commit
+                    .as_mut()
+                    .expect("the exact entry retains its injected ticket holder")
+                    .ticket,
+                &mut foreign
+                    .pending_commit
+                    .as_mut()
+                    .expect("the foreign entry retains its injected ticket holder")
+                    .ticket,
+            );
+        }
+        assert_classifier_permanent_returned_owner_pairs_exact_ticket(&app, router, &returned);
+    }
+
+    #[test]
+    fn back_target_classifier_permanent_rejects_same_authority_entity_without_a_splice_role() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, protected) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-classifier-permanent-unclassified-same-authority",
+        );
+        let staged = stage_real_back_target_classifier_permanent(&mut app, router, protected, true);
+        let source_before = ClassifierPermanentSourceProjection::capture(&staged.owner);
+        let same_authority_frame = classifier_permanent_same_authority_frame(&staged.owner);
+        let (unclassified, unclassified_claim) = spawn_exact_unclassified_same_authority_descendant(
+            &mut app,
+            staged.protected[1],
+            same_authority_frame,
+        );
+        assert!(
+            staged
+                .owner
+                .owner
+                .splice
+                .preserved()
+                .claims()
+                .chain(staged.owner.owner.splice.entering().claims())
+                .chain(staged.owner.owner.splice.leaving().claims())
+                .all(|claim| claim.entity() != unclassified)
+                && staged
+                    .owner
+                    .owner
+                    .splice
+                    .slot_roles()
+                    .iter()
+                    .all(|role| role.entity() != unclassified),
+            "the exact same-authority Entity must be absent from every explicit splice role"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(unclassified)
+                .map(|record| record.claim()),
+            Some(unclassified_claim.clone())
+        );
+
+        let authority_before =
+            ClassifierPermanentAuthorityStateProjection::capture(app.world(), staged.host);
+        let world_before = authority_world_fingerprint(app.world());
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .expect("the explicit-role fixture retains its public snapshot")
+            .clone();
+        let (entry_local_before, engine_before, request_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the explicit-role fixture retains its exact entry");
+            (
+                ClassifierPermanentEntryLocalProjection::capture(entry),
+                entry.engine.snapshot(),
+                entry
+                    .engine
+                    .request(staged.request)
+                    .expect("the explicit-role fixture retains its Back request")
+                    .status()
+                    .clone(),
+            )
+        };
+        let returned = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the explicit-role fixture retains its exact entry");
+                match prepare_back_target_classifier_permanent(world, entry, staged.owner) {
+                    BackTargetClassifierPermanentPreparationOutcome::PhysicalMismatch {
+                        owner,
+                        evidence,
+                    } => {
+                        assert_eq!(
+                            evidence.source(),
+                            LifecyclePreflightSource::TargetPartition,
+                            "an unclassified same-authority claim must retain typed partition evidence"
+                        );
+                        owner
+                    }
+                    BackTargetClassifierPermanentPreparationOutcome::Prepared(_) => panic!(
+                        "RED: an exact same-authority Entity absent from every accepted role must fail closed"
+                    ),
+                    BackTargetClassifierPermanentPreparationOutcome::ReceiverMismatch { .. } => {
+                        panic!("the exact original Core receiver must not mask physical role drift")
+                    }
+                }
+            },
+        );
+        assert_eq!(
+            ClassifierPermanentSourceProjection::capture(&returned),
+            source_before,
+            "role-partition mismatch must return the whole classifier owner"
+        );
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            ClassifierPermanentAuthorityStateProjection::capture(app.world(), staged.host),
+            authority_before,
+            "role-partition rejection must preserve every pre-call authority fact"
+        );
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .get(router)
+                .expect("role-partition mismatch retains the public snapshot"),
+            &public_before
+        );
+        assert_eq!(
+            app.world()
+                .get::<ChildOf>(unclassified)
+                .map(ChildOf::parent),
+            Some(staged.protected[1]),
+            "role-partition mismatch must preserve the exact protected relationship"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(unclassified)
+                .map(|record| record.claim()),
+            Some(unclassified_claim)
+        );
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("role-partition mismatch retains the exact entry");
+        assert_eq!(entry.engine.snapshot(), engine_before);
+        assert_eq!(
+            entry
+                .engine
+                .request(staged.request)
+                .expect("role-partition mismatch retains the Back request")
+                .status(),
+            &request_before
+        );
+        assert!(
+            ClassifierPermanentEntryLocalProjection::capture(entry) == entry_local_before,
+            "role-partition mismatch must preserve the pending ticket, branch and holder shape"
+        );
+        assert_classifier_permanent_returned_owner_pairs_exact_ticket(&app, router, &returned);
     }
 
     #[test]

@@ -856,6 +856,38 @@ impl RealizedFrame {
         .then_some(entering_shell)
     }
 
+    pub(crate) fn sealed_reconciliation_leaving_sibling_shell_for<'a>(
+        &self,
+        leaving: &'a Self,
+    ) -> Option<&'a ExactRegistryClaim> {
+        let leaving_shell = leaving.entities.iter().find_map(|entity| {
+            (entity.entity == leaving.shell
+                && entity.claim.lifecycle() == EntityLifecycle::Active
+                && matches!(
+                    entity.claim.owner(),
+                    RegistryOwner::Committed(EntityOwner::FrameShell(owner))
+                        if owner == leaving.frame()
+                ))
+            .then_some(&entity.claim)
+        })?;
+        let entering_shell_is_exact = self
+            .entities
+            .iter()
+            .find_map(|entity| {
+                (entity.entity == self.shell
+                    && entity.claim.lifecycle() == EntityLifecycle::PreparedInert
+                    && matches!(
+                        entity.claim.owner(),
+                        RegistryOwner::Committed(EntityOwner::FrameShell(owner))
+                            if owner == self.frame()
+                    ))
+                .then_some(&entity.claim)
+            })
+            .is_some();
+        (entering_shell_is_exact && self.mount.same_physical_mount(&leaving.mount))
+            .then_some(leaving_shell)
+    }
+
     pub(crate) fn prior_mount_children(&self) -> &[Entity] {
         &self.prior_mount_children
     }
@@ -2184,7 +2216,7 @@ fn exact_manifest_cas_is_current(
 }
 
 pub(crate) fn validate_realized_frame(world: &World, frame: &RealizedFrame) -> bool {
-    validate_realized_frame_allowing_child_slots(world, frame, &[], None)
+    validate_realized_frame_allowing_child_slots(world, frame, &[], None, &[])
 }
 
 pub(crate) fn validate_realized_frame_with_child_slots(
@@ -2192,7 +2224,7 @@ pub(crate) fn validate_realized_frame_with_child_slots(
     frame: &RealizedFrame,
     child_slots: &[(Entity, Vec<Entity>)],
 ) -> bool {
-    validate_realized_frame_allowing_child_slots(world, frame, child_slots, None)
+    validate_realized_frame_allowing_child_slots(world, frame, child_slots, None, &[])
 }
 
 pub(crate) fn validate_reconciliation_entering_frame_with_child_slots(
@@ -2200,8 +2232,15 @@ pub(crate) fn validate_reconciliation_entering_frame_with_child_slots(
     frame: &RealizedFrame,
     child_slots: &[(Entity, Vec<Entity>)],
     existing_mount: Option<&RealizedFrame>,
+    observed_leaving_shells: &[ExactRegistryClaim],
 ) -> bool {
-    validate_realized_frame_allowing_child_slots(world, frame, child_slots, existing_mount)
+    validate_realized_frame_allowing_child_slots(
+        world,
+        frame,
+        child_slots,
+        existing_mount,
+        observed_leaving_shells,
+    )
 }
 
 fn validate_realized_frame_allowing_child_slots(
@@ -2209,6 +2248,7 @@ fn validate_realized_frame_allowing_child_slots(
     frame: &RealizedFrame,
     child_slots: &[(Entity, Vec<Entity>)],
     existing_mount: Option<&RealizedFrame>,
+    observed_leaving_shells: &[ExactRegistryClaim],
 ) -> bool {
     let sealed_existing_mount = existing_mount.is_some_and(|existing| {
         frame
@@ -2228,9 +2268,23 @@ fn validate_realized_frame_allowing_child_slots(
         validate_mount_binding(world, &frame.host_candidate, &frame.mount, frame.frame()).is_ok()
     };
     let mount_children_valid = if sealed_existing_mount {
-        mount_slot_children_are_acceptable(world, frame, true, &[])
+        mount_slot_children_are_acceptable(
+            world,
+            frame,
+            CurrentShellManifestPolicy::Strict,
+            true,
+            &[],
+            observed_leaving_shells,
+        )
     } else {
-        mount_slot_children_are_exact(world, frame)
+        mount_slot_children_are_acceptable(
+            world,
+            frame,
+            CurrentShellManifestPolicy::Strict,
+            false,
+            &[],
+            observed_leaving_shells,
+        )
     };
     let focus_present = frame_focus_is_in_subtree(world, frame);
     if !mount_valid || !mount_children_valid || focus_present {
@@ -2552,8 +2606,14 @@ fn classify_committed_frame(
         leaving_child_boundary,
     )
     .is_ok();
-    let mount_children_valid =
-        mount_slot_children_are_acceptable(world, frame, leaving_child_boundary, entering_shells);
+    let mount_children_valid = mount_slot_children_are_acceptable(
+        world,
+        frame,
+        CurrentShellManifestPolicy::ObserveAdditions,
+        leaving_child_boundary,
+        entering_shells,
+        &[],
+    );
     if binding_valid && mount_children_valid {
         // Continue with the role-sensitive closure checks below.
     } else {
@@ -2944,14 +3004,29 @@ fn apply_mount_children_manifest_cas_drift_probe(world: &mut World, mount_slot: 
 }
 
 fn mount_slot_children_are_exact(world: &World, frame: &RealizedFrame) -> bool {
-    mount_slot_children_are_acceptable(world, frame, false, &[])
+    mount_slot_children_are_acceptable(
+        world,
+        frame,
+        CurrentShellManifestPolicy::Strict,
+        false,
+        &[],
+        &[],
+    )
+}
+
+#[derive(Clone, Copy)]
+enum CurrentShellManifestPolicy {
+    Strict,
+    ObserveAdditions,
 }
 
 fn mount_slot_children_are_acceptable(
     world: &World,
     frame: &RealizedFrame,
+    current_shell_manifest: CurrentShellManifestPolicy,
     allow_foreign_children: bool,
     entering_shells: &[ExactRegistryClaim],
+    observed_leaving_shells: &[ExactRegistryClaim],
 ) -> bool {
     let slot_entity = frame.mount.slot();
     let registry = world.resource::<RouteEntityRegistry>();
@@ -2981,9 +3056,20 @@ fn mount_slot_children_are_acceptable(
             if !frame_version_matches_mount(&frame.mount, mount_owner, child_frame)
                 || (child == frame.shell && child_frame != &frame.frame)
                 || (child != frame.shell && child_frame == &frame.frame)
-                || !(if child != frame.shell
-                    && (frame.mount.allows_existing_shell(&record.claim())
-                        || entering_shells.iter().any(|claim| *claim == record.claim()))
+                || !(if child == frame.shell {
+                    match current_shell_manifest {
+                        CurrentShellManifestPolicy::Strict => {
+                            record.manifest().matches(world, child)
+                        }
+                        CurrentShellManifestPolicy::ObserveAdditions => {
+                            manifest_contains_expected(world, child, record.manifest())
+                        }
+                    }
+                } else if frame.mount.allows_existing_shell(&record.claim())
+                    || entering_shells.iter().any(|claim| *claim == record.claim())
+                    || observed_leaving_shells
+                        .iter()
+                        .any(|claim| *claim == record.claim())
                 {
                     manifest_contains_expected(world, child, record.manifest())
                 } else {
@@ -3925,6 +4011,175 @@ pub(crate) mod tests {
         )
         .unwrap();
         (world, host, top_slot, frame)
+    }
+
+    fn activate_realized_frame_for_committed_preflight(
+        world: &mut World,
+        frame: &mut RealizedFrame,
+    ) {
+        let transitions = frame.lifecycle_transitions(EntityLifecycle::Active);
+        let registry_mutation = world
+            .resource::<RouteEntityRegistry>()
+            .prepare_lifecycle_mutation(&transitions)
+            .expect("the exact realized-frame claims must prepare one active transition");
+        let resulting_claims = registry_mutation.resulting_claims().to_vec();
+        assert!(frame.claims_can_rebind(
+            &resulting_claims,
+            &resulting_claims,
+            EntityLifecycle::PreparedInert,
+            EntityLifecycle::Active,
+        ));
+        let presentation = prepare_presentation_mutation(
+            world,
+            &frame.mutation_targets(
+                EntityLifecycle::PreparedInert,
+                EntityLifecycle::Active,
+                true,
+            ),
+        )
+        .expect("the realized frame must prepare one exact presentation transition");
+
+        presentation.apply();
+        registry_mutation.apply(&mut world.resource_mut::<RouteEntityRegistry>());
+        frame.apply_claim_rebind(&resulting_claims, &resulting_claims);
+        assert!(validate_active_frame(world, frame));
+    }
+
+    fn insert_single_foreign_shell_component(
+        world: &mut World,
+        frame: &RealizedFrame,
+        expected_lifecycle: EntityLifecycle,
+    ) {
+        let shell = frame.shell();
+        let realized_shell = frame
+            .entities
+            .iter()
+            .find(|realized| realized.entity == shell)
+            .expect("the realized frame must retain its shell fact");
+        let expected_claim = realized_shell.claim.clone();
+        let expected_parent = realized_shell.parent;
+        let expected_manifest = world
+            .resource::<RouteEntityRegistry>()
+            .record(shell)
+            .expect("the realized shell must remain registered")
+            .manifest()
+            .clone();
+
+        world.entity_mut(shell).insert(ForeignRealizationComponent);
+
+        let actual_manifest = ComponentManifest::from_world(world, shell)
+            .expect("the realized shell must remain observable");
+        let foreign_component = world
+            .components()
+            .component_id::<ForeignRealizationComponent>()
+            .expect("insertion must register the test-private foreign component");
+        let additions = actual_manifest
+            .component_ids()
+            .iter()
+            .copied()
+            .filter(|component| !expected_manifest.component_ids().contains(component))
+            .collect::<Vec<_>>();
+        let record = world
+            .resource::<RouteEntityRegistry>()
+            .record(shell)
+            .expect("the realized shell must retain its registry record");
+
+        assert_eq!(additions, vec![foreign_component]);
+        assert_eq!(record.claim(), expected_claim);
+        assert_eq!(record.lifecycle(), expected_lifecycle);
+        assert_eq!(record.manifest(), &expected_manifest);
+        assert_eq!(
+            world.get::<RouteOwnershipSeal>(shell),
+            Some(&RouteOwnershipSeal::new(expected_claim.seal()))
+        );
+        assert_eq!(
+            world.get::<FrameLifecycle>(shell),
+            Some(&FrameLifecycle(expected_lifecycle))
+        );
+        assert_eq!(
+            world.get::<ChildOf>(shell).map(ChildOf::parent),
+            Some(expected_parent)
+        );
+        assert!(
+            expected_manifest
+                .component_ids()
+                .iter()
+                .all(|component| actual_manifest.component_ids().contains(component)),
+            "the foreign addition must not remove any registry-required shell component"
+        );
+    }
+
+    #[test]
+    fn committed_current_shell_foreign_component_is_preserved_ready() {
+        let (mut world, _host, _top_slot, mut frame) = realized_empty_fixture();
+        activate_realized_frame_for_committed_preflight(&mut world, &mut frame);
+        insert_single_foreign_shell_component(&mut world, &frame, EntityLifecycle::Active);
+
+        assert!(
+            matches!(
+                classify_committed_frame(&world, &frame, CommittedFrameRole::Preserved, &[], &[],),
+                CommittedFramePreflight::Ready
+            ),
+            "RED: a preserved committed shell with required manifest coverage and one protected foreign component must remain Ready"
+        );
+    }
+
+    #[test]
+    fn committed_current_shell_foreign_component_requires_leaving_quarantine() {
+        let (mut world, _host, _top_slot, mut frame) = realized_empty_fixture();
+        activate_realized_frame_for_committed_preflight(&mut world, &mut frame);
+        insert_single_foreign_shell_component(&mut world, &frame, EntityLifecycle::Active);
+
+        assert!(
+            matches!(
+                classify_committed_frame(&world, &frame, CommittedFrameRole::Leaving, &[], &[],),
+                CommittedFramePreflight::ReadyWithQuarantine
+            ),
+            "RED: a leaving committed shell with one protected foreign component must be ReadyWithQuarantine"
+        );
+    }
+
+    #[test]
+    fn committed_current_shell_missing_required_component_is_invalid() {
+        let (mut world, _host, _top_slot, mut frame) = realized_empty_fixture();
+        activate_realized_frame_for_committed_preflight(&mut world, &mut frame);
+        let shell = frame.shell();
+        let pickable = world
+            .components()
+            .component_id::<Pickable>()
+            .expect("the committed shell manifest must register Pickable");
+        assert!(
+            world
+                .resource::<RouteEntityRegistry>()
+                .record(shell)
+                .expect("the committed shell must remain registered")
+                .manifest()
+                .component_ids()
+                .contains(&pickable)
+        );
+
+        world.entity_mut(shell).remove::<Pickable>();
+
+        assert!(world.get::<Pickable>(shell).is_none());
+        assert!(matches!(
+            classify_committed_frame(&world, &frame, CommittedFrameRole::Preserved, &[], &[],),
+            CommittedFramePreflight::Invalid
+        ));
+        assert!(matches!(
+            classify_committed_frame(&world, &frame, CommittedFrameRole::Leaving, &[], &[],),
+            CommittedFramePreflight::Invalid
+        ));
+    }
+
+    #[test]
+    fn prepared_current_shell_foreign_component_remains_invalid() {
+        let (mut world, _host, _top_slot, frame) = realized_empty_fixture();
+        insert_single_foreign_shell_component(&mut world, &frame, EntityLifecycle::PreparedInert);
+
+        assert!(
+            !validate_realized_frame(&world, &frame),
+            "prepared and entering shell validation must retain strict manifest equality"
+        );
     }
 
     fn presentation_commit_fixture(

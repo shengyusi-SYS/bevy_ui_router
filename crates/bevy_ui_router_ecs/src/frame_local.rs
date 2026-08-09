@@ -209,6 +209,12 @@ pub(crate) fn validate_reconciliation_entering_branch(
                     .is_some()
             })
             .collect::<Vec<_>>();
+        let observed_leaving_shells = leaving
+            .frames()
+            .iter()
+            .filter_map(|leaving| frame.sealed_reconciliation_leaving_sibling_shell_for(leaving))
+            .cloned()
+            .collect::<Vec<_>>();
         let preserved_slots = preserved
             .child_slots()
             .iter()
@@ -221,6 +227,7 @@ pub(crate) fn validate_reconciliation_entering_branch(
                 frame,
                 &child_slots,
                 existing_mounts.first().copied(),
+                &observed_leaving_shells,
             )
         {
             return Err(FrameLocalError::OwnershipDrift(frame.shell()));
