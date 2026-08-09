@@ -41,7 +41,7 @@ use crate::engine::{
     CoreBackTargetDriverFailureCleanup, CoreBackTargetDriverFailureReport,
     CoreBackTargetDriverFailureReportMode, CoreBackTargetDriverFallback,
     CoreBackTargetDriverTerminal, CoreBackTargetDriverTerminalProjection,
-    CoreBackTargetPermanentCanonicalRelationProjection,
+    CoreBackTargetPermanentBeginOwner, CoreBackTargetPermanentCanonicalRelationProjection,
     CoreBackTargetPermanentCurrentStateProjection,
     CoreBackTargetPermanentHistoryPreparationErrorProjection,
     CoreBackTargetPermanentRequestProjection, CoreBackTargetPermanentSettlementOwner,
@@ -1125,19 +1125,25 @@ pub struct TargetAuthoritySettlementOwner {
 #[doc(hidden)]
 pub struct BackTargetPermanentBeginOwner {
     settlement: TargetAuthoritySettlementOwner,
+    host: HostLease,
     manifest: CleanupManifest,
 }
 
 impl BackTargetPermanentBeginOwner {
-    pub fn new(settlement: TargetAuthoritySettlementOwner, manifest: CleanupManifest) -> Self {
+    pub fn new(
+        settlement: TargetAuthoritySettlementOwner,
+        host: HostLease,
+        manifest: CleanupManifest,
+    ) -> Self {
         Self {
             settlement,
+            host,
             manifest,
         }
     }
 
-    pub fn into_parts(self) -> (TargetAuthoritySettlementOwner, CleanupManifest) {
-        (self.settlement, self.manifest)
+    pub fn into_parts(self) -> (TargetAuthoritySettlementOwner, HostLease, CleanupManifest) {
+        (self.settlement, self.host, self.manifest)
     }
 }
 
@@ -1206,6 +1212,7 @@ pub enum BackTargetPermanentBeginPermanentEvidence {
     CanonicalRelationContradiction(BackTargetPermanentCanonicalRelationContradictionView),
     RequestRecordContradiction(BackTargetPermanentRequestRecordContradictionView),
     TerminalPlanContradiction(BackTargetPermanentTerminalPlanContradictionView),
+    HostRetirementRejected,
 }
 
 #[doc(hidden)]
@@ -4066,14 +4073,16 @@ impl RouterEngine {
     {
         let BackTargetPermanentBeginOwner {
             settlement,
+            host,
             manifest,
         } = owner;
-        let settlement = settlement.inner;
+        let core_owner = CoreBackTargetPermanentBeginOwner::new(settlement.inner, host.inner);
         let manifest_digest = manifest.manifest_digest;
         let obligation_count = manifest.obligation_count;
         let logical_roots = manifest.logical_roots.clone();
         match self.inner.begin_back_target_permanent_cleanup(
-            settlement,
+            &mut self.admission,
+            core_owner,
             &ticket.inner,
             logical_roots,
             manifest_digest,
@@ -4094,32 +4103,41 @@ impl RouterEngine {
         ) {
             CoreBackTargetPermanentBeginOutcome::Begun => BackTargetPermanentBeginOutcome::Begun,
             CoreBackTargetPermanentBeginOutcome::ReceiverMismatch {
-                owner: settlement,
+                owner,
                 installation,
                 mismatch,
-            } => BackTargetPermanentBeginOutcome::ReceiverMismatch {
-                owner: BackTargetPermanentBeginOwner {
-                    settlement: TargetAuthoritySettlementOwner { inner: settlement },
-                    manifest,
-                },
-                installation,
-                mismatch: PreparationReceiverMismatchView { inner: mismatch },
-            },
+            } => {
+                let (settlement, host) = owner.into_parts();
+                BackTargetPermanentBeginOutcome::ReceiverMismatch {
+                    owner: BackTargetPermanentBeginOwner {
+                        settlement: TargetAuthoritySettlementOwner { inner: settlement },
+                        host: HostLease { inner: host },
+                        manifest,
+                    },
+                    installation,
+                    mismatch: PreparationReceiverMismatchView { inner: mismatch },
+                }
+            }
             CoreBackTargetPermanentBeginOutcome::LogicalRootsMismatch {
-                owner: settlement,
+                owner,
                 installation,
-            } => BackTargetPermanentBeginOutcome::LogicalRootsMismatch {
-                owner: BackTargetPermanentBeginOwner {
-                    settlement: TargetAuthoritySettlementOwner { inner: settlement },
-                    manifest,
-                },
-                installation,
-            },
+            } => {
+                let (settlement, host) = owner.into_parts();
+                BackTargetPermanentBeginOutcome::LogicalRootsMismatch {
+                    owner: BackTargetPermanentBeginOwner {
+                        settlement: TargetAuthoritySettlementOwner { inner: settlement },
+                        host: HostLease { inner: host },
+                        manifest,
+                    },
+                    installation,
+                }
+            }
             CoreBackTargetPermanentBeginOutcome::Permanent {
-                owner: settlement,
+                owner,
                 installation,
                 evidence: inner,
             } => {
+                let (settlement, host) = owner.into_parts();
                 let evidence = match inner {
                     BackTargetPermanentBeginCorePermanentEvidence::CurrentStateContradiction {
                         expected,
@@ -4169,10 +4187,14 @@ impl RouterEngine {
                             },
                         },
                     ),
+                    BackTargetPermanentBeginCorePermanentEvidence::HostRetirementRejected => {
+                        BackTargetPermanentBeginPermanentEvidence::HostRetirementRejected
+                    }
                 };
                 BackTargetPermanentBeginOutcome::Permanent {
                     owner: BackTargetPermanentBeginOwner {
                         settlement: TargetAuthoritySettlementOwner { inner: settlement },
+                        host: HostLease { inner: host },
                         manifest,
                     },
                     installation,
@@ -4312,6 +4334,17 @@ impl RouterEngine {
                 .inner
                 .testing_back_target_permanent_current_state_projection(),
         }
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_back_target_permanent_retired_host_matches(
+        &self,
+        version: &HostVersion,
+        top_slot: RouteSlotId,
+    ) -> bool {
+        self.inner
+            .testing_back_target_permanent_retired_host_matches(version, top_slot)
     }
 
     #[doc(hidden)]

@@ -742,20 +742,32 @@ pub(crate) struct FrozenTargetPreparationPermanentProtectedClosures {
     observed: Vec<FrozenTargetPreparationPermanentObservedEntity>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FrozenTargetPreparationPermanentAllowedWriteSet {
-    targets: Vec<bevy_ecs::entity::Entity>,
+    splice_targets: Vec<bevy_ecs::entity::Entity>,
+    host_edge: FrozenTargetPreparationPermanentHostEdge,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FrozenTargetPreparationPermanentHostEdge {
+    host: bevy_ecs::entity::Entity,
+    top_slot: bevy_ecs::entity::Entity,
+    host_observed: FrozenTargetPreparationPermanentObservedEntity,
+    host_children_before: Vec<bevy_ecs::entity::Entity>,
+    host_children_after: Vec<bevy_ecs::entity::Entity>,
+    top_slot_parent_before: Option<bevy_ecs::entity::Entity>,
+    top_slot_parent_after: Option<bevy_ecs::entity::Entity>,
 }
 
 pub(crate) enum FrozenTargetPreparationPermanentBranch {
     Classifier {
         physical: BackTargetClassifiedPhysicalOwner,
-        frozen_manifest: FrozenCleanupManifest,
         evidence: PreparationPermanentEvidence,
     },
     ReadyPlan {
         physical: PreparedBackTargetPhysicalOwner,
-        frozen_manifest: FrozenCleanupManifest,
+        normal_frozen_manifest: FrozenCleanupManifest,
+        normal_manifest: CleanupManifest,
         evidence: PreparationPermanentEvidence,
     },
 }
@@ -780,7 +792,8 @@ pub(crate) struct BackTargetPermanentAuthorityManifest {
 pub(crate) struct TargetPreparationPermanentDisposition {
     cleanup: TargetPreparationPermanentCleanupOwner,
     settlement: TargetAuthoritySettlementOwner,
-    manifest: BackTargetPermanentAuthorityManifest,
+    ecs_manifest: FrozenCleanupManifest,
+    core_binding: BackTargetPermanentAuthorityManifest,
 }
 
 pub(crate) struct PreparedTargetPreparationPermanentLedger {
@@ -791,7 +804,8 @@ pub(crate) struct PreparedTargetPreparationPermanentLedger {
 pub(crate) struct PreparedTargetPreparationPermanentDisposition {
     cleanup: TargetPreparationPermanentCleanupOwner,
     settlement: TargetAuthoritySettlementOwner,
-    manifest: BackTargetPermanentAuthorityManifest,
+    ecs_manifest: FrozenCleanupManifest,
+    core_binding: BackTargetPermanentAuthorityManifest,
     ledger: PreparedTargetPreparationPermanentLedger,
 }
 
@@ -822,12 +836,14 @@ pub(crate) struct InstalledTargetPreparationPermanentCleanup {
     cleanup: TargetPreparationPermanentCleanupOwner,
     ledger: TargetPreparationPermanentLedgerHolder,
     batch: BackTargetPermanentCleanupBatchOwner,
+    retired_host: RetiredHostBinding,
     inert: Option<TargetPreparationPermanentInertEvidence>,
 }
 
 pub(crate) struct PreparedTargetPermanentEcsInstallationOwner {
     cleanup: TargetPreparationPermanentCleanupOwner,
     ledger: PreparedTargetPreparationPermanentLedger,
+    retired_host: RetiredHostBinding,
 }
 
 impl PreparedTargetPermanentEcsInstallationOwner {
@@ -840,6 +856,7 @@ impl PreparedTargetPermanentEcsInstallationOwner {
                 cleanup: self.cleanup,
                 ledger: TargetPreparationPermanentLedgerHolder::Prepared(self.ledger),
                 batch,
+                retired_host: self.retired_host,
                 inert: None,
             },
         )
@@ -7890,8 +7907,72 @@ pub(crate) fn classify_back_target(
 
 struct FrozenBackTargetPreparationPermanentPhysicalFacts {
     physical: FrozenTargetPreparationPermanentPhysicalManifest,
-    frozen_manifest: FrozenCleanupManifest,
+    normal_frozen_manifest: FrozenCleanupManifest,
+    ecs_manifest: FrozenCleanupManifest,
     scope: PreparationBoundaryScopeView,
+}
+
+fn projected_target_preparation_permanent_claims(
+    registry: &RouteEntityRegistry,
+    splice: &SealedReconciliationSplice,
+    top_slot_claim: &ExactRegistryClaim,
+) -> Option<Vec<ExactRegistryClaim>> {
+    fn retain(
+        candidates: &mut std::collections::HashMap<
+            bevy_ecs::entity::Entity,
+            (ExactRegistryClaim, EntityLifecycle, u8),
+        >,
+        claim: &ExactRegistryClaim,
+        lifecycle: EntityLifecycle,
+        priority: u8,
+    ) -> Option<()> {
+        match candidates.entry(claim.entity()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((claim.clone(), lifecycle, priority));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().0 != *claim {
+                    return None;
+                }
+                if priority > entry.get().2 {
+                    entry.insert((claim.clone(), lifecycle, priority));
+                }
+            }
+        }
+        Some(())
+    }
+
+    let mut candidates = std::collections::HashMap::new();
+    for claim in splice.entering().claims() {
+        retain(&mut candidates, claim, EntityLifecycle::PreparedInert, 0)?;
+    }
+    for role in splice.slot_roles() {
+        let current_or_shared = role.current() == EntityLifecycle::Active;
+        retain(
+            &mut candidates,
+            role.claim(),
+            if current_or_shared {
+                EntityLifecycle::Leaving
+            } else {
+                EntityLifecycle::PreparedInert
+            },
+            u8::from(current_or_shared),
+        )?;
+    }
+    for claim in splice.preserved().claims().chain(splice.leaving().claims()) {
+        retain(&mut candidates, claim, EntityLifecycle::Leaving, 2)?;
+    }
+    retain(&mut candidates, top_slot_claim, EntityLifecycle::Leaving, 3)?;
+
+    let mut transitions = candidates
+        .into_values()
+        .map(|(claim, lifecycle, _)| (claim, lifecycle))
+        .collect::<Vec<_>>();
+    transitions.sort_by_key(|(claim, _)| claim.entity().to_bits());
+    let plan = registry.prepare_lifecycle_mutation(&transitions)?;
+    let mut projected = plan.resulting_claims().to_vec();
+    projected.sort_by_key(|claim| claim.entity().to_bits());
+    Some(projected)
 }
 
 fn target_preparation_permanent_mismatch(
@@ -8139,8 +8220,9 @@ fn freeze_back_target_preparation_permanent_physical(
         ));
     }
 
-    let transitions = splice.lifecycle_transitions();
-    let Some(registry_plan) = registry.prepare_lifecycle_mutation(&transitions) else {
+    let normal_transitions = splice.lifecycle_transitions();
+    let Some(normal_registry_plan) = registry.prepare_lifecycle_mutation(&normal_transitions)
+    else {
         return Err(mismatch(
             LifecyclePreflightSource::TargetPartition,
             LifecyclePreflightExpectation::ExactAuthority,
@@ -8196,23 +8278,12 @@ fn freeze_back_target_preparation_permanent_physical(
         ));
     }
 
-    let mut targets = transitions
-        .iter()
-        .map(|(claim, _)| claim.entity())
-        .collect::<Vec<_>>();
-    targets.sort_by_key(|entity| entity.to_bits());
-    targets.dedup();
-    if targets.len() != transitions.len()
-        || targets.iter().any(|target| {
-            *target == host.host || *target == host.top_slot || !host_closure.contains(target)
-        })
-        || transitions.iter().any(|(claim, _)| {
-            accepted_roles.get(&claim.entity()) != Some(claim)
-                || !registered_claim_has_exact_authority_and_manifest_coverage(
-                    world, registry, claim, false,
-                )
-        })
-    {
+    if normal_transitions.iter().any(|(claim, _)| {
+        accepted_roles.get(&claim.entity()) != Some(claim)
+            || !registered_claim_has_exact_authority_and_manifest_coverage(
+                world, registry, claim, false,
+            )
+    }) {
         return Err(mismatch(
             LifecyclePreflightSource::TargetPartition,
             LifecyclePreflightExpectation::ExactAuthority,
@@ -8220,13 +8291,52 @@ fn freeze_back_target_preparation_permanent_physical(
         ));
     }
 
-    let target_set = targets
+    let Some(projected_claims) =
+        projected_target_preparation_permanent_claims(registry, splice, &host.top_slot_claim)
+    else {
+        return Err(mismatch(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Contradictory,
+        ));
+    };
+    if projected_claims.len() != accepted_roles.len()
+        || projected_claims.iter().any(|projected| {
+            accepted_roles
+                .get(&projected.entity())
+                .is_none_or(|source| {
+                    source.owner() != projected.owner() || source.seal() != projected.seal()
+                })
+        })
+    {
+        return Err(mismatch(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Contradictory,
+        ));
+    }
+    let splice_targets = projected_claims
         .iter()
-        .copied()
+        .filter(|claim| claim.entity() != host.top_slot)
+        .map(ExactRegistryClaim::entity)
+        .collect::<Vec<_>>();
+    if splice_targets.iter().any(|target| {
+        *target == host.host || *target == host.top_slot || !host_closure.contains(target)
+    }) {
+        return Err(mismatch(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+
+    let target_set = projected_claims
+        .iter()
+        .map(ExactRegistryClaim::entity)
         .collect::<std::collections::HashSet<_>>();
-    let mut target_observed = targets
+    let mut target_observed = projected_claims
         .iter()
-        .copied()
+        .map(ExactRegistryClaim::entity)
         .map(|entity| observe_target_preparation_permanent_entity(world, registry, entity))
         .collect::<Vec<_>>();
     target_observed.sort_by_key(|observed| observed.entity.to_bits());
@@ -8320,14 +8430,14 @@ fn freeze_back_target_preparation_permanent_physical(
         .map(|entity| observe_target_preparation_permanent_entity(world, registry, entity))
         .collect::<Vec<_>>();
 
-    let frozen_manifest = if splice.leaving().obligation_count() == 0 {
+    let normal_frozen_manifest = if splice.leaving().obligation_count() == 0 {
         FrozenCleanupManifest::empty()
     } else {
         let Some(manifest) = FrozenCleanupManifest::from_leaving_branch(
             world,
             registry,
             splice.leaving(),
-            registry_plan.resulting_claims(),
+            normal_registry_plan.resulting_claims(),
             (!splice.entering().frames().is_empty()).then_some(splice.entering()),
         ) else {
             return Err(mismatch(
@@ -8337,6 +8447,45 @@ fn freeze_back_target_preparation_permanent_physical(
             ));
         };
         manifest
+    };
+    let ecs_manifest = FrozenCleanupManifest::from_target_preparation_permanent(
+        world,
+        registry,
+        splice,
+        &projected_claims,
+        host,
+    )
+    .map_err(|_| {
+        mismatch(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactRelationshipClosure,
+            LifecyclePreflightObserved::Contradictory,
+        )
+    })?;
+    let host_children_before = world
+        .get::<bevy_ecs::hierarchy::Children>(host.host)
+        .map(|children| children.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut host_children_after = host_children_before.clone();
+    let Some(top_slot_index) = host_children_after
+        .iter()
+        .position(|child| *child == host.top_slot)
+    else {
+        return Err(mismatch(
+            LifecyclePreflightSource::HostBinding,
+            LifecyclePreflightExpectation::ExactRelationshipClosure,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    };
+    host_children_after.remove(top_slot_index);
+    let host_edge = FrozenTargetPreparationPermanentHostEdge {
+        host: host.host,
+        top_slot: host.top_slot,
+        host_observed: observe_target_preparation_permanent_entity(world, registry, host.host),
+        host_children_before,
+        host_children_after,
+        top_slot_parent_before: Some(host.host),
+        top_slot_parent_after: None,
     };
     let scope = continuation.preparation_boundary_scope();
     Ok(FrozenBackTargetPreparationPermanentPhysicalFacts {
@@ -8351,9 +8500,13 @@ fn freeze_back_target_preparation_permanent_physical(
                 roots: protected_roots,
                 observed: protected_observed,
             },
-            allowed_write: FrozenTargetPreparationPermanentAllowedWriteSet { targets },
+            allowed_write: FrozenTargetPreparationPermanentAllowedWriteSet {
+                splice_targets,
+                host_edge,
+            },
         },
-        frozen_manifest,
+        normal_frozen_manifest,
+        ecs_manifest,
         scope,
     })
 }
@@ -8401,7 +8554,8 @@ pub(crate) fn prepare_back_target_classifier_permanent(
 
     let FrozenBackTargetPreparationPermanentPhysicalFacts {
         physical,
-        frozen_manifest,
+        normal_frozen_manifest: _,
+        ecs_manifest,
         scope,
     } = match physical {
         Ok(physical) => physical,
@@ -8423,14 +8577,13 @@ pub(crate) fn prepare_back_target_classifier_permanent(
     } = owner;
     let manifest = CleanupManifest::new(
         logical_cleanup_roots(splice.leaving()),
-        frozen_manifest.digest(),
-        frozen_manifest.len(),
+        ecs_manifest.digest(),
+        ecs_manifest.len(),
     );
     let cleanup = TargetPreparationPermanentCleanupOwner {
         physical,
         branch: FrozenTargetPreparationPermanentBranch::Classifier {
             physical: BackTargetClassifiedPhysicalOwner { splice, history },
-            frozen_manifest,
             evidence,
         },
     };
@@ -8443,7 +8596,8 @@ pub(crate) fn prepare_back_target_classifier_permanent(
                 TargetPreparationPermanentDisposition {
                     cleanup,
                     settlement,
-                    manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+                    ecs_manifest,
+                    core_binding: BackTargetPermanentAuthorityManifest { cleanup: manifest },
                 },
             )
         }
@@ -8454,7 +8608,6 @@ pub(crate) fn prepare_back_target_classifier_permanent(
             } = cleanup;
             let FrozenTargetPreparationPermanentBranch::Classifier {
                 physical: BackTargetClassifiedPhysicalOwner { splice, history },
-                frozen_manifest: _,
                 evidence,
             } = branch
             else {
@@ -8523,7 +8676,7 @@ pub(crate) fn prepare_back_target_ready_plan_permanent(
             };
         }
     };
-    if refrozen.frozen_manifest != owner.owner.frozen_manifest {
+    if refrozen.normal_frozen_manifest != owner.owner.frozen_manifest {
         return BackTargetReadyPlanPermanentPreparationOutcome::PhysicalMismatch {
             owner,
             evidence: target_preparation_permanent_mismatch(
@@ -8536,7 +8689,8 @@ pub(crate) fn prepare_back_target_ready_plan_permanent(
 
     let FrozenBackTargetPreparationPermanentPhysicalFacts {
         physical: refrozen_physical,
-        frozen_manifest: _,
+        normal_frozen_manifest: _,
+        ecs_manifest,
         scope,
     } = refrozen;
     let PreparationPermanentOwner { owner, evidence } = owner;
@@ -8546,24 +8700,33 @@ pub(crate) fn prepare_back_target_ready_plan_permanent(
         frozen_manifest,
         manifest,
     } = owner;
+    let dedicated_manifest = CleanupManifest::new(
+        logical_cleanup_roots(physical.classified.splice.leaving()),
+        ecs_manifest.digest(),
+        ecs_manifest.len(),
+    );
     let cleanup = TargetPreparationPermanentCleanupOwner {
         physical: refrozen_physical,
         branch: FrozenTargetPreparationPermanentBranch::ReadyPlan {
             physical,
-            frozen_manifest,
+            normal_frozen_manifest: frozen_manifest,
+            normal_manifest: manifest,
             evidence,
         },
     };
     match entry
         .engine
-        .accept_back_target_authority_lost(continuation, scope, &manifest)
+        .accept_back_target_authority_lost(continuation, scope, &dedicated_manifest)
     {
         BackTargetPreparationAcceptance::Matched(settlement) => {
             BackTargetReadyPlanPermanentPreparationOutcome::Prepared(
                 TargetPreparationPermanentDisposition {
                     cleanup,
                     settlement,
-                    manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+                    ecs_manifest,
+                    core_binding: BackTargetPermanentAuthorityManifest {
+                        cleanup: dedicated_manifest,
+                    },
                 },
             )
         }
@@ -8574,7 +8737,8 @@ pub(crate) fn prepare_back_target_ready_plan_permanent(
             } = cleanup;
             let FrozenTargetPreparationPermanentBranch::ReadyPlan {
                 physical,
-                frozen_manifest,
+                normal_frozen_manifest: frozen_manifest,
+                normal_manifest: manifest,
                 evidence,
             } = branch
             else {
@@ -8593,19 +8757,6 @@ pub(crate) fn prepare_back_target_ready_plan_permanent(
                 mismatch,
             }
         }
-    }
-}
-
-fn target_preparation_permanent_frozen_manifest(
-    cleanup: &TargetPreparationPermanentCleanupOwner,
-) -> &FrozenCleanupManifest {
-    match &cleanup.branch {
-        FrozenTargetPreparationPermanentBranch::Classifier {
-            frozen_manifest, ..
-        }
-        | FrozenTargetPreparationPermanentBranch::ReadyPlan {
-            frozen_manifest, ..
-        } => frozen_manifest,
     }
 }
 
@@ -8743,8 +8894,7 @@ where
         };
     }
 
-    let frozen_manifest = target_preparation_permanent_frozen_manifest(&disposition.cleanup);
-    let ledger = match CleanupLedger::reserve(frozen_manifest.clone()) {
+    let ledger = match CleanupLedger::reserve(disposition.ecs_manifest.clone()) {
         Ok(ledger) => PreparedTargetPreparationPermanentLedger {
             ledger,
             validation: disposition.cleanup.physical.clone(),
@@ -8756,7 +8906,8 @@ where
     let TargetPreparationPermanentDisposition {
         cleanup,
         settlement,
-        manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+        ecs_manifest,
+        core_binding: BackTargetPermanentAuthorityManifest { cleanup: manifest },
     } = disposition;
     dispatch_prepared_back_target_permanent_with_installation_observer(
         world,
@@ -8764,7 +8915,8 @@ where
         PreparedTargetPreparationPermanentDisposition {
             cleanup,
             settlement,
-            manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+            ecs_manifest,
+            core_binding: BackTargetPermanentAuthorityManifest { cleanup: manifest },
             ledger,
         },
         observe_installed,
@@ -8805,9 +8957,9 @@ where
     }
 
     let ledger_projection = disposition.ledger.ledger.projection();
-    let manifest_digest = disposition.manifest.cleanup.manifest_digest();
-    let manifest_obligation_count = disposition.manifest.cleanup.obligation_count();
-    let frozen_manifest = target_preparation_permanent_frozen_manifest(&disposition.cleanup);
+    let manifest_digest = disposition.core_binding.cleanup.manifest_digest();
+    let manifest_obligation_count = disposition.core_binding.cleanup.obligation_count();
+    let frozen_manifest = &disposition.ecs_manifest;
     let validation = &disposition.ledger.validation;
     if validation.lineage.router != disposition.cleanup.physical.lineage.router
         || validation.lineage.host != disposition.cleanup.physical.lineage.host
@@ -8852,9 +9004,10 @@ where
         .collect::<std::collections::HashSet<_>>();
     if validation
         .allowed_write
-        .targets
+        .splice_targets
         .iter()
         .any(|target| protected.contains(target))
+        || protected.contains(&validation.allowed_write.host_edge.top_slot)
     {
         return BackTargetPermanentDispatchOutcome::PreparedEntryMismatch {
             disposition,
@@ -8865,7 +9018,7 @@ where
             ),
         };
     }
-    if validation.allowed_write.targets != disposition.cleanup.physical.allowed_write.targets {
+    if validation.allowed_write != disposition.cleanup.physical.allowed_write {
         return BackTargetPermanentDispatchOutcome::PreparedEntryMismatch {
             disposition,
             evidence: target_preparation_permanent_mismatch(
@@ -8892,19 +9045,42 @@ where
     let PreparedTargetPreparationPermanentDisposition {
         cleanup,
         settlement,
-        manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+        ecs_manifest,
+        core_binding: BackTargetPermanentAuthorityManifest { cleanup: manifest },
         ledger,
     } = disposition;
-    let begin = BackTargetPermanentBeginOwner::new(settlement, manifest);
-    let installation = PreparedTargetPermanentEcsInstallationOwner { cleanup, ledger };
     let RouterEntry {
         engine,
+        host: host_slot,
         pending_commit,
         pending_back_target_permanent_cleanup,
         #[cfg(test)]
         back_target_permanent_begin_callback_calls,
         ..
     } = entry;
+    let Some(host) = host_slot.take() else {
+        return BackTargetPermanentDispatchOutcome::PreparedEntryMismatch {
+            disposition: PreparedTargetPreparationPermanentDisposition {
+                cleanup,
+                settlement,
+                ecs_manifest,
+                core_binding: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+                ledger,
+            },
+            evidence: target_preparation_permanent_mismatch(
+                LifecyclePreflightSource::HostBinding,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Missing,
+            ),
+        };
+    };
+    let (retired_host, lease) = host.into_retired();
+    let begin = BackTargetPermanentBeginOwner::new(settlement, lease, manifest);
+    let installation = PreparedTargetPermanentEcsInstallationOwner {
+        cleanup,
+        ledger,
+        retired_host,
+    };
     let ticket = pending_commit
         .as_ref()
         .and_then(|pending| pending.ticket.as_ref())
@@ -8928,13 +9104,19 @@ where
             installation,
             mismatch,
         } => {
-            let (settlement, manifest) = owner.into_parts();
-            let PreparedTargetPermanentEcsInstallationOwner { cleanup, ledger } = installation;
+            let (settlement, lease, manifest) = owner.into_parts();
+            let PreparedTargetPermanentEcsInstallationOwner {
+                cleanup,
+                ledger,
+                retired_host,
+            } = installation;
+            *host_slot = Some(retired_host.restore(lease));
             BackTargetPermanentDispatchOutcome::ReceiverMismatch {
                 disposition: PreparedTargetPreparationPermanentDisposition {
                     cleanup,
                     settlement,
-                    manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+                    ecs_manifest,
+                    core_binding: BackTargetPermanentAuthorityManifest { cleanup: manifest },
                     ledger,
                 },
                 mismatch,
@@ -8944,13 +9126,19 @@ where
             owner,
             installation,
         } => {
-            let (settlement, manifest) = owner.into_parts();
-            let PreparedTargetPermanentEcsInstallationOwner { cleanup, ledger } = installation;
+            let (settlement, lease, manifest) = owner.into_parts();
+            let PreparedTargetPermanentEcsInstallationOwner {
+                cleanup,
+                ledger,
+                retired_host,
+            } = installation;
+            *host_slot = Some(retired_host.restore(lease));
             BackTargetPermanentDispatchOutcome::LogicalRootsMismatch(
                 PreparedTargetPreparationPermanentDisposition {
                     cleanup,
                     settlement,
-                    manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+                    ecs_manifest,
+                    core_binding: BackTargetPermanentAuthorityManifest { cleanup: manifest },
                     ledger,
                 },
             )
@@ -8960,13 +9148,19 @@ where
             installation,
             evidence,
         } => {
-            let (settlement, manifest) = owner.into_parts();
-            let PreparedTargetPermanentEcsInstallationOwner { cleanup, ledger } = installation;
+            let (settlement, lease, manifest) = owner.into_parts();
+            let PreparedTargetPermanentEcsInstallationOwner {
+                cleanup,
+                ledger,
+                retired_host,
+            } = installation;
+            *host_slot = Some(retired_host.restore(lease));
             BackTargetPermanentDispatchOutcome::Permanent {
                 disposition: PreparedTargetPreparationPermanentDisposition {
                     cleanup,
                     settlement,
-                    manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+                    ecs_manifest,
+                    core_binding: BackTargetPermanentAuthorityManifest { cleanup: manifest },
                     ledger,
                 },
                 evidence,
@@ -14265,7 +14459,7 @@ fn target_preparation_permanent_prewrite_refreeze(
         .collect::<std::collections::HashSet<_>>();
     let allowed_write_entity_set = validation
         .allowed_write
-        .targets
+        .splice_targets
         .iter()
         .copied()
         .collect::<std::collections::HashSet<_>>();
@@ -14296,6 +14490,42 @@ fn target_preparation_permanent_prewrite_refreeze(
     ) {
         return Err(LifecyclePreflightEvidence::new(
             LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactRelationshipClosure,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+    let host_edge = &validation.allowed_write.host_edge;
+    let observed_host =
+        observe_target_preparation_permanent_entity(world, registry, host_edge.host);
+    let observed_top_slot =
+        observe_target_preparation_permanent_entity(world, registry, host_edge.top_slot);
+    let mut expected_host_children_after = Vec::new();
+    let mut top_slot_memberships = 0;
+    for child in &host_edge.host_children_before {
+        if *child == host_edge.top_slot {
+            top_slot_memberships += 1;
+        } else {
+            expected_host_children_after.push(*child);
+        }
+    }
+    if host_edge.host != validation.lineage.host
+        || host_edge.top_slot_parent_before != Some(host_edge.host)
+        || host_edge.top_slot_parent_after != None
+        || top_slot_memberships != 1
+        || expected_host_children_after != host_edge.host_children_after
+        || observed_host.children != host_edge.host_children_before
+        || observed_top_slot.parent != host_edge.top_slot_parent_before
+        || !target_preparation_permanent_structure_is_exact(
+            &observed_host,
+            &host_edge.host_observed,
+        )
+        || !target_preparation_permanent_authority_values_are_exact(
+            &observed_host,
+            &host_edge.host_observed,
+        )
+    {
+        return Err(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::HostBinding,
             LifecyclePreflightExpectation::ExactRelationshipClosure,
             LifecyclePreflightObserved::Drifted,
         ));
@@ -14394,7 +14624,10 @@ fn target_preparation_permanent_prewrite_refreeze(
             LifecyclePreflightObserved::Contradictory,
         ));
     }
-    if target_entities != validation.allowed_write.targets {
+    let mut expected_target_entities = validation.allowed_write.splice_targets.clone();
+    expected_target_entities.push(validation.allowed_write.host_edge.top_slot);
+    expected_target_entities.sort_by_key(|entity| entity.to_bits());
+    if target_entities != expected_target_entities {
         return Err(LifecyclePreflightEvidence::new(
             LifecyclePreflightSource::TargetPartition,
             LifecyclePreflightExpectation::ExactTaskShape,
@@ -14435,6 +14668,7 @@ fn drive_target_preparation_permanent_cleanup(world: &World, entry: &mut RouterE
         cleanup,
         ledger,
         batch,
+        retired_host,
         inert,
     } = installed;
     let prepared = match ledger {
@@ -14446,6 +14680,7 @@ fn drive_target_preparation_permanent_cleanup(world: &World, entry: &mut RouterE
                         cleanup,
                         ledger: TargetPreparationPermanentLedgerHolder::Active(active),
                         batch,
+                        retired_host,
                         inert,
                     },
                 ));
@@ -14460,6 +14695,7 @@ fn drive_target_preparation_permanent_cleanup(world: &World, entry: &mut RouterE
                         cleanup,
                         ledger: TargetPreparationPermanentLedgerHolder::Prepared(prepared),
                         batch,
+                        retired_host,
                         inert: Some(inert),
                     },
                 ));
@@ -14476,6 +14712,7 @@ fn drive_target_preparation_permanent_cleanup(world: &World, entry: &mut RouterE
                         cleanup,
                         ledger: TargetPreparationPermanentLedgerHolder::Active(active),
                         batch,
+                        retired_host,
                         inert: None,
                     },
                 ));
@@ -14487,6 +14724,7 @@ fn drive_target_preparation_permanent_cleanup(world: &World, entry: &mut RouterE
                         cleanup,
                         ledger: TargetPreparationPermanentLedgerHolder::Active(active),
                         batch,
+                        retired_host,
                         inert: Some(TargetPreparationPermanentInertEvidence::Physical(evidence)),
                     },
                 ));
@@ -28747,6 +28985,7 @@ pub(crate) mod tests {
         physical: ClassifierPermanentSourceProjection,
         focus_leaving: Vec<Entity>,
         frozen_manifest: FrozenCleanupManifest,
+        manifest: CleanupManifestView,
     }
 
     impl ReadyPlanPermanentSourceProjection {
@@ -28759,7 +28998,123 @@ pub(crate) mod tests {
                 ),
                 focus_leaving: owner.owner.physical.focus_leaving.clone(),
                 frozen_manifest: owner.owner.frozen_manifest.clone(),
+                manifest: owner.owner.manifest.projection(),
             }
+        }
+    }
+
+    fn target_permanent_contract_item_between<'a>(
+        source: &'a str,
+        start: &str,
+        end: &str,
+    ) -> &'a str {
+        let tail = &source[source.find(start).expect("contract item must remain named")..];
+        &tail[..tail
+            .find(end)
+            .expect("contract item boundary must remain named")]
+    }
+
+    fn target_permanent_contract_field_count(contract: &str, field: &str) -> usize {
+        let prefix = format!("{field}:");
+        contract
+            .lines()
+            .map(str::trim)
+            .map(|line| {
+                line.strip_prefix("pub(crate) ")
+                    .or_else(|| line.strip_prefix("pub "))
+                    .unwrap_or(line)
+            })
+            .filter(|line| line.starts_with(&prefix) && line.ends_with(','))
+            .count()
+    }
+
+    fn target_permanent_production_source() -> &'static str {
+        include_str!("navigation.rs")
+            .split_once(concat!("\n#[cfg(test)]\n", "pub(crate) mod tests {"))
+            .expect("the production/test boundary must remain named")
+            .0
+    }
+
+    struct ProjectedTargetPermanentClaims {
+        claims: Vec<ExactRegistryClaim>,
+        splice_targets: Vec<Entity>,
+        top_slot: Entity,
+    }
+
+    fn projected_target_permanent_claims(
+        world: &World,
+        splice: &SealedReconciliationSplice,
+        top_slot_claim: &ExactRegistryClaim,
+    ) -> ProjectedTargetPermanentClaims {
+        fn retain(
+            candidates: &mut std::collections::HashMap<
+                Entity,
+                (ExactRegistryClaim, EntityLifecycle, u8),
+            >,
+            claim: &ExactRegistryClaim,
+            lifecycle: EntityLifecycle,
+            priority: u8,
+        ) {
+            match candidates.entry(claim.entity()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((claim.clone(), lifecycle, priority));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    assert_eq!(
+                        entry.get().0,
+                        *claim,
+                        "one current registry Entity must retain one exact source claim"
+                    );
+                    if priority > entry.get().2 {
+                        entry.insert((claim.clone(), lifecycle, priority));
+                    }
+                }
+            }
+        }
+
+        let mut candidates = std::collections::HashMap::new();
+        for claim in splice.entering().claims() {
+            retain(&mut candidates, claim, EntityLifecycle::PreparedInert, 0);
+        }
+        for role in splice.slot_roles() {
+            let current_or_shared = role.current() == EntityLifecycle::Active;
+            retain(
+                &mut candidates,
+                role.claim(),
+                if current_or_shared {
+                    EntityLifecycle::Leaving
+                } else {
+                    EntityLifecycle::PreparedInert
+                },
+                u8::from(current_or_shared),
+            );
+        }
+        for claim in splice.preserved().claims().chain(splice.leaving().claims()) {
+            retain(&mut candidates, claim, EntityLifecycle::Leaving, 2);
+        }
+        retain(&mut candidates, top_slot_claim, EntityLifecycle::Leaving, 3);
+
+        let mut transitions = candidates
+            .into_values()
+            .map(|(claim, lifecycle, _)| (claim, lifecycle))
+            .collect::<Vec<_>>();
+        transitions.sort_by_key(|(claim, _)| claim.entity().to_bits());
+        let registry = world.resource::<RouteEntityRegistry>();
+        let projected = registry
+            .prepare_lifecycle_mutation(&transitions)
+            .expect("the canonical failure-isolation transitions must accept exact current claims");
+        let mut claims = projected.resulting_claims().to_vec();
+        claims.sort_by_key(|claim| claim.entity().to_bits());
+        let top_slot = top_slot_claim.entity();
+        let splice_targets = claims
+            .iter()
+            .filter(|claim| claim.entity() != top_slot)
+            .map(ExactRegistryClaim::entity)
+            .collect();
+        ProjectedTargetPermanentClaims {
+            claims,
+            splice_targets,
+            top_slot,
         }
     }
 
@@ -28886,7 +29241,9 @@ pub(crate) mod tests {
         target_observed: Vec<FrozenTargetPreparationPermanentObservedEntity>,
         protected_roots: Vec<Entity>,
         protected_observed: Vec<FrozenTargetPreparationPermanentObservedEntity>,
-        allowed_write: Vec<Entity>,
+        allowed_write: FrozenTargetPreparationPermanentAllowedWriteSet,
+        ecs_manifest: FrozenCleanupManifest,
+        core_binding: CleanupManifestView,
     }
 
     impl std::fmt::Debug for TargetPermanentDispositionProjection {
@@ -28908,7 +29265,8 @@ pub(crate) mod tests {
         fn capture_cleanup(cleanup: &TargetPreparationPermanentCleanupOwner) -> Self {
             let FrozenTargetPreparationPermanentBranch::ReadyPlan {
                 physical,
-                frozen_manifest,
+                normal_frozen_manifest,
+                normal_manifest,
                 evidence,
             } = &cleanup.branch
             else {
@@ -28922,7 +29280,8 @@ pub(crate) mod tests {
                         evidence,
                     ),
                     focus_leaving: physical.focus_leaving.clone(),
-                    frozen_manifest: frozen_manifest.clone(),
+                    frozen_manifest: normal_frozen_manifest.clone(),
+                    manifest: normal_manifest.projection(),
                 },
                 lineage_router: cleanup.physical.lineage.router,
                 lineage_host: cleanup.physical.lineage.host,
@@ -28930,16 +29289,24 @@ pub(crate) mod tests {
                 target_observed: cleanup.physical.target_observed.clone(),
                 protected_roots: cleanup.physical.protected.roots.clone(),
                 protected_observed: cleanup.physical.protected.observed.clone(),
-                allowed_write: cleanup.physical.allowed_write.targets.clone(),
+                allowed_write: cleanup.physical.allowed_write.clone(),
+                ecs_manifest: FrozenCleanupManifest::empty(),
+                core_binding: CleanupManifest::empty().projection(),
             }
         }
 
         fn capture(disposition: &TargetPreparationPermanentDisposition) -> Self {
-            Self::capture_cleanup(&disposition.cleanup)
+            let mut projection = Self::capture_cleanup(&disposition.cleanup);
+            projection.ecs_manifest = disposition.ecs_manifest.clone();
+            projection.core_binding = disposition.core_binding.cleanup.projection();
+            projection
         }
 
         fn capture_prepared(disposition: &PreparedTargetPreparationPermanentDisposition) -> Self {
-            Self::capture_cleanup(&disposition.cleanup)
+            let mut projection = Self::capture_cleanup(&disposition.cleanup);
+            projection.ecs_manifest = disposition.ecs_manifest.clone();
+            projection.core_binding = disposition.core_binding.cleanup.projection();
+            projection
         }
     }
 
@@ -28949,11 +29316,10 @@ pub(crate) mod tests {
         let _settlement = &disposition.settlement;
         let BackTargetPermanentAuthorityManifest {
             cleanup: _core_manifest,
-        } = &disposition.manifest;
+        } = &disposition.core_binding;
         let _prepared_ledger = &disposition.ledger.ledger;
         assert_eq!(
-            disposition.ledger.validation.allowed_write.targets,
-            disposition.cleanup.physical.allowed_write.targets,
+            disposition.ledger.validation.allowed_write, disposition.cleanup.physical.allowed_write,
             "the prepared ledger projection must remain paired with the actual cleanup owner"
         );
     }
@@ -28964,15 +29330,15 @@ pub(crate) mod tests {
         let PreparedTargetPreparationPermanentDisposition {
             cleanup,
             settlement,
-            manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+            ecs_manifest,
+            core_binding,
             ledger,
         } = disposition;
-        let begin = BackTargetPermanentBeginOwner::new(settlement, manifest);
-        let (settlement, manifest) = begin.into_parts();
         PreparedTargetPreparationPermanentDisposition {
             cleanup,
             settlement,
-            manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+            ecs_manifest,
+            core_binding,
             ledger,
         }
     }
@@ -28986,7 +29352,7 @@ pub(crate) mod tests {
     impl PreparedTargetPermanentIdentityProjection {
         fn capture(disposition: &PreparedTargetPreparationPermanentDisposition) -> Self {
             Self {
-                manifest: disposition.manifest.cleanup.projection(),
+                manifest: disposition.core_binding.cleanup.projection(),
                 ledger: disposition.ledger.ledger.projection(),
             }
         }
@@ -29004,7 +29370,7 @@ pub(crate) mod tests {
         validation_target_observed: Vec<FrozenTargetPreparationPermanentObservedEntity>,
         validation_protected_roots: Vec<Entity>,
         validation_protected_observed: Vec<FrozenTargetPreparationPermanentObservedEntity>,
-        validation_allowed_write: Vec<Entity>,
+        validation_allowed_write: FrozenTargetPreparationPermanentAllowedWriteSet,
         identity: PreparedTargetPermanentIdentityProjection,
     }
 
@@ -29026,12 +29392,7 @@ pub(crate) mod tests {
                     .protected
                     .observed
                     .clone(),
-                validation_allowed_write: disposition
-                    .ledger
-                    .validation
-                    .allowed_write
-                    .targets
-                    .clone(),
+                validation_allowed_write: disposition.ledger.validation.allowed_write.clone(),
                 identity: PreparedTargetPermanentIdentityProjection::capture(disposition),
             }
         }
@@ -29174,8 +29535,8 @@ pub(crate) mod tests {
             expected_cleanup.protected_observed
         );
         assert_eq!(
-            active.validation.allowed_write.targets,
-            expected_cleanup.allowed_write
+            active.validation.allowed_write.splice_targets,
+            expected_cleanup.allowed_write.splice_targets
         );
         assert!(
             active.ledger.projection() == expected_ledger,
@@ -29379,7 +29740,7 @@ pub(crate) mod tests {
                     .cleanup
                     .physical
                     .allowed_write
-                    .targets
+                    .splice_targets
                     .pop();
                 assert!(
                     removed.is_some(),
@@ -29402,7 +29763,7 @@ pub(crate) mod tests {
                         .cleanup
                         .physical
                         .allowed_write
-                        .targets
+                        .splice_targets
                         .contains(&protected),
                     "the exact fixture starts with disjoint target and protected closures"
                 );
@@ -29411,7 +29772,7 @@ pub(crate) mod tests {
                     .cleanup
                     .physical
                     .allowed_write
-                    .targets
+                    .splice_targets
                     .push(protected);
             }
         }
@@ -29805,13 +30166,28 @@ pub(crate) mod tests {
             source_before.frozen_manifest.len() > 0,
             "the real replacement must carry a non-empty frozen Entity manifest"
         );
+        let top_slot_claim = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .and_then(|entry| entry.host.as_ref())
+            .expect("the Ready-plan fixture retains its exact HostBinding")
+            .top_slot_claim
+            .clone();
+        let projected = projected_target_permanent_claims(
+            app.world(),
+            &owner.owner.physical.classified.splice,
+            &top_slot_claim,
+        );
         let authority_before =
             ClassifierPermanentAuthorityStateProjection::capture(app.world(), host);
-        let expected_frozen_targets = authority_before
-            .observed_for(source_before.physical.allowed_write_targets.iter().copied());
+        let expected_frozen_targets =
+            authority_before.observed_for(projected.claims.iter().map(ExactRegistryClaim::entity));
         let expected_frozen_protected = authority_before.protected_for(
             host,
-            source_before.physical.allowed_write_targets.iter().copied(),
+            projected.claims.iter().map(ExactRegistryClaim::entity),
         );
         let world_before = authority_world_fingerprint(app.world());
         let registry_before = app
@@ -30210,30 +30586,42 @@ pub(crate) mod tests {
         let TargetPreparationPermanentDisposition {
             cleanup,
             settlement: _settlement,
-            manifest,
+            ecs_manifest,
+            core_binding,
         } = disposition;
+        drop(ecs_manifest);
         let BackTargetPermanentAuthorityManifest {
             cleanup: moved_core_manifest,
-        } = manifest;
+        } = core_binding;
         drop(moved_core_manifest);
         let TargetPreparationPermanentCleanupOwner { physical, branch } = cleanup;
         assert_eq!(physical.lineage.router, router);
         assert_eq!(physical.lineage.host, host);
-        let mut allowed_write = physical.allowed_write.targets.clone();
+        let mut allowed_write = physical.allowed_write.splice_targets.clone();
         allowed_write.sort_by_key(|entity| entity.to_bits());
-        assert_eq!(allowed_write, source_before.physical.allowed_write_targets);
+        assert_eq!(allowed_write, projected.splice_targets);
+        let mut expected_target_observed = allowed_write.clone();
+        expected_target_observed.push(projected.top_slot);
+        expected_target_observed.sort_by_key(|entity| entity.to_bits());
+        let mut target_observed = physical
+            .target_observed
+            .iter()
+            .map(|observed| observed.entity)
+            .collect::<Vec<_>>();
+        target_observed.sort_by_key(|entity| entity.to_bits());
+        assert_eq!(target_observed, expected_target_observed);
         assert_eq!(physical.target_observed, expected_frozen_targets);
         assert_eq!(physical.protected.observed, expected_frozen_protected);
-        assert!(
-            physical
-                .protected
-                .observed
-                .iter()
-                .all(|protected| { !physical.allowed_write.targets.contains(&protected.entity) })
-        );
+        assert!(physical.protected.observed.iter().all(|protected| {
+            !physical
+                .allowed_write
+                .splice_targets
+                .contains(&protected.entity)
+        }));
         let FrozenTargetPreparationPermanentBranch::ReadyPlan {
             physical,
-            frozen_manifest,
+            normal_frozen_manifest,
+            normal_manifest,
             evidence,
         } = branch
         else {
@@ -30250,17 +30638,20 @@ pub(crate) mod tests {
         );
         assert_eq!(physical.focus_leaving, source_before.focus_leaving);
         assert_eq!(
-            frozen_manifest, source_before.frozen_manifest,
+            normal_frozen_manifest, source_before.frozen_manifest,
             "Prepared must move the existing frozen Entity manifest by value"
         );
+        assert_eq!(normal_manifest.projection(), source_before.manifest);
 
         let source = include_str!("navigation.rs");
         const READY_PLAN_ADAPTER_START: &str = concat!(
             "pub(crate) fn prepare_back_target_",
             "ready_plan_permanent("
         );
-        const READY_PLAN_ADAPTER_END: &str =
-            concat!("\nfn target_preparation_permanent_", "frozen_manifest(");
+        const READY_PLAN_ADAPTER_END: &str = concat!(
+            "\nfn target_preparation_permanent_",
+            "dispatch_entry_preflight("
+        );
         assert_eq!(
             source.match_indices(READY_PLAN_ADAPTER_START).count(),
             1,
@@ -30288,11 +30679,29 @@ pub(crate) mod tests {
             "the Ready-plan adapter must whole-destructure its original typed owner and existing Ready facts"
         );
         assert!(
-            compact.contains("manifest:BackTargetPermanentAuthorityManifest{cleanup:manifest},"),
-            "the common disposition must receive the original Ready-plan Core manifest directly"
+            compact.contains("normal_manifest:manifest,"),
+            "the Ready-plan branch must retain the original Core manifest as source evidence"
+        );
+        assert_eq!(
+            adapter.matches("CleanupManifest::new").count(),
+            1,
+            "the Ready-plan adapter must construct exactly one dedicated Core binding"
+        );
+        assert!(
+            compact.contains(
+                "letdedicated_manifest=CleanupManifest::new(logical_cleanup_roots(physical.classified.splice.leaving()),ecs_manifest.digest(),ecs_manifest.len(),);"
+            ),
+            "the dedicated Core binding must come directly from the original leaving roots and exact ECS digest/count"
+        );
+        assert!(
+            compact.contains(
+                "accept_back_target_authority_lost(continuation,scope,&dedicated_manifest)"
+            ) && compact.contains(
+                "core_binding:BackTargetPermanentAuthorityManifest{cleanup:dedicated_manifest,}"
+            ),
+            "the same dedicated Core binding must authorize acceptance and move into the common disposition"
         );
         for forbidden in [
-            "CleanupManifest::new",
             "CleanupManifest::empty",
             "prepare_back_target_classifier_permanent",
             "classify_back_target(",
@@ -30300,7 +30709,17 @@ pub(crate) mod tests {
         ] {
             assert!(
                 !adapter.contains(forbidden),
-                "the Ready-plan adapter must not rebuild manifests or enter the classifier adapter: {forbidden}"
+                "the Ready-plan adapter must not substitute normal evidence or enter the classifier adapter: {forbidden}"
+            );
+        }
+        for forbidden in [
+            "accept_back_target_authority_lost(continuation,scope,&manifest)",
+            "cleanup:manifest,",
+            "cleanup:normal_manifest,",
+        ] {
+            assert!(
+                !compact.contains(forbidden),
+                "normal source evidence must not replace the dedicated Core binding: {forbidden}"
             );
         }
         assert!(
@@ -30815,6 +31234,7 @@ pub(crate) mod tests {
 
         let target = *expected
             .allowed_write
+            .splice_targets
             .first()
             .expect("the real replacement disposition has an exact target");
         app.world_mut()
@@ -30854,7 +31274,7 @@ pub(crate) mod tests {
         let staged = stage_real_back_target_permanent_disposition(&mut app, router);
         publish_snapshots_system(app.world_mut());
         let expected = TargetPermanentDispositionProjection::capture(&staged.disposition);
-        let manifest_before = staged.disposition.manifest.cleanup.projection();
+        let manifest_before = staged.disposition.core_binding.cleanup.projection();
         {
             let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
             let exact_index = navigation
@@ -30912,7 +31332,7 @@ pub(crate) mod tests {
             TargetPermanentDispositionProjection::capture(&returned),
             expected
         );
-        assert_eq!(returned.manifest.cleanup.projection(), manifest_before);
+        assert_eq!(returned.core_binding.cleanup.projection(), manifest_before);
         assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
         assert_eq!(
             ReadyPlanPermanentZeroWriteProjection::capture(
@@ -30949,7 +31369,7 @@ pub(crate) mod tests {
         let staged = stage_real_back_target_permanent_disposition(&mut app, router);
         publish_snapshots_system(app.world_mut());
         let expected = TargetPermanentDispositionProjection::capture(&staged.disposition);
-        let manifest_before = staged.disposition.manifest.cleanup.projection();
+        let manifest_before = staged.disposition.core_binding.cleanup.projection();
         let foreign_request = app
             .world_mut()
             .resource_mut::<RouterNavigation>()
@@ -31016,7 +31436,7 @@ pub(crate) mod tests {
             TargetPermanentDispositionProjection::capture(&returned),
             expected
         );
-        assert_eq!(returned.manifest.cleanup.projection(), manifest_before);
+        assert_eq!(returned.core_binding.cleanup.projection(), manifest_before);
         assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
         assert_eq!(
             ReadyPlanPermanentZeroWriteProjection::capture(
@@ -31048,8 +31468,7 @@ pub(crate) mod tests {
         );
         let mut staged = stage_real_back_target_permanent_disposition(&mut app, router);
         publish_snapshots_system(app.world_mut());
-        let expected = TargetPermanentDispositionProjection::capture(&staged.disposition);
-        let original_manifest = staged.disposition.manifest.cleanup.projection();
+        let original_manifest = staged.disposition.core_binding.cleanup.projection();
         let drifted = CleanupManifest::new(
             Vec::new(),
             original_manifest.manifest_digest(),
@@ -31059,8 +31478,8 @@ pub(crate) mod tests {
             drifted.projection() != original_manifest,
             "the real replacement fixture must retain a non-empty Core logical-root manifest"
         );
-        staged.disposition.manifest.cleanup = drifted;
-        let drifted_manifest = staged.disposition.manifest.cleanup.projection();
+        staged.disposition.core_binding.cleanup = drifted;
+        let drifted_manifest = staged.disposition.core_binding.cleanup.projection();
         assert_eq!(
             drifted_manifest.manifest_digest(),
             original_manifest.manifest_digest()
@@ -31069,6 +31488,7 @@ pub(crate) mod tests {
             drifted_manifest.obligation_count(),
             original_manifest.obligation_count()
         );
+        let expected = TargetPermanentDispositionProjection::capture(&staged.disposition);
         let zero_write_before = ReadyPlanPermanentZeroWriteProjection::capture(
             &app,
             router,
@@ -31100,7 +31520,7 @@ pub(crate) mod tests {
             expected
         );
         assert_prepared_target_permanent_dispatch_owner_is_complete(&returned);
-        assert_eq!(returned.manifest.cleanup.projection(), drifted_manifest);
+        assert_eq!(returned.core_binding.cleanup.projection(), drifted_manifest);
         assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
         assert_eq!(
             ReadyPlanPermanentZeroWriteProjection::capture(
@@ -31325,9 +31745,8 @@ pub(crate) mod tests {
         let staged = stage_real_back_target_permanent_disposition(&mut app, router);
         publish_snapshots_system(app.world_mut());
         let expected = TargetPermanentDispositionProjection::capture(&staged.disposition);
-        let manifest_before = staged.disposition.manifest.cleanup.projection();
-        let frozen_before =
-            target_preparation_permanent_frozen_manifest(&staged.disposition.cleanup).clone();
+        let manifest_before = staged.disposition.core_binding.cleanup.projection();
+        let frozen_before = staged.disposition.ecs_manifest.clone();
         let zero_write_before = ReadyPlanPermanentZeroWriteProjection::capture(
             &app,
             router,
@@ -31368,7 +31787,7 @@ pub(crate) mod tests {
             TargetPermanentDispositionProjection::capture(&returned),
             expected
         );
-        assert_eq!(returned.manifest.cleanup.projection(), manifest_before);
+        assert_eq!(returned.core_binding.cleanup.projection(), manifest_before);
         assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
         assert_eq!(
             ReadyPlanPermanentZeroWriteProjection::capture(
@@ -31498,7 +31917,7 @@ pub(crate) mod tests {
         let staged = stage_real_back_target_permanent_disposition(&mut app, router);
         publish_snapshots_system(app.world_mut());
         let expected = TargetPermanentDispositionProjection::capture(&staged.disposition);
-        let source_manifest = staged.disposition.manifest.cleanup.projection();
+        let source_manifest = staged.disposition.core_binding.cleanup.projection();
         swap_ready_plan_test_engines(&mut app, router, foreign_router);
         let zero_write_before = ReadyPlanPermanentZeroWriteProjection::capture(
             &app,
@@ -31749,7 +32168,7 @@ pub(crate) mod tests {
                     .ledger
                     .validation
                     .allowed_write
-                    .targets
+                    .splice_targets
                     .pop()
                     .expect("the real prepared fixture freezes at least one allowed-write target");
             }
@@ -31765,10 +32184,10 @@ pub(crate) mod tests {
                 assert_ne!(drifted.obligation_count(), original.obligation_count());
             }
             PreparedTargetPermanentInternalMismatchFault::CoreManifest => {
-                let original = prepared.manifest.cleanup.projection();
+                let original = prepared.core_binding.cleanup.projection();
                 assert!(original.obligation_count() > 0);
-                prepared.manifest.cleanup = CleanupManifest::empty();
-                let drifted = prepared.manifest.cleanup.projection();
+                prepared.core_binding.cleanup = CleanupManifest::empty();
+                let drifted = prepared.core_binding.cleanup.projection();
                 assert_ne!(drifted.manifest_digest(), original.manifest_digest());
                 assert_ne!(drifted.obligation_count(), original.obligation_count());
             }
@@ -31958,7 +32377,7 @@ pub(crate) mod tests {
         let staged = stage_real_back_target_permanent_disposition(&mut app, router);
         publish_snapshots_system(app.world_mut());
         let expected_ticket = staged.disposition.cleanup.physical.lineage.ticket.clone();
-        let expected_manifest = staged.disposition.manifest.cleanup.projection();
+        let expected_manifest = staged.disposition.core_binding.cleanup.projection();
         let queued_request = {
             let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
             let entry = navigation
@@ -32038,8 +32457,8 @@ pub(crate) mod tests {
             panic!("begin must retain the prepared ledger until cleanup execution")
         };
         assert_eq!(
-            prepared.validation.allowed_write.targets,
-            installed.cleanup.physical.allowed_write.targets
+            prepared.validation.allowed_write.splice_targets,
+            installed.cleanup.physical.allowed_write.splice_targets
         );
         let ledger = prepared.ledger.projection();
         let batch = installed.batch.batch();
@@ -32521,7 +32940,7 @@ pub(crate) mod tests {
             "ifobserved_protected.iter().zip(&validation.protected.observed).any(|pair|!target_preparation_permanent_structure_is_exact(pair.0,pair.1)){returnErr(",
             "ifobserved_protected.iter().zip(&validation.protected.observed).any(|pair|!target_preparation_permanent_authority_values_are_exact(pair.0,pair.1)){returnErr(",
             "ifobserved_protected_roots!=validation.protected.roots{returnErr(",
-            "iftarget_entities!=validation.allowed_write.targets{returnErr(",
+            "iftarget_entities!=expected_target_entities{returnErr(",
             "if!target_entity_set.is_disjoint(&protected_entity_set){returnErr(",
             "if!allowed_write_entity_set.is_disjoint(&protected_entity_set){returnErr(",
         ] {
@@ -33076,6 +33495,7 @@ pub(crate) mod tests {
     fn back_target_permanent_core_begin_keeps_submitted_count_independent_from_logical_roots() {
         struct DirectCoreCountInstallationOwner {
             request: NavigationRequestId,
+            retired_host: RetiredHostBinding,
         }
 
         let mut app = App::new();
@@ -33089,18 +33509,14 @@ pub(crate) mod tests {
         let TargetPreparationPermanentDisposition {
             cleanup: _,
             settlement,
-            manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+            ecs_manifest: _,
+            core_binding: BackTargetPermanentAuthorityManifest { cleanup: manifest },
         } = staged.disposition;
         let original = manifest.projection();
         assert!(original.obligation_count() > 0);
         let manifest = manifest.testing_with_obligation_count(0);
         assert_eq!(manifest.manifest_digest(), original.manifest_digest());
         assert_eq!(manifest.obligation_count(), 0);
-        let begin = BackTargetPermanentBeginOwner::new(settlement, manifest);
-        let installation = DirectCoreCountInstallationOwner {
-            request: expected_installation_request,
-        };
-        assert!(std::mem::size_of_val(&installation) > 0);
         let mut installed = None;
         let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
         let entry = navigation
@@ -33110,10 +33526,21 @@ pub(crate) mod tests {
             .expect("the zero-obligation fixture retains its exact entry");
         let RouterEntry {
             engine,
+            host,
             pending_commit,
             pending_back_target_permanent_cleanup,
             ..
         } = entry;
+        let (retired_host, lease) = host
+            .take()
+            .expect("the direct Core fixture retains its exact HostBinding")
+            .into_retired();
+        let begin = BackTargetPermanentBeginOwner::new(settlement, lease, manifest);
+        let installation = DirectCoreCountInstallationOwner {
+            request: expected_installation_request,
+            retired_host,
+        };
+        assert!(std::mem::size_of_val(&installation) > 0);
         let ticket = pending_commit
             .as_ref()
             .and_then(|pending| pending.ticket.as_ref())
@@ -33131,7 +33558,7 @@ pub(crate) mod tests {
                 owner,
                 installation,
             } => {
-                let (_, returned) = owner.into_parts();
+                let (_, _, returned) = owner.into_parts();
                 assert_eq!(returned.obligation_count(), 0);
                 assert_eq!(installation.request, expected_installation_request);
                 panic!("zero Core-submitted obligations must not invalidate exact logical roots")
@@ -33141,7 +33568,7 @@ pub(crate) mod tests {
                 installation,
                 evidence,
             } => {
-                let (_, returned) = owner.into_parts();
+                let (_, _, returned) = owner.into_parts();
                 assert_eq!(returned.obligation_count(), 0);
                 assert_eq!(installation.request, expected_installation_request);
                 let _ = evidence;
@@ -33152,7 +33579,7 @@ pub(crate) mod tests {
                 installation,
                 mismatch,
             } => {
-                let (_, returned) = owner.into_parts();
+                let (_, _, returned) = owner.into_parts();
                 assert_eq!(returned.obligation_count(), 0);
                 assert_eq!(installation.request, expected_installation_request);
                 let _ = mismatch;
@@ -33163,6 +33590,7 @@ pub(crate) mod tests {
             .as_ref()
             .expect("direct Core begin must return installation and batch through its callback");
         assert_eq!(installation.request, expected_installation_request);
+        assert_eq!(installation.retired_host.host, staged.host);
         assert_eq!(batch.batch().manifest_digest(), original.manifest_digest());
         assert_eq!(batch.batch().obligation_count(), 0);
         let state = engine.testing_back_target_permanent_begin_state();
@@ -33313,13 +33741,14 @@ pub(crate) mod tests {
             installed.contains("cleanup: TargetPreparationPermanentCleanupOwner")
                 && installed.contains("ledger: TargetPreparationPermanentLedgerHolder")
                 && installed.contains("batch: BackTargetPermanentCleanupBatchOwner")
+                && installed.contains("retired_host: RetiredHostBinding")
                 && installed.contains("inert: Option<TargetPreparationPermanentInertEvidence>")
                 && !installed.contains("settlement"),
-            "the ECS holder must retain the exact three owners plus typed inert evidence"
+            "the ECS holder must retain the exact four owners plus typed inert evidence"
         );
         assert_eq!(
-            installed_fields, 4,
-            "the ECS holder must remain an exact three-owner tuple plus inert evidence"
+            installed_fields, 5,
+            "the ECS holder must remain an exact four-owner tuple plus inert evidence"
         );
     }
 
@@ -33737,6 +34166,554 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn back_target_permanent_dedicated_scope_covers_actual_splice_and_keeps_normal_source() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_deep_nested_router(&mut app);
+        app.update();
+        for location in ["/sections/a/items/1", "/sections/a/items/2"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .expect("the deep permanent fixture accepts its real three-frame route");
+            run_updates_until_succeeded(&mut app, request);
+        }
+
+        let StagedReadyPlanPermanent {
+            request: _,
+            owner,
+            host,
+        } = stage_real_back_target_ready_plan_permanent(&mut app, router);
+        let (top_slot, top_slot_claim) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let binding = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .and_then(|entry| entry.host.as_ref())
+                .expect("the real ReadyPlan source retains its exact HostBinding");
+            assert_eq!(binding.host, host);
+            (binding.top_slot, binding.top_slot_claim.clone())
+        };
+
+        let splice = &owner.owner.physical.classified.splice;
+        assert!(
+            splice.preserved().claims().next().is_some(),
+            "the deep fixture must exercise actual preserved claims"
+        );
+        assert!(
+            splice.leaving().claims().next().is_some(),
+            "the deep fixture must exercise actual leaving claims"
+        );
+        assert!(
+            splice.entering().claims().next().is_some(),
+            "the deep fixture must exercise actual entering claims"
+        );
+        let projected = projected_target_permanent_claims(app.world(), splice, &top_slot_claim);
+        assert_eq!(
+            projected
+                .claims
+                .iter()
+                .filter(|claim| claim.entity() == top_slot)
+                .count(),
+            1,
+            "the exact top slot must contribute one obligation identity"
+        );
+        assert!(
+            projected.claims.iter().all(|claim| claim.entity() != host),
+            "the app-owned host must not enter the ECS obligation set"
+        );
+
+        let normal_frozen_manifest = owner.owner.frozen_manifest.clone();
+        let normal_core_manifest = owner.owner.manifest.projection();
+        assert_eq!(
+            normal_core_manifest.manifest_digest(),
+            normal_frozen_manifest.digest()
+        );
+        assert_eq!(
+            normal_core_manifest.obligation_count(),
+            normal_frozen_manifest.len()
+        );
+        let disposition = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the deep permanent fixture retains its exact entry");
+                match prepare_back_target_ready_plan_permanent(world, entry, owner) {
+                    BackTargetReadyPlanPermanentPreparationOutcome::Prepared(disposition) => {
+                        disposition
+                    }
+                    BackTargetReadyPlanPermanentPreparationOutcome::PhysicalMismatch {
+                        evidence,
+                        ..
+                    } => panic!(
+                        "the unchanged real splice must prepare its dedicated scope; evidence={:?}",
+                        (
+                            evidence.source(),
+                            evidence.expectation(),
+                            evidence.observed()
+                        )
+                    ),
+                    BackTargetReadyPlanPermanentPreparationOutcome::ReceiverMismatch { .. } => {
+                        panic!("the exact real ReadyPlan source must retain its Core receiver")
+                    }
+                }
+            },
+        );
+        let dedicated = &disposition.ecs_manifest;
+        let (retained_normal_frozen, retained_normal_manifest) = match &disposition.cleanup.branch {
+            FrozenTargetPreparationPermanentBranch::ReadyPlan {
+                normal_frozen_manifest,
+                normal_manifest,
+                ..
+            } => (normal_frozen_manifest, normal_manifest),
+            FrozenTargetPreparationPermanentBranch::Classifier { .. } => {
+                panic!("the real ReadyPlan adapter must retain its branch-specific source")
+            }
+        };
+        assert_eq!(
+            retained_normal_frozen, &normal_frozen_manifest,
+            "the Prepared ReadyPlan disposition must retain the normal Frozen manifest by value"
+        );
+        assert_eq!(
+            retained_normal_manifest.projection(),
+            normal_core_manifest,
+            "the Prepared ReadyPlan disposition must retain the normal Core manifest by value"
+        );
+        let mut obligation_entities = dedicated.obligation_entities();
+        obligation_entities.sort_by_key(|entity| entity.to_bits());
+        let mut unique_obligation_entities = obligation_entities.clone();
+        unique_obligation_entities.dedup();
+        let expected_entities = projected
+            .claims
+            .iter()
+            .map(ExactRegistryClaim::entity)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            obligation_entities, unique_obligation_entities,
+            "the dedicated ECS manifest must contain one obligation per exact Entity"
+        );
+        assert_eq!(
+            unique_obligation_entities, expected_entities,
+            "the dedicated ECS settlement scope must cover actual preserved + leaving + entering + shared-slot claims and the top slot, while excluding the app host"
+        );
+        assert_eq!(dedicated.len(), projected.claims.len());
+        for claim in &projected.claims {
+            assert!(
+                dedicated.contains_exact_obligation(claim),
+                "the dedicated ECS manifest must retain each exact splice/top-slot claim: {:?}",
+                claim.entity()
+            );
+        }
+        assert_ne!(
+            dedicated, &normal_frozen_manifest,
+            "the normal Ready Frozen manifest remains source evidence and cannot become the dedicated permanent manifest"
+        );
+        assert_eq!(
+            disposition.core_binding.cleanup.manifest_digest(),
+            dedicated.digest(),
+            "Core must bind the dedicated ECS digest without receiving Entity authority"
+        );
+        assert_eq!(
+            disposition.core_binding.cleanup.obligation_count(),
+            dedicated.len(),
+            "Core must bind the dedicated ECS count without receiving Entity authority"
+        );
+
+        let protected = disposition
+            .cleanup
+            .physical
+            .protected
+            .observed
+            .iter()
+            .map(|observed| observed.entity)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            projected
+                .splice_targets
+                .iter()
+                .all(|entity| !protected.contains(entity)),
+            "the projected splice write domain must be disjoint from every protected closure"
+        );
+        assert!(
+            !protected.contains(&projected.top_slot),
+            "the top slot belongs to the dedicated host-edge domain and cannot remain an ordinary protected Entity"
+        );
+        let mut actual_splice_targets = disposition
+            .cleanup
+            .physical
+            .allowed_write
+            .splice_targets
+            .clone();
+        actual_splice_targets.sort_by_key(|entity| entity.to_bits());
+        assert_eq!(
+            actual_splice_targets, projected.splice_targets,
+            "the splice write domain must contain every projected current/pending target and must exclude the top-slot host-edge domain"
+        );
+        assert_eq!(
+            app.world().get::<ChildOf>(top_slot).map(ChildOf::parent),
+            Some(host),
+            "the independent host-edge domain must bind the exact app host and exact top slot"
+        );
+
+        let ecs_source = target_permanent_production_source();
+        let branches = target_permanent_contract_item_between(
+            ecs_source,
+            "pub(crate) enum FrozenTargetPreparationPermanentBranch {",
+            "pub(crate) struct FrozenTargetPreparationPermanentPhysicalManifest {",
+        );
+        let ready = &branches[branches
+            .find("ReadyPlan {")
+            .expect("the ReadyPlan source owner must remain explicit")..];
+        assert_eq!(
+            (
+                target_permanent_contract_field_count(ready, "normal_frozen_manifest"),
+                target_permanent_contract_field_count(ready, "normal_manifest"),
+                target_permanent_contract_field_count(ready, "frozen_manifest"),
+                target_permanent_contract_field_count(ready, "manifest"),
+            ),
+            (1, 1, 0, 0),
+            "the ReadyPlan branch must retain both normal manifests by value as source evidence"
+        );
+        let allowed_write_contract = target_permanent_contract_item_between(
+            ecs_source,
+            "pub(crate) struct FrozenTargetPreparationPermanentAllowedWriteSet {",
+            "pub(crate) enum FrozenTargetPreparationPermanentBranch {",
+        );
+        assert_eq!(
+            (
+                target_permanent_contract_field_count(allowed_write_contract, "splice_targets"),
+                target_permanent_contract_field_count(allowed_write_contract, "host_edge"),
+                target_permanent_contract_field_count(allowed_write_contract, "targets"),
+            ),
+            (1, 1, 0),
+            "permanent settlement must type-separate splice writes from the exact host-edge effect"
+        );
+        let disposition_contract = target_permanent_contract_item_between(
+            ecs_source,
+            "pub(crate) struct TargetPreparationPermanentDisposition {",
+            "pub(crate) struct PreparedTargetPreparationPermanentLedger {",
+        );
+        assert_eq!(
+            (
+                target_permanent_contract_field_count(disposition_contract, "ecs_manifest"),
+                target_permanent_contract_field_count(disposition_contract, "core_binding"),
+                target_permanent_contract_field_count(disposition_contract, "manifest"),
+            ),
+            (1, 1, 0),
+            "the common disposition must keep ECS exact obligations separate from the Core logical binding"
+        );
+        let core_source = include_str!("../../bevy_ui_router_core/src/integration.rs");
+        for contract in [
+            target_permanent_contract_item_between(
+                core_source,
+                "pub struct CleanupManifest {",
+                "pub struct CleanupManifestView {",
+            ),
+            target_permanent_contract_item_between(
+                core_source,
+                "pub struct BackTargetPermanentBeginOwner {",
+                "impl BackTargetPermanentBeginOwner {",
+            ),
+        ] {
+            assert!(
+                !contract.contains("Entity"),
+                "Core permanent manifest/begin authority must not contain Entity identity"
+            );
+        }
+    }
+
+    #[test]
+    fn back_target_permanent_exact_begin_retires_host_into_ecs_and_core_owners() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-retires-host",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        let expected_host_binding = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let binding = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .and_then(|entry| entry.host.as_ref())
+                .expect("the exact begin source retains its live HostBinding");
+            ProjectionlessHostProjection::from(binding)
+        };
+        assert_eq!(expected_host_binding.host, staged.host);
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+
+        match dispatch_real_back_target_permanent(&mut app, router, staged.disposition) {
+            BackTargetPermanentDispatchOutcome::Dispatched => {}
+            BackTargetPermanentDispatchOutcome::EntryMismatch { .. }
+            | BackTargetPermanentDispatchOutcome::PreparedEntryMismatch { .. } => {
+                panic!("the unchanged exact entry/partition must pass begin preflight")
+            }
+            BackTargetPermanentDispatchOutcome::LedgerRejected { .. } => {
+                panic!("the real dedicated manifest must reserve its ledger")
+            }
+            BackTargetPermanentDispatchOutcome::ReceiverMismatch { .. } => {
+                panic!("the exact target settlement must retain its Core receiver")
+            }
+            BackTargetPermanentDispatchOutcome::LogicalRootsMismatch(_) => {
+                panic!("the exact dedicated logical roots must remain paired")
+            }
+            BackTargetPermanentDispatchOutcome::Permanent { .. } => {
+                panic!("the exact begin must not produce permanent evidence")
+            }
+        }
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 1);
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the exact begin retains its RouterEntry");
+        let retired_host = match entry.pending_back_target_permanent_cleanup.as_ref() {
+            Some(PendingTargetPreparationPermanentCleanup::Installed(
+                InstalledTargetPreparationPermanentCleanup { retired_host, .. },
+            )) => retired_host,
+            _ => panic!("exact begin must install the whole target cleanup owner"),
+        };
+        assert_eq!(
+            (
+                &retired_host.version,
+                retired_host.slot_id,
+                retired_host.host,
+                retired_host.top_slot,
+                &retired_host.top_slot_claim,
+                &retired_host.candidate,
+            ),
+            (
+                &expected_host_binding.version,
+                expected_host_binding.slot_id,
+                expected_host_binding.host,
+                expected_host_binding.top_slot,
+                &expected_host_binding.top_slot_claim,
+                &expected_host_binding.candidate,
+            ),
+            "Installed must retain the exact six-field retired HostBinding identity"
+        );
+        let core = entry.engine.testing_back_target_permanent_current_state();
+        let registry_claim_is_exact = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(expected_host_binding.top_slot)
+            .is_some_and(|record| record.claim() == expected_host_binding.top_slot_claim);
+        let host_registration_is_preserved = app
+            .world()
+            .get::<RouterHostRegistration>(expected_host_binding.host)
+            .is_some_and(|registration| registration.router() == router);
+
+        let ecs_source = target_permanent_production_source();
+        let retired_binding_contract = target_permanent_contract_item_between(
+            ecs_source,
+            "pub(crate) struct RetiredHostBinding {",
+            "impl HostBinding {",
+        );
+        let retirement_contract = target_permanent_contract_item_between(
+            ecs_source,
+            "impl HostBinding {",
+            "impl RetiredHostBinding {",
+        );
+        let installed_contract = target_permanent_contract_item_between(
+            ecs_source,
+            "pub(crate) struct InstalledTargetPreparationPermanentCleanup {",
+            "pub(crate) struct PreparedTargetPermanentEcsInstallationOwner {",
+        );
+        let retired_binding_has_exact_fields = [
+            "version",
+            "slot_id",
+            "host",
+            "top_slot",
+            "top_slot_claim",
+            "candidate",
+        ]
+        .iter()
+        .all(|field| target_permanent_contract_field_count(retired_binding_contract, field) == 1)
+            && target_permanent_contract_field_count(retired_binding_contract, "lease") == 0;
+        let installed_has_only_retired_host =
+            target_permanent_contract_field_count(installed_contract, "retired_host") == 1
+                && target_permanent_contract_field_count(installed_contract, "host") == 0
+                && target_permanent_contract_field_count(installed_contract, "host_binding") == 0;
+        let compact_retirement = retirement_contract
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        let retirement_moves_binding_and_lease = compact_retirement
+            .contains("(RetiredHostBinding{")
+            && compact_retirement.contains("},lease,)")
+            && !compact_retirement.contains("lease.clone()");
+        assert_eq!(
+            (
+                entry.host.is_none(),
+                installed_has_only_retired_host,
+                retired_binding_has_exact_fields && retirement_moves_binding_and_lease,
+                registry_claim_is_exact,
+                entry
+                    .engine
+                    .testing_back_target_permanent_retired_host_matches(
+                        &expected_host_binding.version,
+                        expected_host_binding.slot_id,
+                    ),
+                core.pending_target_cleanup_present(),
+                host_registration_is_preserved,
+            ),
+            (true, true, true, true, true, true, true),
+            "exact begin must linearly retire HostBinding into an ECS RetiredHostBinding carrying the top-slot claim plus a Core logical retired-host owner before returning"
+        );
+    }
+
+    #[test]
+    fn back_target_permanent_host_retirement_rejection_restores_whole_owner_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-host-retirement-rejected",
+        );
+        let StagedTargetPermanentDisposition {
+            request,
+            host,
+            disposition,
+        } = stage_real_back_target_permanent_disposition(&mut app, router);
+        let expected_cleanup = TargetPermanentDispositionProjection::capture(&disposition);
+        let expected_manifest = disposition.core_binding.cleanup.projection();
+        publish_snapshots_system(app.world_mut());
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the retirement-rejection fixture retains its exact entry");
+            assert!(
+                entry
+                    .engine
+                    .testing_replace_host_admission_with_non_owning_issuer(),
+                "the existing seam must install a real non-owning host issuer"
+            );
+        }
+        let (host_before, core_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the retirement-rejection fixture retains its exact entry");
+            (
+                ProjectionlessHostProjection::from(
+                    entry
+                        .host
+                        .as_ref()
+                        .expect("dispatch has not moved the exact HostBinding yet"),
+                ),
+                entry.engine.snapshot(),
+            )
+        };
+        assert_eq!(host_before.host, host);
+        let zero_write_before =
+            ReadyPlanPermanentZeroWriteProjection::capture(&app, router, request, host);
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+
+        let (returned, evidence) =
+            match dispatch_real_back_target_permanent(&mut app, router, disposition) {
+                BackTargetPermanentDispatchOutcome::Permanent {
+                    disposition,
+                    evidence,
+                } => (disposition, evidence),
+                BackTargetPermanentDispatchOutcome::Dispatched => {
+                    panic!("the real non-owning issuer must reject target host retirement")
+                }
+                BackTargetPermanentDispatchOutcome::EntryMismatch { .. }
+                | BackTargetPermanentDispatchOutcome::PreparedEntryMismatch { .. } => {
+                    panic!(
+                        "the unchanged exact ECS entry/partition must pass before host retirement"
+                    )
+                }
+                BackTargetPermanentDispatchOutcome::LedgerRejected { .. } => {
+                    panic!("the real dedicated manifest must reserve before host retirement")
+                }
+                BackTargetPermanentDispatchOutcome::ReceiverMismatch { .. } => {
+                    panic!("the exact target settlement must reach its host-retirement predicate")
+                }
+                BackTargetPermanentDispatchOutcome::LogicalRootsMismatch(_) => {
+                    panic!("the exact dedicated logical roots must reach host retirement")
+                }
+            };
+        let core_source = include_str!("../../bevy_ui_router_core/src/integration.rs");
+        let evidence_contract = target_permanent_contract_item_between(
+            core_source,
+            "pub enum BackTargetPermanentBeginPermanentEvidence {",
+            "pub struct BackTargetPermanentCurrentStateProjectionView {",
+        );
+        assert!(
+            evidence_contract
+                .lines()
+                .map(str::trim)
+                .any(|line| line.starts_with("HostRetirementRejected")),
+            "target begin must expose a typed HostRetirementRejected evidence variant"
+        );
+        assert!(
+            format!("{evidence:?}").starts_with("HostRetirementRejected"),
+            "the real non-owning issuer must produce typed host-retirement evidence"
+        );
+        assert_prepared_target_permanent_dispatch_owner_is_complete(&returned);
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture_prepared(&returned),
+            expected_cleanup,
+            "host retirement rejection must whole-return the actual cleanup/splice owner"
+        );
+        assert_eq!(
+            returned.core_binding.cleanup.projection(),
+            expected_manifest,
+            "host retirement rejection must whole-return the exact Core binding"
+        );
+        assert_eq!(
+            returned.ledger.ledger.projection().manifest_digest(),
+            expected_manifest.manifest_digest()
+        );
+        assert_eq!(
+            returned.ledger.ledger.projection().obligation_count(),
+            expected_manifest.obligation_count()
+        );
+
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the rejected target begin retains its exact RouterEntry");
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+        assert_eq!(
+            ProjectionlessHostProjection::from(
+                entry
+                    .host
+                    .as_ref()
+                    .expect("rejection must restore the exact HostBinding"),
+            ),
+            host_before,
+            "rejection must restore version/slot/host/top-slot/claim/candidate exactly"
+        );
+        assert_eq!(entry.engine.snapshot(), core_before);
+        assert!(entry.pending_back_target_permanent_cleanup.is_none());
+        let current = entry.engine.testing_back_target_permanent_current_state();
+        assert!(!current.current_retired_host_present());
+        assert!(!current.pending_target_cleanup_present());
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(&app, router, request, host),
+            zero_write_before,
+            "host retirement rejection must leave Core, World, registry and public state unchanged"
+        );
+    }
+
+    #[test]
     fn back_target_physical_permanent_begin_installs_prepared_before_core_write() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
@@ -33745,7 +34722,7 @@ pub(crate) mod tests {
         let staged = stage_real_back_target_permanent_disposition(&mut app, router);
         publish_snapshots_system(app.world_mut());
         let expected_ticket = staged.disposition.cleanup.physical.lineage.ticket.clone();
-        let expected_manifest = staged.disposition.manifest.cleanup.projection();
+        let expected_manifest = staged.disposition.core_binding.cleanup.projection();
         let zero_write_before = ReadyPlanPermanentZeroWriteProjection::capture(
             &app,
             router,
@@ -33823,8 +34800,8 @@ pub(crate) mod tests {
                         panic!("begin must install Prepared and must not activate the ledger")
                     };
                     assert_eq!(
-                        prepared.validation.allowed_write.targets,
-                        installed.cleanup.physical.allowed_write.targets
+                        prepared.validation.allowed_write.splice_targets,
+                        installed.cleanup.physical.allowed_write.splice_targets
                     );
                     let ledger = prepared.ledger.projection();
                     let batch = installed.batch.batch();
@@ -34040,6 +35017,21 @@ pub(crate) mod tests {
         let staged = stage_real_back_target_classifier_permanent(&mut app, router, protected, true);
         publish_snapshots_system(app.world_mut());
         let source_before = ClassifierPermanentSourceProjection::capture(&staged.owner);
+        let top_slot_claim = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .and_then(|entry| entry.host.as_ref())
+            .expect("the marked fixture retains its exact HostBinding")
+            .top_slot_claim
+            .clone();
+        let projected = projected_target_permanent_claims(
+            app.world(),
+            &staged.owner.owner.splice,
+            &top_slot_claim,
+        );
         let leaving_shell_claim = staged
             .owner
             .owner
@@ -34148,10 +35140,10 @@ pub(crate) mod tests {
         let authority_before =
             ClassifierPermanentAuthorityStateProjection::capture(app.world(), staged.host);
         let expected_frozen_targets =
-            authority_before.observed_for(source_before.allowed_write_targets.iter().copied());
+            authority_before.observed_for(projected.claims.iter().map(ExactRegistryClaim::entity));
         let expected_frozen_protected = authority_before.protected_for(
             staged.host,
-            source_before.allowed_write_targets.iter().copied(),
+            projected.claims.iter().map(ExactRegistryClaim::entity),
         );
         let world_before = authority_world_fingerprint(app.world());
         let registry_before = app
@@ -34301,7 +35293,8 @@ pub(crate) mod tests {
         let TargetPreparationPermanentDisposition {
             cleanup,
             settlement: _settlement,
-            manifest: _manifest,
+            ecs_manifest: _ecs_manifest,
+            core_binding: _core_binding,
         } = disposition;
         let TargetPreparationPermanentCleanupOwner {
             physical,
@@ -34330,10 +35323,13 @@ pub(crate) mod tests {
             .map(|observed| observed.entity)
             .collect::<Vec<_>>();
         observed_targets.sort_by_key(|entity| entity.to_bits());
-        let mut allowed_write = physical.allowed_write.targets.clone();
+        let mut allowed_write = physical.allowed_write.splice_targets.clone();
         allowed_write.sort_by_key(|entity| entity.to_bits());
-        assert_eq!(allowed_write, source_before.allowed_write_targets);
-        assert_eq!(observed_targets, allowed_write);
+        assert_eq!(allowed_write, projected.splice_targets);
+        let mut expected_target_observed = allowed_write.clone();
+        expected_target_observed.push(projected.top_slot);
+        expected_target_observed.sort_by_key(|entity| entity.to_bits());
+        assert_eq!(observed_targets, expected_target_observed);
         assert_eq!(physical.target_observed, expected_frozen_targets);
         assert_eq!(physical.protected.observed, expected_frozen_protected);
         assert!(
@@ -34341,7 +35337,7 @@ pub(crate) mod tests {
                 .protected
                 .observed
                 .iter()
-                .all(|observed| !allowed_write.contains(&observed.entity)),
+                .all(|observed| !expected_target_observed.contains(&observed.entity)),
             "foreign component additions must not widen or overlap the protected partition"
         );
     }
@@ -34661,13 +35657,28 @@ pub(crate) mod tests {
             true,
         );
         let exact_source = ClassifierPermanentSourceProjection::capture(&exact.owner);
+        let top_slot_claim = exact_app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == exact_router)
+            .and_then(|entry| entry.host.as_ref())
+            .expect("the exact classifier fixture retains its HostBinding")
+            .top_slot_claim
+            .clone();
+        let projected = projected_target_permanent_claims(
+            exact_app.world(),
+            &exact.owner.owner.splice,
+            &top_slot_claim,
+        );
         let exact_authority_before =
             ClassifierPermanentAuthorityStateProjection::capture(exact_app.world(), exact.host);
-        let expected_frozen_targets =
-            exact_authority_before.observed_for(exact_source.allowed_write_targets.iter().copied());
+        let expected_frozen_targets = exact_authority_before
+            .observed_for(projected.claims.iter().map(ExactRegistryClaim::entity));
         let expected_frozen_protected = exact_authority_before.protected_for(
             exact.host,
-            exact_source.allowed_write_targets.iter().copied(),
+            projected.claims.iter().map(ExactRegistryClaim::entity),
         );
         let exact_world_before = authority_world_fingerprint(exact_app.world());
         let exact_registry_before = exact_app
@@ -34806,7 +35817,8 @@ pub(crate) mod tests {
         let TargetPreparationPermanentDisposition {
             cleanup,
             settlement: _settlement,
-            manifest,
+            ecs_manifest,
+            core_binding,
         } = disposition;
         let TargetPreparationPermanentCleanupOwner { physical, branch } = cleanup;
         assert_eq!(physical.lineage.router, exact_router);
@@ -34817,10 +35829,13 @@ pub(crate) mod tests {
             .map(|observed| observed.entity)
             .collect::<Vec<_>>();
         target_observed.sort_by_key(|entity| entity.to_bits());
-        let mut allowed_write = physical.allowed_write.targets.clone();
+        let mut allowed_write = physical.allowed_write.splice_targets.clone();
         allowed_write.sort_by_key(|entity| entity.to_bits());
-        assert_eq!(allowed_write, exact_source.allowed_write_targets);
-        assert_eq!(target_observed, allowed_write);
+        assert_eq!(allowed_write, projected.splice_targets);
+        let mut expected_target_observed = allowed_write.clone();
+        expected_target_observed.push(projected.top_slot);
+        expected_target_observed.sort_by_key(|entity| entity.to_bits());
+        assert_eq!(target_observed, expected_target_observed);
         assert_eq!(
             physical.target_observed, expected_frozen_targets,
             "frozen target evidence must equal the independently captured pre-call target facts"
@@ -34838,14 +35853,13 @@ pub(crate) mod tests {
             "every protected closure must be disjoint from the allowed write set"
         );
         let frozen_top_slot = physical
-            .protected
-            .observed
+            .target_observed
             .iter()
             .find(|observed| observed.entity == exact.top_slot)
-            .expect("the exact current top slot must be frozen as a mixed carrier");
+            .expect("the exact current top slot must be frozen in the host-edge domain");
         assert!(
-            expected_frozen_protected.contains(frozen_top_slot),
-            "the pre-call projection must include the mixed top-slot carrier"
+            expected_frozen_targets.contains(frozen_top_slot),
+            "the pre-call projection must include the exact top-slot carrier"
         );
         assert!(
             !physical.protected.roots.contains(&exact.top_slot),
@@ -34875,13 +35889,9 @@ pub(crate) mod tests {
         }
         let BackTargetPermanentAuthorityManifest {
             cleanup: _core_manifest,
-        } = manifest;
+        } = core_binding;
         match branch {
-            FrozenTargetPreparationPermanentBranch::Classifier {
-                physical,
-                frozen_manifest,
-                evidence,
-            } => {
+            FrozenTargetPreparationPermanentBranch::Classifier { physical, evidence } => {
                 let reconstructed_projection = ClassifierPermanentSourceProjection::capture_parts(
                     &physical.splice,
                     &physical.history,
@@ -34891,7 +35901,7 @@ pub(crate) mod tests {
                 assert_eq!(reconstructed_projection.preserved, exact_source.preserved);
                 assert_eq!(reconstructed_projection.entering, exact_source.entering);
                 assert_eq!(reconstructed_projection.leaving, exact_source.leaving);
-                assert_eq!(frozen_manifest.len(), exact_source.leaving.len());
+                assert_eq!(ecs_manifest.len(), projected.claims.len());
             }
             FrozenTargetPreparationPermanentBranch::ReadyPlan { .. } => {
                 panic!("a classifier source must never become a Ready-plan permanent branch")

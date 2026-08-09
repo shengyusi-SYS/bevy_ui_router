@@ -1027,19 +1027,34 @@ pub(crate) enum BackNoTargetAuthorityBeginCoreOutcome {
 pub(crate) enum BackTargetPermanentBeginCoreOutcome<Installation> {
     Begun,
     ReceiverMismatch {
-        owner: CoreBackTargetPermanentSettlementOwner,
+        owner: CoreBackTargetPermanentBeginOwner,
         installation: Installation,
         mismatch: CorePreparationReceiverMismatchProjection,
     },
     LogicalRootsMismatch {
-        owner: CoreBackTargetPermanentSettlementOwner,
+        owner: CoreBackTargetPermanentBeginOwner,
         installation: Installation,
     },
     Permanent {
-        owner: CoreBackTargetPermanentSettlementOwner,
+        owner: CoreBackTargetPermanentBeginOwner,
         installation: Installation,
         evidence: BackTargetPermanentBeginCorePermanentEvidence,
     },
+}
+
+pub(crate) struct CoreBackTargetPermanentBeginOwner {
+    settlement: CoreBackTargetPermanentSettlementOwner,
+    host: HostLease,
+}
+
+impl CoreBackTargetPermanentBeginOwner {
+    pub(crate) fn new(settlement: CoreBackTargetPermanentSettlementOwner, host: HostLease) -> Self {
+        Self { settlement, host }
+    }
+
+    pub(crate) fn into_parts(self) -> (CoreBackTargetPermanentSettlementOwner, HostLease) {
+        (self.settlement, self.host)
+    }
 }
 
 pub(crate) struct CoreBackTargetPermanentSettlementOwner {
@@ -1068,6 +1083,7 @@ pub(crate) enum BackTargetPermanentBeginCorePermanentEvidence {
         expected: CoreBackTargetPermanentTerminalExpectedProjection,
         observed: CoreBackTargetPermanentTerminalObservedProjection,
     },
+    HostRetirementRejected,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2252,6 +2268,7 @@ struct CoreBackTargetPermanentCleanupState {
     receiver: CoreBackTargetPermanentCleanupProjection,
     history: Option<HistoryCommitCapability>,
     settlement: CoreBackTargetPermanentSettlementOwner,
+    retired_host: RetiredHostAuthority,
     terminal: CoreBackTargetPermanentTerminalPlan,
 }
 
@@ -3924,7 +3941,8 @@ impl RouterEngine {
 
     pub(crate) fn begin_back_target_permanent_cleanup<Installation, F>(
         &mut self,
-        settlement: CoreBackTargetPermanentSettlementOwner,
+        issuer: &mut HostAdmissionIssuer,
+        owner: CoreBackTargetPermanentBeginOwner,
         ticket: &CommitTicket,
         logical_roots: Vec<RouteFrameVersion>,
         manifest_digest: u64,
@@ -3935,18 +3953,28 @@ impl RouterEngine {
     where
         F: FnOnce(Installation, CleanupBatchToken),
     {
+        let CoreBackTargetPermanentBeginOwner {
+            settlement,
+            host: host_lease,
+        } = owner;
         if let Err(mismatch) =
             self.inspect_back_target_continuation(&settlement.scope, Some(ticket))
         {
             return BackTargetPermanentBeginCoreOutcome::ReceiverMismatch {
-                owner: settlement,
+                owner: CoreBackTargetPermanentBeginOwner {
+                    settlement,
+                    host: host_lease,
+                },
                 installation,
                 mismatch,
             };
         }
         if settlement.logical_roots != logical_roots {
             return BackTargetPermanentBeginCoreOutcome::LogicalRootsMismatch {
-                owner: settlement,
+                owner: CoreBackTargetPermanentBeginOwner {
+                    settlement,
+                    host: host_lease,
+                },
                 installation,
             };
         }
@@ -3959,7 +3987,10 @@ impl RouterEngine {
                         expected: settlement.expected_current.clone(),
                         observed: observed_current,
                     },
-                owner: settlement,
+                owner: CoreBackTargetPermanentBeginOwner {
+                    settlement,
+                    host: host_lease,
+                },
                 installation,
             };
         }
@@ -3972,7 +4003,10 @@ impl RouterEngine {
                         expected: expected_canonical,
                         observed: observed_canonical,
                     },
-                owner: settlement,
+                owner: CoreBackTargetPermanentBeginOwner {
+                    settlement,
+                    host: host_lease,
+                },
                 installation,
             };
         }
@@ -4000,7 +4034,10 @@ impl RouterEngine {
                         expected: settlement.expected_request.clone(),
                         observed: observed_request,
                     },
-                owner: settlement,
+                owner: CoreBackTargetPermanentBeginOwner {
+                    settlement,
+                    host: host_lease,
+                },
                 installation,
             };
         }
@@ -4088,7 +4125,10 @@ impl RouterEngine {
                                 ),
                         },
                     },
-                owner: settlement,
+                owner: CoreBackTargetPermanentBeginOwner {
+                    settlement,
+                    host: host_lease,
+                },
                 installation,
             };
         }
@@ -4118,7 +4158,10 @@ impl RouterEngine {
                                 ),
                         },
                     },
-                owner: settlement,
+                owner: CoreBackTargetPermanentBeginOwner {
+                    settlement,
+                    host: host_lease,
+                },
                 installation,
             };
         }
@@ -4147,7 +4190,10 @@ impl RouterEngine {
                             failure: CoreBackTargetPermanentTerminalFailureProjection::MissingRequest,
                         },
                     },
-                    owner: settlement,
+                owner: CoreBackTargetPermanentBeginOwner {
+                    settlement,
+                    host: host_lease,
+                },
                     installation,
                 };
             };
@@ -4175,7 +4221,10 @@ impl RouterEngine {
                             failure: CoreBackTargetPermanentTerminalFailureProjection::RequestRejected(error),
                         },
                     },
-                    owner: settlement,
+                owner: CoreBackTargetPermanentBeginOwner {
+                    settlement,
+                    host: host_lease,
+                },
                     installation,
                 };
             }
@@ -4197,7 +4246,10 @@ impl RouterEngine {
                             failure: CoreBackTargetPermanentTerminalFailureProjection::RequestRejected(error),
                         },
                     },
-                    owner: settlement,
+                owner: CoreBackTargetPermanentBeginOwner {
+                    settlement,
+                    host: host_lease,
+                },
                     installation,
                 };
             }
@@ -4222,7 +4274,10 @@ impl RouterEngine {
                         failure: CoreBackTargetPermanentTerminalFailureProjection::AuthorityRecoveryRejected,
                     },
                 },
-                owner: settlement,
+                owner: CoreBackTargetPermanentBeginOwner {
+                    settlement,
+                    host: host_lease,
+                },
                 installation,
             };
         }
@@ -4257,7 +4312,10 @@ impl RouterEngine {
                             failure: CoreBackTargetPermanentTerminalFailureProjection::RetentionInvariant,
                         },
                     },
-                    owner: settlement,
+                owner: CoreBackTargetPermanentBeginOwner {
+                    settlement,
+                    host: host_lease,
+                },
                     installation,
                 };
             };
@@ -4309,7 +4367,10 @@ impl RouterEngine {
                                 ),
                         },
                     },
-                owner: settlement,
+                owner: CoreBackTargetPermanentBeginOwner {
+                    settlement,
+                    host: host_lease,
+                },
                 installation,
             };
         }
@@ -4339,7 +4400,10 @@ impl RouterEngine {
                                 ),
                         },
                     },
-                owner: settlement,
+                owner: CoreBackTargetPermanentBeginOwner {
+                    settlement,
+                    host: host_lease,
+                },
                 installation,
             };
         }
@@ -4369,7 +4433,10 @@ impl RouterEngine {
                                 ),
                         },
                     },
-                owner: settlement,
+                owner: CoreBackTargetPermanentBeginOwner {
+                    settlement,
+                    host: host_lease,
+                },
                 installation,
             };
         }
@@ -4393,7 +4460,10 @@ impl RouterEngine {
                         failure: CoreBackTargetPermanentTerminalFailureProjection::AuthoritySettlementRejected,
                     },
                 },
-                owner: settlement,
+                owner: CoreBackTargetPermanentBeginOwner {
+                    settlement,
+                    host: host_lease,
+                },
                 installation,
             };
         }
@@ -4426,7 +4496,10 @@ impl RouterEngine {
                             failure: CoreBackTargetPermanentTerminalFailureProjection::RetentionInvariant,
                         },
                     },
-                    owner: settlement,
+                owner: CoreBackTargetPermanentBeginOwner {
+                    settlement,
+                    host: host_lease,
+                },
                     installation,
                 };
             };
@@ -4469,12 +4542,27 @@ impl RouterEngine {
         };
         let recovering_queue = VecDeque::new();
 
+        let retired_host = match issuer.retire_current(host_lease) {
+            Ok(retired_host) => retired_host,
+            Err(error) => {
+                return BackTargetPermanentBeginCoreOutcome::Permanent {
+                    owner: CoreBackTargetPermanentBeginOwner {
+                        settlement,
+                        host: error.into_owner(),
+                    },
+                    installation,
+                    evidence: BackTargetPermanentBeginCorePermanentEvidence::HostRetirementRejected,
+                };
+            }
+        };
+
         install(installation, batch);
         let history = self.current_history_capability.take();
         self.pending_back_target_permanent_cleanup = Some(CoreBackTargetPermanentCleanupState {
             receiver,
             history,
             settlement,
+            retired_host,
             terminal,
         });
         self.records = recovering_records;
@@ -9881,12 +9969,18 @@ impl RouterEngine {
             current_logical_roots: current.map(|current| current.cleanup_roots.clone()),
             current_reconciliation: current
                 .and_then(|current| current.reconciliation.as_ref().cloned()),
-            current_retired_host: current.and_then(|current| {
-                current
-                    .retired_host
-                    .as_ref()
-                    .map(RetiredHostAuthority::projection)
-            }),
+            current_retired_host: current
+                .and_then(|current| {
+                    current
+                        .retired_host
+                        .as_ref()
+                        .map(RetiredHostAuthority::projection)
+                })
+                .or_else(|| {
+                    self.pending_back_target_permanent_cleanup
+                        .as_ref()
+                        .map(|cleanup| cleanup.retired_host.projection())
+                }),
             active_baseline: self.back_target_preparation_baseline(),
             availability: self.state.availability().clone(),
             request_status: self.state.current_request().cloned(),
@@ -10109,6 +10203,22 @@ impl RouterEngine {
         &self,
     ) -> CoreBackTargetPermanentCurrentStateProjection {
         self.back_target_permanent_current_state_projection()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_back_target_permanent_retired_host_matches(
+        &self,
+        version: &crate::admission::HostVersion,
+        top_slot: crate::ids::RouteSlotId,
+    ) -> bool {
+        self.pending_back_target_permanent_cleanup
+            .as_ref()
+            .is_some_and(|cleanup| {
+                cleanup
+                    .retired_host
+                    .projection()
+                    .matches(self.router, version, top_slot)
+            })
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -11157,6 +11267,8 @@ impl EngineSnapshot {
 
 #[cfg(test)]
 mod tests {
+    use super::CoreBackTargetPermanentBeginOwner;
+    use crate::admission::HostLease;
     use std::collections::VecDeque;
 
     use super::{
@@ -11255,6 +11367,12 @@ mod tests {
     }
 
     fn ready_engine_with_tree(tree: RouteTree) -> RouterEngine {
+        ready_engine_with_tree_and_authority(tree).0
+    }
+
+    fn ready_engine_with_tree_and_authority(
+        tree: RouteTree,
+    ) -> (RouterEngine, HostAdmissionIssuer, HostLease) {
         let mut engine =
             RouterEngine::install(tree, RouteViewKey::new("fallback").unwrap()).unwrap();
         let mut issuer = HostAdmissionIssuer::new().unwrap();
@@ -11262,7 +11380,8 @@ mod tests {
         let grant = engine.grant_host_admission(&mut issuer, &token).unwrap();
         let confirmation = issuer.confirm(&grant).unwrap();
         engine.confirm_host(&issuer, &confirmation).unwrap();
-        engine
+        let lease = confirmation.into_lease();
+        (engine, issuer, lease)
     }
 
     fn publish_current(engine: &mut RouterEngine) -> crate::cleanup::CleanupBatchToken {
@@ -11423,8 +11542,10 @@ mod tests {
         crate::history_authority::BackResolutionScopeProjection,
         super::CommitTicket,
         Vec<RouteFrameVersion>,
+        HostAdmissionIssuer,
+        HostLease,
     ) {
-        let mut engine = ready_engine();
+        let (mut engine, issuer, lease) = ready_engine_with_tree_and_authority(tree());
         engine.push(RouteLocation::new("/")).unwrap();
         settle_current(&mut engine);
         engine.push(RouteLocation::new("/about")).unwrap();
@@ -11485,7 +11606,7 @@ mod tests {
             .expect("the ReadyToCommit fixture retains current work")
             .cleanup_roots
             .clone();
-        (engine, continuation, ticket, logical_roots)
+        (engine, continuation, ticket, logical_roots, issuer, lease)
     }
 
     fn real_retired_host_authority() -> (
@@ -11555,7 +11676,7 @@ mod tests {
             NoncanonicalFact::Availability,
             NoncanonicalFact::PendingRelation,
         ] {
-            let (mut engine, scope, ticket, actual_logical_roots) =
+            let (mut engine, scope, ticket, actual_logical_roots, mut issuer, lease) =
                 back_target_permanent_begin_fixture();
             let mut submitted_logical_roots = actual_logical_roots.clone();
             match fact {
@@ -11629,7 +11750,8 @@ mod tests {
             let installation = format!("{fact:?}");
 
             let evidence = match engine.begin_back_target_permanent_cleanup(
-                settlement,
+                &mut issuer,
+                CoreBackTargetPermanentBeginOwner::new(settlement, lease),
                 &ticket,
                 submitted_logical_roots,
                 0x4341_4e4f_4e49_4341,
@@ -11642,6 +11764,7 @@ mod tests {
                     installation: returned_installation,
                     evidence,
                 } => {
+                    let (owner, _lease) = owner.into_parts();
                     assert_eq!(owner.scope, expected_scope);
                     assert_eq!(owner.expected_current, expected_current);
                     assert_eq!(owner.expected_request, expected_request);
@@ -11677,7 +11800,8 @@ mod tests {
     #[test]
     fn back_target_permanent_begin_rejects_owned_noncanonical_relations_losslessly() {
         {
-            let (mut engine, scope, ticket, logical_roots) = back_target_permanent_begin_fixture();
+            let (mut engine, scope, ticket, logical_roots, mut issuer, lease) =
+                back_target_permanent_begin_fixture();
             let (router, version, top_slot, retired_host) = real_retired_host_authority();
             engine
                 .current
@@ -11696,7 +11820,8 @@ mod tests {
             let installation = "owned-retired-host";
 
             let evidence = match engine.begin_back_target_permanent_cleanup(
-                settlement,
+                &mut issuer,
+                CoreBackTargetPermanentBeginOwner::new(settlement, lease),
                 &ticket,
                 logical_roots,
                 0x4f57_4e45_445f_524c,
@@ -11709,6 +11834,7 @@ mod tests {
                     installation: returned_installation,
                     evidence,
                 } => {
+                    let (owner, _lease) = owner.into_parts();
                     assert_eq!(owner.scope, expected_scope);
                     assert_eq!(owner.expected_current, expected_current);
                     assert_eq!(owner.expected_request, expected_request);
@@ -11757,7 +11883,8 @@ mod tests {
         }
 
         {
-            let (mut engine, scope, ticket, logical_roots) = back_target_permanent_begin_fixture();
+            let (mut engine, scope, ticket, logical_roots, mut issuer, lease) =
+                back_target_permanent_begin_fixture();
             let pending_mount = real_pending_mount();
             let expected_child_index = pending_mount.child_index;
             let expected_parent = pending_mount.parent.clone();
@@ -11780,7 +11907,8 @@ mod tests {
             let installation = "owned-pending-mount";
 
             let evidence = match engine.begin_back_target_permanent_cleanup(
-                settlement,
+                &mut issuer,
+                CoreBackTargetPermanentBeginOwner::new(settlement, lease),
                 &ticket,
                 logical_roots,
                 0x4f57_4e45_445f_524c,
@@ -11793,6 +11921,7 @@ mod tests {
                     installation: returned_installation,
                     evidence,
                 } => {
+                    let (owner, _lease) = owner.into_parts();
                     assert_eq!(owner.scope, expected_scope);
                     assert_eq!(owner.expected_current, expected_current);
                     assert_eq!(owner.expected_request, expected_request);
@@ -11991,7 +12120,8 @@ mod tests {
 
     #[test]
     fn back_target_permanent_canonical_evidence_is_typed_and_snapshot_drift_stays_distinct() {
-        let (mut engine, scope, ticket, logical_roots) = back_target_permanent_begin_fixture();
+        let (mut engine, scope, ticket, logical_roots, mut issuer, lease) =
+            back_target_permanent_begin_fixture();
         let settlement =
             engine.prepare_back_target_permanent_settlement_owner(scope, logical_roots.clone());
         let expected_scope = settlement.scope.clone();
@@ -12007,7 +12137,8 @@ mod tests {
         let callback_calls = std::cell::Cell::new(0usize);
 
         match engine.begin_back_target_permanent_cleanup(
-            settlement,
+            &mut issuer,
+            CoreBackTargetPermanentBeginOwner::new(settlement, lease),
             &ticket,
             logical_roots,
             0x534e_4150_5f44_5246,
@@ -12024,6 +12155,7 @@ mod tests {
                         observed,
                     },
             } => {
+                let (owner, _lease) = owner.into_parts();
                 assert_eq!(owner.scope, expected_scope);
                 assert_eq!(owner.expected_current, expected_current);
                 assert_eq!(owner.expected_request, expected_request);
@@ -12120,7 +12252,8 @@ mod tests {
 
     #[test]
     fn back_target_permanent_request_contradiction_preserves_presence_and_trace_contract() {
-        let (mut engine, scope, ticket, logical_roots) = back_target_permanent_begin_fixture();
+        let (mut engine, scope, ticket, logical_roots, mut issuer, lease) =
+            back_target_permanent_begin_fixture();
         let settlement = engine
             .prepare_back_target_permanent_settlement_owner(scope.clone(), logical_roots.clone());
         let expected_scope = settlement.scope.clone();
@@ -12137,7 +12270,8 @@ mod tests {
         let callback_calls = std::cell::Cell::new(0usize);
 
         let source = match engine.begin_back_target_permanent_cleanup(
-            settlement,
+            &mut issuer,
+            CoreBackTargetPermanentBeginOwner::new(settlement, lease),
             &ticket,
             logical_roots,
             0x5452_4143_455f_4f4e,
@@ -12155,6 +12289,7 @@ mod tests {
                         observed,
                     },
             } => {
+                let (owner, _lease) = owner.into_parts();
                 assert_eq!(owner.scope, expected_scope);
                 assert_eq!(owner.expected_current, expected_current);
                 assert_eq!(owner.expected_request, expected_request);
@@ -12244,7 +12379,8 @@ mod tests {
 
     #[test]
     fn back_target_permanent_missing_current_record_returns_lossless_typed_evidence() {
-        let (mut engine, scope, ticket, logical_roots) = back_target_permanent_begin_fixture();
+        let (mut engine, scope, ticket, logical_roots, mut issuer, lease) =
+            back_target_permanent_begin_fixture();
         let settlement = engine
             .prepare_back_target_permanent_settlement_owner(scope.clone(), logical_roots.clone());
         let expected_scope = settlement.scope.clone();
@@ -12258,7 +12394,8 @@ mod tests {
         let callback_calls = std::cell::Cell::new(0usize);
 
         let evidence = match engine.begin_back_target_permanent_cleanup(
-            settlement,
+            &mut issuer,
+            CoreBackTargetPermanentBeginOwner::new(settlement, lease),
             &ticket,
             logical_roots,
             0x4d49_5353_494e_475f,
@@ -12271,6 +12408,7 @@ mod tests {
                 installation,
                 evidence,
             } => {
+                let (owner, _lease) = owner.into_parts();
                 assert_eq!(owner.scope, expected_scope);
                 assert_eq!(owner.expected_current, expected_current);
                 assert_eq!(owner.expected_request, expected_request);
@@ -12299,7 +12437,8 @@ mod tests {
 
     #[test]
     fn back_target_permanent_terminal_source_retains_missing_queued_record_expectation() {
-        let (mut engine, scope, ticket, logical_roots) = back_target_permanent_begin_fixture();
+        let (mut engine, scope, ticket, logical_roots, mut issuer, lease) =
+            back_target_permanent_begin_fixture();
         let queued_location = RouteLocation::new("/items/queued-after-back");
         let queued_request = engine
             .push(queued_location.clone())
@@ -12318,7 +12457,8 @@ mod tests {
         let callback_calls = std::cell::Cell::new(0usize);
 
         let source = match engine.begin_back_target_permanent_cleanup(
-            settlement,
+            &mut issuer,
+            CoreBackTargetPermanentBeginOwner::new(settlement, lease),
             &ticket,
             logical_roots,
             0x5155_4555_455f_4f4e,
@@ -12336,6 +12476,7 @@ mod tests {
                         observed,
                     },
             } => {
+                let (owner, _lease) = owner.into_parts();
                 assert_eq!(owner.scope, expected_scope);
                 assert_eq!(owner.expected_current, expected_current);
                 assert_eq!(owner.expected_request, expected_request);

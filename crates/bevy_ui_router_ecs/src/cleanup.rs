@@ -23,7 +23,10 @@ use bevy_ui_router_core::{
 };
 
 use crate::{
-    branch_transaction::{FailedPreparedBranch, RealizedBranch, RejectedChildSlot},
+    branch_transaction::{
+        FailedPreparedBranch, RealizedBranch, RejectedChildSlot, SealedReconciliationSlotRole,
+        SealedReconciliationSplice,
+    },
     components::{
         ChildSlotAuthority, ChildSlotLifecycle, ProvisionalSlotLifecycle, RouteOwnershipSeal,
         RouterInputBarrier,
@@ -2819,6 +2822,106 @@ impl FrozenCleanupManifest {
         })
     }
 
+    pub(crate) fn from_target_preparation_permanent(
+        world: &World,
+        registry: &RouteEntityRegistry,
+        splice: &SealedReconciliationSplice,
+        projected_claims: &[ExactRegistryClaim],
+        host: &HostBinding,
+    ) -> Result<Self, AuthoritySettlementManifestError> {
+        let projected = projected_claims
+            .iter()
+            .map(|claim| (claim.entity(), claim))
+            .collect::<HashMap<_, _>>();
+        if projected.len() != projected_claims.len()
+            || host.top_slot_claim.entity() != host.top_slot
+            || host.candidate.host() != host.host
+        {
+            return Err(AuthoritySettlementManifestError::InvalidAuthority);
+        }
+
+        let mut source_claims = HashMap::new();
+        for claim in splice
+            .preserved()
+            .claims()
+            .chain(splice.leaving().claims())
+            .chain(splice.entering().claims())
+            .chain(
+                splice
+                    .slot_roles()
+                    .iter()
+                    .map(SealedReconciliationSlotRole::claim),
+            )
+            .chain(std::iter::once(&host.top_slot_claim))
+        {
+            if source_claims
+                .insert(claim.entity(), claim)
+                .is_some_and(|previous| previous != claim)
+            {
+                return Err(AuthoritySettlementManifestError::InvalidAuthority);
+            }
+        }
+        if source_claims.len() != projected.len()
+            || source_claims.iter().any(|(entity, source)| {
+                projected.get(entity).is_none_or(|projected| {
+                    projected.owner() != source.owner() || projected.seal() != source.seal()
+                })
+            })
+        {
+            return Err(AuthoritySettlementManifestError::InvalidAuthority);
+        }
+
+        let mut obligations = Vec::new();
+        for branch in [splice.preserved(), splice.leaving(), splice.entering()] {
+            append_projected_target_permanent_branch(
+                registry,
+                branch,
+                projected_claims,
+                &mut obligations,
+            )?;
+        }
+        for role in splice.slot_roles() {
+            let projected = projected
+                .get(&role.entity())
+                .ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
+            obligations.push(
+                target_permanent_slot_role_obligation(registry, role, projected)
+                    .ok_or(AuthoritySettlementManifestError::InvalidTopology)?,
+            );
+        }
+        let projected_top_slot = projected
+            .get(&host.top_slot)
+            .ok_or(AuthoritySettlementManifestError::InvalidAuthority)?;
+        obligations.push(
+            target_permanent_host_obligation(world, registry, host, projected_top_slot)
+                .ok_or(AuthoritySettlementManifestError::InvalidAuthority)?,
+        );
+        normalize_authority_obligations(&mut obligations)?;
+        if obligations.len() != projected_claims.len()
+            || projected_claims.iter().any(|claim| {
+                !obligations
+                    .iter()
+                    .any(|obligation| obligation.claim == *claim)
+            })
+            || obligations
+                .iter()
+                .any(|obligation| obligation.claim.entity() == host.host)
+        {
+            return Err(AuthoritySettlementManifestError::InvalidTopology);
+        }
+        order_leaf_to_root(&mut obligations)
+            .ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
+        let mount_parents = Vec::new();
+        let digest = frozen_manifest_digest(&obligations, &mount_parents);
+        Ok(Self {
+            obligations,
+            mount_parents,
+            boundary_drifts: Vec::new(),
+            pending_boundary_loss_claims: Vec::new(),
+            digest,
+        })
+    }
+
     pub(crate) fn finalize_failed_authority_settlement(
         mut self,
         world: &World,
@@ -4169,6 +4272,112 @@ fn authority_host_obligation(
             CleanupTerminalMode::AuthorityLost
         },
     }
+}
+
+fn append_projected_target_permanent_branch(
+    registry: &RouteEntityRegistry,
+    branch: &RealizedBranch,
+    projected_claims: &[ExactRegistryClaim],
+    obligations: &mut Vec<CleanupObligation>,
+) -> Result<(), AuthoritySettlementManifestError> {
+    for frame in branch.frames() {
+        let frame_projected = frame
+            .claims()
+            .map(|source| {
+                projected_claims
+                    .iter()
+                    .find(|projected| projected.entity() == source.entity())
+                    .cloned()
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
+        let mut frame_obligations = frame_obligations(registry, frame, &frame_projected)
+            .ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
+        for obligation in &mut frame_obligations {
+            obligation.terminal_mode = CleanupTerminalMode::AuthorityExact;
+        }
+        obligations.extend(frame_obligations);
+    }
+    for slot in branch.child_slots() {
+        let projected = projected_claims
+            .iter()
+            .find(|projected| projected.entity() == slot.slot())
+            .ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
+        let mut obligation = mounted_slot_obligation_with_claim(registry, slot, projected)
+            .ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
+        obligation.terminal_mode = CleanupTerminalMode::AuthorityExact;
+        obligations.push(obligation);
+    }
+    Ok(())
+}
+
+fn target_permanent_slot_role_obligation(
+    registry: &RouteEntityRegistry,
+    role: &SealedReconciliationSlotRole,
+    projected: &ExactRegistryClaim,
+) -> Option<CleanupObligation> {
+    let record = registry.record(role.entity())?;
+    let anchor_record = registry.record(role.anchor())?;
+    if record.claim() != *role.claim()
+        || anchor_record.claim() != *role.anchor_claim()
+        || projected.entity() != role.entity()
+        || projected.owner() != role.claim().owner()
+        || projected.seal() != role.claim().seal()
+        || !matches!(
+            role.claim().owner(),
+            RegistryOwner::Committed(EntityOwner::ChildSlot { parent, outlet, slot })
+                | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
+                    parent,
+                    outlet,
+                    slot,
+                })
+                if parent == role.parent()
+                    && outlet == role.outlet()
+                    && *slot == role.slot()
+        )
+    {
+        return None;
+    }
+    Some(CleanupObligation {
+        claim: projected.clone(),
+        manifest: record.manifest().clone(),
+        expected_parent: role.anchor(),
+        unit_root: role.entity(),
+        authorized_parent: role.anchor(),
+        allow_missing_components: false,
+        terminal_mode: CleanupTerminalMode::AuthorityExact,
+    })
+}
+
+fn target_permanent_host_obligation(
+    world: &World,
+    registry: &RouteEntityRegistry,
+    host: &HostBinding,
+    projected: &ExactRegistryClaim,
+) -> Option<CleanupObligation> {
+    let record = registry.record(host.top_slot)?;
+    if record.claim() != host.top_slot_claim
+        || projected.entity() != host.top_slot
+        || projected.owner() != host.top_slot_claim.owner()
+        || projected.seal() != host.top_slot_claim.seal()
+        || !cleanup_claim_has_exact_authority(world, &host.top_slot_claim)
+        || !matches!(
+            host.top_slot_claim.owner(),
+            RegistryOwner::Committed(EntityOwner::HostTopSlot { host: version, slot })
+                if version == &host.version && *slot == host.slot_id
+        )
+    {
+        return None;
+    }
+    Some(CleanupObligation {
+        claim: projected.clone(),
+        manifest: record.manifest().clone(),
+        expected_parent: host.host,
+        unit_root: host.top_slot,
+        authorized_parent: host.host,
+        allow_missing_components: false,
+        terminal_mode: CleanupTerminalMode::AuthorityExact,
+    })
 }
 
 fn normalize_authority_obligations(

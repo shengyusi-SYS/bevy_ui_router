@@ -478,7 +478,7 @@ impl RetiredHostAuthority {
 }
 
 impl RetiredHostAuthorityProjection {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn matches(
         &self,
         router: RouterIdentity,
