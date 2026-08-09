@@ -21,6 +21,7 @@ use crate::engine::{
     BackNoTargetSourceRefreezeOutcome as CoreBackNoTargetSourceRefreezeOutcome,
     BackTargetCommitOperationFailure as CoreBackTargetCommitOperationFailure,
     BackTargetCommitOperationOutcome as CoreBackTargetCommitOperationOutcome,
+    BackTargetPermanentSettlementOutcome as CoreBackTargetPermanentSettlementOutcome,
     BackTargetResumeAction as CoreBackTargetResumeAction,
     BackTargetResumeOutcome as CoreBackTargetResumeOutcome,
     BeginAuthoritySettlementErrorKind as CoreBeginAuthoritySettlementErrorKind,
@@ -2320,8 +2321,14 @@ impl RouterEngine {
         &mut self,
         owner: BackTargetPermanentOwner,
     ) -> BackTargetPermanentSettlementOutcome {
-        let evidence = owner.evidence();
-        BackTargetPermanentSettlementOutcome::Mismatch { owner, evidence }
+        match self.inner.settle_back_target_permanent_exact(owner) {
+            CoreBackTargetPermanentSettlementOutcome::Settled(terminal) => {
+                BackTargetPermanentSettlementOutcome::Settled(terminal)
+            }
+            CoreBackTargetPermanentSettlementOutcome::Mismatch { owner, evidence } => {
+                BackTargetPermanentSettlementOutcome::Mismatch { owner, evidence }
+            }
+        }
     }
 
     #[doc(hidden)]
@@ -3688,6 +3695,7 @@ fn map_failure_cleanup_error(error: CoreFailureCleanupError) -> IntegrationError
 mod tests {
     use super::*;
     use crate::admission::HostAdmissionIssuer;
+    use crate::engine::BackTargetBusyReceiverSlot;
     use crate::frame::RouteFrameVersion;
     use crate::ids::{CoreIdAllocator, RouteGeneration};
     use crate::mount::MountIssuer;
@@ -6882,6 +6890,219 @@ mod tests {
         engine
     }
 
+    fn take_source_refreeze_back_target_permanent_owner(
+        engine: &mut RouterEngine,
+        fragment: &'static str,
+    ) -> BackTargetPermanentOwner {
+        use crate::history_authority::BackTargetPermanentCauseSnapshot;
+
+        let owner = take_verified_back_target(engine);
+        settle_changed_history_push(engine, RouteLocation::new("/").with_fragment(fragment));
+        let retirement_calls = std::cell::Cell::new(0usize);
+        let owner = match engine.resume_back_target_with_retirement(owner, || {
+            retirement_calls.set(retirement_calls.get() + 1);
+        }) {
+            BackTargetCoreResumeOutcome::Permanent(owner) => owner,
+            BackTargetCoreResumeOutcome::Resumed(_) => {
+                panic!("the real history push must form a SourceRefreeze permanent owner")
+            }
+            BackTargetCoreResumeOutcome::Mismatch { .. } => {
+                panic!("the exact receiver must classify the real source refreeze")
+            }
+        };
+        assert_eq!(retirement_calls.get(), 1);
+        assert_eq!(
+            owner.testing_evidence_snapshot().cause(),
+            BackTargetPermanentCauseSnapshot::SourceRefreeze
+        );
+        owner
+    }
+
+    fn assert_back_target_permanent_settlement_mismatch_zero_write(
+        mut engine: RouterEngine,
+        owner: BackTargetPermanentOwner,
+        drift: &str,
+    ) {
+        let expected_evidence = owner.evidence();
+        let expected_target = owner
+            .target_location()
+            .expect("the real permanent owner retains its target")
+            .clone();
+        let expected_owner_snapshot = owner.testing_evidence_snapshot();
+        let before = engine.inner.testing_snapshot();
+
+        let returned = match engine.settle_back_target_permanent_exact(owner) {
+            BackTargetPermanentSettlementOutcome::Mismatch { owner, evidence } => {
+                assert_eq!(evidence, expected_evidence);
+                owner
+            }
+            BackTargetPermanentSettlementOutcome::Settled(_) => {
+                panic!("{drift} must reject permanent settlement")
+            }
+        };
+
+        assert_eq!(returned.evidence(), expected_evidence);
+        assert_eq!(returned.target_location(), Some(&expected_target));
+        assert_eq!(
+            returned.testing_evidence_snapshot(),
+            expected_owner_snapshot
+        );
+        assert_eq!(
+            engine.inner.testing_snapshot(),
+            before,
+            "{drift} mismatch must be a semantic zero-write"
+        );
+    }
+
+    fn back_target_busy_running_donor() -> RouterEngine {
+        let mut donor = confirmed_engine();
+        donor
+            .push(RouteLocation::new("/").with_fragment("busy-donor"))
+            .expect("the donor accepts one real request");
+        donor.collect();
+        donor
+    }
+
+    fn back_target_busy_prepared_publication_donor() -> RouterEngine {
+        let mut donor = back_target_busy_running_donor();
+        let EngineAction::FrameTask(task) = donor.action().expect("the donor has one real action")
+        else {
+            panic!("the depth-one donor must issue a real frame task")
+        };
+        let ticket = donor
+            .report_applied(task)
+            .expect("the real donor frame report reaches commit");
+        donor
+            .prepare_commit(&ticket, CleanupManifest::empty())
+            .expect("the donor installs real prepared publication authority");
+        donor
+    }
+
+    fn back_target_busy_history_preparation_error_donor() -> RouterEngine {
+        let mut donor = confirmed_nested_engine();
+        settle_nested_history_command(
+            &mut donor,
+            HistoryFixtureCommand::Push,
+            RouteLocation::new("/items/1"),
+        );
+        donor
+            .replace(RouteLocation::new("/items/2"))
+            .expect("the donor accepts a real nested replacement");
+        donor.collect();
+        let ticket = loop {
+            match donor.action().expect("the donor retains one real action") {
+                EngineAction::FrameTask(task) => {
+                    let outlets = donor
+                        .expected_child_outlet(&task)
+                        .expect("the donor frame task has a real outlet projection")
+                        .into_iter()
+                        .collect();
+                    donor
+                        .report_applied_with_outlets(task, outlets)
+                        .expect("the donor accepts its real frame report");
+                }
+                EngineAction::MountRequest(mount) => {
+                    let receipt = donor.resolve_mount(mount).unwrap().attest_receipt(0x71);
+                    let completion = donor.accept_mount_receipt(receipt).unwrap().complete(0x73);
+                    donor.complete_mount_registration(completion).unwrap();
+                }
+                EngineAction::Commit(ticket) => break ticket,
+                EngineAction::FailureCleanup(_) | EngineAction::BackResolution(_) => {
+                    panic!("the unchanged nested donor must reach a real commit")
+                }
+            }
+        };
+        let logical_roots = donor
+            .reconciliation_projection_for_commit(&ticket)
+            .unwrap()
+            .leaving()
+            .map(|leaving| leaving.version().clone())
+            .collect::<Vec<_>>();
+        let obligation_count = logical_roots.len();
+        assert!(donor.inner.testing_drift_current_history_binding());
+        let manifest = if obligation_count == 0 {
+            CleanupManifest::empty()
+        } else {
+            CleanupManifest::new(logical_roots, 0x4255_5359_4552_524f, obligation_count)
+        };
+        assert!(matches!(
+            donor.prepare_commit(&ticket, manifest),
+            Err(IntegrationError::Stale)
+        ));
+        donor
+    }
+
+    fn back_target_busy_donor(slot: BackTargetBusyReceiverSlot) -> RouterEngine {
+        match slot {
+            BackTargetBusyReceiverSlot::Action
+            | BackTargetBusyReceiverSlot::Current
+            | BackTargetBusyReceiverSlot::CurrentHistoryCapability => {
+                back_target_busy_running_donor()
+            }
+            BackTargetBusyReceiverSlot::PendingNoTargetBack => {
+                let mut donor = confirmed_engine();
+                settle_push(&mut donor, RouteLocation::new("/"));
+                donor
+            }
+            BackTargetBusyReceiverSlot::PendingBackNoTargetAuthority => {
+                take_accepted_back_no_target_authority().0
+            }
+            BackTargetBusyReceiverSlot::PendingHistoryPreparationError => {
+                back_target_busy_history_preparation_error_donor()
+            }
+            BackTargetBusyReceiverSlot::PreparedPublicationAuthority => {
+                back_target_busy_prepared_publication_donor()
+            }
+            BackTargetBusyReceiverSlot::CurrentRequest => confirmed_engine(),
+        }
+    }
+
+    fn assert_back_target_busy_receiver_calls_zero(slot: BackTargetBusyReceiverSlot) {
+        let mut exact = direct_back_target_fixture();
+        let owner = take_verified_back_target(&mut exact);
+        let expected_evidence = owner.evidence();
+        let expected_target = owner.target_location().clone();
+        let mut donor = back_target_busy_donor(slot);
+        exact
+            .inner
+            .testing_move_back_target_busy_receiver_slot_from(&mut donor.inner, slot);
+        let before = exact.inner.testing_snapshot();
+        let callback_calls = std::cell::Cell::new(0usize);
+
+        let outcome = exact.resume_back_target_with_retirement(owner, || {
+            callback_calls.set(callback_calls.get() + 1);
+        });
+
+        assert_eq!(
+            callback_calls.get(),
+            0,
+            "busy {slot:?} must reject before retirement"
+        );
+        let returned = match outcome {
+            BackTargetCoreResumeOutcome::Mismatch { owner, evidence } => {
+                assert_eq!(evidence, expected_evidence);
+                owner
+            }
+            BackTargetCoreResumeOutcome::Resumed(_) => {
+                panic!("busy {slot:?} must return the whole verified owner as Mismatch")
+            }
+            BackTargetCoreResumeOutcome::Permanent(_) => {
+                panic!("busy {slot:?} must not mint a Permanent owner")
+            }
+        };
+        assert_eq!(returned.evidence(), expected_evidence);
+        assert_eq!(returned.target_location(), &expected_target);
+        assert_eq!(
+            exact.classify_back_resolution_evidence(&expected_evidence),
+            BackResolutionEvidenceClassification::ConsumedReplay
+        );
+        assert_eq!(
+            exact.inner.testing_snapshot(),
+            before,
+            "busy {slot:?} mismatch must be a semantic zero-write"
+        );
+    }
+
     #[test]
     fn back_target_prepares_all_fallible_work_before_retirement_callback() {
         assert_back_target_permanent_zero_write(direct_back_target_fixture(), |engine, _owner| {
@@ -6899,10 +7120,467 @@ mod tests {
             .inner
             .testing_set_active_generation(RouteGeneration::testing_max());
         assert_back_target_permanent_zero_write(generation, |_engine, _owner| {});
+    }
 
-        assert_back_target_permanent_zero_write(nested_mount_back_fixture(), |_engine, owner| {
-            owner.testing_truncate_reserved_frames(1);
+    #[test]
+    fn back_target_reservation_truncation_mismatches_before_retirement() {
+        let mut exact = nested_mount_back_fixture();
+        let mut owner = take_verified_back_target(&mut exact);
+        let expected_evidence = owner.evidence();
+        let expected_target = owner.target_location().clone();
+        owner.testing_truncate_reserved_frames(1);
+        let before = exact.inner.testing_snapshot();
+        let callback_calls = std::cell::Cell::new(0usize);
+
+        let outcome = exact.resume_back_target_with_retirement(owner, || {
+            callback_calls.set(callback_calls.get() + 1);
         });
+
+        assert_eq!(
+            callback_calls.get(),
+            0,
+            "reservation drift must reject before retirement"
+        );
+        let returned = match outcome {
+            BackTargetCoreResumeOutcome::Mismatch { owner, evidence } => {
+                assert_eq!(evidence, expected_evidence);
+                owner
+            }
+            BackTargetCoreResumeOutcome::Resumed(_) => {
+                panic!("reservation drift must not resume the changed owner")
+            }
+            BackTargetCoreResumeOutcome::Permanent(_) => {
+                panic!("reservation drift must not mint a Permanent owner")
+            }
+        };
+        assert_eq!(returned.evidence(), expected_evidence);
+        assert_eq!(returned.target_location(), &expected_target);
+        assert_eq!(
+            exact.classify_back_resolution_evidence(&expected_evidence),
+            BackResolutionEvidenceClassification::ConsumedReplay
+        );
+        assert_eq!(
+            exact.inner.testing_snapshot(),
+            before,
+            "reservation mismatch must be a semantic zero-write"
+        );
+    }
+
+    #[test]
+    fn back_target_permanent_settlement_rejects_independent_owner_source_and_record_drift() {
+        let mut reservation_engine = direct_back_target_fixture();
+        let mut reservation_owner = take_source_refreeze_back_target_permanent_owner(
+            &mut reservation_engine,
+            "permanent-reservation-drift",
+        );
+        reservation_owner.testing_truncate_reserved_frames(0);
+        assert_back_target_permanent_settlement_mismatch_zero_write(
+            reservation_engine,
+            reservation_owner,
+            "permanent owner reservation drift",
+        );
+
+        let mut source_engine = direct_back_target_fixture();
+        let source_owner = take_source_refreeze_back_target_permanent_owner(
+            &mut source_engine,
+            "permanent-current-source-drift",
+        );
+        source_engine
+            .inner
+            .testing_move_back_target_current_source_cursor_back();
+        assert_back_target_permanent_settlement_mismatch_zero_write(
+            source_engine,
+            source_owner,
+            "current source drift",
+        );
+
+        let mut record_engine = direct_back_target_fixture();
+        let record_owner = take_source_refreeze_back_target_permanent_owner(
+            &mut record_engine,
+            "permanent-retained-record-drift",
+        );
+        let record_request = record_owner.evidence().request();
+        assert!(
+            record_engine
+                .inner
+                .testing_transition_back_target_record_to_matching(record_request),
+            "the retained Back record must transition through its real status input"
+        );
+        assert_back_target_permanent_settlement_mismatch_zero_write(
+            record_engine,
+            record_owner,
+            "retained record drift",
+        );
+    }
+
+    #[test]
+    fn back_target_pre_splice_permanent_settlement_terminals_once() {
+        use crate::history_authority::{
+            BackTargetAuthorityLossCause, BackTargetPermanentCauseSnapshot,
+        };
+
+        let mut capability = direct_back_target_fixture();
+        let owner = take_verified_back_target(&mut capability);
+        let capability_request = owner.evidence().request();
+        capability
+            .inner
+            .testing_request_back_target_source_drift_before_freeze_once();
+        let retirement_calls = std::cell::Cell::new(0usize);
+        let outcome = capability.resume_back_target_with_retirement(owner, || {
+            retirement_calls.set(retirement_calls.get() + 1);
+        });
+        assert_eq!(retirement_calls.get(), 1);
+        let owner = match outcome {
+            BackTargetCoreResumeOutcome::Permanent(owner) => owner,
+            BackTargetCoreResumeOutcome::Resumed(_) => {
+                panic!(
+                    "the armed post-refreeze seam must reach the production freeze_back drift predicate"
+                )
+            }
+            BackTargetCoreResumeOutcome::Mismatch { .. } => {
+                panic!("the exact receiver must not reject the defensive source recheck seam")
+            }
+        };
+        let expected_evidence = owner.evidence();
+        let expected_target = owner
+            .target_location()
+            .expect("the real SourceCapability owner retains its target")
+            .clone();
+        let capability_owner_snapshot = owner.testing_evidence_snapshot();
+        assert_eq!(
+            capability_owner_snapshot.cause(),
+            BackTargetPermanentCauseSnapshot::SourceCapability
+        );
+        let (expected_source, observed_source) = capability_owner_snapshot.sources();
+        assert_ne!(
+            expected_source, observed_source,
+            "the production HistorySourceDrift must retain distinct source facts"
+        );
+        let (expected_baseline, observed_baseline) = capability_owner_snapshot.baselines();
+        assert_eq!(
+            expected_baseline, observed_baseline,
+            "the source-only seam must not alter unrelated preparation baseline facts"
+        );
+
+        let mut capability_foreign = confirmed_engine();
+        let foreign_before = capability_foreign.inner.testing_snapshot();
+        let exact_before_foreign = capability.inner.testing_snapshot();
+        let owner = match capability_foreign.settle_back_target_permanent_exact(owner) {
+            BackTargetPermanentSettlementOutcome::Mismatch { owner, evidence } => {
+                assert_eq!(evidence, expected_evidence);
+                assert_eq!(
+                    capability_foreign.classify_back_resolution_evidence(&evidence),
+                    BackResolutionEvidenceClassification::Foreign
+                );
+                owner
+            }
+            BackTargetPermanentSettlementOutcome::Settled(_) => {
+                panic!("a foreign receiver must return the whole SourceCapability owner")
+            }
+        };
+        assert_eq!(capability_foreign.inner.testing_snapshot(), foreign_before);
+        assert_eq!(capability.inner.testing_snapshot(), exact_before_foreign);
+        assert_eq!(owner.evidence(), expected_evidence);
+        assert_eq!(owner.target_location(), Some(&expected_target));
+        assert_eq!(owner.testing_evidence_snapshot(), capability_owner_snapshot);
+
+        let before_settlement = capability.snapshot();
+        let terminal_evidence = match capability.settle_back_target_permanent_exact(owner) {
+            BackTargetPermanentSettlementOutcome::Settled(terminal) => terminal,
+            BackTargetPermanentSettlementOutcome::Mismatch { .. } => {
+                panic!("the exact receiver must terminal the SourceCapability owner")
+            }
+        };
+        assert_eq!(
+            terminal_evidence.testing_evidence_snapshot(),
+            capability_owner_snapshot,
+            "terminal evidence must conserve the Capability mapping, baselines, and owner facts"
+        );
+        let after_settlement = capability.snapshot();
+        assert_eq!(after_settlement.active(), before_settlement.active());
+        assert_eq!(after_settlement.history(), before_settlement.history());
+        assert_eq!(after_settlement.running_request(), None);
+        assert!(capability.action().is_none());
+        let terminal = capability
+            .request(capability_request)
+            .expect("the SourceCapability terminal request remains retained");
+        assert!(matches!(
+            terminal.status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == crate::request::NavigationFailureKind::AuthorityLost
+        ));
+        assert_eq!(
+            terminal
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                .count(),
+            1
+        );
+        assert!(
+            terminal
+                .trace()
+                .iter()
+                .all(|event| event.kind() != NavigationTraceEventKind::CleanupSettled)
+        );
+
+        let mut baseline_drift = direct_back_target_fixture();
+        let owner = take_verified_back_target(&mut baseline_drift);
+        settle_changed_history_push(
+            &mut baseline_drift,
+            RouteLocation::new("/").with_fragment("baseline-owner-source-refreeze"),
+        );
+        let retirement_calls = std::cell::Cell::new(0usize);
+        let owner = match baseline_drift.resume_back_target_with_retirement(owner, || {
+            retirement_calls.set(retirement_calls.get() + 1);
+        }) {
+            BackTargetCoreResumeOutcome::Permanent(owner) => owner,
+            BackTargetCoreResumeOutcome::Resumed(_) => {
+                panic!("a real history push must form a SourceRefreeze permanent owner")
+            }
+            BackTargetCoreResumeOutcome::Mismatch { .. } => {
+                panic!("the exact receiver must classify the real source refreeze")
+            }
+        };
+        assert_eq!(retirement_calls.get(), 1);
+        let expected_evidence = owner.evidence();
+        let expected_target = owner
+            .target_location()
+            .expect("the real SourceRefreeze owner retains its target")
+            .clone();
+        let expected_owner_snapshot = owner.testing_evidence_snapshot();
+        assert_eq!(
+            expected_owner_snapshot.cause(),
+            BackTargetPermanentCauseSnapshot::SourceRefreeze
+        );
+        assert!(baseline_drift.inner.testing_begin_back_target_host_drift());
+        let before_baseline_mismatch = baseline_drift.inner.testing_snapshot();
+        let returned = match baseline_drift.settle_back_target_permanent_exact(owner) {
+            BackTargetPermanentSettlementOutcome::Mismatch { owner, evidence } => {
+                assert_eq!(evidence, expected_evidence);
+                owner
+            }
+            BackTargetPermanentSettlementOutcome::Settled(_) => {
+                panic!("a changed complete baseline must return the whole permanent owner")
+            }
+        };
+        assert_eq!(returned.evidence(), expected_evidence);
+        assert_eq!(returned.target_location(), Some(&expected_target));
+        assert_eq!(
+            returned.testing_evidence_snapshot(),
+            expected_owner_snapshot
+        );
+        assert_eq!(
+            baseline_drift.classify_back_resolution_evidence(&expected_evidence),
+            BackResolutionEvidenceClassification::ConsumedReplay
+        );
+        assert_eq!(
+            baseline_drift.inner.testing_snapshot(),
+            before_baseline_mismatch,
+            "complete-baseline mismatch must be a semantic zero-write"
+        );
+
+        let mut exact = direct_back_target_fixture();
+        let owner = take_verified_back_target(&mut exact);
+        let request = owner.evidence().request();
+
+        settle_changed_history_push(
+            &mut exact,
+            RouteLocation::new("/").with_fragment("post-resolution-source-drift"),
+        );
+        let before_resume = exact.inner.testing_snapshot();
+        let retirement_calls = std::cell::Cell::new(0usize);
+        let owner = match exact.resume_back_target_with_retirement(owner, || {
+            retirement_calls.set(retirement_calls.get() + 1);
+        }) {
+            BackTargetCoreResumeOutcome::Permanent(owner) => owner,
+            BackTargetCoreResumeOutcome::Resumed(_) => {
+                panic!("a real post-resolution source drift must settle before ECS splice")
+            }
+            BackTargetCoreResumeOutcome::Mismatch { .. } => {
+                panic!("the exact receiver must classify its source drift as permanent")
+            }
+        };
+        assert_eq!(retirement_calls.get(), 1);
+        assert_eq!(exact.inner.testing_snapshot(), before_resume);
+        assert!(exact.action().is_none());
+
+        let expected_evidence = owner.evidence();
+        assert_eq!(
+            exact.classify_back_resolution_evidence(&expected_evidence),
+            BackResolutionEvidenceClassification::ConsumedReplay
+        );
+
+        let mut foreign = confirmed_engine();
+        let foreign_before = foreign.inner.testing_snapshot();
+        let exact_before_foreign = exact.inner.testing_snapshot();
+        let owner = match foreign.settle_back_target_permanent_exact(owner) {
+            BackTargetPermanentSettlementOutcome::Mismatch { owner, evidence } => {
+                assert_eq!(evidence, expected_evidence);
+                assert_eq!(
+                    foreign.classify_back_resolution_evidence(&evidence),
+                    BackResolutionEvidenceClassification::Foreign
+                );
+                owner
+            }
+            BackTargetPermanentSettlementOutcome::Settled(_) => {
+                panic!("a foreign receiver must return the whole permanent owner")
+            }
+        };
+        assert_eq!(foreign.inner.testing_snapshot(), foreign_before);
+        assert_eq!(exact.inner.testing_snapshot(), exact_before_foreign);
+
+        let source_owner_snapshot = owner.testing_evidence_snapshot();
+        assert_eq!(
+            source_owner_snapshot.cause(),
+            BackTargetPermanentCauseSnapshot::SourceRefreeze
+        );
+        let before_settlement = exact.snapshot();
+        let terminal_evidence = match exact.settle_back_target_permanent_exact(owner) {
+            BackTargetPermanentSettlementOutcome::Settled(terminal) => terminal,
+            BackTargetPermanentSettlementOutcome::Mismatch { .. } => {
+                panic!("the exact receiver must terminal the returned permanent owner")
+            }
+        };
+        let source_terminal_snapshot = terminal_evidence.testing_evidence_snapshot();
+
+        let after_settlement = exact.snapshot();
+        assert_eq!(after_settlement.active(), before_settlement.active());
+        assert_eq!(after_settlement.history(), before_settlement.history());
+        assert_eq!(after_settlement.running_request(), None);
+        assert!(exact.action().is_none());
+        let terminal = exact
+            .request(request)
+            .expect("the terminal Back request must remain retained");
+        assert!(matches!(
+            terminal.status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == crate::request::NavigationFailureKind::AuthorityLost
+        ));
+        assert_eq!(
+            terminal
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                .count(),
+            1
+        );
+        assert!(
+            terminal
+                .trace()
+                .iter()
+                .all(|event| event.kind() != NavigationTraceEventKind::CleanupSettled)
+        );
+
+        let mut host = direct_back_target_fixture();
+        let owner = take_verified_back_target(&mut host);
+        let host_request = owner.evidence().request();
+        assert!(host.inner.testing_begin_back_target_host_drift());
+        let retirement_calls = std::cell::Cell::new(0usize);
+        let owner = match host.resume_back_target_with_retirement(owner, || {
+            retirement_calls.set(retirement_calls.get() + 1);
+        }) {
+            BackTargetCoreResumeOutcome::Permanent(owner) => owner,
+            BackTargetCoreResumeOutcome::Resumed(_) => {
+                panic!("real Host baseline drift must become permanent before ECS splice")
+            }
+            BackTargetCoreResumeOutcome::Mismatch { .. } => {
+                panic!("the exact receiver must classify its real Host baseline drift")
+            }
+        };
+        assert_eq!(retirement_calls.get(), 1);
+        let host_owner_snapshot = owner.testing_evidence_snapshot();
+        assert_eq!(
+            host_owner_snapshot.cause(),
+            BackTargetPermanentCauseSnapshot::AuthorityLost(BackTargetAuthorityLossCause::Host)
+        );
+        let terminal_evidence = match host.settle_back_target_permanent_exact(owner) {
+            BackTargetPermanentSettlementOutcome::Settled(terminal) => terminal,
+            BackTargetPermanentSettlementOutcome::Mismatch { .. } => {
+                panic!("the exact receiver must terminal the real Host permanent owner")
+            }
+        };
+        let host_terminal_snapshot = terminal_evidence.testing_evidence_snapshot();
+        let terminal = host
+            .request(host_request)
+            .expect("the exact Host settlement must retain its terminal request");
+        assert!(matches!(
+            terminal.status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == crate::request::NavigationFailureKind::AuthorityLost
+        ));
+        assert_eq!(
+            terminal
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                .count(),
+            1
+        );
+
+        let mut generation = direct_back_target_fixture();
+        generation
+            .inner
+            .testing_set_active_generation(RouteGeneration::testing_max());
+        let owner = take_verified_back_target(&mut generation);
+        let generation_request = owner.evidence().request();
+        let retirement_calls = std::cell::Cell::new(0usize);
+        let owner = match generation.resume_back_target_with_retirement(owner, || {
+            retirement_calls.set(retirement_calls.get() + 1);
+        }) {
+            BackTargetCoreResumeOutcome::Permanent(owner) => owner,
+            BackTargetCoreResumeOutcome::Resumed(_) => {
+                panic!("real generation exhaustion must become permanent before ECS splice")
+            }
+            BackTargetCoreResumeOutcome::Mismatch { .. } => {
+                panic!("the exact receiver must classify its real generation exhaustion")
+            }
+        };
+        assert_eq!(retirement_calls.get(), 1);
+        let generation_owner_snapshot = owner.testing_evidence_snapshot();
+        assert_eq!(
+            generation_owner_snapshot.cause(),
+            BackTargetPermanentCauseSnapshot::AuthorityLost(
+                BackTargetAuthorityLossCause::Generation
+            )
+        );
+        let terminal_evidence = match generation.settle_back_target_permanent_exact(owner) {
+            BackTargetPermanentSettlementOutcome::Settled(terminal) => terminal,
+            BackTargetPermanentSettlementOutcome::Mismatch { .. } => {
+                panic!("the exact receiver must terminal the real Generation permanent owner")
+            }
+        };
+        let generation_terminal_snapshot = terminal_evidence.testing_evidence_snapshot();
+        let terminal = generation
+            .request(generation_request)
+            .expect("the exact Generation settlement must retain its terminal request");
+        assert!(matches!(
+            terminal.status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == crate::request::NavigationFailureKind::AuthorityLost
+        ));
+        assert_eq!(
+            terminal
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                .count(),
+            1
+        );
+
+        assert_eq!(
+            (
+                source_terminal_snapshot,
+                host_terminal_snapshot,
+                generation_terminal_snapshot,
+            ),
+            (
+                source_owner_snapshot,
+                host_owner_snapshot,
+                generation_owner_snapshot,
+            ),
+            "each terminal must retain its real cause, expected/observed source mapping, and complete expected/observed baseline"
+        );
     }
 
     fn rust_function_body<'a>(source: &'a str, signature: &str) -> &'a str {
@@ -6991,6 +7669,19 @@ mod tests {
 
     #[test]
     fn back_target_receiver_mismatch_calls_zero_and_exact_receiver_calls_once() {
+        for slot in [
+            BackTargetBusyReceiverSlot::Action,
+            BackTargetBusyReceiverSlot::Current,
+            BackTargetBusyReceiverSlot::PendingNoTargetBack,
+            BackTargetBusyReceiverSlot::PendingBackNoTargetAuthority,
+            BackTargetBusyReceiverSlot::CurrentHistoryCapability,
+            BackTargetBusyReceiverSlot::PendingHistoryPreparationError,
+            BackTargetBusyReceiverSlot::PreparedPublicationAuthority,
+            BackTargetBusyReceiverSlot::CurrentRequest,
+        ] {
+            assert_back_target_busy_receiver_calls_zero(slot);
+        }
+
         let mut frame_task = confirmed_engine();
         settle_push(
             &mut frame_task,

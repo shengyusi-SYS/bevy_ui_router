@@ -337,13 +337,78 @@ pub struct BackTargetPermanentOwner {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CoreBackTargetPermanentTerminalProjection {
     scope: BackResolutionScopeProjection,
-    expected: CoreFrozenHistorySourceProjection,
-    observed: CoreFrozenHistorySourceProjection,
+    cause: CoreBackTargetPermanentTerminalCauseProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CoreBackTargetPermanentTerminalCauseProjection {
+    SourceRefreeze {
+        expected_source: CoreFrozenHistorySourceProjection,
+        observed_source: CoreFrozenHistorySourceProjection,
+        expected_baseline: BackTargetPreparationBaseline,
+        observed_baseline: BackTargetPreparationBaseline,
+    },
+    SourceCapability {
+        expected_source: CoreFrozenHistorySourceProjection,
+        observed_source: CoreFrozenHistorySourceProjection,
+        expected_baseline: BackTargetPreparationBaseline,
+        observed_baseline: BackTargetPreparationBaseline,
+    },
+    AuthorityLost {
+        cause: BackTargetAuthorityLossCause,
+        expected_and_observed_source: CoreFrozenHistorySourceProjection,
+        expected_baseline: BackTargetPreparationBaseline,
+        observed_baseline: BackTargetPreparationBaseline,
+    },
 }
 
 #[doc(hidden)]
 pub struct BackTargetPermanentTerminalEvidence {
     inner: CoreBackTargetPermanentTerminalProjection,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackTargetPermanentCauseSnapshot {
+    SourceRefreeze,
+    SourceCapability,
+    AuthorityLost(BackTargetAuthorityLossCause),
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BackTargetPermanentEvidenceSnapshot {
+    scope: BackResolutionScopeProjection,
+    cause: BackTargetPermanentCauseSnapshot,
+    expected_source: CoreFrozenHistorySourceProjection,
+    observed_source: CoreFrozenHistorySourceProjection,
+    expected_baseline: BackTargetPreparationBaseline,
+    observed_baseline: BackTargetPreparationBaseline,
+}
+
+#[cfg(test)]
+impl BackTargetPermanentEvidenceSnapshot {
+    pub(crate) const fn cause(&self) -> BackTargetPermanentCauseSnapshot {
+        self.cause
+    }
+
+    pub(crate) fn sources(
+        &self,
+    ) -> (
+        &CoreFrozenHistorySourceProjection,
+        &CoreFrozenHistorySourceProjection,
+    ) {
+        (&self.expected_source, &self.observed_source)
+    }
+
+    pub(crate) fn baselines(
+        &self,
+    ) -> (
+        &BackTargetPreparationBaseline,
+        &BackTargetPreparationBaseline,
+    ) {
+        (&self.expected_baseline, &self.observed_baseline)
+    }
 }
 
 #[allow(dead_code)]
@@ -708,10 +773,14 @@ impl VerifiedBackTargetExecutionOwner {
         history: HistoryIncarnation,
     ) -> bool {
         let scope = &self.inner.raw.scope;
-        world == Some(scope.world)
-            && scope.router == router
-            && scope.history == history
-            && scope.request.router_identity() == router
+        scope.matches_engine_scope(world, router, history)
+            && scope
+                == &BackResolutionScopeProjection::from_reservation(
+                    scope.world,
+                    scope.router,
+                    scope.history,
+                    &self.inner.raw.reservation,
+                )
     }
 
     pub(crate) fn into_execution_parts(
@@ -852,6 +921,279 @@ impl BackTargetPermanentOwner {
 
     pub(crate) fn evidence(&self) -> BackResolutionEvidence {
         BackResolutionEvidence::observed(&self.inner.scope)
+    }
+
+    pub(crate) const fn request(&self) -> NavigationRequestId {
+        self.inner.scope.request
+    }
+
+    pub(crate) fn resolution_evidence(&self) -> BackResolutionEvidence {
+        BackResolutionEvidence::observed(&self.inner.scope)
+    }
+
+    pub(crate) fn matches_receiver(
+        &self,
+        world: Option<CoreIssuedWorldSealProjection>,
+        router: RouterIdentity,
+        history: HistoryIncarnation,
+    ) -> bool {
+        self.inner
+            .scope
+            .matches_engine_scope(world, router, history)
+            && self.inner.scope
+                == BackResolutionScopeProjection::from_reservation(
+                    self.inner.scope.world,
+                    self.inner.scope.router,
+                    self.inner.scope.history,
+                    &self.inner.reservation,
+                )
+            && self.source_facts().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_truncate_reserved_frames(&mut self, len: usize) {
+        self.inner.reservation.testing_truncate_frames(len);
+    }
+
+    pub(crate) fn target_location(&self) -> Option<&RouteLocation> {
+        self.source_facts().map(|(_, _, target)| target)
+    }
+
+    pub(crate) fn observed_source_is_current(&self, history: &CanonicalHistory) -> bool {
+        self.source_facts()
+            .is_some_and(|(_, observed, _)| observed == &history.freeze_source())
+    }
+
+    pub(crate) fn observed_baseline_is_current(
+        &self,
+        baseline: &BackTargetPreparationBaseline,
+    ) -> bool {
+        self.observed_baseline()
+            .is_some_and(|observed| observed == baseline)
+    }
+
+    pub(crate) fn into_terminal_evidence(
+        self,
+    ) -> Result<BackTargetPermanentTerminalEvidence, Self> {
+        let Some(inner) = self.terminal_projection() else {
+            return Err(self);
+        };
+        Ok(BackTargetPermanentTerminalEvidence { inner })
+    }
+
+    fn source_facts(&self) -> Option<(&FrozenHistorySource, &FrozenHistorySource, &RouteLocation)> {
+        match &self.inner.cause {
+            CoreBackTargetPermanentCause::SourceDrift(
+                CoreBackTargetSourceDriftOwner::Refreeze {
+                    destination,
+                    observed_source,
+                    ..
+                },
+            ) => Some((
+                &destination.source,
+                observed_source,
+                &destination.target_location,
+            )),
+            CoreBackTargetPermanentCause::SourceDrift(
+                CoreBackTargetSourceDriftOwner::Capability { drift, .. },
+            ) => match &drift.capability.destination {
+                FrozenHistoryDestination::Back(destination)
+                    if drift.capability.source.cursor == Some(destination.source_cursor)
+                        && drift
+                            .capability
+                            .source
+                            .entry_ids
+                            .get(destination.source_cursor)
+                            == Some(&destination.source_entry)
+                        && destination.target_cursor.checked_add(1)
+                            == Some(destination.source_cursor)
+                        && drift
+                            .capability
+                            .source
+                            .entry_ids
+                            .get(destination.target_cursor)
+                            == Some(&destination.target_entry)
+                        && drift
+                            .capability
+                            .source
+                            .locations
+                            .get(destination.target_cursor)
+                            == Some(&destination.target) =>
+                {
+                    Some((
+                        &drift.capability.source,
+                        &drift.observed,
+                        &destination.target,
+                    ))
+                }
+                _ => None,
+            },
+            CoreBackTargetPermanentCause::AuthorityLost { destination, .. } => Some((
+                &destination.source,
+                &destination.source,
+                &destination.target_location,
+            )),
+        }
+    }
+
+    fn observed_baseline(&self) -> Option<&BackTargetPreparationBaseline> {
+        match &self.inner.cause {
+            CoreBackTargetPermanentCause::SourceDrift(
+                CoreBackTargetSourceDriftOwner::Refreeze { observed, .. }
+                | CoreBackTargetSourceDriftOwner::Capability { observed, .. },
+            )
+            | CoreBackTargetPermanentCause::AuthorityLost { observed, .. } => Some(observed),
+        }
+    }
+
+    fn terminal_projection(&self) -> Option<CoreBackTargetPermanentTerminalProjection> {
+        let (expected_source, observed_source, _) = self.source_facts()?;
+        let cause = match &self.inner.cause {
+            CoreBackTargetPermanentCause::SourceDrift(
+                CoreBackTargetSourceDriftOwner::Refreeze {
+                    expected, observed, ..
+                },
+            ) => CoreBackTargetPermanentTerminalCauseProjection::SourceRefreeze {
+                expected_source: CoreFrozenHistorySourceProjection::project(expected_source),
+                observed_source: CoreFrozenHistorySourceProjection::project(observed_source),
+                expected_baseline: expected.clone(),
+                observed_baseline: observed.clone(),
+            },
+            CoreBackTargetPermanentCause::SourceDrift(
+                CoreBackTargetSourceDriftOwner::Capability {
+                    expected, observed, ..
+                },
+            ) => CoreBackTargetPermanentTerminalCauseProjection::SourceCapability {
+                expected_source: CoreFrozenHistorySourceProjection::project(expected_source),
+                observed_source: CoreFrozenHistorySourceProjection::project(observed_source),
+                expected_baseline: expected.clone(),
+                observed_baseline: observed.clone(),
+            },
+            CoreBackTargetPermanentCause::AuthorityLost {
+                destination,
+                cause,
+                expected,
+                observed,
+            } => CoreBackTargetPermanentTerminalCauseProjection::AuthorityLost {
+                cause: *cause,
+                expected_and_observed_source: CoreFrozenHistorySourceProjection::project(
+                    &destination.source,
+                ),
+                expected_baseline: expected.clone(),
+                observed_baseline: observed.clone(),
+            },
+        };
+        Some(CoreBackTargetPermanentTerminalProjection {
+            scope: self.inner.scope.clone(),
+            cause,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_evidence_snapshot(&self) -> BackTargetPermanentEvidenceSnapshot {
+        let (cause, expected_source, observed_source, expected_baseline, observed_baseline) =
+            match &self.inner.cause {
+                CoreBackTargetPermanentCause::SourceDrift(
+                    CoreBackTargetSourceDriftOwner::Refreeze {
+                        destination,
+                        observed_source,
+                        expected,
+                        observed,
+                    },
+                ) => (
+                    BackTargetPermanentCauseSnapshot::SourceRefreeze,
+                    &destination.source,
+                    observed_source,
+                    expected,
+                    observed,
+                ),
+                CoreBackTargetPermanentCause::SourceDrift(
+                    CoreBackTargetSourceDriftOwner::Capability {
+                        drift,
+                        expected,
+                        observed,
+                    },
+                ) => (
+                    BackTargetPermanentCauseSnapshot::SourceCapability,
+                    &drift.capability.source,
+                    &drift.observed,
+                    expected,
+                    observed,
+                ),
+                CoreBackTargetPermanentCause::AuthorityLost {
+                    destination,
+                    cause,
+                    expected,
+                    observed,
+                } => (
+                    BackTargetPermanentCauseSnapshot::AuthorityLost(*cause),
+                    &destination.source,
+                    &destination.source,
+                    expected,
+                    observed,
+                ),
+            };
+        BackTargetPermanentEvidenceSnapshot {
+            scope: self.inner.scope.clone(),
+            cause,
+            expected_source: CoreFrozenHistorySourceProjection::project(expected_source),
+            observed_source: CoreFrozenHistorySourceProjection::project(observed_source),
+            expected_baseline: expected_baseline.clone(),
+            observed_baseline: observed_baseline.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl BackTargetPermanentTerminalEvidence {
+    pub(crate) fn testing_evidence_snapshot(&self) -> BackTargetPermanentEvidenceSnapshot {
+        let (cause, expected_source, observed_source, expected_baseline, observed_baseline) =
+            match &self.inner.cause {
+                CoreBackTargetPermanentTerminalCauseProjection::SourceRefreeze {
+                    expected_source,
+                    observed_source,
+                    expected_baseline,
+                    observed_baseline,
+                } => (
+                    BackTargetPermanentCauseSnapshot::SourceRefreeze,
+                    expected_source,
+                    observed_source,
+                    expected_baseline,
+                    observed_baseline,
+                ),
+                CoreBackTargetPermanentTerminalCauseProjection::SourceCapability {
+                    expected_source,
+                    observed_source,
+                    expected_baseline,
+                    observed_baseline,
+                } => (
+                    BackTargetPermanentCauseSnapshot::SourceCapability,
+                    expected_source,
+                    observed_source,
+                    expected_baseline,
+                    observed_baseline,
+                ),
+                CoreBackTargetPermanentTerminalCauseProjection::AuthorityLost {
+                    cause,
+                    expected_and_observed_source,
+                    expected_baseline,
+                    observed_baseline,
+                } => (
+                    BackTargetPermanentCauseSnapshot::AuthorityLost(*cause),
+                    expected_and_observed_source,
+                    expected_and_observed_source,
+                    expected_baseline,
+                    observed_baseline,
+                ),
+            };
+        BackTargetPermanentEvidenceSnapshot {
+            scope: self.inner.scope.clone(),
+            cause,
+            expected_source: expected_source.clone(),
+            observed_source: observed_source.clone(),
+            expected_baseline: expected_baseline.clone(),
+            observed_baseline: observed_baseline.clone(),
+        }
     }
 }
 

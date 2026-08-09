@@ -20,14 +20,14 @@ use crate::history_authority::{
     BackNoTargetSourceDriftTerminalEvidence, BackPreview, BackResolutionEvidence,
     BackResolutionEvidenceClassification, BackResolutionOwnerHandoff,
     BackResolutionScopeProjection, BackResolutionVerifyOutcome, BackTargetAuthorityLossCause,
-    BackTargetPermanentOwner, BackTargetPreparationBaseline, CanonicalHistory,
-    ClaimHistoryAdmissionWorldError, CoreFrozenHistorySourceProjection, CoreIssuedWorldSeal,
-    CoreIssuedWorldSealProjection, EnqueueBackErrorKind, HistoryAdmissionStamp,
-    HistoryAdmissionWorldSeal, HistoryCommitCapability, HistoryEffect, HistoryExecutionBinding,
-    HistoryExecutionBindingProjection, HistoryIncarnation, HistoryPreparationError,
-    HistoryRevision, HistorySourceDrift, NormalAttemptIdentity, PrepareBackAdmissionErrorKind,
-    PreparedHistoryPublication, PreparedPresentationBinding, VerifiedBackNoTargetCandidate,
-    VerifiedBackTargetExecutionOwner,
+    BackTargetPermanentOwner, BackTargetPermanentTerminalEvidence, BackTargetPreparationBaseline,
+    CanonicalHistory, ClaimHistoryAdmissionWorldError, CoreFrozenHistorySourceProjection,
+    CoreIssuedWorldSeal, CoreIssuedWorldSealProjection, EnqueueBackErrorKind,
+    HistoryAdmissionStamp, HistoryAdmissionWorldSeal, HistoryCommitCapability, HistoryEffect,
+    HistoryExecutionBinding, HistoryExecutionBindingProjection, HistoryIncarnation,
+    HistoryPreparationError, HistoryRevision, HistorySourceDrift, NormalAttemptIdentity,
+    PrepareBackAdmissionErrorKind, PreparedHistoryPublication, PreparedPresentationBinding,
+    VerifiedBackNoTargetCandidate, VerifiedBackTargetExecutionOwner,
 };
 #[cfg(test)]
 use crate::history_authority::{
@@ -630,6 +630,19 @@ pub(crate) enum BackTargetResumeOutcome {
     Mismatch(VerifiedBackTargetExecutionOwner),
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BackTargetBusyReceiverSlot {
+    Action,
+    Current,
+    PendingNoTargetBack,
+    PendingBackNoTargetAuthority,
+    CurrentHistoryCapability,
+    PendingHistoryPreparationError,
+    PreparedPublicationAuthority,
+    CurrentRequest,
+}
+
 pub(crate) enum BackNoTargetSourceRefreezeOutcome {
     Unchanged(VerifiedBackNoTargetCandidate),
     Drift(BackNoTargetSourceDriftOwner),
@@ -1015,6 +1028,14 @@ pub(crate) enum BackNoTargetSourceDriftSettlementOutcome {
     Mismatch {
         owner: BackNoTargetSourceDriftOwner,
         evidence: BackNoTargetSourceDriftEvidence,
+    },
+}
+
+pub(crate) enum BackTargetPermanentSettlementOutcome {
+    Settled(BackTargetPermanentTerminalEvidence),
+    Mismatch {
+        owner: BackTargetPermanentOwner,
+        evidence: BackResolutionEvidence,
     },
 }
 
@@ -1918,6 +1939,15 @@ struct PreparedBackNoTargetSourceDriftTerminal {
     terminal: BackNoTargetSourceDriftTerminalEvidence,
 }
 
+struct PreparedBackTargetPermanentTerminal {
+    records: VecDeque<NavigationRequestRecord>,
+    evicted_through: Option<u64>,
+    issued_view_tasks: Vec<FrameTaskIdentity>,
+    report_dispositions: Vec<ReportDispositionRecord>,
+    completed_cleanup: Vec<CompletedCleanupTombstone>,
+    terminal: BackTargetPermanentTerminalEvidence,
+}
+
 struct PreparedBackNoTargetCleanupTerminal {
     state: RouterNavigationState,
     records: VecDeque<NavigationRequestRecord>,
@@ -2061,6 +2091,8 @@ pub(crate) struct RouterEngine {
     next_failed_authority_trigger_revision: u64,
     live_failed_authority_trigger_revision: Option<u64>,
     pending_back_no_target_authority: Option<CorePendingBackNoTargetAuthority>,
+    #[cfg(test)]
+    testing_back_target_source_drift_before_freeze_once: bool,
 }
 
 impl RouterEngine {
@@ -2100,6 +2132,8 @@ impl RouterEngine {
             next_failed_authority_trigger_revision: 1,
             live_failed_authority_trigger_revision: None,
             pending_back_no_target_authority: None,
+            #[cfg(test)]
+            testing_back_target_source_drift_before_freeze_once: false,
         })
     }
 
@@ -2918,16 +2952,38 @@ impl RouterEngine {
     where
         F: FnOnce(),
     {
-        let exact_receiver = owner.matches_receiver(
+        let evidence = owner.evidence();
+        let request = evidence.request();
+        let target_location = owner.target_location();
+        let record_index = if owner.matches_receiver(
             self.history_admission_world,
             self.router,
             self.history.incarnation(),
-        );
-        if !exact_receiver {
+        ) && self.action.is_none()
+            && self.current.is_none()
+            && self.pending_no_target_back.is_none()
+            && self.pending_back_no_target_authority.is_none()
+            && self.current_history_capability.is_none()
+            && self.pending_history_preparation_error.is_none()
+            && self.prepared_publication_authority.is_none()
+            && self.state.current_request().is_none()
+            && self.queue.iter().all(|queued| queued.request != request)
+        {
+            self.records.iter().position(|record| {
+                record.id() == request
+                    && record.classify_back_resolution(&evidence)
+                        == BackResolutionEvidenceClassification::ConsumedReplay
+                    && matches!(record.status(), RequestStatus::Queued)
+                    && record.requested() == Some(target_location)
+            })
+        } else {
+            None
+        };
+        let Some(record_index) = record_index else {
             return BackTargetResumeOutcome::Mismatch(owner);
-        }
+        };
 
-        let prepared = self.prepare_back_target_start(owner);
+        let prepared = self.prepare_back_target_start(owner, record_index);
         commit_retirement();
         self.install_prepared_back_target_start(prepared)
     }
@@ -4136,6 +4192,140 @@ impl RouterEngine {
         )
     }
 
+    pub(crate) fn settle_back_target_permanent_exact(
+        &mut self,
+        owner: BackTargetPermanentOwner,
+    ) -> BackTargetPermanentSettlementOutcome {
+        let prepared = match self.prepare_back_target_permanent_terminal(owner) {
+            Ok(prepared) => prepared,
+            Err(owner) => {
+                let evidence = owner.evidence();
+                return BackTargetPermanentSettlementOutcome::Mismatch { owner, evidence };
+            }
+        };
+        BackTargetPermanentSettlementOutcome::Settled(
+            self.install_prepared_back_target_permanent_terminal(prepared),
+        )
+    }
+
+    fn prepare_back_target_permanent_terminal(
+        &self,
+        owner: BackTargetPermanentOwner,
+    ) -> Result<PreparedBackTargetPermanentTerminal, BackTargetPermanentOwner> {
+        let request = owner.request();
+        let resolution = owner.resolution_evidence();
+        let Some(target_location) = owner.target_location() else {
+            return Err(owner);
+        };
+        let exact_receiver = owner.matches_receiver(
+            self.history_admission_world,
+            self.router,
+            self.history.incarnation(),
+        ) && owner.observed_source_is_current(&self.history)
+            && owner.observed_baseline_is_current(&self.back_target_preparation_baseline())
+            && self.action.is_none()
+            && self.current.is_none()
+            && self.pending_no_target_back.is_none()
+            && self.pending_back_no_target_authority.is_none()
+            && self.current_history_capability.is_none()
+            && self.pending_history_preparation_error.is_none()
+            && self.prepared_publication_authority.is_none()
+            && self.state.current_request().is_none()
+            && self.queue.iter().all(|queued| queued.request != request);
+        if !exact_receiver {
+            return Err(owner);
+        }
+
+        let Some(record_index) = self.records.iter().position(|record| {
+            record.id() == request
+                && record.classify_back_resolution(&resolution)
+                    == BackResolutionEvidenceClassification::ConsumedReplay
+                && matches!(record.status(), RequestStatus::Queued)
+                && record.requested() == Some(target_location)
+        }) else {
+            return Err(owner);
+        };
+
+        let mut records = self.records.clone();
+        let Some(record) = records.get_mut(record_index) else {
+            return Err(owner);
+        };
+        if record
+            .transition(RequestStatus::Failed(NavigationFailure::new(
+                NavigationFailureKind::AuthorityLost,
+                "back target authority was lost before physical splice",
+            )))
+            .is_err()
+            || record
+                .append_trace(NavigationTraceEvent::request_terminal())
+                .is_err()
+        {
+            return Err(owner);
+        }
+
+        let mut issued_view_tasks = self.issued_view_tasks.clone();
+        let mut report_dispositions = self.report_dispositions.clone();
+        let mut completed_cleanup = self.completed_cleanup.clone();
+        let mut evicted_through = self.evicted_through;
+        while records
+            .iter()
+            .filter(|record| is_terminal(record.status()))
+            .count()
+            > TERMINAL_RETENTION
+        {
+            let Some(index) = records
+                .iter()
+                .position(|record| is_terminal(record.status()))
+            else {
+                return Err(owner);
+            };
+            let Some(evicted) = records.remove(index) else {
+                return Err(owner);
+            };
+            let evicted_request = evicted.id();
+            issued_view_tasks.retain(|identity| identity.request != evicted_request);
+            report_dispositions
+                .retain(|record| record.target != DiagnosticTarget::Request(evicted_request));
+            completed_cleanup.retain(|tombstone| tombstone.request != evicted_request);
+            let sequence = evicted_request.sequence();
+            evicted_through =
+                Some(evicted_through.map_or(sequence, |current| current.max(sequence)));
+        }
+
+        let terminal = match owner.into_terminal_evidence() {
+            Ok(terminal) => terminal,
+            Err(owner) => return Err(owner),
+        };
+        Ok(PreparedBackTargetPermanentTerminal {
+            records,
+            evicted_through,
+            issued_view_tasks,
+            report_dispositions,
+            completed_cleanup,
+            terminal,
+        })
+    }
+
+    fn install_prepared_back_target_permanent_terminal(
+        &mut self,
+        prepared: PreparedBackTargetPermanentTerminal,
+    ) -> BackTargetPermanentTerminalEvidence {
+        let PreparedBackTargetPermanentTerminal {
+            records,
+            evicted_through,
+            issued_view_tasks,
+            report_dispositions,
+            completed_cleanup,
+            terminal,
+        } = prepared;
+        self.records = records;
+        self.evicted_through = evicted_through;
+        self.issued_view_tasks = issued_view_tasks;
+        self.report_dispositions = report_dispositions;
+        self.completed_cleanup = completed_cleanup;
+        terminal
+    }
+
     fn prepare_back_no_target_source_drift_terminal(
         &self,
         owner: BackNoTargetSourceDriftOwner,
@@ -4253,9 +4443,9 @@ impl RouterEngine {
     fn prepare_back_target_start(
         &mut self,
         owner: VerifiedBackTargetExecutionOwner,
+        record_index: usize,
     ) -> PreparedBackTargetStart {
-        let evidence = owner.evidence();
-        let request = evidence.request();
+        let request = owner.evidence().request();
         let (continuation, reservation, destination, expected_baseline) =
             owner.into_execution_parts();
         if let Err(observed_source) = self.history.refreeze_back_source(&destination) {
@@ -4270,6 +4460,10 @@ impl RouterEngine {
                     observed_baseline,
                 ),
             );
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.testing_back_target_source_drift_before_freeze_once) {
+            self.history.testing_move_cursor_back();
         }
         let observed_baseline = self.back_target_preparation_baseline();
 
@@ -4287,33 +4481,6 @@ impl RouterEngine {
         if let Err(cause) = expected_baseline.classify_refreeze(&observed_baseline) {
             return authority_lost(continuation, reservation, destination, cause);
         }
-        if self.action.is_some()
-            || self.current.is_some()
-            || self.pending_no_target_back.is_some()
-            || self.current_history_capability.is_some()
-        {
-            return authority_lost(
-                continuation,
-                reservation,
-                destination,
-                BackTargetAuthorityLossCause::RequestRecord,
-            );
-        }
-
-        let Some(record_index) = self.records.iter().position(|record| {
-            record.id() == request
-                && record.classify_back_resolution(&evidence)
-                    == BackResolutionEvidenceClassification::ConsumedReplay
-                && record.requested() == Some(destination.target_location())
-                && !is_terminal(record.status())
-        }) else {
-            return authority_lost(
-                continuation,
-                reservation,
-                destination,
-                BackTargetAuthorityLossCause::RequestRecord,
-            );
-        };
         let records = self.records.clone();
         let mut record = records[record_index].clone();
 
@@ -8782,6 +8949,12 @@ impl RouterEngine {
                 .prepared_publication_authority
                 .as_ref()
                 .map(PreparedPublicationAuthoritySnapshot::from),
+            pending_back_no_target_authority: self.pending_back_no_target_authority.as_ref().map(
+                |pending| match pending {
+                    CorePendingBackNoTargetAuthority::Accepted(_) => "accepted",
+                    CorePendingBackNoTargetAuthority::Cleanup(_) => "cleanup",
+                },
+            ),
             action: self.action.as_ref().map(ActionSnapshot::from),
             issued_view_tasks: self.issued_view_tasks.clone(),
             mount: self.mount.snapshot(),
@@ -8796,6 +8969,125 @@ impl RouterEngine {
     #[cfg(test)]
     pub(crate) fn testing_snapshot(&self) -> EngineSnapshot {
         self.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_request_back_target_source_drift_before_freeze_once(&mut self) {
+        self.testing_back_target_source_drift_before_freeze_once = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_move_back_target_current_source_cursor_back(&mut self) {
+        self.history.testing_move_cursor_back();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_transition_back_target_record_to_matching(
+        &mut self,
+        request: NavigationRequestId,
+    ) -> bool {
+        self.records
+            .iter_mut()
+            .find(|record| record.id() == request)
+            .is_some_and(|record| {
+                record
+                    .transition(RequestStatus::Running(NavigationPhase::Matching))
+                    .is_ok()
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_move_back_target_busy_receiver_slot_from(
+        &mut self,
+        donor: &mut Self,
+        slot: BackTargetBusyReceiverSlot,
+    ) {
+        match slot {
+            BackTargetBusyReceiverSlot::Action => {
+                debug_assert!(self.action.is_none());
+                self.action = Some(donor.action.take().expect("the donor has a real action"));
+            }
+            BackTargetBusyReceiverSlot::Current => {
+                debug_assert!(self.current.is_none());
+                self.current = Some(
+                    donor
+                        .current
+                        .take()
+                        .expect("the donor has real current work"),
+                );
+            }
+            BackTargetBusyReceiverSlot::PendingNoTargetBack => {
+                debug_assert!(self.pending_no_target_back.is_none());
+                let source = match donor.history.preview_back() {
+                    BackPreview::NoTarget(source) => source,
+                    BackPreview::Target(_) | BackPreview::Contradiction(_) => {
+                        panic!("the donor must produce a real no-target source")
+                    }
+                };
+                let request = donor
+                    .records
+                    .back()
+                    .expect("the no-target donor retains a real request")
+                    .id();
+                self.pending_no_target_back = Some(PendingNoTargetBack { request, source });
+            }
+            BackTargetBusyReceiverSlot::PendingBackNoTargetAuthority => {
+                debug_assert!(self.pending_back_no_target_authority.is_none());
+                self.pending_back_no_target_authority = Some(
+                    donor
+                        .pending_back_no_target_authority
+                        .take()
+                        .expect("the donor has real pending no-target authority"),
+                );
+            }
+            BackTargetBusyReceiverSlot::CurrentHistoryCapability => {
+                debug_assert!(self.current_history_capability.is_none());
+                self.current_history_capability = Some(
+                    donor
+                        .current_history_capability
+                        .take()
+                        .expect("the donor has a real history capability"),
+                );
+            }
+            BackTargetBusyReceiverSlot::PendingHistoryPreparationError => {
+                debug_assert!(self.pending_history_preparation_error.is_none());
+                self.pending_history_preparation_error = Some(
+                    donor
+                        .pending_history_preparation_error
+                        .take()
+                        .expect("the donor has a real history preparation error"),
+                );
+            }
+            BackTargetBusyReceiverSlot::PreparedPublicationAuthority => {
+                debug_assert!(self.prepared_publication_authority.is_none());
+                self.prepared_publication_authority = Some(
+                    donor
+                        .prepared_publication_authority
+                        .take()
+                        .expect("the donor has real prepared publication authority"),
+                );
+            }
+            BackTargetBusyReceiverSlot::CurrentRequest => {
+                debug_assert!(self.state.current_request().is_none());
+                self.state
+                    .set_request(Some(RequestStatus::Running(NavigationPhase::Matching)));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_drift_current_history_binding(&mut self) -> bool {
+        let Some(current) = self.current.as_mut() else {
+            return false;
+        };
+        let Some(alternate) = current.reservation.get(1).cloned() else {
+            return false;
+        };
+        if current.reservation[0].frame_task() == alternate.frame_task() {
+            return false;
+        }
+        current.reservation[0] = alternate;
+        true
     }
 
     #[cfg(test)]
@@ -9656,6 +9948,7 @@ pub(crate) struct EngineSnapshot {
     current_history_capability: Option<HistoryCapabilitySnapshot>,
     pending_history_preparation_error: Option<HistoryDriftEvidenceSnapshot>,
     prepared_publication_authority: Option<PreparedPublicationAuthoritySnapshot>,
+    pending_back_no_target_authority: Option<&'static str>,
     action: Option<ActionSnapshot>,
     issued_view_tasks: Vec<FrameTaskIdentity>,
     mount: crate::mount::MountIssuerSnapshot,
@@ -9687,9 +9980,9 @@ mod tests {
 
     use super::{
         ActionSnapshot, BackNoTargetSourceDriftSettlementOutcome,
-        BackNoTargetSourceRefreezeOutcome, BackTargetResumeAction, BackTargetResumeOutcome,
-        BackTargetStart, CleanupError, CommitError,
-        CoreBackNoTargetPublicationPreparationFailureProjection,
+        BackNoTargetSourceRefreezeOutcome, BackTargetPermanentSettlementOutcome,
+        BackTargetResumeAction, BackTargetResumeOutcome, BackTargetStart, CleanupError,
+        CommitError, CoreBackNoTargetPublicationPreparationFailureProjection,
         CoreBackNoTargetReadyMismatchProjection, CorePreparationReceiverMismatchProjection,
         EngineAction, MountError, NavigationCommand, PrivateRequestLookup, PushError,
         QueuedNavigation, QueuedReservation, ROUTER_DIAGNOSTIC_RETENTION, ReportError,
@@ -9707,7 +10000,7 @@ mod tests {
     };
     use crate::history_authority::{
         BackResolutionEvidenceClassification, BackResolutionVerifyOutcome,
-        VerifiedBackResolutionOwnerHandoff,
+        BackTargetPermanentCauseSnapshot, VerifiedBackResolutionOwnerHandoff,
     };
     use crate::ids::{
         CleanupBatchId, ReservationCounter, RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId,
@@ -11908,6 +12201,200 @@ mod tests {
         assert_eq!(
             engine.classify_back_resolution_evidence(&source_resolution),
             BackResolutionEvidenceClassification::ConsumedReplay
+        );
+    }
+
+    #[test]
+    fn back_target_permanent_prepared_terminal_evicts_exact_oldest_retention_state() {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/")).unwrap();
+        settle_current(&mut engine);
+        engine.push(RouteLocation::new("/about")).unwrap();
+        settle_current(&mut engine);
+        for index in 0..(TERMINAL_RETENTION - 2) {
+            engine
+                .replace(RouteLocation::new(format!("/items/{index}")))
+                .unwrap();
+            settle_current(&mut engine);
+        }
+
+        let mut retained_terminals = engine
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.status(),
+                    RequestStatus::Succeeded | RequestStatus::Failed(_)
+                )
+            })
+            .map(|record| record.id())
+            .collect::<Vec<_>>();
+        retained_terminals.sort_by_key(|request| request.sequence());
+        assert_eq!(retained_terminals.len(), TERMINAL_RETENTION);
+        assert_eq!(engine.history().len(), 2);
+        let evicted_request = retained_terminals[0];
+        let next_earliest_request = retained_terminals[1];
+        assert!(
+            engine
+                .issued_view_tasks
+                .iter()
+                .any(|identity| identity.request == evicted_request),
+            "the oldest real terminal must own issued task inventory before eviction"
+        );
+        assert!(
+            engine.report_dispositions.iter().any(|record| {
+                record.target == super::DiagnosticTarget::Request(evicted_request)
+            }),
+            "the oldest real terminal must own report inventory before eviction"
+        );
+        assert!(
+            engine
+                .completed_cleanup
+                .iter()
+                .any(|tombstone| tombstone.request == evicted_request),
+            "the oldest real terminal must own cleanup inventory before eviction"
+        );
+
+        let world = engine
+            .claim_history_admission_world()
+            .expect("the confirmed engine issues one real history world seal");
+        let stamp = engine
+            .history_admission_stamp(&world)
+            .expect("the two-entry history admits a target Back");
+        let admission = engine
+            .prepare_back_admission(&world, &stamp)
+            .expect("the target Back exact-refreezes the live history");
+        let accepted = engine.enqueue_back(admission).unwrap();
+        let permanent_request = accepted.request();
+        engine.collect();
+        let handoff = match engine.action().unwrap() {
+            EngineAction::BackResolution(handoff) => handoff,
+            _ => panic!("the accepted Back must produce a real resolution handoff"),
+        };
+        let (_request, view) = accepted.into_parts();
+        let verified = match engine.verify_back_resolution_handoff(view, handoff) {
+            BackResolutionVerifyOutcome::Matched(verified) => verified,
+            BackResolutionVerifyOutcome::Mismatch { .. } => {
+                panic!("the exact Back lineage must verify")
+            }
+        };
+        let (_view, owner) = verified.into_parts();
+        let target = match owner {
+            VerifiedBackResolutionOwnerHandoff::Target(owner) => owner,
+            VerifiedBackResolutionOwnerHandoff::NoTarget(_)
+            | VerifiedBackResolutionOwnerHandoff::Contradiction(_) => {
+                panic!("the two-entry history must resolve a real target")
+            }
+        };
+        engine.testing_request_back_target_source_drift_before_freeze_once();
+        let retirement_calls = std::cell::Cell::new(0usize);
+        let permanent = match engine.resume_back_target_with_retirement(target, || {
+            retirement_calls.set(retirement_calls.get() + 1);
+        }) {
+            BackTargetResumeOutcome::Permanent(owner) => owner,
+            BackTargetResumeOutcome::Resumed(_) => {
+                panic!("the real post-refreeze source drift must form a permanent owner")
+            }
+            BackTargetResumeOutcome::Mismatch(_) => {
+                panic!("the exact target receiver must not reject its real owner")
+            }
+        };
+        assert_eq!(retirement_calls.get(), 1);
+        let owner_snapshot = permanent.testing_evidence_snapshot();
+        assert_eq!(
+            owner_snapshot.cause(),
+            BackTargetPermanentCauseSnapshot::SourceCapability
+        );
+        assert!(matches!(
+            engine.request(permanent_request).unwrap().status(),
+            RequestStatus::Queued
+        ));
+        assert_eq!(
+            engine
+                .records
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.status(),
+                        RequestStatus::Succeeded | RequestStatus::Failed(_)
+                    )
+                })
+                .count(),
+            TERMINAL_RETENTION,
+            "the permanent target must remain queued beside a full terminal window"
+        );
+        let watermark_before = engine.testing_evicted_watermark();
+
+        let terminal = match engine.settle_back_target_permanent_exact(permanent) {
+            BackTargetPermanentSettlementOutcome::Settled(terminal) => terminal,
+            BackTargetPermanentSettlementOutcome::Mismatch { .. } => {
+                panic!("the exact permanent target owner must settle under retention pressure")
+            }
+        };
+
+        assert_eq!(terminal.testing_evidence_snapshot(), owner_snapshot);
+        assert!(matches!(
+            engine.private_lookup(evicted_request),
+            PrivateRequestLookup::Evicted
+        ));
+        assert!(matches!(
+            engine.private_lookup(next_earliest_request),
+            PrivateRequestLookup::Retained(_)
+        ));
+        assert_eq!(
+            engine.testing_evicted_watermark(),
+            Some(evicted_request.sequence())
+        );
+        assert!(watermark_before.is_none_or(|watermark| watermark < evicted_request.sequence()));
+        assert_eq!(
+            engine.earliest_retained_sequence(),
+            Some(next_earliest_request.sequence())
+        );
+        assert!(
+            engine
+                .issued_view_tasks
+                .iter()
+                .all(|identity| identity.request != evicted_request)
+        );
+        assert!(
+            engine.report_dispositions.iter().all(|record| {
+                record.target != super::DiagnosticTarget::Request(evicted_request)
+            })
+        );
+        assert!(
+            engine
+                .completed_cleanup
+                .iter()
+                .all(|tombstone| tombstone.request != evicted_request)
+        );
+        let permanent_record = engine
+            .request(permanent_request)
+            .expect("the new permanent target request remains retained");
+        assert!(matches!(
+            permanent_record.status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        assert_eq!(
+            permanent_record
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                .count(),
+            1
+        );
+        assert_eq!(
+            engine
+                .records
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.status(),
+                        RequestStatus::Succeeded | RequestStatus::Failed(_)
+                    )
+                })
+                .count(),
+            TERMINAL_RETENTION
         );
     }
 
