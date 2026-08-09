@@ -796,15 +796,29 @@ pub(crate) struct ActiveTargetPreparationPermanentLedger {
     validation: FrozenTargetPreparationPermanentPhysicalManifest,
 }
 
+impl PreparedTargetPreparationPermanentLedger {
+    fn into_active(self) -> ActiveTargetPreparationPermanentLedger {
+        ActiveTargetPreparationPermanentLedger {
+            ledger: CleanupLedger::activate(self.ledger, None),
+            validation: self.validation,
+        }
+    }
+}
+
 pub(crate) enum TargetPreparationPermanentLedgerHolder {
     Prepared(PreparedTargetPreparationPermanentLedger),
     Active(ActiveTargetPreparationPermanentLedger),
+}
+
+pub(crate) enum TargetPreparationPermanentInertEvidence {
+    Physical(LifecyclePreflightEvidence),
 }
 
 pub(crate) struct InstalledTargetPreparationPermanentCleanup {
     cleanup: TargetPreparationPermanentCleanupOwner,
     ledger: TargetPreparationPermanentLedgerHolder,
     batch: BackTargetPermanentCleanupBatchOwner,
+    inert: Option<TargetPreparationPermanentInertEvidence>,
 }
 
 pub(crate) struct PreparedTargetPermanentEcsInstallationOwner {
@@ -822,6 +836,7 @@ impl PreparedTargetPermanentEcsInstallationOwner {
                 cleanup: self.cleanup,
                 ledger: TargetPreparationPermanentLedgerHolder::Prepared(self.ledger),
                 batch,
+                inert: None,
             },
         )
     }
@@ -8590,7 +8605,7 @@ fn target_preparation_permanent_dispatch_entry_preflight(
             LifecyclePreflightObserved::Missing,
         ));
     };
-    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+    let Some(_registry) = world.get_resource::<RouteEntityRegistry>() else {
         return Err(target_preparation_permanent_mismatch(
             LifecyclePreflightSource::RequiredResources(RequiredResourceSet::ROUTE_ENTITY_REGISTRY),
             LifecyclePreflightExpectation::ResourcePresent,
@@ -8642,60 +8657,6 @@ fn target_preparation_permanent_dispatch_entry_preflight(
         ));
     }
 
-    let targets_are_exact = physical.target_observed.iter().all(|expected| {
-        observe_target_preparation_permanent_entity(world, registry, expected.entity) == *expected
-    });
-    let protected_are_exact = physical.protected.observed.iter().all(|expected| {
-        observe_target_preparation_permanent_entity(world, registry, expected.entity) == *expected
-    });
-    let mut observed_targets = physical
-        .target_observed
-        .iter()
-        .map(|observed| observed.entity)
-        .collect::<Vec<_>>();
-    observed_targets.sort_by_key(|entity| entity.to_bits());
-    observed_targets.dedup();
-    let mut allowed_write = physical.allowed_write.targets.clone();
-    allowed_write.sort_by_key(|entity| entity.to_bits());
-    allowed_write.dedup();
-    let protected = physical
-        .protected
-        .observed
-        .iter()
-        .map(|observed| observed.entity)
-        .collect::<std::collections::HashSet<_>>();
-    let protected_roots_are_exact = physical.protected.roots.iter().all(|root| {
-        protected.contains(root)
-            && world
-                .get::<bevy_ecs::hierarchy::ChildOf>(*root)
-                .map(bevy_ecs::hierarchy::ChildOf::parent)
-                .is_none_or(|parent| !protected.contains(&parent))
-    });
-
-    if !targets_are_exact || !protected_are_exact || !protected_roots_are_exact {
-        return Err(target_preparation_permanent_mismatch(
-            LifecyclePreflightSource::TargetPartition,
-            LifecyclePreflightExpectation::ExactRelationshipClosure,
-            LifecyclePreflightObserved::Drifted,
-        ));
-    }
-    if allowed_write
-        .iter()
-        .any(|target| protected.contains(target))
-    {
-        return Err(target_preparation_permanent_mismatch(
-            LifecyclePreflightSource::TargetPartition,
-            LifecyclePreflightExpectation::DisjointClosure,
-            LifecyclePreflightObserved::Contradictory,
-        ));
-    }
-    if observed_targets != allowed_write {
-        return Err(target_preparation_permanent_mismatch(
-            LifecyclePreflightSource::TargetPartition,
-            LifecyclePreflightExpectation::ExactTaskShape,
-            LifecyclePreflightObserved::Contradictory,
-        ));
-    }
     if !current_host_binding_is_exact(world, host) {
         return Err(target_preparation_permanent_mismatch(
             LifecyclePreflightSource::HostBinding,
@@ -8703,7 +8664,7 @@ fn target_preparation_permanent_dispatch_entry_preflight(
             LifecyclePreflightObserved::Drifted,
         ));
     }
-    Ok(())
+    target_preparation_permanent_prewrite_refreeze(world, physical)
 }
 
 pub(crate) fn dispatch_back_target_permanent(
@@ -14242,10 +14203,245 @@ fn drive_back_no_target_zero_completion(entry: &mut RouterEntry) -> bool {
     true
 }
 
+fn target_preparation_permanent_prewrite_refreeze(
+    world: &World,
+    validation: &FrozenTargetPreparationPermanentPhysicalManifest,
+) -> Result<(), LifecyclePreflightEvidence> {
+    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+        return Err(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::RequiredResources(RequiredResourceSet::ROUTE_ENTITY_REGISTRY),
+            LifecyclePreflightExpectation::ResourcePresent,
+            LifecyclePreflightObserved::Missing,
+        ));
+    };
+    let target_entities = validation
+        .target_observed
+        .iter()
+        .map(|observed| observed.entity)
+        .collect::<Vec<_>>();
+    let protected_entities = validation
+        .protected
+        .observed
+        .iter()
+        .map(|observed| observed.entity)
+        .collect::<Vec<_>>();
+    let target_entity_set = target_entities
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let protected_entity_set = protected_entities
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let allowed_write_entity_set = validation
+        .allowed_write
+        .targets
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    if target_entity_set.len() != target_entities.len()
+        || protected_entity_set.len() != protected_entities.len()
+    {
+        return Err(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactTaskShape,
+            LifecyclePreflightObserved::Contradictory,
+        ));
+    }
+    let observed_host_descendants = observed_descendant_closure(world, [validation.lineage.host]);
+    let mut expected_host_descendants = std::collections::HashSet::new();
+    expected_host_descendants.insert(validation.lineage.host);
+    expected_host_descendants.extend(target_entities.iter().copied());
+    expected_host_descendants.extend(protected_entities.iter().copied());
+    if observed_host_descendants != expected_host_descendants {
+        return Err(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactRelationshipClosure,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+    if !target_preparation_permanent_relationship_closure_is_exact(
+        world,
+        &observed_host_descendants,
+    ) {
+        return Err(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactRelationshipClosure,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+    let observed_targets = target_entities
+        .iter()
+        .copied()
+        .map(|entity| observe_target_preparation_permanent_entity(world, registry, entity))
+        .collect::<Vec<_>>();
+    if observed_targets != validation.target_observed {
+        return Err(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactRelationshipClosure,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+    let observed_protected = protected_entities
+        .iter()
+        .copied()
+        .map(|entity| observe_target_preparation_permanent_entity(world, registry, entity))
+        .collect::<Vec<_>>();
+    if observed_protected != validation.protected.observed {
+        return Err(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactRelationshipClosure,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+    let subtree_has_target = |entity| {
+        observed_descendant_closure(world, [entity])
+            .iter()
+            .any(|descendant| target_entity_set.contains(descendant))
+    };
+    let mut observed_protected_roots = Vec::new();
+    for observed in &observed_protected {
+        if subtree_has_target(observed.entity) {
+            continue;
+        }
+        let is_root = match observed.parent {
+            Some(parent) => !protected_entity_set.contains(&parent) || subtree_has_target(parent),
+            None => true,
+        };
+        if is_root {
+            observed_protected_roots.push(observed.entity);
+        }
+    }
+    observed_protected_roots.sort_by_key(|entity| entity.to_bits());
+    if observed_protected_roots != validation.protected.roots {
+        return Err(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactRelationshipClosure,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+    if !target_entity_set.is_disjoint(&protected_entity_set) {
+        return Err(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::DisjointClosure,
+            LifecyclePreflightObserved::Contradictory,
+        ));
+    }
+    if !allowed_write_entity_set.is_disjoint(&protected_entity_set) {
+        return Err(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::DisjointClosure,
+            LifecyclePreflightObserved::Contradictory,
+        ));
+    }
+    if target_entities != validation.allowed_write.targets {
+        return Err(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactTaskShape,
+            LifecyclePreflightObserved::Contradictory,
+        ));
+    }
+    Ok(())
+}
+
+fn drive_target_preparation_permanent_cleanup(world: &World, entry: &mut RouterEntry) -> bool {
+    let Some(PendingTargetPreparationPermanentCleanup::Installed(installed)) =
+        entry.pending_back_target_permanent_cleanup.as_ref()
+    else {
+        return false;
+    };
+    match &installed.ledger {
+        TargetPreparationPermanentLedgerHolder::Active(_) => return true,
+        TargetPreparationPermanentLedgerHolder::Prepared(_) => {}
+    }
+    match &installed.inert {
+        Some(_) => return true,
+        None => {}
+    }
+
+    let Some(pending) = entry.pending_back_target_permanent_cleanup.take() else {
+        return true;
+    };
+    let installed = match pending {
+        PendingTargetPreparationPermanentCleanup::Installed(installed) => installed,
+        #[cfg(test)]
+        PendingTargetPreparationPermanentCleanup::TestOccupied => {
+            entry.pending_back_target_permanent_cleanup =
+                Some(PendingTargetPreparationPermanentCleanup::TestOccupied);
+            return false;
+        }
+    };
+    let InstalledTargetPreparationPermanentCleanup {
+        cleanup,
+        ledger,
+        batch,
+        inert,
+    } = installed;
+    let prepared = match ledger {
+        TargetPreparationPermanentLedgerHolder::Prepared(prepared) => prepared,
+        TargetPreparationPermanentLedgerHolder::Active(active) => {
+            entry.pending_back_target_permanent_cleanup =
+                Some(PendingTargetPreparationPermanentCleanup::Installed(
+                    InstalledTargetPreparationPermanentCleanup {
+                        cleanup,
+                        ledger: TargetPreparationPermanentLedgerHolder::Active(active),
+                        batch,
+                        inert,
+                    },
+                ));
+            return true;
+        }
+    };
+    match inert {
+        Some(inert) => {
+            entry.pending_back_target_permanent_cleanup =
+                Some(PendingTargetPreparationPermanentCleanup::Installed(
+                    InstalledTargetPreparationPermanentCleanup {
+                        cleanup,
+                        ledger: TargetPreparationPermanentLedgerHolder::Prepared(prepared),
+                        batch,
+                        inert: Some(inert),
+                    },
+                ));
+            return true;
+        }
+        None => {}
+    }
+    let active = prepared.into_active();
+    match target_preparation_permanent_prewrite_refreeze(world, &active.validation) {
+        Ok(()) => {
+            entry.pending_back_target_permanent_cleanup =
+                Some(PendingTargetPreparationPermanentCleanup::Installed(
+                    InstalledTargetPreparationPermanentCleanup {
+                        cleanup,
+                        ledger: TargetPreparationPermanentLedgerHolder::Active(active),
+                        batch,
+                        inert: None,
+                    },
+                ));
+        }
+        Err(evidence) => {
+            entry.pending_back_target_permanent_cleanup =
+                Some(PendingTargetPreparationPermanentCleanup::Installed(
+                    InstalledTargetPreparationPermanentCleanup {
+                        cleanup,
+                        ledger: TargetPreparationPermanentLedgerHolder::Active(active),
+                        batch,
+                        inert: Some(TargetPreparationPermanentInertEvidence::Physical(evidence)),
+                    },
+                ));
+        }
+    }
+    true
+}
+
 pub(crate) fn settle_cleanup_system(world: &mut World) {
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             for entry in &mut navigation.entries {
+                if drive_target_preparation_permanent_cleanup(world, entry) {
+                    continue;
+                }
                 if drive_back_no_target_authority_cleanup(world, entry) {
                     continue;
                 }
@@ -28621,13 +28817,31 @@ pub(crate) mod tests {
         }
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq)]
+    #[derive(Clone, Eq, PartialEq)]
     struct TargetPermanentDispositionProjection {
         source: ReadyPlanPermanentSourceProjection,
+        lineage_router: RouterHandle,
+        lineage_host: Entity,
+        lineage_ticket: ViewReportIdentity,
         target_observed: Vec<FrozenTargetPreparationPermanentObservedEntity>,
         protected_roots: Vec<Entity>,
         protected_observed: Vec<FrozenTargetPreparationPermanentObservedEntity>,
         allowed_write: Vec<Entity>,
+    }
+
+    impl std::fmt::Debug for TargetPermanentDispositionProjection {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("TargetPermanentDispositionProjection")
+                .field("lineage_router", &self.lineage_router)
+                .field("lineage_host", &self.lineage_host)
+                .field("lineage_ticket", &"<opaque>")
+                .field("target_observed", &self.target_observed)
+                .field("protected_roots", &self.protected_roots)
+                .field("protected_observed", &self.protected_observed)
+                .field("allowed_write", &self.allowed_write)
+                .finish_non_exhaustive()
+        }
     }
 
     impl TargetPermanentDispositionProjection {
@@ -28650,6 +28864,9 @@ pub(crate) mod tests {
                     focus_leaving: physical.focus_leaving.clone(),
                     frozen_manifest: frozen_manifest.clone(),
                 },
+                lineage_router: cleanup.physical.lineage.router,
+                lineage_host: cleanup.physical.lineage.host,
+                lineage_ticket: cleanup.physical.lineage.ticket.clone(),
                 target_observed: cleanup.physical.target_observed.clone(),
                 protected_roots: cleanup.physical.protected.roots.clone(),
                 protected_observed: cleanup.physical.protected.observed.clone(),
@@ -28786,6 +29003,196 @@ pub(crate) mod tests {
             .expect("the real permanent dispatch fixture retains its exact entry")
             .back_target_permanent_begin_callback_calls
             .load(Ordering::Relaxed)
+    }
+
+    #[derive(Clone, Eq, PartialEq)]
+    struct TargetPermanentBatchProjection {
+        identity: ViewReportIdentity,
+        manifest_digest: u64,
+        obligation_count: usize,
+    }
+
+    impl TargetPermanentBatchProjection {
+        fn capture(owner: &BackTargetPermanentCleanupBatchOwner) -> Self {
+            let batch = owner.batch();
+            Self {
+                identity: batch.report_identity(),
+                manifest_digest: batch.manifest_digest(),
+                obligation_count: batch.obligation_count(),
+            }
+        }
+    }
+
+    fn target_permanent_installed_prepared_projection(
+        app: &App,
+        router: RouterHandle,
+    ) -> (
+        TargetPermanentDispositionProjection,
+        TargetPermanentBatchProjection,
+        PreparedCleanupLedgerProjection,
+    ) {
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the permanent cleanup fixture retains its exact RouterEntry");
+        let Some(PendingTargetPreparationPermanentCleanup::Installed(installed)) =
+            entry.pending_back_target_permanent_cleanup.as_ref()
+        else {
+            panic!("the permanent cleanup fixture retains one installed owner")
+        };
+        let TargetPreparationPermanentLedgerHolder::Prepared(prepared) = &installed.ledger else {
+            panic!("the freshly dispatched permanent cleanup starts Prepared")
+        };
+        (
+            TargetPermanentDispositionProjection::capture_cleanup(&installed.cleanup),
+            TargetPermanentBatchProjection::capture(&installed.batch),
+            prepared.ledger.projection(),
+        )
+    }
+
+    fn assert_target_permanent_installed_active(
+        app: &App,
+        router: RouterHandle,
+        expected_cleanup: &TargetPermanentDispositionProjection,
+        expected_batch: &TargetPermanentBatchProjection,
+        expected_ledger: PreparedCleanupLedgerProjection,
+        expected_inert: Option<(
+            LifecyclePreflightSource,
+            LifecyclePreflightExpectation,
+            LifecyclePreflightObserved,
+        )>,
+    ) {
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the permanent cleanup fixture retains its exact RouterEntry");
+        let Some(PendingTargetPreparationPermanentCleanup::Installed(installed)) =
+            entry.pending_back_target_permanent_cleanup.as_ref()
+        else {
+            panic!("the permanent cleanup driver must restore one installed owner")
+        };
+        assert!(
+            TargetPermanentDispositionProjection::capture_cleanup(&installed.cleanup)
+                == *expected_cleanup,
+            "activation must preserve the actual cleanup branch owner"
+        );
+        assert!(
+            TargetPermanentBatchProjection::capture(&installed.batch) == *expected_batch,
+            "activation must preserve the unique Core batch owner"
+        );
+        let TargetPreparationPermanentLedgerHolder::Active(active) = &installed.ledger else {
+            panic!("the installed Prepared ledger must activate exactly once")
+        };
+        assert_eq!(
+            active.validation.lineage.router,
+            expected_cleanup.lineage_router
+        );
+        assert_eq!(
+            active.validation.lineage.host,
+            expected_cleanup.lineage_host
+        );
+        assert!(
+            active.validation.lineage.ticket == expected_cleanup.lineage_ticket,
+            "activation must preserve the exact cleanup ticket lineage"
+        );
+        assert_eq!(
+            active.validation.target_observed,
+            expected_cleanup.target_observed
+        );
+        assert_eq!(
+            active.validation.protected.roots,
+            expected_cleanup.protected_roots
+        );
+        assert_eq!(
+            active.validation.protected.observed,
+            expected_cleanup.protected_observed
+        );
+        assert_eq!(
+            active.validation.allowed_write.targets,
+            expected_cleanup.allowed_write
+        );
+        assert!(
+            active.ledger.projection() == expected_ledger,
+            "activation must preserve ledger domain, manifest, obligation and receipt identity"
+        );
+        assert_eq!(
+            active.ledger.receipt_count(),
+            0,
+            "activation-only cleanup must not observe or settle receipts"
+        );
+        match (&installed.inert, expected_inert) {
+            (None, None) => {}
+            (Some(TargetPreparationPermanentInertEvidence::Physical(evidence)), Some(expected)) => {
+                assert_eq!(
+                    (
+                        evidence.source(),
+                        evidence.expectation(),
+                        evidence.observed()
+                    ),
+                    expected,
+                    "activation drift must retain its exact typed physical evidence"
+                )
+            }
+            _ => panic!("activation must retain the expected exact inert disposition"),
+        }
+    }
+
+    fn assert_target_permanent_activation_tick(
+        app: &mut App,
+        router: RouterHandle,
+        request: NavigationRequestId,
+        host: Entity,
+        expected_cleanup: &TargetPermanentDispositionProjection,
+        expected_batch: &TargetPermanentBatchProjection,
+        expected_ledger: PreparedCleanupLedgerProjection,
+        expected_inert: Option<(
+            LifecyclePreflightSource,
+            LifecyclePreflightExpectation,
+            LifecyclePreflightObserved,
+        )>,
+    ) {
+        let zero_write_before =
+            ReadyPlanPermanentZeroWriteProjection::capture(app, router, request, host);
+        let engine_before = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the activation fixture retains its exact entry")
+            .engine
+            .snapshot();
+
+        settle_cleanup_system(app.world_mut());
+
+        assert_target_permanent_installed_active(
+            app,
+            router,
+            expected_cleanup,
+            expected_batch,
+            expected_ledger,
+            expected_inert,
+        );
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("activation must retain its exact entry");
+        assert_eq!(entry.engine.snapshot(), engine_before);
+        assert_eq!(target_permanent_begin_callback_calls(app, router), 1);
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(app, router, request, host),
+            zero_write_before,
+            "one activation tick must preserve Core, public, registry and World state"
+        );
     }
 
     fn stage_real_back_target_prepared_permanent_disposition(
@@ -30201,6 +30608,96 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn back_target_permanent_dispatch_rejects_unfrozen_host_child_losslessly() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-unfrozen-host-child",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        let expected = TargetPermanentDispositionProjection::capture(&staged.disposition);
+        let foreign_child = app.world_mut().spawn(ReadyPlanPermanentForeignMarker).id();
+        app.world_mut()
+            .entity_mut(staged.host)
+            .add_child(foreign_child);
+        let zero_write_before = ReadyPlanPermanentZeroWriteProjection::capture(
+            &app,
+            router,
+            staged.request,
+            staged.host,
+        );
+        let core_before = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the unfrozen-child fixture retains its exact entry")
+            .engine
+            .snapshot();
+
+        let returned =
+            match dispatch_real_back_target_permanent(&mut app, router, staged.disposition) {
+                BackTargetPermanentDispatchOutcome::EntryMismatch {
+                    disposition,
+                    evidence,
+                } => {
+                    assert_eq!(
+                        (
+                            evidence.source(),
+                            evidence.expectation(),
+                            evidence.observed(),
+                        ),
+                        (
+                            LifecyclePreflightSource::TargetPartition,
+                            LifecyclePreflightExpectation::ExactRelationshipClosure,
+                            LifecyclePreflightObserved::Drifted,
+                        ),
+                        "the real dispatch predicate must classify an unfrozen host child"
+                    );
+                    disposition
+                }
+                BackTargetPermanentDispatchOutcome::Dispatched => {
+                    panic!("an unfrozen app-owned host child must not pass permanent dispatch")
+                }
+                _ => panic!("host-child drift must remain a typed entry mismatch"),
+            };
+
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(
+                &app,
+                router,
+                staged.request,
+                staged.host,
+            ),
+            zero_write_before,
+            "dispatch rejection must be zero-write after the real fault injection"
+        );
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the unfrozen-child rejection retains its exact entry");
+        assert_eq!(entry.engine.snapshot(), core_before);
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture(&returned),
+            expected
+        );
+
+        app.world_mut().despawn(foreign_child);
+        match dispatch_real_back_target_permanent(&mut app, router, returned) {
+            BackTargetPermanentDispatchOutcome::Dispatched => {}
+            _ => panic!("removing only the foreign child must recover the whole disposition"),
+        }
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 1);
+    }
+
+    #[test]
     fn back_target_physical_permanent_begin_rejects_entry_and_partition_drift_zero_write() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
@@ -31499,6 +31996,449 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn back_target_physical_permanent_activation_is_exact_once_and_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-activation-exact-once",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+
+        match dispatch_real_back_target_permanent(&mut app, router, staged.disposition) {
+            BackTargetPermanentDispatchOutcome::Dispatched => {}
+            _ => panic!("the exact activation fixture must complete real permanent dispatch"),
+        }
+        let (expected_cleanup, expected_batch, prepared_ledger) =
+            target_permanent_installed_prepared_projection(&app, router);
+        assert_eq!(
+            prepared_ledger.manifest_digest(),
+            expected_batch.manifest_digest
+        );
+        assert_eq!(
+            prepared_ledger.obligation_count(),
+            expected_batch.obligation_count
+        );
+        assert_eq!(prepared_ledger.receipt_count(), 0);
+        for _ in 0..2 {
+            assert_target_permanent_activation_tick(
+                &mut app,
+                router,
+                staged.request,
+                staged.host,
+                &expected_cleanup,
+                &expected_batch,
+                prepared_ledger,
+                None,
+            );
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TargetPermanentActivationPrewriteFault {
+        UnfrozenHostChild,
+        TargetManifest,
+        ReciprocalOnly,
+    }
+
+    #[test]
+    fn back_target_physical_permanent_prewrite_partition_drift_restores_active_owner_once() {
+        for (label, fault) in [
+            (
+                "back-target-permanent-activation-host-child-drift",
+                TargetPermanentActivationPrewriteFault::UnfrozenHostChild,
+            ),
+            (
+                "back-target-permanent-activation-target-manifest-drift",
+                TargetPermanentActivationPrewriteFault::TargetManifest,
+            ),
+            (
+                "back-target-permanent-activation-reciprocal-only-drift",
+                TargetPermanentActivationPrewriteFault::ReciprocalOnly,
+            ),
+        ] {
+            let mut app = App::new();
+            app.add_plugins(BevyUiRouterPlugin::default());
+            let (router, _) = install_classifier_permanent_fixture(&mut app, label);
+            let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+            let target = staged
+                .disposition
+                .cleanup
+                .physical
+                .target_observed
+                .first()
+                .expect("the real target cleanup freezes at least one target Entity")
+                .entity;
+            publish_snapshots_system(app.world_mut());
+
+            match dispatch_real_back_target_permanent(&mut app, router, staged.disposition) {
+                BackTargetPermanentDispatchOutcome::Dispatched => {}
+                _ => panic!("the prewrite-drift fixture must complete real permanent dispatch"),
+            }
+            let (expected_cleanup, expected_batch, prepared_ledger) =
+                target_permanent_installed_prepared_projection(&app, router);
+            assert_eq!(
+                prepared_ledger.manifest_digest(),
+                expected_batch.manifest_digest
+            );
+            assert_eq!(
+                prepared_ledger.obligation_count(),
+                expected_batch.obligation_count
+            );
+            assert_eq!(prepared_ledger.receipt_count(), 0);
+
+            match fault {
+                TargetPermanentActivationPrewriteFault::UnfrozenHostChild => {
+                    let foreign_child = app.world_mut().spawn(ReadyPlanPermanentForeignMarker).id();
+                    app.world_mut()
+                        .entity_mut(staged.host)
+                        .add_child(foreign_child);
+                }
+                TargetPermanentActivationPrewriteFault::TargetManifest => {
+                    app.world_mut()
+                        .entity_mut(target)
+                        .insert(ReadyPlanPermanentForeignMarker);
+                }
+                TargetPermanentActivationPrewriteFault::ReciprocalOnly => {
+                    let existing_child = app
+                        .world()
+                        .get::<Children>(staged.host)
+                        .and_then(|children| children.iter().next().copied())
+                        .expect("the real host retains at least one direct child");
+                    let mut host = app.world_mut().entity_mut(staged.host);
+                    let mut children = host
+                        .get_mut::<Children>()
+                        .expect("the real host retains its relationship target");
+                    let collection = <Children as bevy_ecs::relationship::RelationshipTarget>::collection_mut_risky(
+                        &mut *children,
+                    );
+                    assert!(
+                        bevy_ecs::relationship::RelationshipSourceCollection::add(
+                            collection,
+                            existing_child,
+                        ),
+                        "the reciprocal-only fault must add one duplicate Children entry"
+                    );
+                }
+            }
+            for _ in 0..2 {
+                assert_target_permanent_activation_tick(
+                    &mut app,
+                    router,
+                    staged.request,
+                    staged.host,
+                    &expected_cleanup,
+                    &expected_batch,
+                    prepared_ledger,
+                    Some((
+                        LifecyclePreflightSource::TargetPartition,
+                        LifecyclePreflightExpectation::ExactRelationshipClosure,
+                        LifecyclePreflightObserved::Drifted,
+                    )),
+                );
+            }
+        }
+
+        let source = include_str!("navigation.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\npub(crate) mod tests {")
+            .expect("navigation.rs retains one production/test boundary")
+            .0;
+        let inert = production
+            .split_once("pub(crate) enum TargetPreparationPermanentInertEvidence")
+            .expect("the activation contract requires typed inert evidence")
+            .1
+            .split_once("pub(crate) struct InstalledTargetPreparationPermanentCleanup")
+            .expect("typed inert evidence must precede the installed owner")
+            .0;
+        assert!(
+            inert.contains("Physical(LifecyclePreflightEvidence)"),
+            "activation drift must be retained as typed physical inert evidence"
+        );
+        let installed = production
+            .split_once("pub(crate) struct InstalledTargetPreparationPermanentCleanup")
+            .expect("the activation contract requires the installed owner")
+            .1
+            .split_once("pub(crate) struct PreparedTargetPermanentEcsInstallationOwner")
+            .expect("the installed owner must precede its installation owner")
+            .0;
+        assert!(
+            installed.contains("inert: Option<TargetPreparationPermanentInertEvidence>"),
+            "the whole installed owner must retain typed inert evidence"
+        );
+        let prepared = production
+            .split_once("impl PreparedTargetPreparationPermanentLedger")
+            .expect("Prepared must expose one activation boundary")
+            .1
+            .split_once("pub(crate) enum TargetPreparationPermanentLedgerHolder")
+            .expect("Prepared activation must precede the holder")
+            .0;
+        assert!(prepared.contains("fn into_active"));
+        assert_eq!(
+            prepared.matches("CleanupLedger::activate(").count(),
+            1,
+            "Prepared must have one activation callsite"
+        );
+        for forbidden in ["receipt", "attempt", "settle", "completion"] {
+            assert!(
+                !prepared.contains(forbidden),
+                "Prepared must not expose executable cleanup operation: {forbidden}"
+            );
+        }
+        let into_active_body = prepared
+            .split_once("fn into_active(")
+            .expect("Prepared must expose into_active")
+            .1
+            .split_once('{')
+            .expect("into_active must have one function body")
+            .1;
+        let into_active_calls = permanent_atomic_tail_call_heads(into_active_body);
+        assert!(
+            into_active_calls.len() == 1 && into_active_calls[0] == "CleanupLedger::activate",
+            "into_active may call only CleanupLedger::activate"
+        );
+        let driver = production
+            .split_once("fn drive_target_preparation_permanent_cleanup(")
+            .expect("activation requires one dedicated driver")
+            .1
+            .split_once("pub(crate) fn settle_cleanup_system(")
+            .expect("the target driver must precede settle_cleanup_system")
+            .0;
+        let compact = driver
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        let driver_calls = permanent_atomic_tail_call_heads(driver);
+        assert!(
+            driver_calls.iter().all(|call| matches!(
+                *call,
+                "Some"
+                    | "Ok"
+                    | "Err"
+                    | "as_ref"
+                    | "take"
+                    | "into_active"
+                    | "target_preparation_permanent_prewrite_refreeze"
+                    | "PendingTargetPreparationPermanentCleanup::Installed"
+                    | "InstalledTargetPreparationPermanentCleanup"
+                    | "TargetPreparationPermanentLedgerHolder::Prepared"
+                    | "TargetPreparationPermanentLedgerHolder::Active"
+                    | "TargetPreparationPermanentInertEvidence::Physical"
+            )),
+            "the activation driver may call only classification, activation, canonical refreeze and owner reinstallation"
+        );
+        let classify = compact
+            .find("entry.pending_back_target_permanent_cleanup.as_ref()")
+            .expect("the driver must classify the holder by reference");
+        let take = compact
+            .find("entry.pending_back_target_permanent_cleanup.take()")
+            .expect("the driver may whole-take only after classification");
+        assert!(
+            classify < take,
+            "the driver must classify before whole-take"
+        );
+        assert_eq!(
+            compact
+                .matches("entry.pending_back_target_permanent_cleanup.take()")
+                .count(),
+            1,
+            "the driver may whole-take Prepared only once"
+        );
+        let active_safe_stop = compact
+            .find("TargetPreparationPermanentLedgerHolder::Active(_)=>returntrue")
+            .expect("the classified Active arm must safe-stop before take or refreeze");
+        assert!(active_safe_stop < take);
+        assert_eq!(
+            compact.matches(".into_active()").count(),
+            1,
+            "the driver must consume Prepared exactly once"
+        );
+        let refreeze = compact
+            .find("target_preparation_permanent_prewrite_refreeze(")
+            .expect("activation must use the canonical read-only prewrite refreeze");
+        assert_eq!(
+            compact
+                .matches("target_preparation_permanent_prewrite_refreeze(")
+                .count(),
+            1,
+            "the driver must call the canonical prewrite refreeze exactly once"
+        );
+        assert!(take < refreeze);
+        let exact = compact
+            .find("Ok(())=>")
+            .expect("exact prewrite refreeze must have an explicit success arm");
+        let drift = compact
+            .find("Err(evidence)=>")
+            .expect("prewrite refreeze drift must retain the original evidence binding");
+        assert!(refreeze < exact && exact < drift);
+        let exact_arm = &compact[exact..drift];
+        let drift_arm = &compact[drift..];
+        const REINSTALL: &str = concat!(
+            "entry.pending_back_target_permanent_cleanup=Some(",
+            "PendingTargetPreparationPermanentCleanup::Installed(",
+            "InstalledTargetPreparationPermanentCleanup{"
+        );
+        assert!(
+            exact_arm.contains(REINSTALL) && exact_arm.contains("inert:None"),
+            "exact refreeze must reinstall the same Active owner with no inert evidence"
+        );
+        assert!(
+            drift_arm.contains(REINSTALL)
+                && drift_arm.contains(concat!(
+                    "inert:Some(",
+                    "TargetPreparationPermanentInertEvidence::Physical(evidence))"
+                )),
+            "the Err arm must reinstall the same Active owner with its original typed evidence"
+        );
+        for forbidden in [
+            "world.entity_mut",
+            "world.despawn",
+            ".despawn(",
+            ".flush(",
+            ".insert(",
+            ".remove(",
+            "resource_mut",
+            "get_resource_mut",
+            "UnsafeWorldCell",
+            "Commands",
+            "observe_cleanup_receipts",
+            "receipt",
+            ".attempt(",
+            ".settle(",
+            "pending_completion",
+            "complete_back_target_permanent_cleanup",
+        ] {
+            assert!(
+                !compact.contains(forbidden),
+                "the activation-only driver must stop before later cleanup work: {forbidden}"
+            );
+        }
+        let refreeze_helper = production
+            .split_once("fn target_preparation_permanent_prewrite_refreeze(")
+            .expect("activation requires one canonical prewrite refreeze")
+            .1
+            .split_once("fn drive_target_preparation_permanent_cleanup(")
+            .expect("the canonical refreeze must precede its only caller")
+            .0;
+        let refreeze_compact = refreeze_helper
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert!(
+            refreeze_compact.contains("world:&World")
+                && refreeze_compact.contains("->Result<(),LifecyclePreflightEvidence>"),
+            "the canonical prewrite refreeze must be a read-only typed Result boundary"
+        );
+        let refreeze_calls = permanent_atomic_tail_call_heads(refreeze_helper);
+        assert!(
+            refreeze_calls.iter().all(|call| {
+                matches!(
+                    *call,
+                    "Some"
+                        | "Ok"
+                        | "Err"
+                        | "iter"
+                        | "map"
+                        | "collect"
+                        | "copied"
+                        | "clone"
+                        | "sort"
+                        | "sort_by_key"
+                        | "dedup"
+                        | "len"
+                        | "any"
+                        | "push"
+                        | "to_bits"
+                        | "insert"
+                        | "extend"
+                        | "contains"
+                        | "is_disjoint"
+                        | "get_resource"
+                        | "record"
+                        | "Vec::new"
+                        | "subtree_has_target"
+                        | "observed_descendant_closure"
+                        | "observe_target_preparation_permanent_entity"
+                        | "target_preparation_permanent_relationship_closure_is_exact"
+                        | "LifecyclePreflightSource::RequiredResources"
+                ) || call.starts_with("LifecyclePreflightEvidence::")
+                    || call.ends_with("HashSet::new")
+                    || call.ends_with("BTreeSet::new")
+            }),
+            "prewrite refreeze may call only read observation, collection normalization and typed-evidence constructors: {refreeze_calls:?}"
+        );
+        for required in [
+            "letobserved_host_descendants=observed_descendant_closure(world,[validation.lineage.host])",
+            "expected_host_descendants.insert(validation.lineage.host)",
+            "expected_host_descendants.extend(target_entities.iter().copied())",
+            "expected_host_descendants.extend(protected_entities.iter().copied())",
+            "target_entity_set.len()!=target_entities.len()",
+            "protected_entity_set.len()!=protected_entities.len()",
+            "ifobserved_host_descendants!=expected_host_descendants{returnErr(",
+            "ifobserved_targets!=validation.target_observed{returnErr(",
+            "ifobserved_protected!=validation.protected.observed{returnErr(",
+            "ifobserved_protected_roots!=validation.protected.roots{returnErr(",
+            "iftarget_entities!=validation.allowed_write.targets{returnErr(",
+            "if!target_entity_set.is_disjoint(&protected_entity_set){returnErr(",
+            "if!allowed_write_entity_set.is_disjoint(&protected_entity_set){returnErr(",
+        ] {
+            assert!(
+                refreeze_compact.contains(required),
+                "canonical prewrite refreeze must retain exact closure predicate: {required}"
+            );
+        }
+        assert_eq!(
+            refreeze_calls
+                .iter()
+                .filter(|call| {
+                    **call == "target_preparation_permanent_relationship_closure_is_exact"
+                })
+                .count(),
+            1,
+            "canonical refreeze must validate reciprocal relationship closure exactly once"
+        );
+        assert!(
+            refreeze_compact.ends_with("Ok(())}"),
+            "canonical refreeze may succeed only after every exact predicate"
+        );
+        for forbidden in [
+            "&mut",
+            "world.entity_mut",
+            "world.despawn",
+            ".despawn(",
+            ".flush(",
+            ".remove(",
+            "resource_mut",
+            "get_resource_mut",
+            "UnsafeWorldCell",
+            "Commands",
+            "engine",
+            "snapshot",
+            "receipt",
+            "attempt",
+            "settle",
+            "completion",
+        ] {
+            assert!(
+                !refreeze_compact.contains(forbidden),
+                "the canonical refreeze helper must remain observation-only: {forbidden}"
+            );
+        }
+        let settle = production
+            .split_once("pub(crate) fn settle_cleanup_system(")
+            .expect("the cleanup system must expose the target driver callsite")
+            .1;
+        assert_eq!(
+            settle
+                .matches("drive_target_preparation_permanent_cleanup(world, entry)")
+                .count(),
+            1,
+            "settle_cleanup_system must drive target activation through one dedicated callsite"
+        );
+    }
+
+    #[test]
     fn back_target_physical_permanent_begin_current_state_drift_is_typed_and_zero_write() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
@@ -32231,12 +33171,13 @@ pub(crate) mod tests {
             installed.contains("cleanup: TargetPreparationPermanentCleanupOwner")
                 && installed.contains("ledger: TargetPreparationPermanentLedgerHolder")
                 && installed.contains("batch: BackTargetPermanentCleanupBatchOwner")
+                && installed.contains("inert: Option<TargetPreparationPermanentInertEvidence>")
                 && !installed.contains("settlement"),
-            "the ECS holder must retain only physical cleanup, Prepared ledger and unique batch"
+            "the ECS holder must retain the exact three owners plus typed inert evidence"
         );
         assert_eq!(
-            installed_fields, 3,
-            "the ECS holder must remain an exact three-owner tuple"
+            installed_fields, 4,
+            "the ECS holder must remain an exact three-owner tuple plus inert evidence"
         );
     }
 
@@ -32357,6 +33298,9 @@ pub(crate) mod tests {
                         break;
                     }
                     start = index;
+                }
+                if start == end && source[open..].starts_with("()") {
+                    return None;
                 }
                 assert!(
                     start < end,

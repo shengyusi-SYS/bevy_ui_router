@@ -6025,6 +6025,7 @@ pub(crate) struct PreparedCleanupLedgerProjection {
     ledger_domain: u64,
     manifest_digest: u64,
     obligation_count: usize,
+    receipt_count: usize,
 }
 
 impl PreparedCleanupLedgerProjection {
@@ -6034,6 +6035,10 @@ impl PreparedCleanupLedgerProjection {
 
     pub(crate) const fn obligation_count(self) -> usize {
         self.obligation_count
+    }
+
+    pub(crate) const fn receipt_count(self) -> usize {
+        self.receipt_count
     }
 }
 
@@ -6070,6 +6075,7 @@ impl PreparedCleanupLedger {
             ledger_domain: self.ledger_domain,
             manifest_digest: self.manifest_digest,
             obligation_count: self.obligations.len(),
+            receipt_count: self.receipts.iter().flatten().count(),
         }
     }
 
@@ -8441,6 +8447,16 @@ impl CleanupLedger {
     #[cfg(test)]
     pub(crate) fn receipt_count(&self) -> usize {
         self.receipts.iter().flatten().count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn projection(&self) -> PreparedCleanupLedgerProjection {
+        PreparedCleanupLedgerProjection {
+            ledger_domain: self.ledger_domain,
+            manifest_digest: self.manifest_digest,
+            obligation_count: self.obligations.len(),
+            receipt_count: self.receipts.iter().flatten().count(),
+        }
     }
 
     pub(crate) fn next_unobserved_receipt(&self) -> Option<(usize, CleanupDisposition)> {
