@@ -1754,8 +1754,8 @@ fn back_target_dispatch_owners_are_linear_and_exact() {
         production_navigation
             .match_indices(".validate_back_target_execution_pairing(")
             .count(),
-        10,
-        "action injection, retry restore, source freeze, failure routing, applied MountRequest/Commit outcomes, classifier entry and permanent settlement, commit transfer, and prepared publication must each use the one opaque pairing predicate"
+        11,
+        "action injection, retry restore, source freeze, failure routing, applied MountRequest/Commit outcomes, classifier and ReadyPlan permanent preparation, commit transfer, and prepared publication must each use the one opaque pairing predicate"
     );
     assert!(
         navigation.contains("ReconciliationPreparationOutcome::PairingMismatch"),

@@ -787,6 +787,18 @@ pub(crate) enum BackTargetClassifierPermanentPreparationOutcome {
     },
 }
 
+pub(crate) enum BackTargetReadyPlanPermanentPreparationOutcome {
+    Prepared(TargetPreparationPermanentDisposition),
+    PhysicalMismatch {
+        owner: PreparationPermanentOwner<BackTargetReadyAcceptanceOwner>,
+        evidence: LifecyclePreflightEvidence,
+    },
+    ReceiverMismatch {
+        owner: PreparationPermanentOwner<BackTargetReadyAcceptanceOwner>,
+        mismatch: PreparationReceiverMismatchView,
+    },
+}
+
 pub(crate) enum PendingBackTargetClassification {
     Active(TargetPreparationOwner),
     PairingMismatch {
@@ -7766,104 +7778,443 @@ pub(crate) fn classify_back_target(
     }
 }
 
+struct FrozenBackTargetPreparationPermanentPhysicalFacts {
+    physical: FrozenTargetPreparationPermanentPhysicalManifest,
+    frozen_manifest: FrozenCleanupManifest,
+    scope: PreparationBoundaryScopeView,
+}
+
+fn target_preparation_permanent_mismatch(
+    source: LifecyclePreflightSource,
+    expectation: LifecyclePreflightExpectation,
+    observed: LifecyclePreflightObserved,
+) -> LifecyclePreflightEvidence {
+    LifecyclePreflightEvidence::new(source, expectation, observed)
+}
+
+fn observe_target_preparation_permanent_entity(
+    world: &World,
+    registry: &RouteEntityRegistry,
+    entity: bevy_ecs::entity::Entity,
+) -> FrozenTargetPreparationPermanentObservedEntity {
+    FrozenTargetPreparationPermanentObservedEntity {
+        entity,
+        parent: world
+            .get::<bevy_ecs::hierarchy::ChildOf>(entity)
+            .map(bevy_ecs::hierarchy::ChildOf::parent),
+        children: world
+            .get::<bevy_ecs::hierarchy::Children>(entity)
+            .map(|children| children.iter().copied().collect())
+            .unwrap_or_default(),
+        registry_claim: registry.record(entity).map(|record| record.claim()),
+        ownership_seal: world.get::<RouteOwnershipSeal>(entity).copied(),
+        manifest: ComponentManifest::from_world(world, entity),
+    }
+}
+
+fn target_preparation_permanent_claim_belongs_to_host(
+    host: &HostBinding,
+    claim: &ExactRegistryClaim,
+) -> bool {
+    match claim.owner() {
+        RegistryOwner::Committed(
+            EntityOwner::FrameShell(frame)
+            | EntityOwner::FrameContentTarget(frame)
+            | EntityOwner::FrameOutput { frame, .. },
+        )
+        | RegistryOwner::Committed(EntityOwner::ChildSlot { parent: frame, .. })
+        | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { parent: frame, .. }) => {
+            bevy_ui_router_core::integration::host_version_matches_frame(&host.version, frame)
+        }
+        RegistryOwner::Committed(EntityOwner::HostTopSlot {
+            host: version,
+            slot,
+        }) => version == &host.version && *slot == host.slot_id,
+        RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(_)) => false,
+    }
+}
+
+fn target_preparation_permanent_relationship_closure_is_exact(
+    world: &World,
+    closure: &std::collections::HashSet<bevy_ecs::entity::Entity>,
+) -> bool {
+    for parent in closure.iter().copied() {
+        let children = world
+            .get::<bevy_ecs::hierarchy::Children>(parent)
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let unique = children
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        if unique.len() != children.len()
+            || children.iter().any(|child| {
+                !closure.contains(child)
+                    || world
+                        .get::<bevy_ecs::hierarchy::ChildOf>(*child)
+                        .map(bevy_ecs::hierarchy::ChildOf::parent)
+                        != Some(parent)
+            })
+        {
+            return false;
+        }
+    }
+    world.iter_entities().all(|entity| {
+        let Some(parent) = entity
+            .get::<bevy_ecs::hierarchy::ChildOf>()
+            .map(bevy_ecs::hierarchy::ChildOf::parent)
+        else {
+            return true;
+        };
+        !closure.contains(&parent)
+            || closure.contains(&entity.id())
+                && world
+                    .get::<bevy_ecs::hierarchy::Children>(parent)
+                    .is_some_and(|children| {
+                        children
+                            .iter()
+                            .filter(|child| **child == entity.id())
+                            .count()
+                            == 1
+                    })
+    })
+}
+
+fn freeze_back_target_preparation_permanent_physical(
+    world: &World,
+    entry: &RouterEntry,
+    splice: &SealedReconciliationSplice,
+    continuation: &LifecycleContinuationCapacity,
+) -> Result<FrozenBackTargetPreparationPermanentPhysicalFacts, LifecyclePreflightEvidence> {
+    let mismatch = target_preparation_permanent_mismatch;
+    if entry.pending_back_target_execution.is_some()
+        || entry.active.is_some()
+        || entry.pending_commit.as_ref().is_none_or(|pending| {
+            pending.ticket.is_none()
+                || pending.final_task.is_some()
+                || !pending.branch.frames().is_empty()
+                || !pending.branch.child_slots().is_empty()
+        })
+    {
+        return Err(mismatch(
+            LifecyclePreflightSource::PendingAdmission,
+            LifecyclePreflightExpectation::ExactTaskShape,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+        return Err(mismatch(
+            LifecyclePreflightSource::RequiredResources(RequiredResourceSet::ROUTE_ENTITY_REGISTRY),
+            LifecyclePreflightExpectation::ResourcePresent,
+            LifecyclePreflightObserved::Missing,
+        ));
+    };
+    let Some(host) = entry.host.as_ref() else {
+        return Err(mismatch(
+            LifecyclePreflightSource::HostBinding,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Missing,
+        ));
+    };
+    if world
+        .get::<crate::app_ext::RouterHostRegistration>(host.host)
+        .is_none_or(|registration| registration.router() != entry.handle)
+        || !current_host_binding_is_exact(world, host)
+    {
+        return Err(mismatch(
+            LifecyclePreflightSource::HostBinding,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+    if registry.record(host.host).is_some() || world.get::<RouteOwnershipSeal>(host.host).is_some()
+    {
+        return Err(mismatch(
+            LifecyclePreflightSource::HostBinding,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+
+    let entering_boundaries = splice
+        .entering()
+        .claims()
+        .map(ExactRegistryClaim::entity)
+        .collect::<Vec<_>>();
+    if validate_preserved_branch_local(
+        world,
+        splice.preserved(),
+        splice.slot_roles(),
+        &entering_boundaries,
+    )
+    .is_err()
+    {
+        return Err(mismatch(
+            LifecyclePreflightSource::PreservedCurrent,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+    if validate_leaving_branch_for_splice(world, splice.leaving(), splice.slot_roles()).is_err() {
+        return Err(mismatch(
+            LifecyclePreflightSource::LeavingCurrent,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+    if validate_reconciliation_entering_branch(
+        world,
+        splice.entering(),
+        splice.preserved(),
+        splice.leaving(),
+    )
+    .is_err()
+    {
+        return Err(mismatch(
+            LifecyclePreflightSource::PendingEntering,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+    if validate_active_branch_for_splice(
+        world,
+        splice.preserved(),
+        splice.entering(),
+        splice.slot_roles(),
+    )
+    .is_err()
+    {
+        return Err(mismatch(
+            LifecyclePreflightSource::CrossRoleRebase,
+            LifecyclePreflightExpectation::RebaseCompatible,
+            LifecyclePreflightObserved::Contradictory,
+        ));
+    }
+
+    let transitions = splice.lifecycle_transitions();
+    let Some(registry_plan) = registry.prepare_lifecycle_mutation(&transitions) else {
+        return Err(mismatch(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Contradictory,
+        ));
+    };
+    let host_closure = observed_descendant_closure(world, [host.host]);
+    if !host_closure.contains(&host.top_slot)
+        || !target_preparation_permanent_relationship_closure_is_exact(world, &host_closure)
+    {
+        return Err(mismatch(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactRelationshipClosure,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+
+    let mut accepted_roles = std::collections::HashMap::new();
+    for claim in splice
+        .preserved()
+        .claims()
+        .chain(splice.entering().claims())
+        .chain(splice.leaving().claims())
+        .chain(splice.slot_roles().iter().map(|role| role.claim()))
+        .chain(std::iter::once(&host.top_slot_claim))
+    {
+        if accepted_roles
+            .insert(claim.entity(), claim.clone())
+            .is_some_and(|previous| previous != *claim)
+        {
+            return Err(mismatch(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Contradictory,
+            ));
+        }
+    }
+    if accepted_roles.iter().any(|(entity, claim)| {
+        *entity == host.host
+            || !host_closure.contains(entity)
+            || !target_preparation_permanent_claim_belongs_to_host(host, claim)
+            || !registered_claim_has_exact_authority_and_manifest_coverage(
+                world,
+                registry,
+                claim,
+                *entity == host.top_slot,
+            )
+    }) {
+        return Err(mismatch(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+
+    let mut targets = transitions
+        .iter()
+        .map(|(claim, _)| claim.entity())
+        .collect::<Vec<_>>();
+    targets.sort_by_key(|entity| entity.to_bits());
+    targets.dedup();
+    if targets.len() != transitions.len()
+        || targets.iter().any(|target| {
+            *target == host.host || *target == host.top_slot || !host_closure.contains(target)
+        })
+        || transitions.iter().any(|(claim, _)| {
+            accepted_roles.get(&claim.entity()) != Some(claim)
+                || !registered_claim_has_exact_authority_and_manifest_coverage(
+                    world, registry, claim, false,
+                )
+        })
+    {
+        return Err(mismatch(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+
+    let target_set = targets
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let mut target_observed = targets
+        .iter()
+        .copied()
+        .map(|entity| observe_target_preparation_permanent_entity(world, registry, entity))
+        .collect::<Vec<_>>();
+    target_observed.sort_by_key(|observed| observed.entity.to_bits());
+
+    let mut closure_entities = host_closure.iter().copied().collect::<Vec<_>>();
+    closure_entities.sort_by_key(|entity| entity.to_bits());
+    let mut protected_entities = Vec::new();
+    for entity in closure_entities {
+        if entity == host.host || target_set.contains(&entity) {
+            continue;
+        }
+        if accepted_roles.contains_key(&entity) {
+            protected_entities.push(entity);
+            continue;
+        }
+        match registry.record(entity) {
+            None if world.get::<RouteOwnershipSeal>(entity).is_none() => {
+                protected_entities.push(entity);
+            }
+            None => {
+                return Err(mismatch(
+                    LifecyclePreflightSource::TargetPartition,
+                    LifecyclePreflightExpectation::ExactAuthority,
+                    LifecyclePreflightObserved::Drifted,
+                ));
+            }
+            Some(record) => {
+                let claim = record.claim();
+                if !registered_claim_has_exact_authority_and_manifest_coverage(
+                    world, registry, &claim, false,
+                ) {
+                    return Err(mismatch(
+                        LifecyclePreflightSource::TargetPartition,
+                        LifecyclePreflightExpectation::ExactAuthority,
+                        LifecyclePreflightObserved::Drifted,
+                    ));
+                }
+                if target_preparation_permanent_claim_belongs_to_host(host, &claim) {
+                    return Err(mismatch(
+                        LifecyclePreflightSource::TargetPartition,
+                        LifecyclePreflightExpectation::ExactAuthority,
+                        LifecyclePreflightObserved::Contradictory,
+                    ));
+                }
+                protected_entities.push(entity);
+            }
+        }
+    }
+    protected_entities.sort_by_key(|entity| entity.to_bits());
+    let protected_set = protected_entities
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let subtree_has_target = |entity| {
+        observed_descendant_closure(world, [entity])
+            .iter()
+            .any(|descendant| target_set.contains(descendant))
+    };
+    let mut protected_roots = protected_entities
+        .iter()
+        .copied()
+        .filter(|entity| {
+            if subtree_has_target(*entity) {
+                return false;
+            }
+            world
+                .get::<bevy_ecs::hierarchy::ChildOf>(*entity)
+                .map(bevy_ecs::hierarchy::ChildOf::parent)
+                .is_none_or(|parent| !protected_set.contains(&parent) || subtree_has_target(parent))
+        })
+        .collect::<Vec<_>>();
+    protected_roots.sort_by_key(|entity| entity.to_bits());
+    let protected_root_closure =
+        observed_descendant_closure(world, protected_roots.iter().copied());
+    if protected_root_closure
+        .iter()
+        .any(|entity| target_set.contains(entity) || !protected_set.contains(entity))
+        || protected_entities
+            .iter()
+            .any(|entity| !subtree_has_target(*entity) && !protected_root_closure.contains(entity))
+    {
+        return Err(mismatch(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactRelationshipClosure,
+            LifecyclePreflightObserved::Contradictory,
+        ));
+    }
+    let protected_observed = protected_entities
+        .iter()
+        .copied()
+        .map(|entity| observe_target_preparation_permanent_entity(world, registry, entity))
+        .collect::<Vec<_>>();
+
+    let frozen_manifest = if splice.leaving().obligation_count() == 0 {
+        FrozenCleanupManifest::empty()
+    } else {
+        let Some(manifest) = FrozenCleanupManifest::from_leaving_branch(
+            world,
+            registry,
+            splice.leaving(),
+            registry_plan.resulting_claims(),
+            (!splice.entering().frames().is_empty()).then_some(splice.entering()),
+        ) else {
+            return Err(mismatch(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactRelationshipClosure,
+                LifecyclePreflightObserved::Contradictory,
+            ));
+        };
+        manifest
+    };
+    let scope = continuation.preparation_boundary_scope();
+    Ok(FrozenBackTargetPreparationPermanentPhysicalFacts {
+        physical: FrozenTargetPreparationPermanentPhysicalManifest {
+            lineage: FrozenTargetPreparationPermanentLineage {
+                router: entry.handle,
+                host: host.host,
+                scope: scope.clone(),
+            },
+            target_observed,
+            protected: FrozenTargetPreparationPermanentProtectedClosures {
+                roots: protected_roots,
+                observed: protected_observed,
+            },
+            allowed_write: FrozenTargetPreparationPermanentAllowedWriteSet { targets },
+        },
+        frozen_manifest,
+        scope,
+    })
+}
+
 pub(crate) fn prepare_back_target_classifier_permanent(
     world: &World,
     entry: &mut RouterEntry,
     owner: PreparationPermanentOwner<TargetPreparationOwner>,
 ) -> BackTargetClassifierPermanentPreparationOutcome {
-    fn mismatch(
-        source: LifecyclePreflightSource,
-        expectation: LifecyclePreflightExpectation,
-        observed: LifecyclePreflightObserved,
-    ) -> LifecyclePreflightEvidence {
-        LifecyclePreflightEvidence::new(source, expectation, observed)
-    }
-
-    fn observe(
-        world: &World,
-        registry: &RouteEntityRegistry,
-        entity: bevy_ecs::entity::Entity,
-    ) -> FrozenTargetPreparationPermanentObservedEntity {
-        FrozenTargetPreparationPermanentObservedEntity {
-            entity,
-            parent: world
-                .get::<bevy_ecs::hierarchy::ChildOf>(entity)
-                .map(bevy_ecs::hierarchy::ChildOf::parent),
-            children: world
-                .get::<bevy_ecs::hierarchy::Children>(entity)
-                .map(|children| children.iter().copied().collect())
-                .unwrap_or_default(),
-            registry_claim: registry.record(entity).map(|record| record.claim()),
-            ownership_seal: world.get::<RouteOwnershipSeal>(entity).copied(),
-            manifest: ComponentManifest::from_world(world, entity),
-        }
-    }
-
-    fn claim_belongs_to_host(host: &HostBinding, claim: &ExactRegistryClaim) -> bool {
-        match claim.owner() {
-            RegistryOwner::Committed(
-                EntityOwner::FrameShell(frame)
-                | EntityOwner::FrameContentTarget(frame)
-                | EntityOwner::FrameOutput { frame, .. },
-            )
-            | RegistryOwner::Committed(EntityOwner::ChildSlot { parent: frame, .. })
-            | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { parent: frame, .. }) => {
-                bevy_ui_router_core::integration::host_version_matches_frame(&host.version, frame)
-            }
-            RegistryOwner::Committed(EntityOwner::HostTopSlot {
-                host: version,
-                slot,
-            }) => version == &host.version && *slot == host.slot_id,
-            RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(_)) => false,
-        }
-    }
-
-    fn relationship_closure_is_exact(
-        world: &World,
-        closure: &std::collections::HashSet<bevy_ecs::entity::Entity>,
-    ) -> bool {
-        for parent in closure.iter().copied() {
-            let children = world
-                .get::<bevy_ecs::hierarchy::Children>(parent)
-                .map(|children| children.iter().copied().collect::<Vec<_>>())
-                .unwrap_or_default();
-            let unique = children
-                .iter()
-                .copied()
-                .collect::<std::collections::HashSet<_>>();
-            if unique.len() != children.len()
-                || children.iter().any(|child| {
-                    !closure.contains(child)
-                        || world
-                            .get::<bevy_ecs::hierarchy::ChildOf>(*child)
-                            .map(bevy_ecs::hierarchy::ChildOf::parent)
-                            != Some(parent)
-                })
-            {
-                return false;
-            }
-        }
-        world.iter_entities().all(|entity| {
-            let Some(parent) = entity
-                .get::<bevy_ecs::hierarchy::ChildOf>()
-                .map(bevy_ecs::hierarchy::ChildOf::parent)
-            else {
-                return true;
-            };
-            !closure.contains(&parent)
-                || closure.contains(&entity.id())
-                    && world
-                        .get::<bevy_ecs::hierarchy::Children>(parent)
-                        .is_some_and(|children| {
-                            children
-                                .iter()
-                                .filter(|child| **child == entity.id())
-                                .count()
-                                == 1
-                        })
-        })
-    }
-
     let Some(ticket) = entry
         .pending_commit
         .as_ref()
@@ -7871,7 +8222,7 @@ pub(crate) fn prepare_back_target_classifier_permanent(
     else {
         return BackTargetClassifierPermanentPreparationOutcome::PhysicalMismatch {
             owner,
-            evidence: mismatch(
+            evidence: target_preparation_permanent_mismatch(
                 LifecyclePreflightSource::PendingAdmission,
                 LifecyclePreflightExpectation::ExactAuthority,
                 LifecyclePreflightObserved::Drifted,
@@ -7893,344 +8244,18 @@ pub(crate) fn prepare_back_target_classifier_permanent(
         };
     }
 
-    let physical = (|| {
-        if entry.pending_back_target_execution.is_some()
-            || entry.active.is_some()
-            || entry.pending_commit.as_ref().is_none_or(|pending| {
-                pending.ticket.is_none()
-                    || pending.final_task.is_some()
-                    || !pending.branch.frames().is_empty()
-                    || !pending.branch.child_slots().is_empty()
-            })
-        {
-            return Err(mismatch(
-                LifecyclePreflightSource::PendingAdmission,
-                LifecyclePreflightExpectation::ExactTaskShape,
-                LifecyclePreflightObserved::Drifted,
-            ));
-        }
-        let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
-            return Err(mismatch(
-                LifecyclePreflightSource::RequiredResources(
-                    RequiredResourceSet::ROUTE_ENTITY_REGISTRY,
-                ),
-                LifecyclePreflightExpectation::ResourcePresent,
-                LifecyclePreflightObserved::Missing,
-            ));
-        };
-        let Some(host) = entry.host.as_ref() else {
-            return Err(mismatch(
-                LifecyclePreflightSource::HostBinding,
-                LifecyclePreflightExpectation::ExactAuthority,
-                LifecyclePreflightObserved::Missing,
-            ));
-        };
-        if world
-            .get::<crate::app_ext::RouterHostRegistration>(host.host)
-            .is_none_or(|registration| registration.router() != entry.handle)
-            || !current_host_binding_is_exact(world, host)
-        {
-            return Err(mismatch(
-                LifecyclePreflightSource::HostBinding,
-                LifecyclePreflightExpectation::ExactAuthority,
-                LifecyclePreflightObserved::Drifted,
-            ));
-        }
-        if registry.record(host.host).is_some()
-            || world.get::<RouteOwnershipSeal>(host.host).is_some()
-        {
-            return Err(mismatch(
-                LifecyclePreflightSource::HostBinding,
-                LifecyclePreflightExpectation::ExactAuthority,
-                LifecyclePreflightObserved::Drifted,
-            ));
-        }
+    let physical = freeze_back_target_preparation_permanent_physical(
+        world,
+        entry,
+        &owner.owner.splice,
+        &owner.owner.continuation,
+    );
 
-        let splice = &owner.owner.splice;
-        let entering_boundaries = splice
-            .entering()
-            .claims()
-            .map(ExactRegistryClaim::entity)
-            .collect::<Vec<_>>();
-        if validate_preserved_branch_local(
-            world,
-            splice.preserved(),
-            splice.slot_roles(),
-            &entering_boundaries,
-        )
-        .is_err()
-        {
-            return Err(mismatch(
-                LifecyclePreflightSource::PreservedCurrent,
-                LifecyclePreflightExpectation::ExactAuthority,
-                LifecyclePreflightObserved::Drifted,
-            ));
-        }
-        if validate_leaving_branch_for_splice(world, splice.leaving(), splice.slot_roles()).is_err()
-        {
-            return Err(mismatch(
-                LifecyclePreflightSource::LeavingCurrent,
-                LifecyclePreflightExpectation::ExactAuthority,
-                LifecyclePreflightObserved::Drifted,
-            ));
-        }
-        if validate_reconciliation_entering_branch(
-            world,
-            splice.entering(),
-            splice.preserved(),
-            splice.leaving(),
-        )
-        .is_err()
-        {
-            return Err(mismatch(
-                LifecyclePreflightSource::PendingEntering,
-                LifecyclePreflightExpectation::ExactAuthority,
-                LifecyclePreflightObserved::Drifted,
-            ));
-        }
-        if validate_active_branch_for_splice(
-            world,
-            splice.preserved(),
-            splice.entering(),
-            splice.slot_roles(),
-        )
-        .is_err()
-        {
-            return Err(mismatch(
-                LifecyclePreflightSource::CrossRoleRebase,
-                LifecyclePreflightExpectation::RebaseCompatible,
-                LifecyclePreflightObserved::Contradictory,
-            ));
-        }
-
-        let transitions = splice.lifecycle_transitions();
-        let Some(registry_plan) = registry.prepare_lifecycle_mutation(&transitions) else {
-            return Err(mismatch(
-                LifecyclePreflightSource::TargetPartition,
-                LifecyclePreflightExpectation::ExactAuthority,
-                LifecyclePreflightObserved::Contradictory,
-            ));
-        };
-        let host_closure = observed_descendant_closure(world, [host.host]);
-        if !host_closure.contains(&host.top_slot)
-            || !relationship_closure_is_exact(world, &host_closure)
-        {
-            return Err(mismatch(
-                LifecyclePreflightSource::TargetPartition,
-                LifecyclePreflightExpectation::ExactRelationshipClosure,
-                LifecyclePreflightObserved::Drifted,
-            ));
-        }
-
-        let mut accepted_roles = std::collections::HashMap::new();
-        for claim in splice
-            .preserved()
-            .claims()
-            .chain(splice.entering().claims())
-            .chain(splice.leaving().claims())
-            .chain(splice.slot_roles().iter().map(|role| role.claim()))
-            .chain(std::iter::once(&host.top_slot_claim))
-        {
-            if accepted_roles
-                .insert(claim.entity(), claim.clone())
-                .is_some_and(|previous| previous != *claim)
-            {
-                return Err(mismatch(
-                    LifecyclePreflightSource::TargetPartition,
-                    LifecyclePreflightExpectation::ExactAuthority,
-                    LifecyclePreflightObserved::Contradictory,
-                ));
-            }
-        }
-        if accepted_roles.iter().any(|(entity, claim)| {
-            *entity == host.host
-                || !host_closure.contains(entity)
-                || !claim_belongs_to_host(host, claim)
-                || !registered_claim_has_exact_authority_and_manifest_coverage(
-                    world,
-                    registry,
-                    claim,
-                    *entity == host.top_slot,
-                )
-        }) {
-            return Err(mismatch(
-                LifecyclePreflightSource::TargetPartition,
-                LifecyclePreflightExpectation::ExactAuthority,
-                LifecyclePreflightObserved::Drifted,
-            ));
-        }
-
-        let mut targets = transitions
-            .iter()
-            .map(|(claim, _)| claim.entity())
-            .collect::<Vec<_>>();
-        targets.sort_by_key(|entity| entity.to_bits());
-        targets.dedup();
-        if targets.len() != transitions.len()
-            || targets.iter().any(|target| {
-                *target == host.host || *target == host.top_slot || !host_closure.contains(target)
-            })
-            || transitions.iter().any(|(claim, _)| {
-                accepted_roles.get(&claim.entity()) != Some(claim)
-                    || !registered_claim_has_exact_authority_and_manifest_coverage(
-                        world, registry, claim, false,
-                    )
-            })
-        {
-            return Err(mismatch(
-                LifecyclePreflightSource::TargetPartition,
-                LifecyclePreflightExpectation::ExactAuthority,
-                LifecyclePreflightObserved::Drifted,
-            ));
-        }
-
-        let target_set = targets
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
-        let mut target_observed = targets
-            .iter()
-            .copied()
-            .map(|entity| observe(world, registry, entity))
-            .collect::<Vec<_>>();
-        target_observed.sort_by_key(|observed| observed.entity.to_bits());
-
-        let mut closure_entities = host_closure.iter().copied().collect::<Vec<_>>();
-        closure_entities.sort_by_key(|entity| entity.to_bits());
-        let mut protected_entities = Vec::new();
-        for entity in closure_entities {
-            if entity == host.host || target_set.contains(&entity) {
-                continue;
-            }
-            if accepted_roles.contains_key(&entity) {
-                protected_entities.push(entity);
-                continue;
-            }
-            match registry.record(entity) {
-                None if world.get::<RouteOwnershipSeal>(entity).is_none() => {
-                    protected_entities.push(entity);
-                }
-                None => {
-                    return Err(mismatch(
-                        LifecyclePreflightSource::TargetPartition,
-                        LifecyclePreflightExpectation::ExactAuthority,
-                        LifecyclePreflightObserved::Drifted,
-                    ));
-                }
-                Some(record) => {
-                    let claim = record.claim();
-                    if !registered_claim_has_exact_authority_and_manifest_coverage(
-                        world, registry, &claim, false,
-                    ) {
-                        return Err(mismatch(
-                            LifecyclePreflightSource::TargetPartition,
-                            LifecyclePreflightExpectation::ExactAuthority,
-                            LifecyclePreflightObserved::Drifted,
-                        ));
-                    }
-                    if claim_belongs_to_host(host, &claim) {
-                        return Err(mismatch(
-                            LifecyclePreflightSource::TargetPartition,
-                            LifecyclePreflightExpectation::ExactAuthority,
-                            LifecyclePreflightObserved::Contradictory,
-                        ));
-                    }
-                    protected_entities.push(entity);
-                }
-            }
-        }
-        protected_entities.sort_by_key(|entity| entity.to_bits());
-        let protected_set = protected_entities
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
-        let subtree_has_target = |entity| {
-            observed_descendant_closure(world, [entity])
-                .iter()
-                .any(|descendant| target_set.contains(descendant))
-        };
-        let mut protected_roots = protected_entities
-            .iter()
-            .copied()
-            .filter(|entity| {
-                if subtree_has_target(*entity) {
-                    return false;
-                }
-                world
-                    .get::<bevy_ecs::hierarchy::ChildOf>(*entity)
-                    .map(bevy_ecs::hierarchy::ChildOf::parent)
-                    .is_none_or(|parent| {
-                        !protected_set.contains(&parent) || subtree_has_target(parent)
-                    })
-            })
-            .collect::<Vec<_>>();
-        protected_roots.sort_by_key(|entity| entity.to_bits());
-        let protected_root_closure =
-            observed_descendant_closure(world, protected_roots.iter().copied());
-        if protected_root_closure
-            .iter()
-            .any(|entity| target_set.contains(entity) || !protected_set.contains(entity))
-            || protected_entities.iter().any(|entity| {
-                !subtree_has_target(*entity) && !protected_root_closure.contains(entity)
-            })
-        {
-            return Err(mismatch(
-                LifecyclePreflightSource::TargetPartition,
-                LifecyclePreflightExpectation::ExactRelationshipClosure,
-                LifecyclePreflightObserved::Contradictory,
-            ));
-        }
-        let protected_observed = protected_entities
-            .iter()
-            .copied()
-            .map(|entity| observe(world, registry, entity))
-            .collect::<Vec<_>>();
-
-        let frozen_manifest = if splice.leaving().obligation_count() == 0 {
-            FrozenCleanupManifest::empty()
-        } else {
-            let Some(manifest) = FrozenCleanupManifest::from_leaving_branch(
-                world,
-                registry,
-                splice.leaving(),
-                registry_plan.resulting_claims(),
-                (!splice.entering().frames().is_empty()).then_some(splice.entering()),
-            ) else {
-                return Err(mismatch(
-                    LifecyclePreflightSource::TargetPartition,
-                    LifecyclePreflightExpectation::ExactRelationshipClosure,
-                    LifecyclePreflightObserved::Contradictory,
-                ));
-            };
-            manifest
-        };
-        let manifest = CleanupManifest::new(
-            logical_cleanup_roots(splice.leaving()),
-            frozen_manifest.digest(),
-            frozen_manifest.len(),
-        );
-        let scope = owner.owner.continuation.preparation_boundary_scope();
-        Ok((
-            FrozenTargetPreparationPermanentPhysicalManifest {
-                lineage: FrozenTargetPreparationPermanentLineage {
-                    router: entry.handle,
-                    host: host.host,
-                    scope: scope.clone(),
-                },
-                target_observed,
-                protected: FrozenTargetPreparationPermanentProtectedClosures {
-                    roots: protected_roots,
-                    observed: protected_observed,
-                },
-                allowed_write: FrozenTargetPreparationPermanentAllowedWriteSet { targets },
-            },
-            frozen_manifest,
-            manifest,
-            scope,
-        ))
-    })();
-
-    let (physical, frozen_manifest, manifest, scope) = match physical {
+    let FrozenBackTargetPreparationPermanentPhysicalFacts {
+        physical,
+        frozen_manifest,
+        scope,
+    } = match physical {
         Ok(physical) => physical,
         Err(evidence) => {
             return BackTargetClassifierPermanentPreparationOutcome::PhysicalMismatch {
@@ -8248,6 +8273,11 @@ pub(crate) fn prepare_back_target_classifier_permanent(
             },
         evidence,
     } = owner;
+    let manifest = CleanupManifest::new(
+        logical_cleanup_roots(splice.leaving()),
+        frozen_manifest.digest(),
+        frozen_manifest.len(),
+    );
     let cleanup = TargetPreparationPermanentCleanupOwner {
         physical,
         branch: FrozenTargetPreparationPermanentBranch::Classifier {
@@ -8288,6 +8318,127 @@ pub(crate) fn prepare_back_target_classifier_permanent(
                         splice,
                         history,
                         continuation: capacity,
+                    },
+                    evidence,
+                },
+                mismatch,
+            }
+        }
+    }
+}
+
+pub(crate) fn prepare_back_target_ready_plan_permanent(
+    world: &World,
+    entry: &mut RouterEntry,
+    owner: PreparationPermanentOwner<BackTargetReadyAcceptanceOwner>,
+) -> BackTargetReadyPlanPermanentPreparationOutcome {
+    let Some(ticket) = entry
+        .pending_commit
+        .as_ref()
+        .and_then(|pending| pending.ticket.as_ref())
+    else {
+        return BackTargetReadyPlanPermanentPreparationOutcome::PhysicalMismatch {
+            owner,
+            evidence: target_preparation_permanent_mismatch(
+                LifecyclePreflightSource::PendingAdmission,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ),
+        };
+    };
+    if let BackTargetExecutionPairingOutcome::Mismatch(mismatch) =
+        entry.engine.validate_back_target_execution_pairing(
+            BackTargetExecutionOwnerRef::Classifying {
+                history: &owner.owner.physical.classified.history,
+                continuation: &owner.owner.continuation,
+            },
+            BackTargetPhysicalOwnerRef::CommitTicket(ticket),
+        )
+    {
+        return BackTargetReadyPlanPermanentPreparationOutcome::ReceiverMismatch {
+            owner,
+            mismatch,
+        };
+    }
+
+    let refrozen = match freeze_back_target_preparation_permanent_physical(
+        world,
+        entry,
+        &owner.owner.physical.classified.splice,
+        &owner.owner.continuation,
+    ) {
+        Ok(refrozen) => refrozen,
+        Err(evidence) => {
+            return BackTargetReadyPlanPermanentPreparationOutcome::PhysicalMismatch {
+                owner,
+                evidence,
+            };
+        }
+    };
+    if refrozen.frozen_manifest != owner.owner.frozen_manifest {
+        return BackTargetReadyPlanPermanentPreparationOutcome::PhysicalMismatch {
+            owner,
+            evidence: target_preparation_permanent_mismatch(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ),
+        };
+    }
+
+    let FrozenBackTargetPreparationPermanentPhysicalFacts {
+        physical: refrozen_physical,
+        frozen_manifest: _,
+        scope,
+    } = refrozen;
+    let PreparationPermanentOwner { owner, evidence } = owner;
+    let BackTargetReadyAcceptanceOwner {
+        physical,
+        continuation,
+        frozen_manifest,
+        manifest,
+    } = owner;
+    let cleanup = TargetPreparationPermanentCleanupOwner {
+        physical: refrozen_physical,
+        branch: FrozenTargetPreparationPermanentBranch::ReadyPlan {
+            physical,
+            frozen_manifest,
+            evidence,
+        },
+    };
+    match entry
+        .engine
+        .accept_back_target_authority_lost(continuation, scope)
+    {
+        BackTargetPreparationAcceptance::Matched(settlement) => {
+            BackTargetReadyPlanPermanentPreparationOutcome::Prepared(
+                TargetPreparationPermanentDisposition {
+                    cleanup,
+                    settlement,
+                    manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+                },
+            )
+        }
+        BackTargetPreparationAcceptance::Mismatch { capacity, mismatch } => {
+            let TargetPreparationPermanentCleanupOwner {
+                physical: _,
+                branch,
+            } = cleanup;
+            let FrozenTargetPreparationPermanentBranch::ReadyPlan {
+                physical,
+                frozen_manifest,
+                evidence,
+            } = branch
+            else {
+                unreachable!("the Ready-plan adapter retains its branch-specific owner")
+            };
+            BackTargetReadyPlanPermanentPreparationOutcome::ReceiverMismatch {
+                owner: PreparationPermanentOwner {
+                    owner: BackTargetReadyAcceptanceOwner {
+                        physical,
+                        continuation: capacity,
+                        frozen_manifest,
+                        manifest,
                     },
                     evidence,
                 },
@@ -27769,6 +27920,95 @@ pub(crate) mod tests {
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ReadyPlanPermanentSourceProjection {
+        physical: ClassifierPermanentSourceProjection,
+        focus_leaving: Vec<Entity>,
+        frozen_manifest: FrozenCleanupManifest,
+    }
+
+    impl ReadyPlanPermanentSourceProjection {
+        fn capture(owner: &PreparationPermanentOwner<BackTargetReadyAcceptanceOwner>) -> Self {
+            Self {
+                physical: ClassifierPermanentSourceProjection::capture_parts(
+                    &owner.owner.physical.classified.splice,
+                    &owner.owner.physical.classified.history,
+                    &owner.evidence,
+                ),
+                focus_leaving: owner.owner.physical.focus_leaving.clone(),
+                frozen_manifest: owner.owner.frozen_manifest.clone(),
+            }
+        }
+    }
+
+    struct StagedReadyPlanPermanent {
+        request: NavigationRequestId,
+        owner: PreparationPermanentOwner<BackTargetReadyAcceptanceOwner>,
+        host: Entity,
+    }
+
+    fn stage_real_back_target_ready_plan_permanent(
+        app: &mut App,
+        router: RouterHandle,
+    ) -> StagedReadyPlanPermanent {
+        let request = stage_real_back_target_applied_commit(app, router);
+        let host = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .and_then(|entry| entry.host.as_ref())
+            .expect("the real Ready-plan fixture retains its exact host binding")
+            .host;
+        let ready_plan_owner = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let input_gate = world
+                    .remove_resource::<RouterInputGate>()
+                    .expect("the real fixture starts with its Router input gate");
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the real Ready-plan fixture retains its exact entry");
+                assert!(
+                    drive_back_target_applied_commit(world, entry),
+                    "the real applied commit must run through classifier Ready into plan preparation"
+                );
+                world.insert_resource(input_gate);
+                let Some(PendingBackTargetExecution::Classifying(
+                    PendingBackTargetClassification::ReadyPlanPermanent(owner),
+                )) = entry.pending_back_target_execution.take()
+                else {
+                    panic!(
+                        "the production missing-resource plan predicate must retain the whole Ready-plan permanent source"
+                    )
+                };
+                owner
+            },
+        );
+        let PreparationPermanentEvidence::PhysicalPreparationContradiction(evidence) =
+            &ready_plan_owner.evidence;
+        assert_eq!(
+            (
+                evidence.source(),
+                evidence.expectation(),
+                evidence.observed(),
+            ),
+            (
+                LifecyclePreflightSource::RequiredResources(RequiredResourceSet::ROUTER_INPUT_GATE,),
+                LifecyclePreflightExpectation::ResourcePresent,
+                LifecyclePreflightObserved::Missing,
+            ),
+            "the Ready-plan source must be minted by the real plan-preparation predicate"
+        );
+        StagedReadyPlanPermanent {
+            request,
+            owner: ready_plan_owner,
+            host,
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
     struct ClassifierPermanentAuthorityObservedEntity {
         entity: Entity,
         parent: Option<Entity>,
@@ -27882,6 +28122,44 @@ pub(crate) mod tests {
         }
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ReadyPlanPermanentZeroWriteProjection {
+        authority: ClassifierPermanentAuthorityStateProjection,
+        world: Vec<(Entity, Vec<bevy_ecs::component::ComponentId>)>,
+        registry: Vec<crate::registry::RouteEntityRecord>,
+        latest_registry_seal: Option<crate::registry::OwnershipSeal>,
+        public_router: crate::snapshots::RouterSnapshot,
+        public_request: crate::snapshots::NavigationRequestSnapshot,
+    }
+
+    impl ReadyPlanPermanentZeroWriteProjection {
+        fn capture(
+            app: &App,
+            router: RouterHandle,
+            request: NavigationRequestId,
+            host: Entity,
+        ) -> Self {
+            let world = app.world();
+            let registry = world.resource::<RouteEntityRegistry>();
+            let snapshots = world.resource::<RouterSnapshots>();
+            let public_request = match snapshots.request(router, request) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                _ => panic!("the Ready-plan fixture retains its public Back request"),
+            };
+            Self {
+                authority: ClassifierPermanentAuthorityStateProjection::capture(world, host),
+                world: authority_world_fingerprint(world),
+                registry: registry.records().to_vec(),
+                latest_registry_seal: registry.latest_issued_seal(),
+                public_router: snapshots
+                    .get(router)
+                    .expect("the Ready-plan fixture retains its public router snapshot")
+                    .clone(),
+                public_request,
+            }
+        }
+    }
+
     fn assert_classifier_permanent_returned_owner_pairs_exact_ticket(
         app: &App,
         router: RouterHandle,
@@ -27912,6 +28190,64 @@ pub(crate) mod tests {
             ),
             "the returned classifier continuation must remain paired with the original exact history/receiver scope"
         );
+    }
+
+    fn assert_ready_plan_permanent_returned_owner_pairs_exact_ticket(
+        app: &App,
+        router: RouterHandle,
+        owner: &PreparationPermanentOwner<BackTargetReadyAcceptanceOwner>,
+    ) {
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the Ready-plan rejection retains its exact RouterEntry");
+        let ticket = entry
+            .pending_commit
+            .as_ref()
+            .and_then(|pending| pending.ticket.as_ref())
+            .expect("the Ready-plan rejection retains its exact CommitTicket");
+        assert!(
+            matches!(
+                entry.engine.validate_back_target_execution_pairing(
+                    BackTargetExecutionOwnerRef::Classifying {
+                        history: &owner.owner.physical.classified.history,
+                        continuation: &owner.owner.continuation,
+                    },
+                    BackTargetPhysicalOwnerRef::CommitTicket(ticket),
+                ),
+                BackTargetExecutionPairingOutcome::Matched
+            ),
+            "the returned Ready-plan continuation must remain paired with the original exact CommitTicket"
+        );
+    }
+
+    fn swap_ready_plan_test_engines(
+        app: &mut App,
+        exact_router: RouterHandle,
+        foreign_router: RouterHandle,
+    ) {
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let exact_index = navigation
+            .entries
+            .iter()
+            .position(|entry| entry.handle == exact_router)
+            .expect("the Ready-plan receiver fixture retains its exact entry");
+        let foreign_index = navigation
+            .entries
+            .iter()
+            .position(|entry| entry.handle == foreign_router)
+            .expect("the Ready-plan receiver fixture retains its foreign entry");
+        let (exact, foreign) = if exact_index < foreign_index {
+            let (before, after) = navigation.entries.split_at_mut(foreign_index);
+            (&mut before[exact_index], &mut after[0])
+        } else {
+            let (before, after) = navigation.entries.split_at_mut(exact_index);
+            (&mut after[0], &mut before[foreign_index])
+        };
+        std::mem::swap(&mut exact.engine, &mut foreign.engine);
     }
 
     fn classifier_permanent_same_authority_frame(
@@ -27995,6 +28331,808 @@ pub(crate) mod tests {
             Some(parent)
         );
         (entity, claim)
+    }
+
+    #[derive(Component)]
+    struct ReadyPlanPermanentForeignMarker;
+
+    #[test]
+    fn back_target_ready_plan_permanent_refreezes_existing_manifests_and_moves_ready_branch() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _protected) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-ready-plan-permanent-existing-manifests",
+        );
+        let StagedReadyPlanPermanent {
+            request,
+            owner,
+            host,
+        } = stage_real_back_target_ready_plan_permanent(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+
+        let source_before = ReadyPlanPermanentSourceProjection::capture(&owner);
+        assert!(
+            source_before.frozen_manifest.len() > 0,
+            "the real replacement must carry a non-empty frozen Entity manifest"
+        );
+        let authority_before =
+            ClassifierPermanentAuthorityStateProjection::capture(app.world(), host);
+        let expected_frozen_targets = authority_before
+            .observed_for(source_before.physical.allowed_write_targets.iter().copied());
+        let expected_frozen_protected = authority_before.protected_for(
+            host,
+            source_before.physical.allowed_write_targets.iter().copied(),
+        );
+        let world_before = authority_world_fingerprint(app.world());
+        let registry_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .to_vec();
+        let registry_seal_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .latest_issued_seal();
+        let public_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .expect("the Ready-plan fixture retains its public router snapshot")
+            .clone();
+        let public_request_before = match app
+            .world()
+            .resource::<RouterSnapshots>()
+            .request(router, request)
+        {
+            crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+            _ => panic!("the Ready-plan fixture retains its public Back request snapshot"),
+        };
+        let (entry_local_before, core_before, request_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the Ready-plan fixture retains its exact RouterEntry");
+            (
+                ClassifierPermanentEntryLocalProjection::capture(entry),
+                entry.engine.snapshot(),
+                entry
+                    .engine
+                    .request(request)
+                    .expect("the Ready-plan fixture retains its Back request")
+                    .status()
+                    .clone(),
+            )
+        };
+
+        let leaving_shell = source_before
+            .physical
+            .leaving
+            .iter()
+            .find(|claim| {
+                matches!(
+                    claim.owner(),
+                    RegistryOwner::Committed(EntityOwner::FrameShell(_))
+                )
+            })
+            .map(ExactRegistryClaim::entity)
+            .expect("the real Ready-plan source retains one leaving frame shell");
+        let (
+            leaving_shell_claim,
+            registered_manifest,
+            seal_before,
+            lifecycle_before,
+            parent_before,
+            children_before,
+        ) = {
+            let world = app.world();
+            let record = world
+                .resource::<RouteEntityRegistry>()
+                .record(leaving_shell)
+                .expect("the leaving shell retains its exact registry record");
+            assert_eq!(
+                ComponentManifest::from_world(world, leaving_shell).as_ref(),
+                Some(record.manifest()),
+                "the Ready-plan source starts from the exact registered manifest"
+            );
+            (
+                record.claim(),
+                record.manifest().clone(),
+                *world
+                    .get::<RouteOwnershipSeal>(leaving_shell)
+                    .expect("the leaving shell retains its ownership seal"),
+                *world
+                    .get::<FrameLifecycle>(leaving_shell)
+                    .expect("the leaving shell retains its lifecycle"),
+                world.get::<ChildOf>(leaving_shell).map(ChildOf::parent),
+                world
+                    .get::<Children>(leaving_shell)
+                    .map(|children| children.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            )
+        };
+        app.world_mut()
+            .entity_mut(leaving_shell)
+            .insert(ReadyPlanPermanentForeignMarker);
+        let marker_component = app
+            .world()
+            .components()
+            .component_id::<ReadyPlanPermanentForeignMarker>()
+            .expect("inserting the Ready-plan marker registers its component type");
+        let actual_manifest = ComponentManifest::from_world(app.world(), leaving_shell)
+            .expect("the marked leaving shell remains observable");
+        let additions = actual_manifest
+            .component_ids()
+            .iter()
+            .copied()
+            .filter(|component| !registered_manifest.component_ids().contains(component))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            additions,
+            vec![marker_component],
+            "the mutation changes only the actual ComponentManifest"
+        );
+        assert!(
+            app.world_mut()
+                .resource_mut::<RouteEntityRegistry>()
+                .compare_exchange_manifest_exact(
+                    &leaving_shell_claim,
+                    &registered_manifest,
+                    actual_manifest.clone(),
+                ),
+            "the test seam must update the exact registry obligation manifest through its production CAS"
+        );
+        {
+            let world = app.world();
+            let registry = world.resource::<RouteEntityRegistry>();
+            assert_eq!(
+                registry
+                    .record(leaving_shell)
+                    .map(|record| (record.claim(), record.manifest().clone())),
+                Some((leaving_shell_claim.clone(), actual_manifest.clone()))
+            );
+            assert!(cleanup_claim_has_exact_authority(
+                world,
+                &leaving_shell_claim
+            ));
+            assert!(registered_claim_has_exact_authority_and_manifest_coverage(
+                world,
+                registry,
+                &leaving_shell_claim,
+                false,
+            ));
+            assert_eq!(
+                world.get::<RouteOwnershipSeal>(leaving_shell),
+                Some(&seal_before)
+            );
+            assert_eq!(
+                world.get::<FrameLifecycle>(leaving_shell),
+                Some(&lifecycle_before)
+            );
+            assert_eq!(
+                world.get::<ChildOf>(leaving_shell).map(ChildOf::parent),
+                parent_before
+            );
+            assert_eq!(
+                world
+                    .get::<Children>(leaving_shell)
+                    .map(|children| children.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                children_before
+            );
+        }
+        let (drifted_registry_before, drifted_registry_seal_before) = {
+            let registry = app.world().resource::<RouteEntityRegistry>();
+            (registry.records().to_vec(), registry.latest_issued_seal())
+        };
+        let drifted_world_before = authority_world_fingerprint(app.world());
+        let drifted_authority_before =
+            ClassifierPermanentAuthorityStateProjection::capture(app.world(), host);
+        let owner = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the stale Ready-plan source retains its exact entry");
+                match prepare_back_target_ready_plan_permanent(world, entry, owner) {
+                    BackTargetReadyPlanPermanentPreparationOutcome::PhysicalMismatch {
+                        owner,
+                        evidence,
+                    } => {
+                        assert_eq!(
+                            (
+                                evidence.source(),
+                                evidence.expectation(),
+                                evidence.observed(),
+                            ),
+                            (
+                                LifecyclePreflightSource::TargetPartition,
+                                LifecyclePreflightExpectation::ExactAuthority,
+                                LifecyclePreflightObserved::Drifted,
+                            ),
+                            "the changed existing obligation facts must use the typed target-partition mismatch"
+                        );
+                        owner
+                    }
+                    BackTargetReadyPlanPermanentPreparationOutcome::Prepared(_) => panic!(
+                        "ReadyPlan exact refreeze must reject changed existing obligation facts even when current authority coverage is exact"
+                    ),
+                    BackTargetReadyPlanPermanentPreparationOutcome::ReceiverMismatch { .. } => {
+                        panic!(
+                            "an actual-manifest drift is a physical Ready-plan mismatch, not a receiver mismatch"
+                        )
+                    }
+                }
+            },
+        );
+        assert_eq!(
+            ReadyPlanPermanentSourceProjection::capture(&owner),
+            source_before,
+            "obligation-manifest drift must whole-return the original Ready-plan source with its existing frozen facts"
+        );
+
+        let owner = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the repeated stale Ready-plan source retains its exact entry");
+                match prepare_back_target_ready_plan_permanent(world, entry, owner) {
+                    BackTargetReadyPlanPermanentPreparationOutcome::PhysicalMismatch {
+                        owner,
+                        evidence,
+                    } => {
+                        assert_eq!(
+                            (
+                                evidence.source(),
+                                evidence.expectation(),
+                                evidence.observed(),
+                            ),
+                            (
+                                LifecyclePreflightSource::TargetPartition,
+                                LifecyclePreflightExpectation::ExactAuthority,
+                                LifecyclePreflightObserved::Drifted,
+                            ),
+                            "repeated existing-facts drift must retain its typed target-partition mismatch"
+                        );
+                        owner
+                    }
+                    BackTargetReadyPlanPermanentPreparationOutcome::Prepared(_) => panic!(
+                        "ReadyPlan rejection must not silently replace existing frozen facts from the drifted World"
+                    ),
+                    BackTargetReadyPlanPermanentPreparationOutcome::ReceiverMismatch { .. } => {
+                        panic!(
+                            "the unchanged exact receiver must not replace physical Ready-plan mismatch semantics"
+                        )
+                    }
+                }
+            },
+        );
+        assert_eq!(
+            ReadyPlanPermanentSourceProjection::capture(&owner),
+            source_before,
+            "repeated obligation-manifest drift must still return the same complete Ready-plan source"
+        );
+        assert_eq!(
+            authority_world_fingerprint(app.world()),
+            drifted_world_before,
+            "physical mismatch classification must be a World zero-write"
+        );
+        assert_eq!(
+            ClassifierPermanentAuthorityStateProjection::capture(app.world(), host),
+            drifted_authority_before,
+            "physical mismatch classification must preserve every drifted authority fact"
+        );
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            drifted_registry_before,
+            "both physical mismatches must preserve the drifted registry records"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .latest_issued_seal(),
+            drifted_registry_seal_before,
+            "both physical mismatches must preserve the registry seal issuer"
+        );
+        assert!(
+            app.world_mut()
+                .resource_mut::<RouteEntityRegistry>()
+                .compare_exchange_manifest_exact(
+                    &leaving_shell_claim,
+                    &actual_manifest,
+                    registered_manifest.clone(),
+                ),
+            "the exact reverse CAS must restore the source registry obligation manifest"
+        );
+        app.world_mut()
+            .entity_mut(leaving_shell)
+            .remove::<ReadyPlanPermanentForeignMarker>();
+        assert_eq!(
+            ComponentManifest::from_world(app.world(), leaving_shell),
+            Some(registered_manifest.clone()),
+            "removing the only foreign marker must restore the exact source manifest"
+        );
+        {
+            let registry = app.world().resource::<RouteEntityRegistry>();
+            assert_eq!(
+                registry
+                    .record(leaving_shell)
+                    .map(|record| (record.claim(), record.manifest().clone())),
+                Some((leaving_shell_claim, registered_manifest))
+            );
+            assert_eq!(registry.latest_issued_seal(), registry_seal_before);
+        }
+
+        let disposition = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the restored Ready-plan source retains its exact entry");
+                match prepare_back_target_ready_plan_permanent(world, entry, owner) {
+                    BackTargetReadyPlanPermanentPreparationOutcome::Prepared(disposition) => {
+                        disposition
+                    }
+                    BackTargetReadyPlanPermanentPreparationOutcome::PhysicalMismatch {
+                        owner,
+                        evidence,
+                    } => {
+                        assert_eq!(
+                            ReadyPlanPermanentSourceProjection::capture(&owner),
+                            source_before,
+                            "exact preparation failure must still return the whole Ready-plan source"
+                        );
+                        panic!(
+                            "RED: exact ReadyPlan existing-facts refreeze must reach Prepared through the authority-lost receiver; evidence={:?}",
+                            (evidence.source(), evidence.expectation(), evidence.observed())
+                        )
+                    }
+                    BackTargetReadyPlanPermanentPreparationOutcome::ReceiverMismatch {
+                        owner,
+                        mismatch: _,
+                    } => {
+                        assert_eq!(
+                            ReadyPlanPermanentSourceProjection::capture(&owner),
+                            source_before,
+                            "receiver mismatch must recompose the same Ready-plan source"
+                        );
+                        panic!("the unchanged exact authority-lost receiver must accept once")
+                    }
+                }
+            },
+        );
+
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(
+            ClassifierPermanentAuthorityStateProjection::capture(app.world(), host),
+            authority_before,
+            "Ready-plan preparation must preserve every pre-call authority fact"
+        );
+        assert_eq!(
+            app.world().resource::<RouteEntityRegistry>().records(),
+            registry_before
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .latest_issued_seal(),
+            registry_seal_before
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .get(router)
+                .expect("Ready-plan preparation retains the public router snapshot"),
+            &public_before
+        );
+        assert!(matches!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .request(router, request),
+            crate::snapshots::RequestLookup::Found(snapshot)
+                if snapshot == &public_request_before
+        ));
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("Ready-plan preparation retains its exact entry");
+        assert_eq!(entry.engine.snapshot(), core_before);
+        assert_eq!(
+            entry
+                .engine
+                .request(request)
+                .expect("Ready-plan preparation retains its Back request")
+                .status(),
+            &request_before
+        );
+        assert!(
+            ClassifierPermanentEntryLocalProjection::capture(entry) == entry_local_before,
+            "Ready-plan preparation must preserve the pending ticket and entry-local holders"
+        );
+
+        let TargetPreparationPermanentDisposition {
+            cleanup,
+            settlement: _settlement,
+            manifest,
+        } = disposition;
+        let BackTargetPermanentAuthorityManifest {
+            cleanup: moved_core_manifest,
+        } = manifest;
+        drop(moved_core_manifest);
+        let TargetPreparationPermanentCleanupOwner { physical, branch } = cleanup;
+        assert_eq!(physical.lineage.router, router);
+        assert_eq!(physical.lineage.host, host);
+        let _exact_scope = &physical.lineage.scope;
+        let mut allowed_write = physical.allowed_write.targets.clone();
+        allowed_write.sort_by_key(|entity| entity.to_bits());
+        assert_eq!(allowed_write, source_before.physical.allowed_write_targets);
+        assert_eq!(physical.target_observed, expected_frozen_targets);
+        assert_eq!(physical.protected.observed, expected_frozen_protected);
+        assert!(
+            physical
+                .protected
+                .observed
+                .iter()
+                .all(|protected| { !physical.allowed_write.targets.contains(&protected.entity) })
+        );
+        let FrozenTargetPreparationPermanentBranch::ReadyPlan {
+            physical,
+            frozen_manifest,
+            evidence,
+        } = branch
+        else {
+            panic!("the Ready-plan adapter must not reconstruct a classifier branch")
+        };
+        assert_eq!(
+            ClassifierPermanentSourceProjection::capture_parts(
+                &physical.classified.splice,
+                &physical.classified.history,
+                &evidence,
+            ),
+            source_before.physical,
+            "Prepared must retain the actual Ready-plan physical owner and evidence"
+        );
+        assert_eq!(physical.focus_leaving, source_before.focus_leaving);
+        assert_eq!(
+            frozen_manifest, source_before.frozen_manifest,
+            "Prepared must move the existing frozen Entity manifest by value"
+        );
+
+        let source = include_str!("navigation.rs");
+        const READY_PLAN_ADAPTER_START: &str = concat!(
+            "pub(crate) fn prepare_back_target_",
+            "ready_plan_permanent("
+        );
+        const READY_PLAN_ADAPTER_END: &str = concat!(
+            "\nfn registered_claim_has_exact_",
+            "authority_and_manifest_coverage("
+        );
+        assert_eq!(
+            source.match_indices(READY_PLAN_ADAPTER_START).count(),
+            1,
+            "the Ready-plan adapter source gate requires one exact production function"
+        );
+        let adapter_and_tail = &source[source
+            .find(READY_PLAN_ADAPTER_START)
+            .expect("the Ready-plan adapter start marker must remain exact")..];
+        let adapter = &adapter_and_tail[..adapter_and_tail
+            .find(READY_PLAN_ADAPTER_END)
+            .expect("the Ready-plan adapter end marker must remain exact")];
+        let compact = adapter
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        let normalized_patterns = compact.replace(",}", "}");
+        let sequential_whole_destructure = normalized_patterns.contains(
+            "letPreparationPermanentOwner{owner,evidence}=owner;letBackTargetReadyAcceptanceOwner{physical,continuation,frozen_manifest,manifest}=owner;",
+        );
+        let nested_whole_destructure = normalized_patterns.contains(
+            "letPreparationPermanentOwner{owner:BackTargetReadyAcceptanceOwner{physical,continuation,frozen_manifest,manifest},evidence}=owner;",
+        );
+        assert!(
+            sequential_whole_destructure || nested_whole_destructure,
+            "the Ready-plan adapter must whole-destructure its original typed owner and existing Ready facts"
+        );
+        assert!(
+            compact.contains("manifest:BackTargetPermanentAuthorityManifest{cleanup:manifest},"),
+            "the common disposition must receive the original Ready-plan Core manifest directly"
+        );
+        for forbidden in [
+            "CleanupManifest::new",
+            "CleanupManifest::empty",
+            "prepare_back_target_classifier_permanent",
+            "classify_back_target(",
+            "FrozenTargetPreparationPermanentBranch::Classifier",
+        ] {
+            assert!(
+                !adapter.contains(forbidden),
+                "the Ready-plan adapter must not rebuild manifests or enter the classifier adapter: {forbidden}"
+            );
+        }
+        assert!(
+            !normalized_patterns.contains("TargetPreparationOwner{"),
+            "the Ready-plan adapter must not reconstruct the classifier source owner"
+        );
+    }
+
+    #[test]
+    fn back_target_ready_plan_permanent_foreign_receiver_returns_whole_source_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _protected) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-ready-plan-permanent-foreign-receiver",
+        );
+        let (foreign_router, _foreign_protected) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-ready-plan-permanent-foreign-receiver-other",
+        );
+        let StagedReadyPlanPermanent {
+            request,
+            owner,
+            host,
+        } = stage_real_back_target_ready_plan_permanent(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+
+        let source_before = ReadyPlanPermanentSourceProjection::capture(&owner);
+        let zero_write_before =
+            ReadyPlanPermanentZeroWriteProjection::capture(&app, router, request, host);
+
+        swap_ready_plan_test_engines(&mut app, router, foreign_router);
+        let (
+            exact_entry_local_before,
+            foreign_entry_local_before,
+            wrong_engine_before,
+            owner_engine_before,
+        ) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let exact = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the Ready-plan receiver fixture retains its exact entry");
+            let foreign = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == foreign_router)
+                .expect("the Ready-plan receiver fixture retains its foreign entry");
+            (
+                ClassifierPermanentEntryLocalProjection::capture(exact),
+                ClassifierPermanentEntryLocalProjection::capture(foreign),
+                exact.engine.snapshot(),
+                foreign.engine.snapshot(),
+            )
+        };
+
+        let returned = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the Ready-plan receiver fixture retains its exact entry");
+                match prepare_back_target_ready_plan_permanent(world, entry, owner) {
+                    BackTargetReadyPlanPermanentPreparationOutcome::ReceiverMismatch {
+                        owner,
+                        mismatch,
+                    } => {
+                        let _typed_receiver_mismatch: PreparationReceiverMismatchView = mismatch;
+                        owner
+                    }
+                    BackTargetReadyPlanPermanentPreparationOutcome::PhysicalMismatch {
+                        owner,
+                        evidence,
+                    } => {
+                        assert_eq!(
+                            ReadyPlanPermanentSourceProjection::capture(&owner),
+                            source_before,
+                            "the foreign receiver path must still whole-return the Ready-plan source"
+                        );
+                        panic!(
+                            "RED: exact physical ReadyPlan facts with a foreign Core receiver must return ReceiverMismatch; evidence={:?}",
+                            (evidence.source(), evidence.expectation(), evidence.observed())
+                        )
+                    }
+                    BackTargetReadyPlanPermanentPreparationOutcome::Prepared(_) => panic!(
+                        "a foreign Core receiver must not accept the Ready-plan continuation"
+                    ),
+                }
+            },
+        );
+
+        assert_eq!(
+            ReadyPlanPermanentSourceProjection::capture(&returned),
+            source_before,
+            "receiver mismatch must recompose the same whole Ready-plan source"
+        );
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(&app, router, request, host),
+            zero_write_before,
+            "receiver mismatch must preserve World authority, registry and public facts"
+        );
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let exact = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("receiver mismatch retains the exact entry");
+            let foreign = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == foreign_router)
+                .expect("receiver mismatch retains the foreign entry");
+            assert_eq!(exact.engine.snapshot(), wrong_engine_before);
+            assert_eq!(foreign.engine.snapshot(), owner_engine_before);
+            assert!(
+                ClassifierPermanentEntryLocalProjection::capture(exact) == exact_entry_local_before,
+                "receiver mismatch must preserve the exact entry-local holders"
+            );
+            assert!(
+                ClassifierPermanentEntryLocalProjection::capture(foreign)
+                    == foreign_entry_local_before,
+                "receiver mismatch must preserve the foreign entry-local holders"
+            );
+        }
+
+        swap_ready_plan_test_engines(&mut app, router, foreign_router);
+        assert_ready_plan_permanent_returned_owner_pairs_exact_ticket(&app, router, &returned);
+    }
+
+    #[test]
+    fn back_target_ready_plan_permanent_missing_pending_commit_is_typed_physical_mismatch() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _protected) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-ready-plan-permanent-missing-pending-commit",
+        );
+        let StagedReadyPlanPermanent {
+            request,
+            owner,
+            host,
+        } = stage_real_back_target_ready_plan_permanent(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+
+        let source_before = ReadyPlanPermanentSourceProjection::capture(&owner);
+        let zero_write_before =
+            ReadyPlanPermanentZeroWriteProjection::capture(&app, router, request, host);
+        let (core_before, core_request_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the Ready-plan entry fixture retains its exact entry");
+            (
+                entry.engine.snapshot(),
+                entry
+                    .engine
+                    .request(request)
+                    .expect("the Ready-plan entry fixture retains its Core Back request")
+                    .status()
+                    .clone(),
+            )
+        };
+        let detached_pending = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the Ready-plan entry fixture retains its exact entry");
+            let pending = entry
+                .pending_commit
+                .take()
+                .expect("the Ready-plan source retains its real pending commit");
+            assert!(
+                pending.ticket.is_some(),
+                "the detached holder must contain the real CommitTicket"
+            );
+            pending
+        };
+        let entry_local_before = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            ClassifierPermanentEntryLocalProjection::capture(
+                navigation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == router)
+                    .expect("the detached Ready-plan fixture retains its exact entry"),
+            )
+        };
+
+        let returned = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the detached Ready-plan fixture retains its exact entry");
+                match prepare_back_target_ready_plan_permanent(world, entry, owner) {
+                    BackTargetReadyPlanPermanentPreparationOutcome::PhysicalMismatch {
+                        owner,
+                        evidence,
+                    } => {
+                        let typed_evidence: LifecyclePreflightEvidence = evidence;
+                        assert_eq!(
+                            (
+                                typed_evidence.source(),
+                                typed_evidence.expectation(),
+                                typed_evidence.observed(),
+                            ),
+                            (
+                                LifecyclePreflightSource::PendingAdmission,
+                                LifecyclePreflightExpectation::ExactAuthority,
+                                LifecyclePreflightObserved::Drifted,
+                            ),
+                            "RED: missing the real pending commit must be classified by the exact-entry PendingAdmission predicate"
+                        );
+                        owner
+                    }
+                    BackTargetReadyPlanPermanentPreparationOutcome::ReceiverMismatch { .. } => {
+                        panic!(
+                            "a missing exact-entry ticket is a physical mismatch before Core receiver acceptance"
+                        )
+                    }
+                    BackTargetReadyPlanPermanentPreparationOutcome::Prepared(_) => panic!(
+                        "a Ready-plan source without its entry-bound pending commit must not prepare"
+                    ),
+                }
+            },
+        );
+
+        assert_eq!(
+            ReadyPlanPermanentSourceProjection::capture(&returned),
+            source_before,
+            "entry mismatch must whole-return the same Ready-plan source"
+        );
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(&app, router, request, host),
+            zero_write_before,
+            "entry mismatch must preserve World authority, registry and public facts"
+        );
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("entry mismatch retains the exact RouterEntry");
+            assert_eq!(entry.engine.snapshot(), core_before);
+            assert_eq!(
+                entry
+                    .engine
+                    .request(request)
+                    .expect("entry mismatch retains the Core Back request")
+                    .status(),
+                &core_request_before
+            );
+            assert!(
+                ClassifierPermanentEntryLocalProjection::capture(entry) == entry_local_before,
+                "entry mismatch must preserve the detached entry-local holder shape"
+            );
+        }
+
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the Ready-plan entry fixture retains its exact RouterEntry");
+            assert!(entry.pending_commit.is_none());
+            entry.pending_commit = Some(detached_pending);
+        }
+        assert_ready_plan_permanent_returned_owner_pairs_exact_ticket(&app, router, &returned);
     }
 
     #[derive(Component)]
