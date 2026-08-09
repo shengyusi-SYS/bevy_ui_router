@@ -6020,6 +6020,23 @@ pub(crate) struct PreparedCleanupLedger {
     ledger_domain: u64,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct PreparedCleanupLedgerProjection {
+    ledger_domain: u64,
+    manifest_digest: u64,
+    obligation_count: usize,
+}
+
+impl PreparedCleanupLedgerProjection {
+    pub(crate) const fn manifest_digest(self) -> u64 {
+        self.manifest_digest
+    }
+
+    pub(crate) const fn obligation_count(self) -> usize {
+        self.obligation_count
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CleanupLedgerReserveErrorKind {
     RetryableCapacity,
@@ -6048,6 +6065,14 @@ impl CleanupLedgerReserveError {
 }
 
 impl PreparedCleanupLedger {
+    pub(crate) fn projection(&self) -> PreparedCleanupLedgerProjection {
+        PreparedCleanupLedgerProjection {
+            ledger_domain: self.ledger_domain,
+            manifest_digest: self.manifest_digest,
+            obligation_count: self.obligations.len(),
+        }
+    }
+
     pub(crate) fn bind_batch(mut self, batch: CleanupBatch) -> Self {
         self.batch = Some(batch);
         self

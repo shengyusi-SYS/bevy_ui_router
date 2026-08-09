@@ -246,4 +246,9 @@ impl NavigationTraceLog {
     pub(crate) const fn is_closed(&self) -> bool {
         self.closed
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_close(&mut self) {
+        self.closed = true;
+    }
 }

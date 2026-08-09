@@ -195,6 +195,10 @@ impl NavigationRequestRecord {
         self.trace.events()
     }
 
+    pub(crate) const fn trace_closed(&self) -> bool {
+        self.trace.is_closed()
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn diagnostics(&self) -> &[DiagnosticEvent] {
         &self.diagnostics
@@ -259,6 +263,11 @@ impl NavigationRequestRecord {
     #[cfg(test)]
     pub(crate) fn testing_clear_back_resolution(&mut self) {
         self.back_resolution = None;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_close_trace(&mut self) {
+        self.trace.testing_close();
     }
 }
 

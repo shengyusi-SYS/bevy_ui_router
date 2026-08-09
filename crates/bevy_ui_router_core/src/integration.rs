@@ -21,6 +21,8 @@ use crate::engine::{
     BackNoTargetSourceRefreezeOutcome as CoreBackNoTargetSourceRefreezeOutcome,
     BackTargetCommitOperationFailure as CoreBackTargetCommitOperationFailure,
     BackTargetCommitOperationOutcome as CoreBackTargetCommitOperationOutcome,
+    BackTargetPermanentBeginCoreOutcome as CoreBackTargetPermanentBeginOutcome,
+    BackTargetPermanentBeginCorePermanentEvidence,
     BackTargetPermanentSettlementOutcome as CoreBackTargetPermanentSettlementOutcome,
     BackTargetResumeAction as CoreBackTargetResumeAction,
     BackTargetResumeOutcome as CoreBackTargetResumeOutcome,
@@ -39,9 +41,17 @@ use crate::engine::{
     CoreBackTargetDriverFailureCleanup, CoreBackTargetDriverFailureReport,
     CoreBackTargetDriverFailureReportMode, CoreBackTargetDriverFallback,
     CoreBackTargetDriverTerminal, CoreBackTargetDriverTerminalProjection,
-    CoreBackTargetPhysicalReceiverRef, CorePreparationReceiverMismatchProjection,
-    CoreProvenEmptyApprovalProjection, CoreRejectedBackContinuationOwner,
-    EngineAction as CoreEngineAction, EngineInstallError as CoreEngineInstallError,
+    CoreBackTargetPermanentCanonicalRelationProjection,
+    CoreBackTargetPermanentCurrentStateProjection,
+    CoreBackTargetPermanentHistoryPreparationErrorProjection,
+    CoreBackTargetPermanentRequestProjection, CoreBackTargetPermanentSettlementOwner,
+    CoreBackTargetPermanentTerminalExpectedProjection,
+    CoreBackTargetPermanentTerminalFailureProjection,
+    CoreBackTargetPermanentTerminalObservedProjection, CoreBackTargetPermanentTerminalOperation,
+    CoreBackTargetPermanentTerminalSourceProjection, CoreBackTargetPhysicalReceiverRef,
+    CorePreparationReceiverMismatchProjection, CoreProvenEmptyApprovalProjection,
+    CoreRejectedBackContinuationOwner, EngineAction as CoreEngineAction,
+    EngineInstallError as CoreEngineInstallError,
     FailedAuthoritySettlementTrigger as CoreFailedAuthoritySettlementTrigger,
     FailedAuthorityTriggerError as CoreFailedAuthorityTriggerError,
     FailureCleanupError as CoreFailureCleanupError,
@@ -87,7 +97,7 @@ use crate::mount::{
 use crate::presentation::{ActivePresentation, RouterAvailability};
 use crate::request::{
     NavigationFailure, NavigationFailureKind, NavigationPhase, NavigationRequestRecord,
-    RequestStatus,
+    RequestRecordError, RequestStatus,
 };
 use crate::route_tree::RouteTree;
 use crate::slot::RouteSlotKey;
@@ -95,7 +105,7 @@ use crate::trace::{CleanupDisposition, MountRejectionKind, NavigationTraceEvent}
 use crate::view_input::RouteViewInput;
 use crate::view_key::RouteViewKey;
 use crate::{
-    HostSnapshot, HostTraceEvent, HostTraceEventKind,
+    HostSnapshot, HostTraceEvent, HostTraceEventKind, HostVersion,
     diagnostics::{DiagnosticEvent, DiagnosticSnapshot},
     fingerprint::RouteBranchFingerprint,
 };
@@ -770,6 +780,14 @@ pub struct CleanupManifest {
     obligation_count: usize,
 }
 
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupManifestView {
+    logical_roots: Vec<RouteFrameVersion>,
+    manifest_digest: u64,
+    obligation_count: usize,
+}
+
 impl CleanupManifest {
     pub fn empty() -> Self {
         Self {
@@ -789,6 +807,39 @@ impl CleanupManifest {
             manifest_digest,
             obligation_count,
         }
+    }
+
+    pub fn projection(&self) -> CleanupManifestView {
+        CleanupManifestView {
+            logical_roots: self.logical_roots.clone(),
+            manifest_digest: self.manifest_digest,
+            obligation_count: self.obligation_count,
+        }
+    }
+
+    pub fn manifest_digest(&self) -> u64 {
+        self.manifest_digest
+    }
+
+    pub fn obligation_count(&self) -> usize {
+        self.obligation_count
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_with_obligation_count(mut self, obligation_count: usize) -> Self {
+        self.obligation_count = obligation_count;
+        self
+    }
+}
+
+impl CleanupManifestView {
+    pub fn manifest_digest(&self) -> u64 {
+        self.manifest_digest
+    }
+
+    pub fn obligation_count(&self) -> usize {
+        self.obligation_count
     }
 }
 
@@ -1068,7 +1119,647 @@ pub struct RouteFailureContinuationOwner {
 
 #[doc(hidden)]
 pub struct TargetAuthoritySettlementOwner {
-    inner: PreparedPostCommitContinuation,
+    inner: CoreBackTargetPermanentSettlementOwner,
+}
+
+#[doc(hidden)]
+pub struct BackTargetPermanentBeginOwner {
+    settlement: TargetAuthoritySettlementOwner,
+    manifest: CleanupManifest,
+}
+
+impl BackTargetPermanentBeginOwner {
+    pub fn new(settlement: TargetAuthoritySettlementOwner, manifest: CleanupManifest) -> Self {
+        Self {
+            settlement,
+            manifest,
+        }
+    }
+
+    pub fn into_parts(self) -> (TargetAuthoritySettlementOwner, CleanupManifest) {
+        (self.settlement, self.manifest)
+    }
+}
+
+#[doc(hidden)]
+pub struct BackTargetPermanentCleanupBatchOwner {
+    inner: CleanupBatch,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Eq, PartialEq)]
+pub struct BackTargetPermanentCleanupBatchView {
+    identity: CleanupBatchToken,
+    manifest_digest: u64,
+    obligation_count: usize,
+}
+
+impl BackTargetPermanentCleanupBatchOwner {
+    pub fn batch(&self) -> BackTargetPermanentCleanupBatchView {
+        BackTargetPermanentCleanupBatchView {
+            identity: self.inner.inner.clone(),
+            manifest_digest: self.inner.manifest_digest,
+            obligation_count: self.inner.obligation_count,
+        }
+    }
+}
+
+impl BackTargetPermanentCleanupBatchView {
+    pub fn report_identity(&self) -> ViewReportIdentity {
+        ViewReportIdentity {
+            inner: self.identity.identity().clone(),
+        }
+    }
+
+    pub fn manifest_digest(&self) -> u64 {
+        self.manifest_digest
+    }
+
+    pub fn obligation_count(&self) -> usize {
+        self.obligation_count
+    }
+}
+
+#[doc(hidden)]
+pub enum BackTargetPermanentBeginOutcome<Installation> {
+    Begun,
+    ReceiverMismatch {
+        owner: BackTargetPermanentBeginOwner,
+        installation: Installation,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    LogicalRootsMismatch {
+        owner: BackTargetPermanentBeginOwner,
+        installation: Installation,
+    },
+    Permanent {
+        owner: BackTargetPermanentBeginOwner,
+        installation: Installation,
+        evidence: BackTargetPermanentBeginPermanentEvidence,
+    },
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BackTargetPermanentBeginPermanentEvidence {
+    CurrentStateContradiction(BackTargetPermanentCurrentStateContradictionView),
+    CanonicalRelationContradiction(BackTargetPermanentCanonicalRelationContradictionView),
+    RequestRecordContradiction(BackTargetPermanentRequestRecordContradictionView),
+    TerminalPlanContradiction(BackTargetPermanentTerminalPlanContradictionView),
+}
+
+#[doc(hidden)]
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackTargetPermanentCanonicalRelationContradictionView {
+    expected: CoreBackTargetPermanentCanonicalRelationProjection,
+    observed: CoreBackTargetPermanentCanonicalRelationProjection,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackTargetPermanentCurrentStateContradictionView {
+    expected: BackTargetPermanentCurrentStateProjectionView,
+    observed: BackTargetPermanentCurrentStateProjectionView,
+}
+
+impl BackTargetPermanentCurrentStateContradictionView {
+    pub fn expected(&self) -> &BackTargetPermanentCurrentStateProjectionView {
+        &self.expected
+    }
+
+    pub fn observed(&self) -> &BackTargetPermanentCurrentStateProjectionView {
+        &self.observed
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackTargetPermanentCurrentStateProjectionView {
+    inner: CoreBackTargetPermanentCurrentStateProjection,
+}
+
+impl BackTargetPermanentCurrentStateProjectionView {
+    pub fn host_present(&self) -> bool {
+        self.inner.host.is_some()
+    }
+
+    pub fn top_slot_present(&self) -> bool {
+        self.inner.top_slot.is_some()
+    }
+
+    pub fn current_identity(&self) -> Option<ViewReportIdentity> {
+        self.inner
+            .current_identity
+            .as_ref()
+            .map(|inner| ViewReportIdentity {
+                inner: inner.clone(),
+            })
+    }
+
+    pub fn current_logical_roots(&self) -> Option<&[RouteFrameVersion]> {
+        self.inner.current_logical_roots.as_deref()
+    }
+
+    pub fn current_reconciliation_present(&self) -> bool {
+        self.inner.current_reconciliation.is_some()
+    }
+
+    pub fn current_reconciliation_matches(&self, other: &Self) -> bool {
+        self.inner.current_reconciliation == other.inner.current_reconciliation
+    }
+
+    pub fn active_baseline_matches(&self, other: &Self) -> bool {
+        self.inner.active_baseline == other.inner.active_baseline
+    }
+
+    pub fn current_retired_host_present(&self) -> bool {
+        self.inner.current_retired_host.is_some()
+    }
+
+    pub fn availability(&self) -> &RouterAvailability {
+        &self.inner.availability
+    }
+
+    pub fn request_status(&self) -> Option<&RequestStatus> {
+        self.inner.request_status.as_ref()
+    }
+
+    pub fn history_binding_present(&self) -> bool {
+        self.inner.history_binding.is_some()
+    }
+
+    pub fn pending_no_target_present(&self) -> bool {
+        self.inner.pending_no_target.is_some()
+    }
+
+    pub fn pending_no_target_authority_present(&self) -> bool {
+        self.inner.pending_no_target_authority.is_some()
+    }
+
+    pub fn pending_target_cleanup_present(&self) -> bool {
+        self.inner.pending_target_cleanup.is_some()
+    }
+
+    pub fn history_preparation_error_present(&self) -> bool {
+        self.inner.history_preparation_error
+            != CoreBackTargetPermanentHistoryPreparationErrorProjection::Vacant
+    }
+
+    pub fn prepared_publication_present(&self) -> bool {
+        self.inner.prepared_publication.is_some()
+    }
+
+    pub fn action_present(&self) -> bool {
+        self.inner.action != crate::engine::CoreBackTargetReceiverActionProjection::Missing
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackTargetPermanentRequestRecordContradictionView {
+    expected: Option<CoreBackTargetPermanentRequestProjection>,
+    observed: Option<CoreBackTargetPermanentRequestProjection>,
+}
+
+impl BackTargetPermanentRequestRecordContradictionView {
+    pub fn expected(&self) -> Option<BackTargetPermanentRequestProjectionView<'_>> {
+        self.expected
+            .as_ref()
+            .map(|inner| BackTargetPermanentRequestProjectionView { inner })
+    }
+
+    pub fn observed(&self) -> Option<BackTargetPermanentRequestProjectionView<'_>> {
+        self.observed
+            .as_ref()
+            .map(|inner| BackTargetPermanentRequestProjectionView { inner })
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackTargetPermanentTerminalPlanContradictionView {
+    source: BackTargetPermanentTerminalSourceProjectionView,
+    expected: BackTargetPermanentTerminalExpectedProjectionView,
+    observed: BackTargetPermanentTerminalObservedProjectionView,
+}
+
+impl BackTargetPermanentTerminalPlanContradictionView {
+    pub fn source(&self) -> &BackTargetPermanentTerminalSourceProjectionView {
+        &self.source
+    }
+
+    pub fn expected(&self) -> &BackTargetPermanentTerminalExpectedProjectionView {
+        &self.expected
+    }
+
+    pub fn observed(&self) -> &BackTargetPermanentTerminalObservedProjectionView {
+        &self.observed
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackTargetPermanentTerminalSourceProjectionView {
+    inner: CoreBackTargetPermanentTerminalSourceProjection,
+}
+
+impl BackTargetPermanentTerminalSourceProjectionView {
+    pub fn current(&self) -> BackTargetPermanentCurrentStateProjectionView {
+        BackTargetPermanentCurrentStateProjectionView {
+            inner: self.inner.current.clone(),
+        }
+    }
+
+    pub fn current_request(&self) -> BackTargetPermanentRequestProjectionView<'_> {
+        BackTargetPermanentRequestProjectionView {
+            inner: &self.inner.current_request,
+        }
+    }
+
+    pub fn queue_len(&self) -> usize {
+        self.inner.queue.len()
+    }
+
+    pub fn queued_request(
+        &self,
+        index: usize,
+    ) -> Option<BackTargetPermanentQueuedRequestProjectionView<'_>> {
+        self.inner
+            .queue
+            .get(index)
+            .map(|inner| BackTargetPermanentQueuedRequestProjectionView { inner })
+    }
+
+    pub fn host(&self) -> Option<&HostVersion> {
+        self.inner.authority.host.as_ref()
+    }
+
+    pub fn top_slot(&self) -> Option<RouteSlotId> {
+        self.inner.authority.top_slot
+    }
+
+    pub fn host_present(&self) -> bool {
+        self.inner.authority.host.is_some()
+    }
+
+    pub fn top_slot_present(&self) -> bool {
+        self.inner.authority.top_slot.is_some()
+    }
+
+    pub fn availability(&self) -> &RouterAvailability {
+        &self.inner.authority.availability
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BackTargetPermanentQueuedRequestProjectionView<'a> {
+    inner: &'a crate::engine::CoreBackTargetPermanentQueuedRequestProjection,
+}
+
+impl<'a> BackTargetPermanentQueuedRequestProjectionView<'a> {
+    pub fn expected(self) -> BackTargetPermanentRequestProjectionView<'a> {
+        BackTargetPermanentRequestProjectionView {
+            inner: &self.inner.expected,
+        }
+    }
+
+    pub fn observed(self) -> Option<BackTargetPermanentRequestProjectionView<'a>> {
+        self.inner
+            .observed
+            .as_ref()
+            .map(|inner| BackTargetPermanentRequestProjectionView { inner })
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackTargetPermanentTerminalOperation {
+    RecoveringTransition,
+    RecoveringTrace,
+    QueuedTerminalTransition,
+    QueuedTerminalTrace,
+    AuthorityRecovery,
+    RecoveringRetention,
+    CleanupSettledTrace,
+    TerminalTransition,
+    RequestTerminalTrace,
+    AuthoritySettlement,
+    TerminalRetention,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackTargetPermanentTerminalFailureKind {
+    MissingRequest,
+    RequestRejected(BackTargetPermanentRequestFailureKind),
+    AuthorityRecoveryRejected,
+    AuthoritySettlementRejected,
+    RetentionInvariant,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackTargetPermanentRequestFailureKind {
+    AlreadyTerminal,
+    BackResolutionAlreadyInstalled,
+    BackResolutionMismatch,
+    ImmutableMatch,
+    OutstandingBackResolution,
+    TerminalStatusRequired,
+    TerminalEventRequired,
+    TraceClosed,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BackTargetPermanentRequestProjectionView<'a> {
+    inner: &'a CoreBackTargetPermanentRequestProjection,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BackTargetPermanentAuthorityProjectionView<'a> {
+    inner: &'a crate::engine::CoreBackTargetPermanentAuthorityProjection,
+}
+
+impl<'a> BackTargetPermanentAuthorityProjectionView<'a> {
+    pub fn host(self) -> Option<&'a HostVersion> {
+        self.inner.host.as_ref()
+    }
+
+    pub fn top_slot(self) -> Option<RouteSlotId> {
+        self.inner.top_slot
+    }
+
+    pub fn availability(self) -> &'a RouterAvailability {
+        &self.inner.availability
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BackTargetPermanentRetentionProjectionView<'a> {
+    inner: &'a crate::engine::CoreBackTargetPermanentRetentionProjection,
+}
+
+impl<'a> BackTargetPermanentRetentionProjectionView<'a> {
+    pub fn limit(self) -> usize {
+        self.inner.limit
+    }
+
+    pub fn terminal_count(self) -> usize {
+        self.inner.terminal_count
+    }
+
+    pub fn record_count(self) -> usize {
+        self.inner.records.len()
+    }
+
+    pub fn record(&self, index: usize) -> Option<BackTargetPermanentRequestProjectionView<'_>> {
+        self.inner
+            .records
+            .get(index)
+            .map(|inner| BackTargetPermanentRequestProjectionView { inner })
+    }
+}
+
+impl<'a> BackTargetPermanentRequestProjectionView<'a> {
+    pub fn request(self) -> NavigationRequestId {
+        self.inner.request
+    }
+
+    pub fn status(self) -> &'a RequestStatus {
+        &self.inner.status
+    }
+
+    pub fn requested(self) -> Option<&'a RouteLocation> {
+        self.inner.requested.as_ref()
+    }
+
+    pub fn trace_closed(self) -> bool {
+        self.inner.trace_closed
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackTargetPermanentTerminalExpectedProjectionView {
+    inner: CoreBackTargetPermanentTerminalExpectedProjection,
+}
+
+impl BackTargetPermanentTerminalExpectedProjectionView {
+    pub fn operation(&self) -> BackTargetPermanentTerminalOperation {
+        expected_terminal_operation(&self.inner)
+    }
+
+    pub fn request(&self) -> Option<BackTargetPermanentRequestProjectionView<'_>> {
+        match &self.inner {
+            CoreBackTargetPermanentTerminalExpectedProjection::Request { request, .. } => {
+                Some(BackTargetPermanentRequestProjectionView { inner: request })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn authority(&self) -> Option<BackTargetPermanentAuthorityProjectionView<'_>> {
+        match &self.inner {
+            CoreBackTargetPermanentTerminalExpectedProjection::Authority { authority, .. } => {
+                Some(BackTargetPermanentAuthorityProjectionView { inner: authority })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn retention(&self) -> Option<BackTargetPermanentRetentionProjectionView<'_>> {
+        match &self.inner {
+            CoreBackTargetPermanentTerminalExpectedProjection::Retention { retention, .. } => {
+                Some(BackTargetPermanentRetentionProjectionView { inner: retention })
+            }
+            _ => None,
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackTargetPermanentTerminalObservedProjectionView {
+    inner: CoreBackTargetPermanentTerminalObservedProjection,
+}
+
+impl BackTargetPermanentTerminalObservedProjectionView {
+    pub fn operation(&self) -> BackTargetPermanentTerminalOperation {
+        observed_terminal_operation(&self.inner)
+    }
+
+    pub fn request(&self) -> Option<BackTargetPermanentRequestProjectionView<'_>> {
+        match &self.inner {
+            CoreBackTargetPermanentTerminalObservedProjection::Request { request, .. } => request
+                .as_ref()
+                .map(|inner| BackTargetPermanentRequestProjectionView { inner }),
+            _ => None,
+        }
+    }
+
+    pub fn authority(&self) -> Option<BackTargetPermanentAuthorityProjectionView<'_>> {
+        match &self.inner {
+            CoreBackTargetPermanentTerminalObservedProjection::Authority { authority, .. } => {
+                Some(BackTargetPermanentAuthorityProjectionView { inner: authority })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn retention(&self) -> Option<BackTargetPermanentRetentionProjectionView<'_>> {
+        match &self.inner {
+            CoreBackTargetPermanentTerminalObservedProjection::Retention { retention, .. } => {
+                Some(BackTargetPermanentRetentionProjectionView { inner: retention })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn failure(&self) -> BackTargetPermanentTerminalFailureKind {
+        let failure = match &self.inner {
+            CoreBackTargetPermanentTerminalObservedProjection::Request { failure, .. }
+            | CoreBackTargetPermanentTerminalObservedProjection::Authority { failure, .. }
+            | CoreBackTargetPermanentTerminalObservedProjection::Retention { failure, .. } => {
+                *failure
+            }
+        };
+        match failure {
+            CoreBackTargetPermanentTerminalFailureProjection::MissingRequest => {
+                BackTargetPermanentTerminalFailureKind::MissingRequest
+            }
+            CoreBackTargetPermanentTerminalFailureProjection::RequestRejected(error) => {
+                let error = match error {
+                    RequestRecordError::AlreadyTerminal => {
+                        BackTargetPermanentRequestFailureKind::AlreadyTerminal
+                    }
+                    RequestRecordError::BackResolutionAlreadyInstalled => {
+                        BackTargetPermanentRequestFailureKind::BackResolutionAlreadyInstalled
+                    }
+                    RequestRecordError::BackResolutionMismatch => {
+                        BackTargetPermanentRequestFailureKind::BackResolutionMismatch
+                    }
+                    RequestRecordError::ImmutableMatch => {
+                        BackTargetPermanentRequestFailureKind::ImmutableMatch
+                    }
+                    RequestRecordError::OutstandingBackResolution => {
+                        BackTargetPermanentRequestFailureKind::OutstandingBackResolution
+                    }
+                    RequestRecordError::TerminalStatusRequired => {
+                        BackTargetPermanentRequestFailureKind::TerminalStatusRequired
+                    }
+                    RequestRecordError::TerminalEventRequired => {
+                        BackTargetPermanentRequestFailureKind::TerminalEventRequired
+                    }
+                    RequestRecordError::TraceClosed => {
+                        BackTargetPermanentRequestFailureKind::TraceClosed
+                    }
+                };
+                BackTargetPermanentTerminalFailureKind::RequestRejected(error)
+            }
+            CoreBackTargetPermanentTerminalFailureProjection::AuthorityRecoveryRejected => {
+                BackTargetPermanentTerminalFailureKind::AuthorityRecoveryRejected
+            }
+            CoreBackTargetPermanentTerminalFailureProjection::AuthoritySettlementRejected => {
+                BackTargetPermanentTerminalFailureKind::AuthoritySettlementRejected
+            }
+            CoreBackTargetPermanentTerminalFailureProjection::RetentionInvariant => {
+                BackTargetPermanentTerminalFailureKind::RetentionInvariant
+            }
+        }
+    }
+}
+
+fn map_terminal_operation(
+    operation: CoreBackTargetPermanentTerminalOperation,
+) -> BackTargetPermanentTerminalOperation {
+    use BackTargetPermanentTerminalOperation as Public;
+    use CoreBackTargetPermanentTerminalOperation as Core;
+    match operation {
+        Core::RecoveringTransition => Public::RecoveringTransition,
+        Core::RecoveringTrace => Public::RecoveringTrace,
+        Core::QueuedTerminalTransition => Public::QueuedTerminalTransition,
+        Core::QueuedTerminalTrace => Public::QueuedTerminalTrace,
+        Core::AuthorityRecovery => Public::AuthorityRecovery,
+        Core::RecoveringRetention => Public::RecoveringRetention,
+        Core::CleanupSettledTrace => Public::CleanupSettledTrace,
+        Core::TerminalTransition => Public::TerminalTransition,
+        Core::RequestTerminalTrace => Public::RequestTerminalTrace,
+        Core::AuthoritySettlement => Public::AuthoritySettlement,
+        Core::TerminalRetention => Public::TerminalRetention,
+    }
+}
+
+fn expected_terminal_operation(
+    projection: &CoreBackTargetPermanentTerminalExpectedProjection,
+) -> BackTargetPermanentTerminalOperation {
+    let operation = match projection {
+        CoreBackTargetPermanentTerminalExpectedProjection::Request { operation, .. }
+        | CoreBackTargetPermanentTerminalExpectedProjection::Authority { operation, .. }
+        | CoreBackTargetPermanentTerminalExpectedProjection::Retention { operation, .. } => {
+            *operation
+        }
+    };
+    map_terminal_operation(operation)
+}
+
+fn observed_terminal_operation(
+    projection: &CoreBackTargetPermanentTerminalObservedProjection,
+) -> BackTargetPermanentTerminalOperation {
+    let operation = match projection {
+        CoreBackTargetPermanentTerminalObservedProjection::Request { operation, .. }
+        | CoreBackTargetPermanentTerminalObservedProjection::Authority { operation, .. }
+        | CoreBackTargetPermanentTerminalObservedProjection::Retention { operation, .. } => {
+            *operation
+        }
+    };
+    map_terminal_operation(operation)
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct BackTargetPermanentBeginStateView {
+    inner: crate::engine::BackTargetPermanentBeginTestingProjection,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl BackTargetPermanentBeginStateView {
+    pub fn cleanup_owner_count(self) -> usize {
+        self.inner.cleanup_owner_count
+    }
+
+    pub fn current_owner_count(self) -> usize {
+        self.inner.current_owner_count
+    }
+
+    pub fn action_owner_count(self) -> usize {
+        self.inner.action_owner_count
+    }
+
+    pub fn current_history_slot_count(self) -> usize {
+        self.inner.current_history_slot_count
+    }
+
+    pub fn cleanup_history_owner_count(self) -> usize {
+        self.inner.cleanup_history_owner_count
+    }
+
+    pub fn cleanup_settlement_owner_count(self) -> usize {
+        self.inner.cleanup_settlement_owner_count
+    }
+
+    pub fn queue_len(self) -> usize {
+        self.inner.queue_len
+    }
+
+    pub fn conflicting_owner_count(self) -> usize {
+        self.inner.conflicting_owner_count
+    }
 }
 
 #[doc(hidden)]
@@ -3342,10 +4033,153 @@ impl RouterEngine {
         &mut self,
         capacity: LifecycleContinuationCapacity,
         scope: PreparationBoundaryScopeView,
+        manifest: &CleanupManifest,
     ) -> BackTargetPreparationAcceptance<TargetAuthoritySettlementOwner> {
-        self.accept_back_target_capacity(capacity, scope, |inner| TargetAuthoritySettlementOwner {
-            inner,
-        })
+        match self.accept_back_target_capacity(capacity, scope, |inner| inner) {
+            BackTargetPreparationAcceptance::Matched(inner) => {
+                let PreparedPostCommitContinuation {
+                    binding: LifecycleContinuationBinding { scope },
+                } = inner;
+                BackTargetPreparationAcceptance::Matched(TargetAuthoritySettlementOwner {
+                    inner: self.inner.prepare_back_target_permanent_settlement_owner(
+                        scope,
+                        manifest.logical_roots.clone(),
+                    ),
+                })
+            }
+            BackTargetPreparationAcceptance::Mismatch { capacity, mismatch } => {
+                BackTargetPreparationAcceptance::Mismatch { capacity, mismatch }
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn begin_back_target_permanent_cleanup<Installation, F>(
+        &mut self,
+        owner: BackTargetPermanentBeginOwner,
+        ticket: &CommitTicket,
+        installation: Installation,
+        install: F,
+    ) -> BackTargetPermanentBeginOutcome<Installation>
+    where
+        F: FnOnce(Installation, BackTargetPermanentCleanupBatchOwner),
+    {
+        let BackTargetPermanentBeginOwner {
+            settlement,
+            manifest,
+        } = owner;
+        let settlement = settlement.inner;
+        let manifest_digest = manifest.manifest_digest;
+        let obligation_count = manifest.obligation_count;
+        let logical_roots = manifest.logical_roots.clone();
+        match self.inner.begin_back_target_permanent_cleanup(
+            settlement,
+            &ticket.inner,
+            logical_roots,
+            manifest_digest,
+            obligation_count,
+            installation,
+            |installation, inner| {
+                install(
+                    installation,
+                    BackTargetPermanentCleanupBatchOwner {
+                        inner: CleanupBatch {
+                            inner,
+                            manifest_digest,
+                            obligation_count,
+                        },
+                    },
+                )
+            },
+        ) {
+            CoreBackTargetPermanentBeginOutcome::Begun => BackTargetPermanentBeginOutcome::Begun,
+            CoreBackTargetPermanentBeginOutcome::ReceiverMismatch {
+                owner: settlement,
+                installation,
+                mismatch,
+            } => BackTargetPermanentBeginOutcome::ReceiverMismatch {
+                owner: BackTargetPermanentBeginOwner {
+                    settlement: TargetAuthoritySettlementOwner { inner: settlement },
+                    manifest,
+                },
+                installation,
+                mismatch: PreparationReceiverMismatchView { inner: mismatch },
+            },
+            CoreBackTargetPermanentBeginOutcome::LogicalRootsMismatch {
+                owner: settlement,
+                installation,
+            } => BackTargetPermanentBeginOutcome::LogicalRootsMismatch {
+                owner: BackTargetPermanentBeginOwner {
+                    settlement: TargetAuthoritySettlementOwner { inner: settlement },
+                    manifest,
+                },
+                installation,
+            },
+            CoreBackTargetPermanentBeginOutcome::Permanent {
+                owner: settlement,
+                installation,
+                evidence: inner,
+            } => {
+                let evidence = match inner {
+                    BackTargetPermanentBeginCorePermanentEvidence::CurrentStateContradiction {
+                        expected,
+                        observed,
+                    } => BackTargetPermanentBeginPermanentEvidence::CurrentStateContradiction(
+                        BackTargetPermanentCurrentStateContradictionView {
+                            expected: BackTargetPermanentCurrentStateProjectionView {
+                                inner: expected,
+                            },
+                            observed: BackTargetPermanentCurrentStateProjectionView {
+                                inner: observed,
+                            },
+                        },
+                    ),
+                    BackTargetPermanentBeginCorePermanentEvidence::CanonicalRelationContradiction {
+                        expected,
+                        observed,
+                    } => BackTargetPermanentBeginPermanentEvidence::CanonicalRelationContradiction(
+                        BackTargetPermanentCanonicalRelationContradictionView {
+                            expected,
+                            observed,
+                        },
+                    ),
+                    BackTargetPermanentBeginCorePermanentEvidence::RequestRecordContradiction {
+                        expected,
+                        observed,
+                    } => BackTargetPermanentBeginPermanentEvidence::RequestRecordContradiction(
+                        BackTargetPermanentRequestRecordContradictionView {
+                            expected,
+                            observed,
+                        },
+                    ),
+                    BackTargetPermanentBeginCorePermanentEvidence::TerminalPlanContradiction {
+                        source,
+                        expected,
+                        observed,
+                    } => BackTargetPermanentBeginPermanentEvidence::TerminalPlanContradiction(
+                        BackTargetPermanentTerminalPlanContradictionView {
+                            source: BackTargetPermanentTerminalSourceProjectionView {
+                                inner: source,
+                            },
+                            expected: BackTargetPermanentTerminalExpectedProjectionView {
+                                inner: expected,
+                            },
+                            observed: BackTargetPermanentTerminalObservedProjectionView {
+                                inner: observed,
+                            },
+                        },
+                    ),
+                };
+                BackTargetPermanentBeginOutcome::Permanent {
+                    owner: BackTargetPermanentBeginOwner {
+                        settlement: TargetAuthoritySettlementOwner { inner: settlement },
+                        manifest,
+                    },
+                    installation,
+                    evidence,
+                }
+            }
+        }
     }
 
     #[doc(hidden)]
@@ -3452,6 +4286,59 @@ impl RouterEngine {
     #[cfg(any(test, feature = "test-support"))]
     pub fn testing_drift_current_frame_task_identity(&mut self) -> bool {
         self.inner.testing_drift_current_frame_task_identity()
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_remove_back_target_permanent_current_reconciliation(&mut self) -> bool {
+        self.inner
+            .testing_remove_back_target_permanent_current_reconciliation()
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_remove_back_target_permanent_active_branch(&mut self) -> bool {
+        self.inner
+            .testing_remove_back_target_permanent_active_branch()
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_back_target_permanent_current_state(
+        &self,
+    ) -> BackTargetPermanentCurrentStateProjectionView {
+        BackTargetPermanentCurrentStateProjectionView {
+            inner: self
+                .inner
+                .testing_back_target_permanent_current_state_projection(),
+        }
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_transition_back_target_record_to_matching(
+        &mut self,
+        request: NavigationRequestId,
+    ) -> bool {
+        self.inner
+            .testing_transition_back_target_record_to_matching(request)
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_close_back_target_request_trace(
+        &mut self,
+        request: NavigationRequestId,
+    ) -> bool {
+        self.inner.testing_close_back_target_request_trace(request)
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_back_target_permanent_begin_state(&self) -> BackTargetPermanentBeginStateView {
+        BackTargetPermanentBeginStateView {
+            inner: self.inner.testing_back_target_permanent_begin_projection(),
+        }
     }
 
     pub fn validate_publication(

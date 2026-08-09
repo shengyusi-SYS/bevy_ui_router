@@ -24,9 +24,13 @@ use bevy_ui_router_core::{
         BackTargetCoreResumeOutcome, BackTargetDriverFailureConsumeOutcome,
         BackTargetDriverFailureCoreOutcome, BackTargetDriverFailureReportMode,
         BackTargetDriverFailureReportOutcome, BackTargetExecutionOwnerRef,
-        BackTargetExecutionPairingOutcome, BackTargetPermanentOwner, BackTargetPhysicalOwnerRef,
+        BackTargetExecutionPairingOutcome, BackTargetPermanentBeginOutcome,
+        BackTargetPermanentBeginOwner, BackTargetPermanentBeginPermanentEvidence,
+        BackTargetPermanentCleanupBatchOwner, BackTargetPermanentOwner,
+        BackTargetPermanentRequestFailureKind, BackTargetPermanentTerminalFailureKind,
+        BackTargetPermanentTerminalOperation, BackTargetPhysicalOwnerRef,
         BackTargetPreparationAcceptance, BackTargetStart, BeginAuthoritySettlementErrorKind,
-        CleanupManifest, CommitTicket, EngineAction, EnqueueBackErrorKind,
+        CleanupManifest, CleanupManifestView, CommitTicket, EngineAction, EnqueueBackErrorKind,
         FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError, FailureCleanupRequest,
         FrameMountTarget, HistoryAdmissionStamp, HistoryAdmissionWorldSeal,
         HistoryExecutionBindingView, HostLease, IntegrationError, LifecycleContinuationCapacity,
@@ -64,8 +68,8 @@ use crate::{
         FailedManifestBuildError, FailedPreparedTopologyError,
         FrozenBackNoTargetAuthorityPartition, FrozenCleanupManifest, ManifestNeutralLedgerSlot,
         NoTargetCapacityPermit, PendingBoundaryBinding, PreparedBackNoTargetAuthorityCleanupLedger,
-        PreparedBackNoTargetZeroCompletion, PreparedCleanupLedger, RouterCleanupObservation,
-        canonical_zero_completion_digest, canonical_zero_manifest_digest,
+        PreparedBackNoTargetZeroCompletion, PreparedCleanupLedger, PreparedCleanupLedgerProjection,
+        RouterCleanupObservation, canonical_zero_completion_digest, canonical_zero_manifest_digest,
         cleanup_claim_has_exact_authority, failed_prepared_branch_roots_are_exact,
     },
     components::{
@@ -725,7 +729,7 @@ pub(crate) struct FrozenTargetPreparationPermanentObservedEntity {
 pub(crate) struct FrozenTargetPreparationPermanentLineage {
     router: RouterHandle,
     host: bevy_ecs::entity::Entity,
-    scope: PreparationBoundaryScopeView,
+    ticket: ViewReportIdentity,
 }
 
 #[derive(Clone)]
@@ -773,6 +777,85 @@ pub(crate) struct TargetPreparationPermanentDisposition {
     cleanup: TargetPreparationPermanentCleanupOwner,
     settlement: TargetAuthoritySettlementOwner,
     manifest: BackTargetPermanentAuthorityManifest,
+}
+
+pub(crate) struct PreparedTargetPreparationPermanentLedger {
+    ledger: PreparedCleanupLedger,
+    validation: FrozenTargetPreparationPermanentPhysicalManifest,
+}
+
+pub(crate) struct PreparedTargetPreparationPermanentDisposition {
+    cleanup: TargetPreparationPermanentCleanupOwner,
+    settlement: TargetAuthoritySettlementOwner,
+    manifest: BackTargetPermanentAuthorityManifest,
+    ledger: PreparedTargetPreparationPermanentLedger,
+}
+
+pub(crate) struct ActiveTargetPreparationPermanentLedger {
+    ledger: CleanupLedger,
+    validation: FrozenTargetPreparationPermanentPhysicalManifest,
+}
+
+pub(crate) enum TargetPreparationPermanentLedgerHolder {
+    Prepared(PreparedTargetPreparationPermanentLedger),
+    Active(ActiveTargetPreparationPermanentLedger),
+}
+
+pub(crate) struct InstalledTargetPreparationPermanentCleanup {
+    cleanup: TargetPreparationPermanentCleanupOwner,
+    ledger: TargetPreparationPermanentLedgerHolder,
+    batch: BackTargetPermanentCleanupBatchOwner,
+}
+
+pub(crate) struct PreparedTargetPermanentEcsInstallationOwner {
+    cleanup: TargetPreparationPermanentCleanupOwner,
+    ledger: PreparedTargetPreparationPermanentLedger,
+}
+
+impl PreparedTargetPermanentEcsInstallationOwner {
+    fn commit(
+        self,
+        batch: BackTargetPermanentCleanupBatchOwner,
+    ) -> PendingTargetPreparationPermanentCleanup {
+        PendingTargetPreparationPermanentCleanup::Installed(
+            InstalledTargetPreparationPermanentCleanup {
+                cleanup: self.cleanup,
+                ledger: TargetPreparationPermanentLedgerHolder::Prepared(self.ledger),
+                batch,
+            },
+        )
+    }
+}
+
+pub(crate) enum PendingTargetPreparationPermanentCleanup {
+    Installed(InstalledTargetPreparationPermanentCleanup),
+    #[cfg(test)]
+    TestOccupied,
+}
+
+pub(crate) enum BackTargetPermanentDispatchOutcome {
+    Dispatched,
+    EntryMismatch {
+        disposition: TargetPreparationPermanentDisposition,
+        evidence: LifecyclePreflightEvidence,
+    },
+    LedgerRejected {
+        disposition: TargetPreparationPermanentDisposition,
+        error: CleanupLedgerReserveError,
+    },
+    PreparedEntryMismatch {
+        disposition: PreparedTargetPreparationPermanentDisposition,
+        evidence: LifecyclePreflightEvidence,
+    },
+    ReceiverMismatch {
+        disposition: PreparedTargetPreparationPermanentDisposition,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    LogicalRootsMismatch(PreparedTargetPreparationPermanentDisposition),
+    Permanent {
+        disposition: PreparedTargetPreparationPermanentDisposition,
+        evidence: BackTargetPermanentBeginPermanentEvidence,
+    },
 }
 
 pub(crate) enum BackTargetClassifierPermanentPreparationOutcome {
@@ -1119,6 +1202,7 @@ pub(crate) struct RouterEntry {
     pending_back_no_target_completion: Option<PendingBackNoTargetCompletion>,
     pending_back_no_target_preparation: Option<PendingBackNoTargetPreparation>,
     pending_back_no_target_authority_cleanup: Option<PendingBackNoTargetAuthorityCleanup>,
+    pending_back_target_permanent_cleanup: Option<PendingTargetPreparationPermanentCleanup>,
     history_admission_world: HistoryAdmissionWorldSeal,
     history_admission_stamp: Option<HistoryAdmissionStamp>,
     back_capacity_issuer: Option<BackCapacityIssuer>,
@@ -1128,6 +1212,8 @@ pub(crate) struct RouterEntry {
     back_target_driver_failure_dispatch_calls: AtomicUsize,
     #[cfg(test)]
     back_target_atomic_applied_dispatch_calls: AtomicUsize,
+    #[cfg(test)]
+    back_target_permanent_begin_callback_calls: AtomicUsize,
     #[cfg(test)]
     back_target_driver_staging_drift_armed: bool,
     #[cfg(test)]
@@ -1422,6 +1508,8 @@ enum PendingBackNoTargetPreparation {
     SourceDriftBlocked {
         owner: BackNoTargetSourceDriftPermanentOwner,
     },
+    #[cfg(test)]
+    TestOccupied,
 }
 
 #[cfg(test)]
@@ -4864,6 +4952,7 @@ impl RouterNavigation {
             pending_back_no_target_completion: None,
             pending_back_no_target_preparation: None,
             pending_back_no_target_authority_cleanup: None,
+            pending_back_target_permanent_cleanup: None,
             history_admission_world,
             history_admission_stamp: None,
             back_capacity_issuer: None,
@@ -4873,6 +4962,8 @@ impl RouterNavigation {
             back_target_driver_failure_dispatch_calls: AtomicUsize::new(0),
             #[cfg(test)]
             back_target_atomic_applied_dispatch_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            back_target_permanent_begin_callback_calls: AtomicUsize::new(0),
             #[cfg(test)]
             back_target_driver_staging_drift_armed: false,
             #[cfg(test)]
@@ -7902,6 +7993,18 @@ fn freeze_back_target_preparation_permanent_physical(
             LifecyclePreflightObserved::Drifted,
         ));
     }
+    let Some(ticket) = entry
+        .pending_commit
+        .as_ref()
+        .and_then(|pending| pending.ticket.as_ref())
+        .map(CommitTicket::report_identity)
+    else {
+        return Err(mismatch(
+            LifecyclePreflightSource::PendingAdmission,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    };
     let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
         return Err(mismatch(
             LifecyclePreflightSource::RequiredResources(RequiredResourceSet::ROUTE_ENTITY_REGISTRY),
@@ -8196,7 +8299,7 @@ fn freeze_back_target_preparation_permanent_physical(
             lineage: FrozenTargetPreparationPermanentLineage {
                 router: entry.handle,
                 host: host.host,
-                scope: scope.clone(),
+                ticket,
             },
             target_observed,
             protected: FrozenTargetPreparationPermanentProtectedClosures {
@@ -8288,7 +8391,7 @@ pub(crate) fn prepare_back_target_classifier_permanent(
     };
     match entry
         .engine
-        .accept_back_target_authority_lost(continuation, scope)
+        .accept_back_target_authority_lost(continuation, scope, &manifest)
     {
         BackTargetPreparationAcceptance::Matched(settlement) => {
             BackTargetClassifierPermanentPreparationOutcome::Prepared(
@@ -8408,7 +8511,7 @@ pub(crate) fn prepare_back_target_ready_plan_permanent(
     };
     match entry
         .engine
-        .accept_back_target_authority_lost(continuation, scope)
+        .accept_back_target_authority_lost(continuation, scope, &manifest)
     {
         BackTargetPreparationAcceptance::Matched(settlement) => {
             BackTargetReadyPlanPermanentPreparationOutcome::Prepared(
@@ -8443,6 +8546,439 @@ pub(crate) fn prepare_back_target_ready_plan_permanent(
                     evidence,
                 },
                 mismatch,
+            }
+        }
+    }
+}
+
+fn target_preparation_permanent_frozen_manifest(
+    cleanup: &TargetPreparationPermanentCleanupOwner,
+) -> &FrozenCleanupManifest {
+    match &cleanup.branch {
+        FrozenTargetPreparationPermanentBranch::Classifier {
+            frozen_manifest, ..
+        }
+        | FrozenTargetPreparationPermanentBranch::ReadyPlan {
+            frozen_manifest, ..
+        } => frozen_manifest,
+    }
+}
+
+fn target_preparation_permanent_dispatch_entry_preflight(
+    world: &World,
+    entry: &RouterEntry,
+    physical: &FrozenTargetPreparationPermanentPhysicalManifest,
+) -> Result<(), LifecyclePreflightEvidence> {
+    let Some(host) = entry.host.as_ref() else {
+        return Err(target_preparation_permanent_mismatch(
+            LifecyclePreflightSource::HostBinding,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Missing,
+        ));
+    };
+    let Some(pending) = entry.pending_commit.as_ref() else {
+        return Err(target_preparation_permanent_mismatch(
+            LifecyclePreflightSource::PendingAdmission,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Missing,
+        ));
+    };
+    let Some(ticket) = pending.ticket.as_ref() else {
+        return Err(target_preparation_permanent_mismatch(
+            LifecyclePreflightSource::PendingAdmission,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Missing,
+        ));
+    };
+    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+        return Err(target_preparation_permanent_mismatch(
+            LifecyclePreflightSource::RequiredResources(RequiredResourceSet::ROUTE_ENTITY_REGISTRY),
+            LifecyclePreflightExpectation::ResourcePresent,
+            LifecyclePreflightObserved::Missing,
+        ));
+    };
+    if entry.handle != physical.lineage.router || host.host != physical.lineage.host {
+        return Err(target_preparation_permanent_mismatch(
+            LifecyclePreflightSource::HostBinding,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+    if ticket.report_identity() != physical.lineage.ticket {
+        return Err(target_preparation_permanent_mismatch(
+            LifecyclePreflightSource::PendingAdmission,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+    let current_entry_inputs_are_vacant =
+        entry.active.is_none() && entry.back_capacity_reservations.is_empty();
+    if pending.final_task.is_some()
+        || !pending.branch.frames().is_empty()
+        || !pending.branch.child_slots().is_empty()
+        || !current_entry_inputs_are_vacant
+        || entry.host_settlement.is_some()
+        || entry.pending_frame_drive.is_some()
+        || entry.pending_mount_frame_task.is_some()
+        || entry.pending_mount_request.is_some()
+        || entry.pending_mount_mutation_rejection.is_some()
+        || entry.pending_failed_branch.is_some()
+        || entry.projectionless_fail_close.is_some()
+        || entry.pending_back_target_execution.is_some()
+        || entry.pending_back_target_permanent_cleanup.is_some()
+        || entry.cleanup_ledger.is_some()
+        || entry.authority_protocol_residual.is_some()
+        || entry.back_capacity_enqueue_retire_residual.is_some()
+        || entry.pending_back_resolution_action.is_some()
+        || entry.pending_bound_back_resolution.is_some()
+        || entry.pending_back_no_target_completion.is_some()
+        || entry.pending_back_no_target_preparation.is_some()
+        || entry.pending_back_no_target_authority_cleanup.is_some()
+    {
+        return Err(target_preparation_permanent_mismatch(
+            LifecyclePreflightSource::PendingAdmission,
+            LifecyclePreflightExpectation::ExactTaskShape,
+            LifecyclePreflightObserved::Contradictory,
+        ));
+    }
+
+    let targets_are_exact = physical.target_observed.iter().all(|expected| {
+        observe_target_preparation_permanent_entity(world, registry, expected.entity) == *expected
+    });
+    let protected_are_exact = physical.protected.observed.iter().all(|expected| {
+        observe_target_preparation_permanent_entity(world, registry, expected.entity) == *expected
+    });
+    let mut observed_targets = physical
+        .target_observed
+        .iter()
+        .map(|observed| observed.entity)
+        .collect::<Vec<_>>();
+    observed_targets.sort_by_key(|entity| entity.to_bits());
+    observed_targets.dedup();
+    let mut allowed_write = physical.allowed_write.targets.clone();
+    allowed_write.sort_by_key(|entity| entity.to_bits());
+    allowed_write.dedup();
+    let protected = physical
+        .protected
+        .observed
+        .iter()
+        .map(|observed| observed.entity)
+        .collect::<std::collections::HashSet<_>>();
+    let protected_roots_are_exact = physical.protected.roots.iter().all(|root| {
+        protected.contains(root)
+            && world
+                .get::<bevy_ecs::hierarchy::ChildOf>(*root)
+                .map(bevy_ecs::hierarchy::ChildOf::parent)
+                .is_none_or(|parent| !protected.contains(&parent))
+    });
+
+    if !targets_are_exact || !protected_are_exact || !protected_roots_are_exact {
+        return Err(target_preparation_permanent_mismatch(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactRelationshipClosure,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+    if allowed_write
+        .iter()
+        .any(|target| protected.contains(target))
+    {
+        return Err(target_preparation_permanent_mismatch(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::DisjointClosure,
+            LifecyclePreflightObserved::Contradictory,
+        ));
+    }
+    if observed_targets != allowed_write {
+        return Err(target_preparation_permanent_mismatch(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactTaskShape,
+            LifecyclePreflightObserved::Contradictory,
+        ));
+    }
+    if !current_host_binding_is_exact(world, host) {
+        return Err(target_preparation_permanent_mismatch(
+            LifecyclePreflightSource::HostBinding,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn dispatch_back_target_permanent(
+    world: &World,
+    entry: &mut RouterEntry,
+    disposition: TargetPreparationPermanentDisposition,
+) -> BackTargetPermanentDispatchOutcome {
+    dispatch_back_target_permanent_with_installation_observer(world, entry, disposition, |_| {})
+}
+
+#[cfg(test)]
+fn dispatch_back_target_permanent_with_test_installation_observer<F>(
+    world: &World,
+    entry: &mut RouterEntry,
+    disposition: TargetPreparationPermanentDisposition,
+    observe_installed: F,
+) -> BackTargetPermanentDispatchOutcome
+where
+    F: FnOnce(&PendingTargetPreparationPermanentCleanup),
+{
+    dispatch_back_target_permanent_with_installation_observer(
+        world,
+        entry,
+        disposition,
+        observe_installed,
+    )
+}
+
+fn dispatch_back_target_permanent_with_installation_observer<F>(
+    world: &World,
+    entry: &mut RouterEntry,
+    disposition: TargetPreparationPermanentDisposition,
+    observe_installed: F,
+) -> BackTargetPermanentDispatchOutcome
+where
+    F: FnOnce(&PendingTargetPreparationPermanentCleanup),
+{
+    if let Err(evidence) = target_preparation_permanent_dispatch_entry_preflight(
+        world,
+        entry,
+        &disposition.cleanup.physical,
+    ) {
+        return BackTargetPermanentDispatchOutcome::EntryMismatch {
+            disposition,
+            evidence,
+        };
+    }
+
+    let frozen_manifest = target_preparation_permanent_frozen_manifest(&disposition.cleanup);
+    let ledger = match CleanupLedger::reserve(frozen_manifest.clone()) {
+        Ok(ledger) => PreparedTargetPreparationPermanentLedger {
+            ledger,
+            validation: disposition.cleanup.physical.clone(),
+        },
+        Err(error) => {
+            return BackTargetPermanentDispatchOutcome::LedgerRejected { disposition, error };
+        }
+    };
+    let TargetPreparationPermanentDisposition {
+        cleanup,
+        settlement,
+        manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+    } = disposition;
+    dispatch_prepared_back_target_permanent_with_installation_observer(
+        world,
+        entry,
+        PreparedTargetPreparationPermanentDisposition {
+            cleanup,
+            settlement,
+            manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+            ledger,
+        },
+        observe_installed,
+    )
+}
+
+fn dispatch_prepared_back_target_permanent(
+    world: &World,
+    entry: &mut RouterEntry,
+    disposition: PreparedTargetPreparationPermanentDisposition,
+) -> BackTargetPermanentDispatchOutcome {
+    dispatch_prepared_back_target_permanent_with_installation_observer(
+        world,
+        entry,
+        disposition,
+        |_| {},
+    )
+}
+
+fn dispatch_prepared_back_target_permanent_with_installation_observer<F>(
+    world: &World,
+    entry: &mut RouterEntry,
+    disposition: PreparedTargetPreparationPermanentDisposition,
+    observe_installed: F,
+) -> BackTargetPermanentDispatchOutcome
+where
+    F: FnOnce(&PendingTargetPreparationPermanentCleanup),
+{
+    if let Err(evidence) = target_preparation_permanent_dispatch_entry_preflight(
+        world,
+        entry,
+        &disposition.cleanup.physical,
+    ) {
+        return BackTargetPermanentDispatchOutcome::PreparedEntryMismatch {
+            disposition,
+            evidence,
+        };
+    }
+
+    let ledger_projection = disposition.ledger.ledger.projection();
+    let manifest_digest = disposition.manifest.cleanup.manifest_digest();
+    let manifest_obligation_count = disposition.manifest.cleanup.obligation_count();
+    let frozen_manifest = target_preparation_permanent_frozen_manifest(&disposition.cleanup);
+    let validation = &disposition.ledger.validation;
+    if validation.lineage.router != disposition.cleanup.physical.lineage.router
+        || validation.lineage.host != disposition.cleanup.physical.lineage.host
+    {
+        return BackTargetPermanentDispatchOutcome::PreparedEntryMismatch {
+            disposition,
+            evidence: target_preparation_permanent_mismatch(
+                LifecyclePreflightSource::HostBinding,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ),
+        };
+    }
+    if validation.lineage.ticket != disposition.cleanup.physical.lineage.ticket {
+        return BackTargetPermanentDispatchOutcome::PreparedEntryMismatch {
+            disposition,
+            evidence: target_preparation_permanent_mismatch(
+                LifecyclePreflightSource::PendingAdmission,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ),
+        };
+    }
+    if validation.target_observed != disposition.cleanup.physical.target_observed
+        || validation.protected.roots != disposition.cleanup.physical.protected.roots
+        || validation.protected.observed != disposition.cleanup.physical.protected.observed
+    {
+        return BackTargetPermanentDispatchOutcome::PreparedEntryMismatch {
+            disposition,
+            evidence: target_preparation_permanent_mismatch(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactRelationshipClosure,
+                LifecyclePreflightObserved::Drifted,
+            ),
+        };
+    }
+    let protected = validation
+        .protected
+        .observed
+        .iter()
+        .map(|observed| observed.entity)
+        .collect::<std::collections::HashSet<_>>();
+    if validation
+        .allowed_write
+        .targets
+        .iter()
+        .any(|target| protected.contains(target))
+    {
+        return BackTargetPermanentDispatchOutcome::PreparedEntryMismatch {
+            disposition,
+            evidence: target_preparation_permanent_mismatch(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::DisjointClosure,
+                LifecyclePreflightObserved::Contradictory,
+            ),
+        };
+    }
+    if validation.allowed_write.targets != disposition.cleanup.physical.allowed_write.targets {
+        return BackTargetPermanentDispatchOutcome::PreparedEntryMismatch {
+            disposition,
+            evidence: target_preparation_permanent_mismatch(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactTaskShape,
+                LifecyclePreflightObserved::Contradictory,
+            ),
+        };
+    }
+    if ledger_projection.manifest_digest() != frozen_manifest.digest()
+        || ledger_projection.obligation_count() != frozen_manifest.len()
+        || manifest_digest != frozen_manifest.digest()
+        || manifest_obligation_count != frozen_manifest.len()
+    {
+        return BackTargetPermanentDispatchOutcome::PreparedEntryMismatch {
+            disposition,
+            evidence: target_preparation_permanent_mismatch(
+                LifecyclePreflightSource::PendingAdmission,
+                LifecyclePreflightExpectation::ExactTaskShape,
+                LifecyclePreflightObserved::Contradictory,
+            ),
+        };
+    }
+    let PreparedTargetPreparationPermanentDisposition {
+        cleanup,
+        settlement,
+        manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+        ledger,
+    } = disposition;
+    let begin = BackTargetPermanentBeginOwner::new(settlement, manifest);
+    let installation = PreparedTargetPermanentEcsInstallationOwner { cleanup, ledger };
+    let RouterEntry {
+        engine,
+        pending_commit,
+        pending_back_target_permanent_cleanup,
+        #[cfg(test)]
+        back_target_permanent_begin_callback_calls,
+        ..
+    } = entry;
+    let ticket = pending_commit
+        .as_ref()
+        .and_then(|pending| pending.ticket.as_ref())
+        .expect("the dispatch preflight retained the exact current CommitTicket");
+    let outcome = engine.begin_back_target_permanent_cleanup(
+        begin,
+        ticket,
+        installation,
+        |installation, batch| {
+            #[cfg(test)]
+            back_target_permanent_begin_callback_calls.fetch_add(1, Ordering::Relaxed);
+            let installed =
+                pending_back_target_permanent_cleanup.insert(installation.commit(batch));
+            observe_installed(installed);
+        },
+    );
+    match outcome {
+        BackTargetPermanentBeginOutcome::Begun => BackTargetPermanentDispatchOutcome::Dispatched,
+        BackTargetPermanentBeginOutcome::ReceiverMismatch {
+            owner,
+            installation,
+            mismatch,
+        } => {
+            let (settlement, manifest) = owner.into_parts();
+            let PreparedTargetPermanentEcsInstallationOwner { cleanup, ledger } = installation;
+            BackTargetPermanentDispatchOutcome::ReceiverMismatch {
+                disposition: PreparedTargetPreparationPermanentDisposition {
+                    cleanup,
+                    settlement,
+                    manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+                    ledger,
+                },
+                mismatch,
+            }
+        }
+        BackTargetPermanentBeginOutcome::LogicalRootsMismatch {
+            owner,
+            installation,
+        } => {
+            let (settlement, manifest) = owner.into_parts();
+            let PreparedTargetPermanentEcsInstallationOwner { cleanup, ledger } = installation;
+            BackTargetPermanentDispatchOutcome::LogicalRootsMismatch(
+                PreparedTargetPreparationPermanentDisposition {
+                    cleanup,
+                    settlement,
+                    manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+                    ledger,
+                },
+            )
+        }
+        BackTargetPermanentBeginOutcome::Permanent {
+            owner,
+            installation,
+            evidence,
+        } => {
+            let (settlement, manifest) = owner.into_parts();
+            let PreparedTargetPermanentEcsInstallationOwner { cleanup, ledger } = installation;
+            BackTargetPermanentDispatchOutcome::Permanent {
+                disposition: PreparedTargetPreparationPermanentDisposition {
+                    cleanup,
+                    settlement,
+                    manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+                    ledger,
+                },
+                evidence,
             }
         }
     }
@@ -20412,6 +20948,7 @@ pub(crate) mod tests {
             pending_back_no_target_completion: None,
             pending_back_no_target_preparation: None,
             pending_back_no_target_authority_cleanup: None,
+            pending_back_target_permanent_cleanup: None,
             history_admission_world,
             history_admission_stamp: None,
             back_capacity_issuer: None,
@@ -20421,6 +20958,8 @@ pub(crate) mod tests {
             back_target_driver_failure_dispatch_calls: AtomicUsize::new(0),
             #[cfg(test)]
             back_target_atomic_applied_dispatch_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            back_target_permanent_begin_callback_calls: AtomicUsize::new(0),
             #[cfg(test)]
             back_target_driver_staging_drift_armed: false,
             #[cfg(test)]
@@ -27699,12 +28238,19 @@ pub(crate) mod tests {
     #[derive(Clone, Eq, PartialEq)]
     struct ClassifierPermanentEntryLocalProjection {
         pending_commit: Option<ClassifierPermanentPendingCommitProjection>,
+        active_frames: Option<Vec<RouteFrameVersion>>,
+        back_capacity_reservations: Vec<(
+            NavigationRequestId,
+            NavigationRequestId,
+            (u64, usize, u64, u64),
+        )>,
         pending_back_target_execution_occupied: bool,
         cleanup_ledger_occupied: bool,
         authority_protocol_residual_occupied: bool,
         pending_back_no_target_completion_occupied: bool,
         pending_back_no_target_preparation_occupied: bool,
         pending_back_no_target_authority_cleanup_occupied: bool,
+        pending_back_target_permanent_cleanup_occupied: bool,
     }
 
     impl ClassifierPermanentEntryLocalProjection {
@@ -27726,6 +28272,24 @@ pub(crate) mod tests {
                         claims: pending.branch.as_realized().claims().cloned().collect(),
                     }
                 }),
+                active_frames: entry.active.as_ref().map(|active| {
+                    active
+                        .frames()
+                        .iter()
+                        .map(|frame| frame.frame().clone())
+                        .collect()
+                }),
+                back_capacity_reservations: entry
+                    .back_capacity_reservations
+                    .iter()
+                    .map(|(request, reservation)| {
+                        (
+                            *request,
+                            reservation.request(),
+                            reservation.capacity_identity_for_test(),
+                        )
+                    })
+                    .collect(),
                 pending_back_target_execution_occupied: entry
                     .pending_back_target_execution
                     .is_some(),
@@ -27739,6 +28303,9 @@ pub(crate) mod tests {
                     .is_some(),
                 pending_back_no_target_authority_cleanup_occupied: entry
                     .pending_back_no_target_authority_cleanup
+                    .is_some(),
+                pending_back_target_permanent_cleanup_occupied: entry
+                    .pending_back_target_permanent_cleanup
                     .is_some(),
             }
         }
@@ -28006,6 +28573,417 @@ pub(crate) mod tests {
             owner: ready_plan_owner,
             host,
         }
+    }
+
+    struct StagedTargetPermanentDisposition {
+        request: NavigationRequestId,
+        host: Entity,
+        disposition: TargetPreparationPermanentDisposition,
+    }
+
+    fn stage_real_back_target_permanent_disposition(
+        app: &mut App,
+        router: RouterHandle,
+    ) -> StagedTargetPermanentDisposition {
+        let StagedReadyPlanPermanent {
+            request,
+            owner,
+            host,
+        } = stage_real_back_target_ready_plan_permanent(app, router);
+        let disposition = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the real permanent dispatch fixture retains its exact entry");
+                match prepare_back_target_ready_plan_permanent(world, entry, owner) {
+                    BackTargetReadyPlanPermanentPreparationOutcome::Prepared(disposition) => {
+                        disposition
+                    }
+                    BackTargetReadyPlanPermanentPreparationOutcome::PhysicalMismatch {
+                        evidence,
+                        ..
+                    } => panic!(
+                        "the exact real ReadyPlan producer must reach the common disposition; evidence={:?}",
+                        (evidence.source(), evidence.expectation(), evidence.observed())
+                    ),
+                    BackTargetReadyPlanPermanentPreparationOutcome::ReceiverMismatch { .. } => {
+                        panic!("the exact real ReadyPlan producer must retain its Core receiver")
+                    }
+                }
+            },
+        );
+        StagedTargetPermanentDisposition {
+            request,
+            host,
+            disposition,
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct TargetPermanentDispositionProjection {
+        source: ReadyPlanPermanentSourceProjection,
+        target_observed: Vec<FrozenTargetPreparationPermanentObservedEntity>,
+        protected_roots: Vec<Entity>,
+        protected_observed: Vec<FrozenTargetPreparationPermanentObservedEntity>,
+        allowed_write: Vec<Entity>,
+    }
+
+    impl TargetPermanentDispositionProjection {
+        fn capture_cleanup(cleanup: &TargetPreparationPermanentCleanupOwner) -> Self {
+            let FrozenTargetPreparationPermanentBranch::ReadyPlan {
+                physical,
+                frozen_manifest,
+                evidence,
+            } = &cleanup.branch
+            else {
+                panic!("the dispatch RED uses the real ReadyPlan branch producer")
+            };
+            Self {
+                source: ReadyPlanPermanentSourceProjection {
+                    physical: ClassifierPermanentSourceProjection::capture_parts(
+                        &physical.classified.splice,
+                        &physical.classified.history,
+                        evidence,
+                    ),
+                    focus_leaving: physical.focus_leaving.clone(),
+                    frozen_manifest: frozen_manifest.clone(),
+                },
+                target_observed: cleanup.physical.target_observed.clone(),
+                protected_roots: cleanup.physical.protected.roots.clone(),
+                protected_observed: cleanup.physical.protected.observed.clone(),
+                allowed_write: cleanup.physical.allowed_write.targets.clone(),
+            }
+        }
+
+        fn capture(disposition: &TargetPreparationPermanentDisposition) -> Self {
+            Self::capture_cleanup(&disposition.cleanup)
+        }
+
+        fn capture_prepared(disposition: &PreparedTargetPreparationPermanentDisposition) -> Self {
+            Self::capture_cleanup(&disposition.cleanup)
+        }
+    }
+
+    fn assert_prepared_target_permanent_dispatch_owner_is_complete(
+        disposition: &PreparedTargetPreparationPermanentDisposition,
+    ) {
+        let _settlement = &disposition.settlement;
+        let BackTargetPermanentAuthorityManifest {
+            cleanup: _core_manifest,
+        } = &disposition.manifest;
+        let _prepared_ledger = &disposition.ledger.ledger;
+        assert_eq!(
+            disposition.ledger.validation.allowed_write.targets,
+            disposition.cleanup.physical.allowed_write.targets,
+            "the prepared ledger projection must remain paired with the actual cleanup owner"
+        );
+    }
+
+    fn reassemble_prepared_target_permanent_dispatch_owner(
+        disposition: PreparedTargetPreparationPermanentDisposition,
+    ) -> PreparedTargetPreparationPermanentDisposition {
+        let PreparedTargetPreparationPermanentDisposition {
+            cleanup,
+            settlement,
+            manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+            ledger,
+        } = disposition;
+        let begin = BackTargetPermanentBeginOwner::new(settlement, manifest);
+        let (settlement, manifest) = begin.into_parts();
+        PreparedTargetPreparationPermanentDisposition {
+            cleanup,
+            settlement,
+            manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+            ledger,
+        }
+    }
+
+    #[derive(Clone, Eq, PartialEq)]
+    struct PreparedTargetPermanentIdentityProjection {
+        manifest: CleanupManifestView,
+        ledger: PreparedCleanupLedgerProjection,
+    }
+
+    impl PreparedTargetPermanentIdentityProjection {
+        fn capture(disposition: &PreparedTargetPreparationPermanentDisposition) -> Self {
+            Self {
+                manifest: disposition.manifest.cleanup.projection(),
+                ledger: disposition.ledger.ledger.projection(),
+            }
+        }
+    }
+
+    #[derive(Clone, Eq, PartialEq)]
+    struct PreparedTargetPermanentWholeProjection {
+        cleanup: TargetPermanentDispositionProjection,
+        cleanup_router: RouterHandle,
+        cleanup_host: Entity,
+        cleanup_ticket: ViewReportIdentity,
+        validation_router: RouterHandle,
+        validation_host: Entity,
+        validation_ticket: ViewReportIdentity,
+        validation_target_observed: Vec<FrozenTargetPreparationPermanentObservedEntity>,
+        validation_protected_roots: Vec<Entity>,
+        validation_protected_observed: Vec<FrozenTargetPreparationPermanentObservedEntity>,
+        validation_allowed_write: Vec<Entity>,
+        identity: PreparedTargetPermanentIdentityProjection,
+    }
+
+    impl PreparedTargetPermanentWholeProjection {
+        fn capture(disposition: &PreparedTargetPreparationPermanentDisposition) -> Self {
+            Self {
+                cleanup: TargetPermanentDispositionProjection::capture_prepared(disposition),
+                cleanup_router: disposition.cleanup.physical.lineage.router,
+                cleanup_host: disposition.cleanup.physical.lineage.host,
+                cleanup_ticket: disposition.cleanup.physical.lineage.ticket.clone(),
+                validation_router: disposition.ledger.validation.lineage.router,
+                validation_host: disposition.ledger.validation.lineage.host,
+                validation_ticket: disposition.ledger.validation.lineage.ticket.clone(),
+                validation_target_observed: disposition.ledger.validation.target_observed.clone(),
+                validation_protected_roots: disposition.ledger.validation.protected.roots.clone(),
+                validation_protected_observed: disposition
+                    .ledger
+                    .validation
+                    .protected
+                    .observed
+                    .clone(),
+                validation_allowed_write: disposition
+                    .ledger
+                    .validation
+                    .allowed_write
+                    .targets
+                    .clone(),
+                identity: PreparedTargetPermanentIdentityProjection::capture(disposition),
+            }
+        }
+    }
+
+    fn dispatch_real_back_target_permanent(
+        app: &mut App,
+        router: RouterHandle,
+        disposition: TargetPreparationPermanentDisposition,
+    ) -> BackTargetPermanentDispatchOutcome {
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the real permanent dispatch fixture retains its exact entry");
+                dispatch_back_target_permanent(world, entry, disposition)
+            },
+        )
+    }
+
+    fn target_permanent_begin_callback_calls(app: &App, router: RouterHandle) -> usize {
+        app.world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the real permanent dispatch fixture retains its exact entry")
+            .back_target_permanent_begin_callback_calls
+            .load(Ordering::Relaxed)
+    }
+
+    fn stage_real_back_target_prepared_permanent_disposition(
+        app: &mut App,
+        router: RouterHandle,
+        foreign_router: RouterHandle,
+    ) -> PreparedTargetPreparationPermanentDisposition {
+        let staged = stage_real_back_target_permanent_disposition(app, router);
+        publish_snapshots_system(app.world_mut());
+        swap_ready_plan_test_engines(app, router, foreign_router);
+        let prepared = match dispatch_real_back_target_permanent(app, router, staged.disposition) {
+            BackTargetPermanentDispatchOutcome::ReceiverMismatch {
+                disposition,
+                mismatch: _,
+            } => disposition,
+            _ => panic!(
+                "the foreign receiver fixture must whole-return one genuinely reserved prepared disposition"
+            ),
+        };
+        swap_ready_plan_test_engines(app, router, foreign_router);
+        prepared
+    }
+
+    #[derive(Clone, Copy)]
+    enum TargetPermanentInitialMismatchFault {
+        MissingHost,
+        MissingTicket,
+        OccupiedPermanentHolder,
+        MissingRegistry,
+        TargetManifestDrift,
+        ProtectedManifestDrift,
+        AllowedWriteTargetMismatch,
+        AllowedWriteProtectedOverlap,
+    }
+
+    fn assert_target_permanent_initial_mismatch_evidence(
+        label: &'static str,
+        fault: TargetPermanentInitialMismatchFault,
+        expected: (
+            LifecyclePreflightSource,
+            LifecyclePreflightExpectation,
+            LifecyclePreflightObserved,
+        ),
+    ) {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(&mut app, label);
+        let mut staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+
+        match fault {
+            TargetPermanentInitialMismatchFault::MissingHost => {
+                let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the missing-host RED retains its exact RouterEntry");
+                let _detached_host = entry
+                    .host
+                    .take()
+                    .expect("the exact fixture starts with one app-owned host binding");
+            }
+            TargetPermanentInitialMismatchFault::MissingTicket => {
+                let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the missing-ticket RED retains its exact RouterEntry");
+                let _detached_ticket = entry
+                    .pending_commit
+                    .as_mut()
+                    .and_then(|pending| pending.ticket.take())
+                    .expect("the exact fixture starts with one entry-bound CommitTicket");
+            }
+            TargetPermanentInitialMismatchFault::OccupiedPermanentHolder => {
+                let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the occupied-holder RED retains its exact RouterEntry");
+                assert!(entry.pending_back_target_permanent_cleanup.is_none());
+                entry.pending_back_target_permanent_cleanup =
+                    Some(PendingTargetPreparationPermanentCleanup::TestOccupied);
+            }
+            TargetPermanentInitialMismatchFault::MissingRegistry => {
+                let _registry = app
+                    .world_mut()
+                    .remove_resource::<RouteEntityRegistry>()
+                    .expect("the exact fixture starts with its registry resource");
+            }
+            TargetPermanentInitialMismatchFault::TargetManifestDrift => {
+                let target = staged
+                    .disposition
+                    .cleanup
+                    .physical
+                    .target_observed
+                    .first()
+                    .expect("the exact fixture freezes at least one physical target")
+                    .entity;
+                app.world_mut()
+                    .entity_mut(target)
+                    .insert(ReadyPlanPermanentForeignMarker);
+            }
+            TargetPermanentInitialMismatchFault::ProtectedManifestDrift => {
+                let protected = staged
+                    .disposition
+                    .cleanup
+                    .physical
+                    .protected
+                    .observed
+                    .first()
+                    .expect("the exact fixture freezes at least one protected Entity")
+                    .entity;
+                app.world_mut()
+                    .entity_mut(protected)
+                    .insert(ReadyPlanPermanentForeignMarker);
+            }
+            TargetPermanentInitialMismatchFault::AllowedWriteTargetMismatch => {
+                let removed = staged
+                    .disposition
+                    .cleanup
+                    .physical
+                    .allowed_write
+                    .targets
+                    .pop();
+                assert!(
+                    removed.is_some(),
+                    "the exact fixture freezes at least one allowed-write target"
+                );
+            }
+            TargetPermanentInitialMismatchFault::AllowedWriteProtectedOverlap => {
+                let protected = staged
+                    .disposition
+                    .cleanup
+                    .physical
+                    .protected
+                    .observed
+                    .first()
+                    .expect("the exact fixture freezes at least one protected Entity")
+                    .entity;
+                assert!(
+                    !staged
+                        .disposition
+                        .cleanup
+                        .physical
+                        .allowed_write
+                        .targets
+                        .contains(&protected),
+                    "the exact fixture starts with disjoint target and protected closures"
+                );
+                staged
+                    .disposition
+                    .cleanup
+                    .physical
+                    .allowed_write
+                    .targets
+                    .push(protected);
+            }
+        }
+
+        let owner_before = TargetPermanentDispositionProjection::capture(&staged.disposition);
+        let returned = match dispatch_real_back_target_permanent(
+            &mut app,
+            router,
+            staged.disposition,
+        ) {
+            BackTargetPermanentDispatchOutcome::EntryMismatch {
+                disposition,
+                evidence,
+            } => {
+                assert_eq!(
+                    (
+                        evidence.source(),
+                        evidence.expectation(),
+                        evidence.observed()
+                    ),
+                    expected,
+                    "the initial permanent dispatch must preserve the exact mismatch source, expectation and observed fact"
+                );
+                disposition
+            }
+            _ => panic!(
+                "the initial permanent dispatch contradiction must fail closed with typed boundary evidence"
+            ),
+        };
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture(&returned),
+            owner_before,
+            "typed mismatch evidence must accompany the whole original disposition"
+        );
+        assert_eq!(
+            target_permanent_begin_callback_calls(&app, router),
+            0,
+            "initial preflight mismatch must reject before Core begin"
+        );
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28770,7 +29748,6 @@ pub(crate) mod tests {
         let TargetPreparationPermanentCleanupOwner { physical, branch } = cleanup;
         assert_eq!(physical.lineage.router, router);
         assert_eq!(physical.lineage.host, host);
-        let _exact_scope = &physical.lineage.scope;
         let mut allowed_write = physical.allowed_write.targets.clone();
         allowed_write.sort_by_key(|entity| entity.to_bits());
         assert_eq!(allowed_write, source_before.physical.allowed_write_targets);
@@ -28811,10 +29788,8 @@ pub(crate) mod tests {
             "pub(crate) fn prepare_back_target_",
             "ready_plan_permanent("
         );
-        const READY_PLAN_ADAPTER_END: &str = concat!(
-            "\nfn registered_claim_has_exact_",
-            "authority_and_manifest_coverage("
-        );
+        const READY_PLAN_ADAPTER_END: &str =
+            concat!("\nfn target_preparation_permanent_", "frozen_manifest(");
         assert_eq!(
             source.match_indices(READY_PLAN_ADAPTER_START).count(),
             1,
@@ -29133,6 +30108,2745 @@ pub(crate) mod tests {
             entry.pending_commit = Some(detached_pending);
         }
         assert_ready_plan_permanent_returned_owner_pairs_exact_ticket(&app, router, &returned);
+    }
+
+    #[test]
+    fn back_target_permanent_initial_dispatch_entry_mismatch_retains_typed_exact_evidence() {
+        for (label, fault, expected) in [
+            (
+                "back-target-permanent-initial-evidence-missing-host",
+                TargetPermanentInitialMismatchFault::MissingHost,
+                (
+                    LifecyclePreflightSource::HostBinding,
+                    LifecyclePreflightExpectation::ExactAuthority,
+                    LifecyclePreflightObserved::Missing,
+                ),
+            ),
+            (
+                "back-target-permanent-initial-evidence-missing-ticket",
+                TargetPermanentInitialMismatchFault::MissingTicket,
+                (
+                    LifecyclePreflightSource::PendingAdmission,
+                    LifecyclePreflightExpectation::ExactAuthority,
+                    LifecyclePreflightObserved::Missing,
+                ),
+            ),
+            (
+                "back-target-permanent-initial-evidence-occupied-holder",
+                TargetPermanentInitialMismatchFault::OccupiedPermanentHolder,
+                (
+                    LifecyclePreflightSource::PendingAdmission,
+                    LifecyclePreflightExpectation::ExactTaskShape,
+                    LifecyclePreflightObserved::Contradictory,
+                ),
+            ),
+            (
+                "back-target-permanent-initial-evidence-missing-registry",
+                TargetPermanentInitialMismatchFault::MissingRegistry,
+                (
+                    LifecyclePreflightSource::RequiredResources(
+                        RequiredResourceSet::ROUTE_ENTITY_REGISTRY,
+                    ),
+                    LifecyclePreflightExpectation::ResourcePresent,
+                    LifecyclePreflightObserved::Missing,
+                ),
+            ),
+        ] {
+            assert_target_permanent_initial_mismatch_evidence(label, fault, expected);
+        }
+    }
+
+    #[test]
+    fn back_target_permanent_initial_dispatch_partition_mismatch_retains_typed_exact_evidence() {
+        for (label, fault, expected) in [
+            (
+                "back-target-permanent-initial-evidence-target-drift",
+                TargetPermanentInitialMismatchFault::TargetManifestDrift,
+                (
+                    LifecyclePreflightSource::TargetPartition,
+                    LifecyclePreflightExpectation::ExactRelationshipClosure,
+                    LifecyclePreflightObserved::Drifted,
+                ),
+            ),
+            (
+                "back-target-permanent-initial-evidence-protected-drift",
+                TargetPermanentInitialMismatchFault::ProtectedManifestDrift,
+                (
+                    LifecyclePreflightSource::TargetPartition,
+                    LifecyclePreflightExpectation::ExactRelationshipClosure,
+                    LifecyclePreflightObserved::Drifted,
+                ),
+            ),
+            (
+                "back-target-permanent-initial-evidence-allowed-write-drift",
+                TargetPermanentInitialMismatchFault::AllowedWriteTargetMismatch,
+                (
+                    LifecyclePreflightSource::TargetPartition,
+                    LifecyclePreflightExpectation::ExactTaskShape,
+                    LifecyclePreflightObserved::Contradictory,
+                ),
+            ),
+            (
+                "back-target-permanent-initial-evidence-allowed-write-overlap",
+                TargetPermanentInitialMismatchFault::AllowedWriteProtectedOverlap,
+                (
+                    LifecyclePreflightSource::TargetPartition,
+                    LifecyclePreflightExpectation::DisjointClosure,
+                    LifecyclePreflightObserved::Contradictory,
+                ),
+            ),
+        ] {
+            assert_target_permanent_initial_mismatch_evidence(label, fault, expected);
+        }
+    }
+
+    #[test]
+    fn back_target_physical_permanent_begin_rejects_entry_and_partition_drift_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-entry-partition",
+        );
+        let StagedTargetPermanentDisposition {
+            request,
+            host,
+            disposition,
+        } = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        let expected = TargetPermanentDispositionProjection::capture(&disposition);
+
+        let pending = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the exact dispatch entry remains installed")
+                .pending_commit
+                .take()
+                .expect("the real producer retains its exact pending Commit")
+        };
+        let zero_write_before =
+            ReadyPlanPermanentZeroWriteProjection::capture(&app, router, request, host);
+        let disposition = match dispatch_real_back_target_permanent(&mut app, router, disposition) {
+            BackTargetPermanentDispatchOutcome::EntryMismatch { disposition, .. } => disposition,
+            _ => panic!("missing the exact current-entry Commit must reject before ledger/begin"),
+        };
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture(&disposition),
+            expected
+        );
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(&app, router, request, host),
+            zero_write_before
+        );
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the exact dispatch entry remains installed")
+                .pending_commit = Some(pending);
+        }
+
+        let target = *expected
+            .allowed_write
+            .first()
+            .expect("the real replacement disposition has an exact target");
+        app.world_mut()
+            .entity_mut(target)
+            .insert(ReadyPlanPermanentForeignMarker);
+        let drifted_before =
+            ReadyPlanPermanentZeroWriteProjection::capture(&app, router, request, host);
+        let returned = match dispatch_real_back_target_permanent(&mut app, router, disposition) {
+            BackTargetPermanentDispatchOutcome::EntryMismatch { disposition, .. } => disposition,
+            _ => panic!("same-World target manifest drift must reject before ledger/begin"),
+        };
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture(&returned),
+            expected,
+            "partition drift must whole-return the original branch disposition"
+        );
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(&app, router, request, host),
+            drifted_before,
+            "the partition predicate must not write World, registry or public facts"
+        );
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+    }
+
+    #[test]
+    fn back_target_physical_permanent_begin_rejects_occupied_active_current_entry() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-active-entry",
+        );
+        let (foreign_router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-active-entry-foreign",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        let expected = TargetPermanentDispositionProjection::capture(&staged.disposition);
+        let manifest_before = staged.disposition.manifest.cleanup.projection();
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let exact_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == router)
+                .expect("the exact current-entry fixture retains its RouterEntry");
+            let foreign_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == foreign_router)
+                .expect("the foreign active fixture retains its RouterEntry");
+            let (exact, foreign) = if exact_index < foreign_index {
+                let (left, right) = navigation.entries.split_at_mut(foreign_index);
+                (&mut left[exact_index], &mut right[0])
+            } else {
+                let (left, right) = navigation.entries.split_at_mut(exact_index);
+                (&mut right[0], &mut left[foreign_index])
+            };
+            assert!(exact.active.is_none());
+            exact.active = Some(
+                foreign
+                    .active
+                    .take()
+                    .expect("the settled foreign fixture retains one real active branch"),
+            );
+        }
+        let zero_write_before = ReadyPlanPermanentZeroWriteProjection::capture(
+            &app,
+            router,
+            staged.request,
+            staged.host,
+        );
+        let (core_before, entry_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the occupied-active fixture retains its exact entry");
+            (
+                entry.engine.snapshot(),
+                ClassifierPermanentEntryLocalProjection::capture(entry),
+            )
+        };
+
+        let returned =
+            match dispatch_real_back_target_permanent(&mut app, router, staged.disposition) {
+                BackTargetPermanentDispatchOutcome::EntryMismatch { disposition, .. } => {
+                    disposition
+                }
+                _ => panic!("an occupied active holder must reject before ledger/Core begin"),
+            };
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture(&returned),
+            expected
+        );
+        assert_eq!(returned.manifest.cleanup.projection(), manifest_before);
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(
+                &app,
+                router,
+                staged.request,
+                staged.host,
+            ),
+            zero_write_before
+        );
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the occupied-active fixture retains its exact entry");
+        assert_eq!(entry.engine.snapshot(), core_before);
+        assert!(ClassifierPermanentEntryLocalProjection::capture(entry) == entry_before);
+        assert!(entry.active.is_some());
+    }
+
+    #[test]
+    fn back_target_physical_permanent_begin_rejects_outstanding_capacity_current_entry() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-capacity-entry",
+        );
+        let (foreign_router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-capacity-entry-foreign",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        let expected = TargetPermanentDispositionProjection::capture(&staged.disposition);
+        let manifest_before = staged.disposition.manifest.cleanup.projection();
+        let foreign_request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(foreign_router)
+            .expect("the settled foreign fixture admits one real Back reservation");
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let exact_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == router)
+                .expect("the exact current-entry fixture retains its RouterEntry");
+            let foreign_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == foreign_router)
+                .expect("the foreign capacity fixture retains its RouterEntry");
+            let (exact, foreign) = if exact_index < foreign_index {
+                let (left, right) = navigation.entries.split_at_mut(foreign_index);
+                (&mut left[exact_index], &mut right[0])
+            } else {
+                let (left, right) = navigation.entries.split_at_mut(exact_index);
+                (&mut right[0], &mut left[foreign_index])
+            };
+            assert!(exact.back_capacity_reservations.is_empty());
+            let reservation_index = foreign
+                .back_capacity_reservations
+                .iter()
+                .position(|(request, _)| *request == foreign_request)
+                .expect("the foreign Back owns one real bound capacity reservation");
+            exact
+                .back_capacity_reservations
+                .push(foreign.back_capacity_reservations.remove(reservation_index));
+        }
+        let zero_write_before = ReadyPlanPermanentZeroWriteProjection::capture(
+            &app,
+            router,
+            staged.request,
+            staged.host,
+        );
+        let (core_before, entry_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the occupied-capacity fixture retains its exact entry");
+            (
+                entry.engine.snapshot(),
+                ClassifierPermanentEntryLocalProjection::capture(entry),
+            )
+        };
+
+        let returned =
+            match dispatch_real_back_target_permanent(&mut app, router, staged.disposition) {
+                BackTargetPermanentDispatchOutcome::EntryMismatch { disposition, .. } => {
+                    disposition
+                }
+                _ => panic!(
+                    "an outstanding capacity reservation must reject before ledger/Core begin"
+                ),
+            };
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture(&returned),
+            expected
+        );
+        assert_eq!(returned.manifest.cleanup.projection(), manifest_before);
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(
+                &app,
+                router,
+                staged.request,
+                staged.host,
+            ),
+            zero_write_before
+        );
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the occupied-capacity fixture retains its exact entry");
+        assert_eq!(entry.engine.snapshot(), core_before);
+        assert!(ClassifierPermanentEntryLocalProjection::capture(entry) == entry_before);
+        assert_eq!(entry.back_capacity_reservations.len(), 1);
+    }
+
+    #[test]
+    fn back_target_physical_permanent_begin_rejects_logical_roots_only_drift_in_core() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-logical-roots",
+        );
+        let mut staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        let expected = TargetPermanentDispositionProjection::capture(&staged.disposition);
+        let original_manifest = staged.disposition.manifest.cleanup.projection();
+        let drifted = CleanupManifest::new(
+            Vec::new(),
+            original_manifest.manifest_digest(),
+            original_manifest.obligation_count(),
+        );
+        assert!(
+            drifted.projection() != original_manifest,
+            "the real replacement fixture must retain a non-empty Core logical-root manifest"
+        );
+        staged.disposition.manifest.cleanup = drifted;
+        let drifted_manifest = staged.disposition.manifest.cleanup.projection();
+        assert_eq!(
+            drifted_manifest.manifest_digest(),
+            original_manifest.manifest_digest()
+        );
+        assert_eq!(
+            drifted_manifest.obligation_count(),
+            original_manifest.obligation_count()
+        );
+        let zero_write_before = ReadyPlanPermanentZeroWriteProjection::capture(
+            &app,
+            router,
+            staged.request,
+            staged.host,
+        );
+        let core_before = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the logical-roots fixture retains its exact entry")
+            .engine
+            .snapshot();
+
+        let returned =
+            match dispatch_real_back_target_permanent(&mut app, router, staged.disposition) {
+                BackTargetPermanentDispatchOutcome::LogicalRootsMismatch(disposition) => {
+                    disposition
+                }
+                BackTargetPermanentDispatchOutcome::Permanent { .. } => {
+                    panic!("logical-root drift must not be folded into generic permanent evidence")
+                }
+                _ => panic!("logical-root-only drift must return its dedicated typed Core outcome"),
+            };
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture_prepared(&returned),
+            expected
+        );
+        assert_prepared_target_permanent_dispatch_owner_is_complete(&returned);
+        assert_eq!(returned.manifest.cleanup.projection(), drifted_manifest);
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(
+                &app,
+                router,
+                staged.request,
+                staged.host,
+            ),
+            zero_write_before
+        );
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the logical-roots fixture retains its exact entry");
+        assert_eq!(entry.engine.snapshot(), core_before);
+        assert!(entry.pending_back_target_permanent_cleanup.is_none());
+
+        let source = include_str!("navigation.rs");
+        let dispatch_and_tail = &source[source
+            .find("pub(crate) fn dispatch_back_target_permanent(")
+            .expect("the unique target permanent dispatch must remain named")..];
+        let dispatch = &dispatch_and_tail[..dispatch_and_tail
+            .find("\nfn registered_claim_has_exact_authority_and_manifest_coverage(")
+            .expect("the dispatch source boundary must remain exact")];
+        assert!(
+            !dispatch.contains(".logical_roots"),
+            "ECS must carry the opaque Core manifest without reading or authenticating its logical roots"
+        );
+    }
+
+    #[test]
+    fn back_target_physical_permanent_begin_rejects_foreign_current_ticket_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) =
+            install_classifier_permanent_fixture(&mut app, "back-target-permanent-begin-ticket");
+        let (foreign_router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-ticket-other",
+        );
+        let foreign = stage_real_back_target_permanent_disposition(&mut app, foreign_router);
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        let expected = TargetPermanentDispositionProjection::capture(&staged.disposition);
+        let expected_ticket = staged.disposition.cleanup.physical.lineage.ticket.clone();
+        let foreign_ticket = foreign.disposition.cleanup.physical.lineage.ticket.clone();
+        assert!(
+            expected_ticket != foreign_ticket,
+            "the real producer paths must issue distinct CommitTicket identities"
+        );
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let exact_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == router)
+                .expect("the exact ticket fixture retains its entry");
+            let foreign_index = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == foreign_router)
+                .expect("the foreign ticket fixture retains its entry");
+            let (exact, foreign) = if exact_index < foreign_index {
+                let (left, right) = navigation.entries.split_at_mut(foreign_index);
+                (&mut left[exact_index], &mut right[0])
+            } else {
+                let (left, right) = navigation.entries.split_at_mut(exact_index);
+                (&mut right[0], &mut left[foreign_index])
+            };
+            std::mem::swap(
+                &mut exact
+                    .pending_commit
+                    .as_mut()
+                    .expect("the exact producer retains PendingCommit")
+                    .ticket,
+                &mut foreign
+                    .pending_commit
+                    .as_mut()
+                    .expect("the foreign producer retains PendingCommit")
+                    .ticket,
+            );
+            assert!(
+                exact
+                    .pending_commit
+                    .as_ref()
+                    .and_then(|pending| pending.ticket.as_ref())
+                    .map(CommitTicket::report_identity)
+                    == Some(foreign_ticket)
+            );
+        }
+        let zero_write_before = ReadyPlanPermanentZeroWriteProjection::capture(
+            &app,
+            router,
+            staged.request,
+            staged.host,
+        );
+        let core_before = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the exact ticket fixture retains its entry")
+            .engine
+            .snapshot();
+
+        let returned =
+            match dispatch_real_back_target_permanent(&mut app, router, staged.disposition) {
+                BackTargetPermanentDispatchOutcome::EntryMismatch { disposition, .. } => {
+                    disposition
+                }
+                _ => panic!("a foreign current CommitTicket must reject before ledger/Core begin"),
+            };
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture(&returned),
+            expected
+        );
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(
+                &app,
+                router,
+                staged.request,
+                staged.host,
+            ),
+            zero_write_before
+        );
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the exact ticket fixture retains its entry");
+        assert_eq!(entry.engine.snapshot(), core_before);
+        assert!(entry.pending_back_target_permanent_cleanup.is_none());
+        drop(foreign.disposition);
+    }
+
+    #[test]
+    fn back_target_physical_permanent_begin_requires_vacant_dedicated_holder() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-holder-vacancy",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        let expected = TargetPermanentDispositionProjection::capture(&staged.disposition);
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the exact dispatch entry remains installed");
+            entry.pending_back_no_target_preparation =
+                Some(PendingBackNoTargetPreparation::TestOccupied);
+        }
+        let disposition =
+            match dispatch_real_back_target_permanent(&mut app, router, staged.disposition) {
+                BackTargetPermanentDispatchOutcome::EntryMismatch { disposition, .. } => {
+                    disposition
+                }
+                _ => panic!(
+                    "a competing no-target preparation holder must reject before ledger/Core begin"
+                ),
+            };
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the exact dispatch entry remains installed");
+            assert!(matches!(
+                entry.pending_back_no_target_preparation.as_ref(),
+                Some(&PendingBackNoTargetPreparation::TestOccupied)
+            ));
+            entry.pending_back_no_target_preparation = None;
+            entry.pending_back_target_permanent_cleanup =
+                Some(PendingTargetPreparationPermanentCleanup::TestOccupied);
+        }
+
+        let returned = match dispatch_real_back_target_permanent(&mut app, router, disposition) {
+            BackTargetPermanentDispatchOutcome::EntryMismatch { disposition, .. } => disposition,
+            _ => panic!("an occupied dedicated holder must reject before ledger/Core begin"),
+        };
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture(&returned),
+            expected
+        );
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the exact dispatch entry remains installed");
+        assert!(matches!(
+            entry.pending_back_target_permanent_cleanup.as_ref(),
+            Some(&PendingTargetPreparationPermanentCleanup::TestOccupied)
+        ));
+        assert_eq!(
+            entry
+                .back_target_permanent_begin_callback_calls
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn back_target_physical_permanent_begin_reserve_fault_returns_whole_disposition_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-reserve-fault",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        let expected = TargetPermanentDispositionProjection::capture(&staged.disposition);
+        let manifest_before = staged.disposition.manifest.cleanup.projection();
+        let frozen_before =
+            target_preparation_permanent_frozen_manifest(&staged.disposition.cleanup).clone();
+        let zero_write_before = ReadyPlanPermanentZeroWriteProjection::capture(
+            &app,
+            router,
+            staged.request,
+            staged.host,
+        );
+        let (core_before, entry_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the reserve-fault fixture retains its exact entry");
+            (
+                entry.engine.snapshot(),
+                ClassifierPermanentEntryLocalProjection::capture(entry),
+            )
+        };
+        crate::cleanup::fail_next_reservation_for_test();
+
+        let (returned, error) =
+            match dispatch_real_back_target_permanent(&mut app, router, staged.disposition) {
+                BackTargetPermanentDispatchOutcome::LedgerRejected { disposition, error } => {
+                    (disposition, error)
+                }
+                _ => panic!(
+                    "the real reserve fault must return typed LedgerRejected before Core begin"
+                ),
+            };
+        assert_eq!(
+            error.kind(),
+            CleanupLedgerReserveErrorKind::RetryableCapacity
+        );
+        let returned_manifest = error.into_manifest();
+        assert_eq!(returned_manifest.digest(), frozen_before.digest());
+        assert_eq!(returned_manifest.len(), frozen_before.len());
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture(&returned),
+            expected
+        );
+        assert_eq!(returned.manifest.cleanup.projection(), manifest_before);
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(
+                &app,
+                router,
+                staged.request,
+                staged.host,
+            ),
+            zero_write_before
+        );
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the reserve-fault fixture retains its exact entry");
+        assert_eq!(entry.engine.snapshot(), core_before);
+        assert!(ClassifierPermanentEntryLocalProjection::capture(entry) == entry_before);
+        assert!(entry.pending_back_target_permanent_cleanup.is_none());
+    }
+
+    #[test]
+    fn back_target_physical_permanent_begin_current_commit_drift_calls_zero_and_returns_whole() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-current-commit-drift",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        let expected = TargetPermanentDispositionProjection::capture(&staged.disposition);
+        let expected_ticket = staged.disposition.cleanup.physical.lineage.ticket.clone();
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the commit-drift fixture retains its exact entry");
+            let ticket = entry
+                .pending_commit
+                .as_ref()
+                .and_then(|pending| pending.ticket.as_ref())
+                .expect("the real producer retains its exact CommitTicket");
+            assert!(ticket.report_identity() == expected_ticket);
+            entry.engine.testing_invalidate_commit_action();
+            assert_eq!(
+                entry.engine.inspect_commit_identity(ticket),
+                Err(IntegrationError::Stale)
+            );
+        }
+        let zero_write_before = ReadyPlanPermanentZeroWriteProjection::capture(
+            &app,
+            router,
+            staged.request,
+            staged.host,
+        );
+        let core_before = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the commit-drift fixture retains its exact entry")
+            .engine
+            .snapshot();
+
+        let returned =
+            match dispatch_real_back_target_permanent(&mut app, router, staged.disposition) {
+                BackTargetPermanentDispatchOutcome::ReceiverMismatch {
+                    disposition,
+                    mismatch: _,
+                } => disposition,
+                BackTargetPermanentDispatchOutcome::Permanent { .. } => {
+                    panic!("a stale current Commit stage must remain a receiver mismatch")
+                }
+                _ => panic!(
+                    "same-engine current Commit drift must be a typed Core receiver mismatch"
+                ),
+            };
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture_prepared(&returned),
+            expected
+        );
+        assert_prepared_target_permanent_dispatch_owner_is_complete(&returned);
+        let identity = PreparedTargetPermanentIdentityProjection::capture(&returned);
+        assert_eq!(
+            identity.manifest.manifest_digest(),
+            identity.ledger.manifest_digest()
+        );
+        assert_eq!(
+            identity.manifest.obligation_count(),
+            identity.ledger.obligation_count()
+        );
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(
+                &app,
+                router,
+                staged.request,
+                staged.host,
+            ),
+            zero_write_before
+        );
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the commit-drift fixture retains its exact entry");
+        assert_eq!(entry.engine.snapshot(), core_before);
+        assert!(entry.pending_back_target_permanent_cleanup.is_none());
+    }
+
+    #[test]
+    fn back_target_physical_permanent_begin_foreign_receiver_calls_zero_and_returns_whole() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) =
+            install_classifier_permanent_fixture(&mut app, "back-target-permanent-begin-foreign");
+        let (foreign_router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-foreign-other",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        let expected = TargetPermanentDispositionProjection::capture(&staged.disposition);
+        let source_manifest = staged.disposition.manifest.cleanup.projection();
+        swap_ready_plan_test_engines(&mut app, router, foreign_router);
+        let zero_write_before = ReadyPlanPermanentZeroWriteProjection::capture(
+            &app,
+            router,
+            staged.request,
+            staged.host,
+        );
+        let (wrong_engine_before, owner_engine_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let exact = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the receiver fixture retains its exact entry");
+            let foreign = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == foreign_router)
+                .expect("the receiver fixture retains its foreign entry");
+            (exact.engine.snapshot(), foreign.engine.snapshot())
+        };
+        crate::cleanup::reset_ledger_domain_allocations_for_test();
+
+        let (returned, _mismatch) =
+            match dispatch_real_back_target_permanent(&mut app, router, staged.disposition) {
+                BackTargetPermanentDispatchOutcome::ReceiverMismatch {
+                    disposition,
+                    mismatch,
+                } => (disposition, mismatch),
+                BackTargetPermanentDispatchOutcome::Permanent { .. } => {
+                    panic!("a foreign Core continuation must remain a receiver mismatch")
+                }
+                _ => panic!(
+                    "the exact World/entry with a foreign Core receiver must be typed mismatch"
+                ),
+            };
+        assert_eq!(
+            crate::cleanup::ledger_domain_allocations_for_test(),
+            1,
+            "the first physical dispatch must reserve exactly one real prepared ledger"
+        );
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture_prepared(&returned),
+            expected,
+            "Core mismatch must preserve cleanup, branch, settlement, manifest and prepared ledger"
+        );
+        assert_prepared_target_permanent_dispatch_owner_is_complete(&returned);
+        assert_eq!(
+            PreparedTargetPermanentIdentityProjection::capture(&returned).manifest,
+            source_manifest,
+            "Core receiver mismatch must retain the original manifest digest/count and roots"
+        );
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(
+                &app,
+                router,
+                staged.request,
+                staged.host,
+            ),
+            zero_write_before
+        );
+        let navigation = app.world().resource::<RouterNavigation>();
+        let exact = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the receiver fixture retains its exact entry");
+        let foreign = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == foreign_router)
+            .expect("the receiver fixture retains its foreign entry");
+        assert_eq!(exact.engine.snapshot(), wrong_engine_before);
+        assert_eq!(foreign.engine.snapshot(), owner_engine_before);
+        assert!(exact.pending_back_target_permanent_cleanup.is_none());
+        swap_ready_plan_test_engines(&mut app, router, foreign_router);
+        let exact_recheck = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the original receiver is restored");
+                dispatch_prepared_back_target_permanent(world, entry, returned)
+            },
+        );
+        match exact_recheck {
+            BackTargetPermanentDispatchOutcome::Dispatched => {
+                assert_eq!(target_permanent_begin_callback_calls(&app, router), 1);
+            }
+            BackTargetPermanentDispatchOutcome::Permanent { .. } => {
+                panic!("the restored exact receiver must not produce permanent evidence")
+            }
+            BackTargetPermanentDispatchOutcome::ReceiverMismatch { .. } => {
+                panic!(
+                    "the whole returned settlement must remain recognizable by its original engine"
+                )
+            }
+            BackTargetPermanentDispatchOutcome::LogicalRootsMismatch(_) => {
+                panic!("the whole returned Core manifest must retain its original logical roots")
+            }
+            BackTargetPermanentDispatchOutcome::PreparedEntryMismatch { .. } => {
+                panic!("the returned manifest/ledger/partition identity must remain exact")
+            }
+            BackTargetPermanentDispatchOutcome::EntryMismatch { .. }
+            | BackTargetPermanentDispatchOutcome::LedgerRejected { .. } => {
+                panic!("a prepared exact recheck cannot return an unprepared dispatch outcome")
+            }
+        }
+        assert_eq!(
+            crate::cleanup::ledger_domain_allocations_for_test(),
+            1,
+            "retrying the already prepared whole owner must not reserve a second ledger"
+        );
+    }
+
+    #[test]
+    fn back_target_permanent_prepared_dispatch_mismatch_retains_typed_exact_evidence() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-prepared-evidence",
+        );
+        let (foreign_router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-prepared-evidence-foreign",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        swap_ready_plan_test_engines(&mut app, router, foreign_router);
+        let prepared = match dispatch_real_back_target_permanent(
+            &mut app,
+            router,
+            staged.disposition,
+        ) {
+            BackTargetPermanentDispatchOutcome::ReceiverMismatch {
+                disposition,
+                mismatch: _,
+            } => disposition,
+            _ => panic!(
+                "the foreign receiver fixture must whole-return one genuinely reserved prepared disposition"
+            ),
+        };
+        swap_ready_plan_test_engines(&mut app, router, foreign_router);
+
+        let owner_before = TargetPermanentDispositionProjection::capture_prepared(&prepared);
+        let identity_before = PreparedTargetPermanentIdentityProjection::capture(&prepared);
+        let target = prepared
+            .cleanup
+            .physical
+            .target_observed
+            .first()
+            .expect("the real prepared owner freezes at least one physical target")
+            .entity;
+        app.world_mut()
+            .entity_mut(target)
+            .insert(ReadyPlanPermanentForeignMarker);
+
+        let returned = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the prepared evidence RED retains its exact RouterEntry");
+                match dispatch_prepared_back_target_permanent(world, entry, prepared) {
+                    BackTargetPermanentDispatchOutcome::PreparedEntryMismatch {
+                        disposition,
+                        evidence,
+                    } => {
+                        assert_eq!(
+                            (
+                                evidence.source(),
+                                evidence.expectation(),
+                                evidence.observed(),
+                            ),
+                            (
+                                LifecyclePreflightSource::TargetPartition,
+                                LifecyclePreflightExpectation::ExactRelationshipClosure,
+                                LifecyclePreflightObserved::Drifted,
+                            ),
+                            "prepared refreeze must retain the exact post-reservation World drift"
+                        );
+                        disposition
+                    }
+                    _ => panic!(
+                        "prepared physical drift must fail closed with typed boundary evidence"
+                    ),
+                }
+            },
+        );
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture_prepared(&returned),
+            owner_before,
+            "prepared mismatch must whole-return the physical cleanup owner"
+        );
+        assert!(
+            PreparedTargetPermanentIdentityProjection::capture(&returned) == identity_before,
+            "prepared mismatch must whole-return the exact manifest and reserved ledger"
+        );
+        assert_eq!(
+            target_permanent_begin_callback_calls(&app, router),
+            0,
+            "prepared preflight mismatch must reject before Core begin"
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum PreparedTargetPermanentInternalMismatchFault {
+        LineageRouter,
+        LineageTicket,
+        AllowedWrite,
+        LedgerManifest,
+        CoreManifest,
+    }
+
+    fn assert_prepared_target_permanent_internal_mismatch_evidence(
+        label: &'static str,
+        foreign_label: &'static str,
+        fault: PreparedTargetPermanentInternalMismatchFault,
+        expected: (
+            LifecyclePreflightSource,
+            LifecyclePreflightExpectation,
+            LifecyclePreflightObserved,
+        ),
+    ) {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(&mut app, label);
+        let (foreign_router, _) = install_classifier_permanent_fixture(&mut app, foreign_label);
+        let mut prepared =
+            stage_real_back_target_prepared_permanent_disposition(&mut app, router, foreign_router);
+
+        match fault {
+            PreparedTargetPermanentInternalMismatchFault::LineageRouter => {
+                prepared.ledger.validation.lineage.router = foreign_router;
+            }
+            PreparedTargetPermanentInternalMismatchFault::LineageTicket => {
+                let foreign =
+                    stage_real_back_target_permanent_disposition(&mut app, foreign_router);
+                prepared.ledger.validation.lineage.ticket =
+                    foreign.disposition.cleanup.physical.lineage.ticket.clone();
+            }
+            PreparedTargetPermanentInternalMismatchFault::AllowedWrite => {
+                prepared
+                    .ledger
+                    .validation
+                    .allowed_write
+                    .targets
+                    .pop()
+                    .expect("the real prepared fixture freezes at least one allowed-write target");
+            }
+            PreparedTargetPermanentInternalMismatchFault::LedgerManifest => {
+                let original = prepared.ledger.ledger.projection();
+                assert!(original.obligation_count() > 0);
+                let empty = FrozenCleanupManifest::empty();
+                assert_ne!(original.manifest_digest(), empty.digest());
+                prepared.ledger.ledger = CleanupLedger::reserve(empty)
+                    .expect("the empty mismatch manifest remains reservable");
+                let drifted = prepared.ledger.ledger.projection();
+                assert_ne!(drifted.manifest_digest(), original.manifest_digest());
+                assert_ne!(drifted.obligation_count(), original.obligation_count());
+            }
+            PreparedTargetPermanentInternalMismatchFault::CoreManifest => {
+                let original = prepared.manifest.cleanup.projection();
+                assert!(original.obligation_count() > 0);
+                prepared.manifest.cleanup = CleanupManifest::empty();
+                let drifted = prepared.manifest.cleanup.projection();
+                assert_ne!(drifted.manifest_digest(), original.manifest_digest());
+                assert_ne!(drifted.obligation_count(), original.obligation_count());
+            }
+        }
+
+        {
+            let world = app.world();
+            let navigation = world.resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the prepared internal-mismatch fixture retains its exact entry");
+            assert!(
+                target_preparation_permanent_dispatch_entry_preflight(
+                    world,
+                    entry,
+                    &prepared.cleanup.physical,
+                )
+                .is_ok(),
+                "the external entry preflight must remain exact so the internal frozen-owner check is exercised"
+            );
+        }
+
+        let owner_before = PreparedTargetPermanentWholeProjection::capture(&prepared);
+        let returned = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the prepared internal-mismatch fixture retains its exact entry");
+                match dispatch_prepared_back_target_permanent(world, entry, prepared) {
+                    BackTargetPermanentDispatchOutcome::PreparedEntryMismatch {
+                        disposition,
+                        evidence,
+                    } => {
+                        assert_eq!(
+                            (evidence.source(), evidence.expectation(), evidence.observed()),
+                            expected,
+                            "the prepared internal check must preserve its ordered source, expectation and observed classification"
+                        );
+                        disposition
+                    }
+                    _ => panic!(
+                        "a prepared internal frozen-owner mismatch must fail closed with typed evidence"
+                    ),
+                }
+            },
+        );
+        let returned = reassemble_prepared_target_permanent_dispatch_owner(returned);
+        assert!(
+            PreparedTargetPermanentWholeProjection::capture(&returned) == owner_before,
+            "prepared rejection must whole-return cleanup, validation, manifest, ledger and settlement ownership"
+        );
+        assert_eq!(
+            target_permanent_begin_callback_calls(&app, router),
+            0,
+            "prepared internal mismatch must reject before Core begin"
+        );
+    }
+
+    #[test]
+    fn back_target_permanent_prepared_lineage_mismatch_has_host_binding_evidence() {
+        assert_prepared_target_permanent_internal_mismatch_evidence(
+            "back-target-prepared-lineage-mismatch",
+            "back-target-prepared-lineage-mismatch-foreign",
+            PreparedTargetPermanentInternalMismatchFault::LineageRouter,
+            (
+                LifecyclePreflightSource::HostBinding,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ),
+        );
+    }
+
+    #[test]
+    fn back_target_permanent_prepared_ticket_mismatch_has_pending_admission_evidence() {
+        assert_prepared_target_permanent_internal_mismatch_evidence(
+            "back-target-prepared-ticket-mismatch",
+            "back-target-prepared-ticket-mismatch-foreign",
+            PreparedTargetPermanentInternalMismatchFault::LineageTicket,
+            (
+                LifecyclePreflightSource::PendingAdmission,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ),
+        );
+    }
+
+    #[test]
+    fn back_target_permanent_prepared_partition_mismatch_has_target_evidence() {
+        assert_prepared_target_permanent_internal_mismatch_evidence(
+            "back-target-prepared-partition-mismatch",
+            "back-target-prepared-partition-mismatch-foreign",
+            PreparedTargetPermanentInternalMismatchFault::AllowedWrite,
+            (
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactTaskShape,
+                LifecyclePreflightObserved::Contradictory,
+            ),
+        );
+    }
+
+    #[test]
+    fn back_target_permanent_prepared_ledger_mismatch_has_pending_shape_evidence() {
+        assert_prepared_target_permanent_internal_mismatch_evidence(
+            "back-target-prepared-ledger-mismatch",
+            "back-target-prepared-ledger-mismatch-foreign",
+            PreparedTargetPermanentInternalMismatchFault::LedgerManifest,
+            (
+                LifecyclePreflightSource::PendingAdmission,
+                LifecyclePreflightExpectation::ExactTaskShape,
+                LifecyclePreflightObserved::Contradictory,
+            ),
+        );
+    }
+
+    #[test]
+    fn back_target_permanent_prepared_core_manifest_mismatch_has_pending_shape_evidence() {
+        assert_prepared_target_permanent_internal_mismatch_evidence(
+            "back-target-prepared-core-manifest-mismatch",
+            "back-target-prepared-core-manifest-mismatch-foreign",
+            PreparedTargetPermanentInternalMismatchFault::CoreManifest,
+            (
+                LifecyclePreflightSource::PendingAdmission,
+                LifecyclePreflightExpectation::ExactTaskShape,
+                LifecyclePreflightObserved::Contradictory,
+            ),
+        );
+    }
+
+    #[test]
+    fn back_target_permanent_prepared_lineage_scope_is_exact_bound_or_removed() {
+        const LINEAGE_START: &str = concat!(
+            "pub(crate) struct FrozenTargetPreparationPermanent",
+            "Lineage {"
+        );
+        const LINEAGE_END: &str = concat!(
+            "#[derive(Clone)]\n",
+            "pub(crate) struct FrozenTargetPreparationPermanentProtectedClosures {"
+        );
+        const DISPATCH_START: &str = concat!(
+            "fn dispatch_prepared_back_target_permanent_with_installation_",
+            "observer<F>("
+        );
+        const DISPATCH_END: &str = concat!(
+            "\nfn registered_claim_has_exact_authority_and_manifest_",
+            "coverage("
+        );
+        let source = include_str!("navigation.rs");
+        for marker in [LINEAGE_START, LINEAGE_END, DISPATCH_START, DISPATCH_END] {
+            assert_eq!(
+                source.matches(marker).count(),
+                1,
+                "the prepared scope source contract requires one exact boundary marker: {marker}"
+            );
+        }
+        let lineage_tail = &source[source.find(LINEAGE_START).unwrap()..];
+        let lineage = &lineage_tail[..lineage_tail.find(LINEAGE_END).unwrap()];
+        if lineage.contains("scope:") {
+            let dispatch_tail = &source[source.find(DISPATCH_START).unwrap()..];
+            let dispatch = &dispatch_tail[..dispatch_tail.find(DISPATCH_END).unwrap()];
+            let compact = dispatch
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>();
+            assert!(
+                compact.contains(
+                    "validation.lineage.scope==disposition.cleanup.physical.lineage.scope"
+                ) || compact.contains(
+                    "disposition.cleanup.physical.lineage.scope==validation.lineage.scope"
+                ),
+                "a retained prepared lineage scope must exact-bind to the cleanup owner or be removed as redundant"
+            );
+        }
+    }
+
+    #[test]
+    fn back_target_physical_permanent_begin_success_tail_is_complete_and_linear() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-success-tail",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        let expected_ticket = staged.disposition.cleanup.physical.lineage.ticket.clone();
+        let expected_manifest = staged.disposition.manifest.cleanup.projection();
+        let queued_request = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the success fixture retains its exact entry");
+            entry
+                .engine
+                .push(RouteLocation::new("/queued-after-permanent-begin"))
+                .expect("the production Core facade must queue a later request")
+        };
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the success fixture retains its exact entry");
+            let state = entry.engine.testing_back_target_permanent_begin_state();
+            assert_eq!(state.cleanup_owner_count(), 0);
+            assert_eq!(state.current_owner_count(), 1);
+            assert_eq!(state.action_owner_count(), 0);
+            assert_eq!(state.current_history_slot_count(), 1);
+            assert_eq!(state.cleanup_history_owner_count(), 0);
+            assert_eq!(state.cleanup_settlement_owner_count(), 0);
+            assert_eq!(state.queue_len(), 1);
+            assert_eq!(state.conflicting_owner_count(), 0);
+        }
+
+        match dispatch_real_back_target_permanent(&mut app, router, staged.disposition) {
+            BackTargetPermanentDispatchOutcome::Dispatched => {}
+            BackTargetPermanentDispatchOutcome::Permanent { .. } => {
+                panic!("the exact success fixture must not produce permanent evidence")
+            }
+            _ => panic!("the unchanged production dispatch must complete its begin tail"),
+        }
+
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 1);
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the completed success fixture retains its exact entry");
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::RecoveringAuthority
+        );
+        assert!(matches!(
+            entry
+                .engine
+                .request(staged.request)
+                .map(|record| record.status().clone()),
+            Some(RequestStatus::Running(NavigationPhase::Recovering))
+        ));
+        let state = entry.engine.testing_back_target_permanent_begin_state();
+        assert_eq!(state.cleanup_owner_count(), 1);
+        assert_eq!(state.current_owner_count(), 0);
+        assert_eq!(state.action_owner_count(), 0);
+        assert_eq!(state.current_history_slot_count(), 0);
+        assert_eq!(state.cleanup_history_owner_count(), 1);
+        assert_eq!(state.cleanup_settlement_owner_count(), 1);
+        assert_eq!(state.queue_len(), 0);
+        assert_eq!(state.conflicting_owner_count(), 0);
+        assert!(matches!(
+            entry.engine.request(queued_request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        let Some(PendingTargetPreparationPermanentCleanup::Installed(installed)) =
+            entry.pending_back_target_permanent_cleanup.as_ref()
+        else {
+            panic!("successful begin must retain the complete installed cleanup owner")
+        };
+        let TargetPreparationPermanentLedgerHolder::Prepared(prepared) = &installed.ledger else {
+            panic!("begin must retain the prepared ledger until cleanup execution")
+        };
+        assert_eq!(
+            prepared.validation.allowed_write.targets,
+            installed.cleanup.physical.allowed_write.targets
+        );
+        let ledger = prepared.ledger.projection();
+        let batch = installed.batch.batch();
+        assert!(batch.report_identity() == expected_ticket);
+        assert_eq!(
+            ledger.manifest_digest(),
+            expected_manifest.manifest_digest()
+        );
+        assert_eq!(
+            ledger.obligation_count(),
+            expected_manifest.obligation_count()
+        );
+        assert_eq!(batch.manifest_digest(), expected_manifest.manifest_digest());
+        assert_eq!(
+            batch.obligation_count(),
+            expected_manifest.obligation_count()
+        );
+    }
+
+    #[test]
+    fn back_target_physical_permanent_begin_current_state_drift_is_typed_and_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-current-state-drift",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        let expected_disposition =
+            TargetPermanentDispositionProjection::capture(&staged.disposition);
+        let expected_ticket = staged.disposition.cleanup.physical.lineage.ticket.clone();
+        let expected_current = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the current-state fixture retains its exact entry")
+            .engine
+            .testing_back_target_permanent_current_state();
+        assert!(expected_current.host_present());
+        assert!(expected_current.top_slot_present());
+        assert!(expected_current.current_identity() == Some(expected_ticket));
+        assert!(
+            expected_current
+                .current_logical_roots()
+                .is_some_and(|roots| !roots.is_empty())
+        );
+        assert!(expected_current.current_reconciliation_present());
+        assert!(!expected_current.current_retired_host_present());
+        assert_eq!(expected_current.availability(), &RouterAvailability::Ready);
+        assert!(matches!(
+            expected_current.request_status(),
+            Some(RequestStatus::Running(NavigationPhase::ReadyToSwitch))
+        ));
+        assert!(expected_current.history_binding_present());
+        assert!(!expected_current.pending_no_target_present());
+        assert!(!expected_current.pending_no_target_authority_present());
+        assert!(!expected_current.pending_target_cleanup_present());
+        assert!(!expected_current.history_preparation_error_present());
+        assert!(!expected_current.prepared_publication_present());
+        assert!(!expected_current.action_present());
+        let observed_current = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the current-state fixture retains its exact entry");
+            assert!(
+                entry
+                    .engine
+                    .testing_remove_back_target_permanent_current_reconciliation(),
+                "the seam must remove the real current reconciliation predicate fact"
+            );
+            entry.engine.testing_back_target_permanent_current_state()
+        };
+        assert_ne!(expected_current, observed_current);
+        assert!(!observed_current.current_reconciliation_present());
+        let zero_write_before = ReadyPlanPermanentZeroWriteProjection::capture(
+            &app,
+            router,
+            staged.request,
+            staged.host,
+        );
+        let core_before = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the drifted current-state fixture retains its exact entry")
+            .engine
+            .snapshot();
+
+        let returned = match dispatch_real_back_target_permanent(
+            &mut app,
+            router,
+            staged.disposition,
+        ) {
+            BackTargetPermanentDispatchOutcome::Permanent {
+                disposition,
+                evidence:
+                    BackTargetPermanentBeginPermanentEvidence::CurrentStateContradiction(evidence),
+            } => {
+                assert_eq!(evidence.expected(), &expected_current);
+                assert_eq!(evidence.observed(), &observed_current);
+                assert_ne!(evidence.expected(), evidence.observed());
+                disposition
+            }
+            BackTargetPermanentDispatchOutcome::LogicalRootsMismatch(_) => {
+                panic!("current-state contradiction must not collapse to logical-roots mismatch")
+            }
+            _ => panic!("real current-state drift must produce typed permanent evidence"),
+        };
+        let returned = reassemble_prepared_target_permanent_dispatch_owner(returned);
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture_prepared(&returned),
+            expected_disposition
+        );
+        assert_prepared_target_permanent_dispatch_owner_is_complete(&returned);
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(
+                &app,
+                router,
+                staged.request,
+                staged.host,
+            ),
+            zero_write_before
+        );
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the rejected current-state fixture retains its exact entry");
+        assert_eq!(entry.engine.snapshot(), core_before);
+        assert!(entry.pending_back_target_permanent_cleanup.is_none());
+    }
+
+    #[test]
+    fn back_target_physical_permanent_begin_active_drift_is_typed_and_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-active-drift",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        let expected_disposition =
+            TargetPermanentDispositionProjection::capture(&staged.disposition);
+        let expected_current = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the active-drift fixture retains its exact entry")
+            .engine
+            .testing_back_target_permanent_current_state();
+        assert!(expected_current.current_reconciliation_present());
+        let observed_current = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the active-drift fixture retains its exact entry");
+            assert!(
+                entry
+                    .engine
+                    .testing_remove_back_target_permanent_active_branch(),
+                "the seam must alter only the real active baseline fact"
+            );
+            entry.engine.testing_back_target_permanent_current_state()
+        };
+        assert!(observed_current.current_reconciliation_present());
+        assert!(expected_current.current_reconciliation_matches(&observed_current));
+        assert!(!expected_current.active_baseline_matches(&observed_current));
+        let zero_write_before = ReadyPlanPermanentZeroWriteProjection::capture(
+            &app,
+            router,
+            staged.request,
+            staged.host,
+        );
+        let core_before = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the active-drift fixture retains its exact entry")
+            .engine
+            .snapshot();
+
+        let returned = match dispatch_real_back_target_permanent(
+            &mut app,
+            router,
+            staged.disposition,
+        ) {
+            BackTargetPermanentDispatchOutcome::Permanent {
+                disposition,
+                evidence:
+                    BackTargetPermanentBeginPermanentEvidence::CurrentStateContradiction(evidence),
+            } => {
+                assert_eq!(evidence.expected(), &expected_current);
+                assert_eq!(evidence.observed(), &observed_current);
+                disposition
+            }
+            BackTargetPermanentDispatchOutcome::LogicalRootsMismatch(_) => {
+                panic!("active-state contradiction must not collapse to logical-roots mismatch")
+            }
+            _ => panic!("real active-only drift must produce typed permanent evidence"),
+        };
+        let returned = reassemble_prepared_target_permanent_dispatch_owner(returned);
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture_prepared(&returned),
+            expected_disposition
+        );
+        assert_prepared_target_permanent_dispatch_owner_is_complete(&returned);
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(
+                &app,
+                router,
+                staged.request,
+                staged.host,
+            ),
+            zero_write_before
+        );
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the rejected active-drift fixture retains its exact entry");
+        assert_eq!(entry.engine.snapshot(), core_before);
+        assert!(entry.pending_back_target_permanent_cleanup.is_none());
+    }
+
+    #[test]
+    fn back_target_physical_permanent_begin_request_drift_is_typed_and_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-request-drift",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        let expected = TargetPermanentDispositionProjection::capture(&staged.disposition);
+        let expected_requested = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the request-drift fixture retains its exact entry")
+            .engine
+            .request(staged.request)
+            .expect("the real producer retains its request record")
+            .requested()
+            .cloned();
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the request-drift fixture retains its exact entry");
+            assert!(
+                entry
+                    .engine
+                    .testing_transition_back_target_record_to_matching(staged.request),
+                "the test seam must alter the real request record predicate"
+            );
+        }
+        let zero_write_before = ReadyPlanPermanentZeroWriteProjection::capture(
+            &app,
+            router,
+            staged.request,
+            staged.host,
+        );
+        let core_before = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the request-drift fixture retains its exact entry")
+            .engine
+            .snapshot();
+
+        let returned =
+            match dispatch_real_back_target_permanent(&mut app, router, staged.disposition) {
+                BackTargetPermanentDispatchOutcome::Permanent {
+                    disposition,
+                    evidence,
+                } => {
+                    let BackTargetPermanentBeginPermanentEvidence::RequestRecordContradiction(
+                        evidence,
+                    ) = evidence
+                    else {
+                        panic!("request-record drift must preserve its distinct permanent purpose")
+                    };
+                    let expected_request = evidence
+                        .expected()
+                        .expect("the frozen request record must remain explicitly present");
+                    assert_eq!(expected_request.request(), staged.request);
+                    assert!(matches!(
+                        expected_request.status(),
+                        RequestStatus::Running(NavigationPhase::ReadyToSwitch)
+                    ));
+                    assert_eq!(expected_request.requested(), expected_requested.as_ref());
+                    assert!(!expected_request.trace_closed());
+
+                    let observed_request = evidence
+                        .observed()
+                        .expect("the drifted request record must remain explicitly present");
+                    assert_eq!(observed_request.request(), staged.request);
+                    assert!(matches!(
+                        observed_request.status(),
+                        RequestStatus::Running(NavigationPhase::Matching)
+                    ));
+                    assert_eq!(observed_request.requested(), expected_requested.as_ref());
+                    assert!(!observed_request.trace_closed());
+                    disposition
+                }
+                BackTargetPermanentDispatchOutcome::LogicalRootsMismatch(_) => {
+                    panic!(
+                        "request-record contradiction must not collapse to logical-roots mismatch"
+                    )
+                }
+                _ => panic!("request-record drift must return typed permanent evidence"),
+            };
+        let returned = reassemble_prepared_target_permanent_dispatch_owner(returned);
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture_prepared(&returned),
+            expected
+        );
+        assert_prepared_target_permanent_dispatch_owner_is_complete(&returned);
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(
+                &app,
+                router,
+                staged.request,
+                staged.host,
+            ),
+            zero_write_before
+        );
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the rejected request-drift fixture retains its exact entry");
+        assert_eq!(entry.engine.snapshot(), core_before);
+        assert!(entry.pending_back_target_permanent_cleanup.is_none());
+    }
+
+    #[test]
+    fn back_target_physical_permanent_begin_closed_recovering_trace_is_exact_and_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-closed-recovering-trace",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        let expected_disposition =
+            TargetPermanentDispositionProjection::capture(&staged.disposition);
+        let expected_requested = {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the trace-closed fixture retains its exact entry");
+            let requested = entry
+                .engine
+                .request(staged.request)
+                .expect("the trace-closed fixture retains its request")
+                .requested()
+                .cloned();
+            assert!(
+                entry
+                    .engine
+                    .testing_close_back_target_request_trace(staged.request),
+                "the seam must close the current request's real trace"
+            );
+            requested
+        };
+        let zero_write_before = ReadyPlanPermanentZeroWriteProjection::capture(
+            &app,
+            router,
+            staged.request,
+            staged.host,
+        );
+        let core_before = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the trace-closed fixture retains its exact entry")
+            .engine
+            .snapshot();
+
+        let returned = match dispatch_real_back_target_permanent(
+            &mut app,
+            router,
+            staged.disposition,
+        ) {
+            BackTargetPermanentDispatchOutcome::Permanent {
+                disposition,
+                evidence:
+                    BackTargetPermanentBeginPermanentEvidence::TerminalPlanContradiction(evidence),
+            } => {
+                let source = evidence.source();
+                let source_request = source.current_request();
+                assert_eq!(source_request.request(), staged.request);
+                assert!(matches!(
+                    source_request.status(),
+                    RequestStatus::Running(NavigationPhase::ReadyToSwitch)
+                ));
+                assert_eq!(source_request.requested(), expected_requested.as_ref());
+                assert!(source_request.trace_closed());
+                assert_eq!(source.queue_len(), 0);
+                assert!(source.host_present());
+                assert!(source.top_slot_present());
+                assert_eq!(source.availability(), &RouterAvailability::Ready);
+
+                assert_eq!(
+                    evidence.expected().operation(),
+                    BackTargetPermanentTerminalOperation::RecoveringTrace
+                );
+                let expected = evidence
+                    .expected()
+                    .request()
+                    .expect("recovering trace expectation must retain exact request facts");
+                assert_eq!(expected.request(), staged.request);
+                assert!(matches!(
+                    expected.status(),
+                    RequestStatus::Running(NavigationPhase::Recovering)
+                ));
+                assert_eq!(expected.requested(), expected_requested.as_ref());
+                assert!(!expected.trace_closed());
+
+                assert_eq!(
+                    evidence.observed().operation(),
+                    BackTargetPermanentTerminalOperation::RecoveringTrace
+                );
+                let observed = evidence
+                    .observed()
+                    .request()
+                    .expect("recovering trace rejection must retain clone-local request facts");
+                assert_eq!(observed.request(), staged.request);
+                assert!(matches!(
+                    observed.status(),
+                    RequestStatus::Running(NavigationPhase::Recovering)
+                ));
+                assert_eq!(observed.requested(), expected_requested.as_ref());
+                assert!(observed.trace_closed());
+                assert_eq!(
+                    evidence.observed().failure(),
+                    BackTargetPermanentTerminalFailureKind::RequestRejected(
+                        BackTargetPermanentRequestFailureKind::TraceClosed,
+                    )
+                );
+                disposition
+            }
+            BackTargetPermanentDispatchOutcome::LogicalRootsMismatch(_) => {
+                panic!("terminal preparation contradiction must not collapse to logical roots")
+            }
+            _ => panic!("the real clone-local trace failure must retain exact terminal evidence"),
+        };
+        let returned = reassemble_prepared_target_permanent_dispatch_owner(returned);
+        assert_eq!(
+            TargetPermanentDispositionProjection::capture_prepared(&returned),
+            expected_disposition
+        );
+        assert_prepared_target_permanent_dispatch_owner_is_complete(&returned);
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(
+                &app,
+                router,
+                staged.request,
+                staged.host,
+            ),
+            zero_write_before
+        );
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the rejected trace-closed fixture retains its exact entry");
+        assert_eq!(entry.engine.snapshot(), core_before);
+        assert!(entry.pending_back_target_permanent_cleanup.is_none());
+    }
+
+    #[test]
+    fn back_target_permanent_core_begin_keeps_submitted_count_independent_from_logical_roots() {
+        struct DirectCoreCountInstallationOwner {
+            request: NavigationRequestId,
+        }
+
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-begin-zero-obligations",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        let expected_installation_request = staged.request;
+        let TargetPreparationPermanentDisposition {
+            cleanup: _,
+            settlement,
+            manifest: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+        } = staged.disposition;
+        let original = manifest.projection();
+        assert!(original.obligation_count() > 0);
+        let manifest = manifest.testing_with_obligation_count(0);
+        assert_eq!(manifest.manifest_digest(), original.manifest_digest());
+        assert_eq!(manifest.obligation_count(), 0);
+        let begin = BackTargetPermanentBeginOwner::new(settlement, manifest);
+        let installation = DirectCoreCountInstallationOwner {
+            request: expected_installation_request,
+        };
+        assert!(std::mem::size_of_val(&installation) > 0);
+        let mut installed = None;
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handle == router)
+            .expect("the zero-obligation fixture retains its exact entry");
+        let RouterEntry {
+            engine,
+            pending_commit,
+            pending_back_target_permanent_cleanup,
+            ..
+        } = entry;
+        let ticket = pending_commit
+            .as_ref()
+            .and_then(|pending| pending.ticket.as_ref())
+            .expect("the zero-obligation fixture retains its exact ticket");
+        match engine.begin_back_target_permanent_cleanup(
+            begin,
+            ticket,
+            installation,
+            |installation, batch| {
+                installed = Some((installation, batch));
+            },
+        ) {
+            BackTargetPermanentBeginOutcome::Begun => {}
+            BackTargetPermanentBeginOutcome::LogicalRootsMismatch {
+                owner,
+                installation,
+            } => {
+                let (_, returned) = owner.into_parts();
+                assert_eq!(returned.obligation_count(), 0);
+                assert_eq!(installation.request, expected_installation_request);
+                panic!("zero Core-submitted obligations must not invalidate exact logical roots")
+            }
+            BackTargetPermanentBeginOutcome::Permanent {
+                owner,
+                installation,
+                evidence,
+            } => {
+                let (_, returned) = owner.into_parts();
+                assert_eq!(returned.obligation_count(), 0);
+                assert_eq!(installation.request, expected_installation_request);
+                let _ = evidence;
+                panic!("the exact sparse shape must not produce permanent evidence")
+            }
+            BackTargetPermanentBeginOutcome::ReceiverMismatch {
+                owner,
+                installation,
+                mismatch,
+            } => {
+                let (_, returned) = owner.into_parts();
+                assert_eq!(returned.obligation_count(), 0);
+                assert_eq!(installation.request, expected_installation_request);
+                let _ = mismatch;
+                panic!("the exact sparse shape must retain its receiver")
+            }
+        }
+        let (installation, batch) = installed
+            .as_ref()
+            .expect("direct Core begin must return installation and batch through its callback");
+        assert_eq!(installation.request, expected_installation_request);
+        assert_eq!(batch.batch().manifest_digest(), original.manifest_digest());
+        assert_eq!(batch.batch().obligation_count(), 0);
+        let state = engine.testing_back_target_permanent_begin_state();
+        assert_eq!(state.cleanup_owner_count(), 1);
+        assert_eq!(state.current_owner_count(), 0);
+        assert!(
+            pending_back_target_permanent_cleanup.is_none(),
+            "this direct Core submitted-count test must not pass through ECS physical dispatch"
+        );
+    }
+
+    #[test]
+    fn back_target_permanent_begin_owner_conservation_is_structural() {
+        fn item_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let tail = &source[source.find(start).expect("contract item must remain named")..];
+            &tail[..tail
+                .find(end)
+                .expect("contract item boundary must remain named")]
+        }
+
+        fn variant_between<'a>(source: &'a str, variant: &str, next: &str) -> &'a str {
+            let tail = &source[source
+                .find(variant)
+                .expect("contract variant must remain named")..];
+            &tail[..tail
+                .find(next)
+                .expect("next contract variant must remain named")]
+        }
+
+        let core_source = include_str!("../../bevy_ui_router_core/src/integration.rs");
+        let settlement_family_and_tail = &core_source[core_source
+            .find("struct PreparedPostCommitContinuation {")
+            .expect("the settlement owner family must remain named")..];
+        let settlement_family = &settlement_family_and_tail[..settlement_family_and_tail
+            .find("pub struct BackTargetPermanentBeginOwner {")
+            .expect("the target permanent begin owner boundary must remain exact")];
+        assert!(
+            settlement_family.contains("CoreBackTargetPermanent"),
+            "TargetAuthoritySettlementOwner must directly or indirectly wrap a real Core linear settlement owner"
+        );
+        let public_outcome = item_between(
+            core_source,
+            "pub enum BackTargetPermanentBeginOutcome",
+            "pub enum BackTargetPermanentBeginPermanentEvidence",
+        );
+        for (variant, next) in [
+            ("ReceiverMismatch", "LogicalRootsMismatch"),
+            ("LogicalRootsMismatch", "\n    Permanent"),
+            ("\n    Permanent", "#[doc(hidden)]"),
+        ] {
+            let contract = variant_between(public_outcome, variant, next);
+            assert!(
+                contract.contains("owner") && contract.contains("installation"),
+                "public {variant} must whole-return settlement and generic installation owners"
+            );
+        }
+        let core_begin = item_between(
+            core_source,
+            "pub fn begin_back_target_permanent_cleanup",
+            "pub fn prepare_back_target_commit<'a>(",
+        );
+        assert!(
+            !core_begin.contains("&owner.settlement"),
+            "Core begin must move the real settlement owner instead of borrowing its scope"
+        );
+        let moves_wrapped_settlement = core_begin.contains("owner.settlement.inner")
+            || (core_begin.contains("BackTargetPermanentBeginOwner {")
+                && core_begin.contains("settlement.inner"));
+        assert!(
+            moves_wrapped_settlement,
+            "the integration boundary must move the wrapped Core settlement owner into begin"
+        );
+        assert!(
+            core_begin.contains("installation:")
+                && !core_begin.contains("installation: &")
+                && core_begin.contains("installation,"),
+            "the integration begin boundary must move one generic installation owner"
+        );
+
+        let engine_source = include_str!("../../bevy_ui_router_core/src/engine.rs");
+        let outcome = item_between(
+            engine_source,
+            "pub(crate) enum BackTargetPermanentBeginCoreOutcome",
+            "pub(crate) enum BackTargetPermanentBeginCorePermanentEvidence",
+        );
+        let outcome_header = &outcome[..outcome
+            .find('{')
+            .expect("the Core begin outcome retains an enum body")];
+        assert!(
+            outcome_header.contains('<'),
+            "Core begin outcome must be generic over the single installation owner"
+        );
+        for (variant, next) in [
+            ("ReceiverMismatch", "LogicalRootsMismatch"),
+            ("LogicalRootsMismatch", "\n    Permanent"),
+            ("\n    Permanent", "\n}"),
+        ] {
+            let contract = variant_between(outcome, variant, next);
+            assert!(
+                contract.contains("owner") && contract.contains("installation"),
+                "Core {variant} must whole-return moved settlement and installation owners"
+            );
+        }
+
+        let cleanup_state = item_between(
+            engine_source,
+            "struct CoreBackTargetPermanentCleanupState {",
+            "enum CorePendingBackNoTargetAuthority {",
+        );
+        assert!(
+            cleanup_state.contains("HistoryCommitCapability")
+                && cleanup_state.contains("settlement:"),
+            "the Core private cleanup state must retain both real history and settlement owners"
+        );
+
+        let engine_begin = item_between(
+            engine_source,
+            "pub(crate) fn begin_back_target_permanent_cleanup",
+            "pub(crate) fn complete_back_no_target_authority_cleanup<F>(",
+        );
+        let accepts_linear_owner = (engine_begin.contains("settlement:")
+            && !engine_begin.contains("settlement: &"))
+            || engine_begin.contains("owner: CoreBackTargetPermanentBeginOwner");
+        assert!(
+            accepts_linear_owner,
+            "the engine boundary must accept the real settlement owner by value"
+        );
+        assert!(
+            engine_begin.contains("installation:")
+                && !engine_begin.contains("installation: &")
+                && engine_begin.contains("settlement,")
+                && engine_begin.contains("history,")
+                && !engine_begin.contains("settlement.clone()"),
+            "successful begin must move settlement, history and generic installation owners"
+        );
+
+        let ecs_source = include_str!("navigation.rs");
+        let installed = item_between(
+            ecs_source,
+            "pub(crate) struct InstalledTargetPreparationPermanentCleanup {",
+            "\n}",
+        );
+        let installed_fields = installed
+            .lines()
+            .filter(|line| line.trim_end().ends_with(','))
+            .count();
+        assert!(
+            installed.contains("cleanup: TargetPreparationPermanentCleanupOwner")
+                && installed.contains("ledger: TargetPreparationPermanentLedgerHolder")
+                && installed.contains("batch: BackTargetPermanentCleanupBatchOwner")
+                && !installed.contains("settlement"),
+            "the ECS holder must retain only physical cleanup, Prepared ledger and unique batch"
+        );
+        assert_eq!(
+            installed_fields, 3,
+            "the ECS holder must remain an exact three-owner tuple"
+        );
+    }
+
+    fn assert_permanent_atomic_tail_source_closed(
+        source: &str,
+        boundary: &str,
+        allow_exact_option_take: bool,
+    ) {
+        assert!(
+            !source.contains("/*") && !source.contains("//"),
+            "{boundary} must not contain block or line comment tokens that can obscure a call"
+        );
+        for forbidden in [
+            "unsafe",
+            "std::mem::take",
+            "std::mem::replace",
+            "mem::take",
+            "mem::replace",
+            "unwrap(",
+            "expect(",
+            "panic!(",
+            "unreachable!(",
+            "abort(",
+            "return",
+            "if ",
+            "if let",
+            "let Some",
+            "match ",
+            "else",
+            "query",
+            "world.",
+            "Vec::",
+            "Box::",
+            ".collect",
+            "reserve(",
+            "validate",
+            "?",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{boundary} must be an infallible single-consumption move: {forbidden}"
+            );
+        }
+        if !allow_exact_option_take {
+            assert!(
+                !source.contains(".take()"),
+                "{boundary} must not extract an owner through Option::take"
+            );
+        }
+        let compact = source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert!(
+            !compact.contains('!'),
+            "{boundary} must not contain a macro invocation, including whitespace variants"
+        );
+        for (postfix, kind) in [
+            (")(", "parenthesized"),
+            ("](", "indexed"),
+            (">(", "turbofish"),
+            ("}(", "block-expression"),
+        ] {
+            assert!(
+                !compact.contains(postfix),
+                "{boundary} must not contain a {kind} callable invocation, including whitespace variants"
+            );
+        }
+    }
+
+    fn permanent_atomic_tail_is_inside_rust_attribute(source: &str, offset: usize) -> bool {
+        let bytes = source.as_bytes();
+        let mut index = 0;
+        let mut inside = false;
+        while index < offset {
+            if inside {
+                if bytes[index] == b']' {
+                    inside = false;
+                }
+                index += 1;
+                continue;
+            }
+            if bytes[index] != b'#' {
+                index += 1;
+                continue;
+            }
+            let mut bracket = index + 1;
+            while bracket < offset && bytes[bracket].is_ascii_whitespace() {
+                bracket += 1;
+            }
+            if bracket < offset && bytes[bracket] == b'[' {
+                inside = true;
+                index = bracket + 1;
+            } else {
+                index += 1;
+            }
+        }
+        inside
+    }
+
+    fn permanent_atomic_tail_call_heads(source: &str) -> Vec<&str> {
+        source
+            .match_indices('(')
+            .filter_map(|(open, _)| {
+                if permanent_atomic_tail_is_inside_rust_attribute(source, open) {
+                    return None;
+                }
+                let mut end = open;
+                while let Some((index, character)) = source[..end].char_indices().next_back() {
+                    if !character.is_whitespace() {
+                        break;
+                    }
+                    end = index;
+                }
+                let mut start = end;
+                while let Some((index, character)) = source[..start].char_indices().next_back() {
+                    if !(character.is_alphanumeric() || matches!(character, '_' | ':')) {
+                        break;
+                    }
+                    start = index;
+                }
+                assert!(
+                    start < end,
+                    "every nonattribute call parenthesis must resolve to a callable head"
+                );
+                Some(&source[start..end])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn back_target_permanent_installation_closure_is_infallible_and_source_closed() {
+        fn item_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            assert_eq!(
+                source.matches(start).count(),
+                1,
+                "source gate start marker must remain exact and unique: {start}"
+            );
+            assert_eq!(
+                source.matches(end).count(),
+                1,
+                "source gate end marker must remain exact and unique: {end}"
+            );
+            let tail = &source[source.find(start).expect("contract item must remain named")..];
+            &tail[..tail
+                .find(end)
+                .expect("contract item boundary must remain named")]
+        }
+
+        const TEST_MODULE_START: &str = concat!("\n#[cfg(test)]\n", "pub(crate) mod tests {");
+        let source_and_tests = include_str!("navigation.rs");
+        assert_eq!(
+            source_and_tests.matches(TEST_MODULE_START).count(),
+            1,
+            "the source gate requires one exact production/test boundary"
+        );
+        let source = &source_and_tests[..source_and_tests.find(TEST_MODULE_START).unwrap()];
+        let typed_commit = item_between(
+            source,
+            "impl PreparedTargetPermanentEcsInstallationOwner {",
+            "pub(crate) enum PendingTargetPreparationPermanentCleanup {",
+        );
+        assert_permanent_atomic_tail_source_closed(
+            typed_commit,
+            "typed ECS installation commit boundary",
+            false,
+        );
+        assert!(
+            typed_commit.contains("fn commit(")
+                && typed_commit.contains("PendingTargetPreparationPermanentCleanup::Installed")
+                && typed_commit.contains("TargetPreparationPermanentLedgerHolder::Prepared")
+                && typed_commit.contains("batch,"),
+            "typed commit must consume one prepared payload and produce the exact three-owner holder"
+        );
+        let commit_function = &typed_commit[typed_commit
+            .find("fn commit(")
+            .expect("typed commit must remain named")..];
+        let commit_body = &commit_function[commit_function
+            .find('{')
+            .expect("typed commit must retain an explicit body")
+            + 1..];
+        let commit_calls = permanent_atomic_tail_call_heads(commit_body);
+        let allowed_commit_calls = [
+            "PendingTargetPreparationPermanentCleanup::Installed",
+            "TargetPreparationPermanentLedgerHolder::Prepared",
+        ];
+        assert_eq!(
+            commit_calls.len(),
+            allowed_commit_calls.len(),
+            "typed commit body must retain exactly two constructor calls"
+        );
+        assert!(
+            commit_calls
+                .iter()
+                .all(|call| allowed_commit_calls.contains(call)),
+            "typed commit body may call only the required typed constructors: {commit_calls:?}"
+        );
+
+        let dispatch = item_between(
+            source,
+            "fn dispatch_prepared_back_target_permanent_with_installation_observer",
+            "fn registered_claim_has_exact_authority_and_manifest_coverage",
+        );
+        let installation_position = dispatch
+            .find("PreparedTargetPermanentEcsInstallationOwner")
+            .expect("dispatch must prebuild one typed ECS installation owner");
+        let begin_position = dispatch
+            .find("begin_back_target_permanent_cleanup")
+            .expect("dispatch must retain the unique Core begin call");
+        assert!(
+            installation_position < begin_position,
+            "typed ECS installation owner must be complete before Core begin"
+        );
+        let callback_and_tail = &dispatch[begin_position..];
+        let callback = &callback_and_tail[..callback_and_tail
+            .find("    match outcome {")
+            .expect("the installation callback boundary must remain exact")];
+        let parameters_and_tail = &callback[callback
+            .find('|')
+            .expect("the Core success callback must remain explicit")
+            + 1..];
+        let parameters = &parameters_and_tail[..parameters_and_tail
+            .find('|')
+            .expect("the Core success callback parameters must remain closed")];
+        let parameters = parameters
+            .split(',')
+            .map(str::trim)
+            .map(|parameter| parameter.trim_start_matches("mut "))
+            .filter(|parameter| !parameter.is_empty())
+            .collect::<Vec<_>>();
+        assert!(
+            parameters.len() == 2,
+            "Core begin must consume the typed installation owner and return it to the success callback with batch"
+        );
+        let installation_parameter = parameters[0];
+        let batch_parameter = parameters[1];
+        assert_permanent_atomic_tail_source_closed(
+            callback,
+            "Core success installation callback",
+            false,
+        );
+        let closure_tail = &parameters_and_tail[parameters_and_tail
+            .find('|')
+            .expect("the callback parameter boundary remains exact")
+            + 1..];
+        let closure_body = &closure_tail[closure_tail
+            .find('{')
+            .expect("the callback must retain an explicit body")
+            + 1..];
+        let callback_calls = permanent_atomic_tail_call_heads(closure_body);
+        let allowed_callback_calls = ["fetch_add", "commit", "insert", "observe_installed"];
+        assert!(
+            callback_calls
+                .iter()
+                .all(|call| allowed_callback_calls.contains(call)),
+            "callback contains a call outside its explicit allowlist: {callback_calls:?}"
+        );
+        let counter_calls = callback_calls
+            .iter()
+            .copied()
+            .filter(|call| *call == "fetch_add")
+            .count();
+        assert!(
+            counter_calls <= 1,
+            "the cfg(test) counter may be called at most once"
+        );
+        assert_eq!(
+            callback_calls.len(),
+            3 + counter_calls,
+            "callback must contain only commit, unique insert, observer and optional cfg count"
+        );
+        for required in ["commit", "insert", "observe_installed"] {
+            assert_eq!(
+                callback_calls
+                    .iter()
+                    .copied()
+                    .filter(|call| *call == required)
+                    .count(),
+                1,
+                "callback must call {required} exactly once"
+            );
+        }
+        assert_eq!(
+            callback.matches(".insert(").count(),
+            1,
+            "the callback must commit through one unique Option::insert path"
+        );
+        let commit_call = format!("{installation_parameter}.commit({batch_parameter})");
+        assert_eq!(
+            callback.matches(commit_call.as_str()).count(),
+            1,
+            "the prebuilt typed installation owner must be consumed exactly once"
+        );
+        let insert_position = callback
+            .find(".insert(")
+            .expect("the callback must insert the typed commit exactly once");
+        let binding_tail = &callback[..insert_position];
+        let binding = &binding_tail[binding_tail
+            .rfind("let ")
+            .expect("Option::insert result must be bound for the observer")
+            + 4..];
+        let binding = binding[..binding
+            .find('=')
+            .expect("the inserted holder binding must remain explicit")]
+            .trim()
+            .trim_start_matches("mut ");
+        let observe_call = format!("observe_installed({binding}");
+        assert!(
+            callback.contains(observe_call.as_str())
+                && !callback.contains("InstalledTargetPreparationPermanentCleanup {")
+                && !callback.contains("TargetPreparationPermanentLedgerHolder::Prepared"),
+            "the callback must observe the exact Option::insert reference without rebuilding fields"
+        );
+
+        let integration_source = include_str!("../../bevy_ui_router_core/src/integration.rs");
+        let integration_begin = item_between(
+            integration_source,
+            "    pub fn begin_back_target_permanent_cleanup<Installation, F>(",
+            "    pub fn prepare_back_target_commit<'a>(",
+        );
+        let adapter_callback = item_between(
+            integration_begin,
+            "            |installation, inner| {",
+            "            },\n        )",
+        );
+        assert_permanent_atomic_tail_source_closed(
+            adapter_callback,
+            "Core integration installation adapter callback",
+            false,
+        );
+        assert_eq!(
+            permanent_atomic_tail_call_heads(adapter_callback),
+            vec!["install"],
+            "the adapter callback may only forward the prepared installation and construct the sealed public batch owner"
+        );
+
+        let engine_source = include_str!("../../bevy_ui_router_core/src/engine.rs");
+        let core_begin = item_between(
+            engine_source,
+            "    pub(crate) fn begin_back_target_permanent_cleanup<Installation, F>(",
+            "    pub(crate) fn complete_back_no_target_authority_cleanup<F>(",
+        );
+        let core_tail = &core_begin[core_begin
+            .find("        install(installation, batch);")
+            .expect("Core begin must retain one exact publication callback invocation")..];
+        assert_permanent_atomic_tail_source_closed(
+            core_tail,
+            "Core callback and post-callback assignment tail",
+            true,
+        );
+        assert_eq!(
+            permanent_atomic_tail_call_heads(core_tail),
+            vec!["install", "take", "Some"],
+            "after terminal preparation Core may only invoke the callback, linearly extract history, construct the holder and assign prepared state"
+        );
+    }
+
+    #[test]
+    fn back_target_permanent_source_gate_rejects_unknown_callable_syntax() {
+        let cases = [
+            ("turbofish", "allowed(); opaque::<()>()"),
+            (
+                "turbofish-whitespace",
+                "allowed ( ); opaque :: < ( ) > \n ( )",
+            ),
+            ("indexed-callable", "allowed(); CALLABLES[0]()"),
+            (
+                "indexed-callable-whitespace",
+                "allowed ( ); CALLABLES [ 0 ] \n ( )",
+            ),
+            ("block-expression-callable", "allowed(); { opaque }()"),
+            (
+                "block-expression-callable-whitespace",
+                "allowed ( ); { opaque } \n ( )",
+            ),
+            ("parenthesized-callable", "allowed(); (opaque)()"),
+            (
+                "parenthesized-callable-whitespace",
+                "allowed ( ); ( opaque ) \n ( )",
+            ),
+            (
+                "callable-comment-gap",
+                "allowed(); opaque::< /* the gap must not hide a call */ () >()",
+            ),
+            ("unicode-callable", "allowed(); 调用()"),
+            ("unicode-method", "allowed(); 对象.调用()"),
+        ];
+        let accepted = cases
+            .iter()
+            .filter_map(|(label, source)| {
+                let rejected = std::panic::catch_unwind(|| {
+                    assert_permanent_atomic_tail_source_closed(
+                        source,
+                        "synthetic unknown callable",
+                        false,
+                    );
+                    let calls = permanent_atomic_tail_call_heads(source);
+                    assert_eq!(
+                        calls,
+                        vec!["allowed"],
+                        "the fixture's explicit allowlist contains only the direct allowed call"
+                    );
+                })
+                .is_err();
+                (!rejected).then_some(*label)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            accepted.is_empty(),
+            "every nonattribute call parenthesis that cannot be parsed to an allowed direct head must fail closed: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn back_target_physical_permanent_begin_installs_prepared_before_core_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) =
+            install_classifier_permanent_fixture(&mut app, "back-target-permanent-begin-exact");
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        let expected_ticket = staged.disposition.cleanup.physical.lineage.ticket.clone();
+        let expected_manifest = staged.disposition.manifest.cleanup.projection();
+        let zero_write_before = ReadyPlanPermanentZeroWriteProjection::capture(
+            &app,
+            router,
+            staged.request,
+            staged.host,
+        );
+        let core_before = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the exact begin fixture retains its entry")
+            .engine
+            .snapshot();
+
+        let source = include_str!("navigation.rs");
+        let dispatch_and_tail = &source[source
+            .find("pub(crate) fn dispatch_back_target_permanent(")
+            .expect("the unique target permanent dispatch must remain named")..];
+        let dispatch = &dispatch_and_tail[..dispatch_and_tail
+            .find("\nfn registered_claim_has_exact_authority_and_manifest_coverage(")
+            .expect("the dispatch source boundary must remain exact")];
+        for forbidden in [
+            "dispatch_back_no_target",
+            "publish_ready_back_target",
+            "prepare_back_target_commit",
+            "CleanupLedger::activate",
+            "observe_cleanup_receipts",
+            "settle_cleanup",
+        ] {
+            assert!(
+                !dispatch.contains(forbidden),
+                "begin dispatch must not reuse a no-target/publisher/executable cleanup path: {forbidden}"
+            );
+        }
+        assert!(dispatch.contains("CleanupLedger::reserve"));
+        assert!(dispatch.contains("begin_back_target_permanent_cleanup"));
+        assert!(dispatch.contains("PreparedTargetPermanentEcsInstallationOwner"));
+        assert!(
+            std::mem::size_of::<BackTargetPermanentCleanupBatchOwner>() > 0,
+            "the unique Core batch owner must carry real opaque identity, not a ZST marker"
+        );
+        assert_eq!(
+            dispatch
+                .matches("begin_back_target_permanent_cleanup")
+                .count(),
+            1,
+            "the physical begin path must retain one unique Core begin callsite"
+        );
+
+        let observed_whole_owner = std::cell::Cell::new(false);
+        let mut navigation = app
+            .world_mut()
+            .remove_resource::<RouterNavigation>()
+            .expect("the exact begin fixture retains its navigation resource");
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the exact begin fixture retains its entry");
+            match dispatch_back_target_permanent_with_test_installation_observer(
+                app.world(),
+                entry,
+                staged.disposition,
+                |pending| {
+                    let PendingTargetPreparationPermanentCleanup::Installed(installed) = pending
+                    else {
+                        panic!("the begin observer must receive the complete installed owner")
+                    };
+                    let TargetPreparationPermanentLedgerHolder::Prepared(prepared) =
+                        &installed.ledger
+                    else {
+                        panic!("begin must install Prepared and must not activate the ledger")
+                    };
+                    assert_eq!(
+                        prepared.validation.allowed_write.targets,
+                        installed.cleanup.physical.allowed_write.targets
+                    );
+                    let ledger = prepared.ledger.projection();
+                    let batch = installed.batch.batch();
+                    assert!(batch.report_identity() == expected_ticket);
+                    assert_eq!(
+                        ledger.manifest_digest(),
+                        expected_manifest.manifest_digest()
+                    );
+                    assert_eq!(
+                        ledger.obligation_count(),
+                        expected_manifest.obligation_count()
+                    );
+                    assert_eq!(batch.manifest_digest(), expected_manifest.manifest_digest());
+                    assert_eq!(
+                        batch.obligation_count(),
+                        expected_manifest.obligation_count()
+                    );
+                    observed_whole_owner.set(true);
+                    panic!("interrupt after target Prepared owner installation");
+                },
+            ) {
+                BackTargetPermanentDispatchOutcome::Permanent { .. } => {
+                    panic!("the exact begin must not produce permanent evidence")
+                }
+                BackTargetPermanentDispatchOutcome::Dispatched => {
+                    panic!("the installation observer must interrupt before begin can return")
+                }
+                BackTargetPermanentDispatchOutcome::EntryMismatch { .. } => {
+                    panic!("the unchanged real World/current entry must pass dispatch preflight")
+                }
+                BackTargetPermanentDispatchOutcome::PreparedEntryMismatch { .. } => {
+                    panic!("the prepared ledger and frozen partition must remain exact")
+                }
+                BackTargetPermanentDispatchOutcome::LedgerRejected { .. } => {
+                    panic!("the ordinary non-empty real manifest must reserve its Prepared ledger")
+                }
+                BackTargetPermanentDispatchOutcome::ReceiverMismatch { .. } => {
+                    panic!(
+                        "the unchanged real Core continuation must pass begin receiver validation"
+                    )
+                }
+                BackTargetPermanentDispatchOutcome::LogicalRootsMismatch(_) => {
+                    panic!("the unchanged opaque Core logical-root manifest must remain exact")
+                }
+            }
+        }));
+        app.world_mut().insert_resource(navigation);
+
+        if interrupted.is_ok() {
+            assert!(!observed_whole_owner.get());
+            assert_eq!(target_permanent_begin_callback_calls(&app, router), 0);
+            assert_eq!(
+                ReadyPlanPermanentZeroWriteProjection::capture(
+                    &app,
+                    router,
+                    staged.request,
+                    staged.host,
+                ),
+                zero_write_before
+            );
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the exact begin fixture retains its entry");
+            assert_eq!(entry.engine.snapshot(), core_before);
+            assert!(entry.pending_back_target_permanent_cleanup.is_none());
+            panic!(
+                "RED: exact Core begin must callback once and install the target Prepared holder before any Core write"
+            );
+        }
+        assert!(
+            observed_whole_owner.get(),
+            "the observer must see the complete Prepared holder before interrupting begin"
+        );
+        assert_eq!(target_permanent_begin_callback_calls(&app, router), 1);
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(
+                &app,
+                router,
+                staged.request,
+                staged.host,
+            ),
+            zero_write_before,
+            "interrupting immediately after installation must precede every World/public write"
+        );
+        let navigation = app.world().resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the interrupted begin fixture retains its entry");
+        assert_eq!(
+            entry.engine.snapshot(),
+            core_before,
+            "the complete Prepared holder must be installed before the first Core write"
+        );
+        assert!(matches!(
+            entry.pending_back_target_permanent_cleanup.as_ref(),
+            Some(PendingTargetPreparationPermanentCleanup::Installed(
+                InstalledTargetPreparationPermanentCleanup {
+                    ledger: TargetPreparationPermanentLedgerHolder::Prepared(_),
+                    ..
+                }
+            ))
+        ));
     }
 
     #[derive(Component)]
@@ -30011,7 +33725,6 @@ pub(crate) mod tests {
         let TargetPreparationPermanentCleanupOwner { physical, branch } = cleanup;
         assert_eq!(physical.lineage.router, exact_router);
         assert_eq!(physical.lineage.host, exact.host);
-        let _exact_scope = &physical.lineage.scope;
         let mut target_observed = physical
             .target_observed
             .iter()
@@ -33827,7 +37540,8 @@ pub(crate) mod tests {
             | PendingBackNoTargetPreparation::ReadyCapacityRejected { .. }
             | PendingBackNoTargetPreparation::ReadyReceiverMismatch { .. }
             | PendingBackNoTargetPreparation::AuthorityDispatchBlocked { .. }
-            | PendingBackNoTargetPreparation::SourceDriftBlocked { .. } => {
+            | PendingBackNoTargetPreparation::SourceDriftBlocked { .. }
+            | PendingBackNoTargetPreparation::TestOccupied => {
                 panic!("RED: a permanent physical contradiction needs its own linear holder")
             }
         };

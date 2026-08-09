@@ -2368,12 +2368,12 @@ mod tests {
     }
 
     #[test]
-    fn current_work_clone_does_not_clone_history_capability() {
+    fn current_work_pre_retirement_clone_does_not_clone_history_capability() {
         let fixture = HistoryAuthorityFixture::running_replace("/items/2");
         let owner_before = fixture.history_capability_snapshot();
         assert!(owner_before.has_exactly_one_owner());
 
-        fixture.clone_current_work();
+        fixture.clone_current_work_pre_retirement();
 
         assert_eq!(fixture.history_capability_snapshot(), owner_before);
     }

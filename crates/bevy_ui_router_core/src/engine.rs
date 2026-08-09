@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 
 use crate::admission::{
     AdmissionError, HostAdmissionConfirmation, HostAdmissionIssuer, HostAdmissionToken, HostGrant,
-    HostLease, RetiredHostAuthority,
+    HostLease, RetiredHostAuthority, RetiredHostAuthorityProjection,
 };
 use crate::branch::{MatchedBranch, MatchedRoute, RouteParams};
 use crate::cleanup::{CleanupBatchToken, CleanupCompletion, CleanupManifestSeal};
@@ -34,8 +34,9 @@ use crate::history_authority::{
     HistoryAuthoritySnapshot, HistoryCapabilitySnapshot, HistoryDriftEvidenceSnapshot,
 };
 use crate::ids::{
-    CoreIdAllocator, FrameTaskId, NavigationRequestId, ReservedBranchAttempt, ReservedFrameAttempt,
-    RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId, RouterIdentity, TransactionId,
+    CleanupBatchId, CoreIdAllocator, FrameTaskId, NavigationRequestId, ReservedBranchAttempt,
+    ReservedFrameAttempt, RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId, RouterIdentity,
+    TransactionId,
 };
 use crate::location::RouteLocation;
 use crate::matcher::RouteMatcher;
@@ -1023,6 +1024,236 @@ pub(crate) enum BackNoTargetAuthorityBeginCoreOutcome {
     },
 }
 
+pub(crate) enum BackTargetPermanentBeginCoreOutcome<Installation> {
+    Begun,
+    ReceiverMismatch {
+        owner: CoreBackTargetPermanentSettlementOwner,
+        installation: Installation,
+        mismatch: CorePreparationReceiverMismatchProjection,
+    },
+    LogicalRootsMismatch {
+        owner: CoreBackTargetPermanentSettlementOwner,
+        installation: Installation,
+    },
+    Permanent {
+        owner: CoreBackTargetPermanentSettlementOwner,
+        installation: Installation,
+        evidence: BackTargetPermanentBeginCorePermanentEvidence,
+    },
+}
+
+pub(crate) struct CoreBackTargetPermanentSettlementOwner {
+    scope: BackResolutionScopeProjection,
+    expected_current: CoreBackTargetPermanentCurrentStateProjection,
+    expected_request: Option<CoreBackTargetPermanentRequestProjection>,
+    logical_roots: Vec<RouteFrameVersion>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BackTargetPermanentBeginCorePermanentEvidence {
+    CurrentStateContradiction {
+        expected: CoreBackTargetPermanentCurrentStateProjection,
+        observed: CoreBackTargetPermanentCurrentStateProjection,
+    },
+    CanonicalRelationContradiction {
+        expected: CoreBackTargetPermanentCanonicalRelationProjection,
+        observed: CoreBackTargetPermanentCanonicalRelationProjection,
+    },
+    RequestRecordContradiction {
+        expected: Option<CoreBackTargetPermanentRequestProjection>,
+        observed: Option<CoreBackTargetPermanentRequestProjection>,
+    },
+    TerminalPlanContradiction {
+        source: CoreBackTargetPermanentTerminalSourceProjection,
+        expected: CoreBackTargetPermanentTerminalExpectedProjection,
+        observed: CoreBackTargetPermanentTerminalObservedProjection,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetPermanentCanonicalRelationProjection {
+    request: Option<CoreBackTargetPermanentRequestProjection>,
+    request_status: Option<RequestStatus>,
+    location: Option<RouteLocation>,
+    logical_roots: Vec<RouteFrameVersion>,
+    cleanup_roots: Option<Vec<RouteFrameVersion>>,
+    reconciliation: Option<RouteReconciliationProjection>,
+    active: CoreBackTargetPermanentActiveRelationProjection,
+    stage: CoreBackTargetReceiverStageProjection,
+    availability: crate::presentation::RouterAvailability,
+    retired_host: Option<RetiredHostAuthorityProjection>,
+    pending_mount: Option<CoreBackTargetPendingMountProjection>,
+    forbidden_pending: CoreBackTargetPermanentForbiddenPendingProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CoreBackTargetPermanentActiveRelationProjection {
+    Reconciliation(RouteReconciliationProjection),
+    ReconciliationRequired,
+    Active(BackTargetPreparationBaseline),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoreBackTargetPermanentForbiddenPendingProjection {
+    pending_no_target: Option<NavigationRequestId>,
+    pending_no_target_authority: Option<CoreBackTargetPermanentNoTargetAuthorityProjection>,
+    pending_target_cleanup: Option<CoreBackTargetPermanentCleanupProjection>,
+    history_preparation_error: CoreBackTargetPermanentHistoryPreparationErrorProjection,
+    prepared_publication: Option<SealedCommitEvidence>,
+    action: CoreBackTargetReceiverActionProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetPermanentCurrentStateProjection {
+    pub(crate) host: Option<HostVersion>,
+    pub(crate) top_slot: Option<RouteSlotId>,
+    pub(crate) current_identity: Option<FrameTaskIdentity>,
+    pub(crate) current_location: Option<RouteLocation>,
+    pub(crate) current_stage: CoreBackTargetReceiverStageProjection,
+    pub(crate) current_logical_roots: Option<Vec<RouteFrameVersion>>,
+    pub(crate) current_reconciliation: Option<RouteReconciliationProjection>,
+    pub(crate) current_retired_host: Option<RetiredHostAuthorityProjection>,
+    pub(crate) active_baseline: BackTargetPreparationBaseline,
+    pub(crate) availability: crate::presentation::RouterAvailability,
+    pub(crate) request_status: Option<RequestStatus>,
+    pub(crate) history_binding: Option<HistoryExecutionBindingProjection>,
+    pub(crate) pending_no_target: Option<NavigationRequestId>,
+    pub(crate) pending_no_target_authority:
+        Option<CoreBackTargetPermanentNoTargetAuthorityProjection>,
+    pub(crate) pending_target_cleanup: Option<CoreBackTargetPermanentCleanupProjection>,
+    pub(crate) history_preparation_error: CoreBackTargetPermanentHistoryPreparationErrorProjection,
+    pub(crate) prepared_publication: Option<SealedCommitEvidence>,
+    pub(crate) action: CoreBackTargetReceiverActionProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CoreBackTargetPermanentNoTargetAuthorityProjection {
+    Accepted {
+        receiver: BackResolutionEvidence,
+        source: CoreFrozenHistorySourceProjection,
+        host: HostVersion,
+        top_slot: RouteSlotId,
+        logical_roots: Vec<RouteFrameVersion>,
+    },
+    Cleanup(CoreBackNoTargetAuthorityCleanupProjection),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoreBackTargetPermanentHistoryPreparationErrorProjection {
+    Vacant,
+    SourceDrift,
+    BindingDrift,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoreBackTargetPermanentTerminalOperation {
+    RecoveringTransition,
+    RecoveringTrace,
+    QueuedTerminalTransition,
+    QueuedTerminalTrace,
+    AuthorityRecovery,
+    RecoveringRetention,
+    CleanupSettledTrace,
+    TerminalTransition,
+    RequestTerminalTrace,
+    AuthoritySettlement,
+    TerminalRetention,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetPermanentRequestProjection {
+    pub(crate) request: NavigationRequestId,
+    pub(crate) status: RequestStatus,
+    pub(crate) requested: Option<RouteLocation>,
+    pub(crate) trace_closed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetPermanentAuthorityProjection {
+    pub(crate) host: Option<HostVersion>,
+    pub(crate) top_slot: Option<RouteSlotId>,
+    pub(crate) availability: crate::presentation::RouterAvailability,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetPermanentRetentionProjection {
+    pub(crate) limit: usize,
+    pub(crate) terminal_count: usize,
+    pub(crate) records: Vec<CoreBackTargetPermanentRequestProjection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetPermanentTerminalSourceProjection {
+    pub(crate) scope: BackResolutionScopeProjection,
+    pub(crate) current: CoreBackTargetPermanentCurrentStateProjection,
+    pub(crate) current_request: CoreBackTargetPermanentRequestProjection,
+    pub(crate) queue: Vec<CoreBackTargetPermanentQueuedRequestProjection>,
+    pub(crate) authority: CoreBackTargetPermanentAuthorityProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetPermanentQueuedRequestProjection {
+    pub(crate) expected: CoreBackTargetPermanentRequestProjection,
+    pub(crate) observed: Option<CoreBackTargetPermanentRequestProjection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CoreBackTargetPermanentTerminalExpectedProjection {
+    Request {
+        operation: CoreBackTargetPermanentTerminalOperation,
+        request: CoreBackTargetPermanentRequestProjection,
+    },
+    Authority {
+        operation: CoreBackTargetPermanentTerminalOperation,
+        authority: CoreBackTargetPermanentAuthorityProjection,
+    },
+    Retention {
+        operation: CoreBackTargetPermanentTerminalOperation,
+        retention: CoreBackTargetPermanentRetentionProjection,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoreBackTargetPermanentTerminalFailureProjection {
+    MissingRequest,
+    RequestRejected(RequestRecordError),
+    AuthorityRecoveryRejected,
+    AuthoritySettlementRejected,
+    RetentionInvariant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CoreBackTargetPermanentTerminalObservedProjection {
+    Request {
+        operation: CoreBackTargetPermanentTerminalOperation,
+        request: Option<CoreBackTargetPermanentRequestProjection>,
+        failure: CoreBackTargetPermanentTerminalFailureProjection,
+    },
+    Authority {
+        operation: CoreBackTargetPermanentTerminalOperation,
+        authority: CoreBackTargetPermanentAuthorityProjection,
+        failure: CoreBackTargetPermanentTerminalFailureProjection,
+    },
+    Retention {
+        operation: CoreBackTargetPermanentTerminalOperation,
+        retention: CoreBackTargetPermanentRetentionProjection,
+        failure: CoreBackTargetPermanentTerminalFailureProjection,
+    },
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct BackTargetPermanentBeginTestingProjection {
+    pub(crate) cleanup_owner_count: usize,
+    pub(crate) current_owner_count: usize,
+    pub(crate) action_owner_count: usize,
+    pub(crate) current_history_slot_count: usize,
+    pub(crate) cleanup_history_owner_count: usize,
+    pub(crate) cleanup_settlement_owner_count: usize,
+    pub(crate) queue_len: usize,
+    pub(crate) conflicting_owner_count: usize,
+}
+
 pub(crate) enum BackNoTargetSourceDriftSettlementOutcome {
     Settled(BackNoTargetSourceDriftTerminalEvidence),
     Mismatch {
@@ -1858,7 +2089,7 @@ enum AttemptKind {
     Fallback { original_failure: NavigationFailure },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct CurrentWork {
     identity: FrameTaskIdentity,
     branch: Option<MatchedBranch>,
@@ -1874,6 +2105,30 @@ struct CurrentWork {
     attempt: AttemptKind,
     reconciliation: Option<RouteReconciliationProjection>,
     retired_host: Option<RetiredHostAuthority>,
+}
+
+impl CurrentWork {
+    fn clone_pre_retirement(&self) -> Option<Self> {
+        if self.retired_host.is_some() {
+            return None;
+        }
+        Some(Self {
+            identity: self.identity.clone(),
+            branch: self.branch.clone(),
+            location: self.location.clone(),
+            reservation: self.reservation.clone(),
+            target_frames: self.target_frames.clone(),
+            applied_frames: self.applied_frames.clone(),
+            current_target: self.current_target.clone(),
+            pending_mount: self.pending_mount.clone(),
+            stage: self.stage.clone(),
+            cleanup_batch: self.cleanup_batch,
+            cleanup_roots: self.cleanup_roots.clone(),
+            attempt: self.attempt.clone(),
+            reconciliation: self.reconciliation.clone(),
+            retired_host: None,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1971,6 +2226,33 @@ struct CoreBackNoTargetAuthorityCleanupState {
     receiver: CoreBackNoTargetAuthorityCleanupProjection,
     retired_host: RetiredHostAuthority,
     terminal: CoreBackNoTargetAuthorityTerminalPlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetPermanentCleanupProjection {
+    scope: BackResolutionScopeProjection,
+    commit: FrameTaskIdentity,
+    batch: CleanupBatchId,
+    logical_roots: Vec<RouteFrameVersion>,
+    manifest_digest: u64,
+    obligation_count: usize,
+}
+
+struct CoreBackTargetPermanentTerminalPlan {
+    state: RouterNavigationState,
+    records: VecDeque<NavigationRequestRecord>,
+    evicted_through: Option<u64>,
+    issued_view_tasks: Vec<FrameTaskIdentity>,
+    report_dispositions: Vec<ReportDispositionRecord>,
+    completed_cleanup: Vec<CompletedCleanupTombstone>,
+    active_child_slots: Vec<LogicalChildSlotBinding>,
+}
+
+struct CoreBackTargetPermanentCleanupState {
+    receiver: CoreBackTargetPermanentCleanupProjection,
+    history: Option<HistoryCommitCapability>,
+    settlement: CoreBackTargetPermanentSettlementOwner,
+    terminal: CoreBackTargetPermanentTerminalPlan,
 }
 
 enum CorePendingBackNoTargetAuthority {
@@ -2091,6 +2373,7 @@ pub(crate) struct RouterEngine {
     next_failed_authority_trigger_revision: u64,
     live_failed_authority_trigger_revision: Option<u64>,
     pending_back_no_target_authority: Option<CorePendingBackNoTargetAuthority>,
+    pending_back_target_permanent_cleanup: Option<CoreBackTargetPermanentCleanupState>,
     #[cfg(test)]
     testing_back_target_source_drift_before_freeze_once: bool,
 }
@@ -2132,6 +2415,7 @@ impl RouterEngine {
             next_failed_authority_trigger_revision: 1,
             live_failed_authority_trigger_revision: None,
             pending_back_no_target_authority: None,
+            pending_back_target_permanent_cleanup: None,
             #[cfg(test)]
             testing_back_target_source_drift_before_freeze_once: false,
         })
@@ -3636,6 +3920,575 @@ impl RouterEngine {
         self.completed_cleanup = recovering_completed_cleanup;
         self.queue.clear();
         BackNoTargetAuthorityBeginCoreOutcome::Begun
+    }
+
+    pub(crate) fn begin_back_target_permanent_cleanup<Installation, F>(
+        &mut self,
+        settlement: CoreBackTargetPermanentSettlementOwner,
+        ticket: &CommitTicket,
+        logical_roots: Vec<RouteFrameVersion>,
+        manifest_digest: u64,
+        obligation_count: usize,
+        installation: Installation,
+        install: F,
+    ) -> BackTargetPermanentBeginCoreOutcome<Installation>
+    where
+        F: FnOnce(Installation, CleanupBatchToken),
+    {
+        if let Err(mismatch) =
+            self.inspect_back_target_continuation(&settlement.scope, Some(ticket))
+        {
+            return BackTargetPermanentBeginCoreOutcome::ReceiverMismatch {
+                owner: settlement,
+                installation,
+                mismatch,
+            };
+        }
+        if settlement.logical_roots != logical_roots {
+            return BackTargetPermanentBeginCoreOutcome::LogicalRootsMismatch {
+                owner: settlement,
+                installation,
+            };
+        }
+
+        let observed_current = self.back_target_permanent_current_state_projection();
+        if observed_current != settlement.expected_current {
+            return BackTargetPermanentBeginCoreOutcome::Permanent {
+                evidence:
+                    BackTargetPermanentBeginCorePermanentEvidence::CurrentStateContradiction {
+                        expected: settlement.expected_current.clone(),
+                        observed: observed_current,
+                    },
+                owner: settlement,
+                installation,
+            };
+        }
+        let (expected_canonical, observed_canonical) =
+            self.back_target_permanent_canonical_relation_projections(&settlement);
+        if expected_canonical != observed_canonical {
+            return BackTargetPermanentBeginCoreOutcome::Permanent {
+                evidence:
+                    BackTargetPermanentBeginCorePermanentEvidence::CanonicalRelationContradiction {
+                        expected: expected_canonical,
+                        observed: observed_canonical,
+                    },
+                owner: settlement,
+                installation,
+            };
+        }
+
+        let request = settlement.scope.request();
+        let observed_request = self
+            .records
+            .iter()
+            .find(|record| record.id() == request)
+            .map(Self::back_target_permanent_request_projection);
+        let exact_request_record = observed_request.as_ref().is_some_and(|observed| {
+            settlement
+                .expected_request
+                .as_ref()
+                .is_some_and(|expected| {
+                    observed.request == expected.request
+                        && observed.status == expected.status
+                        && observed.requested == expected.requested
+                })
+        });
+        if !exact_request_record {
+            return BackTargetPermanentBeginCoreOutcome::Permanent {
+                evidence:
+                    BackTargetPermanentBeginCorePermanentEvidence::RequestRecordContradiction {
+                        expected: settlement.expected_request.clone(),
+                        observed: observed_request,
+                    },
+                owner: settlement,
+                installation,
+            };
+        }
+
+        let current = self
+            .current
+            .as_ref()
+            .expect("the exact frozen current projection retains current work");
+        let host = self
+            .state
+            .host()
+            .cloned()
+            .expect("the exact frozen current projection retains host authority");
+        let top_slot = self
+            .state
+            .top_slot()
+            .expect("the exact frozen current projection retains the top slot");
+        let record_index = self
+            .records
+            .iter()
+            .position(|record| record.id() == request)
+            .expect("the exact frozen request projection retains its record");
+        let cleanup_batch = current.cleanup_batch;
+
+        let source = CoreBackTargetPermanentTerminalSourceProjection {
+            scope: settlement.scope.clone(),
+            current: observed_current,
+            current_request: observed_request
+                .expect("the exact frozen request projection retains its record"),
+            queue: self
+                .queue
+                .iter()
+                .map(|queued| CoreBackTargetPermanentQueuedRequestProjection {
+                    expected: CoreBackTargetPermanentRequestProjection {
+                        request: queued.request,
+                        status: RequestStatus::Queued,
+                        requested: queued.command.location().cloned(),
+                        trace_closed: false,
+                    },
+                    observed: self
+                        .records
+                        .iter()
+                        .find(|record| record.id() == queued.request)
+                        .map(Self::back_target_permanent_request_projection),
+                })
+                .collect(),
+            authority: Self::back_target_permanent_authority_projection(&self.state),
+        };
+
+        let failure = NavigationFailure::new(
+            NavigationFailureKind::AuthorityLost,
+            "physical back-target cleanup authority was lost after splice preparation",
+        );
+        let mut recovering_records = self.records.clone();
+        let recovering_record = recovering_records
+            .get_mut(record_index)
+            .expect("the clone retains the exact frozen record index");
+        let recovering_expected = CoreBackTargetPermanentRequestProjection {
+            request,
+            status: RequestStatus::Running(NavigationPhase::Recovering),
+            requested: recovering_record.requested().cloned(),
+            trace_closed: recovering_record.trace_closed(),
+        };
+        if let Err(error) =
+            recovering_record.transition(RequestStatus::Running(NavigationPhase::Recovering))
+        {
+            return BackTargetPermanentBeginCoreOutcome::Permanent {
+                evidence:
+                    BackTargetPermanentBeginCorePermanentEvidence::TerminalPlanContradiction {
+                        source,
+                        expected: CoreBackTargetPermanentTerminalExpectedProjection::Request {
+                            operation:
+                                CoreBackTargetPermanentTerminalOperation::RecoveringTransition,
+                            request: recovering_expected,
+                        },
+                        observed: CoreBackTargetPermanentTerminalObservedProjection::Request {
+                            operation:
+                                CoreBackTargetPermanentTerminalOperation::RecoveringTransition,
+                            request: Some(Self::back_target_permanent_request_projection(
+                                recovering_record,
+                            )),
+                            failure:
+                                CoreBackTargetPermanentTerminalFailureProjection::RequestRejected(
+                                    error,
+                                ),
+                        },
+                    },
+                owner: settlement,
+                installation,
+            };
+        }
+        let recovering_trace_expected = CoreBackTargetPermanentRequestProjection {
+            trace_closed: false,
+            ..recovering_expected
+        };
+        if let Err(error) = recovering_record.append_trace(
+            NavigationTraceEvent::request_phase_changed(NavigationPhase::Recovering),
+        ) {
+            return BackTargetPermanentBeginCoreOutcome::Permanent {
+                evidence:
+                    BackTargetPermanentBeginCorePermanentEvidence::TerminalPlanContradiction {
+                        source,
+                        expected: CoreBackTargetPermanentTerminalExpectedProjection::Request {
+                            operation: CoreBackTargetPermanentTerminalOperation::RecoveringTrace,
+                            request: recovering_trace_expected,
+                        },
+                        observed: CoreBackTargetPermanentTerminalObservedProjection::Request {
+                            operation: CoreBackTargetPermanentTerminalOperation::RecoveringTrace,
+                            request: Some(Self::back_target_permanent_request_projection(
+                                recovering_record,
+                            )),
+                            failure:
+                                CoreBackTargetPermanentTerminalFailureProjection::RequestRejected(
+                                    error,
+                                ),
+                        },
+                    },
+                owner: settlement,
+                installation,
+            };
+        }
+
+        for queued in &self.queue {
+            let Some(record) = recovering_records
+                .iter_mut()
+                .find(|record| record.id() == queued.request)
+            else {
+                let expected = CoreBackTargetPermanentRequestProjection {
+                    request: queued.request,
+                    status: RequestStatus::Queued,
+                    requested: queued.command.location().cloned(),
+                    trace_closed: false,
+                };
+                return BackTargetPermanentBeginCoreOutcome::Permanent {
+                    evidence: BackTargetPermanentBeginCorePermanentEvidence::TerminalPlanContradiction {
+                        source,
+                        expected: CoreBackTargetPermanentTerminalExpectedProjection::Request {
+                            operation: CoreBackTargetPermanentTerminalOperation::QueuedTerminalTransition,
+                            request: expected,
+                        },
+                        observed: CoreBackTargetPermanentTerminalObservedProjection::Request {
+                            operation: CoreBackTargetPermanentTerminalOperation::QueuedTerminalTransition,
+                            request: None,
+                            failure: CoreBackTargetPermanentTerminalFailureProjection::MissingRequest,
+                        },
+                    },
+                    owner: settlement,
+                    installation,
+                };
+            };
+            let queued_failure = NavigationFailure::new(
+                NavigationFailureKind::AuthorityLost,
+                "router authority was lost before request start",
+            );
+            let transition_expected = CoreBackTargetPermanentRequestProjection {
+                request: record.id(),
+                status: RequestStatus::Failed(queued_failure.clone()),
+                requested: record.requested().cloned(),
+                trace_closed: record.trace_closed(),
+            };
+            if let Err(error) = record.transition(RequestStatus::Failed(queued_failure)) {
+                return BackTargetPermanentBeginCoreOutcome::Permanent {
+                    evidence: BackTargetPermanentBeginCorePermanentEvidence::TerminalPlanContradiction {
+                        source,
+                        expected: CoreBackTargetPermanentTerminalExpectedProjection::Request {
+                            operation: CoreBackTargetPermanentTerminalOperation::QueuedTerminalTransition,
+                            request: transition_expected,
+                        },
+                        observed: CoreBackTargetPermanentTerminalObservedProjection::Request {
+                            operation: CoreBackTargetPermanentTerminalOperation::QueuedTerminalTransition,
+                            request: Some(Self::back_target_permanent_request_projection(record)),
+                            failure: CoreBackTargetPermanentTerminalFailureProjection::RequestRejected(error),
+                        },
+                    },
+                    owner: settlement,
+                    installation,
+                };
+            }
+            let trace_expected = CoreBackTargetPermanentRequestProjection {
+                trace_closed: true,
+                ..transition_expected
+            };
+            if let Err(error) = record.append_trace(NavigationTraceEvent::request_terminal()) {
+                return BackTargetPermanentBeginCoreOutcome::Permanent {
+                    evidence: BackTargetPermanentBeginCorePermanentEvidence::TerminalPlanContradiction {
+                        source,
+                        expected: CoreBackTargetPermanentTerminalExpectedProjection::Request {
+                            operation: CoreBackTargetPermanentTerminalOperation::QueuedTerminalTrace,
+                            request: trace_expected,
+                        },
+                        observed: CoreBackTargetPermanentTerminalObservedProjection::Request {
+                            operation: CoreBackTargetPermanentTerminalOperation::QueuedTerminalTrace,
+                            request: Some(Self::back_target_permanent_request_projection(record)),
+                            failure: CoreBackTargetPermanentTerminalFailureProjection::RequestRejected(error),
+                        },
+                    },
+                    owner: settlement,
+                    installation,
+                };
+            }
+        }
+
+        let mut recovering_state = self.state.clone();
+        if !recovering_state.begin_authority_recovery(&host, top_slot) {
+            return BackTargetPermanentBeginCoreOutcome::Permanent {
+                evidence: BackTargetPermanentBeginCorePermanentEvidence::TerminalPlanContradiction {
+                    source,
+                    expected: CoreBackTargetPermanentTerminalExpectedProjection::Authority {
+                        operation: CoreBackTargetPermanentTerminalOperation::AuthorityRecovery,
+                        authority: CoreBackTargetPermanentAuthorityProjection {
+                            host: Some(host),
+                            top_slot: Some(top_slot),
+                            availability: crate::presentation::RouterAvailability::RecoveringAuthority,
+                        },
+                    },
+                    observed: CoreBackTargetPermanentTerminalObservedProjection::Authority {
+                        operation: CoreBackTargetPermanentTerminalOperation::AuthorityRecovery,
+                        authority: Self::back_target_permanent_authority_projection(&recovering_state),
+                        failure: CoreBackTargetPermanentTerminalFailureProjection::AuthorityRecoveryRejected,
+                    },
+                },
+                owner: settlement,
+                installation,
+            };
+        }
+        recovering_state.set_request(Some(RequestStatus::Running(NavigationPhase::Recovering)));
+
+        let mut recovering_evicted_through = self.evicted_through;
+        let mut recovering_issued_view_tasks = self.issued_view_tasks.clone();
+        let mut recovering_report_dispositions = self.report_dispositions.clone();
+        let mut recovering_completed_cleanup = self.completed_cleanup.clone();
+        while recovering_records
+            .iter()
+            .filter(|record| is_terminal(record.status()))
+            .count()
+            > TERMINAL_RETENTION
+        {
+            let Some(index) = recovering_records
+                .iter()
+                .position(|record| is_terminal(record.status()))
+            else {
+                let retention =
+                    Self::back_target_permanent_retention_projection(&recovering_records);
+                return BackTargetPermanentBeginCoreOutcome::Permanent {
+                    evidence: BackTargetPermanentBeginCorePermanentEvidence::TerminalPlanContradiction {
+                        source,
+                        expected: CoreBackTargetPermanentTerminalExpectedProjection::Retention {
+                            operation: CoreBackTargetPermanentTerminalOperation::RecoveringRetention,
+                            retention: retention.clone(),
+                        },
+                        observed: CoreBackTargetPermanentTerminalObservedProjection::Retention {
+                            operation: CoreBackTargetPermanentTerminalOperation::RecoveringRetention,
+                            retention,
+                            failure: CoreBackTargetPermanentTerminalFailureProjection::RetentionInvariant,
+                        },
+                    },
+                    owner: settlement,
+                    installation,
+                };
+            };
+            let evicted = recovering_records
+                .remove(index)
+                .expect("the located terminal clone entry remains removable");
+            let evicted_request = evicted.id();
+            recovering_issued_view_tasks.retain(|identity| identity.request != evicted_request);
+            recovering_report_dispositions
+                .retain(|record| record.target != DiagnosticTarget::Request(evicted_request));
+            recovering_completed_cleanup.retain(|tombstone| tombstone.request != evicted_request);
+            let sequence = evicted_request.sequence();
+            recovering_evicted_through =
+                Some(recovering_evicted_through.map_or(sequence, |current| current.max(sequence)));
+        }
+
+        let mut terminal_records = recovering_records.clone();
+        let terminal_record = terminal_records
+            .iter_mut()
+            .find(|record| record.id() == request)
+            .expect("the recovering clone retains the current request");
+        let cleanup_trace_expected = CoreBackTargetPermanentRequestProjection {
+            request,
+            status: terminal_record.status().clone(),
+            requested: terminal_record.requested().cloned(),
+            trace_closed: false,
+        };
+        if let Err(error) =
+            terminal_record.append_trace(NavigationTraceEvent::cleanup_settled(None))
+        {
+            return BackTargetPermanentBeginCoreOutcome::Permanent {
+                evidence:
+                    BackTargetPermanentBeginCorePermanentEvidence::TerminalPlanContradiction {
+                        source,
+                        expected: CoreBackTargetPermanentTerminalExpectedProjection::Request {
+                            operation:
+                                CoreBackTargetPermanentTerminalOperation::CleanupSettledTrace,
+                            request: cleanup_trace_expected,
+                        },
+                        observed: CoreBackTargetPermanentTerminalObservedProjection::Request {
+                            operation:
+                                CoreBackTargetPermanentTerminalOperation::CleanupSettledTrace,
+                            request: Some(Self::back_target_permanent_request_projection(
+                                terminal_record,
+                            )),
+                            failure:
+                                CoreBackTargetPermanentTerminalFailureProjection::RequestRejected(
+                                    error,
+                                ),
+                        },
+                    },
+                owner: settlement,
+                installation,
+            };
+        }
+        let terminal_expected = CoreBackTargetPermanentRequestProjection {
+            request,
+            status: RequestStatus::Failed(failure.clone()),
+            requested: terminal_record.requested().cloned(),
+            trace_closed: terminal_record.trace_closed(),
+        };
+        if let Err(error) = terminal_record.transition(RequestStatus::Failed(failure)) {
+            return BackTargetPermanentBeginCoreOutcome::Permanent {
+                evidence:
+                    BackTargetPermanentBeginCorePermanentEvidence::TerminalPlanContradiction {
+                        source,
+                        expected: CoreBackTargetPermanentTerminalExpectedProjection::Request {
+                            operation: CoreBackTargetPermanentTerminalOperation::TerminalTransition,
+                            request: terminal_expected,
+                        },
+                        observed: CoreBackTargetPermanentTerminalObservedProjection::Request {
+                            operation: CoreBackTargetPermanentTerminalOperation::TerminalTransition,
+                            request: Some(Self::back_target_permanent_request_projection(
+                                terminal_record,
+                            )),
+                            failure:
+                                CoreBackTargetPermanentTerminalFailureProjection::RequestRejected(
+                                    error,
+                                ),
+                        },
+                    },
+                owner: settlement,
+                installation,
+            };
+        }
+        let terminal_trace_expected = CoreBackTargetPermanentRequestProjection {
+            trace_closed: true,
+            ..terminal_expected
+        };
+        if let Err(error) = terminal_record.append_trace(NavigationTraceEvent::request_terminal()) {
+            return BackTargetPermanentBeginCoreOutcome::Permanent {
+                evidence:
+                    BackTargetPermanentBeginCorePermanentEvidence::TerminalPlanContradiction {
+                        source,
+                        expected: CoreBackTargetPermanentTerminalExpectedProjection::Request {
+                            operation:
+                                CoreBackTargetPermanentTerminalOperation::RequestTerminalTrace,
+                            request: terminal_trace_expected,
+                        },
+                        observed: CoreBackTargetPermanentTerminalObservedProjection::Request {
+                            operation:
+                                CoreBackTargetPermanentTerminalOperation::RequestTerminalTrace,
+                            request: Some(Self::back_target_permanent_request_projection(
+                                terminal_record,
+                            )),
+                            failure:
+                                CoreBackTargetPermanentTerminalFailureProjection::RequestRejected(
+                                    error,
+                                ),
+                        },
+                    },
+                owner: settlement,
+                installation,
+            };
+        }
+
+        let mut terminal_state = recovering_state.clone();
+        if !terminal_state.complete_authority_settlement(&host, top_slot) {
+            return BackTargetPermanentBeginCoreOutcome::Permanent {
+                evidence: BackTargetPermanentBeginCorePermanentEvidence::TerminalPlanContradiction {
+                    source,
+                    expected: CoreBackTargetPermanentTerminalExpectedProjection::Authority {
+                        operation: CoreBackTargetPermanentTerminalOperation::AuthoritySettlement,
+                        authority: CoreBackTargetPermanentAuthorityProjection {
+                            host: None,
+                            top_slot: None,
+                            availability: crate::presentation::RouterAvailability::AwaitingHost,
+                        },
+                    },
+                    observed: CoreBackTargetPermanentTerminalObservedProjection::Authority {
+                        operation: CoreBackTargetPermanentTerminalOperation::AuthoritySettlement,
+                        authority: Self::back_target_permanent_authority_projection(&terminal_state),
+                        failure: CoreBackTargetPermanentTerminalFailureProjection::AuthoritySettlementRejected,
+                    },
+                },
+                owner: settlement,
+                installation,
+            };
+        }
+        terminal_state.set_request(None);
+        let mut terminal_evicted_through = recovering_evicted_through;
+        let mut terminal_issued_view_tasks = recovering_issued_view_tasks.clone();
+        let mut terminal_report_dispositions = recovering_report_dispositions.clone();
+        let mut terminal_completed_cleanup = recovering_completed_cleanup.clone();
+        while terminal_records
+            .iter()
+            .filter(|record| is_terminal(record.status()))
+            .count()
+            > TERMINAL_RETENTION
+        {
+            let Some(index) = terminal_records
+                .iter()
+                .position(|record| is_terminal(record.status()))
+            else {
+                let retention = Self::back_target_permanent_retention_projection(&terminal_records);
+                return BackTargetPermanentBeginCoreOutcome::Permanent {
+                    evidence: BackTargetPermanentBeginCorePermanentEvidence::TerminalPlanContradiction {
+                        source,
+                        expected: CoreBackTargetPermanentTerminalExpectedProjection::Retention {
+                            operation: CoreBackTargetPermanentTerminalOperation::TerminalRetention,
+                            retention: retention.clone(),
+                        },
+                        observed: CoreBackTargetPermanentTerminalObservedProjection::Retention {
+                            operation: CoreBackTargetPermanentTerminalOperation::TerminalRetention,
+                            retention,
+                            failure: CoreBackTargetPermanentTerminalFailureProjection::RetentionInvariant,
+                        },
+                    },
+                    owner: settlement,
+                    installation,
+                };
+            };
+            let evicted = terminal_records
+                .remove(index)
+                .expect("the located terminal clone entry remains removable");
+            let evicted_request = evicted.id();
+            terminal_issued_view_tasks.retain(|identity| identity.request != evicted_request);
+            terminal_report_dispositions
+                .retain(|record| record.target != DiagnosticTarget::Request(evicted_request));
+            terminal_completed_cleanup.retain(|tombstone| tombstone.request != evicted_request);
+            let sequence = evicted_request.sequence();
+            terminal_evicted_through =
+                Some(terminal_evicted_through.map_or(sequence, |current| current.max(sequence)));
+        }
+
+        let receiver = CoreBackTargetPermanentCleanupProjection {
+            scope: settlement.scope.clone(),
+            commit: ticket.identity.clone(),
+            batch: cleanup_batch,
+            logical_roots: logical_roots.clone(),
+            manifest_digest,
+            obligation_count,
+        };
+        let batch = CleanupBatchToken::sealed(
+            ticket.identity.clone(),
+            cleanup_batch,
+            &logical_roots,
+            crate::cleanup::CleanupManifestDigest::from_opaque(manifest_digest),
+            obligation_count,
+        );
+        let terminal = CoreBackTargetPermanentTerminalPlan {
+            state: terminal_state,
+            records: terminal_records,
+            evicted_through: terminal_evicted_through,
+            issued_view_tasks: terminal_issued_view_tasks,
+            report_dispositions: terminal_report_dispositions,
+            completed_cleanup: terminal_completed_cleanup,
+            active_child_slots: Vec::new(),
+        };
+        let recovering_queue = VecDeque::new();
+
+        install(installation, batch);
+        let history = self.current_history_capability.take();
+        self.pending_back_target_permanent_cleanup = Some(CoreBackTargetPermanentCleanupState {
+            receiver,
+            history,
+            settlement,
+            terminal,
+        });
+        self.records = recovering_records;
+        self.state = recovering_state;
+        self.evicted_through = recovering_evicted_through;
+        self.issued_view_tasks = recovering_issued_view_tasks;
+        self.report_dispositions = recovering_report_dispositions;
+        self.completed_cleanup = recovering_completed_cleanup;
+        self.queue = recovering_queue;
+        self.current = None;
+        self.pending_history_preparation_error = None;
+        self.prepared_publication_authority = None;
+        self.action = None;
+        BackTargetPermanentBeginCoreOutcome::Begun
     }
 
     pub(crate) fn complete_back_no_target_authority_cleanup<F>(
@@ -6709,6 +7562,7 @@ impl RouterEngine {
             return Err(CommitError::InvalidManifest);
         }
 
+        let current = current.clone_pre_retirement().ok_or(CommitError::Stale)?;
         let cleanup = CleanupBatchToken::sealed(
             current.identity.clone(),
             current.cleanup_batch,
@@ -6716,10 +7570,7 @@ impl RouterEngine {
             seal.manifest_digest(),
             seal.obligation_count(),
         );
-        let is_normal = self
-            .current
-            .as_ref()
-            .is_some_and(|current| matches!(&current.attempt, AttemptKind::Normal(_)));
+        let is_normal = matches!(&current.attempt, AttemptKind::Normal(_));
         let history_capability = if is_normal {
             match self.current_history_capability.take() {
                 Some(capability) => Some(capability),
@@ -6729,22 +7580,23 @@ impl RouterEngine {
             debug_assert!(self.current_history_capability.is_none());
             None
         };
-        let publication = match self.precompute_publication(cleanup.clone(), history_capability) {
-            Ok(publication) => publication,
-            Err(error) => {
-                debug_assert!(error.evidence_is_consistent_for(ticket.identity.request));
-                self.pending_history_preparation_error = Some(error);
-                let failure = self.begin_failure_cleanup(
-                    PendingFailureKind::AuthorityLost,
-                    NavigationFailure::new(
-                        NavigationFailureKind::AuthorityLost,
-                        "canonical history source or execution binding drifted",
-                    ),
-                );
-                self.action = Some(EngineAction::FailureCleanup(failure));
-                return Err(CommitError::Stale);
-            }
-        };
+        let publication =
+            match self.precompute_publication(current, cleanup.clone(), history_capability) {
+                Ok(publication) => publication,
+                Err(error) => {
+                    debug_assert!(error.evidence_is_consistent_for(ticket.identity.request));
+                    self.pending_history_preparation_error = Some(error);
+                    let failure = self.begin_failure_cleanup(
+                        PendingFailureKind::AuthorityLost,
+                        NavigationFailure::new(
+                            NavigationFailureKind::AuthorityLost,
+                            "canonical history source or execution binding drifted",
+                        ),
+                    );
+                    self.action = Some(EngineAction::FailureCleanup(failure));
+                    return Err(CommitError::Stale);
+                }
+            };
         let evidence = SealedCommitEvidence {
             identity: ticket.identity.clone(),
             cleanup_batch: cleanup.batch(),
@@ -6881,6 +7733,19 @@ impl RouterEngine {
         };
         current.identity.host_epoch = host_epoch;
         true
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_remove_back_target_permanent_current_reconciliation(&mut self) -> bool {
+        self.current
+            .as_mut()
+            .and_then(|current| current.reconciliation.take())
+            .is_some()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_remove_back_target_permanent_active_branch(&mut self) -> bool {
+        self.active_branch.take().is_some()
     }
 
     #[cfg(test)]
@@ -8424,7 +9289,11 @@ impl RouterEngine {
         if !self.has_live_mount_context(&WorkStage::ConfirmingMount, None) {
             return Err(MountError::WrongPhase);
         }
-        let mut current = self.current.clone().ok_or(MountError::WrongPhase)?;
+        let mut current = self
+            .current
+            .as_ref()
+            .and_then(CurrentWork::clone_pre_retirement)
+            .ok_or(MountError::WrongPhase)?;
         let pending = current.pending_mount.take().ok_or(MountError::WrongPhase)?;
         let index = pending.child_index;
         let matched = current
@@ -8749,13 +9618,10 @@ impl RouterEngine {
 
     fn precompute_publication(
         &self,
+        mut current: CurrentWork,
         cleanup: CleanupBatchToken,
         history_capability: Option<HistoryCommitCapability>,
     ) -> Result<PublicationPlan, HistoryPreparationError> {
-        let current = self
-            .current
-            .as_ref()
-            .expect("sealing validated current work");
         let request = current.identity.request;
         let location = self
             .request(request)
@@ -8767,7 +9633,7 @@ impl RouterEngine {
         let mut state = self.state.clone();
         let (active, active_branch, active_child_slots) = match &current.attempt {
             AttemptKind::Normal(_) => {
-                let active_child_slots = reconciled_child_slots(current);
+                let active_child_slots = reconciled_child_slots(&current);
                 (
                     ActivePresentation::route(location, current.target_frames.clone()),
                     current.branch.clone(),
@@ -8818,7 +9684,7 @@ impl RouterEngine {
 
         let history = match history_capability {
             Some(capability) => {
-                let execution = self.current_history_execution_projection(current);
+                let execution = self.current_history_execution_projection(&current);
                 let matched = current
                     .branch
                     .as_ref()
@@ -8837,7 +9703,6 @@ impl RouterEngine {
             None => None,
         };
 
-        let mut current = current.clone();
         current.stage = WorkStage::PostCommitCleanup {
             outstanding: cleanup,
         };
@@ -8955,6 +9820,10 @@ impl RouterEngine {
                     CorePendingBackNoTargetAuthority::Cleanup(_) => "cleanup",
                 },
             ),
+            pending_back_target_permanent_cleanup: self
+                .pending_back_target_permanent_cleanup
+                .as_ref()
+                .map(|_| "cleanup"),
             action: self.action.as_ref().map(ActionSnapshot::from),
             issued_view_tasks: self.issued_view_tasks.clone(),
             mount: self.mount.snapshot(),
@@ -8971,6 +9840,302 @@ impl RouterEngine {
         self.snapshot()
     }
 
+    fn back_target_permanent_current_state_projection(
+        &self,
+    ) -> CoreBackTargetPermanentCurrentStateProjection {
+        let current = self.current.as_ref();
+        let pending_no_target_authority =
+            self.pending_back_no_target_authority
+                .as_ref()
+                .map(|pending| match pending {
+                    CorePendingBackNoTargetAuthority::Accepted(accepted) => {
+                        CoreBackTargetPermanentNoTargetAuthorityProjection::Accepted {
+                            receiver: accepted.receiver.clone(),
+                            source: accepted.source.clone(),
+                            host: accepted.host.clone(),
+                            top_slot: accepted.top_slot,
+                            logical_roots: accepted.logical_roots.clone(),
+                        }
+                    }
+                    CorePendingBackNoTargetAuthority::Cleanup(cleanup) => {
+                        CoreBackTargetPermanentNoTargetAuthorityProjection::Cleanup(
+                            cleanup.receiver.clone(),
+                        )
+                    }
+                });
+        let history_preparation_error = match self.pending_history_preparation_error.as_ref() {
+            None => CoreBackTargetPermanentHistoryPreparationErrorProjection::Vacant,
+            Some(HistoryPreparationError::Source(_)) => {
+                CoreBackTargetPermanentHistoryPreparationErrorProjection::SourceDrift
+            }
+            Some(HistoryPreparationError::Binding(_)) => {
+                CoreBackTargetPermanentHistoryPreparationErrorProjection::BindingDrift
+            }
+        };
+        CoreBackTargetPermanentCurrentStateProjection {
+            host: self.state.host().cloned(),
+            top_slot: self.state.top_slot(),
+            current_identity: current.map(|current| current.identity.clone()),
+            current_location: current.map(|current| current.location.clone()),
+            current_stage: Self::back_target_stage_projection(current),
+            current_logical_roots: current.map(|current| current.cleanup_roots.clone()),
+            current_reconciliation: current
+                .and_then(|current| current.reconciliation.as_ref().cloned()),
+            current_retired_host: current.and_then(|current| {
+                current
+                    .retired_host
+                    .as_ref()
+                    .map(RetiredHostAuthority::projection)
+            }),
+            active_baseline: self.back_target_preparation_baseline(),
+            availability: self.state.availability().clone(),
+            request_status: self.state.current_request().cloned(),
+            history_binding: self
+                .current_history_capability
+                .as_ref()
+                .map(HistoryCommitCapability::execution_projection),
+            pending_no_target: self
+                .pending_no_target_back
+                .as_ref()
+                .map(|pending| pending.request),
+            pending_no_target_authority,
+            pending_target_cleanup: self
+                .pending_back_target_permanent_cleanup
+                .as_ref()
+                .map(|cleanup| cleanup.receiver.clone()),
+            history_preparation_error,
+            prepared_publication: self
+                .prepared_publication_authority
+                .as_ref()
+                .map(|authority| authority.owner().evidence.clone()),
+            action: Self::back_target_action_projection(self.action.as_ref()),
+        }
+    }
+
+    fn back_target_permanent_canonical_relation_projections(
+        &self,
+        settlement: &CoreBackTargetPermanentSettlementOwner,
+    ) -> (
+        CoreBackTargetPermanentCanonicalRelationProjection,
+        CoreBackTargetPermanentCanonicalRelationProjection,
+    ) {
+        let current = self.current.as_ref();
+        let reconciliation = current.and_then(|current| current.reconciliation.clone());
+        let expected_active = reconciliation.clone().map_or(
+            CoreBackTargetPermanentActiveRelationProjection::ReconciliationRequired,
+            CoreBackTargetPermanentActiveRelationProjection::Reconciliation,
+        );
+        let active_baseline = self.back_target_preparation_baseline();
+        let observed_active = if self.current_reconciliation_matches_active() {
+            reconciliation.clone().map_or(
+                CoreBackTargetPermanentActiveRelationProjection::Active(active_baseline.clone()),
+                CoreBackTargetPermanentActiveRelationProjection::Reconciliation,
+            )
+        } else {
+            CoreBackTargetPermanentActiveRelationProjection::Active(active_baseline.clone())
+        };
+        let expected_request = Some(CoreBackTargetPermanentRequestProjection {
+            request: settlement.scope.request(),
+            status: RequestStatus::Running(NavigationPhase::ReadyToSwitch),
+            requested: settlement
+                .expected_request
+                .as_ref()
+                .and_then(|request| request.requested.clone()),
+            trace_closed: settlement
+                .expected_request
+                .as_ref()
+                .is_some_and(|request| request.trace_closed),
+        });
+        let expected_location = expected_request
+            .as_ref()
+            .and_then(|request| request.requested.clone());
+        let observed_pending_mount = current.and_then(|current| {
+            current
+                .pending_mount
+                .as_ref()
+                .map(|pending| CoreBackTargetPendingMountProjection {
+                    child_index: pending.child_index,
+                    parent: pending.parent.clone(),
+                    outlet: pending.outlet.clone(),
+                    from_preserved_parent: pending.from_preserved_parent,
+                })
+        });
+        let pending_no_target_authority =
+            self.pending_back_no_target_authority
+                .as_ref()
+                .map(|pending| match pending {
+                    CorePendingBackNoTargetAuthority::Accepted(accepted) => {
+                        CoreBackTargetPermanentNoTargetAuthorityProjection::Accepted {
+                            receiver: accepted.receiver.clone(),
+                            source: accepted.source.clone(),
+                            host: accepted.host.clone(),
+                            top_slot: accepted.top_slot,
+                            logical_roots: accepted.logical_roots.clone(),
+                        }
+                    }
+                    CorePendingBackNoTargetAuthority::Cleanup(cleanup) => {
+                        CoreBackTargetPermanentNoTargetAuthorityProjection::Cleanup(
+                            cleanup.receiver.clone(),
+                        )
+                    }
+                });
+        let history_preparation_error = match self.pending_history_preparation_error.as_ref() {
+            None => CoreBackTargetPermanentHistoryPreparationErrorProjection::Vacant,
+            Some(HistoryPreparationError::Source(_)) => {
+                CoreBackTargetPermanentHistoryPreparationErrorProjection::SourceDrift
+            }
+            Some(HistoryPreparationError::Binding(_)) => {
+                CoreBackTargetPermanentHistoryPreparationErrorProjection::BindingDrift
+            }
+        };
+        let vacant_pending = CoreBackTargetPermanentForbiddenPendingProjection {
+            pending_no_target: None,
+            pending_no_target_authority: None,
+            pending_target_cleanup: None,
+            history_preparation_error:
+                CoreBackTargetPermanentHistoryPreparationErrorProjection::Vacant,
+            prepared_publication: None,
+            action: CoreBackTargetReceiverActionProjection::Missing,
+        };
+        let observed_pending = CoreBackTargetPermanentForbiddenPendingProjection {
+            pending_no_target: self
+                .pending_no_target_back
+                .as_ref()
+                .map(|pending| pending.request),
+            pending_no_target_authority,
+            pending_target_cleanup: self
+                .pending_back_target_permanent_cleanup
+                .as_ref()
+                .map(|cleanup| cleanup.receiver.clone()),
+            history_preparation_error,
+            prepared_publication: self
+                .prepared_publication_authority
+                .as_ref()
+                .map(|authority| authority.owner().evidence.clone()),
+            action: Self::back_target_action_projection(self.action.as_ref()),
+        };
+        let expected = CoreBackTargetPermanentCanonicalRelationProjection {
+            request: expected_request,
+            request_status: Some(RequestStatus::Running(NavigationPhase::ReadyToSwitch)),
+            location: expected_location,
+            logical_roots: settlement.logical_roots.clone(),
+            cleanup_roots: Some(settlement.logical_roots.clone()),
+            reconciliation: reconciliation.clone(),
+            active: expected_active,
+            stage: CoreBackTargetReceiverStageProjection::ReadyToCommit,
+            availability: crate::presentation::RouterAvailability::Ready,
+            retired_host: None,
+            pending_mount: None,
+            forbidden_pending: vacant_pending,
+        };
+        let observed = CoreBackTargetPermanentCanonicalRelationProjection {
+            request: settlement.expected_request.clone(),
+            request_status: self.state.current_request().cloned(),
+            location: current.map(|current| current.location.clone()),
+            logical_roots: settlement.logical_roots.clone(),
+            cleanup_roots: current.map(|current| current.cleanup_roots.clone()),
+            reconciliation,
+            active: observed_active,
+            stage: Self::back_target_stage_projection(current),
+            availability: self.state.availability().clone(),
+            retired_host: current.and_then(|current| {
+                current
+                    .retired_host
+                    .as_ref()
+                    .map(RetiredHostAuthority::projection)
+            }),
+            pending_mount: observed_pending_mount,
+            forbidden_pending: observed_pending,
+        };
+        (expected, observed)
+    }
+
+    fn back_target_permanent_request_projection(
+        record: &NavigationRequestRecord,
+    ) -> CoreBackTargetPermanentRequestProjection {
+        CoreBackTargetPermanentRequestProjection {
+            request: record.id(),
+            status: record.status().clone(),
+            requested: record.requested().cloned(),
+            trace_closed: record.trace_closed(),
+        }
+    }
+
+    fn back_target_permanent_authority_projection(
+        state: &RouterNavigationState,
+    ) -> CoreBackTargetPermanentAuthorityProjection {
+        CoreBackTargetPermanentAuthorityProjection {
+            host: state.host().cloned(),
+            top_slot: state.top_slot(),
+            availability: state.availability().clone(),
+        }
+    }
+
+    fn back_target_permanent_retention_projection(
+        records: &VecDeque<NavigationRequestRecord>,
+    ) -> CoreBackTargetPermanentRetentionProjection {
+        CoreBackTargetPermanentRetentionProjection {
+            limit: TERMINAL_RETENTION,
+            terminal_count: records
+                .iter()
+                .filter(|record| is_terminal(record.status()))
+                .count(),
+            records: records
+                .iter()
+                .map(Self::back_target_permanent_request_projection)
+                .collect(),
+        }
+    }
+
+    pub(crate) fn prepare_back_target_permanent_settlement_owner(
+        &self,
+        scope: BackResolutionScopeProjection,
+        logical_roots: Vec<RouteFrameVersion>,
+    ) -> CoreBackTargetPermanentSettlementOwner {
+        CoreBackTargetPermanentSettlementOwner {
+            expected_current: self.back_target_permanent_current_state_projection(),
+            expected_request: self
+                .records
+                .iter()
+                .find(|record| record.id() == scope.request())
+                .map(Self::back_target_permanent_request_projection),
+            scope,
+            logical_roots,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_back_target_permanent_current_state_projection(
+        &self,
+    ) -> CoreBackTargetPermanentCurrentStateProjection {
+        self.back_target_permanent_current_state_projection()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_back_target_permanent_begin_projection(
+        &self,
+    ) -> BackTargetPermanentBeginTestingProjection {
+        BackTargetPermanentBeginTestingProjection {
+            cleanup_owner_count: usize::from(self.pending_back_target_permanent_cleanup.is_some()),
+            current_owner_count: usize::from(self.current.is_some()),
+            action_owner_count: usize::from(self.action.is_some()),
+            current_history_slot_count: usize::from(self.current_history_capability.is_some()),
+            cleanup_history_owner_count: usize::from(
+                self.pending_back_target_permanent_cleanup
+                    .as_ref()
+                    .is_some_and(|cleanup| cleanup.history.is_some()),
+            ),
+            cleanup_settlement_owner_count: usize::from(
+                self.pending_back_target_permanent_cleanup.is_some(),
+            ),
+            queue_len: self.queue.len(),
+            conflicting_owner_count: usize::from(self.pending_no_target_back.is_some())
+                + usize::from(self.pending_back_no_target_authority.is_some())
+                + usize::from(self.pending_history_preparation_error.is_some())
+                + usize::from(self.prepared_publication_authority.is_some()),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn testing_request_back_target_source_drift_before_freeze_once(&mut self) {
         self.testing_back_target_source_drift_before_freeze_once = true;
@@ -8981,7 +10146,7 @@ impl RouterEngine {
         self.history.testing_move_cursor_back();
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn testing_transition_back_target_record_to_matching(
         &mut self,
         request: NavigationRequestId,
@@ -8993,6 +10158,20 @@ impl RouterEngine {
                 record
                     .transition(RequestStatus::Running(NavigationPhase::Matching))
                     .is_ok()
+            })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_close_back_target_request_trace(
+        &mut self,
+        request: NavigationRequestId,
+    ) -> bool {
+        self.records
+            .iter_mut()
+            .find(|record| record.id() == request)
+            .is_some_and(|record| {
+                record.testing_close_trace();
+                true
             })
     }
 
@@ -9672,13 +10851,14 @@ impl HistoryAuthorityFixture {
         history_fixture_seal_current(&mut self.engine, ticket)
     }
 
-    pub(crate) fn clone_current_work(&self) {
+    pub(crate) fn clone_current_work_pre_retirement(&self) {
         let _cloned = self
             .engine
             .current
             .as_ref()
             .expect("fixture has current work")
-            .clone();
+            .clone_pre_retirement()
+            .expect("fixture current work has not retired its host");
     }
 
     pub(crate) fn history_capability_snapshot(&self) -> HistoryCapabilitySnapshot {
@@ -9949,6 +11129,7 @@ pub(crate) struct EngineSnapshot {
     pending_history_preparation_error: Option<HistoryDriftEvidenceSnapshot>,
     prepared_publication_authority: Option<PreparedPublicationAuthoritySnapshot>,
     pending_back_no_target_authority: Option<&'static str>,
+    pending_back_target_permanent_cleanup: Option<&'static str>,
     action: Option<ActionSnapshot>,
     issued_view_tasks: Vec<FrameTaskIdentity>,
     mount: crate::mount::MountIssuerSnapshot,
@@ -10235,6 +11416,980 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn back_target_permanent_begin_fixture() -> (
+        RouterEngine,
+        crate::history_authority::BackResolutionScopeProjection,
+        super::CommitTicket,
+        Vec<RouteFrameVersion>,
+    ) {
+        let mut engine = ready_engine();
+        engine.push(RouteLocation::new("/")).unwrap();
+        settle_current(&mut engine);
+        engine.push(RouteLocation::new("/about")).unwrap();
+        settle_current(&mut engine);
+
+        let world = engine
+            .claim_history_admission_world()
+            .expect("the confirmed fixture issues one history world seal");
+        let stamp = engine
+            .history_admission_stamp(&world)
+            .expect("the two-entry history admits Back");
+        let admission = engine
+            .prepare_back_admission(&world, &stamp)
+            .expect("the target Back exact-refreezes the live history");
+        let accepted = engine.enqueue_back(admission).unwrap();
+        engine.collect();
+        let handoff = match engine.action().unwrap() {
+            EngineAction::BackResolution(handoff) => handoff,
+            _ => panic!("the accepted Back must produce a real resolution handoff"),
+        };
+        let (_request, view) = accepted.into_parts();
+        let verified = match engine.verify_back_resolution_handoff(view, handoff) {
+            BackResolutionVerifyOutcome::Matched(verified) => verified,
+            BackResolutionVerifyOutcome::Mismatch { .. } => {
+                panic!("the exact Back lineage must verify")
+            }
+        };
+        let (_view, owner) = verified.into_parts();
+        let target = match owner {
+            VerifiedBackResolutionOwnerHandoff::Target(target) => target,
+            VerifiedBackResolutionOwnerHandoff::NoTarget(_)
+            | VerifiedBackResolutionOwnerHandoff::Contradiction(_) => {
+                panic!("the two-entry history must resolve its predecessor")
+            }
+        };
+        let resume = match engine.resume_back_target_with_retirement(target, || {}) {
+            BackTargetResumeOutcome::Resumed(BackTargetStart::Ready(resume)) => resume,
+            BackTargetResumeOutcome::Resumed(BackTargetStart::FailureCleanup(_))
+            | BackTargetResumeOutcome::Permanent(_)
+            | BackTargetResumeOutcome::Mismatch(_) => {
+                panic!("the exact target Back must reach a normal action")
+            }
+        };
+        let super::BackTargetResume {
+            action,
+            execution: _,
+            continuation,
+        } = resume;
+        let action = match action {
+            BackTargetResumeAction::FrameTask(task) => EngineAction::FrameTask(task),
+            BackTargetResumeAction::MountRequest(request) => EngineAction::MountRequest(request),
+            BackTargetResumeAction::Commit(ticket) => EngineAction::Commit(ticket),
+        };
+        let ticket = drive_to_commit(&mut engine, action);
+        let logical_roots = engine
+            .current
+            .as_ref()
+            .expect("the ReadyToCommit fixture retains current work")
+            .cleanup_roots
+            .clone();
+        (engine, continuation, ticket, logical_roots)
+    }
+
+    fn real_retired_host_authority() -> (
+        crate::ids::RouterIdentity,
+        crate::admission::HostVersion,
+        RouteSlotId,
+        crate::admission::RetiredHostAuthority,
+    ) {
+        let mut donor =
+            RouterEngine::install(tree(), RouteViewKey::new("fallback").unwrap()).unwrap();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+        let token = donor.request_host_admission(&mut issuer).unwrap();
+        let grant = donor.grant_host_admission(&mut issuer, &token).unwrap();
+        let confirmation = issuer.confirm(&grant).unwrap();
+        donor.confirm_host(&issuer, &confirmation).unwrap();
+        let router = donor.router;
+        let version = confirmation.version().clone();
+        let top_slot = confirmation.top_slot();
+        let authority = issuer.retire_current(confirmation.into_lease()).unwrap();
+        assert!(authority.matches(router, &version, top_slot));
+        (router, version, top_slot, authority)
+    }
+
+    fn real_pending_mount() -> super::PendingMount {
+        let mut donor = ready_engine();
+        donor.push(RouteLocation::new("/items/1")).unwrap();
+        let task = match donor.action().unwrap() {
+            EngineAction::FrameTask(task) => task,
+            _ => panic!("the nested route must begin with its real root frame task"),
+        };
+        let next_outlet = donor
+            .current
+            .as_ref()
+            .and_then(|current| current.branch.as_ref())
+            .and_then(|branch| branch.routes().get(task.identity().branch_index() + 1))
+            .map(|matched| matched.slot().clone())
+            .expect("the nested route retains its real child outlet");
+        donor
+            .accept_applied_report(task.into_applied_report(vec![next_outlet]))
+            .unwrap();
+        assert!(matches!(
+            donor.action.as_ref(),
+            Some(EngineAction::MountRequest(_))
+        ));
+        donor
+            .current
+            .as_mut()
+            .and_then(|current| current.pending_mount.take())
+            .expect("the real mount request installs its pending mount fact")
+    }
+
+    #[test]
+    fn back_target_permanent_begin_rejects_noncanonical_state_frozen_before_acceptance() {
+        #[derive(Clone, Copy, Debug)]
+        enum NoncanonicalFact {
+            CurrentLocation,
+            LogicalRoots,
+            Reconciliation,
+            Availability,
+            PendingRelation,
+        }
+
+        for fact in [
+            NoncanonicalFact::CurrentLocation,
+            NoncanonicalFact::LogicalRoots,
+            NoncanonicalFact::Reconciliation,
+            NoncanonicalFact::Availability,
+            NoncanonicalFact::PendingRelation,
+        ] {
+            let (mut engine, scope, ticket, actual_logical_roots) =
+                back_target_permanent_begin_fixture();
+            let mut submitted_logical_roots = actual_logical_roots.clone();
+            match fact {
+                NoncanonicalFact::CurrentLocation => {
+                    let requested = engine
+                        .records
+                        .iter()
+                        .find(|record| record.id() == scope.request())
+                        .and_then(|record| record.requested())
+                        .cloned()
+                        .expect("the Back request retains its requested target");
+                    let current = engine
+                        .current
+                        .as_mut()
+                        .expect("the fixture retains ReadyToCommit work");
+                    assert_eq!(current.location, requested);
+                    current.location = RouteLocation::new("/items/noncanonical-current");
+                }
+                NoncanonicalFact::LogicalRoots => {
+                    assert!(
+                        !actual_logical_roots.is_empty(),
+                        "the real Back splice fixture must retain cleanup roots"
+                    );
+                    submitted_logical_roots.clear();
+                }
+                NoncanonicalFact::Reconciliation => {
+                    assert!(
+                        engine
+                            .current
+                            .as_ref()
+                            .and_then(|current| current.reconciliation.as_ref())
+                            .is_some(),
+                        "the real Back fixture retains its reconciliation proof"
+                    );
+                    assert!(
+                        engine.active_branch.take().is_some(),
+                        "the seam changes the real active-side reconciliation input"
+                    );
+                }
+                NoncanonicalFact::Availability => {
+                    let host = engine
+                        .state
+                        .host()
+                        .cloned()
+                        .expect("the host remains exact");
+                    let top_slot = engine.state.top_slot().expect("the top slot remains exact");
+                    assert!(engine.state.begin_authority_recovery(&host, top_slot));
+                }
+                NoncanonicalFact::PendingRelation => {
+                    let mut donor = ready_engine();
+                    donor.push(RouteLocation::new("/")).unwrap();
+                    settle_current(&mut donor);
+                    engine.testing_move_back_target_busy_receiver_slot_from(
+                        &mut donor,
+                        super::BackTargetBusyReceiverSlot::PendingNoTargetBack,
+                    );
+                    assert!(engine.pending_no_target_back.is_some());
+                }
+            }
+
+            let settlement = engine.prepare_back_target_permanent_settlement_owner(
+                scope,
+                submitted_logical_roots.clone(),
+            );
+            let expected_scope = settlement.scope.clone();
+            let expected_current = settlement.expected_current.clone();
+            let expected_request = settlement.expected_request.clone();
+            let expected_roots = settlement.logical_roots.clone();
+            let before = engine.snapshot();
+            let callback_calls = std::cell::Cell::new(0usize);
+            let installation = format!("{fact:?}");
+
+            let evidence = match engine.begin_back_target_permanent_cleanup(
+                settlement,
+                &ticket,
+                submitted_logical_roots,
+                0x4341_4e4f_4e49_4341,
+                NONZERO_OBLIGATION_COUNT,
+                installation.clone(),
+                |_, _| callback_calls.set(callback_calls.get() + 1),
+            ) {
+                super::BackTargetPermanentBeginCoreOutcome::Permanent {
+                    owner,
+                    installation: returned_installation,
+                    evidence,
+                } => {
+                    assert_eq!(owner.scope, expected_scope);
+                    assert_eq!(owner.expected_current, expected_current);
+                    assert_eq!(owner.expected_request, expected_request);
+                    assert_eq!(owner.logical_roots, expected_roots);
+                    assert_eq!(returned_installation, installation);
+                    evidence
+                }
+                super::BackTargetPermanentBeginCoreOutcome::Begun
+                | super::BackTargetPermanentBeginCoreOutcome::ReceiverMismatch { .. }
+                | super::BackTargetPermanentBeginCoreOutcome::LogicalRootsMismatch { .. } => {
+                    panic!("{fact:?} must not pass or be downgraded to receiver/argument mismatch")
+                }
+            };
+            assert_eq!(callback_calls.get(), 0, "fact: {fact:?}");
+            assert_eq!(engine.snapshot(), before, "fact: {fact:?}");
+
+            let evidence = format!("{evidence:?}");
+            assert!(
+                evidence.contains("CanonicalRelationContradiction"),
+                "{fact:?} must report purpose-specific typed canonical relation evidence, got {evidence}"
+            );
+            assert!(
+                evidence.contains("expected:") && evidence.contains("observed:"),
+                "{fact:?} canonical evidence must retain named expected/observed relations"
+            );
+            assert!(
+                !evidence.contains("CurrentStateContradiction"),
+                "{fact:?} was already noncanonical when frozen and is not ordinary snapshot drift"
+            );
+        }
+    }
+
+    #[test]
+    fn back_target_permanent_begin_rejects_owned_noncanonical_relations_losslessly() {
+        {
+            let (mut engine, scope, ticket, logical_roots) = back_target_permanent_begin_fixture();
+            let (router, version, top_slot, retired_host) = real_retired_host_authority();
+            engine
+                .current
+                .as_mut()
+                .expect("the fixture retains ReadyToCommit work")
+                .retired_host = Some(retired_host);
+
+            let settlement =
+                engine.prepare_back_target_permanent_settlement_owner(scope, logical_roots.clone());
+            let expected_scope = settlement.scope.clone();
+            let expected_current = settlement.expected_current.clone();
+            let expected_request = settlement.expected_request.clone();
+            let expected_roots = settlement.logical_roots.clone();
+            let before = engine.snapshot();
+            let callback_calls = std::cell::Cell::new(0usize);
+            let installation = "owned-retired-host";
+
+            let evidence = match engine.begin_back_target_permanent_cleanup(
+                settlement,
+                &ticket,
+                logical_roots,
+                0x4f57_4e45_445f_524c,
+                NONZERO_OBLIGATION_COUNT,
+                installation,
+                |_, _| callback_calls.set(callback_calls.get() + 1),
+            ) {
+                super::BackTargetPermanentBeginCoreOutcome::Permanent {
+                    owner,
+                    installation: returned_installation,
+                    evidence,
+                } => {
+                    assert_eq!(owner.scope, expected_scope);
+                    assert_eq!(owner.expected_current, expected_current);
+                    assert_eq!(owner.expected_request, expected_request);
+                    assert_eq!(owner.logical_roots, expected_roots);
+                    assert_eq!(returned_installation, installation);
+                    evidence
+                }
+                super::BackTargetPermanentBeginCoreOutcome::Begun
+                | super::BackTargetPermanentBeginCoreOutcome::ReceiverMismatch { .. }
+                | super::BackTargetPermanentBeginCoreOutcome::LogicalRootsMismatch { .. } => {
+                    panic!("owned retired-host contradiction must fail closed")
+                }
+            };
+            match evidence {
+                super::BackTargetPermanentBeginCorePermanentEvidence::CanonicalRelationContradiction {
+                    expected,
+                    observed,
+                } => {
+                    assert!(expected.retired_host.is_none());
+                    assert!(
+                        observed
+                            .retired_host
+                            .as_ref()
+                            .is_some_and(|projection| projection.matches(
+                                router,
+                                &version,
+                                top_slot
+                            )),
+                        "canonical evidence must retain the exact retired-host identity"
+                    );
+                }
+                other => panic!(
+                    "owned retired-host contradiction needs canonical relation evidence, got {other:?}"
+                ),
+            }
+            assert_eq!(callback_calls.get(), 0);
+            assert_eq!(engine.snapshot(), before);
+            assert!(
+                engine
+                    .current
+                    .as_ref()
+                    .and_then(|current| current.retired_host.as_ref())
+                    .is_some_and(|authority| authority.matches(router, &version, top_slot)),
+                "rejection must leave the sole authority in current"
+            );
+        }
+
+        {
+            let (mut engine, scope, ticket, logical_roots) = back_target_permanent_begin_fixture();
+            let pending_mount = real_pending_mount();
+            let expected_child_index = pending_mount.child_index;
+            let expected_parent = pending_mount.parent.clone();
+            let expected_outlet = pending_mount.outlet.clone();
+            let expected_from_preserved_parent = pending_mount.from_preserved_parent;
+            engine
+                .current
+                .as_mut()
+                .expect("the fixture retains ReadyToCommit work")
+                .pending_mount = Some(pending_mount);
+
+            let settlement =
+                engine.prepare_back_target_permanent_settlement_owner(scope, logical_roots.clone());
+            let expected_scope = settlement.scope.clone();
+            let expected_current = settlement.expected_current.clone();
+            let expected_request = settlement.expected_request.clone();
+            let expected_roots = settlement.logical_roots.clone();
+            let before = engine.snapshot();
+            let callback_calls = std::cell::Cell::new(0usize);
+            let installation = "owned-pending-mount";
+
+            let evidence = match engine.begin_back_target_permanent_cleanup(
+                settlement,
+                &ticket,
+                logical_roots,
+                0x4f57_4e45_445f_524c,
+                NONZERO_OBLIGATION_COUNT,
+                installation,
+                |_, _| callback_calls.set(callback_calls.get() + 1),
+            ) {
+                super::BackTargetPermanentBeginCoreOutcome::Permanent {
+                    owner,
+                    installation: returned_installation,
+                    evidence,
+                } => {
+                    assert_eq!(owner.scope, expected_scope);
+                    assert_eq!(owner.expected_current, expected_current);
+                    assert_eq!(owner.expected_request, expected_request);
+                    assert_eq!(owner.logical_roots, expected_roots);
+                    assert_eq!(returned_installation, installation);
+                    evidence
+                }
+                super::BackTargetPermanentBeginCoreOutcome::Begun
+                | super::BackTargetPermanentBeginCoreOutcome::ReceiverMismatch { .. }
+                | super::BackTargetPermanentBeginCoreOutcome::LogicalRootsMismatch { .. } => {
+                    panic!("owned pending-mount contradiction must fail closed")
+                }
+            };
+            let observed = match evidence {
+                super::BackTargetPermanentBeginCorePermanentEvidence::CanonicalRelationContradiction {
+                    expected,
+                    observed,
+                } => {
+                    assert!(expected.pending_mount.is_none());
+                    observed
+                        .pending_mount
+                        .expect("canonical evidence must retain the pending-mount projection")
+                }
+                other => panic!(
+                    "owned pending-mount contradiction needs canonical relation evidence, got {other:?}"
+                ),
+            };
+            assert_eq!(observed.child_index, expected_child_index);
+            assert_eq!(observed.parent, expected_parent);
+            assert_eq!(observed.outlet, expected_outlet);
+            assert_eq!(
+                observed.from_preserved_parent,
+                expected_from_preserved_parent
+            );
+            assert_eq!(callback_calls.get(), 0);
+            assert_eq!(engine.snapshot(), before);
+            let current = engine
+                .current
+                .as_ref()
+                .and_then(|current| current.pending_mount.as_ref())
+                .expect("rejection must leave the pending mount in current");
+            assert_eq!(current.child_index, expected_child_index);
+            assert_eq!(current.parent, expected_parent);
+            assert_eq!(current.outlet, expected_outlet);
+            assert_eq!(
+                current.from_preserved_parent,
+                expected_from_preserved_parent
+            );
+        }
+
+        fn braced_item<'a>(source: &'a str, marker: &str) -> &'a str {
+            let tail = &source[source
+                .find(marker)
+                .expect("typed contract item must remain named")..];
+            let open = tail
+                .find('{')
+                .expect("typed contract item must have a body");
+            let mut depth = 0usize;
+            for (offset, character) in tail[open..].char_indices() {
+                match character {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &tail[..open + offset + character.len_utf8()];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("typed contract item body must close")
+        }
+
+        fn compact(source: &str) -> String {
+            source
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>()
+        }
+
+        let admission_and_tests = include_str!("../../bevy_ui_router_core/src/admission.rs");
+        let admission = &admission_and_tests[..admission_and_tests
+            .find("mod tests {")
+            .expect("the admission production/test boundary must remain explicit")];
+        let retired_projection = braced_item(admission, "struct RetiredHostAuthorityProjection");
+        let compact_retired_projection = compact(retired_projection);
+        let exact_projection = compact_retired_projection.contains("key:AdmissionKey")
+            && compact_retired_projection.contains("version:HostVersion")
+            && compact_retired_projection.contains("top_slot:RouteSlotId");
+        assert!(
+            exact_projection
+                && !compact_retired_projection.contains(":RetiredHostAuthority,")
+                && !compact_retired_projection.contains(":Option<RetiredHostAuthority>")
+                && !compact_retired_projection.contains("bool")
+                && !compact_retired_projection.contains(":()"),
+            "admission must expose an exact, typed, non-authorizing retired-host identity projection"
+        );
+        let admission_key = compact(braced_item(admission, "struct AdmissionKey"));
+        for exact_field in [
+            "issuer:AdmissionIssuerId",
+            "router:RouterIdentity",
+            "sequence:u64",
+        ] {
+            assert!(
+                admission_key.contains(exact_field),
+                "AdmissionKey must retain exact {exact_field} identity"
+            );
+        }
+        let retired_authority_marker = admission
+            .find("struct RetiredHostAuthority")
+            .expect("retired-host authority must remain explicit");
+        let retired_authority_derive = &admission[..retired_authority_marker][admission
+            [..retired_authority_marker]
+            .rfind("#[derive(")
+            .expect("retired-host authority must retain an explicit derive list")..];
+        assert!(
+            !retired_authority_derive.contains("Clone"),
+            "linear retired-host authority must not implement Clone"
+        );
+        let compact_admission = compact(admission);
+        assert_eq!(
+            compact_admission.matches("RetiredHostAuthority{").count(),
+            3,
+            "retired-host authority may appear only in its declaration, sole retirement construction, and impl"
+        );
+        assert_eq!(
+            compact_admission
+                .matches("Ok(RetiredHostAuthority{")
+                .count(),
+            1,
+            "retire_current must remain the sole retired-host authority constructor"
+        );
+        let retired_authority_impl = compact(braced_item(admission, "impl RetiredHostAuthority"));
+        let projection_method = compact(braced_item(&retired_authority_impl, "fnprojection"));
+        for exact_mapping in [
+            "key:self.identity.key",
+            "version:self.identity.version.clone()",
+            "top_slot:self.identity.top_slot",
+        ] {
+            assert!(
+                projection_method.contains(exact_mapping),
+                "borrowed projection must map exact authority identity: {exact_mapping}"
+            );
+        }
+
+        let engine_and_tests = include_str!("../../bevy_ui_router_core/src/engine.rs");
+        let engine = &engine_and_tests[..engine_and_tests
+            .find("mod tests {")
+            .expect("the engine production/test boundary must remain explicit")];
+        let current_projection = braced_item(
+            engine,
+            "struct CoreBackTargetPermanentCurrentStateProjection",
+        );
+        let canonical_projection = braced_item(
+            engine,
+            "struct CoreBackTargetPermanentCanonicalRelationProjection",
+        );
+        let evidence = braced_item(engine, "enum BackTargetPermanentBeginCorePermanentEvidence");
+        for projection_or_evidence in [current_projection, canonical_projection, evidence] {
+            let projection_or_evidence = compact(projection_or_evidence);
+            assert!(
+                !projection_or_evidence.contains("Option<RetiredHostAuthority>")
+                    && !projection_or_evidence.contains(":RetiredHostAuthority,"),
+                "permanent validation evidence must not hold retired-host authority"
+            );
+        }
+        assert!(
+            compact(current_projection)
+                .contains("current_retired_host:Option<RetiredHostAuthorityProjection>")
+                && compact(canonical_projection)
+                    .contains("retired_host:Option<RetiredHostAuthorityProjection>"),
+            "permanent begin must retain the admission projection, not a parallel Core identity type"
+        );
+        let compact_engine = compact(engine);
+        let named_borrow_count = compact_engine
+            .matches("current.retired_host.as_ref().map(RetiredHostAuthority::projection)")
+            .count();
+        let closure_borrow_count = compact_engine
+            .matches("current.retired_host.as_ref().map(|authority|authority.projection())")
+            .count();
+        assert!(
+            named_borrow_count + closure_borrow_count >= 2
+                && !compact_engine.contains("retired_host.clone()"),
+            "both permanent projection builders must borrow retired-host authority without cloning"
+        );
+
+        let integration_and_tests = include_str!("../../bevy_ui_router_core/src/integration.rs");
+        let integration = &integration_and_tests[..integration_and_tests
+            .find("mod tests {")
+            .unwrap_or(integration_and_tests.len())];
+        assert!(
+            !compact(integration).contains("RetiredHostAuthority"),
+            "integration evidence must not acquire or clone retired-host authority"
+        );
+    }
+
+    #[test]
+    fn back_target_permanent_canonical_evidence_is_typed_and_snapshot_drift_stays_distinct() {
+        let (mut engine, scope, ticket, logical_roots) = back_target_permanent_begin_fixture();
+        let settlement =
+            engine.prepare_back_target_permanent_settlement_owner(scope, logical_roots.clone());
+        let expected_scope = settlement.scope.clone();
+        let expected_current = settlement.expected_current.clone();
+        let expected_request = settlement.expected_request.clone();
+        let expected_roots = settlement.logical_roots.clone();
+        engine
+            .current
+            .as_mut()
+            .expect("the fixture retains ReadyToCommit work")
+            .reconciliation = None;
+        let before = engine.snapshot();
+        let callback_calls = std::cell::Cell::new(0usize);
+
+        match engine.begin_back_target_permanent_cleanup(
+            settlement,
+            &ticket,
+            logical_roots,
+            0x534e_4150_5f44_5246,
+            NONZERO_OBLIGATION_COUNT,
+            "snapshot-drift-installation",
+            |_, _| callback_calls.set(callback_calls.get() + 1),
+        ) {
+            super::BackTargetPermanentBeginCoreOutcome::Permanent {
+                owner,
+                installation,
+                evidence:
+                    super::BackTargetPermanentBeginCorePermanentEvidence::CurrentStateContradiction {
+                        expected,
+                        observed,
+                    },
+            } => {
+                assert_eq!(owner.scope, expected_scope);
+                assert_eq!(owner.expected_current, expected_current);
+                assert_eq!(owner.expected_request, expected_request);
+                assert_eq!(owner.logical_roots, expected_roots);
+                assert_eq!(installation, "snapshot-drift-installation");
+                assert_ne!(expected, observed);
+            }
+            _ => panic!("post-freeze projection drift must remain CurrentStateContradiction"),
+        }
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(engine.snapshot(), before);
+
+        fn item_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let tail = &source[source.find(start).expect("contract item must remain named")..];
+            &tail[..tail.find(end).expect("contract boundary must remain named")]
+        }
+
+        fn braced_item<'a>(source: &'a str, marker: &str) -> &'a str {
+            let tail = &source[source
+                .find(marker)
+                .expect("typed contract item must remain named")..];
+            let open = tail
+                .find('{')
+                .expect("typed contract item must have a body");
+            let mut depth = 0usize;
+            for (offset, character) in tail[open..].char_indices() {
+                match character {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &tail[..open + offset + character.len_utf8()];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("typed contract item body must close")
+        }
+
+        let engine_source = include_str!("../../bevy_ui_router_core/src/engine.rs");
+        let production_source = &engine_source[..engine_source
+            .find("mod tests {")
+            .expect("the production/test boundary must remain explicit")];
+        let evidence = item_between(
+            production_source,
+            "pub(crate) enum BackTargetPermanentBeginCorePermanentEvidence",
+            "pub(crate) struct CoreBackTargetPermanentCurrentStateProjection",
+        );
+        assert!(
+            evidence.contains("CanonicalRelationContradiction"),
+            "pre-freeze canonical rejection needs a purpose-specific evidence variant"
+        );
+        let canonical = braced_item(evidence, "CanonicalRelationContradiction");
+        let compact_canonical = canonical
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert!(
+            compact_canonical
+                .contains("expected:CoreBackTargetPermanentCanonicalRelationProjection")
+                && compact_canonical
+                    .contains("observed:CoreBackTargetPermanentCanonicalRelationProjection"),
+            "canonical rejection must carry the complete typed expected/observed relation pair"
+        );
+        assert!(
+            !compact_canonical.contains("canonical:bool"),
+            "canonical relation evidence must not collapse to a hidden boolean"
+        );
+
+        let projection = braced_item(
+            production_source,
+            "struct CoreBackTargetPermanentCanonicalRelationProjection",
+        );
+        for relation in [
+            "request",
+            "location",
+            "logical_roots",
+            "cleanup_roots",
+            "reconciliation",
+            "active",
+            "stage",
+            "availability",
+            "retired_host",
+            "pending_mount",
+            "forbidden_pending",
+        ] {
+            assert!(
+                projection.contains(relation),
+                "the compact canonical relation projection must name {relation}"
+            );
+        }
+    }
+
+    #[test]
+    fn back_target_permanent_request_contradiction_preserves_presence_and_trace_contract() {
+        let (mut engine, scope, ticket, logical_roots) = back_target_permanent_begin_fixture();
+        let settlement = engine
+            .prepare_back_target_permanent_settlement_owner(scope.clone(), logical_roots.clone());
+        let expected_scope = settlement.scope.clone();
+        let expected_current = settlement.expected_current.clone();
+        let expected_request = settlement.expected_request.clone();
+        let expected_roots = settlement.logical_roots.clone();
+        engine
+            .records
+            .iter_mut()
+            .find(|record| record.id() == scope.request())
+            .expect("the trace fixture retains its current request")
+            .testing_close_trace();
+        let before = engine.snapshot();
+        let callback_calls = std::cell::Cell::new(0usize);
+
+        let source = match engine.begin_back_target_permanent_cleanup(
+            settlement,
+            &ticket,
+            logical_roots,
+            0x5452_4143_455f_4f4e,
+            NONZERO_OBLIGATION_COUNT,
+            "trace-only-installation",
+            |_, _| callback_calls.set(callback_calls.get() + 1),
+        ) {
+            super::BackTargetPermanentBeginCoreOutcome::Permanent {
+                owner,
+                installation,
+                evidence:
+                    super::BackTargetPermanentBeginCorePermanentEvidence::TerminalPlanContradiction {
+                        source,
+                        expected,
+                        observed,
+                    },
+            } => {
+                assert_eq!(owner.scope, expected_scope);
+                assert_eq!(owner.expected_current, expected_current);
+                assert_eq!(owner.expected_request, expected_request);
+                assert_eq!(owner.logical_roots, expected_roots);
+                assert_eq!(installation, "trace-only-installation");
+                assert!(source.current_request.trace_closed);
+                assert!(matches!(
+                    expected,
+                    super::CoreBackTargetPermanentTerminalExpectedProjection::Request {
+                        operation: super::CoreBackTargetPermanentTerminalOperation::RecoveringTrace,
+                        request,
+                    } if request.request == scope.request() && !request.trace_closed
+                ));
+                assert!(matches!(
+                    observed,
+                    super::CoreBackTargetPermanentTerminalObservedProjection::Request {
+                        operation: super::CoreBackTargetPermanentTerminalOperation::RecoveringTrace,
+                        request: Some(request),
+                        failure: super::CoreBackTargetPermanentTerminalFailureProjection::RequestRejected(
+                            RequestRecordError::TraceClosed,
+                        ),
+                    } if request.request == scope.request() && request.trace_closed
+                ));
+                source
+            }
+            super::BackTargetPermanentBeginCoreOutcome::Permanent { .. } => {
+                panic!("trace-only drift must retain purpose-specific terminal evidence")
+            }
+            _ => panic!("the closed real trace must fail before physical installation"),
+        };
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(engine.snapshot(), before);
+        assert!(source.current_request.trace_closed);
+
+        fn item_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let tail = &source[source.find(start).expect("contract item must remain named")..];
+            &tail[..tail.find(end).expect("contract boundary must remain named")]
+        }
+        let engine_source = include_str!("../../bevy_ui_router_core/src/engine.rs");
+        let evidence = item_between(
+            engine_source,
+            "pub(crate) enum BackTargetPermanentBeginCorePermanentEvidence",
+            "pub(crate) struct CoreBackTargetPermanentCurrentStateProjection",
+        );
+        let request_contradiction = item_between(
+            evidence,
+            "RequestRecordContradiction",
+            "TerminalPlanContradiction",
+        );
+        let compact_request_contradiction = request_contradiction
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        let request_projection = item_between(
+            engine_source,
+            "pub(crate) struct CoreBackTargetPermanentRequestProjection",
+            "pub(crate) struct CoreBackTargetPermanentAuthorityProjection",
+        );
+        let begin = item_between(
+            engine_source,
+            "pub(crate) fn begin_back_target_permanent_cleanup",
+            "pub(crate) fn complete_back_no_target_authority_cleanup",
+        );
+        let request_gate = item_between(
+            begin,
+            "let exact_request_record",
+            "if !exact_request_record",
+        );
+        assert!(
+            compact_request_contradiction
+                .contains("expected:Option<CoreBackTargetPermanentRequestProjection>")
+                && compact_request_contradiction
+                    .contains("observed:Option<CoreBackTargetPermanentRequestProjection>")
+                && !compact_request_contradiction.contains("expected_status:")
+                && !compact_request_contradiction.contains("observed_status:"),
+            "generic request contradiction must retain presence-aware full expected/observed records"
+        );
+        assert!(
+            request_projection.contains("trace_closed: bool"),
+            "the full record projection must retain trace closure"
+        );
+        assert!(
+            !request_gate.contains("trace_closed"),
+            "trace-only drift must remain a purpose-specific terminal planning failure"
+        );
+    }
+
+    #[test]
+    fn back_target_permanent_missing_current_record_returns_lossless_typed_evidence() {
+        let (mut engine, scope, ticket, logical_roots) = back_target_permanent_begin_fixture();
+        let settlement = engine
+            .prepare_back_target_permanent_settlement_owner(scope.clone(), logical_roots.clone());
+        let expected_scope = settlement.scope.clone();
+        let expected_current = settlement.expected_current.clone();
+        let expected_request = settlement.expected_request.clone();
+        let expected_roots = settlement.logical_roots.clone();
+        engine
+            .records
+            .retain(|record| record.id() != scope.request());
+        let before = engine.snapshot();
+        let callback_calls = std::cell::Cell::new(0usize);
+
+        let evidence = match engine.begin_back_target_permanent_cleanup(
+            settlement,
+            &ticket,
+            logical_roots,
+            0x4d49_5353_494e_475f,
+            NONZERO_OBLIGATION_COUNT,
+            "missing-current-installation",
+            |_, _| callback_calls.set(callback_calls.get() + 1),
+        ) {
+            super::BackTargetPermanentBeginCoreOutcome::Permanent {
+                owner,
+                installation,
+                evidence,
+            } => {
+                assert_eq!(owner.scope, expected_scope);
+                assert_eq!(owner.expected_current, expected_current);
+                assert_eq!(owner.expected_request, expected_request);
+                assert_eq!(owner.logical_roots, expected_roots);
+                assert_eq!(installation, "missing-current-installation");
+                assert!(matches!(
+                    evidence,
+                    super::BackTargetPermanentBeginCorePermanentEvidence::RequestRecordContradiction {
+                        ..
+                    }
+                ));
+                evidence
+            }
+            _ => panic!("a missing frozen current record must return typed contradiction evidence"),
+        };
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(engine.snapshot(), before);
+        let evidence = format!("{evidence:?}");
+        assert!(
+            evidence.contains("expected: Some(")
+                && evidence.contains("trace_closed: false")
+                && evidence.contains("observed: None"),
+            "missing record evidence must not synthesize an observed status: {evidence}"
+        );
+    }
+
+    #[test]
+    fn back_target_permanent_terminal_source_retains_missing_queued_record_expectation() {
+        let (mut engine, scope, ticket, logical_roots) = back_target_permanent_begin_fixture();
+        let queued_location = RouteLocation::new("/items/queued-after-back");
+        let queued_request = engine
+            .push(queued_location.clone())
+            .expect("the ReadyToCommit fixture queues a later request");
+        assert_eq!(engine.queue.len(), 1);
+        let settlement =
+            engine.prepare_back_target_permanent_settlement_owner(scope, logical_roots.clone());
+        let expected_scope = settlement.scope.clone();
+        let expected_current = settlement.expected_current.clone();
+        let expected_request = settlement.expected_request.clone();
+        let expected_roots = settlement.logical_roots.clone();
+        engine
+            .records
+            .retain(|record| record.id() != queued_request);
+        let before = engine.snapshot();
+        let callback_calls = std::cell::Cell::new(0usize);
+
+        let source = match engine.begin_back_target_permanent_cleanup(
+            settlement,
+            &ticket,
+            logical_roots,
+            0x5155_4555_455f_4f4e,
+            NONZERO_OBLIGATION_COUNT,
+            "missing-queued-installation",
+            |_, _| callback_calls.set(callback_calls.get() + 1),
+        ) {
+            super::BackTargetPermanentBeginCoreOutcome::Permanent {
+                owner,
+                installation,
+                evidence:
+                    super::BackTargetPermanentBeginCorePermanentEvidence::TerminalPlanContradiction {
+                        source,
+                        expected,
+                        observed,
+                    },
+            } => {
+                assert_eq!(owner.scope, expected_scope);
+                assert_eq!(owner.expected_current, expected_current);
+                assert_eq!(owner.expected_request, expected_request);
+                assert_eq!(owner.logical_roots, expected_roots);
+                assert_eq!(installation, "missing-queued-installation");
+                assert!(matches!(
+                    expected,
+                    super::CoreBackTargetPermanentTerminalExpectedProjection::Request {
+                        operation: super::CoreBackTargetPermanentTerminalOperation::QueuedTerminalTransition,
+                        request,
+                    } if request.request == queued_request
+                        && request.status == RequestStatus::Queued
+                        && request.requested.as_ref() == Some(&queued_location)
+                        && !request.trace_closed
+                ));
+                assert!(matches!(
+                    observed,
+                    super::CoreBackTargetPermanentTerminalObservedProjection::Request {
+                        operation: super::CoreBackTargetPermanentTerminalOperation::QueuedTerminalTransition,
+                        request: None,
+                        failure: super::CoreBackTargetPermanentTerminalFailureProjection::MissingRequest,
+                    }
+                ));
+                source
+            }
+            _ => panic!("the missing queued record must return its typed terminal contradiction"),
+        };
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(engine.snapshot(), before);
+        assert_eq!(
+            source.queue.len(),
+            1,
+            "terminal source must retain every queued command even when its record is absent"
+        );
+        let source = format!("{source:?}");
+        assert!(
+            source.contains("expected:")
+                && source.contains(&format!("request: {queued_request:?}"))
+                && source.contains("observed: None"),
+            "the queued source item must pair command expectation with observed record presence: {source}"
+        );
+
+        let engine_source = include_str!("../../bevy_ui_router_core/src/engine.rs");
+        let source_start = engine_source
+            .find("let source = CoreBackTargetPermanentTerminalSourceProjection")
+            .expect("the terminal source freeze must remain named");
+        let source_tail = &engine_source[source_start..];
+        let source_freeze = &source_tail[..source_tail
+            .find("let failure = NavigationFailure::new")
+            .expect("the terminal source freeze boundary must remain named")];
+        assert!(
+            !source_freeze.contains(".filter_map("),
+            "terminal source freeze must not discard queued commands with missing records"
+        );
     }
 
     fn publish_sealed<F>(

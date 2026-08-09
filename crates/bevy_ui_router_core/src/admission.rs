@@ -153,9 +153,16 @@ pub(crate) struct HostLease {
     identity: GrantIdentity,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct RetiredHostAuthority {
     identity: GrantIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RetiredHostAuthorityProjection {
+    key: AdmissionKey,
+    version: HostVersion,
+    top_slot: RouteSlotId,
 }
 
 #[derive(Debug)]
@@ -450,6 +457,14 @@ impl HostLease {
 }
 
 impl RetiredHostAuthority {
+    pub(crate) fn projection(&self) -> RetiredHostAuthorityProjection {
+        RetiredHostAuthorityProjection {
+            key: self.identity.key,
+            version: self.identity.version.clone(),
+            top_slot: self.identity.top_slot,
+        }
+    }
+
     pub(crate) fn matches(
         &self,
         router: RouterIdentity,
@@ -459,6 +474,18 @@ impl RetiredHostAuthority {
         self.identity.key.router == router
             && &self.identity.version == version
             && self.identity.top_slot == top_slot
+    }
+}
+
+impl RetiredHostAuthorityProjection {
+    #[cfg(test)]
+    pub(crate) fn matches(
+        &self,
+        router: RouterIdentity,
+        version: &HostVersion,
+        top_slot: RouteSlotId,
+    ) -> bool {
+        self.key.router == router && &self.version == version && self.top_slot == top_slot
     }
 }
 
