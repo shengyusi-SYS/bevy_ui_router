@@ -723,6 +723,10 @@ pub(crate) struct FrozenTargetPreparationPermanentObservedEntity {
     registry_claim: Option<ExactRegistryClaim>,
     ownership_seal: Option<RouteOwnershipSeal>,
     manifest: Option<ComponentManifest>,
+    frame_lifecycle: Option<FrameLifecycle>,
+    child_slot_lifecycle: Option<ChildSlotLifecycle>,
+    child_slot_authority: Option<ChildSlotAuthority>,
+    provisional_slot_lifecycle: Option<ProvisionalSlotLifecycle>,
 }
 
 #[derive(Clone)]
@@ -7915,7 +7919,33 @@ fn observe_target_preparation_permanent_entity(
         registry_claim: registry.record(entity).map(|record| record.claim()),
         ownership_seal: world.get::<RouteOwnershipSeal>(entity).copied(),
         manifest: ComponentManifest::from_world(world, entity),
+        frame_lifecycle: world.get::<FrameLifecycle>(entity).copied(),
+        child_slot_lifecycle: world.get::<ChildSlotLifecycle>(entity).copied(),
+        child_slot_authority: world.get::<ChildSlotAuthority>(entity).cloned(),
+        provisional_slot_lifecycle: world.get::<ProvisionalSlotLifecycle>(entity).copied(),
     }
+}
+
+fn target_preparation_permanent_structure_is_exact(
+    observed: &FrozenTargetPreparationPermanentObservedEntity,
+    expected: &FrozenTargetPreparationPermanentObservedEntity,
+) -> bool {
+    observed.entity == expected.entity
+        && observed.parent == expected.parent
+        && observed.children == expected.children
+        && observed.registry_claim == expected.registry_claim
+        && observed.ownership_seal == expected.ownership_seal
+        && observed.manifest == expected.manifest
+}
+
+fn target_preparation_permanent_authority_values_are_exact(
+    observed: &FrozenTargetPreparationPermanentObservedEntity,
+    expected: &FrozenTargetPreparationPermanentObservedEntity,
+) -> bool {
+    observed.frame_lifecycle == expected.frame_lifecycle
+        && observed.child_slot_lifecycle == expected.child_slot_lifecycle
+        && observed.child_slot_authority == expected.child_slot_authority
+        && observed.provisional_slot_lifecycle == expected.provisional_slot_lifecycle
 }
 
 fn target_preparation_permanent_claim_belongs_to_host(
@@ -14275,10 +14305,25 @@ fn target_preparation_permanent_prewrite_refreeze(
         .copied()
         .map(|entity| observe_target_preparation_permanent_entity(world, registry, entity))
         .collect::<Vec<_>>();
-    if observed_targets != validation.target_observed {
+    if observed_targets
+        .iter()
+        .zip(&validation.target_observed)
+        .any(|pair| !target_preparation_permanent_structure_is_exact(pair.0, pair.1))
+    {
         return Err(LifecyclePreflightEvidence::new(
             LifecyclePreflightSource::TargetPartition,
             LifecyclePreflightExpectation::ExactRelationshipClosure,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+    if observed_targets
+        .iter()
+        .zip(&validation.target_observed)
+        .any(|pair| !target_preparation_permanent_authority_values_are_exact(pair.0, pair.1))
+    {
+        return Err(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactAuthority,
             LifecyclePreflightObserved::Drifted,
         ));
     }
@@ -14287,10 +14332,25 @@ fn target_preparation_permanent_prewrite_refreeze(
         .copied()
         .map(|entity| observe_target_preparation_permanent_entity(world, registry, entity))
         .collect::<Vec<_>>();
-    if observed_protected != validation.protected.observed {
+    if observed_protected
+        .iter()
+        .zip(&validation.protected.observed)
+        .any(|pair| !target_preparation_permanent_structure_is_exact(pair.0, pair.1))
+    {
         return Err(LifecyclePreflightEvidence::new(
             LifecyclePreflightSource::TargetPartition,
             LifecyclePreflightExpectation::ExactRelationshipClosure,
+            LifecyclePreflightObserved::Drifted,
+        ));
+    }
+    if observed_protected
+        .iter()
+        .zip(&validation.protected.observed)
+        .any(|pair| !target_preparation_permanent_authority_values_are_exact(pair.0, pair.1))
+    {
+        return Err(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::TargetPartition,
+            LifecyclePreflightExpectation::ExactAuthority,
             LifecyclePreflightObserved::Drifted,
         ));
     }
@@ -29420,6 +29480,10 @@ pub(crate) mod tests {
                 registry_claim: observed.registry_claim.clone(),
                 ownership_seal: observed.ownership_seal,
                 manifest: observed.manifest.clone(),
+                frame_lifecycle: observed.frame_lifecycle,
+                child_slot_lifecycle: None,
+                child_slot_authority: None,
+                provisional_slot_lifecycle: observed.provisional_slot_lifecycle,
             }
         }
     }
@@ -32035,6 +32099,79 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn back_target_physical_permanent_prewrite_rejects_frame_lifecycle_value_drift() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-prewrite-frame-lifecycle-value-drift",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        let (target, frozen_manifest, lifecycle_before) = staged
+            .disposition
+            .cleanup
+            .physical
+            .target_observed
+            .iter()
+            .find_map(|observed| {
+                app.world()
+                    .get::<FrameLifecycle>(observed.entity)
+                    .copied()
+                    .map(|lifecycle| {
+                        (
+                            observed.entity,
+                            observed
+                                .manifest
+                                .clone()
+                                .expect("the real frame target retains a frozen manifest"),
+                            lifecycle,
+                        )
+                    })
+            })
+            .expect("the real non-empty permanent fixture freezes a frame lifecycle target");
+        publish_snapshots_system(app.world_mut());
+
+        match dispatch_real_back_target_permanent(&mut app, router, staged.disposition) {
+            BackTargetPermanentDispatchOutcome::Dispatched => {}
+            _ => panic!("the lifecycle-value fixture must complete real permanent dispatch"),
+        }
+        let (expected_cleanup, expected_batch, prepared_ledger) =
+            target_permanent_installed_prepared_projection(&app, router);
+        assert_eq!(prepared_ledger.receipt_count(), 0);
+
+        let drifted_lifecycle = FrameLifecycle(match lifecycle_before.0 {
+            EntityLifecycle::Quarantined => EntityLifecycle::Active,
+            _ => EntityLifecycle::Quarantined,
+        });
+        app.world_mut().entity_mut(target).insert(drifted_lifecycle);
+        assert_ne!(
+            app.world().get::<FrameLifecycle>(target),
+            Some(&lifecycle_before),
+            "the RED changes the lifecycle value without changing component presence"
+        );
+        assert_eq!(
+            ComponentManifest::from_world(app.world(), target),
+            Some(frozen_manifest),
+            "the RED must perturb only the real FrameLifecycle value"
+        );
+
+        assert_target_permanent_activation_tick(
+            &mut app,
+            router,
+            staged.request,
+            staged.host,
+            &expected_cleanup,
+            &expected_batch,
+            prepared_ledger,
+            Some((
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            )),
+        );
+    }
+
     #[derive(Clone, Copy)]
     enum TargetPermanentActivationPrewriteFault {
         UnfrozenHostChild,
@@ -32339,6 +32476,7 @@ pub(crate) mod tests {
                         | "Ok"
                         | "Err"
                         | "iter"
+                        | "zip"
                         | "map"
                         | "collect"
                         | "copied"
@@ -32361,6 +32499,8 @@ pub(crate) mod tests {
                         | "observed_descendant_closure"
                         | "observe_target_preparation_permanent_entity"
                         | "target_preparation_permanent_relationship_closure_is_exact"
+                        | "target_preparation_permanent_structure_is_exact"
+                        | "target_preparation_permanent_authority_values_are_exact"
                         | "LifecyclePreflightSource::RequiredResources"
                 ) || call.starts_with("LifecyclePreflightEvidence::")
                     || call.ends_with("HashSet::new")
@@ -32376,8 +32516,10 @@ pub(crate) mod tests {
             "target_entity_set.len()!=target_entities.len()",
             "protected_entity_set.len()!=protected_entities.len()",
             "ifobserved_host_descendants!=expected_host_descendants{returnErr(",
-            "ifobserved_targets!=validation.target_observed{returnErr(",
-            "ifobserved_protected!=validation.protected.observed{returnErr(",
+            "ifobserved_targets.iter().zip(&validation.target_observed).any(|pair|!target_preparation_permanent_structure_is_exact(pair.0,pair.1)){returnErr(",
+            "ifobserved_targets.iter().zip(&validation.target_observed).any(|pair|!target_preparation_permanent_authority_values_are_exact(pair.0,pair.1)){returnErr(",
+            "ifobserved_protected.iter().zip(&validation.protected.observed).any(|pair|!target_preparation_permanent_structure_is_exact(pair.0,pair.1)){returnErr(",
+            "ifobserved_protected.iter().zip(&validation.protected.observed).any(|pair|!target_preparation_permanent_authority_values_are_exact(pair.0,pair.1)){returnErr(",
             "ifobserved_protected_roots!=validation.protected.roots{returnErr(",
             "iftarget_entities!=validation.allowed_write.targets{returnErr(",
             "if!target_entity_set.is_disjoint(&protected_entity_set){returnErr(",

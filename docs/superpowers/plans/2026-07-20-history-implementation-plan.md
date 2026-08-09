@@ -2012,21 +2012,27 @@ pub enum BackTargetCommitPreparationOutcome<'a> {
 pub struct RouteFailureContinuationOwner { inner: RouteFailureContinuation }
 pub struct TargetAuthoritySettlementOwner { inner: TargetAuthoritySettlement }
 #[doc(hidden)]
-pub struct BackTargetPermanentAuthorityManifest { cleanup: CleanupManifest }
+pub struct BackTargetPermanentAuthorityManifest {
+    /// Logical roots + manifest digest + obligation count only；the latter two bind the ECS manifest.
+    /// No Entity、attempt or receipt authority crosses into Core.
+    cleanup: CleanupManifest,
+}
 impl BackTargetPermanentAuthorityManifest {
     pub fn new(cleanup: CleanupManifest) -> Self;
 }
 #[doc(hidden)]
 pub struct BackTargetPermanentBeginOwner {
     settlement: TargetAuthoritySettlementOwner,
+    host: HostLease,
     manifest: BackTargetPermanentAuthorityManifest,
 }
 impl BackTargetPermanentBeginOwner {
     pub fn new(
         settlement: TargetAuthoritySettlementOwner,
+        host: HostLease,
         manifest: BackTargetPermanentAuthorityManifest,
     ) -> Self;
-    pub fn into_parts(self) -> (TargetAuthoritySettlementOwner, BackTargetPermanentAuthorityManifest);
+    pub fn into_parts(self) -> (TargetAuthoritySettlementOwner, HostLease, BackTargetPermanentAuthorityManifest);
 }
 #[doc(hidden)]
 pub struct BackTargetPermanentCleanupBatchOwner { inner: CoreBackTargetPermanentCleanupBatch }
@@ -2050,6 +2056,10 @@ impl BackTargetPermanentCleanupBatchOwner {
 pub struct BackTargetPermanentCleanupCompletionOwner {
     batch: BackTargetPermanentCleanupBatchOwner,
     completion: CoreBackTargetPermanentCleanupCompletionFacts,
+}
+struct CoreBackTargetPermanentCleanup {
+    /// Unique until completion exact-matches the batch digest/count binding.
+    retired_host: RetiredHostAuthority,
 }
 #[doc(hidden)]
 pub enum BackTargetPermanentBeginOutcome {
@@ -2641,6 +2651,10 @@ pub(crate) struct FrozenTargetPreparationPermanentObservedEntity {
     registry_claim: Option<ExactRegistryClaim>,
     ownership_seal: Option<RouteOwnershipSeal>,
     manifest: Option<ComponentManifest>,
+    frame_lifecycle: Option<FrameLifecycle>,
+    child_slot_lifecycle: Option<ChildSlotLifecycle>,
+    child_slot_authority: Option<ChildSlotAuthority>,
+    provisional_slot_lifecycle: Option<ProvisionalSlotLifecycle>,
 }
 #[derive(Clone)]
 pub(crate) struct FrozenTargetPreparationPermanentLineage {
@@ -2655,17 +2669,28 @@ pub(crate) struct FrozenTargetPreparationPermanentProtectedClosures {
 }
 #[derive(Clone)]
 pub(crate) struct FrozenTargetPreparationPermanentAllowedWriteSet {
-    targets: Vec<Entity>,
+    splice_targets: Vec<Entity>,
+    host_edge: FrozenTargetPreparationPermanentHostEdgeEffect,
+}
+#[derive(Clone)]
+pub(crate) struct FrozenTargetPreparationPermanentHostEdgeEffect {
+    host: Entity,
+    top_slot: Entity,
+    top_slot_claim: ExactRegistryClaim,
+    children_before: Vec<Entity>,
+    children_after: Vec<Entity>,
 }
 pub(crate) enum FrozenTargetPreparationPermanentBranch {
     Classifier {
+        /// Owns actual preserved + leaving current and entering pending through the splice.
         physical: BackTargetClassifiedPhysicalOwner,
-        frozen_manifest: FrozenCleanupManifest,
         evidence: PreparationPermanentEvidence,
     },
     ReadyPlan {
+        /// Owns the same actual current/pending topology; both manifests remain source evidence.
         physical: PreparedBackTargetPhysicalOwner,
-        frozen_manifest: FrozenCleanupManifest,
+        normal_frozen_manifest: FrozenCleanupManifest,
+        normal_manifest: CleanupManifest,
         evidence: PreparationPermanentEvidence,
     },
 }
@@ -2678,12 +2703,16 @@ pub(crate) struct FrozenTargetPreparationPermanentPhysicalManifest {
 }
 pub(crate) struct TargetPreparationPermanentCleanupOwner {
     physical: FrozenTargetPreparationPermanentPhysicalManifest,
+    /// Branch physical owner linearly retains actual current/pending, not a projection.
     branch: FrozenTargetPreparationPermanentBranch,
 }
 pub(crate) struct TargetPreparationPermanentDisposition {
     cleanup: TargetPreparationPermanentCleanupOwner,
     settlement: TargetAuthoritySettlementOwner,
-    manifest: BackTargetPermanentAuthorityManifest,
+    /// ECS-only exact splice + top-slot obligations.
+    ecs_manifest: FrozenCleanupManifest,
+    /// Core-only logical roots plus the ECS digest/count binding.
+    core_binding: BackTargetPermanentAuthorityManifest,
 }
 /// Non-authorizing exact facts used only to refreeze the target/protected partition.
 /// The actual splice/history/physical owner remains in `TargetPreparationPermanentCleanupOwner`.
@@ -2693,21 +2722,27 @@ pub(crate) struct TargetPreparationPermanentLedgerPartitionProjection {
 pub(crate) struct PreparedTargetPreparationPermanentLedger {
     ledger: PreparedCleanupLedger,
     partition: TargetPreparationPermanentLedgerPartitionProjection,
-    manifest_digest: u64,
-    obligation_count: usize,
+    ecs_manifest_digest: u64,
+    ecs_obligation_count: usize,
+}
+pub(crate) enum TargetPreparationPermanentActivePhase {
+    Current,
+    Isolated,
 }
 pub(crate) struct ActiveTargetPreparationPermanentLedger {
     ledger: CleanupLedger,
     partition: TargetPreparationPermanentLedgerPartitionProjection,
-    manifest_digest: u64,
-    obligation_count: usize,
+    ecs_manifest_digest: u64,
+    ecs_obligation_count: usize,
+    phase: TargetPreparationPermanentActivePhase,
 }
 impl PreparedTargetPreparationPermanentLedger {
     /// Single-use activation; `Prepared` exposes no receipt/attempt/settle operation.
-    pub(crate) fn into_active(self) -> ActiveTargetPreparationPermanentLedger;
+    pub(crate) fn into_active_current(self) -> ActiveTargetPreparationPermanentLedger;
 }
 pub(crate) enum TargetPreparationPermanentLedgerHolder {
     Prepared(PreparedTargetPreparationPermanentLedger),
+    /// The phase is exactly `Current | Isolated`; only Isolated is executable cleanup.
     Active(ActiveTargetPreparationPermanentLedger),
 }
 pub(crate) enum TargetPreparationPermanentInertEvidence {
@@ -2722,11 +2757,14 @@ pub(crate) struct InstalledTargetPreparationPermanentCleanup {
     cleanup: TargetPreparationPermanentCleanupOwner,
     ledger: TargetPreparationPermanentLedgerHolder,
     batch: BackTargetPermanentCleanupBatchOwner,
+    retired_host: RetiredHostBinding,
     inert: Option<TargetPreparationPermanentInertEvidence>,
 }
 pub(crate) struct PreparedTargetPreparationPermanentPhysicalCompletion {
     cleanup: TargetPreparationPermanentCleanupOwner,
+    /// Must carry phase Isolated.
     ledger: ActiveTargetPreparationPermanentLedger,
+    retired_host: RetiredHostBinding,
 }
 pub(crate) struct SettledTargetPreparationPermanentCleanup {
     prepared: PreparedTargetPreparationPermanentPhysicalCompletion,
@@ -3051,13 +3089,13 @@ The dedicated authority cleanup driver classifies `PendingBackNoTargetAuthorityC
 
 This adapter may reuse existing scoped-settlement internals only as pure fallible preparation、prebuilt assignment and ECS physical cleanup primitives. It does not reuse or construct the scoped settlement's current、FrameTask、FailureCleanupRequest、ordinary `CleanupCompletion` or public lifecycle path
 
-The two post-splice sources are non-interchangeable. The classifier adapter whole-destructures `PreparationPermanentOwner<TargetPreparationOwner>` into evidence plus `TargetPreparationOwner { splice, history, continuation }`，moves actual `{ splice, history }` into `FrozenTargetPreparationPermanentBranch::Classifier { physical: BackTargetClassifiedPhysicalOwner, frozen_manifest, evidence }` and lets only exact `accept_back_target_authority_lost` consume `continuation`. The Ready-plan adapter whole-destructures `PreparationPermanentOwner<BackTargetReadyAcceptanceOwner>`，moves the existing `PreparedBackTargetPhysicalOwner`、`FrozenCleanupManifest`、Core `CleanupManifest` and evidence forward by value，and likewise lets only exact acceptance consume its continuation. Its World/current-entry refreeze must equal the existing frozen facts；it never discards or rebuilds them
+The two post-splice sources are non-interchangeable. The classifier adapter moves actual `{ splice, history }` with preserved + leaving current and entering pending into `FrozenTargetPreparationPermanentBranch::Classifier { physical, evidence }`. The Ready-plan adapter moves the same actual topology plus existing physical owner、normal `FrozenCleanupManifest`、normal Core `CleanupManifest` and evidence into `ReadyPlan { physical, normal_frozen_manifest, normal_manifest, evidence }`. Only exact acceptance consumes continuation；normal manifests remain source evidence and never authorize permanent obligations
 
-Both adapters freeze exact target observations、every protected closure and allowed-write targets from the same World/current entry. `FrozenTargetPreparationPermanentLineage { router, host, ticket }` is validation-only；the exact scope remains bound by the consumed continuation and resulting settlement，while actual splice/history authority remains in the branch's physical owner. Physical mismatch returns the whole original typed source + `LifecyclePreflightEvidence`; acceptance mismatch uses the returned continuation to reassemble that same source type + `PreparationReceiverMismatchView`. Exact success alone yields `TargetPreparationPermanentDisposition { cleanup, settlement, manifest }`；for ReadyPlan, `manifest` is the existing Core manifest moved by value，while classifier builds it from the same newly frozen target manifest
+Both adapters retain the actual splice owner and freeze exact observations. Projected claims construct an ECS-only `FrozenCleanupManifest` for every exact router-owned splice Entity + one top-slot obligation；Core receives only logical roots and the ECS digest/count binding，never Entity/attempt/receipt. Allowed writes split splice targets from the exact host `Children` edge. The app host stays outside `RouteEntityRegistry`、has no `RouteOwnershipSeal` and retains `RouterHostRegistration` plus all other frozen facts. ReadyPlan retains its normal frozen/Core manifests as source evidence only
 
-`dispatch_target_preparation_permanent` first validates vacancy、exact entry and same-World partition，then prepares `PreparedTargetPreparationPermanentLedger { ledger: PreparedCleanupLedger, partition: validation-only exact projection, ... }` from a non-authorizing clone of the branch manifest while keeping the whole disposition recoverable. This target-specific wrapper is not executable and is not the no-target wrapper. Dispatch calls only `begin_back_target_permanent_cleanup(BackTargetPermanentBeginOwner { settlement, manifest }, install)`。Mismatch calls `install` zero times，returns the whole begin owner，drops the uncommitted prepared-ledger plan and recomposes the entire disposition with zero write. Exact Core begin completes receiver、request/transaction/manifest、unique batch and terminal preparation before calling `install` once；before the first Core/private/public write，that callback installs `InstalledTargetPreparationPermanentCleanup { cleanup, ledger: TargetPreparationPermanentLedgerHolder::Prepared(prepared), batch, inert: None }`。After callback return Core only assignment-installs private `Cleanup { receiver, terminal }` and authority-specific public `Recovering`; Core does not retain or copy the batch owner held by ECS
+`dispatch_target_preparation_permanent` validates vacancy、exact entry and partition，then takes `RouterEntry.host` into a HostLease and prepares the dedicated ledger plus RetiredHostBinding. Core begin completes every fallible receiver/manifest/batch/cleanup/terminal preparation before `retire_current(HostLease)` as the final fallible step. Earlier failure returns complete HostBinding and callback zero；after successful retirement the live lease is never restored. The callback installs `{ cleanup, Prepared ledger, batch, RetiredHostBinding }` before Core/public write；Core assignment installs Cleanup with RetiredHostAuthority and public Recovering
 
-The completion driver classifies the outer holder before take，then whole-takes `Installed` and consumes `PreparedTargetPreparationPermanentLedger::into_active` exactly once. The result is `ActiveTargetPreparationPermanentLedger { ledger: CleanupLedger, partition: target-specific validation facts, ... }`；only this Active wrapper exposes receipt observation、attempt、settle、completion facts and partition refreeze. Prepared is never treated as executable. Before any physical operation and after every observer-triggering write，Active rebuilds and exact-validates the target/protected partition. Any physical、receipt、attempt、settlement or pre/post-write refreeze mismatch whole-restores `Installed { cleanup, ledger: Active(active), batch, inert: Some(typed evidence) }`，so no retry can reactivate or reconstruct the ledger. Exact target-specific receipts under the frozen allowed-write set bind the batch's opaque request/transaction lineage to manifest digest/count、completion digest and settled count，prebuild `PreparedTargetPreparationPermanentPhysicalCompletion { cleanup, ledger: active }`，then move the unique batch into `BackTargetPermanentCleanupCompletionOwner`. `complete_back_target_permanent_cleanup` mismatch calls its callback zero times and whole-returns that completion owner；ECS restores inert `Settled { prepared: prepared physical completion, completion, mismatch }`. Exact match calls the callback once to commit only the prebuilt physical completion and clear the holder，then Core assignment-only transitions `Cleanup → Failed(AuthorityLost) → RequestTerminal` and returns `TargetPreparationPermanentTerminalEvidence`. Completion selects only the actual frozen `Classifier | ReadyPlan` branch owner and clears splice、history/continuation、manifest、ledger、batch/completion、settlement and every lifecycle owner；the ledger partition projection only validates and can never replace that branch's actual splice/history/physical owner. Reuse is limited to `CleanupLedger` internals with identical receipt/attempt/settle semantics；target activation and partition validation remain target-specific，and no normal publisher、pre-splice consumer、no-target wrapper/adapter or generic reconstruction participates
+The driver enters `Active(Current)` once. Its first physical tick changes current frame/slot and top slot together to Leaving/settlement lifecycle、performs exact registry claim rebind、isolates input/focus and exact-refreezes after writes，while pending stays PreparedInert and attempt/despawn/receipt stay zero. Only Isolated settles the ECS exact manifest；Core validates logical root/digest/count binding only. The app host remains alive、outside RouteEntityRegistry、without RouteOwnershipSeal and never despawned；RouterHostRegistration and all facts except the exact Children edge remain unchanged. Completion consumes ECS RetiredHostBinding and Core RetiredHostAuthority before AwaitingHost and zero owner
 
 `BackTargetPermanentOwner` remains the single Task 4-only pre-splice Core owner and may be minted only after the exact resume preflight passes. It retains one total typed source variant：`SourceDriftRefreeze { expected: destination.source, observed: observed_source }`、`SourceDriftCapability { expected: drift.capability.source, observed: drift.observed }` or `AuthorityLost { cause, expected_and_observed: destination.source }`，plus complete stored expected/observed preparation baselines. Refreeze is the current real production source-drift producer；Capability is the defensive unreachable recheck after successful initial refreeze and has no current public/production journey. Its exact Core settlement validates scope/reservation、current source against the variant's stored observed value、current complete baseline against stored observed baseline and the exact retained queued consumed request；mismatch returns the whole owner and typed evidence with zero write，while exact success terminals once without ECS splice or physical cleanup authority. Capability evidence uses only the minimal real-source-fact seam described above and must retain expected=`drift.capability.source`、observed=`drift.observed`、both complete baselines and the same owner. Terminal projection is evidence-only and cannot reconstruct the owner. No post-splice adapter accepts or reconstructs it
 
@@ -3118,7 +3156,7 @@ Missing symbols、placeholder panics、test setup failures and directly injected
 | `back_no_target_ready_terminal_closes_all_lifecycle_owners` | canonical-zero bind freezes opaque expected completion digest with the exact batch lineage，installs live `PendingBackNoTargetCompletion::Installed` and drives `HistoryIntentRejected → CleanupPending`；the same-schedule settle pass takes it once，proves exact-zero facts and forms the whole completion owner. Ledger invariant、missing issuer or reclaim rejection restores typed inert `Installed`；receiver mismatch or wrong completion facts calls reclaim zero times and restores whole `Settled { prepared, completion, mismatch }`；later updates still classify the holder but return before take，so Core receiver and reclaim are not repeated. Exact completion alone reaches `Failed(BackTargetUnavailable)` and clears the holder plus every action、ticket、capability、candidate、continuation、reservation、completion and lifecycle owner |
 | `back_no_target_completion_callback_tail_is_infallible_and_query_free` | static callsite gate proves the completion receiver has one ECS production callsite；first publication writes one canonical holder，settle classifies before the unique take，inert `Installed` and `Settled` return early；reclaim preflight happens before Core，mismatch callback count is zero，exact callback contains only one prebuilt guard commit，and callback 后的 Core terminal tail has no query、allocation、validation、fallible trace/status preparation、owner reconstruction or hook/observer-triggering write |
 | `back_no_target_authority_settlement_terminals_once` | pre-proof AuthorityLost freezes independent obligation-only manifests and produces one whole disposition；accept installs only Core-private Accepted. Unique dispatch prepares ECS plans；begin completes every fallible Core preparation while HostLease remains in the whole owner，then calls `retire_current(HostLease)` as the last fallible step. Err returns HostLease and the whole owner with zero callback/state write；Ok yields Core retired-host owner，then only callback-installed ECS `Installed` → assignment-only private Cleanup/public `Recovering` remain. Exact receipts submit actual digest without preclassification comparison；mismatch restores inert `Settled`，exact completion clears holder、consumes Core retired-host owner and assignment-only publishes original AuthorityLost |
-| `back_target_physical_permanent_terminal_closes_all_lifecycle_owners` | both already-GREEN branch adapters feed one disposition；dispatch/begin mismatch callback zero returns/recomposes it whole. Exact begin callback installs `Prepared` target ledger + cleanup + unique batch before Core/public write. The real driver whole-takes that holder、observably converts `Prepared → Active` once，and only Active performs receipts、attempt/settle and exact partition validation；every observer-triggering write is followed by a real target/protected refreeze. A real physical/receipt/settlement/refreeze mismatch whole-restores `Installed` with the same cleanup、batch and Active ledger plus typed inert evidence；exact receipts move Active+cleanup into prepared physical completion and batch into the Core completion owner. Core completion mismatch whole-returns that owner and restores inert `Settled { prepared physical completion, completion, mismatch }`；exact callback once clears it before Core terminal and leaves zero action、ticket、capability、splice/history、continuation、manifest、ledger、batch/completion、settlement or lifecycle owner. Seams alter only real source/World/current-entry/observer/receipt/settlement predicate inputs；they never inject phase、classification、completion or terminal outcomes |
+| `back_target_physical_permanent_terminal_closes_all_lifecycle_owners` | ECS Frozen manifest独占exact splice + top-slot obligations；Core只有logical roots与digest/count binding且无Entity/attempt/receipt。Current同tick转换current frame/slot/top slot并exact rebind/refreeze，pending保持PreparedInert且零attempt；仅Isolated settle。双retired-host owner完成后才AwaitingHost；app host不进registry、无seal、registration等事实保留，terminal零owner |
 | max-depth and duplicate entries | real shallow prefix burns unused ids; duplicate-location back completes one exact publication by entry identity |
 | negative capability | compile-fail/facade plus static review prove accepted/capacity/handoff owners cannot be cloned、constructed、inspected or converted; no runtime field-absence assertion |
 
@@ -3180,7 +3218,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test
 
 Expected: scaffold compiles; behavioral groups fail on named production predicates and negative gates pass only for intended privacy/non-Clone reasons. Both new ECS `--lib` focused commands must compile、reach the real dispatcher/predicate and fail on their named missing behavior before implementation；the first driver RED proves pre-report Indeterminate preserves the whole Unverified owner. observer-residual and protected-overlap REDs are added only after a real root residual producer is connected and before their corresponding producer branches are implemented. Missing symbols、setup failure、placeholder panic or direct outcome injection invalidates the RED
 
-For permanent closure, record four distinct behavioral REDs in this order: pre-splice Core settlement、classifier permanent adapter、Ready-plan permanent adapter、final terminal closure. The focused final RED must observe the real installed holder as `Prepared` before driver take、its single `Prepared → Active` transition、Active-only receipt/attempt/settle、post-observer-write exact refreeze and whole restoration with the same Active ledger/cleanup/batch on each named mismatch；it must also observe Core completion mismatch restoring `Settled` with both owners. Each test must compile and fail on its named production predicate；a seam may alter only real source/World/current-entry/observer/receipt/settlement inputs，never return or inject a phase、classification、settlement、disposition、completion or terminal outcome. Removing or bypassing activation、refreeze or whole-restore predicates must make the RED fail. Do not implement the next branch until the preceding RED is recorded
+For permanent closure, record four distinct behavioral REDs in order. The final RED proves normal Ready manifests are source-only；ECS Frozen manifest alone owns exact splice + top-slot obligations，while Core holds logical roots and digest/count binding with no Entity/attempt/receipt. It observes actual current/pending ownership and `Prepared → Active(Current) → Active(Isolated)`；Current changes current frame/slot/top slot together to Leaving/settlement lifecycle、exact-rebinds claims、postwrite-refreezes，keeps pending PreparedInert and issues zero attempt/despawn/receipt. Begin failure returns HostBinding；success leaves `entry.host=None` and the ECS/Core retired-host pair. Completion consumes both before AwaitingHost；app host stays alive、outside registry、without ownership seal、never despawned，and preserves RouterHostRegistration/all non-edge facts. Terminal leaves zero owner
 
 - [ ] **Step 8: Implement live resolution, typed handoff and disposition**
 
@@ -3190,9 +3228,9 @@ For permanent closure, record four distinct behavioral REDs in this order: pre-s
 4. Every later Core entry point consumes only its verified branch type: target resume cannot accept raw target handoff, no-target refreeze cannot accept raw candidate, and contradiction terminal cannot accept raw contradiction or another verified branch
 5. Verified NoTarget stays paired with the recomposed bound reservation；only `begin_bound_back_no_target` may transfer it. Issuer preflight `Err` creates no guard/successor、does not call Core and returns `CapacityRejected` with the full bound. Successful preflight yields `OutstandingToLeased` guard + prepared permit while the bound remains outside the closure. Core mismatch calls the callback zero times、drops guard/successor and returns `ReceiverMismatch` with the full bound；the exact receiver first rebuilds and exact-refreezes source into `PreparedUnchanged | PreparedDrift`，then calls only `guard.commit()` once，after which its Core tail moves the prepared branch. The exact outer arm moves the stale bound into `into_permit_after_exact_receiver` to produce candidate+permit or drift+permit
 6. After its RED, minimally GREEN the target resume preflight and pre-splice `BackTargetPermanentOwner` exact Core settlement only：each of the seven busy slots and `state.current_request()` must independently whole-return the verified owner with callback zero、unretired recomposable bound reservation and no permanent owner；real production Refreeze source drift must whole-return on foreign settlement and terminal exact once；Capability is covered only by the minimal post-refreeze/pre-`freeze_back` real `CanonicalHistory` source-fact seam and the production `freeze_back` predicate；one real Host/ActiveBaseline cause and one real Generation/MaximumDepth cause must settle exact；terminal evidence must preserve the typed Refreeze/Capability/AuthorityLost source mapping、stored complete expected/observed baselines and owner conservation. Fault seams may alter only real receiver/source/baseline/reservation predicate inputs and never construct or inject owner、classification、permanent or terminal outcomes. Close these gates before adding any post-splice adapter
-7. After its independent RED, minimally GREEN `prepare_back_target_classifier_permanent(world, current_entry, owner)` through exact physical freeze and `accept_back_target_authority_lost`，without dispatch/completion shortcuts
-8. After its independent RED, minimally GREEN `prepare_back_target_ready_plan_permanent(world, current_entry, owner)`，preserving existing frozen Ready facts and never calling or reconstructing the classifier source
-9. Only after both adapter tests are GREEN，implement the one disposition dispatch、target-specific prepared/active ledger wrappers and receipt/completion driver. The begin callback installs only `Prepared`，the driver whole-take activates once，and all executable cleanup work plus post-write refreeze occurs through `Active`; then run the final terminal closure gate
+7. After its independent RED, minimally GREEN `prepare_back_target_classifier_permanent(world, current_entry, owner)` through exact physical freeze and `accept_back_target_authority_lost`，whole-owning actual preserved + leaving current and entering pending without dispatch/completion shortcuts
+8. After its independent RED, minimally GREEN `prepare_back_target_ready_plan_permanent(world, current_entry, owner)`，whole-owning the same actual current/pending topology while preserving existing Frozen/Core Ready facts as source evidence only and never calling or reconstructing the classifier source
+9. After both adapters are GREEN，derive the ECS-only exact splice + top-slot manifest and Core-only logical root/digest/count binding. Begin retires HostLease last and installs the retired-host pair；Current transitions frame/slot/top slot and exact-refreezes with zero attempt，only Isolated settles，then joint completion reaches AwaitingHost
 
 Target direction remains existing Core publication flow
 
@@ -3222,15 +3260,15 @@ ECS exact take retains the complete bound capacity outside the callback
 -> final-task/ticket pairing exact；Driving whole-transitions to Classifying(TargetPreparationOwner)
 -> drive_navigation_system resource_scope passes the same &World to classify_back_target/classify_back_no_target；registry is read only from that World
 -> classify_back_target performs pure physical classification only
--> Ready freezes exact ECS FrozenCleanupManifest and Core CleanupManifest before acceptance，then installs ReadyAwaitingAcceptance with the whole pre-accept owner
+-> Ready freezes exact ECS FrozenCleanupManifest and Core CleanupManifest as normal publication source evidence before acceptance，then installs ReadyAwaitingAcceptance with the whole pre-accept owner
 -> ReadyAwaitingAcceptance whole-take prepares registry lifecycle、claim rebind/root rebase、input gate、focus and presentation plans as borrowed stack capabilities
 -> plan failure drops borrowed plans and installs ReadyPlanRetry or ReadyPlanPermanent with the whole pre-accept owner + typed evidence
--> ReadyPlanPermanent enters only its World-bound Ready-plan permanent adapter；classifier Permanent enters only its distinct World-bound classifier adapter
+-> ReadyPlanPermanent enters only its World-bound Ready-plan permanent adapter；classifier Permanent enters only its distinct World-bound classifier adapter；each whole-owns actual preserved + leaving current and entering pending
 -> Ready acceptance Mismatch installs ReadyAcceptanceMismatch with that owner；PendingRejected/AuthorityLost mismatch keeps reconstructed TargetPreparationOwner + original classifier evidence + mismatch
 -> with plans live in the same resource_scope borrow，Matched installs/whole-takes ReadyAccepted，reserves the ledger，then installs/whole-takes Prepared for bridge validation
 -> acceptance mismatch、reserve failure or bridge failure first drops plans with zero write，then stores the existing complete failure stage；reserve failure alone uses ReadyReserveFailure
 -> Validated existing publisher closure only applies prepared plans and binds the ledger；atomic tail has no allocation、query or validation
--> normal success leaves no ReadyAccepted/Prepared and never crosses a schedule boundary or yield
+-> normal success leaves no ReadyAccepted/Prepared and never crosses a schedule boundary or yield；normal manifests never authorize permanent cleanup
 -> unique prepared history/publication owner
 
 PreparedFailureCleanup -> existing failure-cleanup owner chain only
@@ -3248,8 +3286,8 @@ Core never constructs ECS `BackTargetReadyAcceptanceOwner`、`PreparedCleanupLed
 - `Resumed(BackTargetStart::FailureCleanup)` either atomically moves the real `FailureCleanupRequest` into the existing failure-cleanup chain or remains whole in `ResumeBlocked::Start`；it never constructs `TargetPreparationOwner`、splice or publication owner，and mount issue exhaustion reaches only this branch
 - same-engine source/host/baseline drift、generation/depth contradiction and later clone-local request transition/trace contradiction return the single typed `Permanent/AuthorityLost` only after exact resume preflight，not `Mismatch`。Only this pre-splice branch enters `settle_back_target_permanent`，which delegates to Core `settle_back_target_permanent_exact` and exact-validates scope/reservation、cause-specific current source、the frozen observed baseline and the exact retained queued consumed request. Settlement drift preserves the whole Core owner + typed evidence with zero write；exact success terminals once and returns evidence retaining the actual cause plus expected/observed source/baseline without ECS splice、physical cleanup or reconstructed ECS authority
 - after a real `CommitTicket`, ECS whole-takes `Driving`、builds exact splice and installs `Classifying::Active(TargetPreparationOwner)` before calling pure physical `classify_back_target`. Cross-entry mismatch、Retry and outer Permanent retain the complete raw owner + typed evidence in the corresponding `Classifying` variant. PendingRejected/AuthorityLost remain `*Unaccepted { owner, evidence }` until their typed Core receiver runs；Matched acceptance converts capacity once into `PendingRejected { physical: BackTargetClassifiedPhysicalOwner, continuation, evidence }` or `AuthorityLost { physical: BackTargetClassifiedPhysicalOwner, settlement, evidence }`，while acceptance Mismatch restores raw `TargetPreparationOwner` + original `LifecyclePreflightEvidence` + opaque view in its branch-specific variant. These branches do not reserve or reuse the normal Ready ledger；their dedicated consumer later prepares its own failure/authority scope. None may enter a generic chain without that whole-owner consumer
-- pure physical Ready classification completes exact Entity manifest freeze and Core manifest construction before installing `ReadyAwaitingAcceptance { physical, raw continuation, frozen_manifest, manifest }`. Its scoped driver whole-takes this owner and prepares existing registry lifecycle、claim rebind/root rebase、input gate、focus and presentation plans as borrowed stack capabilities before acceptance；failure drops plans and installs `ReadyPlanRetry | ReadyPlanPermanent` with the whole pre-accept owner and typed evidence. With plans live in the same `World::resource_scope` borrow，Matched acceptance installs/whole-takes `ReadyAccepted`，reserve success installs/whole-takes `Prepared`，then `prepare_back_target_commit` validates and the existing publisher applies only those plans. Acceptance mismatch、reserve failure and bridge failure first zero-write drop plans before saving the complete existing stage owner；reserve failure alone uses `ReadyReserveFailure` with returned frozen manifest/kind. Normal success leaves no ReadyAccepted/Prepared，crosses no schedule boundary/yield，and its atomic tail performs no allocation、query、validation、freeze or owner/plan reconstruction
-- target physical outer `Permanent` remains whole `PreparationPermanentOwner<TargetPreparationOwner>` and only the World-bound classifier adapter accepts it；`ReadyPlanPermanent` remains whole `PreparationPermanentOwner<BackTargetReadyAcceptanceOwner>` and only the World-bound Ready-plan adapter accepts it. Classifier moves actual splice/history into its branch；ReadyPlan moves existing physical/Frozen/Core manifest facts. After exact acceptance they converge on one disposition. Unique dispatch preflights vacancy、World/entry partition and ledger；dedicated Core begin mismatch recomposes the whole disposition，while exact begin callback installs one `{ cleanup, ledger, batch }` holder before Core/public write. Dedicated completion exact-binds receipts and whole-restores mismatch or terminals after one physical callback，never using count inference、pre-splice/no-target consumers or publisher
+- pure physical Ready classification completes exact Entity manifest freeze and Core manifest construction before installing `ReadyAwaitingAcceptance { physical, raw continuation, frozen_manifest, manifest }`. These manifests authorize only normal publication and remain source evidence if the plan becomes permanent. Its scoped driver whole-takes this owner and prepares existing registry lifecycle、claim rebind/root rebase、input gate、focus and presentation plans as borrowed stack capabilities before acceptance；failure drops plans and installs `ReadyPlanRetry | ReadyPlanPermanent` with the whole pre-accept owner and typed evidence. With plans live in the same `World::resource_scope` borrow，Matched acceptance installs/whole-takes `ReadyAccepted`，reserve success installs/whole-takes `Prepared`，then `prepare_back_target_commit` validates and the existing publisher applies only those plans. Acceptance mismatch、reserve failure and bridge failure first zero-write drop plans before saving the complete existing stage owner；reserve failure alone uses `ReadyReserveFailure` with returned frozen manifest/kind. Normal success leaves no ReadyAccepted/Prepared，crosses no schedule boundary/yield，and its atomic tail performs no allocation、query、validation、freeze or owner/plan reconstruction
+- target permanent keeps branch-specific actual current/pending；ReadyPlan retains normal manifests only as source evidence。ECS Frozen manifest owns exact splice + top-slot obligations，Core owns only logical roots and digest/count binding。Current transitions frame/slot/top slot with exact rebind/refreeze and zero attempt；only Isolated settles，joint retired-host completion precedes AwaitingHost and zero owner
 - verified no-target candidate owns only unresolved lifecycle lineage. `consume_prepared_back_no_target` issuer preflight `Err` creates no guard/successor、does not call Core and returns `CapacityRejected` with the complete owner. Successful preflight yields `LeasedToCanonicalZeroSlot` guard + prepared slot successor；Core mismatch calls the callback zero times、drops both and returns `ReceiverMismatch` with the complete owner. Exact Core calls only `guard.commit()` once，then the outer arm moves the stale permit into `into_slot_after_exact_receiver` and returns sealed `PreparedBackNoTargetPublication` with zero public write. Only its later publication closure binds that slot to the batch and stores the initialized ledger + whole installation before Core publishes
 - pre-proof authority loss and permanent fail-closed never publish the normal no-target trace. AuthorityLost success returns the whole independent-manifest disposition. The unique dispatch prepares ECS installation work，then begin completes all fallible Core preparation while retaining HostLease and uses `retire_current(HostLease)` as the final fallible step；any rejection restores HostBinding and the whole disposition，while success permits only callback installation followed by assignment-only private Cleanup `{ receiver, Core retired host, terminal }` + public `Recovering`. Permanent capacity/domain contradiction remains in its existing dedicated owner
 - source drift uses opaque raw `BackNoTargetSourceDriftOwner` paired with the original permit. `settle_back_no_target_source_drift_permanent(&mut RouterEntry, owner)` is the only ECS API: it keeps the full composite outside the callback, obtains a lifetime-bound retirement guard + private prepared evidence，then calls the Core exact drift consumer. Issuer mismatch returns the full composite; wrong engine calls the closure zero times、drops guard/evidence and returns raw drift for recomposition with the permit; exact receiver calls only `guard.commit()` once、terminals immediately，then ECS drops the stale permit and seals the prepared evidence. No prepared authority crosses the entry/issuer boundary
@@ -3259,7 +3297,7 @@ Core never constructs ECS `BackTargetReadyAcceptanceOwner`、`PreparedCleanupLed
 
 Across these helpers, issuer preflight `Err` always occurs before guard construction and Core call，returning `CapacityRejected` with the complete owner；only a later Core mismatch returns `ReceiverMismatch` after callback zero and uncommitted guard/successor drop. Exact callbacks only move `guard.commit()` after all preparation. Guard commit matches a prebuilt operation-specific transition：retire removes the held live entry、returns lifecycle to `Free` and applies `Reusable | PermanentlyRetired` metadata；transfer retains and updates it to `Leased`；canonical-zero consumes the held `Leased` entry and transfers its exact cell lease into the slot. It performs no owner/key lookup、key remove、Vec index/query、allocation、validation、`expect`、`unwrap`、panic or unsafe. Retirement drops its stale owner then seals evidence；transfer and canonical-zero move their stale owner into the prepared successor conversion. This rule applies to target/contradiction retirement、no-target transfer、drift/authority retirement and canonical-zero bind；none may reintroduce owner-by-value + expectation callbacks、Option owner slots or Core-owned issuer guards
 
-Before Step 9, drive all publication/closure gates GREEN: the first normal no-target public observation must already have the exact whole ledger+installation field; that branch must then reach `BackTargetUnavailable` after same-schedule whole-owner exact-zero completion，with installed capacity reclaimed before the prebuilt Core terminal tail and no outstanding entry field/action/ticket/capability/candidate/continuation/reservation/completion/capacity lease/lifecycle owner. No-target AuthorityLost must complete dedicated accept → begin → exact-receipt completion，prove obligation-only manifests、whole-owner host retirement rejection、pure Core batch installed only in ECS before Core Cleanup/public `Recovering`、actual-digest structural completion、inert Settled mismatch and terminal consumption of both ECS holder and Core retired-host owner. Post-splice target physical permanent must uniquely dispatch and complete its frozen physical cleanup and stored Core authority settlement to terminal with no outstanding splice/cleanup/settlement or lifecycle owner
+Before Step 9, drive all publication/closure gates GREEN. Post-splice target permanent must prove actual current/pending whole ownership、ECS-only exact splice + top-slot manifest、Core-only logical roots/digest/count binding、Current top-slot rebind/refreeze with zero attempt、Isolated-only settlement、retired-host joint completion and terminal zero owner；normal no-target and no-target authority closure requirements remain unchanged
 
 Rerun every Step 4 and Step 7 focused command, including these exact GREEN filters and static contracts
 
@@ -3295,7 +3333,7 @@ Expected: all commands exit `0` before public `back` is exposed
 
 - [ ] **Step 9: Expose public back only after success, no-target and terminal owner-closure paths pass**
 
-Do not remove the public exclusion until `back_no_target_first_publication_has_installed_owners`、`back_no_target_ready_terminal_closes_all_lifecycle_owners`、`back_no_target_authority_settlement_terminals_once`、`back_target_pre_splice_permanent_settlement_terminals_once`、`back_target_classifier_permanent_freezes_exact_world_physical_facts`、`back_target_ready_plan_permanent_preserves_frozen_facts` and `back_target_physical_permanent_terminal_closes_all_lifecycle_owners` are GREEN in addition to every Step 4/7 gate
+Do not remove the public exclusion until all named owner-closure gates are GREEN. The target gate additionally requires ECS exact manifest/Core logical binding separation、top-slot same-tick isolation and rebind、post-retirement ECS/Core owner pair、Isolated-only settlement、app host outside registry/without seal but registration preserved、AwaitingHost only after joint completion and terminal zero owner
 
 Add
 
@@ -3392,8 +3430,8 @@ Reviewers verify
 - normal no-target Ready freezes ECS opaque expected completion digest with manifest digest/count and returns a sealed prepared publication with zero public write；its sole installation closure stores live `PendingBackNoTargetCompletion::Installed` before the first `HistoryIntentRejected`. The same-schedule settle pass takes that live owner once to prove exact-zero facts、preflight reclaim and form the no-target-specific Core completion owner；ledger/issuer/reclaim permanent rejection restores typed inert `Installed`，receiver/wrong-facts rejection restores whole `Settled`，later updates classify either holder but return before take. Exact completion alone reclaims once、runs the prebuilt query/allocation/validation-free terminal tail and clears the holder plus all action/ticket/capability/continuation/completion/capacity owners
 - no-target AuthorityLost uses dedicated accept → begin → completion：classification freezes obligation-only manifests；begin completes all fallible Core preparation with HostLease still in the whole owner，then runs `retire_current(HostLease)` as the last fallible step. Err returns HostLease and the whole owner；Ok后只执行callback安装ECS `Installed`与assignment-only private Cleanup/public `Recovering`。exact completion消费stored Core retired-host owner并清空Core/ECS owner
 - pre-splice `BackTargetPermanentOwner` remains the single Core-only Task 4 owner minted only after resume preflight；Refreeze is the current real production source-drift producer，while Capability is the defensive unreachable recheck covered only by the minimal real-source-fact seam through the production `freeze_back` predicate；settlement exact-validates scope/reservation、typed `Refreeze(destination.source, observed_source) | Capability(drift.capability.source, drift.observed) | AuthorityLost(cause, destination.source)` current-source mapping、current complete baseline against stored observed baseline and exact retained queued consumed request，whole-returns mismatch，and exact consumer terminals once without ECS splice/cleanup authority。Opaque terminal evidence retains that source variant、stored complete expected/observed baselines and owner conservation，and cannot reconstruct the owner
-- classifier and Ready-plan permanent remain distinct whole sources，use separate same-World/current-entry adapters，and converge only after exact physical freeze plus exact `accept_back_target_authority_lost`; classifier branch owns actual splice/history and Ready-plan moves its existing frozen physical/Frozen/Core manifest facts by value
-- post-splice target physical permanent uses the named Core begin/completion receivers：begin callback installs `{ cleanup, Prepared target ledger, unique batch }` before Core/public write；driver whole-takes and activates once，only the target-specific Active wrapper may observe receipts、attempt/settle or refreeze after observer writes；every physical/receipt/settlement/refreeze mismatch whole-restores the same cleanup、batch and Active ledger with typed inert evidence，completion mismatch restores `Settled` with prepared physical completion + Core completion owner，and exact completion callback once precedes Core terminal and leaves zero outstanding splice/history、continuation、manifest、ledger、batch/completion、settlement or lifecycle owner
+- classifier and Ready-plan remain distinct whole sources and both retain actual current/pending；Ready-plan keeps normal Frozen/Core manifests as source evidence。Projected claims build ECS-only exact splice + top-slot obligations and Core-only logical roots/digest/count binding；Entity/attempt/receipt remain ECS-only
+- post-splice target begin retires HostLease last；Current transitions frame/slot/top slot with exact rebind/refreeze and zero attempt，only Isolated settles ECS obligations。Completion consumes both retired-host owners before AwaitingHost；app host stays alive、outside RouteEntityRegistry、without RouteOwnershipSeal、not despawned，and retains RouterHostRegistration/all non-edge facts
 - protected sparse topology remains zero-write
 
 ```powershell

@@ -126,7 +126,7 @@ Inbound parent 与上表 ownership/descendant 分类正交：
 - entering/pending root 发现 `ProtectedAppOwned | OtherAuthorityOwned` 时为 `PendingRejected`，隔离并产生 `QuarantinedProtectedParent`，旧 active 不变。
 - preserved/current root 发现未授权 parent edge 时为 `AuthorityLost`；leaving root 可继续 commit，但必须在 switch 前隔离并产生 `QuarantinedProtectedParent`。
 - Router 永不通过 despawn/remove relationship 改写未授权 app-owned/other-authority parent；应用自行解除 edge 后才可 reap。
-- Host settlement 必须在 current HostLease 关闭前 detach 并复验 old top-slot edge；只有 edge 已消失后才能把 top slot transfer 给独立 quarantine lease。后台 reaper 因而永不持有 `AuthorizedHostTopSlotEdge`。
+- `retire_current(HostLease)` 只是把 live host authority 线性转为 `RetiredHostAuthority`，不关闭 old top-slot edge authority；配对的 ECS `RetiredHostBinding` 与 Core `RetiredHostAuthority` 继续独占 `AuthorizedHostTopSlotEdge`，完成 exact detach + postwrite refreeze 后才可共同消费或把 top slot 转给独立 quarantine lease。后台 reaper 始终不持有该 edge authority。
 
 ## 6. CommitMutationPlan Closure
 
