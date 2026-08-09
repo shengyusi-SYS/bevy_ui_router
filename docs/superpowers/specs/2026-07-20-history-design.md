@@ -271,7 +271,7 @@ push/replace 使用 enqueue 时冻结的 canonical target，成为 running 时�
 back 成为 running 时，Core 消费 accepted branch reservation owner 并只执行一次 live preview
 
 - 有 target 时先冻结 exact destination，生成只携带 lineage 与完整 reserved frame/task identity pool 的 move-only raw target owner；该 owner 绑定 normal attempt 与 exact source/destination，但不提前安装 matcher、reconciliation 或 action，zero-entering 仍保留并烧毁未使用 identities
-- exact target receiver 在 capacity retirement callback 前完成 source、host/top-slot、active/child-slot baseline exact refreeze，以及 matcher、logical reconciliation、first action 与 mount issue 的全部准备，形成 `PreparedReady | PreparedFailureCleanup | PreparedPermanent`
+- exact target receiver 必须先在不解构 `VerifiedBackTargetExecutionOwner` 的前提下完成 pre-splice receiver preflight：exact world/router/history/scope、exact retained `ConsumedReplay` queued request 与 expected target，并要求 `action`、`current`、`pending_no_target_back`、`pending_back_no_target_authority`、`current_history_capability`、`pending_history_preparation_error`、`prepared_publication_authority` 全部为 `None`，且 `state.current_request() == None`。preflight 通过后才可解构 owner，并在 capacity retirement callback 前完成 source、host/top-slot、active/child-slot baseline exact refreeze，以及 matcher、logical reconciliation、first action 与 mount issue 的全部准备，形成 `PreparedReady | PreparedFailureCleanup | PreparedPermanent`
 - `PreparedReady` 保持 engine-held exact history capability 的唯一关联，并以 `BackTargetResumeAction::{FrameTask(RootFrameTask), MountRequest(MountRequest), Commit(CommitTicket)}` 表达正常执行；`PreparedFailureCleanup` 独立交出 `FailureCleanupRequest`，不得伪装成 resume action
 - 结构一致且无 predecessor 时产生 target-free no-target candidate，不签发 history capability，不合成 normal attempt 或 frame identity
 - cursor/entry/location 不一致、target 深度超过 reserved maximum 或 accepted pool 不匹配产生 typed permanent contradiction
@@ -294,13 +294,13 @@ target resume、contradiction terminal 与 no-target transfer/refreeze 都必须
 
 target helper 先对 entry-owned issuer 做全部 non-mutating exact preflight
 
-Core wrong receiver 在准备前返回 `Mismatch`、调用 callback 零次并返还原 verified owner，ECS 可重组完整 bound branch
+Core 随后必须在解构 `VerifiedBackTargetExecutionOwner` 前完成上述 exact pre-splice receiver preflight。任一 world/router/history/scope、retained consumed queued request/expected target、上述七个 busy slot 或 `state.current_request()` fact drift 都返回 receiver `Mismatch`、调用 callback 零次并返还整个原 verified owner；ECS 丢弃未提交 retirement guard 后可重组未退休的完整 bound branch。该分支是 typed zero-write safe-stop，不是 retry，也不得 mint `BackTargetPermanentOwner`
 
-exact receiver 在 callback 前完成 history source、host/top-slot、active/child-slot baseline exact refreeze，以及 matcher、reconciliation、action 与 mount issue 的全部可能失败工作，再形成 `PreparedReady | PreparedFailureCleanup | PreparedPermanent`
+只有 preflight 通过后，exact receiver 才在 callback 前完成 history source、host/top-slot、active/child-slot baseline exact refreeze，以及 matcher、reconciliation、action 与 mount issue 的全部可能失败工作，再形成 `PreparedReady | PreparedFailureCleanup | PreparedPermanent`
 
 prepared branch 形成后 callback 恰好调用一次，callback 后只允许不可失败地移动或安装已准备 owner/action，不得 query、allocation、validation、`expect` 或触发 hook/observer
 
-same-engine source/host/baseline drift 与 generation/depth contradiction 使用 private typed `Permanent/AuthorityLost`，不是 `Mismatch`
+same-engine source/host/baseline drift 与 generation/depth contradiction 使用 private typed `Permanent/AuthorityLost`，不是 `Mismatch`。preflight 后对 clone-local request transition/trace 的矛盾仍可 mint cause 为 `RequestRecord` 的同一个 permanent owner，因为原 retained queued consumed record 保持 exact 且可 terminalize
 
 contradiction terminal 与 no-target transfer/refreeze 继续遵循 wrong receiver callback 零次、exact prepared branch callback 一次的规则，issuer expectation 与 callback 均不得跨出 helper
 
@@ -356,7 +356,7 @@ typed handoff 只确定 running execution lineage，后续 `Ready | PendingRejec
 
 contradiction handoff 必须 exact-match paired bound capacity，退休 ECS reservation 后由 Core 单次消费 accepted branch、request、transaction 与 cleanup batch owner；request 有界成为既有 `Failed(AuthorityLost)`，World、presentation 与 history 零写，不记录 `HistoryIntentRejected`，不留下 outstanding owner 或 retry
 
-target 的 Core source/host/baseline drift 在 ECS splice 与 retirement callback 前准备为唯一 opaque `BackTargetPermanentOwner`。它是 Task 4-only 的 pre-splice Core terminal owner：exact settlement receiver 在 mismatch 时返还整个 owner + typed evidence，在 match 时恰好 terminal 一次；它不取得 ECS splice、physical cleanup 或 World mutation authority，不进入 post-splice classifier，也不能被重建为任何 ECS permanent owner
+target 的 Core source/host/baseline drift、generation/depth contradiction 与 preflight 后 clone-local request transition/trace contradiction，在 ECS splice 与 retirement callback 前只能准备为唯一 opaque `BackTargetPermanentOwner`。它是 Task 4-only 的 pre-splice Core terminal owner；preflight drift 绝不能进入该 owner。cause-specific source 映射固定为：`SourceDrift::Refreeze` 的 expected=`destination.source`、stored observed/current=`observed_source`；`SourceDrift::Capability` 的 expected=`drift.capability.source`、stored observed/current=`drift.observed`；`AuthorityLost(cause)` 的 expected=stored observed/current=`destination.source`。settlement 必须 exact 校验 owner scope/reservation、当前 source 等于该 cause 的 stored observed/current source、当前完整 baseline 等于 stored observed baseline，以及 exact retained queued consumed request。settlement drift whole-return owner + typed evidence 且 zero-write；exact match 恰好 terminal 一次。terminal evidence 用无 optional 歧义的 opaque cause-specific variant 保留上述 source facts，以及 stored 完整 expected/observed `BackTargetPreparationBaseline`。projection 只用于 validation/evidence，不能重建 owner。该 owner 不取得 ECS splice、physical cleanup 或 World mutation authority，不进入 post-splice classifier，也不能被重建为任何 ECS permanent owner
 
 resume 成功并建立 splice 后只有两个不可互换的 permanent source：classifier permanent 保留整个 `PreparationPermanentOwner<TargetPreparationOwner>`；Ready-plan permanent 保留整个 `PreparationPermanentOwner<BackTargetReadyAcceptanceOwner>`，包括 Ready 分支已经冻结的 physical owner、`FrozenCleanupManifest` 与 Core `CleanupManifest`。两者不能降级、互转或由 snapshot/projection 重建
 
@@ -816,7 +816,7 @@ no-target back 的 current/retained slot 必须进入protected并保持零 attem
 | --- | --- | --- | --- |
 | accepted back owner | queued/running before resolution | verify Matched后与原capacity重组bound reservation，并与branch-specific verified owner配对 | wrapper只拆为accepted+verified，不能拆回raw handoff；foreign Mismatch返raw accepted+handoff |
 | back resolution duplicate evidence | fixed `back_resolution`：non-Back与queued Back生成handoff前为None，action可见前安装`Some(Current(observed evidence))` | retained先exact比较supplied/stored；仅exact verify Matched原位转`Some(Consumed)`，Current不得terminal/evict | saved observed evidence按state为Current/ConsumedReplay，mismatch diagnostic为Foreign；仅Consumed可terminal/evict，evicted replay还需exact scope+双watermark；Matched除record state外Core/World/history/public零写 |
-| target pre-splice source-drift owner | Task 4-only Core `BackTargetPermanentOwner` | 不进入ECS splice、physical classification或cleanup，也不重建ECS owner | dedicated exact Core settlement；mismatch返还whole owner + typed evidence，exact receiver terminal一次 |
+| target pre-splice permanent owner | Task 4-only Core `BackTargetPermanentOwner`；仅在 resume receiver preflight 通过后由 source/host/baseline、generation/depth 或 clone-local request contradiction mint | 不进入ECS splice、physical classification或cleanup，也不重建ECS owner；preflight逐项要求七个busy slot与current public request为空，drift whole-return verified owner且不得mint permanent | dedicated exact Core settlement按`Refreeze(destination.source, observed_source) | Capability(drift.capability.source, drift.observed) | AuthorityLost(cause, destination.source)` typed source variant校验current source、完整observed baseline与exact retained queued consumed request；mismatch返还whole owner + typed evidence且zero-write，exact receiver terminal一次；terminal projection保留stored cause/source与完整expected/observed baseline且不能重建owner |
 | target post-splice classifier permanent source | whole `PreparationPermanentOwner<TargetPreparationOwner>` | classifier adapter用同一World/current entry冻结exact target/protected/allowed-write/lineage，再由exact `accept_back_target_authority_lost`产生settlement；mismatch返whole source | 只在branch-specific preparation后转共同disposition；不可变成Ready-plan或pre-splice owner |
 | target post-splice Ready-plan permanent source | whole `PreparationPermanentOwner<BackTargetReadyAcceptanceOwner>` | Ready-plan adapter exact refreeze并保留已有physical/Frozen/Core manifest facts，再冻结缺失partition/lineage并exact accept；mismatch返whole source | 只在branch-specific preparation后转共同disposition；不可丢弃重建或变成classifier source |
 | target permanent disposition/holder | actual branch physical owner + target/protected partition + allowed-write set + settlement + Core manifest | unique begin callback在首个Core/public write前安装`{ cleanup, Prepared target ledger, batch }`；ledger holder显式为`Prepared | Active`，mismatch callback零次并重组whole disposition | driver whole-take后单次`Prepared → Active`；只有持有actual `CleanupLedger`的Active可执行receipt/attempt/settle/post-write refreeze。任一mismatch whole-restore同一cleanup+Active+batch；exact receipts后physical completion持有cleanup+Active，Core completion mismatch恢复`Settled`双owner，exact callback一次后Core terminal并清空全部owner；validation projection不能替代actual branch owner |
@@ -1003,7 +1003,8 @@ History completion 必须显式运行
 - focused `cross_incarnation_history_replay_is_zero_write`
 - focused `no_back_entry_precedes_identity_exhaustion`
 - focused typed preparation retry owner-return 与永久 contradiction fail-closed
-- focused `back_target_pre_splice_permanent_settlement_terminals_once`
+- focused `back_target_receiver_mismatch_calls_zero_and_exact_receiver_calls_once` 必须分别改变 `action`、`current`、`pending_no_target_back`、`pending_back_no_target_authority`、`current_history_capability`、`pending_history_preparation_error`、`prepared_publication_authority` 与 `state.current_request()` 的真实 predicate input；每槽都 whole-return verified owner、callback 零次、ECS bound reservation 未退休且可重组，并证明没有 permanent owner，seam 不得注入 mismatch/permanent outcome
+- focused `back_target_pre_splice_permanent_settlement_terminals_once` 必须覆盖 real source drift permanent 在 foreign settlement whole-return 后 exact terminal 一次、至少一个 real `Host | ActiveBaseline` cause 与一个 real `Generation | MaximumDepth` cause exact settle；terminal evidence 必须按 typed variant 证明 `Refreeze`、`Capability`、`AuthorityLost(cause)` 的固定 source 映射与 stored 完整 expected/observed baseline facts
 - focused `back_target_classifier_permanent_freezes_exact_world_physical_facts`
 - focused `back_target_ready_plan_permanent_preserves_frozen_facts`
 - focused `back_no_target_ready_terminal_closes_all_lifecycle_owners`
