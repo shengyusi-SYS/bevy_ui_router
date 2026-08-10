@@ -8659,6 +8659,11 @@ impl CleanupLedger {
     }
 
     #[cfg(test)]
+    pub(crate) fn issued_attempt_present_for_test(&self) -> bool {
+        self.issued_attempt.is_some()
+    }
+
+    #[cfg(test)]
     pub(crate) fn projection(&self) -> PreparedCleanupLedgerProjection {
         PreparedCleanupLedgerProjection {
             ledger_domain: self.ledger_domain,
@@ -9114,10 +9119,11 @@ fn lifecycle_is_exact(physical: ProvisionalSlotLifecycle, registered: EntityLife
         (
             ProvisionalSlotLifecycle::PreparedInert,
             EntityLifecycle::PreparedInert
-        ) | (
-            ProvisionalSlotLifecycle::Quarantined,
-            EntityLifecycle::Quarantined
-        )
+        ) | (ProvisionalSlotLifecycle::Leaving, EntityLifecycle::Leaving)
+            | (
+                ProvisionalSlotLifecycle::Quarantined,
+                EntityLifecycle::Quarantined
+            )
     )
 }
 

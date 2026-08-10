@@ -804,6 +804,14 @@ pub(crate) struct PreparedReconciliationClaimRebind {
     all_claims: Vec<ExactRegistryClaim>,
 }
 
+pub(crate) struct PreparedPermanentIsolationClaimRebind {
+    preserved_frames: Vec<Vec<ExactRegistryClaim>>,
+    entering_frames: Vec<Vec<ExactRegistryClaim>>,
+    leaving_frames: Vec<Vec<ExactRegistryClaim>>,
+    slot_roles: Vec<(ExactRegistryClaim, ExactRegistryClaim)>,
+    all_claims: Vec<ExactRegistryClaim>,
+}
+
 pub(crate) struct RejectedReconciliationOwners {
     active: RealizedBranch,
     entering: PreparedBranch,
@@ -864,6 +872,82 @@ impl SealedReconciliationSplice {
 
     pub(crate) fn slot_roles(&self) -> &[SealedReconciliationSlotRole] {
         &self.slot_roles
+    }
+
+    pub(crate) fn all_claim_aliases_match(&self, claims: &[ExactRegistryClaim]) -> bool {
+        let contains = |alias: &ExactRegistryClaim| claims.iter().any(|claim| claim == alias);
+        let frame_matches = |frame: &RealizedFrame| {
+            frame.claims().all(|alias| contains(alias))
+                && contains(frame.mount_binding().slot_claim())
+                && frame
+                    .mount_binding()
+                    .physical_parent()
+                    .1
+                    .is_none_or(|alias| contains(alias))
+                && frame
+                    .mount_binding()
+                    .staging_existing_shells()
+                    .iter()
+                    .all(|alias| contains(alias))
+                && frame
+                    .outlets()
+                    .iter()
+                    .all(|outlet| contains(outlet.anchor_claim()))
+        };
+        let slot_matches =
+            |slot: &MountedChildSlot| contains(slot.slot_claim()) && contains(slot.anchor_claim());
+
+        self.preserved
+            .frames
+            .iter()
+            .chain(&self.entering.frames)
+            .chain(&self.leaving.frames)
+            .all(frame_matches)
+            && self
+                .preserved
+                .child_slots
+                .iter()
+                .chain(&self.entering.child_slots)
+                .chain(&self.leaving.child_slots)
+                .all(slot_matches)
+            && self
+                .slot_roles
+                .iter()
+                .all(|role| contains(role.claim()) && contains(role.anchor_claim()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn all_claim_aliases_match_for_test(&self, claims: &[ExactRegistryClaim]) -> bool {
+        self.all_claim_aliases_match(claims)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drift_first_frame_mount_slot_lifecycle_for_test(
+        &mut self,
+        next: EntityLifecycle,
+    ) -> Option<(ExactRegistryClaim, ExactRegistryClaim)> {
+        let frame = if !self.preserved.frames.is_empty() {
+            &mut self.preserved.frames[0]
+        } else if !self.entering.frames.is_empty() {
+            &mut self.entering.frames[0]
+        } else {
+            self.leaving.frames.first_mut()?
+        };
+        let source = frame.mount_binding().slot_claim().clone();
+        let drifted = source.with_lifecycle_for_test(next);
+        let primary = frame.claims().cloned().collect::<Vec<_>>();
+        frame.apply_claim_rebind(&primary, std::slice::from_ref(&drifted));
+        Some((source, drifted))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn first_frame_mount_slot_claim_for_test(&self) -> Option<&ExactRegistryClaim> {
+        self.preserved
+            .frames
+            .first()
+            .or_else(|| self.entering.frames.first())
+            .or_else(|| self.leaving.frames.first())
+            .map(|frame| frame.mount_binding().slot_claim())
     }
 
     pub(crate) fn lifecycle_transitions(&self) -> Vec<(ExactRegistryClaim, EntityLifecycle)> {
@@ -1056,6 +1140,117 @@ impl SealedReconciliationSplice {
             leaving_frames: prepared_frame_claims(&self.leaving, claims),
             all_claims: claims.to_vec(),
         })
+    }
+
+    pub(crate) fn prepare_permanent_isolation_claim_rebind(
+        &self,
+        transitions: &[(ExactRegistryClaim, EntityLifecycle)],
+        claims: &[ExactRegistryClaim],
+    ) -> Option<PreparedPermanentIsolationClaimRebind> {
+        if claims.len() != transitions.len()
+            || claims.iter().enumerate().any(|(index, claim)| {
+                claims[index + 1..]
+                    .iter()
+                    .any(|other| other.entity() == claim.entity())
+            })
+            || transitions.iter().enumerate().any(|(index, (source, _))| {
+                transitions[index + 1..]
+                    .iter()
+                    .any(|(other, _)| other.entity() == source.entity())
+            })
+            || transitions.iter().any(|(source, next)| {
+                claims
+                    .iter()
+                    .find(|claim| claim.entity() == source.entity())
+                    .is_none_or(|projected| {
+                        !claim_rebind_is_exact(source, projected, source.lifecycle(), *next)
+                    })
+            })
+        {
+            return None;
+        }
+        let projected = |alias: &ExactRegistryClaim| {
+            let (source, next) = transitions
+                .iter()
+                .find(|(source, _)| source.entity() == alias.entity())?;
+            if source != alias {
+                return None;
+            }
+            claims
+                .iter()
+                .find(|claim| claim.entity() == source.entity())
+                .filter(|claim| claim_rebind_is_exact(source, claim, source.lifecycle(), *next))
+                .cloned()
+        };
+        let aliases_are_complete = self
+            .preserved
+            .frames
+            .iter()
+            .chain(&self.entering.frames)
+            .chain(&self.leaving.frames)
+            .all(|frame| {
+                frame.claims().all(|alias| projected(alias).is_some())
+                    && projected(frame.mount_binding().slot_claim()).is_some()
+                    && frame
+                        .mount_binding()
+                        .physical_parent()
+                        .1
+                        .is_none_or(|alias| projected(alias).is_some())
+                    && frame
+                        .mount_binding()
+                        .staging_existing_shells()
+                        .iter()
+                        .all(|alias| projected(alias).is_some())
+                    && frame
+                        .outlets()
+                        .iter()
+                        .all(|outlet| projected(outlet.anchor_claim()).is_some())
+            })
+            && self
+                .preserved
+                .child_slots
+                .iter()
+                .chain(&self.entering.child_slots)
+                .chain(&self.leaving.child_slots)
+                .all(|slot| {
+                    projected(slot.slot_claim()).is_some()
+                        && projected(slot.anchor_claim()).is_some()
+                });
+        if !aliases_are_complete {
+            return None;
+        }
+        let slot_roles = self
+            .slot_roles
+            .iter()
+            .map(|role| Some((projected(role.claim())?, projected(role.anchor_claim())?)))
+            .collect::<Option<Vec<_>>>()?;
+        Some(PreparedPermanentIsolationClaimRebind {
+            preserved_frames: prepared_frame_claims(&self.preserved, claims),
+            entering_frames: prepared_frame_claims(&self.entering, claims),
+            leaving_frames: prepared_frame_claims(&self.leaving, claims),
+            slot_roles,
+            all_claims: claims.to_vec(),
+        })
+    }
+
+    pub(crate) fn apply_permanent_isolation_claim_rebind(
+        &mut self,
+        prepared: PreparedPermanentIsolationClaimRebind,
+    ) {
+        let PreparedPermanentIsolationClaimRebind {
+            preserved_frames,
+            entering_frames,
+            leaving_frames,
+            slot_roles,
+            all_claims,
+        } = prepared;
+        apply_reconciliation_claim_rebind(&mut self.preserved, preserved_frames, &all_claims);
+        apply_reconciliation_claim_rebind(&mut self.entering, entering_frames, &all_claims);
+        apply_reconciliation_claim_rebind(&mut self.leaving, leaving_frames, &all_claims);
+        for (role, (claim, anchor_claim)) in self.slot_roles.iter_mut().zip(slot_roles) {
+            role.claim = claim;
+            role.anchor_claim = anchor_claim;
+        }
     }
 
     pub(crate) fn apply_claim_rebind(&mut self, prepared: PreparedReconciliationClaimRebind) {

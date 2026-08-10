@@ -52,6 +52,7 @@ impl RouterInputBarrier {
 #[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProvisionalSlotLifecycle {
     PreparedInert,
+    Leaving,
     Quarantined,
 }
 
