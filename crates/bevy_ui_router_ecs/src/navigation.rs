@@ -71,8 +71,13 @@ use crate::{
         FrozenBackNoTargetAuthorityPartition, FrozenCleanupManifest, ManifestNeutralLedgerSlot,
         NoTargetCapacityPermit, PendingBoundaryBinding, PreparedBackNoTargetAuthorityCleanupLedger,
         PreparedBackNoTargetZeroCompletion, PreparedCleanupLedger, PreparedCleanupLedgerProjection,
-        RouterCleanupObservation, canonical_zero_completion_digest, canonical_zero_manifest_digest,
-        cleanup_claim_has_exact_authority, failed_prepared_branch_roots_are_exact,
+        RouterCleanupObservation, TargetPreparationPermanentHostEdge,
+        TargetPreparationPermanentReceiptObservationEvidence,
+        TargetPreparationPermanentSettlementBoundaryEvidence,
+        TargetPreparationPermanentSettlementError, TargetPreparationPermanentTransition,
+        TargetPreparationPermanentTransitionStage, canonical_zero_completion_digest,
+        canonical_zero_manifest_digest, cleanup_claim_has_exact_authority,
+        failed_prepared_branch_roots_are_exact,
     },
     components::{
         ChildSlotAuthority, ChildSlotLifecycle, ProvisionalSlotLifecycle, RouteOwnershipSeal,
@@ -826,6 +831,8 @@ pub(crate) struct CurrentTargetPreparationPermanentLedger {
 pub(crate) struct IsolatedTargetPreparationPermanentLedger {
     ledger: CleanupLedger,
     validation: FrozenTargetPreparationPermanentPhysicalManifest,
+    expected_input_focus: Option<Option<bevy_ecs::entity::Entity>>,
+    expected_route_focus: Option<Option<bevy_ecs::entity::Entity>>,
 }
 
 pub(crate) enum ActiveTargetPreparationPermanentLedger {
@@ -849,7 +856,121 @@ pub(crate) enum TargetPreparationPermanentLedgerHolder {
 
 pub(crate) enum TargetPreparationPermanentInertEvidence {
     Physical(LifecyclePreflightEvidence),
+    ReceiptPreparationRejected(TargetPreparationPermanentSettlementBoundaryEvidence),
+    ReceiptObservationRejected(TargetPreparationPermanentReceiptObservationEvidence),
+    AttemptUnavailable(TargetPreparationPermanentSettlementBoundaryEvidence),
+    SettlementRejected(TargetPreparationPermanentSettlementBoundaryEvidence),
     PostWriteRefreeze(LifecyclePreflightEvidence),
+    SettlementPrewriteRefreeze(TargetPreparationPermanentSettlementPrewriteEvidence),
+    SettlementPostWriteRefreeze(TargetPreparationPermanentSettlementRefreezeEvidence),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetPreparationPermanentSettlementRefreezeSource {
+    ActiveIsolated,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TargetPreparationPermanentSettlementInputExpectation {
+    input_focus: Option<bevy_ecs::entity::Entity>,
+    route_focus: Option<bevy_ecs::entity::Entity>,
+    targets: Vec<bevy_ecs::entity::Entity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TargetPreparationPermanentSettlementInputObservation {
+    input_resource_present: bool,
+    input_focus: Option<bevy_ecs::entity::Entity>,
+    route_resource_present: bool,
+    route_focus: Option<bevy_ecs::entity::Entity>,
+    gate_present: bool,
+    non_isolated_targets: Vec<bevy_ecs::entity::Entity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TargetPreparationPermanentSettlementHostExpectation {
+    candidate: ValidatedHostCandidate,
+    router: RouterHandle,
+    host: FrozenTargetPreparationPermanentObservedEntity,
+    parent: Option<bevy_ecs::entity::Entity>,
+    children: Vec<bevy_ecs::entity::Entity>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TargetPreparationPermanentSettlementHostRegistrationObservation {
+    router: RouterHandle,
+    incarnation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TargetPreparationPermanentSettlementHostObservation {
+    candidate_current: bool,
+    registration: Option<TargetPreparationPermanentSettlementHostRegistrationObservation>,
+    host: FrozenTargetPreparationPermanentObservedEntity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TargetPreparationPermanentSettlementEntityExpectation {
+    present: bool,
+    registry_claim: Option<ExactRegistryClaim>,
+    parent: Option<bevy_ecs::entity::Entity>,
+    children: Vec<bevy_ecs::entity::Entity>,
+    facts: Option<FrozenTargetPreparationPermanentObservedEntity>,
+    isolated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TargetPreparationPermanentSettlementEntityObservation {
+    present: bool,
+    facts: FrozenTargetPreparationPermanentObservedEntity,
+    isolated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TargetPreparationPermanentSettlementRefreezeFailure {
+    Transition {
+        expected: TargetPreparationPermanentTransitionStage,
+        observed_settled: Vec<bevy_ecs::entity::Entity>,
+        observed_in_flight: Option<bevy_ecs::entity::Entity>,
+    },
+    InputIsolation {
+        expected: TargetPreparationPermanentSettlementInputExpectation,
+        observed: TargetPreparationPermanentSettlementInputObservation,
+    },
+    Registry {
+        expected: bool,
+        observed: bool,
+    },
+    HostIncarnation {
+        expected: TargetPreparationPermanentSettlementHostExpectation,
+        observed: TargetPreparationPermanentSettlementHostObservation,
+    },
+    Target {
+        entity: bevy_ecs::entity::Entity,
+        expected: TargetPreparationPermanentSettlementEntityExpectation,
+        observed: TargetPreparationPermanentSettlementEntityObservation,
+    },
+    Protected {
+        entity: bevy_ecs::entity::Entity,
+        expected: FrozenTargetPreparationPermanentObservedEntity,
+        observed: FrozenTargetPreparationPermanentObservedEntity,
+    },
+    Closure {
+        expected: Vec<bevy_ecs::entity::Entity>,
+        observed: Vec<bevy_ecs::entity::Entity>,
+        relationship_exact: bool,
+    },
+}
+
+pub(crate) struct TargetPreparationPermanentSettlementRefreezeEvidence {
+    source: TargetPreparationPermanentSettlementRefreezeSource,
+    stage: TargetPreparationPermanentTransitionStage,
+    failure: TargetPreparationPermanentSettlementRefreezeFailure,
+}
+
+pub(crate) struct TargetPreparationPermanentSettlementPrewriteEvidence {
+    source: TargetPreparationPermanentSettlementRefreezeSource,
+    failure: TargetPreparationPermanentSettlementRefreezeFailure,
 }
 
 pub(crate) struct InstalledTargetPreparationPermanentCleanup {
@@ -14846,12 +14967,39 @@ fn target_preparation_permanent_physical_error() -> LifecyclePreflightEvidence {
     )
 }
 
+fn target_preparation_permanent_retired_host_is_current(
+    world: &World,
+    validation: &FrozenTargetPreparationPermanentPhysicalManifest,
+    candidate: &ValidatedHostCandidate,
+) -> Result<(), LifecyclePreflightEvidence> {
+    let host = validation.allowed_write.host_edge.host;
+    if candidate.host() == host
+        && validated_host_candidate_is_current(world, candidate)
+        && world
+            .get::<crate::app_ext::RouterHostRegistration>(host)
+            .is_some_and(|registration| registration.router() == validation.lineage.router)
+    {
+        Ok(())
+    } else {
+        Err(target_preparation_permanent_physical_error())
+    }
+}
+
 fn prepare_target_preparation_permanent_current_isolation(
     world: &World,
     cleanup: &TargetPreparationPermanentCleanupOwner,
     retired_host: &RetiredHostBinding,
     validation: &FrozenTargetPreparationPermanentPhysicalManifest,
 ) -> Result<PreparedTargetPreparationPermanentCurrentIsolation, LifecyclePreflightEvidence> {
+    let input_focus = world
+        .get_resource::<InputFocus>()
+        .ok_or_else(target_preparation_permanent_physical_error)?;
+    let route_focus = world
+        .get_resource::<RouteFocusState>()
+        .ok_or_else(target_preparation_permanent_physical_error)?;
+    let input_gate = world
+        .get_resource::<RouterInputGate>()
+        .ok_or_else(target_preparation_permanent_physical_error)?;
     let splice = target_preparation_permanent_splice(cleanup);
     let transitions =
         target_preparation_permanent_lifecycle_transitions(splice, &retired_host.top_slot_claim)
@@ -14895,28 +15043,28 @@ fn prepare_target_preparation_permanent_current_isolation(
             return Err(target_preparation_permanent_physical_error());
         }
     };
-    let expected_gate = world.get_resource::<RouterInputGate>().map(|gate| {
+    let expected_gate = Some({
         world
             .iter_entities()
             .map(|entity| {
                 let entity = entity.id();
                 (
                     entity,
-                    gate.allows_pointer(entity) && !current_interactive.contains(&entity),
+                    input_gate.allows_pointer(entity) && !current_interactive.contains(&entity),
                 )
             })
             .collect::<Vec<_>>()
     });
-    let expected_input_focus = world.get_resource::<InputFocus>().map(|focus| {
-        focus
+    let expected_input_focus = Some(
+        input_focus
             .get()
-            .filter(|focused| !isolation.focus.contains(focused))
-    });
-    let expected_route_focus = world.get_resource::<RouteFocusState>().map(|focus| {
-        focus
+            .filter(|focused| !isolation.focus.contains(focused)),
+    );
+    let expected_route_focus = Some(
+        route_focus
             .focused()
-            .filter(|focused| !isolation.focus.contains(focused))
-    });
+            .filter(|focused| !isolation.focus.contains(focused)),
+    );
     Ok(PreparedTargetPreparationPermanentCurrentIsolation {
         registry,
         rebind,
@@ -14973,6 +15121,11 @@ fn target_preparation_permanent_postwrite_refreeze(
     applied: &AppliedTargetPreparationPermanentCurrentIsolation,
 ) -> Result<(), LifecyclePreflightEvidence> {
     target_preparation_permanent_prewrite_refreeze(world, &applied.expected_validation)?;
+    target_preparation_permanent_retired_host_is_current(
+        world,
+        &applied.expected_validation,
+        &retired_host.candidate,
+    )?;
     if retired_host.top_slot_claim
         != applied
             .projected_claims
@@ -15000,7 +15153,6 @@ fn target_preparation_permanent_postwrite_refreeze(
         &applied.expected_gate,
         world.get_resource::<RouterInputGate>(),
     ) {
-        (None, None) => true,
         (Some(expected), Some(gate)) => expected
             .iter()
             .all(|(entity, allowed)| gate.allows_pointer(*entity) == *allowed),
@@ -15019,24 +15171,508 @@ fn target_preparation_permanent_postwrite_refreeze(
     Ok(())
 }
 
+fn target_preparation_permanent_relationship_manifest_is_exact(
+    world: &World,
+    observed: &FrozenTargetPreparationPermanentObservedEntity,
+    expected: &FrozenTargetPreparationPermanentObservedEntity,
+    expected_parent: Option<bevy_ecs::entity::Entity>,
+    expected_children: &[bevy_ecs::entity::Entity],
+) -> bool {
+    let (Some(observed_manifest), Some(expected_manifest)) =
+        (observed.manifest.as_ref(), expected.manifest.as_ref())
+    else {
+        return false;
+    };
+    let child_of = world
+        .components()
+        .component_id::<bevy_ecs::hierarchy::ChildOf>();
+    let children = world
+        .components()
+        .component_id::<bevy_ecs::hierarchy::Children>();
+    let non_relationship = |manifest: &ComponentManifest| {
+        manifest
+            .component_ids()
+            .iter()
+            .copied()
+            .filter(|component| Some(*component) != child_of && Some(*component) != children)
+            .collect::<Vec<_>>()
+    };
+    observed.entity == expected.entity
+        && observed.parent == expected_parent
+        && observed.children == expected_children
+        && observed.registry_claim == expected.registry_claim
+        && observed.ownership_seal == expected.ownership_seal
+        && non_relationship(observed_manifest) == non_relationship(expected_manifest)
+        && child_of.is_none_or(|component| {
+            observed_manifest.component_ids().contains(&component) == expected_parent.is_some()
+        })
+        && children.is_none_or(|component| {
+            observed_manifest.component_ids().contains(&component) == !expected_children.is_empty()
+        })
+}
+
+fn target_preparation_permanent_input_is_isolated(
+    world: &World,
+    validation: &FrozenTargetPreparationPermanentPhysicalManifest,
+    expected_input_focus: Option<Option<bevy_ecs::entity::Entity>>,
+    expected_route_focus: Option<Option<bevy_ecs::entity::Entity>>,
+) -> bool {
+    let observed = target_preparation_permanent_input_observation(world, validation);
+    target_preparation_permanent_input_observation_is_exact(
+        &observed,
+        expected_input_focus,
+        expected_route_focus,
+    )
+}
+
+fn target_preparation_permanent_input_observation_is_exact(
+    observed: &TargetPreparationPermanentSettlementInputObservation,
+    expected_input_focus: Option<Option<bevy_ecs::entity::Entity>>,
+    expected_route_focus: Option<Option<bevy_ecs::entity::Entity>>,
+) -> bool {
+    expected_input_focus.is_some()
+        && expected_route_focus.is_some()
+        && observed.input_resource_present
+        && observed.input_focus == expected_input_focus.flatten()
+        && observed.route_resource_present
+        && observed.route_focus == expected_route_focus.flatten()
+        && observed.gate_present
+        && observed.non_isolated_targets.is_empty()
+}
+
+fn target_preparation_permanent_input_observation(
+    world: &World,
+    validation: &FrozenTargetPreparationPermanentPhysicalManifest,
+) -> TargetPreparationPermanentSettlementInputObservation {
+    let gate = world.get_resource::<RouterInputGate>();
+    let non_isolated_targets = validation
+        .target_observed
+        .iter()
+        .filter(|observed| {
+            world.get_entity(observed.entity).is_ok()
+                && (world.get::<Visibility>(observed.entity) != Some(&Visibility::Hidden)
+                    || world.get::<Pickable>(observed.entity) != Some(&Pickable::IGNORE)
+                    || world
+                        .get::<RouterInputBarrier>(observed.entity)
+                        .is_none_or(|barrier| !barrier.denies_all())
+                    || gate.is_none_or(|gate| {
+                        gate.allows_pointer(observed.entity)
+                            || gate.allows_keyboard(observed.entity)
+                            || gate.allows_gamepad(observed.entity)
+                    }))
+        })
+        .map(|observed| observed.entity)
+        .collect();
+    TargetPreparationPermanentSettlementInputObservation {
+        input_resource_present: world.contains_resource::<InputFocus>(),
+        input_focus: world.get_resource::<InputFocus>().and_then(InputFocus::get),
+        route_resource_present: world.contains_resource::<RouteFocusState>(),
+        route_focus: world
+            .get_resource::<RouteFocusState>()
+            .and_then(RouteFocusState::focused),
+        gate_present: gate.is_some(),
+        non_isolated_targets,
+    }
+}
+
+fn target_preparation_permanent_settlement_prewrite_error(
+    failure: TargetPreparationPermanentSettlementRefreezeFailure,
+) -> TargetPreparationPermanentSettlementPrewriteEvidence {
+    TargetPreparationPermanentSettlementPrewriteEvidence {
+        source: TargetPreparationPermanentSettlementRefreezeSource::ActiveIsolated,
+        failure,
+    }
+}
+
+fn target_preparation_permanent_settlement_prewrite_refreeze(
+    world: &World,
+    validation: &FrozenTargetPreparationPermanentPhysicalManifest,
+    candidate: &ValidatedHostCandidate,
+    expected_input_focus: Option<Option<bevy_ecs::entity::Entity>>,
+    expected_route_focus: Option<Option<bevy_ecs::entity::Entity>>,
+) -> Result<(), TargetPreparationPermanentSettlementPrewriteEvidence> {
+    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+        return Err(target_preparation_permanent_settlement_prewrite_error(
+            TargetPreparationPermanentSettlementRefreezeFailure::Registry {
+                expected: true,
+                observed: false,
+            },
+        ));
+    };
+    let host_edge = &validation.allowed_write.host_edge;
+    let observed_host =
+        observe_target_preparation_permanent_entity(world, registry, host_edge.host);
+    let candidate_current = validated_host_candidate_is_current(world, candidate);
+    let registration = world
+        .get::<crate::app_ext::RouterHostRegistration>(host_edge.host)
+        .map(
+            |registration| TargetPreparationPermanentSettlementHostRegistrationObservation {
+                router: registration.router(),
+                incarnation: registration.incarnation(),
+            },
+        );
+    if candidate.host() != host_edge.host
+        || !candidate_current
+        || registration
+            .as_ref()
+            .map(|registration| registration.router)
+            != Some(validation.lineage.router)
+        || !target_preparation_permanent_relationship_manifest_is_exact(
+            world,
+            &observed_host,
+            &host_edge.host_observed,
+            host_edge.host_observed.parent,
+            &host_edge.host_children_before,
+        )
+        || !target_preparation_permanent_authority_values_are_exact(
+            &observed_host,
+            &host_edge.host_observed,
+        )
+    {
+        return Err(target_preparation_permanent_settlement_prewrite_error(
+            TargetPreparationPermanentSettlementRefreezeFailure::HostIncarnation {
+                expected: TargetPreparationPermanentSettlementHostExpectation {
+                    candidate: candidate.clone(),
+                    router: validation.lineage.router,
+                    host: host_edge.host_observed.clone(),
+                    parent: host_edge.host_observed.parent,
+                    children: host_edge.host_children_before.clone(),
+                },
+                observed: TargetPreparationPermanentSettlementHostObservation {
+                    candidate_current,
+                    registration,
+                    host: observed_host,
+                },
+            },
+        ));
+    }
+
+    let observed = target_preparation_permanent_input_observation(world, validation);
+    if !target_preparation_permanent_input_observation_is_exact(
+        &observed,
+        expected_input_focus,
+        expected_route_focus,
+    ) {
+        return Err(target_preparation_permanent_settlement_prewrite_error(
+            TargetPreparationPermanentSettlementRefreezeFailure::InputIsolation {
+                expected: TargetPreparationPermanentSettlementInputExpectation {
+                    input_focus: expected_input_focus.flatten(),
+                    route_focus: expected_route_focus.flatten(),
+                    targets: validation
+                        .target_observed
+                        .iter()
+                        .map(|observed| observed.entity)
+                        .collect(),
+                },
+                observed,
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn target_preparation_permanent_settlement_refreeze_error(
+    stage: TargetPreparationPermanentTransitionStage,
+    failure: TargetPreparationPermanentSettlementRefreezeFailure,
+) -> TargetPreparationPermanentSettlementRefreezeEvidence {
+    TargetPreparationPermanentSettlementRefreezeEvidence {
+        source: TargetPreparationPermanentSettlementRefreezeSource::ActiveIsolated,
+        stage,
+        failure,
+    }
+}
+
+fn target_preparation_permanent_settlement_refreeze(
+    world: &World,
+    validation: &FrozenTargetPreparationPermanentPhysicalManifest,
+    candidate: &ValidatedHostCandidate,
+    expected_input_focus: Option<Option<bevy_ecs::entity::Entity>>,
+    expected_route_focus: Option<Option<bevy_ecs::entity::Entity>>,
+    transition: TargetPreparationPermanentTransition<'_>,
+) -> Result<(), TargetPreparationPermanentSettlementRefreezeEvidence> {
+    let stage = transition.stage();
+    let stage_is_exact = match transition.stage() {
+        TargetPreparationPermanentTransitionStage::HostEdgeDetached => {
+            transition.settled().is_empty() && transition.in_flight().is_none()
+        }
+        TargetPreparationPermanentTransitionStage::PhysicalAbsent(entity) => {
+            transition.in_flight() == Some(entity) && !transition.settled().contains(&entity)
+        }
+        TargetPreparationPermanentTransitionStage::ReceiptCommitted(entity) => {
+            transition.in_flight().is_none() && transition.settled().last() == Some(&entity)
+        }
+    };
+    if !stage_is_exact {
+        return Err(target_preparation_permanent_settlement_refreeze_error(
+            stage,
+            TargetPreparationPermanentSettlementRefreezeFailure::Transition {
+                expected: stage,
+                observed_settled: transition.settled().to_vec(),
+                observed_in_flight: transition.in_flight(),
+            },
+        ));
+    }
+    let input_observation = target_preparation_permanent_input_observation(world, validation);
+    if !target_preparation_permanent_input_is_isolated(
+        world,
+        validation,
+        expected_input_focus,
+        expected_route_focus,
+    ) {
+        return Err(target_preparation_permanent_settlement_refreeze_error(
+            stage,
+            TargetPreparationPermanentSettlementRefreezeFailure::InputIsolation {
+                expected: TargetPreparationPermanentSettlementInputExpectation {
+                    input_focus: expected_input_focus.flatten(),
+                    route_focus: expected_route_focus.flatten(),
+                    targets: validation
+                        .target_observed
+                        .iter()
+                        .map(|observed| observed.entity)
+                        .collect(),
+                },
+                observed: input_observation,
+            },
+        ));
+    }
+    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+        return Err(target_preparation_permanent_settlement_refreeze_error(
+            stage,
+            TargetPreparationPermanentSettlementRefreezeFailure::Registry {
+                expected: true,
+                observed: false,
+            },
+        ));
+    };
+    let target_entities = validation
+        .target_observed
+        .iter()
+        .map(|observed| observed.entity)
+        .collect::<std::collections::HashSet<_>>();
+    let settled = transition
+        .settled()
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    if settled.len() != transition.settled().len()
+        || !settled.is_subset(&target_entities)
+        || transition
+            .in_flight()
+            .is_some_and(|entity| !target_entities.contains(&entity) || settled.contains(&entity))
+    {
+        return Err(target_preparation_permanent_settlement_refreeze_error(
+            stage,
+            TargetPreparationPermanentSettlementRefreezeFailure::Transition {
+                expected: stage,
+                observed_settled: transition.settled().to_vec(),
+                observed_in_flight: transition.in_flight(),
+            },
+        ));
+    }
+    let mut removed = settled.clone();
+    removed.extend(transition.in_flight());
+    let host_edge = &validation.allowed_write.host_edge;
+    let observed_host =
+        observe_target_preparation_permanent_entity(world, registry, host_edge.host);
+    if candidate.host() != host_edge.host
+        || !validated_host_candidate_is_current(world, candidate)
+        || world
+            .get::<crate::app_ext::RouterHostRegistration>(host_edge.host)
+            .is_none_or(|registration| registration.router() != validation.lineage.router)
+        || !target_preparation_permanent_relationship_manifest_is_exact(
+            world,
+            &observed_host,
+            &host_edge.host_observed,
+            host_edge.host_observed.parent,
+            &host_edge.host_children_after,
+        )
+        || !target_preparation_permanent_authority_values_are_exact(
+            &observed_host,
+            &host_edge.host_observed,
+        )
+    {
+        return Err(target_preparation_permanent_settlement_refreeze_error(
+            stage,
+            TargetPreparationPermanentSettlementRefreezeFailure::HostIncarnation {
+                expected: TargetPreparationPermanentSettlementHostExpectation {
+                    candidate: candidate.clone(),
+                    router: validation.lineage.router,
+                    host: host_edge.host_observed.clone(),
+                    parent: host_edge.host_observed.parent,
+                    children: host_edge.host_children_after.clone(),
+                },
+                observed: TargetPreparationPermanentSettlementHostObservation {
+                    candidate_current: validated_host_candidate_is_current(world, candidate),
+                    registration: world
+                        .get::<crate::app_ext::RouterHostRegistration>(host_edge.host)
+                        .map(|registration| {
+                            TargetPreparationPermanentSettlementHostRegistrationObservation {
+                                router: registration.router(),
+                                incarnation: registration.incarnation(),
+                            }
+                        }),
+                    host: observed_host,
+                },
+            },
+        ));
+    }
+
+    for expected in &validation.target_observed {
+        if removed.contains(&expected.entity) {
+            let observed_claim = registry
+                .record(expected.entity)
+                .map(|record| record.claim());
+            let expected_claim = if transition.in_flight() == Some(expected.entity) {
+                expected.registry_claim.clone()
+            } else {
+                None
+            };
+            let claim_is_exact = if transition.in_flight() == Some(expected.entity) {
+                observed_claim == expected.registry_claim
+            } else {
+                observed_claim.is_none()
+            };
+            if world.get_entity(expected.entity).is_ok() || !claim_is_exact {
+                let observed =
+                    observe_target_preparation_permanent_entity(world, registry, expected.entity);
+                return Err(target_preparation_permanent_settlement_refreeze_error(
+                    stage,
+                    TargetPreparationPermanentSettlementRefreezeFailure::Target {
+                        entity: expected.entity,
+                        expected: TargetPreparationPermanentSettlementEntityExpectation {
+                            present: false,
+                            registry_claim: expected_claim,
+                            parent: None,
+                            children: Vec::new(),
+                            facts: None,
+                            isolated: true,
+                        },
+                        observed: TargetPreparationPermanentSettlementEntityObservation {
+                            present: world.get_entity(expected.entity).is_ok(),
+                            isolated: !input_observation
+                                .non_isolated_targets
+                                .contains(&expected.entity),
+                            facts: observed,
+                        },
+                    },
+                ));
+            }
+            continue;
+        }
+        let observed =
+            observe_target_preparation_permanent_entity(world, registry, expected.entity);
+        let expected_parent = if expected.entity == host_edge.top_slot {
+            host_edge.top_slot_parent_after
+        } else {
+            expected.parent
+        };
+        let expected_children = expected
+            .children
+            .iter()
+            .copied()
+            .filter(|child| !removed.contains(child))
+            .collect::<Vec<_>>();
+        if !target_preparation_permanent_relationship_manifest_is_exact(
+            world,
+            &observed,
+            expected,
+            expected_parent,
+            &expected_children,
+        ) || !target_preparation_permanent_authority_values_are_exact(&observed, expected)
+        {
+            return Err(target_preparation_permanent_settlement_refreeze_error(
+                stage,
+                TargetPreparationPermanentSettlementRefreezeFailure::Target {
+                    entity: expected.entity,
+                    expected: TargetPreparationPermanentSettlementEntityExpectation {
+                        present: true,
+                        registry_claim: expected.registry_claim.clone(),
+                        parent: expected_parent,
+                        children: expected_children,
+                        facts: Some(expected.clone()),
+                        isolated: true,
+                    },
+                    observed: TargetPreparationPermanentSettlementEntityObservation {
+                        present: world.get_entity(expected.entity).is_ok(),
+                        isolated: !input_observation
+                            .non_isolated_targets
+                            .contains(&expected.entity),
+                        facts: observed,
+                    },
+                },
+            ));
+        }
+    }
+    for expected in &validation.protected.observed {
+        if expected.entity == host_edge.host {
+            continue;
+        }
+        let observed =
+            observe_target_preparation_permanent_entity(world, registry, expected.entity);
+        if !target_preparation_permanent_structure_is_exact(&observed, expected)
+            || !target_preparation_permanent_authority_values_are_exact(&observed, expected)
+        {
+            return Err(target_preparation_permanent_settlement_refreeze_error(
+                stage,
+                TargetPreparationPermanentSettlementRefreezeFailure::Protected {
+                    entity: expected.entity,
+                    expected: expected.clone(),
+                    observed,
+                },
+            ));
+        }
+    }
+
+    let remaining_targets = target_entities
+        .iter()
+        .copied()
+        .filter(|entity| !removed.contains(entity))
+        .collect::<std::collections::HashSet<_>>();
+    let mut expected_closure = validation
+        .protected
+        .observed
+        .iter()
+        .map(|observed| observed.entity)
+        .collect::<std::collections::HashSet<_>>();
+    expected_closure.insert(host_edge.host);
+    expected_closure.extend(remaining_targets.iter().copied());
+    let mut closure_roots = remaining_targets.iter().copied().collect::<Vec<_>>();
+    closure_roots.push(host_edge.host);
+    let observed_closure = observed_descendant_closure(world, closure_roots);
+    let relationship_exact =
+        target_preparation_permanent_relationship_closure_is_exact(world, &observed_closure);
+    if observed_closure != expected_closure || !relationship_exact {
+        let mut expected = expected_closure.into_iter().collect::<Vec<_>>();
+        expected.sort_by_key(|entity| entity.to_bits());
+        let mut observed = observed_closure.into_iter().collect::<Vec<_>>();
+        observed.sort_by_key(|entity| entity.to_bits());
+        return Err(target_preparation_permanent_settlement_refreeze_error(
+            stage,
+            TargetPreparationPermanentSettlementRefreezeFailure::Closure {
+                expected,
+                observed,
+                relationship_exact,
+            },
+        ));
+    }
+    Ok(())
+}
+
 fn drive_target_preparation_permanent_cleanup(world: &mut World, entry: &mut RouterEntry) -> bool {
     let Some(PendingTargetPreparationPermanentCleanup::Installed(installed)) =
         entry.pending_back_target_permanent_cleanup.as_ref()
     else {
         return false;
     };
-    match &installed.ledger {
-        TargetPreparationPermanentLedgerHolder::Active(
-            ActiveTargetPreparationPermanentLedger::Isolated(_),
-        ) => return true,
-        TargetPreparationPermanentLedgerHolder::Active(
-            ActiveTargetPreparationPermanentLedger::Current(_),
-        ) => {}
-        TargetPreparationPermanentLedgerHolder::Prepared(_) => {}
-    }
-    match &installed.inert {
-        Some(_) => return true,
-        None => {}
+    if installed.inert.is_some()
+        || matches!(
+            &installed.ledger,
+            TargetPreparationPermanentLedgerHolder::Active(
+                ActiveTargetPreparationPermanentLedger::Isolated(isolated)
+            ) if isolated.ledger.is_settled()
+        )
+    {
+        return true;
     }
 
     let Some(pending) = entry.pending_back_target_permanent_cleanup.take() else {
@@ -15078,12 +15714,117 @@ fn drive_target_preparation_permanent_cleanup(world: &mut World, entry: &mut Rou
         TargetPreparationPermanentLedgerHolder::Active(
             ActiveTargetPreparationPermanentLedger::Isolated(isolated),
         ) => {
+            let IsolatedTargetPreparationPermanentLedger {
+                mut ledger,
+                validation,
+                expected_input_focus,
+                expected_route_focus,
+            } = isolated;
+            let inert = match inert {
+                Some(inert) => Some(inert),
+                None => match target_preparation_permanent_prewrite_refreeze(world, &validation) {
+                    Err(evidence) => {
+                        Some(TargetPreparationPermanentInertEvidence::Physical(evidence))
+                    }
+                    Ok(()) => match target_preparation_permanent_settlement_prewrite_refreeze(
+                        world,
+                        &validation,
+                        &retired_host.candidate,
+                        expected_input_focus,
+                        expected_route_focus,
+                    ) {
+                        Err(evidence) => Some(
+                            TargetPreparationPermanentInertEvidence::SettlementPrewriteRefreeze(
+                                evidence,
+                            ),
+                        ),
+                        Ok(()) => {
+                            let edge = &validation.allowed_write.host_edge;
+                            let settlement = ledger.settle_target_preparation_permanent(
+                                world,
+                                TargetPreparationPermanentHostEdge::new(
+                                    edge.host,
+                                    edge.top_slot,
+                                    &retired_host.top_slot_claim,
+                                    &edge.host_children_before,
+                                    &edge.host_children_after,
+                                ),
+                                |world, transition| {
+                                    target_preparation_permanent_settlement_refreeze(
+                                        world,
+                                        &validation,
+                                        &retired_host.candidate,
+                                        expected_input_focus,
+                                        expected_route_focus,
+                                        transition,
+                                    )
+                                },
+                            );
+                            let receipts_observed = entry.observe_cleanup_receipts(&mut ledger);
+                            if !receipts_observed {
+                                Some(
+                                TargetPreparationPermanentInertEvidence::ReceiptObservationRejected(
+                                    ledger.target_preparation_permanent_receipt_observation_evidence(),
+                                ),
+                            )
+                            } else {
+                                match settlement {
+                            Ok(()) => None,
+                            Err(
+                                TargetPreparationPermanentSettlementError::AttemptUnavailable(
+                                    evidence,
+                                ),
+                            ) => Some(
+                                TargetPreparationPermanentInertEvidence::AttemptUnavailable(
+                                    evidence,
+                                ),
+                            ),
+                            Err(
+                                TargetPreparationPermanentSettlementError::ReceiptPreparationRejected(
+                                    evidence,
+                                ),
+                            ) => Some(
+                                TargetPreparationPermanentInertEvidence::ReceiptPreparationRejected(
+                                    evidence,
+                                ),
+                            ),
+                            Err(
+                                TargetPreparationPermanentSettlementError::SettlementRejected(
+                                    evidence,
+                                ),
+                            ) => Some(
+                                TargetPreparationPermanentInertEvidence::SettlementRejected(
+                                    evidence,
+                                ),
+                            ),
+                            Err(
+                                TargetPreparationPermanentSettlementError::PostWriteRefreeze(
+                                    evidence,
+                                ),
+                            ) => Some(
+                                TargetPreparationPermanentInertEvidence::SettlementPostWriteRefreeze(
+                                    evidence,
+                                ),
+                            ),
+                            }
+                            }
+                        }
+                    },
+                },
+            };
             entry.pending_back_target_permanent_cleanup =
                 Some(PendingTargetPreparationPermanentCleanup::Installed(
                     InstalledTargetPreparationPermanentCleanup {
                         cleanup,
                         ledger: TargetPreparationPermanentLedgerHolder::Active(
-                            ActiveTargetPreparationPermanentLedger::Isolated(isolated),
+                            ActiveTargetPreparationPermanentLedger::Isolated(
+                                IsolatedTargetPreparationPermanentLedger {
+                                    ledger,
+                                    validation,
+                                    expected_input_focus,
+                                    expected_route_focus,
+                                },
+                            ),
                         ),
                         batch,
                         retired_host,
@@ -15114,6 +15855,25 @@ fn drive_target_preparation_permanent_cleanup(world: &mut World, entry: &mut Rou
     if let Err(evidence) =
         target_preparation_permanent_prewrite_refreeze(world, &current.validation)
     {
+        entry.pending_back_target_permanent_cleanup =
+            Some(PendingTargetPreparationPermanentCleanup::Installed(
+                InstalledTargetPreparationPermanentCleanup {
+                    cleanup,
+                    ledger: TargetPreparationPermanentLedgerHolder::Active(
+                        ActiveTargetPreparationPermanentLedger::Current(current),
+                    ),
+                    batch,
+                    retired_host,
+                    inert: Some(TargetPreparationPermanentInertEvidence::Physical(evidence)),
+                },
+            ));
+        return true;
+    }
+    if let Err(evidence) = target_preparation_permanent_retired_host_is_current(
+        world,
+        &current.validation,
+        &retired_host.candidate,
+    ) {
         entry.pending_back_target_permanent_cleanup =
             Some(PendingTargetPreparationPermanentCleanup::Installed(
                 InstalledTargetPreparationPermanentCleanup {
@@ -15182,11 +15942,21 @@ fn drive_target_preparation_permanent_cleanup(world: &mut World, entry: &mut Rou
     }
     let postwrite =
         target_preparation_permanent_postwrite_refreeze(world, &cleanup, &retired_host, &applied);
-    let validation = applied.expected_validation;
+    let AppliedTargetPreparationPermanentCurrentIsolation {
+        expected_validation: validation,
+        expected_input_focus,
+        expected_route_focus,
+        ..
+    } = applied;
     let (active, inert) = match postwrite {
         Ok(()) => (
             ActiveTargetPreparationPermanentLedger::Isolated(
-                IsolatedTargetPreparationPermanentLedger { ledger, validation },
+                IsolatedTargetPreparationPermanentLedger {
+                    ledger,
+                    validation,
+                    expected_input_focus,
+                    expected_route_focus,
+                },
             ),
             None,
         ),
@@ -15999,6 +16769,8 @@ pub(crate) mod tests {
     enum CleanupDespawnDriftAction {
         TargetRegistryClaim(crate::registry::ExactRegistryClaim),
         ExternalParentSeal(Entity),
+        TargetVisibility(Entity),
+        ProtectedMarker(Entity),
     }
 
     #[derive(Resource)]
@@ -16034,6 +16806,12 @@ pub(crate) mod tests {
                             .commands()
                             .entity(parent)
                             .insert(RouteOwnershipSeal::new(seal));
+                    }
+                    Some(CleanupDespawnDriftAction::TargetVisibility(target)) => {
+                        world.commands().entity(target).insert(Visibility::Visible);
+                    }
+                    Some(CleanupDespawnDriftAction::ProtectedMarker(target)) => {
+                        world.commands().entity(target).insert(CleanupDriftMarker);
                     }
                     None => {}
                 }
@@ -16075,6 +16853,8 @@ pub(crate) mod tests {
         enabled: bool,
         host: Option<Entity>,
         removals: usize,
+        visibility_drift: Option<(usize, Entity)>,
+        registration_reinsert: Option<(usize, Entity, RouterHandle)>,
     }
 
     #[derive(Component)]
@@ -33338,6 +34118,1114 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn back_target_physical_permanent_current_missing_focus_resource_is_zero_write() {
+        for missing_input_focus in [true, false] {
+            let mut app = App::new();
+            app.add_plugins(BevyUiRouterPlugin::default());
+            let name = if missing_input_focus {
+                "back-target-permanent-current-missing-input-focus"
+            } else {
+                "back-target-permanent-current-missing-route-focus"
+            };
+            let (router, _) = install_classifier_permanent_fixture(&mut app, name);
+            let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+            publish_snapshots_system(app.world_mut());
+            assert!(matches!(
+                dispatch_real_back_target_permanent(&mut app, router, staged.disposition),
+                BackTargetPermanentDispatchOutcome::Dispatched
+            ));
+            let (expected_cleanup, expected_batch, prepared_ledger) =
+                target_permanent_installed_prepared_projection(&app, router);
+            let host_edge = expected_cleanup.allowed_write.host_edge.clone();
+            assert_target_permanent_activation_tick(
+                &mut app,
+                router,
+                staged.request,
+                staged.host,
+                &expected_cleanup,
+                &expected_batch,
+                prepared_ledger,
+                None,
+            );
+            if missing_input_focus {
+                app.world_mut().remove_resource::<InputFocus>();
+            } else {
+                app.world_mut().remove_resource::<RouteFocusState>();
+            }
+
+            settle_cleanup_system(app.world_mut());
+
+            let world = app.world();
+            let registry = world.resource::<RouteEntityRegistry>();
+            let entry = world
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .unwrap();
+            let PendingTargetPreparationPermanentCleanup::Installed(installed) = entry
+                .pending_back_target_permanent_cleanup
+                .as_ref()
+                .unwrap()
+            else {
+                panic!("missing focus authority must retain the installed owner")
+            };
+            let TargetPreparationPermanentLedgerHolder::Active(
+                ActiveTargetPreparationPermanentLedger::Current(active),
+            ) = &installed.ledger
+            else {
+                panic!("missing focus authority must stop before Current isolation")
+            };
+            assert!(matches!(
+                installed.inert,
+                Some(TargetPreparationPermanentInertEvidence::Physical(_))
+            ));
+            assert!(!active.ledger.issued_attempt_present_for_test());
+            assert_eq!(active.ledger.receipt_count(), 0);
+            let mut observed_targets = expected_cleanup
+                .target_observed
+                .iter()
+                .map(|expected| {
+                    observe_target_preparation_permanent_entity(world, registry, expected.entity)
+                })
+                .collect::<Vec<_>>();
+            observed_targets.sort_by_key(|observed| observed.entity.to_bits());
+            assert_eq!(observed_targets, expected_cleanup.target_observed);
+            assert_eq!(
+                world
+                    .get::<ChildOf>(host_edge.top_slot)
+                    .map(ChildOf::parent),
+                host_edge.top_slot_parent_before
+            );
+            assert_eq!(
+                world
+                    .get::<Children>(host_edge.host)
+                    .map(|children| children.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                host_edge.host_children_before
+            );
+            assert!(
+                TargetPermanentDispositionProjection::capture_cleanup(&installed.cleanup)
+                    == expected_cleanup
+            );
+            assert!(TargetPermanentBatchProjection::capture(&installed.batch) == expected_batch);
+        }
+    }
+
+    #[test]
+    fn back_target_physical_permanent_isolated_cleanup_settles_exact_receipts() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        install_provisional_detach_reentry(&mut app);
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-isolated-receipts",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+
+        match dispatch_real_back_target_permanent(&mut app, router, staged.disposition) {
+            BackTargetPermanentDispatchOutcome::Dispatched => {}
+            _ => panic!("the exact receipt fixture must complete real permanent dispatch"),
+        }
+        let (expected_cleanup, expected_batch, prepared_ledger) =
+            target_permanent_installed_prepared_projection(&app, router);
+        let host_edge = expected_cleanup.allowed_write.host_edge.clone();
+        let frozen_protected = expected_cleanup.protected_observed.clone();
+
+        assert_target_permanent_activation_tick(
+            &mut app,
+            router,
+            staged.request,
+            staged.host,
+            &expected_cleanup,
+            &expected_batch,
+            prepared_ledger,
+            None,
+        );
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(host_edge.host);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(host_edge.host));
+
+        settle_cleanup_system(app.world_mut());
+
+        let isolated_cleanup_before = {
+            let world = app.world();
+            let entry = world
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("Current isolation retains its exact RouterEntry");
+            let Some(PendingTargetPreparationPermanentCleanup::Installed(installed)) =
+                entry.pending_back_target_permanent_cleanup.as_ref()
+            else {
+                panic!("Current isolation retains the whole installed owner chain")
+            };
+            let TargetPreparationPermanentLedgerHolder::Active(
+                ActiveTargetPreparationPermanentLedger::Isolated(active),
+            ) = &installed.ledger
+            else {
+                panic!("the receipt fixture must reach the real Active(Isolated) predicate")
+            };
+            assert!(!active.ledger.issued_attempt_present_for_test());
+            assert_eq!(active.ledger.receipt_count(), 0);
+            assert!(!active.ledger.is_settled());
+            assert_eq!(
+                world
+                    .get::<ChildOf>(host_edge.top_slot)
+                    .map(ChildOf::parent),
+                host_edge.top_slot_parent_before,
+                "Current isolation must retain the frozen host edge before receipt settlement"
+            );
+            assert_eq!(
+                world
+                    .get::<Children>(host_edge.host)
+                    .map(|children| children.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                host_edge.host_children_before
+            );
+            assert_eq!(world.resource::<InputFocus>().get(), Some(host_edge.host));
+            assert_eq!(
+                world.resource::<RouteFocusState>().focused(),
+                Some(host_edge.host),
+                "Current isolation must preserve focus outside the target closure"
+            );
+            assert!(
+                entry.host.is_none(),
+                "the retired HostLease must not be restored"
+            );
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::RecoveringAuthority
+            );
+            TargetPermanentDispositionProjection::capture_cleanup(&installed.cleanup)
+        };
+
+        settle_cleanup_system(app.world_mut());
+
+        let world = app.world();
+        let navigation = world.resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("Isolated receipt settlement retains its exact RouterEntry");
+        let Some(PendingTargetPreparationPermanentCleanup::Installed(installed)) =
+            entry.pending_back_target_permanent_cleanup.as_ref()
+        else {
+            panic!("receipt settlement must retain the unique installed owner chain")
+        };
+        let TargetPreparationPermanentLedgerHolder::Active(
+            ActiveTargetPreparationPermanentLedger::Isolated(active),
+        ) = &installed.ledger
+        else {
+            panic!("receipt settlement must retain the Active(Isolated) ledger owner")
+        };
+        let inert_kind = installed.inert.as_ref().map(|inert| match inert {
+            TargetPreparationPermanentInertEvidence::Physical(_) => "physical",
+            TargetPreparationPermanentInertEvidence::ReceiptPreparationRejected(_) => {
+                "receipt-preparation"
+            }
+            TargetPreparationPermanentInertEvidence::ReceiptObservationRejected(_) => {
+                "receipt-observation"
+            }
+            TargetPreparationPermanentInertEvidence::AttemptUnavailable(_) => "attempt",
+            TargetPreparationPermanentInertEvidence::SettlementRejected(_) => "settlement",
+            TargetPreparationPermanentInertEvidence::PostWriteRefreeze(_) => "postwrite",
+            TargetPreparationPermanentInertEvidence::SettlementPrewriteRefreeze(evidence) => {
+                let _ = (evidence.source, &evidence.failure);
+                "settlement-prewrite"
+            }
+            TargetPreparationPermanentInertEvidence::SettlementPostWriteRefreeze(evidence) => {
+                let _ = (evidence.source, evidence.stage, &evidence.failure);
+                "settlement-postwrite"
+            }
+        });
+        assert_eq!(
+            inert_kind,
+            None,
+            "the exact Isolated receipt path must not become inert; receipts={}, top_parent={:?}, host_children={:?}",
+            active.ledger.receipt_count(),
+            world
+                .get::<ChildOf>(host_edge.top_slot)
+                .map(ChildOf::parent),
+            world
+                .get::<Children>(host_edge.host)
+                .map(|children| children.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default(),
+        );
+        let settled = active.ledger.projection();
+        assert_eq!(
+            settled.receipt_count(),
+            settled.obligation_count(),
+            "the real Isolated driver must settle every exact ECS obligation to one receipt"
+        );
+        assert!(
+            settled.obligation_count() > 0,
+            "the target-permanent fixture must exercise a non-empty receipt manifest"
+        );
+        assert!(active.ledger.is_settled());
+        assert!(!active.ledger.issued_attempt_present_for_test());
+        assert!(
+            active.ledger.next_unobserved_receipt().is_none(),
+            "target-specific receipts must enter the existing ECS observation protocol"
+        );
+        assert_eq!(settled.manifest_digest(), expected_batch.manifest_digest);
+        assert_eq!(settled.obligation_count(), expected_batch.obligation_count);
+        let completion = active
+            .ledger
+            .target_preparation_permanent_completion_facts()
+            .expect("settled target cleanup exposes ECS-only completion facts");
+        assert_eq!(completion.manifest_digest(), settled.manifest_digest());
+        assert_eq!(completion.obligation_count(), settled.obligation_count());
+        assert_eq!(completion.settled_count(), settled.receipt_count());
+        assert_ne!(completion.completion_digest(), 0);
+        assert!(
+            TargetPermanentDispositionProjection::capture_cleanup(&installed.cleanup)
+                == isolated_cleanup_before,
+            "receipt settlement must retain the exact cleanup owner"
+        );
+        assert!(
+            TargetPermanentBatchProjection::capture(&installed.batch) == expected_batch,
+            "receipt settlement must retain the unique Core batch owner"
+        );
+        assert_eq!(installed.retired_host.host, host_edge.host);
+        assert_eq!(installed.retired_host.top_slot, host_edge.top_slot);
+        assert_eq!(
+            installed.retired_host.top_slot_claim.entity(),
+            host_edge.top_slot
+        );
+        assert!(installed.inert.is_none());
+        assert!(
+            entry.host.is_none(),
+            "the retired HostLease must stay consumed"
+        );
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::RecoveringAuthority,
+            "receipt settlement must not enter AwaitingHost before joint completion"
+        );
+        assert_eq!(world.resource::<InputFocus>().get(), Some(host_edge.host));
+        assert_eq!(
+            world.resource::<RouteFocusState>().focused(),
+            Some(host_edge.host),
+            "settlement must preserve app-owned focus outside the target closure"
+        );
+        let state = entry.engine.testing_back_target_permanent_begin_state();
+        assert_eq!(state.cleanup_owner_count(), 1);
+        assert_eq!(state.current_owner_count(), 0);
+        assert_eq!(state.action_owner_count(), 0);
+        assert_eq!(state.cleanup_history_owner_count(), 1);
+        assert_eq!(state.cleanup_settlement_owner_count(), 1);
+        assert_eq!(state.conflicting_owner_count(), 0);
+
+        let registry = world.resource::<RouteEntityRegistry>();
+        assert!(world.get_entity(host_edge.host).is_ok());
+        assert!(
+            world
+                .get::<RouterHostRegistration>(host_edge.host)
+                .is_some_and(|registration| registration.router() == router)
+        );
+        assert!(registry.record(host_edge.host).is_none());
+        assert!(world.get::<RouteOwnershipSeal>(host_edge.host).is_none());
+        assert_eq!(
+            world
+                .get::<ChildOf>(host_edge.top_slot)
+                .map(ChildOf::parent),
+            host_edge.top_slot_parent_after
+        );
+        assert_eq!(
+            world
+                .get::<Children>(host_edge.host)
+                .map(|children| children.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            host_edge.host_children_after,
+            "Isolated settlement may apply only the frozen exact top-slot host edge delta"
+        );
+        assert_eq!(world.resource::<ProvisionalDetachReentry>().removals, 1);
+
+        let observed_host =
+            observe_target_preparation_permanent_entity(world, registry, host_edge.host);
+        assert_eq!(observed_host.entity, host_edge.host_observed.entity);
+        assert_eq!(observed_host.parent, host_edge.host_observed.parent);
+        assert_eq!(
+            observed_host.registry_claim,
+            host_edge.host_observed.registry_claim
+        );
+        assert_eq!(
+            observed_host.ownership_seal,
+            host_edge.host_observed.ownership_seal
+        );
+        assert!(target_preparation_permanent_authority_values_are_exact(
+            &observed_host,
+            &host_edge.host_observed,
+        ));
+        let relationship_components = [
+            world.components().component_id::<ChildOf>(),
+            world.components().component_id::<Children>(),
+        ];
+        let non_edge_components = |observed: &FrozenTargetPreparationPermanentObservedEntity| {
+            observed
+                .manifest
+                .as_ref()
+                .expect("the app-owned host remains alive")
+                .component_ids()
+                .iter()
+                .copied()
+                .filter(|component| !relationship_components.contains(&Some(*component)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            non_edge_components(&observed_host),
+            non_edge_components(&host_edge.host_observed),
+            "receipt settlement must preserve every frozen non-edge app-host component fact"
+        );
+        for protected in &frozen_protected {
+            assert_eq!(
+                observe_target_preparation_permanent_entity(world, registry, protected.entity),
+                protected.clone(),
+                "receipt settlement must preserve every protected observed fact"
+            );
+        }
+    }
+
+    #[test]
+    fn back_target_physical_permanent_isolated_host_incarnation_drift_stops_after_edge_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        install_provisional_detach_reentry(&mut app);
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-isolated-host-incarnation",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        assert!(matches!(
+            dispatch_real_back_target_permanent(&mut app, router, staged.disposition),
+            BackTargetPermanentDispatchOutcome::Dispatched
+        ));
+        let (expected_cleanup, expected_batch, prepared_ledger) =
+            target_permanent_installed_prepared_projection(&app, router);
+        let host_edge = expected_cleanup.allowed_write.host_edge.clone();
+        assert_target_permanent_activation_tick(
+            &mut app,
+            router,
+            staged.request,
+            staged.host,
+            &expected_cleanup,
+            &expected_batch,
+            prepared_ledger,
+            None,
+        );
+        settle_cleanup_system(app.world_mut());
+        let (cleanup_before, batch_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .unwrap();
+            let PendingTargetPreparationPermanentCleanup::Installed(installed) = entry
+                .pending_back_target_permanent_cleanup
+                .as_ref()
+                .unwrap()
+            else {
+                panic!("the fixture must retain an installed Isolated owner")
+            };
+            (
+                TargetPermanentDispositionProjection::capture_cleanup(&installed.cleanup),
+                TargetPermanentBatchProjection::capture(&installed.batch),
+            )
+        };
+        app.world_mut()
+            .resource_mut::<ProvisionalDetachReentry>()
+            .registration_reinsert = Some((1, host_edge.host, router));
+
+        settle_cleanup_system(app.world_mut());
+
+        let (receipt_count, removal_count) = {
+            let world = app.world();
+            let entry = world
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .unwrap();
+            let PendingTargetPreparationPermanentCleanup::Installed(installed) = entry
+                .pending_back_target_permanent_cleanup
+                .as_ref()
+                .unwrap()
+            else {
+                panic!("postwrite drift must restore the whole installed owner")
+            };
+            let TargetPreparationPermanentLedgerHolder::Active(
+                ActiveTargetPreparationPermanentLedger::Isolated(active),
+            ) = &installed.ledger
+            else {
+                panic!("postwrite drift must retain Active(Isolated)")
+            };
+            assert!(matches!(
+                installed.inert,
+                Some(
+                    TargetPreparationPermanentInertEvidence::SettlementPostWriteRefreeze(
+                        TargetPreparationPermanentSettlementRefreezeEvidence {
+                            stage: TargetPreparationPermanentTransitionStage::HostEdgeDetached,
+                            failure:
+                                TargetPreparationPermanentSettlementRefreezeFailure::HostIncarnation {
+                                    ..
+                                },
+                            ..
+                        }
+                    )
+                )
+            ));
+            assert_eq!(active.ledger.receipt_count(), 0);
+            assert!(!active.ledger.is_settled());
+            assert!(
+                TargetPermanentDispositionProjection::capture_cleanup(&installed.cleanup)
+                    == cleanup_before
+            );
+            assert!(TargetPermanentBatchProjection::capture(&installed.batch) == batch_before);
+            assert!(!validated_host_candidate_is_current(
+                world,
+                &installed.retired_host.candidate
+            ));
+            assert!(entry.host.is_none());
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::RecoveringAuthority
+            );
+            (
+                active.ledger.receipt_count(),
+                world.resource::<ProvisionalDetachReentry>().removals,
+            )
+        };
+
+        settle_cleanup_system(app.world_mut());
+        let world = app.world();
+        let entry = world
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .unwrap();
+        let PendingTargetPreparationPermanentCleanup::Installed(installed) = entry
+            .pending_back_target_permanent_cleanup
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("inert settlement must remain installed")
+        };
+        let TargetPreparationPermanentLedgerHolder::Active(
+            ActiveTargetPreparationPermanentLedger::Isolated(active),
+        ) = &installed.ledger
+        else {
+            panic!("inert settlement must remain Isolated")
+        };
+        assert_eq!(active.ledger.receipt_count(), receipt_count);
+        assert_eq!(
+            world.resource::<ProvisionalDetachReentry>().removals,
+            removal_count,
+            "an inert owner must stop before any further physical write"
+        );
+    }
+
+    #[test]
+    fn back_target_physical_permanent_isolated_prewrite_host_incarnation_drift_is_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        install_provisional_detach_reentry(&mut app);
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-isolated-prewrite-host-incarnation",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        assert!(matches!(
+            dispatch_real_back_target_permanent(&mut app, router, staged.disposition),
+            BackTargetPermanentDispatchOutcome::Dispatched
+        ));
+        let (expected_cleanup, expected_batch, prepared_ledger) =
+            target_permanent_installed_prepared_projection(&app, router);
+        let host_edge = expected_cleanup.allowed_write.host_edge.clone();
+        assert_target_permanent_activation_tick(
+            &mut app,
+            router,
+            staged.request,
+            staged.host,
+            &expected_cleanup,
+            &expected_batch,
+            prepared_ledger,
+            None,
+        );
+        settle_cleanup_system(app.world_mut());
+        let (cleanup_before, batch_before, target_entities, expected_registration) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .unwrap();
+            let PendingTargetPreparationPermanentCleanup::Installed(installed) = entry
+                .pending_back_target_permanent_cleanup
+                .as_ref()
+                .unwrap()
+            else {
+                panic!("the fixture must retain an installed Isolated owner")
+            };
+            let TargetPreparationPermanentLedgerHolder::Active(
+                ActiveTargetPreparationPermanentLedger::Isolated(active),
+            ) = &installed.ledger
+            else {
+                panic!("the fixture must reach Active(Isolated)")
+            };
+            (
+                TargetPermanentDispositionProjection::capture_cleanup(&installed.cleanup),
+                TargetPermanentBatchProjection::capture(&installed.batch),
+                active.ledger.obligation_entities_for_test(),
+                app.world()
+                    .get::<RouterHostRegistration>(host_edge.host)
+                    .expect("the exact registered host must remain present")
+                    .testing_identity(),
+            )
+        };
+        app.world_mut()
+            .entity_mut(host_edge.host)
+            .remove::<RouterHostRegistration>()
+            .insert(RouterHostRegistration::new(router));
+        app.world_mut().flush();
+        let observed_registration = app
+            .world()
+            .get::<RouterHostRegistration>(host_edge.host)
+            .expect("the reinserted host registration must exist")
+            .testing_identity();
+        assert_ne!(observed_registration, expected_registration);
+
+        settle_cleanup_system(app.world_mut());
+
+        let (receipt_count, removal_count) = {
+            let world = app.world();
+            let entry = world
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .unwrap();
+            let PendingTargetPreparationPermanentCleanup::Installed(installed) = entry
+                .pending_back_target_permanent_cleanup
+                .as_ref()
+                .unwrap()
+            else {
+                panic!("prewrite drift must restore the whole installed owner")
+            };
+            let TargetPreparationPermanentLedgerHolder::Active(
+                ActiveTargetPreparationPermanentLedger::Isolated(active),
+            ) = &installed.ledger
+            else {
+                panic!("prewrite drift must retain Active(Isolated)")
+            };
+            let Some(TargetPreparationPermanentInertEvidence::SettlementPrewriteRefreeze(
+                TargetPreparationPermanentSettlementPrewriteEvidence {
+                    source: TargetPreparationPermanentSettlementRefreezeSource::ActiveIsolated,
+                    failure:
+                        TargetPreparationPermanentSettlementRefreezeFailure::HostIncarnation {
+                            expected,
+                            observed,
+                        },
+                },
+            )) = &installed.inert
+            else {
+                panic!("prewrite host drift must retain exact typed host evidence")
+            };
+            assert_eq!(expected.candidate, installed.retired_host.candidate);
+            assert_eq!(expected.router, router);
+            assert_eq!(expected.host, host_edge.host_observed);
+            assert!(!observed.candidate_current);
+            assert_eq!(
+                observed
+                    .registration
+                    .map(|registration| (registration.router, registration.incarnation)),
+                Some(observed_registration)
+            );
+            assert_ne!(
+                observed
+                    .registration
+                    .map(|registration| (registration.router, registration.incarnation)),
+                Some(expected_registration)
+            );
+            assert_eq!(observed.host, expected.host);
+            assert_eq!(active.ledger.receipt_count(), 0);
+            assert!(!active.ledger.is_settled());
+            assert!(
+                !active.ledger.issued_attempt_present_for_test(),
+                "prewrite host incarnation drift must not issue a cleanup attempt"
+            );
+            assert_eq!(
+                world
+                    .get::<ChildOf>(host_edge.top_slot)
+                    .map(ChildOf::parent),
+                host_edge.top_slot_parent_before,
+                "host incarnation drift before settlement must stop before detaching the app-host edge"
+            );
+            assert_eq!(
+                world
+                    .get::<Children>(host_edge.host)
+                    .map(|children| children.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                host_edge.host_children_before
+            );
+            assert!(
+                target_entities
+                    .iter()
+                    .all(|entity| world.get_entity(*entity).is_ok())
+            );
+            assert!(
+                TargetPermanentDispositionProjection::capture_cleanup(&installed.cleanup)
+                    == cleanup_before
+            );
+            assert!(TargetPermanentBatchProjection::capture(&installed.batch) == batch_before);
+            assert!(!validated_host_candidate_is_current(
+                world,
+                &installed.retired_host.candidate
+            ));
+            assert!(entry.host.is_none());
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::RecoveringAuthority
+            );
+            (
+                active.ledger.receipt_count(),
+                world.resource::<ProvisionalDetachReentry>().removals,
+            )
+        };
+        assert_eq!(removal_count, 0);
+
+        settle_cleanup_system(app.world_mut());
+        let world = app.world();
+        let entry = world
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .unwrap();
+        let PendingTargetPreparationPermanentCleanup::Installed(installed) = entry
+            .pending_back_target_permanent_cleanup
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("inert prewrite drift must remain installed")
+        };
+        let TargetPreparationPermanentLedgerHolder::Active(
+            ActiveTargetPreparationPermanentLedger::Isolated(active),
+        ) = &installed.ledger
+        else {
+            panic!("inert prewrite drift must remain Isolated")
+        };
+        assert_eq!(active.ledger.receipt_count(), receipt_count);
+        assert_eq!(
+            world.resource::<ProvisionalDetachReentry>().removals,
+            removal_count,
+            "an inert prewrite owner must stop every later physical write"
+        );
+    }
+
+    #[test]
+    fn back_target_physical_permanent_isolated_prewrite_input_drift_is_typed_and_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        install_provisional_detach_reentry(&mut app);
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-isolated-prewrite-input-drift",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        assert!(matches!(
+            dispatch_real_back_target_permanent(&mut app, router, staged.disposition),
+            BackTargetPermanentDispatchOutcome::Dispatched
+        ));
+        let (expected_cleanup, expected_batch, prepared_ledger) =
+            target_permanent_installed_prepared_projection(&app, router);
+        let host_edge = expected_cleanup.allowed_write.host_edge.clone();
+        assert_target_permanent_activation_tick(
+            &mut app,
+            router,
+            staged.request,
+            staged.host,
+            &expected_cleanup,
+            &expected_batch,
+            prepared_ledger,
+            None,
+        );
+        settle_cleanup_system(app.world_mut());
+        let (cleanup_before, batch_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .unwrap();
+            let PendingTargetPreparationPermanentCleanup::Installed(installed) = entry
+                .pending_back_target_permanent_cleanup
+                .as_ref()
+                .unwrap()
+            else {
+                panic!("the fixture must retain an installed Isolated owner")
+            };
+            (
+                TargetPermanentDispositionProjection::capture_cleanup(&installed.cleanup),
+                TargetPermanentBatchProjection::capture(&installed.batch),
+            )
+        };
+        app.world_mut().remove_resource::<InputFocus>();
+
+        settle_cleanup_system(app.world_mut());
+
+        let world = app.world();
+        let entry = world
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .unwrap();
+        let PendingTargetPreparationPermanentCleanup::Installed(installed) = entry
+            .pending_back_target_permanent_cleanup
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("prewrite input drift must restore the whole installed owner")
+        };
+        let TargetPreparationPermanentLedgerHolder::Active(
+            ActiveTargetPreparationPermanentLedger::Isolated(active),
+        ) = &installed.ledger
+        else {
+            panic!("prewrite input drift must retain Active(Isolated)")
+        };
+        let Some(TargetPreparationPermanentInertEvidence::SettlementPrewriteRefreeze(
+            TargetPreparationPermanentSettlementPrewriteEvidence {
+                source: TargetPreparationPermanentSettlementRefreezeSource::ActiveIsolated,
+                failure:
+                    TargetPreparationPermanentSettlementRefreezeFailure::InputIsolation {
+                        expected,
+                        observed,
+                    },
+            },
+        )) = &installed.inert
+        else {
+            panic!("prewrite input drift must retain exact typed input evidence")
+        };
+        assert_eq!(expected.input_focus, active.expected_input_focus.flatten());
+        assert_eq!(expected.route_focus, active.expected_route_focus.flatten());
+        assert_eq!(
+            expected.targets.len(),
+            active.validation.target_observed.len()
+        );
+        assert!(!observed.input_resource_present);
+        assert!(observed.route_resource_present);
+        assert!(observed.gate_present);
+        assert!(observed.non_isolated_targets.is_empty());
+        assert!(!active.ledger.issued_attempt_present_for_test());
+        assert_eq!(active.ledger.receipt_count(), 0);
+        assert_eq!(
+            world
+                .get::<ChildOf>(host_edge.top_slot)
+                .map(ChildOf::parent),
+            host_edge.top_slot_parent_before
+        );
+        assert_eq!(world.resource::<ProvisionalDetachReentry>().removals, 0);
+        assert!(
+            TargetPermanentDispositionProjection::capture_cleanup(&installed.cleanup)
+                == cleanup_before
+        );
+        assert!(TargetPermanentBatchProjection::capture(&installed.batch) == batch_before);
+    }
+
+    #[test]
+    fn back_target_physical_permanent_isolated_despawn_hook_isolation_drift_keeps_partial_receipts()
+    {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        install_provisional_detach_reentry(&mut app);
+        install_cleanup_despawn_drift_hook(&mut app);
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-isolated-isolation-drift",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        assert!(matches!(
+            dispatch_real_back_target_permanent(&mut app, router, staged.disposition),
+            BackTargetPermanentDispatchOutcome::Dispatched
+        ));
+        let (expected_cleanup, expected_batch, prepared_ledger) =
+            target_permanent_installed_prepared_projection(&app, router);
+        let host_edge = expected_cleanup.allowed_write.host_edge.clone();
+        assert_target_permanent_activation_tick(
+            &mut app,
+            router,
+            staged.request,
+            staged.host,
+            &expected_cleanup,
+            &expected_batch,
+            prepared_ledger,
+            None,
+        );
+        settle_cleanup_system(app.world_mut());
+        let trigger = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .unwrap();
+            let PendingTargetPreparationPermanentCleanup::Installed(installed) = entry
+                .pending_back_target_permanent_cleanup
+                .as_ref()
+                .unwrap()
+            else {
+                panic!("the fixture must retain an installed Isolated owner")
+            };
+            let TargetPreparationPermanentLedgerHolder::Active(
+                ActiveTargetPreparationPermanentLedger::Isolated(active),
+            ) = &installed.ledger
+            else {
+                panic!("the fixture must reach Active(Isolated)")
+            };
+            let obligations = active.ledger.obligation_entities_for_test();
+            assert!(obligations.len() > 2);
+            obligations[1]
+        };
+        app.world_mut().insert_resource(CleanupDespawnDrift {
+            target: trigger,
+            action: CleanupDespawnDriftAction::TargetVisibility(host_edge.top_slot),
+        });
+
+        settle_cleanup_system(app.world_mut());
+
+        let (receipt_count, live_count) = {
+            let world = app.world();
+            let entry = world
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .unwrap();
+            let PendingTargetPreparationPermanentCleanup::Installed(installed) = entry
+                .pending_back_target_permanent_cleanup
+                .as_ref()
+                .unwrap()
+            else {
+                panic!("isolation drift must restore the whole installed owner")
+            };
+            let TargetPreparationPermanentLedgerHolder::Active(
+                ActiveTargetPreparationPermanentLedger::Isolated(active),
+            ) = &installed.ledger
+            else {
+                panic!("isolation drift must retain Active(Isolated)")
+            };
+            assert!(matches!(
+                installed.inert,
+                Some(
+                    TargetPreparationPermanentInertEvidence::SettlementPostWriteRefreeze(
+                        TargetPreparationPermanentSettlementRefreezeEvidence {
+                            stage: TargetPreparationPermanentTransitionStage::PhysicalAbsent(
+                                entity
+                            ),
+                            failure:
+                                TargetPreparationPermanentSettlementRefreezeFailure::InputIsolation {
+                                    ..
+                                },
+                            ..
+                        }
+                    )
+                ) if entity == trigger
+            ));
+            assert!(active.ledger.receipt_count() > 0);
+            assert!(active.ledger.receipt_count() < active.ledger.projection().obligation_count());
+            assert!(!active.ledger.is_settled());
+            assert!(active.ledger.next_unobserved_receipt().is_none());
+            assert_eq!(
+                world.get::<Visibility>(host_edge.top_slot),
+                Some(&Visibility::Visible)
+            );
+            assert!(entry.host.is_none());
+            (active.ledger.receipt_count(), world.iter_entities().count())
+        };
+
+        settle_cleanup_system(app.world_mut());
+        let world = app.world();
+        let entry = world
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .unwrap();
+        let PendingTargetPreparationPermanentCleanup::Installed(installed) = entry
+            .pending_back_target_permanent_cleanup
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("inert partial settlement must remain installed")
+        };
+        let TargetPreparationPermanentLedgerHolder::Active(
+            ActiveTargetPreparationPermanentLedger::Isolated(active),
+        ) = &installed.ledger
+        else {
+            panic!("inert partial settlement must remain Isolated")
+        };
+        assert_eq!(active.ledger.receipt_count(), receipt_count);
+        assert_eq!(world.iter_entities().count(), live_count);
+    }
+
+    #[test]
+    fn back_target_physical_permanent_isolated_despawn_hook_protected_drift_is_typed() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        install_cleanup_despawn_drift_hook(&mut app);
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-isolated-protected-drift",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        assert!(matches!(
+            dispatch_real_back_target_permanent(&mut app, router, staged.disposition),
+            BackTargetPermanentDispatchOutcome::Dispatched
+        ));
+        let (expected_cleanup, expected_batch, prepared_ledger) =
+            target_permanent_installed_prepared_projection(&app, router);
+        let host_edge = expected_cleanup.allowed_write.host_edge.clone();
+        let protected = expected_cleanup
+            .protected_observed
+            .iter()
+            .find(|observed| observed.entity != host_edge.host)
+            .expect("the real fixture freezes an ordinary protected entity")
+            .entity;
+        assert_target_permanent_activation_tick(
+            &mut app,
+            router,
+            staged.request,
+            staged.host,
+            &expected_cleanup,
+            &expected_batch,
+            prepared_ledger,
+            None,
+        );
+        settle_cleanup_system(app.world_mut());
+        let (trigger, cleanup_before, batch_before) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .unwrap();
+            let PendingTargetPreparationPermanentCleanup::Installed(installed) = entry
+                .pending_back_target_permanent_cleanup
+                .as_ref()
+                .unwrap()
+            else {
+                panic!("the fixture must retain an installed Isolated owner")
+            };
+            let TargetPreparationPermanentLedgerHolder::Active(
+                ActiveTargetPreparationPermanentLedger::Isolated(active),
+            ) = &installed.ledger
+            else {
+                panic!("the fixture must reach Active(Isolated)")
+            };
+            let obligations = active.ledger.obligation_entities_for_test();
+            assert!(obligations.len() > 2);
+            (
+                obligations[1],
+                TargetPermanentDispositionProjection::capture_cleanup(&installed.cleanup),
+                TargetPermanentBatchProjection::capture(&installed.batch),
+            )
+        };
+        app.world_mut().insert_resource(CleanupDespawnDrift {
+            target: trigger,
+            action: CleanupDespawnDriftAction::ProtectedMarker(protected),
+        });
+
+        settle_cleanup_system(app.world_mut());
+
+        let (receipt_count, live_count) = {
+            let world = app.world();
+            let entry = world
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .unwrap();
+            let PendingTargetPreparationPermanentCleanup::Installed(installed) = entry
+                .pending_back_target_permanent_cleanup
+                .as_ref()
+                .unwrap()
+            else {
+                panic!("protected drift must restore the whole installed owner")
+            };
+            let TargetPreparationPermanentLedgerHolder::Active(
+                ActiveTargetPreparationPermanentLedger::Isolated(active),
+            ) = &installed.ledger
+            else {
+                panic!("protected drift must retain Active(Isolated)")
+            };
+            assert!(matches!(
+                installed.inert,
+                Some(
+                    TargetPreparationPermanentInertEvidence::SettlementPostWriteRefreeze(
+                        TargetPreparationPermanentSettlementRefreezeEvidence {
+                            stage: TargetPreparationPermanentTransitionStage::PhysicalAbsent(
+                                entity
+                            ),
+                            failure:
+                                TargetPreparationPermanentSettlementRefreezeFailure::Protected {
+                                    entity: protected_entity,
+                                    ..
+                                },
+                            ..
+                        }
+                    )
+                ) if entity == trigger && protected_entity == protected
+            ));
+            assert!(active.ledger.receipt_count() > 0);
+            assert!(active.ledger.receipt_count() < active.ledger.projection().obligation_count());
+            assert!(active.ledger.next_unobserved_receipt().is_none());
+            assert!(world.get::<CleanupDriftMarker>(protected).is_some());
+            assert!(
+                TargetPermanentDispositionProjection::capture_cleanup(&installed.cleanup)
+                    == cleanup_before
+            );
+            assert!(TargetPermanentBatchProjection::capture(&installed.batch) == batch_before);
+            (active.ledger.receipt_count(), world.iter_entities().count())
+        };
+
+        settle_cleanup_system(app.world_mut());
+        let world = app.world();
+        let entry = world
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .unwrap();
+        let PendingTargetPreparationPermanentCleanup::Installed(installed) = entry
+            .pending_back_target_permanent_cleanup
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("inert protected drift must remain installed")
+        };
+        let TargetPreparationPermanentLedgerHolder::Active(
+            ActiveTargetPreparationPermanentLedger::Isolated(active),
+        ) = &installed.ledger
+        else {
+            panic!("inert protected drift must remain Isolated")
+        };
+        assert_eq!(active.ledger.receipt_count(), receipt_count);
+        assert_eq!(world.iter_entities().count(), live_count);
+    }
+
+    #[test]
     fn back_target_physical_permanent_postwrite_drift_preserves_current_owner_and_isolation() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
@@ -33987,51 +35875,61 @@ pub(crate) mod tests {
             1,
             "the driver may whole-take Prepared only once"
         );
-        let isolated_safe_stop = compact
-            .find(concat!(
-                "ActiveTargetPreparationPermanentLedger::Isolated(_),",
-                ")=>returntrue"
-            ))
-            .expect("Isolated must safe-stop before whole-take");
+        let isolated_settled_safe_stop = compact
+            .find("isolated.ledger.is_settled()")
+            .expect("a settled Isolated ledger must safe-stop before whole-take");
         let current_continues = compact
             .find(concat!(
-                "ActiveTargetPreparationPermanentLedger::Current(_),",
-                ")=>{}"
+                "ActiveTargetPreparationPermanentLedger::Current(current),",
+                ")=>{activated_now=false;current}"
             ))
             .expect("Current must remain the only active phase eligible for isolation");
         let inert_safe_stop = compact
-            .find("match&installed.inert{Some(_)=>returntrue,None=>{}}")
+            .find("installed.inert.is_some()")
             .expect("typed inert evidence must safe-stop before whole-take");
+        let isolated_settlement = compact
+            .find(".settle_target_preparation_permanent(")
+            .expect("an unsettled Isolated ledger must execute only after whole-take");
         assert!(
-            isolated_safe_stop < take && current_continues < take && inert_safe_stop < take,
-            "phase and inert classification must precede whole-take"
+            isolated_settled_safe_stop < take
+                && inert_safe_stop < take
+                && take < current_continues
+                && take < isolated_settlement,
+            "only inert or already-settled owners may stop before the unique whole-take"
         );
         assert_eq!(
             compact.matches(".into_active()").count(),
             1,
             "the driver must consume Prepared exactly once"
         );
-        let refreeze = compact
+        let current_driver = driver
+            .split_once("    match inert {")
+            .expect("the post-match Current driver must retain typed inert restoration")
+            .1;
+        let current_compact = current_driver
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        let refreeze = current_compact
             .find("target_preparation_permanent_prewrite_refreeze(")
-            .expect("activation must use the canonical read-only prewrite refreeze");
+            .expect("Current activation must use the canonical read-only prewrite refreeze");
         assert_eq!(
-            compact
+            current_compact
                 .matches("target_preparation_permanent_prewrite_refreeze(")
                 .count(),
             1,
-            "the driver must call the canonical prewrite refreeze exactly once"
+            "the Current path must call its canonical prewrite refreeze exactly once"
         );
-        assert!(take < refreeze);
-        let activation_stop = compact
+        let activation_stop = current_compact
             .find("ifactivated_now{")
             .expect("the first tick must stop after Prepared activates into Current");
-        let isolation_prepare = compact
+        let isolation_prepare = current_compact
             .find("prepare_target_preparation_permanent_current_isolation(")
             .expect("a later Current tick must prepare isolation before writing");
-        let isolation_apply = compact
+        let isolation_apply = current_compact
             .find("letapplied=prepared.apply(")
             .expect("the fully prepared isolation must expose one apply boundary");
-        let postwrite_refreeze = compact
+        let postwrite_refreeze = current_compact
             .find("target_preparation_permanent_postwrite_refreeze(")
             .expect("Current isolation must perform one exact postwrite refreeze");
         assert!(
@@ -34060,7 +35958,7 @@ pub(crate) mod tests {
             "complete_back_target_permanent_cleanup",
         ] {
             assert!(
-                !compact.contains(forbidden),
+                !current_compact.contains(forbidden),
                 "the Current isolation driver must stop before later cleanup settlement: {forbidden}"
             );
         }
@@ -34191,6 +36089,56 @@ pub(crate) mod tests {
             1,
             "settle_cleanup_system must drive target activation through one dedicated callsite"
         );
+    }
+
+    #[test]
+    fn back_target_physical_permanent_settlement_failures_keep_typed_boundary_evidence() {
+        let cleanup = include_str!("cleanup.rs")
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        let navigation = include_str!("navigation.rs")
+            .split_once("\n#[cfg(test)]\npub(crate) mod tests {")
+            .expect("production navigation must precede its test module")
+            .0
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        for variant in [
+            "AttemptUnavailable(TargetPreparationPermanentSettlementBoundaryEvidence)",
+            "ReceiptPreparationRejected(TargetPreparationPermanentSettlementBoundaryEvidence)",
+            "SettlementRejected(TargetPreparationPermanentSettlementBoundaryEvidence)",
+        ] {
+            assert!(
+                cleanup.contains(variant),
+                "cleanup settlement failure must retain typed source/expectation/observation evidence: {variant}"
+            );
+            assert!(
+                navigation.contains(variant),
+                "the installed inert owner must retain the same typed settlement evidence: {variant}"
+            );
+        }
+        assert!(navigation.contains(
+            "ReceiptObservationRejected(TargetPreparationPermanentReceiptObservationEvidence)"
+        ));
+        assert!(cleanup.contains("source:TargetPreparationPermanentSettlementSource"));
+        assert!(cleanup.contains("stage:TargetPreparationPermanentSettlementFailureStage"));
+        assert!(cleanup.contains("expected:TargetPreparationPermanentSettlementExpectation"));
+        assert!(cleanup.contains("observed:TargetPreparationPermanentSettlementObservation"));
+        assert!(navigation.contains("enumTargetPreparationPermanentSettlementRefreezeFailure"));
+        for failure in [
+            "InputIsolation{expected:",
+            "HostIncarnation{expected:",
+            "Registry{expected:",
+            "Target{entity:",
+            "Protected{entity:",
+            "Closure{expected:",
+        ] {
+            assert!(
+                navigation.contains(failure),
+                "postwrite refreeze must retain specific expected/observed evidence: {failure}"
+            );
+        }
     }
 
     #[test]
@@ -46530,13 +48478,32 @@ pub(crate) mod tests {
                 if world.get::<ProvisionalSlotLifecycle>(entity).is_none() {
                     return;
                 }
-                let host = {
+                let (removal, host, visibility_drift, registration_reinsert) = {
                     let mut reentry = world.resource_mut::<ProvisionalDetachReentry>();
                     reentry.removals += 1;
-                    reentry.enabled.then_some(reentry.host).flatten()
+                    (
+                        reentry.removals,
+                        reentry.enabled.then_some(reentry.host).flatten(),
+                        reentry.visibility_drift,
+                        reentry.registration_reinsert,
+                    )
                 };
                 if let Some(host) = host {
                     world.commands().entity(entity).insert(ChildOf(host));
+                }
+                if let Some((at, target)) = visibility_drift
+                    && at == removal
+                {
+                    world.commands().entity(target).insert(Visibility::Visible);
+                }
+                if let Some((at, host, router)) = registration_reinsert
+                    && at == removal
+                {
+                    world
+                        .commands()
+                        .entity(host)
+                        .remove::<RouterHostRegistration>()
+                        .insert(RouterHostRegistration::new(router));
                 }
             });
     }

@@ -6313,6 +6313,257 @@ pub(crate) struct CleanupLedger {
     back_no_target_authority_partition: Option<FrozenBackNoTargetAuthorityPartition>,
 }
 
+pub(crate) struct TargetPreparationPermanentHostEdge<'a> {
+    host: Entity,
+    top_slot: Entity,
+    top_slot_claim: &'a ExactRegistryClaim,
+    children_before: &'a [Entity],
+    children_after: &'a [Entity],
+}
+
+impl<'a> TargetPreparationPermanentHostEdge<'a> {
+    pub(crate) fn new(
+        host: Entity,
+        top_slot: Entity,
+        top_slot_claim: &'a ExactRegistryClaim,
+        children_before: &'a [Entity],
+        children_after: &'a [Entity],
+    ) -> Self {
+        Self {
+            host,
+            top_slot,
+            top_slot_claim,
+            children_before,
+            children_after,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TargetPreparationPermanentTransitionStage {
+    HostEdgeDetached,
+    PhysicalAbsent(Entity),
+    ReceiptCommitted(Entity),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct TargetPreparationPermanentTransition<'a> {
+    stage: TargetPreparationPermanentTransitionStage,
+    settled: &'a [Entity],
+    in_flight: Option<Entity>,
+}
+
+impl<'a> TargetPreparationPermanentTransition<'a> {
+    pub(crate) const fn stage(self) -> TargetPreparationPermanentTransitionStage {
+        self.stage
+    }
+
+    pub(crate) const fn settled(self) -> &'a [Entity] {
+        self.settled
+    }
+
+    pub(crate) const fn in_flight(self) -> Option<Entity> {
+        self.in_flight
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetPreparationPermanentSettlementSource {
+    ActiveIsolated,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TargetPreparationPermanentSettlementFailureStage {
+    LedgerPreflight,
+    AttemptPreflight,
+    HostEdgePrewrite,
+    FocusPrewrite,
+    CapacityPreparation,
+    ObligationPreflight { index: usize, entity: Entity },
+    ReceiptPreparation { index: usize, entity: Entity },
+    RegistryRetirementPreparation { index: usize, entity: Entity },
+    RemovalPrewrite { index: usize, entity: Entity },
+    Completion,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TargetPreparationPermanentSettlementExpectation {
+    FreshLedger {
+        manifest_digest: u64,
+        obligation_count: usize,
+    },
+    IssuedAttempt(CleanupAttempt),
+    HostEdgeBefore {
+        host: Entity,
+        top_slot: Entity,
+        top_slot_claim: ExactRegistryClaim,
+        host_children: Vec<Entity>,
+        top_slot_parent: Option<Entity>,
+    },
+    FocusReleased {
+        targets: Vec<Entity>,
+    },
+    PreparedCapacity {
+        requested: usize,
+    },
+    ExactObligation {
+        index: usize,
+        claim: ExactRegistryClaim,
+        expected_parent: Entity,
+    },
+    VacantReceiptSlot {
+        index: usize,
+        claim: ExactRegistryClaim,
+    },
+    ExactRegistryRetirement {
+        index: usize,
+        claim: ExactRegistryClaim,
+    },
+    RemovableObligation {
+        index: usize,
+        claim: ExactRegistryClaim,
+        expected_parent: Option<Entity>,
+        expected_children: Vec<Entity>,
+    },
+    FullySettled {
+        manifest_digest: u64,
+        obligation_count: usize,
+        host: Entity,
+        host_children_after: Vec<Entity>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TargetPreparationPermanentSettlementObservation {
+    Ledger {
+        owner_present: bool,
+        normal_batch_present: bool,
+        back_no_target_batch_present: bool,
+        back_no_target_capacity_present: bool,
+        mount_parent_count: usize,
+        receipt_slot_count: usize,
+        receipt_count: usize,
+        completion_digest: Option<u64>,
+        authority_host_children_present: bool,
+        back_no_target_authority_partition_present: bool,
+    },
+    AttemptUnavailable {
+        next_attempt: u64,
+        completion_digest: Option<u64>,
+    },
+    Attempt {
+        issued: Option<CleanupAttempt>,
+        observed: CleanupAttempt,
+    },
+    HostEdge {
+        host_exists: bool,
+        top_slot_claim_count: usize,
+        host_obligation_count: usize,
+        host_children: Vec<Entity>,
+        top_slot_parent: Option<Entity>,
+    },
+    Focus {
+        remaining: Vec<Entity>,
+    },
+    CapacityRejected {
+        requested: usize,
+    },
+    Obligation {
+        evidence: Option<CleanupEvidence>,
+        authority_exact: bool,
+    },
+    ReceiptSlot {
+        existing: Option<(u64, u64, usize, CleanupDisposition, u64, bool)>,
+    },
+    RegistryRetirementRejected {
+        observed_claim: Option<ExactRegistryClaim>,
+    },
+    Removal {
+        entity_exists: bool,
+        observed_claim: Option<ExactRegistryClaim>,
+        parent: Option<Entity>,
+        children: Vec<Entity>,
+        authority_exact: bool,
+    },
+    Completion {
+        remaining_focus: Vec<Entity>,
+        host_children: Vec<Entity>,
+        receipt_count: usize,
+        missing_receipts: Vec<usize>,
+        completion_digest: Option<u64>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TargetPreparationPermanentSettlementBoundaryEvidence {
+    source: TargetPreparationPermanentSettlementSource,
+    stage: TargetPreparationPermanentSettlementFailureStage,
+    expected: TargetPreparationPermanentSettlementExpectation,
+    observed: TargetPreparationPermanentSettlementObservation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TargetPreparationPermanentReceiptObservationEvidence {
+    manifest_digest: u64,
+    obligation_count: usize,
+    receipt_count: usize,
+    unobserved: Vec<(usize, CleanupDisposition)>,
+}
+
+pub(crate) enum TargetPreparationPermanentSettlementError<Evidence> {
+    AttemptUnavailable(TargetPreparationPermanentSettlementBoundaryEvidence),
+    ReceiptPreparationRejected(TargetPreparationPermanentSettlementBoundaryEvidence),
+    SettlementRejected(TargetPreparationPermanentSettlementBoundaryEvidence),
+    PostWriteRefreeze(Evidence),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TargetPreparationPermanentCompletionFacts {
+    manifest_digest: u64,
+    obligation_count: usize,
+    completion_digest: u64,
+    settled_count: usize,
+}
+
+impl TargetPreparationPermanentCompletionFacts {
+    pub(crate) const fn manifest_digest(self) -> u64 {
+        self.manifest_digest
+    }
+
+    pub(crate) const fn obligation_count(self) -> usize {
+        self.obligation_count
+    }
+
+    pub(crate) const fn completion_digest(self) -> u64 {
+        self.completion_digest
+    }
+
+    pub(crate) const fn settled_count(self) -> usize {
+        self.settled_count
+    }
+}
+
+struct PreparedTargetPreparationPermanentRemoval {
+    index: usize,
+    entity: Entity,
+    expected_parent: Option<Entity>,
+    children_before: Vec<Entity>,
+    retirement: PreparedExactRegistryRetirement,
+    receipt: PreparedCleanupReceiptBatch,
+}
+
+impl PreparedTargetPreparationPermanentRemoval {
+    fn is_current(&self, world: &World, claim: &ExactRegistryClaim, completed: &[Entity]) -> bool {
+        world
+            .resource::<RouteEntityRegistry>()
+            .record(self.entity)
+            .is_some_and(|record| record.claim() == *claim)
+            && world.get::<ChildOf>(self.entity).map(ChildOf::parent) == self.expected_parent
+            && children_match_after_removals(world, self.entity, &self.children_before, completed)
+            && cleanup_claim_has_exact_authority(world, claim)
+    }
+}
+
 struct InstalledBackCapacityLease {
     domain: PreparationCapacityDomain,
     cell: BackCapacityCellId,
@@ -7166,6 +7417,31 @@ impl CleanupLedger {
         })
     }
 
+    pub(crate) fn target_preparation_permanent_completion_facts(
+        &self,
+    ) -> Option<TargetPreparationPermanentCompletionFacts> {
+        if self.owner.is_some()
+            || self.batch.is_some()
+            || self.back_no_target_batch.is_some()
+            || self.back_no_target_capacity.is_some()
+            || !self.mount_parents.is_empty()
+            || self.authority_host_children.is_some()
+            || self.back_no_target_authority_partition.is_some()
+            || self
+                .receipts
+                .iter()
+                .any(|receipt| receipt.as_ref().is_none_or(|receipt| !receipt.observed))
+        {
+            return None;
+        }
+        Some(TargetPreparationPermanentCompletionFacts {
+            manifest_digest: self.manifest_digest,
+            obligation_count: self.obligations.len(),
+            completion_digest: self.completion_digest?,
+            settled_count: self.receipts.iter().flatten().count(),
+        })
+    }
+
     pub(crate) fn back_no_target_authority_completion_facts(
         &self,
     ) -> Option<BackNoTargetAuthorityCompletionFacts> {
@@ -7282,6 +7558,559 @@ impl CleanupLedger {
 
     pub(crate) const fn is_settled(&self) -> bool {
         self.completion_digest.is_some()
+    }
+
+    fn target_preparation_permanent_boundary(
+        stage: TargetPreparationPermanentSettlementFailureStage,
+        expected: TargetPreparationPermanentSettlementExpectation,
+        observed: TargetPreparationPermanentSettlementObservation,
+    ) -> TargetPreparationPermanentSettlementBoundaryEvidence {
+        TargetPreparationPermanentSettlementBoundaryEvidence {
+            source: TargetPreparationPermanentSettlementSource::ActiveIsolated,
+            stage,
+            expected,
+            observed,
+        }
+    }
+
+    fn target_preparation_permanent_ledger_observation(
+        &self,
+    ) -> TargetPreparationPermanentSettlementObservation {
+        TargetPreparationPermanentSettlementObservation::Ledger {
+            owner_present: self.owner.is_some(),
+            normal_batch_present: self.batch.is_some(),
+            back_no_target_batch_present: self.back_no_target_batch.is_some(),
+            back_no_target_capacity_present: self.back_no_target_capacity.is_some(),
+            mount_parent_count: self.mount_parents.len(),
+            receipt_slot_count: self.receipts.len(),
+            receipt_count: self.receipts.iter().flatten().count(),
+            completion_digest: self.completion_digest,
+            authority_host_children_present: self.authority_host_children.is_some(),
+            back_no_target_authority_partition_present: self
+                .back_no_target_authority_partition
+                .is_some(),
+        }
+    }
+
+    fn target_preparation_permanent_receipt_slot_observation(
+        &self,
+        index: usize,
+    ) -> TargetPreparationPermanentSettlementObservation {
+        TargetPreparationPermanentSettlementObservation::ReceiptSlot {
+            existing: self
+                .receipts
+                .get(index)
+                .and_then(Option::as_ref)
+                .map(|receipt| {
+                    (
+                        receipt.ledger_domain,
+                        receipt.attempt_revision,
+                        receipt.obligation,
+                        receipt.disposition,
+                        receipt.binding,
+                        receipt.observed,
+                    )
+                }),
+        }
+    }
+
+    pub(crate) fn target_preparation_permanent_receipt_observation_evidence(
+        &self,
+    ) -> TargetPreparationPermanentReceiptObservationEvidence {
+        TargetPreparationPermanentReceiptObservationEvidence {
+            manifest_digest: self.manifest_digest,
+            obligation_count: self.obligations.len(),
+            receipt_count: self.receipts.iter().flatten().count(),
+            unobserved: self
+                .receipts
+                .iter()
+                .enumerate()
+                .filter_map(|(index, receipt)| {
+                    receipt
+                        .as_ref()
+                        .filter(|receipt| !receipt.observed)
+                        .map(|receipt| (index, receipt.disposition))
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn settle_target_preparation_permanent<Evidence>(
+        &mut self,
+        world: &mut World,
+        edge: TargetPreparationPermanentHostEdge<'_>,
+        mut refreeze: impl FnMut(
+            &World,
+            TargetPreparationPermanentTransition<'_>,
+        ) -> Result<(), Evidence>,
+    ) -> Result<(), TargetPreparationPermanentSettlementError<Evidence>> {
+        if self.owner.is_some()
+            || self.batch.is_some()
+            || self.back_no_target_batch.is_some()
+            || self.back_no_target_capacity.is_some()
+            || !self.mount_parents.is_empty()
+            || self.receipts.iter().any(Option::is_some)
+            || self.completion_digest.is_some()
+            || self.authority_host_children.is_some()
+            || self.back_no_target_authority_partition.is_some()
+        {
+            return Err(
+                TargetPreparationPermanentSettlementError::SettlementRejected(
+                    Self::target_preparation_permanent_boundary(
+                        TargetPreparationPermanentSettlementFailureStage::LedgerPreflight,
+                        TargetPreparationPermanentSettlementExpectation::FreshLedger {
+                            manifest_digest: self.manifest_digest,
+                            obligation_count: self.obligations.len(),
+                        },
+                        self.target_preparation_permanent_ledger_observation(),
+                    ),
+                ),
+            );
+        }
+
+        let attempt = self.attempt(world).ok_or_else(|| {
+            TargetPreparationPermanentSettlementError::AttemptUnavailable(
+                Self::target_preparation_permanent_boundary(
+                    TargetPreparationPermanentSettlementFailureStage::AttemptPreflight,
+                    TargetPreparationPermanentSettlementExpectation::FreshLedger {
+                        manifest_digest: self.manifest_digest,
+                        obligation_count: self.obligations.len(),
+                    },
+                    TargetPreparationPermanentSettlementObservation::AttemptUnavailable {
+                        next_attempt: self.next_attempt,
+                        completion_digest: self.completion_digest,
+                    },
+                ),
+            )
+        })?;
+        if self.issued_attempt.as_ref() != Some(&attempt)
+            || attempt.unsettled_digest
+                != unsettled_digest(self.manifest_digest, &self.obligations, &self.receipts)
+            || !attempt.mount_parents_exact
+            || attempt.evidence.len() != self.obligations.len()
+        {
+            return Err(
+                TargetPreparationPermanentSettlementError::SettlementRejected(
+                    Self::target_preparation_permanent_boundary(
+                        TargetPreparationPermanentSettlementFailureStage::AttemptPreflight,
+                        TargetPreparationPermanentSettlementExpectation::IssuedAttempt(
+                            attempt.clone(),
+                        ),
+                        TargetPreparationPermanentSettlementObservation::Attempt {
+                            issued: self.issued_attempt.clone(),
+                            observed: attempt,
+                        },
+                    ),
+                ),
+            );
+        }
+
+        let top_slot_claim_count = self
+            .obligations
+            .iter()
+            .filter(|obligation| obligation.claim == *edge.top_slot_claim)
+            .count();
+        let host_obligation_count = self
+            .obligations
+            .iter()
+            .filter(|obligation| obligation.claim.entity() == edge.host)
+            .count();
+        let host_children = observed_children(world, edge.host);
+        let top_slot_parent = world.get::<ChildOf>(edge.top_slot).map(ChildOf::parent);
+        if world.get_entity(edge.host).is_err()
+            || edge.top_slot_claim.entity() != edge.top_slot
+            || host_children != edge.children_before
+            || top_slot_parent != Some(edge.host)
+            || top_slot_claim_count != 1
+            || host_obligation_count != 0
+        {
+            return Err(
+                TargetPreparationPermanentSettlementError::SettlementRejected(
+                    Self::target_preparation_permanent_boundary(
+                        TargetPreparationPermanentSettlementFailureStage::HostEdgePrewrite,
+                        TargetPreparationPermanentSettlementExpectation::HostEdgeBefore {
+                            host: edge.host,
+                            top_slot: edge.top_slot,
+                            top_slot_claim: edge.top_slot_claim.clone(),
+                            host_children: edge.children_before.to_vec(),
+                            top_slot_parent: Some(edge.host),
+                        },
+                        TargetPreparationPermanentSettlementObservation::HostEdge {
+                            host_exists: world.get_entity(edge.host).is_ok(),
+                            top_slot_claim_count,
+                            host_obligation_count,
+                            host_children,
+                            top_slot_parent,
+                        },
+                    ),
+                ),
+            );
+        }
+
+        let focus = quarantine_focus_closure(&attempt.evidence, &self.obligations);
+        if !focus_is_released(world, &focus) {
+            return Err(
+                TargetPreparationPermanentSettlementError::SettlementRejected(
+                    Self::target_preparation_permanent_boundary(
+                        TargetPreparationPermanentSettlementFailureStage::FocusPrewrite,
+                        TargetPreparationPermanentSettlementExpectation::FocusReleased {
+                            targets: focus.clone(),
+                        },
+                        TargetPreparationPermanentSettlementObservation::Focus {
+                            remaining: focused_targets(world, &focus),
+                        },
+                    ),
+                ),
+            );
+        }
+
+        let mut removals = Vec::new();
+        removals
+            .try_reserve_exact(attempt.evidence.len())
+            .map_err(|_| {
+                TargetPreparationPermanentSettlementError::SettlementRejected(
+                    Self::target_preparation_permanent_boundary(
+                        TargetPreparationPermanentSettlementFailureStage::CapacityPreparation,
+                        TargetPreparationPermanentSettlementExpectation::PreparedCapacity {
+                            requested: attempt.evidence.len(),
+                        },
+                        TargetPreparationPermanentSettlementObservation::CapacityRejected {
+                            requested: attempt.evidence.len(),
+                        },
+                    ),
+                )
+            })?;
+        for (index, evidence) in &attempt.evidence {
+            let Some(obligation) = self.obligations.get(*index) else {
+                return Err(
+                    TargetPreparationPermanentSettlementError::SettlementRejected(
+                        Self::target_preparation_permanent_boundary(
+                            TargetPreparationPermanentSettlementFailureStage::ObligationPreflight {
+                                index: *index,
+                                entity: edge.top_slot,
+                            },
+                            TargetPreparationPermanentSettlementExpectation::ExactObligation {
+                                index: *index,
+                                claim: edge.top_slot_claim.clone(),
+                                expected_parent: edge.host,
+                            },
+                            TargetPreparationPermanentSettlementObservation::Obligation {
+                                evidence: Some(evidence.clone()),
+                                authority_exact: false,
+                            },
+                        ),
+                    ),
+                );
+            };
+            let authority_exact = cleanup_claim_has_exact_authority(world, &obligation.claim);
+            let CleanupEvidence::Exact {
+                actual_parent,
+                foreign_descendants,
+                foreign_components,
+                missing_components,
+                protected_parent,
+                relationship_cycle,
+                ..
+            } = evidence
+            else {
+                return Err(
+                    TargetPreparationPermanentSettlementError::SettlementRejected(
+                        Self::target_preparation_permanent_boundary(
+                            TargetPreparationPermanentSettlementFailureStage::ObligationPreflight {
+                                index: *index,
+                                entity: obligation.claim.entity(),
+                            },
+                            TargetPreparationPermanentSettlementExpectation::ExactObligation {
+                                index: *index,
+                                claim: obligation.claim.clone(),
+                                expected_parent: obligation.expected_parent,
+                            },
+                            TargetPreparationPermanentSettlementObservation::Obligation {
+                                evidence: Some(evidence.clone()),
+                                authority_exact,
+                            },
+                        ),
+                    ),
+                );
+            };
+            if obligation.terminal_mode != CleanupTerminalMode::AuthorityExact
+                || !foreign_descendants.is_empty()
+                || !foreign_components.is_empty()
+                || !missing_components.is_empty()
+                || protected_parent.is_some()
+                || *relationship_cycle
+                || !authority_exact
+            {
+                return Err(
+                    TargetPreparationPermanentSettlementError::SettlementRejected(
+                        Self::target_preparation_permanent_boundary(
+                            TargetPreparationPermanentSettlementFailureStage::ObligationPreflight {
+                                index: *index,
+                                entity: obligation.claim.entity(),
+                            },
+                            TargetPreparationPermanentSettlementExpectation::ExactObligation {
+                                index: *index,
+                                claim: obligation.claim.clone(),
+                                expected_parent: obligation.expected_parent,
+                            },
+                            TargetPreparationPermanentSettlementObservation::Obligation {
+                                evidence: Some(evidence.clone()),
+                                authority_exact,
+                            },
+                        ),
+                    ),
+                );
+            }
+
+            let disposition = if *actual_parent == Some(obligation.expected_parent) {
+                CleanupDisposition::Removed
+            } else {
+                CleanupDisposition::RemovedDetached
+            };
+            let receipt = self
+                .prepare_receipt_batch(
+                    &attempt,
+                    vec![CleanupReceipt::new(
+                        self.ledger_domain,
+                        attempt.revision,
+                        *index,
+                        disposition,
+                        obligation,
+                    )],
+                )
+                .ok_or_else(|| {
+                    TargetPreparationPermanentSettlementError::ReceiptPreparationRejected(
+                        Self::target_preparation_permanent_boundary(
+                            TargetPreparationPermanentSettlementFailureStage::ReceiptPreparation {
+                                index: *index,
+                                entity: obligation.claim.entity(),
+                            },
+                            TargetPreparationPermanentSettlementExpectation::VacantReceiptSlot {
+                                index: *index,
+                                claim: obligation.claim.clone(),
+                            },
+                            self.target_preparation_permanent_receipt_slot_observation(*index),
+                        ),
+                    )
+                })?;
+            let retirement = prepare_exact_registry_retirement(
+                world.resource::<RouteEntityRegistry>(),
+                vec![obligation.claim.clone()],
+            )
+            .map_err(|_| {
+                TargetPreparationPermanentSettlementError::SettlementRejected(
+                    Self::target_preparation_permanent_boundary(
+                        TargetPreparationPermanentSettlementFailureStage::RegistryRetirementPreparation {
+                            index: *index,
+                            entity: obligation.claim.entity(),
+                        },
+                        TargetPreparationPermanentSettlementExpectation::ExactRegistryRetirement {
+                            index: *index,
+                            claim: obligation.claim.clone(),
+                        },
+                        TargetPreparationPermanentSettlementObservation::RegistryRetirementRejected {
+                            observed_claim: world
+                                .resource::<RouteEntityRegistry>()
+                                .record(obligation.claim.entity())
+                                .map(|record| record.claim()),
+                        },
+                    ),
+                )
+            })?;
+            removals.push(PreparedTargetPreparationPermanentRemoval {
+                index: *index,
+                entity: obligation.claim.entity(),
+                expected_parent: if obligation.claim == *edge.top_slot_claim {
+                    None
+                } else {
+                    *actual_parent
+                },
+                children_before: observed_children(world, obligation.claim.entity()),
+                retirement,
+                receipt,
+            });
+        }
+
+        let mut settled = Vec::new();
+        settled.try_reserve_exact(removals.len()).map_err(|_| {
+            TargetPreparationPermanentSettlementError::SettlementRejected(
+                Self::target_preparation_permanent_boundary(
+                    TargetPreparationPermanentSettlementFailureStage::CapacityPreparation,
+                    TargetPreparationPermanentSettlementExpectation::PreparedCapacity {
+                        requested: removals.len(),
+                    },
+                    TargetPreparationPermanentSettlementObservation::CapacityRejected {
+                        requested: removals.len(),
+                    },
+                ),
+            )
+        })?;
+
+        world.entity_mut(edge.top_slot).remove::<ChildOf>();
+        world.flush();
+        refreeze(
+            world,
+            TargetPreparationPermanentTransition {
+                stage: TargetPreparationPermanentTransitionStage::HostEdgeDetached,
+                settled: &settled,
+                in_flight: None,
+            },
+        )
+        .map_err(TargetPreparationPermanentSettlementError::PostWriteRefreeze)?;
+
+        for removal in removals {
+            let Some(obligation) = self.obligations.get(removal.index) else {
+                return Err(
+                    TargetPreparationPermanentSettlementError::SettlementRejected(
+                        Self::target_preparation_permanent_boundary(
+                            TargetPreparationPermanentSettlementFailureStage::RemovalPrewrite {
+                                index: removal.index,
+                                entity: removal.entity,
+                            },
+                            TargetPreparationPermanentSettlementExpectation::RemovableObligation {
+                                index: removal.index,
+                                claim: edge.top_slot_claim.clone(),
+                                expected_parent: removal.expected_parent,
+                                expected_children: removal.children_before.clone(),
+                            },
+                            TargetPreparationPermanentSettlementObservation::Removal {
+                                entity_exists: world.get_entity(removal.entity).is_ok(),
+                                observed_claim: None,
+                                parent: world.get::<ChildOf>(removal.entity).map(ChildOf::parent),
+                                children: observed_children(world, removal.entity),
+                                authority_exact: false,
+                            },
+                        ),
+                    ),
+                );
+            };
+            if !removal.is_current(world, &obligation.claim, &settled) {
+                return Err(
+                    TargetPreparationPermanentSettlementError::SettlementRejected(
+                        target_preparation_permanent_removal_evidence(
+                            world,
+                            TargetPreparationPermanentSettlementFailureStage::RemovalPrewrite {
+                                index: removal.index,
+                                entity: removal.entity,
+                            },
+                            removal.index,
+                            &obligation.claim,
+                            removal.expected_parent,
+                            &removal.children_before,
+                        ),
+                    ),
+                );
+            }
+            if !world.despawn(removal.entity) {
+                return Err(
+                    TargetPreparationPermanentSettlementError::SettlementRejected(
+                        target_preparation_permanent_removal_evidence(
+                            world,
+                            TargetPreparationPermanentSettlementFailureStage::RemovalPrewrite {
+                                index: removal.index,
+                                entity: removal.entity,
+                            },
+                            removal.index,
+                            &obligation.claim,
+                            removal.expected_parent,
+                            &removal.children_before,
+                        ),
+                    ),
+                );
+            }
+
+            world.flush();
+            refreeze(
+                world,
+                TargetPreparationPermanentTransition {
+                    stage: TargetPreparationPermanentTransitionStage::PhysicalAbsent(
+                        removal.entity,
+                    ),
+                    settled: &settled,
+                    in_flight: Some(removal.entity),
+                },
+            )
+            .map_err(TargetPreparationPermanentSettlementError::PostWriteRefreeze)?;
+
+            apply_prepared_exact_registry_retirement(
+                &mut world.resource_mut::<RouteEntityRegistry>(),
+                removal.retirement,
+            );
+            self.commit_receipt_batch(removal.receipt);
+            settled.push(removal.entity);
+            refreeze(
+                world,
+                TargetPreparationPermanentTransition {
+                    stage: TargetPreparationPermanentTransitionStage::ReceiptCommitted(
+                        removal.entity,
+                    ),
+                    settled: &settled,
+                    in_flight: None,
+                },
+            )
+            .map_err(TargetPreparationPermanentSettlementError::PostWriteRefreeze)?;
+        }
+
+        if !focus_is_released(world, &focus)
+            || observed_children(world, edge.host) != edge.children_after
+            || self.receipts.iter().any(Option::is_none)
+        {
+            return Err(
+                TargetPreparationPermanentSettlementError::SettlementRejected(
+                    Self::target_preparation_permanent_boundary(
+                        TargetPreparationPermanentSettlementFailureStage::Completion,
+                        TargetPreparationPermanentSettlementExpectation::FullySettled {
+                            manifest_digest: self.manifest_digest,
+                            obligation_count: self.obligations.len(),
+                            host: edge.host,
+                            host_children_after: edge.children_after.to_vec(),
+                        },
+                        TargetPreparationPermanentSettlementObservation::Completion {
+                            remaining_focus: focused_targets(world, &focus),
+                            host_children: observed_children(world, edge.host),
+                            receipt_count: self.receipts.iter().flatten().count(),
+                            missing_receipts: self
+                                .receipts
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, receipt)| receipt.is_none().then_some(index))
+                                .collect(),
+                            completion_digest: self.completion_digest,
+                        },
+                    ),
+                ),
+            );
+        }
+        self.finish_if_settled();
+        if self.completion_digest.is_some() {
+            Ok(())
+        } else {
+            Err(
+                TargetPreparationPermanentSettlementError::SettlementRejected(
+                    Self::target_preparation_permanent_boundary(
+                        TargetPreparationPermanentSettlementFailureStage::Completion,
+                        TargetPreparationPermanentSettlementExpectation::FullySettled {
+                            manifest_digest: self.manifest_digest,
+                            obligation_count: self.obligations.len(),
+                            host: edge.host,
+                            host_children_after: edge.children_after.to_vec(),
+                        },
+                        TargetPreparationPermanentSettlementObservation::Completion {
+                            remaining_focus: focused_targets(world, &focus),
+                            host_children: observed_children(world, edge.host),
+                            receipt_count: self.receipts.iter().flatten().count(),
+                            missing_receipts: self
+                                .receipts
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, receipt)| receipt.is_none().then_some(index))
+                                .collect(),
+                            completion_digest: self.completion_digest,
+                        },
+                    ),
+                ),
+            )
+        }
     }
 
     pub(crate) fn settle(&mut self, world: &mut World, attempt: CleanupAttempt) -> bool {
@@ -8659,6 +9488,14 @@ impl CleanupLedger {
     }
 
     #[cfg(test)]
+    pub(crate) fn obligation_entities_for_test(&self) -> Vec<Entity> {
+        self.obligations
+            .iter()
+            .map(|obligation| obligation.claim.entity())
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn issued_attempt_present_for_test(&self) -> bool {
         self.issued_attempt.is_some()
     }
@@ -9511,6 +10348,54 @@ fn observed_children(world: &World, parent: Entity) -> Vec<Entity> {
         .get::<Children>(parent)
         .map(|children| children.iter().copied().collect())
         .unwrap_or_default()
+}
+
+fn focused_targets(world: &World, targets: &[Entity]) -> Vec<Entity> {
+    let mut focused = Vec::new();
+    if let Some(entity) = world.get_resource::<InputFocus>().and_then(InputFocus::get)
+        && targets.contains(&entity)
+    {
+        focused.push(entity);
+    }
+    if let Some(entity) = world
+        .get_resource::<RouteFocusState>()
+        .and_then(RouteFocusState::focused)
+        && targets.contains(&entity)
+        && !focused.contains(&entity)
+    {
+        focused.push(entity);
+    }
+    focused
+}
+
+fn target_preparation_permanent_removal_evidence(
+    world: &World,
+    stage: TargetPreparationPermanentSettlementFailureStage,
+    index: usize,
+    claim: &ExactRegistryClaim,
+    expected_parent: Option<Entity>,
+    expected_children: &[Entity],
+) -> TargetPreparationPermanentSettlementBoundaryEvidence {
+    let observed_claim = world
+        .get_resource::<RouteEntityRegistry>()
+        .and_then(|registry| registry.record(claim.entity()))
+        .map(|record| record.claim());
+    CleanupLedger::target_preparation_permanent_boundary(
+        stage,
+        TargetPreparationPermanentSettlementExpectation::RemovableObligation {
+            index,
+            claim: claim.clone(),
+            expected_parent,
+            expected_children: expected_children.to_vec(),
+        },
+        TargetPreparationPermanentSettlementObservation::Removal {
+            entity_exists: world.get_entity(claim.entity()).is_ok(),
+            observed_claim,
+            parent: world.get::<ChildOf>(claim.entity()).map(ChildOf::parent),
+            children: observed_children(world, claim.entity()),
+            authority_exact: cleanup_claim_has_exact_authority(world, claim),
+        },
+    )
 }
 
 fn children_match(world: &World, parent: Entity, expected: &[Entity]) -> bool {
