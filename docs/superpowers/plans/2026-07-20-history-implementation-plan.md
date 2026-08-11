@@ -4,7 +4,7 @@
 >
 > Use `test-driven-development` for every production semantic change and `verification-before-completion` before every PASS or commit claim
 
-**Status:** Completion gate PASS；documentation close pending
+**Status:** Complete，History PASS 2026-08-11；Recovery is next
 
 **Review:** no open Critical or Important findings
 
@@ -3709,7 +3709,7 @@ git diff --check
 
 Expected: facts agree, profile remains machine-valid, no current document claims Recovery or MVP complete
 
-- [ ] **Step 7: Commit History completion facts**
+- [x] **Step 7: Commit History completion facts**
 
 ```powershell
 git add -- docs/current-architecture.md docs/roadmap.md docs/README.md docs/authority-transition-matrix.md docs/implementation-goals.md docs/superpowers/README.md docs/superpowers/specs/2026-07-20-history-design.md docs/superpowers/plans/2026-07-20-history-implementation-plan.md
@@ -3718,7 +3718,7 @@ git diff --cached --name-only
 git commit -m "docs: close history stage"
 ```
 
-- [ ] **Step 8: Verify the exact committed tree**
+- [x] **Step 8: Verify the exact committed tree**
 
 ```powershell
 git status --short
