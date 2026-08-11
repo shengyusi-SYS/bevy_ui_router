@@ -17,7 +17,7 @@ const DEPENDENCY_SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "bui
 #[test]
 fn history_profile_has_exact_back_execution_slice_machine_state() {
     let profile = history_contract_profile();
-    assert_eq!(profile.exclusions.len(), 11);
+    assert_eq!(profile.exclusions.len(), 10);
     assert_eq!(profile.contract_deltas.len(), 3);
     assert_eq!(
         profile
@@ -544,7 +544,7 @@ fn history_profile_tables_and_curated_facade_source_are_closed_world() {
     let exclusions = profile.exclusions;
     assert_eq!(modules.len(), 7);
     assert!(symbols.len() > 100);
-    assert_eq!(exclusions.len(), 11);
+    assert_eq!(exclusions.len(), 10);
 
     let source = std::fs::read_to_string(facade_dir().join("src/lib.rs")).unwrap();
     assert_eq!(

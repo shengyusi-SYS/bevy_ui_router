@@ -903,6 +903,52 @@ fn history_replace_facade_replaces_empty_history() {
 }
 
 #[test]
+fn history_c1_replace_then_back_restores_prior_route() {
+    let mut fixture = nested_fixture();
+    let route_a = RouteLocation::new("/items/1");
+    let route_b = RouteLocation::new("/items/2");
+    let route_b2 = RouteLocation::new("/items/3");
+
+    let first = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        route_a.clone(),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, first));
+    let second = push_and_settle(&mut fixture.app, fixture.router, route_b, None, None);
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, second));
+    let replacement = replace_and_settle(&mut fixture.app, fixture.router, route_b2.clone(), None);
+    let replacement_snapshot = request_snapshot(&fixture.app, fixture.router, replacement);
+    assert_succeeded(&replacement_snapshot);
+    assert_eq!(replacement_snapshot.requested(), Some(&route_b2));
+
+    let before_back = router_snapshot(&fixture.app, fixture.router);
+    let protected_layout = before_back.active().frames()[0].clone();
+    let protected_child_slot = before_back.active().frames()[1].slot().clone();
+    let back = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(fixture.router)
+        .expect("a published prior entry must enqueue Back");
+    let terminal = drive_request_to_terminal(&mut fixture.app, fixture.router, back);
+
+    assert_succeeded(&terminal);
+    assert_eq!(terminal.requested(), Some(&route_a));
+    assert_cleanup_trace_is_ordered(&terminal, true);
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after.active().location(), Some(&route_a));
+    assert_eq!(after.history().entries(), [route_a.clone(), route_b2]);
+    assert_eq!(after.history().cursor(), Some(0));
+    assert_eq!(after.history().current(), Some(&route_a));
+    assert_eq!(after.active().frames()[0], protected_layout);
+    assert_eq!(after.active().frames()[1].slot(), protected_child_slot);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
 fn history_replace_f1_equivalent_is_physical_zero_write() {
     let mut fixture = root_fixture("/items/:id");
     let target = RouteLocation::new("/items/1");

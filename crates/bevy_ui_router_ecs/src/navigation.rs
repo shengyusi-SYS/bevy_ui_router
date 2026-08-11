@@ -5154,6 +5154,22 @@ pub struct RouterNavigation {
     pub(crate) entries: Vec<RouterEntry>,
 }
 
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BackRequestInventoryProjection {
+    requests: Vec<NavigationRequestId>,
+    reservation_requests: Vec<NavigationRequestId>,
+    issuer: Option<crate::cleanup::BackCapacityIssuerSemanticSnapshot>,
+    enqueue_retire_residual: bool,
+    pending_resolution_action: bool,
+    pending_bound_resolution: bool,
+    pending_target_execution: bool,
+    pending_no_target_completion: bool,
+    pending_no_target_preparation: bool,
+    pending_no_target_authority_cleanup: bool,
+    pending_target_permanent_cleanup: bool,
+}
+
 impl RouterNavigation {
     pub(crate) fn new() -> Self {
         static NEXT_DOMAIN: AtomicU64 = AtomicU64::new(1);
@@ -5290,7 +5306,7 @@ impl RouterNavigation {
         Ok(request)
     }
 
-    pub(crate) fn back(
+    pub fn back(
         &mut self,
         router: RouterHandle,
     ) -> Result<NavigationRequestId, NavigationEnqueueError> {
@@ -5423,6 +5439,39 @@ impl RouterNavigation {
 
         result
     }
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn back_request_inventory_projection(
+    navigation: &RouterNavigation,
+    router: RouterHandle,
+) -> Option<BackRequestInventoryProjection> {
+    let entry = navigation
+        .entries
+        .iter()
+        .find(|entry| entry.handle == router)?;
+    Some(BackRequestInventoryProjection {
+        requests: entry.requests.clone(),
+        reservation_requests: entry
+            .back_capacity_reservations
+            .iter()
+            .map(|(request, _)| *request)
+            .collect(),
+        issuer: entry
+            .back_capacity_issuer
+            .as_ref()
+            .map(|issuer| issuer.semantic_snapshot_for_test()),
+        enqueue_retire_residual: entry.back_capacity_enqueue_retire_residual.is_some(),
+        pending_resolution_action: entry.pending_back_resolution_action.is_some(),
+        pending_bound_resolution: entry.pending_bound_back_resolution.is_some(),
+        pending_target_execution: entry.pending_back_target_execution.is_some(),
+        pending_no_target_completion: entry.pending_back_no_target_completion.is_some(),
+        pending_no_target_preparation: entry.pending_back_no_target_preparation.is_some(),
+        pending_no_target_authority_cleanup: entry
+            .pending_back_no_target_authority_cleanup
+            .is_some(),
+        pending_target_permanent_cleanup: entry.pending_back_target_permanent_cleanup.is_some(),
+    })
 }
 
 #[cfg(feature = "test-support")]

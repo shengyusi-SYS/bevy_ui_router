@@ -811,11 +811,6 @@ fn validate_exclusion_vocabulary(exclusions: &[TableRow]) {
         ),
         (
             "associated",
-            "bevy_ui_router::ecs::RouterNavigation::back",
-            "History",
-        ),
-        (
-            "associated",
             "bevy_ui_router::core::RouteNodeOptions::with_error_boundary",
             "Recovery",
         ),

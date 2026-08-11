@@ -11,7 +11,8 @@ use bevy_ui::{Node, Val};
 use bevy_ui_router::ecs::RouterScheduleSet;
 use bevy_ui_router::prelude::*;
 use bevy_ui_router_ecs::test_support::{
-    BackCapacityOrderInstallError, testing_install_back_capacity_order_observer,
+    BackCapacityOrderEvent, BackCapacityOrderInstallError, testing_back_request_inventory,
+    testing_install_back_capacity_order_observer,
 };
 
 const ROOT_RECT_WIDTH: u16 = 37;
@@ -117,6 +118,62 @@ fn replace_and_publish(
         }
     }
     panic!("public audit replace did not settle within 16 App::update calls")
+}
+
+fn back_and_publish(app: &mut App, router: RouterHandle) -> NavigationRequestId {
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(router)
+        .expect("public audit Back should enqueue");
+    for _ in 0..16 {
+        app.update();
+        match app
+            .world()
+            .resource::<RouterSnapshots>()
+            .request(router, request)
+        {
+            RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded => {
+                return request;
+            }
+            RequestLookup::Found(snapshot)
+                if matches!(snapshot.status(), RequestStatus::Failed(_)) =>
+            {
+                panic!("public audit Back failed: {:?}", snapshot.status());
+            }
+            RequestLookup::Found(_) | RequestLookup::NotRetained | RequestLookup::Unknown => {}
+        }
+    }
+    panic!("public audit Back did not settle within 16 App::update calls")
+}
+
+fn install_history_audit_router(app: &mut App, label: &str) -> RouterHandle {
+    let driver = app
+        .register_ui_view_driver(AuditDriver {
+            key: ViewDriverKey::new(format!("{label}-driver")).unwrap(),
+            outlet_view: None,
+        })
+        .unwrap();
+    let view = RouteViewKey::new(format!("{label}-view")).unwrap();
+    let routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("/items/:id").unwrap(),
+            RouteNodeOptions::new().with_view(view.clone()),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut views = RouteViewRegistry::new();
+    views
+        .insert(view.clone(), RouteViewDescriptor::new(driver))
+        .unwrap();
+    let router = app
+        .add_ui_router(RouterConfig::new(routes, views, view))
+        .unwrap();
+    app.world_mut()
+        .spawn((Node::default(), RouterHostRegistration::new(router)));
+    app.update();
+    router
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -256,6 +313,108 @@ fn back_capacity_order_observer_installs_across_crates_read_only() {
     assert!(!observer_a.observes_same_journal(&observer_b));
     assert!(observer_a.snapshot().events().is_empty());
     assert!(observer_b.snapshot().events().is_empty());
+}
+
+#[test]
+fn history_back_no_entry_is_synchronous_and_creates_no_request() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let router = install_history_audit_router(&mut app, "history-back-no-entry");
+    let first = push_and_publish(&mut app, router, RouteLocation::new("/items/1"));
+    let before_router = app
+        .world()
+        .resource::<RouterSnapshots>()
+        .get(router)
+        .expect("the installed router has a snapshot")
+        .clone();
+    let before_request = match app
+        .world()
+        .resource::<RouterSnapshots>()
+        .request(router, first)
+    {
+        RequestLookup::Found(snapshot) => snapshot.clone(),
+        RequestLookup::NotRetained | RequestLookup::Unknown => {
+            panic!("the setup request must remain retained")
+        }
+    };
+    let observer = testing_install_back_capacity_order_observer(
+        &mut app.world_mut().resource_mut::<RouterNavigation>(),
+        router,
+    )
+    .unwrap();
+    let inventory_before =
+        testing_back_request_inventory(&app.world().resource::<RouterNavigation>(), router)
+            .expect("the installed router has a Back request inventory");
+
+    let error = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(router)
+        .expect_err("cursor zero must reject Back synchronously");
+    assert_eq!(error.kind(), NavigationEnqueueErrorKind::NoBackEntry);
+    let inventory_after_error =
+        testing_back_request_inventory(&app.world().resource::<RouterNavigation>(), router)
+            .expect("the synchronous rejection retains its Back request inventory");
+    assert_eq!(inventory_after_error, inventory_before);
+    assert_eq!(
+        observer.snapshot().events(),
+        &[(0, BackCapacityOrderEvent::FacadeTypedReturn)]
+    );
+
+    app.update();
+
+    let snapshots = app.world().resource::<RouterSnapshots>();
+    assert_eq!(snapshots.get(router), Some(&before_router));
+    match snapshots.request(router, first) {
+        RequestLookup::Found(snapshot) => assert_eq!(snapshot, &before_request),
+        RequestLookup::NotRetained | RequestLookup::Unknown => {
+            panic!("synchronous rejection must preserve the retained request collection")
+        }
+    }
+    assert_eq!(
+        testing_back_request_inventory(&app.world().resource::<RouterNavigation>(), router),
+        Some(inventory_before)
+    );
+}
+
+#[test]
+fn history_back_then_push_truncates_forward_tail() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let router = install_history_audit_router(&mut app, "history-back-truncate");
+    let route_a = RouteLocation::new("/items/1");
+    let route_b = RouteLocation::new("/items/2");
+    let route_c = RouteLocation::new("/items/3");
+    let route_d = RouteLocation::new("/items/4");
+
+    push_and_publish(&mut app, router, route_a.clone());
+    push_and_publish(&mut app, router, route_b.clone());
+    push_and_publish(&mut app, router, route_c.clone());
+    let back = back_and_publish(&mut app, router);
+    let back_snapshot = match app
+        .world()
+        .resource::<RouterSnapshots>()
+        .request(router, back)
+    {
+        RequestLookup::Found(snapshot) => snapshot,
+        RequestLookup::NotRetained | RequestLookup::Unknown => {
+            panic!("the completed Back request must remain retained")
+        }
+    };
+    assert_eq!(back_snapshot.status(), &RequestStatus::Succeeded);
+    assert_eq!(back_snapshot.requested(), Some(&route_b));
+
+    push_and_publish(&mut app, router, route_d.clone());
+    let snapshots = app.world().resource::<RouterSnapshots>();
+    let router_snapshot = snapshots.get(router).unwrap();
+    assert_eq!(
+        router_snapshot.history().entries(),
+        [route_a, route_b, route_d.clone()]
+    );
+    assert_eq!(router_snapshot.history().cursor(), Some(2));
+    assert_eq!(router_snapshot.history().current(), Some(&route_d));
+    assert_eq!(router_snapshot.active().location(), Some(&route_d));
+    assert!(!router_snapshot.history().entries().contains(&route_c));
 }
 
 #[test]

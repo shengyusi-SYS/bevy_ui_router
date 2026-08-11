@@ -156,7 +156,7 @@ pub(crate) struct BackCapacityIssuer {
     drift_next_retire_unbound_generation: bool,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BackCapacityIssuerSemanticSnapshot {
     cell_count: usize,
@@ -182,7 +182,7 @@ pub(crate) struct BackCapacityCellProjectionForTest {
     pub(crate) disposition: BackCapacityCellDispositionForTest,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl BackCapacityIssuerSemanticSnapshot {
     pub(crate) const fn cell_count(&self) -> usize {
         self.cell_count
@@ -274,11 +274,14 @@ impl BackCapacityIssuer {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn semantic_snapshot_for_test(&self) -> BackCapacityIssuerSemanticSnapshot {
-        let _ = self.next_cell_growth_additional_capacity;
-        let _ = self.next_new_cell_initial_generation;
-        let _ = self.drift_next_retire_unbound_generation;
+        #[cfg(test)]
+        {
+            let _ = self.next_cell_growth_additional_capacity;
+            let _ = self.next_new_cell_initial_generation;
+            let _ = self.drift_next_retire_unbound_generation;
+        }
         BackCapacityIssuerSemanticSnapshot {
             cell_count: self.cells.len(),
             outstanding_count: self.live.len(),

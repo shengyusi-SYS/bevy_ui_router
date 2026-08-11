@@ -896,7 +896,6 @@ History 开始时保留以下 exclusions
 | symbol | `bevy_ui_router::ecs::QuarantineSnapshot` | Authority closure |
 | symbol | `bevy_ui_router::ecs::RouterInputModality` | Authority closure |
 | symbol | `bevy_ui_router::ecs::RouterInputProbes` | Authority closure |
-| associated | `bevy_ui_router::ecs::RouterNavigation::back` | History |
 | associated | `bevy_ui_router::core::RouteNodeOptions::with_error_boundary` | Recovery |
 | associated | `bevy_ui_router::core::RouteNodeOptions::with_error_view` | Recovery |
 | associated | `bevy_ui_router::ecs::RouterAuthorityAuditSnapshot::quarantines` | Authority closure |
