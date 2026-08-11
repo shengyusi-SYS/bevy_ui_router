@@ -444,6 +444,14 @@ impl HostAdmissionConfirmation {
 }
 
 impl HostLease {
+    pub(crate) fn retirement_projection(&self) -> RetiredHostAuthorityProjection {
+        RetiredHostAuthorityProjection {
+            key: self.identity.key,
+            version: self.identity.version.clone(),
+            top_slot: self.identity.top_slot,
+        }
+    }
+
     pub(crate) fn matches(
         &self,
         router: RouterIdentity,

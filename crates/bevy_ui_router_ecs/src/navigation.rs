@@ -28,18 +28,20 @@ use bevy_ui_router_core::{
         BackTargetDriverFailureReportOutcome, BackTargetExecutionOwnerRef,
         BackTargetExecutionPairingOutcome, BackTargetPermanentBeginOutcome,
         BackTargetPermanentBeginOwner, BackTargetPermanentBeginPermanentEvidence,
-        BackTargetPermanentCleanupBatchOwner, BackTargetPermanentOwner,
-        BackTargetPermanentRequestFailureKind, BackTargetPermanentTerminalFailureKind,
-        BackTargetPermanentTerminalOperation, BackTargetPhysicalOwnerRef,
-        BackTargetPreparationAcceptance, BackTargetStart, BeginAuthoritySettlementErrorKind,
-        CleanupManifest, CleanupManifestView, CommitTicket, EngineAction, EnqueueBackErrorKind,
-        FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError, FailureCleanupRequest,
-        FrameMountTarget, HistoryAdmissionStamp, HistoryAdmissionWorldSeal,
-        HistoryExecutionBindingView, HostLease, IntegrationError, LifecycleContinuationCapacity,
-        MountMutationArtifact, MountReceiptProof, MountRegistrationBeginError, MountRequest,
-        PreparationBoundaryScopeView, PreparationReceiverMismatchView,
-        PrepareBackAdmissionErrorKind, PreparedPostCommitContinuationOwner, ResolveMountOwner,
-        RootFrameTask, RouteFailureContinuationOwner, RouterEngine, TargetAuthoritySettlementOwner,
+        BackTargetPermanentCleanupBatchOwner, BackTargetPermanentCleanupCompletionOutcome,
+        BackTargetPermanentCleanupCompletionOwner, BackTargetPermanentCleanupMismatchEvidence,
+        BackTargetPermanentOwner, BackTargetPermanentRequestFailureKind,
+        BackTargetPermanentTerminalFailureKind, BackTargetPermanentTerminalOperation,
+        BackTargetPhysicalOwnerRef, BackTargetPreparationAcceptance, BackTargetStart,
+        BeginAuthoritySettlementErrorKind, CleanupManifest, CleanupManifestView, CommitTicket,
+        EngineAction, EnqueueBackErrorKind, FailedAuthoritySettlementTrigger,
+        FailedAuthorityTriggerError, FailureCleanupRequest, FrameMountTarget,
+        HistoryAdmissionStamp, HistoryAdmissionWorldSeal, HistoryExecutionBindingView, HostLease,
+        IntegrationError, LifecycleContinuationCapacity, MountMutationArtifact, MountReceiptProof,
+        MountRegistrationBeginError, MountRequest, PreparationBoundaryScopeView,
+        PreparationReceiverMismatchView, PrepareBackAdmissionErrorKind,
+        PreparedPostCommitContinuationOwner, ResolveMountOwner, RootFrameTask,
+        RouteFailureContinuationOwner, RouterEngine, TargetAuthoritySettlementOwner,
         VerifiedBackNoTargetCandidate, VerifiedBackResolutionContradiction,
         VerifiedBackResolutionOwnerHandoff, VerifiedBackTargetExecutionOwner, ViewFailureKind,
         ViewReportIdentity,
@@ -71,8 +73,10 @@ use crate::{
         FrozenBackNoTargetAuthorityPartition, FrozenCleanupManifest, ManifestNeutralLedgerSlot,
         NoTargetCapacityPermit, PendingBoundaryBinding, PreparedBackNoTargetAuthorityCleanupLedger,
         PreparedBackNoTargetZeroCompletion, PreparedCleanupLedger, PreparedCleanupLedgerProjection,
-        RouterCleanupObservation, TargetPreparationPermanentHostEdge,
-        TargetPreparationPermanentReceiptObservationEvidence,
+        RouterCleanupObservation, TargetPreparationPermanentCompletionDomain,
+        TargetPreparationPermanentCompletionFacts,
+        TargetPreparationPermanentCompletionPreparationEvidence,
+        TargetPreparationPermanentHostEdge, TargetPreparationPermanentReceiptObservationEvidence,
         TargetPreparationPermanentSettlementBoundaryEvidence,
         TargetPreparationPermanentSettlementError, TargetPreparationPermanentTransition,
         TargetPreparationPermanentTransitionStage, canonical_zero_completion_digest,
@@ -833,6 +837,64 @@ pub(crate) struct IsolatedTargetPreparationPermanentLedger {
     validation: FrozenTargetPreparationPermanentPhysicalManifest,
     expected_input_focus: Option<Option<bevy_ecs::entity::Entity>>,
     expected_route_focus: Option<Option<bevy_ecs::entity::Entity>>,
+    completion_domain: Option<TargetPreparationPermanentCompletionDomain>,
+}
+
+struct PreparedIsolatedTargetPreparationPermanentCompletion {
+    ledger: CleanupLedger,
+    validation: FrozenTargetPreparationPermanentPhysicalManifest,
+    expected_input_focus: Option<Option<bevy_ecs::entity::Entity>>,
+    expected_route_focus: Option<Option<bevy_ecs::entity::Entity>>,
+    completion_domain: TargetPreparationPermanentCompletionDomain,
+    facts: TargetPreparationPermanentCompletionFacts,
+}
+
+impl PreparedIsolatedTargetPreparationPermanentCompletion {
+    fn facts(&self) -> TargetPreparationPermanentCompletionFacts {
+        self.facts
+    }
+}
+
+impl IsolatedTargetPreparationPermanentLedger {
+    fn prepare_completion(
+        self,
+    ) -> Result<
+        PreparedIsolatedTargetPreparationPermanentCompletion,
+        (
+            Self,
+            TargetPreparationPermanentCompletionPreparationEvidence,
+        ),
+    > {
+        let Self {
+            ledger,
+            validation,
+            expected_input_focus,
+            expected_route_focus,
+            completion_domain,
+        } = self;
+        match ledger.into_target_preparation_permanent_completion(completion_domain) {
+            Ok((ledger, completion_domain, facts)) => {
+                Ok(PreparedIsolatedTargetPreparationPermanentCompletion {
+                    ledger,
+                    validation,
+                    expected_input_focus,
+                    expected_route_focus,
+                    completion_domain,
+                    facts,
+                })
+            }
+            Err((ledger, completion_domain, evidence)) => Err((
+                Self {
+                    ledger,
+                    validation,
+                    expected_input_focus,
+                    expected_route_focus,
+                    completion_domain,
+                },
+                evidence,
+            )),
+        }
+    }
 }
 
 pub(crate) enum ActiveTargetPreparationPermanentLedger {
@@ -863,6 +925,7 @@ pub(crate) enum TargetPreparationPermanentInertEvidence {
     PostWriteRefreeze(LifecyclePreflightEvidence),
     SettlementPrewriteRefreeze(TargetPreparationPermanentSettlementPrewriteEvidence),
     SettlementPostWriteRefreeze(TargetPreparationPermanentSettlementRefreezeEvidence),
+    CompletionPreparationRejected(TargetPreparationPermanentCompletionPreparationEvidence),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -973,6 +1036,12 @@ pub(crate) struct TargetPreparationPermanentSettlementPrewriteEvidence {
     failure: TargetPreparationPermanentSettlementRefreezeFailure,
 }
 
+pub(crate) struct PreparedTargetPreparationPermanentPhysicalCompletion {
+    cleanup: TargetPreparationPermanentCleanupOwner,
+    prepared: PreparedIsolatedTargetPreparationPermanentCompletion,
+    retired_host: RetiredHostBinding,
+}
+
 pub(crate) struct InstalledTargetPreparationPermanentCleanup {
     cleanup: TargetPreparationPermanentCleanupOwner,
     ledger: TargetPreparationPermanentLedgerHolder,
@@ -1006,6 +1075,12 @@ impl PreparedTargetPermanentEcsInstallationOwner {
 
 pub(crate) enum PendingTargetPreparationPermanentCleanup {
     Installed(InstalledTargetPreparationPermanentCleanup),
+    Completing(PreparedTargetPreparationPermanentPhysicalCompletion),
+    Settled {
+        prepared: PreparedTargetPreparationPermanentPhysicalCompletion,
+        owner: BackTargetPermanentCleanupCompletionOwner,
+        mismatch: BackTargetPermanentCleanupMismatchEvidence,
+    },
     #[cfg(test)]
     TestOccupied,
 }
@@ -15659,20 +15734,19 @@ fn target_preparation_permanent_settlement_refreeze(
 }
 
 fn drive_target_preparation_permanent_cleanup(world: &mut World, entry: &mut RouterEntry) -> bool {
-    let Some(PendingTargetPreparationPermanentCleanup::Installed(installed)) =
-        entry.pending_back_target_permanent_cleanup.as_ref()
-    else {
-        return false;
-    };
-    if installed.inert.is_some()
-        || matches!(
-            &installed.ledger,
-            TargetPreparationPermanentLedgerHolder::Active(
-                ActiveTargetPreparationPermanentLedger::Isolated(isolated)
-            ) if isolated.ledger.is_settled()
-        )
-    {
-        return true;
+    match entry.pending_back_target_permanent_cleanup.as_ref() {
+        None => return false,
+        Some(PendingTargetPreparationPermanentCleanup::Installed(installed)) => {
+            if installed.inert.is_some() {
+                return true;
+            }
+        }
+        Some(
+            PendingTargetPreparationPermanentCleanup::Completing(_)
+            | PendingTargetPreparationPermanentCleanup::Settled { .. },
+        ) => return true,
+        #[cfg(test)]
+        Some(PendingTargetPreparationPermanentCleanup::TestOccupied) => return false,
     }
 
     let Some(pending) = entry.pending_back_target_permanent_cleanup.take() else {
@@ -15680,6 +15754,25 @@ fn drive_target_preparation_permanent_cleanup(world: &mut World, entry: &mut Rou
     };
     let installed = match pending {
         PendingTargetPreparationPermanentCleanup::Installed(installed) => installed,
+        PendingTargetPreparationPermanentCleanup::Completing(prepared) => {
+            entry.pending_back_target_permanent_cleanup = Some(
+                PendingTargetPreparationPermanentCleanup::Completing(prepared),
+            );
+            return true;
+        }
+        PendingTargetPreparationPermanentCleanup::Settled {
+            prepared,
+            owner,
+            mismatch,
+        } => {
+            entry.pending_back_target_permanent_cleanup =
+                Some(PendingTargetPreparationPermanentCleanup::Settled {
+                    prepared,
+                    owner,
+                    mismatch,
+                });
+            return true;
+        }
         #[cfg(test)]
         PendingTargetPreparationPermanentCleanup::TestOccupied => {
             entry.pending_back_target_permanent_cleanup =
@@ -15714,11 +15807,80 @@ fn drive_target_preparation_permanent_cleanup(world: &mut World, entry: &mut Rou
         TargetPreparationPermanentLedgerHolder::Active(
             ActiveTargetPreparationPermanentLedger::Isolated(isolated),
         ) => {
+            if isolated.ledger.is_settled() {
+                let prepared = match isolated.prepare_completion() {
+                    Ok(prepared) => prepared,
+                    Err((isolated, evidence)) => {
+                        entry.pending_back_target_permanent_cleanup =
+                            Some(PendingTargetPreparationPermanentCleanup::Installed(
+                                InstalledTargetPreparationPermanentCleanup {
+                                    cleanup,
+                                    ledger: TargetPreparationPermanentLedgerHolder::Active(
+                                        ActiveTargetPreparationPermanentLedger::Isolated(isolated),
+                                    ),
+                                    batch,
+                                    retired_host,
+                                    inert: Some(
+                                        TargetPreparationPermanentInertEvidence::CompletionPreparationRejected(
+                                            evidence,
+                                        ),
+                                    ),
+                                },
+                            ));
+                        return true;
+                    }
+                };
+                let facts = prepared.facts();
+                let completion = batch.complete(
+                    facts.manifest_digest(),
+                    facts.obligation_count(),
+                    facts.completion_digest(),
+                    facts.settled_count(),
+                );
+                entry.pending_back_target_permanent_cleanup =
+                    Some(PendingTargetPreparationPermanentCleanup::Completing(
+                        PreparedTargetPreparationPermanentPhysicalCompletion {
+                            cleanup,
+                            prepared,
+                            retired_host,
+                        },
+                    ));
+                let RouterEntry {
+                    engine,
+                    pending_back_target_permanent_cleanup: pending,
+                    ..
+                } = entry;
+                let outcome = {
+                    let pending = &mut *pending;
+                    engine
+                        .complete_back_target_permanent_cleanup(completion, move || *pending = None)
+                };
+                match outcome {
+                    BackTargetPermanentCleanupCompletionOutcome::Terminal(_) => {}
+                    BackTargetPermanentCleanupCompletionOutcome::Mismatch { owner, mismatch } => {
+                        let current = pending.take();
+                        let Some(PendingTargetPreparationPermanentCleanup::Completing(prepared)) =
+                            current
+                        else {
+                            unreachable!(
+                                "target-permanent completion mismatch preserves the preinstalled Completing owner"
+                            )
+                        };
+                        *pending = Some(PendingTargetPreparationPermanentCleanup::Settled {
+                            prepared,
+                            owner,
+                            mismatch,
+                        });
+                    }
+                }
+                return true;
+            }
             let IsolatedTargetPreparationPermanentLedger {
                 mut ledger,
                 validation,
                 expected_input_focus,
                 expected_route_focus,
+                mut completion_domain,
             } = isolated;
             let inert = match inert {
                 Some(inert) => Some(inert),
@@ -15769,7 +15931,10 @@ fn drive_target_preparation_permanent_cleanup(world: &mut World, entry: &mut Rou
                             )
                             } else {
                                 match settlement {
-                            Ok(()) => None,
+                            Ok(domain) => {
+                                completion_domain = Some(domain);
+                                None
+                            }
                             Err(
                                 TargetPreparationPermanentSettlementError::AttemptUnavailable(
                                     evidence,
@@ -15823,6 +15988,7 @@ fn drive_target_preparation_permanent_cleanup(world: &mut World, entry: &mut Rou
                                     validation,
                                     expected_input_focus,
                                     expected_route_focus,
+                                    completion_domain,
                                 },
                             ),
                         ),
@@ -15956,6 +16122,7 @@ fn drive_target_preparation_permanent_cleanup(world: &mut World, entry: &mut Rou
                     validation,
                     expected_input_focus,
                     expected_route_focus,
+                    completion_domain: None,
                 },
             ),
             None,
@@ -34342,6 +34509,9 @@ pub(crate) mod tests {
                 let _ = (evidence.source, evidence.stage, &evidence.failure);
                 "settlement-postwrite"
             }
+            TargetPreparationPermanentInertEvidence::CompletionPreparationRejected(_) => {
+                "completion-preparation"
+            }
         });
         assert_eq!(
             inert_kind,
@@ -34374,14 +34544,6 @@ pub(crate) mod tests {
         );
         assert_eq!(settled.manifest_digest(), expected_batch.manifest_digest);
         assert_eq!(settled.obligation_count(), expected_batch.obligation_count);
-        let completion = active
-            .ledger
-            .target_preparation_permanent_completion_facts()
-            .expect("settled target cleanup exposes ECS-only completion facts");
-        assert_eq!(completion.manifest_digest(), settled.manifest_digest());
-        assert_eq!(completion.obligation_count(), settled.obligation_count());
-        assert_eq!(completion.settled_count(), settled.receipt_count());
-        assert_ne!(completion.completion_digest(), 0);
         assert!(
             TargetPermanentDispositionProjection::capture_cleanup(&installed.cleanup)
                 == isolated_cleanup_before,
@@ -34489,6 +34651,403 @@ pub(crate) mod tests {
                 "receipt settlement must preserve every protected observed fact"
             );
         }
+    }
+
+    #[test]
+    fn back_target_permanent_completion_requires_consumed_isolated_proof() {
+        let cleanup = include_str!("cleanup.rs");
+        let navigation = target_permanent_production_source();
+
+        assert!(
+            !cleanup.contains("fn target_preparation_permanent_completion_facts("),
+            "target-permanent completion facts must not be borrowable from a generic CleanupLedger"
+        );
+        assert_eq!(
+            navigation
+                .matches("struct PreparedIsolatedTargetPreparationPermanentCompletion")
+                .count(),
+            1,
+            "one private move-only proof must own the settled Isolated ledger"
+        );
+        let proof = target_permanent_contract_item_between(
+            navigation,
+            "struct PreparedIsolatedTargetPreparationPermanentCompletion",
+            "impl IsolatedTargetPreparationPermanentLedger",
+        );
+        assert!(!proof.contains("derive(Clone"));
+        assert!(!proof.contains("derive(Copy"));
+        let isolated = target_permanent_contract_item_between(
+            navigation,
+            "impl IsolatedTargetPreparationPermanentLedger",
+            "pub(crate) enum ActiveTargetPreparationPermanentLedger",
+        )
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+        assert_eq!(
+            isolated.matches("fnprepare_completion(self,)").count(),
+            1,
+            "only consuming the typed Isolated wrapper may prepare completion"
+        );
+        let driver = target_permanent_contract_item_between(
+            navigation,
+            "fn drive_target_preparation_permanent_cleanup",
+            "pub(crate) fn settle_cleanup_system",
+        );
+        assert_eq!(driver.matches(".prepare_completion()").count(), 1);
+        assert_eq!(
+            driver
+                .matches(".complete_back_target_permanent_cleanup(")
+                .count(),
+            1,
+            "the unique Core batch owner must cross one typed completion bridge"
+        );
+    }
+
+    #[test]
+    fn back_target_permanent_completion_mismatch_preserves_whole_settled_owner() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        install_provisional_detach_reentry(&mut app);
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-completion-mismatch",
+        );
+        let (foreign_router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-completion-foreign-receiver",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        assert!(matches!(
+            dispatch_real_back_target_permanent(&mut app, router, staged.disposition),
+            BackTargetPermanentDispatchOutcome::Dispatched
+        ));
+        let (expected_cleanup, expected_batch, prepared_ledger) =
+            target_permanent_installed_prepared_projection(&app, router);
+        assert_target_permanent_activation_tick(
+            &mut app,
+            router,
+            staged.request,
+            staged.host,
+            &expected_cleanup,
+            &expected_batch,
+            prepared_ledger,
+            None,
+        );
+        settle_cleanup_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+
+        {
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the settled completion fixture retains its exact entry");
+            let Some(PendingTargetPreparationPermanentCleanup::Installed(installed)) =
+                entry.pending_back_target_permanent_cleanup.as_ref()
+            else {
+                panic!("settled receipts must retain the whole installed owner before completion")
+            };
+            let TargetPreparationPermanentLedgerHolder::Active(
+                ActiveTargetPreparationPermanentLedger::Isolated(isolated),
+            ) = &installed.ledger
+            else {
+                panic!("the real completion producer must originate in Active(Isolated)")
+            };
+            assert!(isolated.ledger.is_settled());
+            assert_eq!(
+                isolated.ledger.receipt_count(),
+                isolated.ledger.projection().obligation_count()
+            );
+            assert_eq!(
+                entry
+                    .engine
+                    .testing_back_target_permanent_begin_state()
+                    .cleanup_owner_count(),
+                1
+            );
+        }
+
+        swap_ready_plan_test_engines(&mut app, router, foreign_router);
+        let first_tick_before = ReadyPlanPermanentZeroWriteProjection::capture(
+            &app,
+            router,
+            staged.request,
+            staged.host,
+        );
+        let receiver_snapshots_before = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let exact = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .unwrap()
+                .engine
+                .snapshot();
+            let source = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == foreign_router)
+                .unwrap()
+                .engine
+                .snapshot();
+            (exact, source)
+        };
+        settle_cleanup_system(app.world_mut());
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(
+                &app,
+                router,
+                staged.request,
+                staged.host,
+            ),
+            first_tick_before,
+            "foreign completion receiver mismatch must perform zero physical or public write"
+        );
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let exact_entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .unwrap();
+            let Some(PendingTargetPreparationPermanentCleanup::Settled {
+                prepared,
+                owner: _,
+                mismatch: BackTargetPermanentCleanupMismatchEvidence::Receiver(_),
+            }) = exact_entry.pending_back_target_permanent_cleanup.as_ref()
+            else {
+                panic!(
+                    "receiver mismatch must retain the physical proof and returned Core owner in typed Settled"
+                )
+            };
+            assert_eq!(
+                prepared.prepared.ledger.receipt_count(),
+                prepared.prepared.facts().obligation_count(),
+                "the Settled holder must retain the actually settled Isolated ledger proof"
+            );
+            assert_eq!(
+                (
+                    exact_entry.engine.snapshot(),
+                    navigation
+                        .entries
+                        .iter()
+                        .find(|entry| entry.handle == foreign_router)
+                        .unwrap()
+                        .engine
+                        .snapshot(),
+                ),
+                receiver_snapshots_before,
+                "receiver mismatch must leave both the foreign receiver and source owner unchanged"
+            );
+        }
+
+        swap_ready_plan_test_engines(&mut app, router, foreign_router);
+        let next_tick_before = ReadyPlanPermanentZeroWriteProjection::capture(
+            &app,
+            router,
+            staged.request,
+            staged.host,
+        );
+        settle_cleanup_system(app.world_mut());
+        assert_eq!(
+            ReadyPlanPermanentZeroWriteProjection::capture(
+                &app,
+                router,
+                staged.request,
+                staged.host,
+            ),
+            next_tick_before,
+            "a settled mismatch holder must suppress every later receiver call and physical write"
+        );
+
+        let production = target_permanent_production_source();
+        let holder = target_permanent_contract_item_between(
+            production,
+            "pub(crate) enum PendingTargetPreparationPermanentCleanup",
+            "pub(crate) enum BackTargetPermanentDispatchOutcome",
+        );
+        let compact_holder = holder
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert!(
+            compact_holder
+                .contains("Completing(PreparedTargetPreparationPermanentPhysicalCompletion)")
+                && compact_holder.contains("Settled{")
+                && compact_holder.contains("prepared:")
+                && compact_holder.contains("owner:")
+                && compact_holder.contains("mismatch:"),
+            "the canonical holder must preserve the whole Completing proof and returned Core owner as typed Settled mismatch evidence"
+        );
+        let driver = target_permanent_contract_item_between(
+            production,
+            "fn drive_target_preparation_permanent_cleanup",
+            "pub(crate) fn settle_cleanup_system",
+        );
+        let compact = driver
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert!(
+            compact
+                .contains("BackTargetPermanentCleanupCompletionOutcome::Mismatch{owner,mismatch}")
+                && compact.contains("PendingTargetPreparationPermanentCleanup::Settled"),
+            "typed receiver mismatch must combine the exact physical proof, returned completion owner and expected/observed mismatch"
+        );
+    }
+
+    #[test]
+    fn back_target_physical_permanent_terminal_closes_all_lifecycle_owners() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        install_provisional_detach_reentry(&mut app);
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-permanent-terminal-closes-owners",
+        );
+        let staged = stage_real_back_target_permanent_disposition(&mut app, router);
+        publish_snapshots_system(app.world_mut());
+        assert!(matches!(
+            dispatch_real_back_target_permanent(&mut app, router, staged.disposition),
+            BackTargetPermanentDispatchOutcome::Dispatched
+        ));
+        let (expected_cleanup, expected_batch, prepared_ledger) =
+            target_permanent_installed_prepared_projection(&app, router);
+        assert_target_permanent_activation_tick(
+            &mut app,
+            router,
+            staged.request,
+            staged.host,
+            &expected_cleanup,
+            &expected_batch,
+            prepared_ledger,
+            None,
+        );
+        settle_cleanup_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+
+        let (host_before_completion, registration_before, retired_version, retired_slot) = {
+            let world = app.world();
+            let registry = world.resource::<RouteEntityRegistry>();
+            let entry = world
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the settled terminal fixture retains its exact entry");
+            let Some(PendingTargetPreparationPermanentCleanup::Installed(installed)) =
+                entry.pending_back_target_permanent_cleanup.as_ref()
+            else {
+                panic!("settled receipts retain the ECS retired-host owner until completion")
+            };
+            let TargetPreparationPermanentLedgerHolder::Active(
+                ActiveTargetPreparationPermanentLedger::Isolated(isolated),
+            ) = &installed.ledger
+            else {
+                panic!("terminal completion must consume the exact Isolated owner")
+            };
+            assert!(isolated.ledger.is_settled());
+            assert!(
+                entry
+                    .engine
+                    .testing_back_target_permanent_retired_host_matches(
+                        &installed.retired_host.version,
+                        installed.retired_host.slot_id,
+                    )
+            );
+            let state = entry.engine.testing_back_target_permanent_begin_state();
+            assert_eq!(state.cleanup_owner_count(), 1);
+            assert_eq!(state.cleanup_history_owner_count(), 1);
+            assert_eq!(state.cleanup_settlement_owner_count(), 1);
+            (
+                observe_target_preparation_permanent_entity(world, registry, staged.host),
+                world
+                    .get::<RouterHostRegistration>(staged.host)
+                    .expect("the app-owned host retains its exact registration")
+                    .testing_identity(),
+                installed.retired_host.version.clone(),
+                installed.retired_host.slot_id,
+            )
+        };
+        assert!(app.world().get_entity(staged.host).is_ok());
+        assert!(
+            app.world()
+                .get::<RouterHostRegistration>(staged.host)
+                .is_some_and(|registration| registration.router() == router)
+        );
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(staged.host)
+                .is_none()
+        );
+        assert!(app.world().get::<RouteOwnershipSeal>(staged.host).is_none());
+
+        settle_cleanup_system(app.world_mut());
+
+        let world = app.world();
+        let registry = world.resource::<RouteEntityRegistry>();
+        let entry = world
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("terminal completion retains the Router entry shell");
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::AwaitingHost,
+            "joint physical/Core completion must publish AwaitingHost"
+        );
+        assert!(
+            entry.pending_back_target_permanent_cleanup.is_none(),
+            "terminal completion must consume the ECS retired-host owner"
+        );
+        assert!(
+            !entry
+                .engine
+                .testing_back_target_permanent_retired_host_matches(&retired_version, retired_slot)
+        );
+        let state = entry.engine.testing_back_target_permanent_begin_state();
+        assert_eq!(state.cleanup_owner_count(), 0);
+        assert_eq!(state.current_owner_count(), 0);
+        assert_eq!(state.action_owner_count(), 0);
+        assert_eq!(state.current_history_slot_count(), 0);
+        assert_eq!(state.cleanup_history_owner_count(), 0);
+        assert_eq!(state.cleanup_settlement_owner_count(), 0);
+        assert_eq!(state.queue_len(), 0);
+        assert_eq!(state.conflicting_owner_count(), 0);
+        assert_eq!(
+            observe_target_preparation_permanent_entity(world, registry, staged.host),
+            host_before_completion,
+            "completion must preserve every app-owned host fact"
+        );
+        assert!(world.get_entity(staged.host).is_ok());
+        assert!(
+            world
+                .get::<RouterHostRegistration>(staged.host)
+                .is_some_and(|registration| registration.router() == router)
+        );
+        assert_eq!(
+            world
+                .get::<RouterHostRegistration>(staged.host)
+                .expect("completion preserves the app-owned host registration")
+                .testing_identity(),
+            registration_before
+        );
+        assert!(registry.record(staged.host).is_none());
+        assert!(world.get::<RouteOwnershipSeal>(staged.host).is_none());
+        assert!(matches!(
+            entry
+                .engine
+                .request(staged.request)
+                .map(|record| record.status().clone()),
+            Some(RequestStatus::Failed(failure))
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
     }
 
     #[test]
@@ -35875,9 +36434,15 @@ pub(crate) mod tests {
             1,
             "the driver may whole-take Prepared only once"
         );
-        let isolated_settled_safe_stop = compact
+        let isolated_completion = compact
             .find("isolated.ledger.is_settled()")
-            .expect("a settled Isolated ledger must safe-stop before whole-take");
+            .expect("a settled Isolated ledger must enter the consuming completion path");
+        let completion_holders_safe_stop = compact
+            .find(concat!(
+                "PendingTargetPreparationPermanentCleanup::Completing(_)|",
+                "PendingTargetPreparationPermanentCleanup::Settled{..}"
+            ))
+            .expect("Completing and Settled holders must safe-stop before whole-take");
         let current_continues = compact
             .find(concat!(
                 "ActiveTargetPreparationPermanentLedger::Current(current),",
@@ -35891,11 +36456,12 @@ pub(crate) mod tests {
             .find(".settle_target_preparation_permanent(")
             .expect("an unsettled Isolated ledger must execute only after whole-take");
         assert!(
-            isolated_settled_safe_stop < take
-                && inert_safe_stop < take
+            inert_safe_stop < take
+                && completion_holders_safe_stop < take
                 && take < current_continues
+                && take < isolated_completion
                 && take < isolated_settlement,
-            "only inert or already-settled owners may stop before the unique whole-take"
+            "only inert or already-classified completion holders may stop before the unique whole-take; settled Isolated must be consumed after it"
         );
         assert_eq!(
             compact.matches(".into_active()").count(),

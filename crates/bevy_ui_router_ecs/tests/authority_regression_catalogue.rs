@@ -1701,6 +1701,160 @@ fn back_no_target_completion_callback_tail_is_infallible_and_query_free() {
 }
 
 #[test]
+fn back_target_permanent_completion_callback_tail_is_infallible_and_publication_last() {
+    let navigation = include_str!("../src/navigation.rs");
+    let core_engine = include_str!("../../bevy_ui_router_core/src/engine.rs");
+    let tests_start = navigation
+        .find("pub(crate) mod tests {")
+        .expect("navigation source retains its crate-private test module");
+    let production_navigation = &navigation[..tests_start];
+    let receiver = ".complete_back_target_permanent_cleanup(";
+
+    assert_eq!(
+        production_navigation.match_indices(receiver).count(),
+        1,
+        "target-permanent completion must have one ECS production receiver callsite"
+    );
+    let helper = body_after_marker(
+        production_navigation,
+        "fn drive_target_preparation_permanent_cleanup",
+    );
+    assert_eq!(helper.match_indices(receiver).count(), 1);
+    let completing_install = helper
+        .find("PendingTargetPreparationPermanentCleanup::Completing(")
+        .expect("ECS must install the exact Completing holder before Core publication");
+    let core_call = helper
+        .find(receiver)
+        .expect("the completion driver must call the trusted Core receiver");
+    assert!(
+        completing_install < core_call,
+        "the whole Completing owner must be installed before the trusted receiver call"
+    );
+
+    let callback = callback_after_receiver(helper, receiver);
+    let normalized_callback = callback.split_whitespace().collect::<String>();
+    assert_eq!(normalized_callback.matches("*pending=None").count(), 1);
+    assert!(
+        matches!(
+            normalized_callback.as_str(),
+            "*pending=None" | "*pending=None;"
+        ),
+        "the callback may only clear the preinstalled exact Completing holder; got {callback:?}"
+    );
+    for forbidden in [
+        "world",
+        ".query",
+        ".resource",
+        ".entry(",
+        ".get(",
+        ".get_mut(",
+        "[",
+        "Vec::",
+        "Box::",
+        "String::",
+        "vec!",
+        ".collect",
+        ".reserve",
+        ".try_reserve",
+        ".sort",
+        ".validate",
+        ".expect",
+        ".unwrap",
+        "panic!",
+        "unreachable!",
+        "unsafe",
+        ".insert",
+        ".remove",
+        "despawn",
+        "entity_mut",
+        "commands",
+        ".trigger",
+        ".observe",
+    ] {
+        assert!(
+            !callback.contains(forbidden),
+            "the target completion callback contains forbidden work: {forbidden}"
+        );
+    }
+
+    let core_receiver = body_after_marker(
+        core_engine,
+        "pub(crate) fn complete_back_target_permanent_cleanup",
+    );
+    let receiver_mismatch = body_after_marker(
+        core_engine,
+        "struct CoreBackTargetPermanentCleanupReceiverMismatchProjection",
+    );
+    assert!(
+        receiver_mismatch
+            .contains("expected: CoreBackTargetPermanentCleanupCompletionExpectedProjection")
+            && receiver_mismatch
+                .contains("observed: CoreBackTargetPermanentCleanupCompletionObservedProjection"),
+        "completion receiver mismatch must retain the complete purpose-specific expected/observed boundary projections"
+    );
+    assert!(
+        !core_receiver.contains("prepare_back_target_permanent_cleanup_terminal("),
+        "target completion must consume the terminal plan prepared before host retirement"
+    );
+    let receiver_rejection = core_receiver
+        .find("if !exact_receiver")
+        .expect("Core must reject receiver drift before the callback");
+    let facts_rejection = core_receiver
+        .find("if !exact_facts")
+        .expect("Core must reject completion-fact drift before the callback");
+    let callback_commit = core_receiver
+        .find("commit_completion();")
+        .expect("Core must invoke the ECS completion callback once");
+    assert!(receiver_rejection < callback_commit && facts_rejection < callback_commit);
+    let terminal_tail = &core_receiver[callback_commit + "commit_completion();".len()..];
+    assert!(
+        !terminal_tail.contains("if let Some(cleanup)")
+            && !terminal_tail.contains("let Some(cleanup)"),
+        "Core must move and validate the exact private Cleanup before the callback, then consume it unconditionally"
+    );
+    for forbidden in [
+        ".clone(",
+        ".iter(",
+        ".find(",
+        ".retain(",
+        ".remove(",
+        ".push(",
+        ".reserve(",
+        ".try_reserve(",
+        ".transition(",
+        ".append_trace(",
+        ".validate(",
+        ".expect(",
+        ".unwrap(",
+        "panic!",
+        "unreachable!",
+        "unsafe",
+        "?",
+        ".query",
+        ".resource",
+        ".clear(",
+    ] {
+        assert!(
+            !terminal_tail.contains(forbidden),
+            "the callback/post-callback terminal tail contains forbidden work: {forbidden}"
+        );
+    }
+    let private_cleanup_take = core_receiver[..callback_commit]
+        .find("self.pending_back_target_permanent_cleanup.take()")
+        .expect("Core must move the exact private Cleanup into a prepared local before the ECS callback");
+    let retired_consumption = terminal_tail
+        .find("drop(retired_host);")
+        .expect("Core must consume its matching retired-host authority in the atomic tail");
+    let state_publication = terminal_tail
+        .find("self.state = state;")
+        .expect("Core must publish the begin-prepared AwaitingHost state by assignment");
+    assert!(
+        private_cleanup_take < callback_commit && retired_consumption < state_publication,
+        "Core must prepare the whole Cleanup before the callback, then consume retired-host authority before AwaitingHost publication"
+    );
+}
+
+#[test]
 fn back_target_dispatch_owners_are_linear_and_exact() {
     let navigation = include_str!("../src/navigation.rs");
     let tests_start = navigation

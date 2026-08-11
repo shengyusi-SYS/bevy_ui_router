@@ -714,7 +714,7 @@ impl BackResolutionEvidence {
         }
     }
 
-    fn observed(scope: &BackResolutionScopeProjection) -> Self {
+    pub(crate) fn observed(scope: &BackResolutionScopeProjection) -> Self {
         Self {
             inner: BackResolutionEvidenceProjection {
                 expected: None,

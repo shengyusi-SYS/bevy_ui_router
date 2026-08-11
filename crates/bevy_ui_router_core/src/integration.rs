@@ -23,6 +23,7 @@ use crate::engine::{
     BackTargetCommitOperationOutcome as CoreBackTargetCommitOperationOutcome,
     BackTargetPermanentBeginCoreOutcome as CoreBackTargetPermanentBeginOutcome,
     BackTargetPermanentBeginCorePermanentEvidence,
+    BackTargetPermanentCleanupCompletionCoreOutcome as CoreBackTargetPermanentCleanupCompletionOutcome,
     BackTargetPermanentSettlementOutcome as CoreBackTargetPermanentSettlementOutcome,
     BackTargetResumeAction as CoreBackTargetResumeAction,
     BackTargetResumeOutcome as CoreBackTargetResumeOutcome,
@@ -42,6 +43,11 @@ use crate::engine::{
     CoreBackTargetDriverFailureReportMode, CoreBackTargetDriverFallback,
     CoreBackTargetDriverTerminal, CoreBackTargetDriverTerminalProjection,
     CoreBackTargetPermanentBeginOwner, CoreBackTargetPermanentCanonicalRelationProjection,
+    CoreBackTargetPermanentCleanupBatch, CoreBackTargetPermanentCleanupCompletionOwner,
+    CoreBackTargetPermanentCleanupMismatchEvidence,
+    CoreBackTargetPermanentCleanupReceiverMismatchProjection,
+    CoreBackTargetPermanentCleanupTerminalProjection,
+    CoreBackTargetPermanentCompletionFactsMismatchProjection,
     CoreBackTargetPermanentCurrentStateProjection,
     CoreBackTargetPermanentHistoryPreparationErrorProjection,
     CoreBackTargetPermanentRequestProjection, CoreBackTargetPermanentSettlementOwner,
@@ -1149,7 +1155,7 @@ impl BackTargetPermanentBeginOwner {
 
 #[doc(hidden)]
 pub struct BackTargetPermanentCleanupBatchOwner {
-    inner: CleanupBatch,
+    inner: CoreBackTargetPermanentCleanupBatch,
 }
 
 #[doc(hidden)]
@@ -1163,11 +1169,63 @@ pub struct BackTargetPermanentCleanupBatchView {
 impl BackTargetPermanentCleanupBatchOwner {
     pub fn batch(&self) -> BackTargetPermanentCleanupBatchView {
         BackTargetPermanentCleanupBatchView {
-            identity: self.inner.inner.clone(),
-            manifest_digest: self.inner.manifest_digest,
-            obligation_count: self.inner.obligation_count,
+            identity: self.inner.token().clone(),
+            manifest_digest: self.inner.manifest_digest(),
+            obligation_count: self.inner.obligation_count(),
         }
     }
+
+    pub fn complete(
+        self,
+        manifest_digest: u64,
+        obligation_count: usize,
+        completion_digest: u64,
+        settled_count: usize,
+    ) -> BackTargetPermanentCleanupCompletionOwner {
+        BackTargetPermanentCleanupCompletionOwner {
+            inner: self.inner.completion_owner(
+                manifest_digest,
+                obligation_count,
+                completion_digest,
+                settled_count,
+            ),
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct BackTargetPermanentCleanupCompletionOwner {
+    inner: CoreBackTargetPermanentCleanupCompletionOwner,
+}
+
+#[doc(hidden)]
+pub enum BackTargetPermanentCleanupMismatchEvidence {
+    Receiver(BackTargetPermanentCleanupReceiverMismatchView),
+    Facts(BackTargetPermanentCompletionFactsMismatchView),
+}
+
+#[doc(hidden)]
+pub struct BackTargetPermanentCleanupReceiverMismatchView {
+    inner: CoreBackTargetPermanentCleanupReceiverMismatchProjection,
+}
+
+#[doc(hidden)]
+pub struct BackTargetPermanentCompletionFactsMismatchView {
+    inner: CoreBackTargetPermanentCompletionFactsMismatchProjection,
+}
+
+#[doc(hidden)]
+pub struct BackTargetPermanentCleanupTerminalEvidence {
+    inner: CoreBackTargetPermanentCleanupTerminalProjection,
+}
+
+#[doc(hidden)]
+pub enum BackTargetPermanentCleanupCompletionOutcome {
+    Terminal(BackTargetPermanentCleanupTerminalEvidence),
+    Mismatch {
+        owner: BackTargetPermanentCleanupCompletionOwner,
+        mismatch: BackTargetPermanentCleanupMismatchEvidence,
+    },
 }
 
 impl BackTargetPermanentCleanupBatchView {
@@ -4089,16 +4147,7 @@ impl RouterEngine {
             obligation_count,
             installation,
             |installation, inner| {
-                install(
-                    installation,
-                    BackTargetPermanentCleanupBatchOwner {
-                        inner: CleanupBatch {
-                            inner,
-                            manifest_digest,
-                            obligation_count,
-                        },
-                    },
-                )
+                install(installation, BackTargetPermanentCleanupBatchOwner { inner })
             },
         ) {
             CoreBackTargetPermanentBeginOutcome::Begun => BackTargetPermanentBeginOutcome::Begun,
@@ -4199,6 +4248,45 @@ impl RouterEngine {
                     },
                     installation,
                     evidence,
+                }
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn complete_back_target_permanent_cleanup<F>(
+        &mut self,
+        owner: BackTargetPermanentCleanupCompletionOwner,
+        commit_completion: F,
+    ) -> BackTargetPermanentCleanupCompletionOutcome
+    where
+        F: FnOnce(),
+    {
+        match self
+            .inner
+            .complete_back_target_permanent_cleanup(owner.inner, commit_completion)
+        {
+            CoreBackTargetPermanentCleanupCompletionOutcome::Terminal(inner) => {
+                BackTargetPermanentCleanupCompletionOutcome::Terminal(
+                    BackTargetPermanentCleanupTerminalEvidence { inner },
+                )
+            }
+            CoreBackTargetPermanentCleanupCompletionOutcome::Mismatch { owner, mismatch } => {
+                let mismatch = match mismatch {
+                    CoreBackTargetPermanentCleanupMismatchEvidence::Receiver(inner) => {
+                        BackTargetPermanentCleanupMismatchEvidence::Receiver(
+                            BackTargetPermanentCleanupReceiverMismatchView { inner },
+                        )
+                    }
+                    CoreBackTargetPermanentCleanupMismatchEvidence::Facts(inner) => {
+                        BackTargetPermanentCleanupMismatchEvidence::Facts(
+                            BackTargetPermanentCompletionFactsMismatchView { inner },
+                        )
+                    }
+                };
+                BackTargetPermanentCleanupCompletionOutcome::Mismatch {
+                    owner: BackTargetPermanentCleanupCompletionOwner { inner: owner },
+                    mismatch,
                 }
             }
         }

@@ -6517,6 +6517,47 @@ pub(crate) enum TargetPreparationPermanentSettlementError<Evidence> {
     PostWriteRefreeze(Evidence),
 }
 
+pub(crate) struct TargetPreparationPermanentCompletionDomain {
+    ledger_domain: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetPreparationPermanentCompletionPreparationSource {
+    ActiveIsolated,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TargetPreparationPermanentCompletionPreparationExpectation {
+    ledger_domain: u64,
+    manifest_digest: u64,
+    obligation_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TargetPreparationPermanentCompletionPreparationObservation {
+    marker_domain: Option<u64>,
+    ledger_domain: u64,
+    owner_present: bool,
+    normal_batch_present: bool,
+    back_no_target_batch_present: bool,
+    back_no_target_capacity_present: bool,
+    mount_parent_count: usize,
+    receipt_slot_count: usize,
+    observed_receipt_count: usize,
+    unobserved_receipt_count: usize,
+    issued_attempt_present: bool,
+    completion_digest: Option<u64>,
+    authority_host_children_present: bool,
+    back_no_target_authority_partition_present: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TargetPreparationPermanentCompletionPreparationEvidence {
+    source: TargetPreparationPermanentCompletionPreparationSource,
+    expected: TargetPreparationPermanentCompletionPreparationExpectation,
+    observed: TargetPreparationPermanentCompletionPreparationObservation,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TargetPreparationPermanentCompletionFacts {
     manifest_digest: u64,
@@ -7417,29 +7458,84 @@ impl CleanupLedger {
         })
     }
 
-    pub(crate) fn target_preparation_permanent_completion_facts(
-        &self,
-    ) -> Option<TargetPreparationPermanentCompletionFacts> {
-        if self.owner.is_some()
-            || self.batch.is_some()
-            || self.back_no_target_batch.is_some()
-            || self.back_no_target_capacity.is_some()
-            || !self.mount_parents.is_empty()
-            || self.authority_host_children.is_some()
-            || self.back_no_target_authority_partition.is_some()
-            || self
-                .receipts
-                .iter()
-                .any(|receipt| receipt.as_ref().is_none_or(|receipt| !receipt.observed))
-        {
-            return None;
+    pub(crate) fn into_target_preparation_permanent_completion(
+        self,
+        domain: Option<TargetPreparationPermanentCompletionDomain>,
+    ) -> Result<
+        (
+            Self,
+            TargetPreparationPermanentCompletionDomain,
+            TargetPreparationPermanentCompletionFacts,
+        ),
+        (
+            Self,
+            Option<TargetPreparationPermanentCompletionDomain>,
+            TargetPreparationPermanentCompletionPreparationEvidence,
+        ),
+    > {
+        let expected_domain = domain.as_ref().map(|domain| domain.ledger_domain);
+        let observed_receipt_count = self.receipts.iter().flatten().count();
+        let unobserved_receipt_count = self
+            .receipts
+            .iter()
+            .flatten()
+            .filter(|receipt| !receipt.observed)
+            .count();
+        let exact = expected_domain == Some(self.ledger_domain)
+            && self.owner.is_none()
+            && self.batch.is_none()
+            && self.back_no_target_batch.is_none()
+            && self.back_no_target_capacity.is_none()
+            && self.mount_parents.is_empty()
+            && self.receipts.len() == self.obligations.len()
+            && observed_receipt_count == self.receipts.len()
+            && unobserved_receipt_count == 0
+            && self.issued_attempt.is_none()
+            && self.completion_digest.is_some()
+            && self.authority_host_children.is_none()
+            && self.back_no_target_authority_partition.is_none();
+        let evidence = TargetPreparationPermanentCompletionPreparationEvidence {
+            source: TargetPreparationPermanentCompletionPreparationSource::ActiveIsolated,
+            expected: TargetPreparationPermanentCompletionPreparationExpectation {
+                ledger_domain: self.ledger_domain,
+                manifest_digest: self.manifest_digest,
+                obligation_count: self.obligations.len(),
+            },
+            observed: TargetPreparationPermanentCompletionPreparationObservation {
+                marker_domain: expected_domain,
+                ledger_domain: self.ledger_domain,
+                owner_present: self.owner.is_some(),
+                normal_batch_present: self.batch.is_some(),
+                back_no_target_batch_present: self.back_no_target_batch.is_some(),
+                back_no_target_capacity_present: self.back_no_target_capacity.is_some(),
+                mount_parent_count: self.mount_parents.len(),
+                receipt_slot_count: self.receipts.len(),
+                observed_receipt_count,
+                unobserved_receipt_count,
+                issued_attempt_present: self.issued_attempt.is_some(),
+                completion_digest: self.completion_digest,
+                authority_host_children_present: self.authority_host_children.is_some(),
+                back_no_target_authority_partition_present: self
+                    .back_no_target_authority_partition
+                    .is_some(),
+            },
+        };
+        if !exact {
+            return Err((self, domain, evidence));
         }
-        Some(TargetPreparationPermanentCompletionFacts {
+        let Some(completion_digest) = self.completion_digest else {
+            return Err((self, domain, evidence));
+        };
+        let Some(domain) = domain else {
+            return Err((self, None, evidence));
+        };
+        let facts = TargetPreparationPermanentCompletionFacts {
             manifest_digest: self.manifest_digest,
             obligation_count: self.obligations.len(),
-            completion_digest: self.completion_digest?,
-            settled_count: self.receipts.iter().flatten().count(),
-        })
+            completion_digest,
+            settled_count: observed_receipt_count,
+        };
+        Ok((self, domain, facts))
     }
 
     pub(crate) fn back_no_target_authority_completion_facts(
@@ -7643,7 +7739,10 @@ impl CleanupLedger {
             &World,
             TargetPreparationPermanentTransition<'_>,
         ) -> Result<(), Evidence>,
-    ) -> Result<(), TargetPreparationPermanentSettlementError<Evidence>> {
+    ) -> Result<
+        TargetPreparationPermanentCompletionDomain,
+        TargetPreparationPermanentSettlementError<Evidence>,
+    > {
         if self.owner.is_some()
             || self.batch.is_some()
             || self.back_no_target_batch.is_some()
@@ -8083,7 +8182,9 @@ impl CleanupLedger {
         }
         self.finish_if_settled();
         if self.completion_digest.is_some() {
-            Ok(())
+            Ok(TargetPreparationPermanentCompletionDomain {
+                ledger_domain: self.ledger_domain,
+            })
         } else {
             Err(
                 TargetPreparationPermanentSettlementError::SettlementRejected(

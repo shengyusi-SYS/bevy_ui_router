@@ -949,6 +949,123 @@ pub(crate) enum BackNoTargetAuthorityCleanupCompletionCoreOutcome {
     },
 }
 
+pub(crate) struct CoreBackTargetPermanentCleanupBatch {
+    expectation: CoreBackTargetPermanentCleanupCompletionExpectedProjection,
+    token: CleanupBatchToken,
+}
+
+impl CoreBackTargetPermanentCleanupBatch {
+    pub(crate) fn token(&self) -> &CleanupBatchToken {
+        &self.token
+    }
+
+    pub(crate) const fn manifest_digest(&self) -> u64 {
+        self.expectation.cleanup.manifest_digest
+    }
+
+    pub(crate) const fn obligation_count(&self) -> usize {
+        self.expectation.cleanup.obligation_count
+    }
+
+    pub(crate) fn completion_owner(
+        self,
+        manifest_digest: u64,
+        obligation_count: usize,
+        completion_digest: u64,
+        settled_count: usize,
+    ) -> CoreBackTargetPermanentCleanupCompletionOwner {
+        CoreBackTargetPermanentCleanupCompletionOwner {
+            batch: self,
+            completion: CoreBackTargetPermanentCleanupCompletionFacts {
+                manifest_digest,
+                obligation_count,
+                completion_digest,
+                settled_count,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetPermanentCleanupCompletionFacts {
+    manifest_digest: u64,
+    obligation_count: usize,
+    completion_digest: u64,
+    settled_count: usize,
+}
+
+pub(crate) struct CoreBackTargetPermanentCleanupCompletionOwner {
+    batch: CoreBackTargetPermanentCleanupBatch,
+    completion: CoreBackTargetPermanentCleanupCompletionFacts,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetPermanentCleanupCompletionExpectedProjection {
+    cleanup: CoreBackTargetPermanentCleanupProjection,
+    current: CoreBackTargetPermanentCurrentStateProjection,
+    request: CoreBackTargetPermanentRequestProjection,
+    resolution: BackResolutionEvidenceClassification,
+}
+
+impl CoreBackTargetPermanentCleanupCompletionExpectedProjection {
+    fn matches_observed(
+        &self,
+        observed: &CoreBackTargetPermanentCleanupCompletionObservedProjection,
+    ) -> bool {
+        observed.cleanup.as_ref() == Some(&self.cleanup)
+            && observed.expectation.as_ref() == Some(self)
+            && self.cleanup.scope.matches_engine_scope(
+                observed.scope.world,
+                observed.scope.router,
+                observed.scope.history,
+            )
+            && self.current == observed.current
+            && observed.request.as_ref() == Some(&self.request)
+            && observed.resolution == Some(self.resolution)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetPermanentCleanupCompletionObservedProjection {
+    cleanup: Option<CoreBackTargetPermanentCleanupProjection>,
+    expectation: Option<CoreBackTargetPermanentCleanupCompletionExpectedProjection>,
+    scope: CoreBackTargetEngineScopeProjection,
+    current: CoreBackTargetPermanentCurrentStateProjection,
+    request: Option<CoreBackTargetPermanentRequestProjection>,
+    resolution: Option<BackResolutionEvidenceClassification>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetPermanentCleanupReceiverMismatchProjection {
+    expected: CoreBackTargetPermanentCleanupCompletionExpectedProjection,
+    observed: CoreBackTargetPermanentCleanupCompletionObservedProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetPermanentCompletionFactsMismatchProjection {
+    expected: CoreBackTargetPermanentCleanupProjection,
+    observed: CoreBackTargetPermanentCleanupCompletionFacts,
+}
+
+pub(crate) enum CoreBackTargetPermanentCleanupMismatchEvidence {
+    Receiver(CoreBackTargetPermanentCleanupReceiverMismatchProjection),
+    Facts(CoreBackTargetPermanentCompletionFactsMismatchProjection),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreBackTargetPermanentCleanupTerminalProjection {
+    request: NavigationRequestId,
+    completion: CoreBackTargetPermanentCleanupCompletionFacts,
+}
+
+pub(crate) enum BackTargetPermanentCleanupCompletionCoreOutcome {
+    Terminal(CoreBackTargetPermanentCleanupTerminalProjection),
+    Mismatch {
+        owner: CoreBackTargetPermanentCleanupCompletionOwner,
+        mismatch: CoreBackTargetPermanentCleanupMismatchEvidence,
+    },
+}
+
 pub(crate) enum BackNoTargetAuthorityCoreOutcome {
     Accepted(BackNoTargetAuthoritySettlementOwner),
     Mismatch {
@@ -2266,6 +2383,7 @@ struct CoreBackTargetPermanentTerminalPlan {
 
 struct CoreBackTargetPermanentCleanupState {
     receiver: CoreBackTargetPermanentCleanupProjection,
+    expectation: CoreBackTargetPermanentCleanupCompletionExpectedProjection,
     history: Option<HistoryCommitCapability>,
     settlement: CoreBackTargetPermanentSettlementOwner,
     retired_host: RetiredHostAuthority,
@@ -3951,7 +4069,7 @@ impl RouterEngine {
         install: F,
     ) -> BackTargetPermanentBeginCoreOutcome<Installation>
     where
-        F: FnOnce(Installation, CleanupBatchToken),
+        F: FnOnce(Installation, CoreBackTargetPermanentCleanupBatch),
     {
         let CoreBackTargetPermanentBeginOwner {
             settlement,
@@ -4132,6 +4250,7 @@ impl RouterEngine {
                 installation,
             };
         }
+        let completion_expected_request = recovering_expected.clone();
         let recovering_trace_expected = CoreBackTargetPermanentRequestProjection {
             trace_closed: false,
             ..recovering_expected
@@ -4524,13 +4643,50 @@ impl RouterEngine {
             manifest_digest,
             obligation_count,
         };
-        let batch = CleanupBatchToken::sealed(
-            ticket.identity.clone(),
-            cleanup_batch,
-            &logical_roots,
-            crate::cleanup::CleanupManifestDigest::from_opaque(manifest_digest),
-            obligation_count,
-        );
+        let expectation = CoreBackTargetPermanentCleanupCompletionExpectedProjection {
+            cleanup: receiver.clone(),
+            current: CoreBackTargetPermanentCurrentStateProjection {
+                host: Some(host.clone()),
+                top_slot: Some(top_slot),
+                current_identity: None,
+                current_location: None,
+                current_stage: CoreBackTargetReceiverStageProjection::Missing,
+                current_logical_roots: None,
+                current_reconciliation: None,
+                current_retired_host: Some(host_lease.retirement_projection()),
+                active_baseline: BackTargetPreparationBaseline::new(
+                    false,
+                    Some(host.clone()),
+                    Some(top_slot),
+                    recovering_state.active().clone(),
+                    self.current_active_branch()
+                        .map(|branch| branch.branch_fingerprint().clone()),
+                    self.active_child_slots.clone(),
+                ),
+                availability: crate::presentation::RouterAvailability::RecoveringAuthority,
+                request_status: Some(RequestStatus::Running(NavigationPhase::Recovering)),
+                history_binding: None,
+                pending_no_target: None,
+                pending_no_target_authority: None,
+                pending_target_cleanup: Some(receiver.clone()),
+                history_preparation_error:
+                    CoreBackTargetPermanentHistoryPreparationErrorProjection::Vacant,
+                prepared_publication: None,
+                action: CoreBackTargetReceiverActionProjection::Missing,
+            },
+            request: completion_expected_request,
+            resolution: BackResolutionEvidenceClassification::ConsumedReplay,
+        };
+        let batch = CoreBackTargetPermanentCleanupBatch {
+            expectation: expectation.clone(),
+            token: CleanupBatchToken::sealed(
+                ticket.identity.clone(),
+                cleanup_batch,
+                &logical_roots,
+                crate::cleanup::CleanupManifestDigest::from_opaque(manifest_digest),
+                obligation_count,
+            ),
+        };
         let terminal = CoreBackTargetPermanentTerminalPlan {
             state: terminal_state,
             records: terminal_records,
@@ -4560,6 +4716,7 @@ impl RouterEngine {
         let history = self.current_history_capability.take();
         self.pending_back_target_permanent_cleanup = Some(CoreBackTargetPermanentCleanupState {
             receiver,
+            expectation,
             history,
             settlement,
             retired_host,
@@ -4682,6 +4839,109 @@ impl RouterEngine {
             self.active_child_slots.clear();
         }
         BackNoTargetAuthorityCleanupCompletionCoreOutcome::Terminal(terminal)
+    }
+
+    pub(crate) fn complete_back_target_permanent_cleanup<F>(
+        &mut self,
+        owner: CoreBackTargetPermanentCleanupCompletionOwner,
+        commit_completion: F,
+    ) -> BackTargetPermanentCleanupCompletionCoreOutcome
+    where
+        F: FnOnce(),
+    {
+        let expected = owner.batch.expectation.clone();
+        let observed =
+            self.back_target_permanent_cleanup_completion_observed(&expected.cleanup.scope);
+        let exact_receiver = expected.matches_observed(&observed);
+        if !exact_receiver {
+            return BackTargetPermanentCleanupCompletionCoreOutcome::Mismatch {
+                owner,
+                mismatch: CoreBackTargetPermanentCleanupMismatchEvidence::Receiver(
+                    CoreBackTargetPermanentCleanupReceiverMismatchProjection { expected, observed },
+                ),
+            };
+        }
+        let exact_facts = owner.completion.manifest_digest == expected.cleanup.manifest_digest
+            && owner.completion.obligation_count == expected.cleanup.obligation_count
+            && owner.completion.settled_count == owner.completion.obligation_count;
+        if !exact_facts {
+            let observed_facts = owner.completion;
+            return BackTargetPermanentCleanupCompletionCoreOutcome::Mismatch {
+                owner,
+                mismatch: CoreBackTargetPermanentCleanupMismatchEvidence::Facts(
+                    CoreBackTargetPermanentCompletionFactsMismatchProjection {
+                        expected: expected.cleanup,
+                        observed: observed_facts,
+                    },
+                ),
+            };
+        }
+        let terminal = CoreBackTargetPermanentCleanupTerminalProjection {
+            request: expected.cleanup.scope.request(),
+            completion: owner.completion,
+        };
+        let cleanup = match self.pending_back_target_permanent_cleanup.take() {
+            Some(cleanup) => cleanup,
+            None => {
+                let observed =
+                    self.back_target_permanent_cleanup_completion_observed(&expected.cleanup.scope);
+                return BackTargetPermanentCleanupCompletionCoreOutcome::Mismatch {
+                    owner,
+                    mismatch: CoreBackTargetPermanentCleanupMismatchEvidence::Receiver(
+                        CoreBackTargetPermanentCleanupReceiverMismatchProjection {
+                            expected,
+                            observed,
+                        },
+                    ),
+                };
+            }
+        };
+        let local_exact = cleanup.expectation == expected
+            && cleanup.receiver == expected.cleanup
+            && expected.current.current_retired_host.as_ref()
+                == Some(&cleanup.retired_host.projection());
+        if !local_exact {
+            self.pending_back_target_permanent_cleanup = Some(cleanup);
+            let observed =
+                self.back_target_permanent_cleanup_completion_observed(&expected.cleanup.scope);
+            return BackTargetPermanentCleanupCompletionCoreOutcome::Mismatch {
+                owner,
+                mismatch: CoreBackTargetPermanentCleanupMismatchEvidence::Receiver(
+                    CoreBackTargetPermanentCleanupReceiverMismatchProjection { expected, observed },
+                ),
+            };
+        }
+        let CoreBackTargetPermanentCleanupCompletionOwner { batch, .. } = owner;
+        let CoreBackTargetPermanentCleanupState {
+            history,
+            settlement,
+            retired_host,
+            terminal:
+                CoreBackTargetPermanentTerminalPlan {
+                    state,
+                    records,
+                    evicted_through,
+                    issued_view_tasks,
+                    report_dispositions,
+                    completed_cleanup,
+                    active_child_slots,
+                },
+            ..
+        } = cleanup;
+        commit_completion();
+        drop(batch);
+        drop(history);
+        drop(settlement);
+        drop(retired_host);
+        self.state = state;
+        self.records = records;
+        self.evicted_through = evicted_through;
+        self.issued_view_tasks = issued_view_tasks;
+        self.report_dispositions = report_dispositions;
+        self.completed_cleanup = completed_cleanup;
+        self.active_branch = None;
+        self.active_child_slots = active_child_slots;
+        BackTargetPermanentCleanupCompletionCoreOutcome::Terminal(terminal)
     }
 
     fn prepare_back_no_target_publication(
@@ -6867,6 +7127,34 @@ impl RouterEngine {
             world: self.history_admission_world,
             router: self.router,
             history: self.history.incarnation(),
+        }
+    }
+
+    fn back_target_permanent_cleanup_completion_observed(
+        &self,
+        scope: &BackResolutionScopeProjection,
+    ) -> CoreBackTargetPermanentCleanupCompletionObservedProjection {
+        let resolution = BackResolutionEvidence::observed(scope);
+        let (request, resolution) = match self.request(scope.request()) {
+            Some(record) => (
+                Some(Self::back_target_permanent_request_projection(record)),
+                Some(record.classify_back_resolution(&resolution)),
+            ),
+            None => (None, None),
+        };
+        CoreBackTargetPermanentCleanupCompletionObservedProjection {
+            cleanup: self
+                .pending_back_target_permanent_cleanup
+                .as_ref()
+                .map(|cleanup| cleanup.receiver.clone()),
+            expectation: self
+                .pending_back_target_permanent_cleanup
+                .as_ref()
+                .map(|cleanup| cleanup.expectation.clone()),
+            scope: self.back_target_engine_scope_projection(),
+            current: self.back_target_permanent_current_state_projection(),
+            request,
+            resolution,
         }
     }
 
