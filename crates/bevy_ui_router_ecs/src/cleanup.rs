@@ -32,6 +32,7 @@ use crate::{
         RouterInputBarrier,
     },
     input::{RouteFocusState, observed_descendant_closure, prepare_focus_mutation},
+    lifecycle_preparation::LifecyclePreflightEvidence,
     mount::{ChildSlotResidual, MountedChildSlot, residual_child_slot_is_isolated},
     navigation::{HostBinding, PendingFailedBranch, ProvenEmptyProjection, RetiredHostBinding},
     presentation::{FrameContentTarget, FrameLifecycle, FrameOutput, RealizedFrame},
@@ -6889,9 +6890,14 @@ pub(crate) struct BackNoTargetLedgerProjectionForTest {
 
 pub(crate) enum CleanupOwner {
     Leaving(RealizedBranch),
-    FailedPrepared(FailedPreparedBranch),
+    FailedPrepared(FailedPreparedCleanupOwner),
     AuthoritySettlement(AuthoritySettlementOwner),
     BackNoTargetAuthority(BackNoTargetAuthorityCleanupOwner),
+}
+
+pub(crate) struct FailedPreparedCleanupOwner {
+    branch: FailedPreparedBranch,
+    preflight: Option<LifecyclePreflightEvidence>,
 }
 
 pub(crate) struct AuthoritySettlementOwner {
@@ -7134,7 +7140,21 @@ impl CleanupLedger {
         prepared: PreparedCleanupLedger,
         failed: FailedPreparedBranch,
     ) -> Self {
-        Self::activate_owner(prepared, Some(CleanupOwner::FailedPrepared(failed)))
+        Self::activate_failed_with_preflight(prepared, failed, None)
+    }
+
+    pub(crate) fn activate_failed_with_preflight(
+        prepared: PreparedCleanupLedger,
+        failed: FailedPreparedBranch,
+        preflight: Option<LifecyclePreflightEvidence>,
+    ) -> Self {
+        Self::activate_owner(
+            prepared,
+            Some(CleanupOwner::FailedPrepared(FailedPreparedCleanupOwner {
+                branch: failed,
+                preflight,
+            })),
+        )
     }
 
     pub(crate) fn activate_leaving_branch(
@@ -7236,7 +7256,9 @@ impl CleanupLedger {
     }
 
     fn release_settled_owner(&mut self) {
-        if !self.is_physical_authority_settlement() {
+        if !self.is_physical_authority_settlement()
+            && !matches!(self.owner, Some(CleanupOwner::FailedPrepared(_)))
+        {
             self.owner.take();
         }
     }
@@ -7582,9 +7604,22 @@ impl CleanupLedger {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn failed_prepared_frames(&self) -> &[RealizedFrame] {
         match self.owner.as_ref() {
-            Some(CleanupOwner::FailedPrepared(branch)) => branch.frames(),
+            Some(CleanupOwner::FailedPrepared(owner)) => owner.branch.frames(),
             Some(CleanupOwner::AuthoritySettlement(owner)) => owner.pending.branch().frames(),
             Some(CleanupOwner::Leaving(_) | CleanupOwner::BackNoTargetAuthority(_)) | None => &[],
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failed_preflight_evidence(&self) -> Option<LifecyclePreflightEvidence> {
+        match self.owner.as_ref() {
+            Some(CleanupOwner::FailedPrepared(owner)) => owner.preflight,
+            Some(
+                CleanupOwner::Leaving(_)
+                | CleanupOwner::AuthoritySettlement(_)
+                | CleanupOwner::BackNoTargetAuthority(_),
+            )
+            | None => None,
         }
     }
 
@@ -7601,7 +7636,7 @@ impl CleanupLedger {
         &self,
     ) -> Option<&crate::branch_transaction::SealedMountNewStagingAllowance> {
         match self.owner.as_ref() {
-            Some(CleanupOwner::FailedPrepared(branch)) => branch.mount_new_allowance(),
+            Some(CleanupOwner::FailedPrepared(owner)) => owner.branch.mount_new_allowance(),
             Some(
                 CleanupOwner::AuthoritySettlement(_)
                 | CleanupOwner::BackNoTargetAuthority(_)
@@ -7615,7 +7650,7 @@ impl CleanupLedger {
     pub(crate) fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
         match self.owner.as_ref() {
             Some(CleanupOwner::Leaving(branch)) => branch.tracked_child_slots(),
-            Some(CleanupOwner::FailedPrepared(branch)) => branch.tracked_child_slots(),
+            Some(CleanupOwner::FailedPrepared(owner)) => owner.branch.tracked_child_slots(),
             Some(CleanupOwner::AuthoritySettlement(owner)) => {
                 let mut slots = owner
                     .active
@@ -11918,8 +11953,8 @@ pub(crate) mod tests {
             Some(CleanupOwner::Leaving(branch)) => CleanupOwnerSnapshot::Leaving {
                 claims: claims(branch),
             },
-            Some(CleanupOwner::FailedPrepared(branch)) => CleanupOwnerSnapshot::FailedPrepared {
-                claims: claims(branch.realized()),
+            Some(CleanupOwner::FailedPrepared(owner)) => CleanupOwnerSnapshot::FailedPrepared {
+                claims: claims(owner.branch.realized()),
             },
             Some(CleanupOwner::AuthoritySettlement(owner)) => {
                 CleanupOwnerSnapshot::AuthoritySettlement {

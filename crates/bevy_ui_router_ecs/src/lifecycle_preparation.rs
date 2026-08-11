@@ -134,4 +134,15 @@ impl LifecyclePreflightEvidence {
             ) if !resources.is_empty()
         )
     }
+
+    pub(crate) const fn is_host_binding_authority_loss(self) -> bool {
+        matches!(
+            (self.source, self.expectation, self.observed),
+            (
+                LifecyclePreflightSource::HostBinding,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Missing | LifecyclePreflightObserved::Drifted
+            )
+        )
+    }
 }

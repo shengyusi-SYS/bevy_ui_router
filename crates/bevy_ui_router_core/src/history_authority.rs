@@ -2291,20 +2291,27 @@ mod tests {
     }
 
     #[test]
-    fn source_revision_aba_is_rejected_before_publication() {
+    fn history_source_aba_is_rejected() {
         let mut fixture = HistoryAuthorityFixture::new();
         let mut history = CanonicalHistory::new(fixture.router_identity());
-        publish(
-            &mut history,
-            &mut fixture,
-            HistoryEffect::Push(RouteLocation::new("/items/1")),
-        );
+        for location in ["/items/1", "/items/2"] {
+            publish(
+                &mut history,
+                &mut fixture,
+                HistoryEffect::Push(RouteLocation::new(location)),
+            );
+        }
+        let frozen_public_shape = history.snapshot();
         let frozen_revision = history.revision;
+        let frozen_entry_ids = history.entry_ids.clone();
+        let BackPreview::Target(destination) = history.preview_back() else {
+            panic!("the two-entry fixture must freeze a real Back destination")
+        };
         let (stale_execution, stale_presentation) = fixture.next_history_binding();
-        let stale = history.freeze(
-            stale_execution,
-            HistoryEffect::Replace(RouteLocation::new("/items/2")),
-        );
+        let stale = match history.freeze_back(stale_execution, destination) {
+            Ok(stale) => stale,
+            Err(_) => panic!("the Back capability must freeze against the exact live source"),
+        };
 
         publish(
             &mut history,
@@ -2314,25 +2321,34 @@ mod tests {
         publish(
             &mut history,
             &mut fixture,
-            HistoryEffect::Replace(RouteLocation::new("/items/1")),
+            HistoryEffect::Replace(RouteLocation::new("/items/2")),
         );
+        assert_eq!(history.snapshot(), frozen_public_shape);
+        assert_ne!(history.entry_ids, frozen_entry_ids);
         let shape_before_probe = history.snapshot();
         let revision_before_probe = history.revision;
         let identities_before_probe = history.entry_ids.clone();
+        let authority_before_probe = history.authority_snapshot();
 
         let error = match history.prepare(stale, stale_presentation) {
             Err(error) => error,
-            Ok(_) => panic!("equal locations do not authorize an ABA-stale capability"),
+            Ok(_) => panic!("equal locations and cursor do not authorize an ABA-stale Back"),
         };
-        let HistoryPreparationError::Source(drift) = error else {
+        let capability = error.capability_snapshot();
+        let HistoryPreparationError::Source(drift) = &error else {
             panic!("source revision drift must not be flattened into binding drift")
         };
 
         assert_eq!(drift.capability.source.revision, frozen_revision);
         assert_ne!(drift.observed.revision, frozen_revision);
+        assert_eq!(drift.capability.source.locations, drift.observed.locations);
+        assert_eq!(drift.capability.source.cursor, drift.observed.cursor);
+        assert_ne!(drift.capability.source.entry_ids, drift.observed.entry_ids);
+        assert!(capability.has_exactly_one_owner());
         assert_eq!(history.snapshot(), shape_before_probe);
         assert_eq!(history.revision, revision_before_probe);
         assert_eq!(history.entry_ids, identities_before_probe);
+        assert_eq!(history.authority_snapshot(), authority_before_probe);
     }
 
     #[test]

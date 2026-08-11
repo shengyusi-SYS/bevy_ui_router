@@ -22,7 +22,7 @@ use bevy_ecs::{
 use bevy_picking::Pickable;
 use bevy_ui::{BackgroundColor, Node, Val};
 #[cfg(feature = "test-support")]
-use bevy_ui_router::ecs::RouterAuthorityAudits;
+use bevy_ui_router::ecs::{AuthorityFrameLifecycle, RouterAuthorityAudits};
 use bevy_ui_router::prelude::*;
 
 const NORMAL_RECT_WIDTH: u16 = 31;
@@ -71,6 +71,7 @@ struct EffectRecord {
 #[derive(Default)]
 struct FixtureState {
     modes: Vec<(RouteViewKey, FixtureMode)>,
+    one_shot_modes: Vec<(RouteViewKey, FixtureMode)>,
     effects: Vec<EffectRecord>,
 }
 
@@ -92,16 +93,35 @@ impl FixtureControl {
         }
     }
 
+    fn set_one_shot_mode(&self, view: &RouteViewKey, mode: FixtureMode) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("fixture lock must not be poisoned");
+        if let Some((_, stored)) = state.one_shot_modes.iter_mut().find(|(key, _)| key == view) {
+            *stored = mode;
+        } else {
+            state.one_shot_modes.push((view.clone(), mode));
+        }
+    }
+
     fn mode_and_record(&self, effect: &ViewBuildEffect) -> FixtureMode {
         let mut state = self
             .state
             .lock()
             .expect("fixture lock must not be poisoned");
-        let mode = state
-            .modes
+        let one_shot = state
+            .one_shot_modes
             .iter()
-            .find_map(|(key, mode)| (key == effect.view()).then_some(*mode))
-            .expect("every fixture view must have a mode");
+            .position(|(key, _)| key == effect.view());
+        let mode = match one_shot {
+            Some(index) => state.one_shot_modes.remove(index).1,
+            None => state
+                .modes
+                .iter()
+                .find_map(|(key, mode)| (key == effect.view()).then_some(*mode))
+                .expect("every fixture view must have a mode"),
+        };
         state.effects.push(EffectRecord {
             view: effect.view().clone(),
             location: effect.input().location().clone(),
@@ -694,6 +714,240 @@ fn assert_cleanup_trace_is_ordered(snapshot: &NavigationRequestSnapshot, expect_
     assert_eq!(terminal + 1, trace.len());
 }
 
+fn assert_terminal_owner_closure(app: &App, router: RouterHandle) {
+    let snapshot = router_snapshot(app, router);
+    assert!(snapshot.running_request().is_none());
+    assert!(snapshot.pending_phase().is_none());
+    assert!(!snapshot.cleanup().foreground_pending());
+    assert_eq!(snapshot.cleanup().quarantine_count(), 0);
+    #[cfg(feature = "test-support")]
+    {
+        let audit = app
+            .world()
+            .resource::<RouterAuthorityAudits>()
+            .get(router)
+            .expect("terminal router has an authority audit");
+        assert_eq!(audit.frames().len(), snapshot.active().frames().len());
+        for (mapping, active) in audit.frames().iter().zip(snapshot.active().frames()) {
+            assert_eq!(mapping.frame(), active);
+            assert_eq!(mapping.lifecycle(), AuthorityFrameLifecycle::Active);
+        }
+        assert!(audit.orphan_slots().is_empty());
+    }
+}
+
+fn assert_failed_route_trace_settles_before_fallback(
+    snapshot: &NavigationRequestSnapshot,
+    expected: NavigationFailureKind,
+) {
+    assert_failed(snapshot, expected);
+    let trace = snapshot.trace();
+    assert_eq!(
+        trace
+            .iter()
+            .map(NavigationTraceEvent::kind)
+            .collect::<Vec<_>>(),
+        vec![
+            NavigationTraceEventKind::FrameTaskIssued,
+            NavigationTraceEventKind::RequestPhaseChanged,
+            NavigationTraceEventKind::HistoryIntentRejected,
+            NavigationTraceEventKind::FrameTaskIssued,
+            NavigationTraceEventKind::RequestPhaseChanged,
+            NavigationTraceEventKind::ShellPrepared,
+            NavigationTraceEventKind::ViewApplied,
+            NavigationTraceEventKind::RequestPhaseChanged,
+            NavigationTraceEventKind::FrameActivated,
+            NavigationTraceEventKind::CommitPublished,
+            NavigationTraceEventKind::RequestPhaseChanged,
+            NavigationTraceEventKind::CleanupSettled,
+            NavigationTraceEventKind::CleanupSettled,
+            NavigationTraceEventKind::CleanupSettled,
+            NavigationTraceEventKind::CleanupSettled,
+            NavigationTraceEventKind::CleanupSettled,
+            NavigationTraceEventKind::RequestTerminal,
+        ],
+        "failed route trace must contain only the canonical rejected attempt, fallback, and settlement events"
+    );
+    assert!(
+        trace[0]
+            .frame()
+            .is_some_and(|frame| matches!(frame.origin(), FrameOrigin::MatchedRoute(_)))
+    );
+    let fallback_frame = trace[3]
+        .frame()
+        .expect("failed route fallback must issue one frame");
+    assert_eq!(fallback_frame.origin(), &FrameOrigin::RouterFallback);
+    for index in [3, 5, 6, 8] {
+        assert_eq!(
+            trace[index].frame(),
+            Some(fallback_frame),
+            "fallback trace event {index} must retain the exact fallback frame"
+        );
+    }
+    for index in [1, 2, 4, 7, 9, 10, 11, 12, 13, 14, 15, 16] {
+        assert_eq!(
+            trace[index].frame(),
+            None,
+            "trace event {index} has no frame"
+        );
+    }
+    assert_eq!(trace[1].phase(), Some(&NavigationPhase::ApplyingFrame(0)));
+    assert_eq!(trace[4].phase(), Some(&NavigationPhase::Recovering));
+    assert_eq!(trace[7].phase(), Some(&NavigationPhase::ReadyToSwitch));
+    assert_eq!(trace[10].phase(), Some(&NavigationPhase::PostCommitCleanup));
+    for index in [0, 2, 3, 5, 6, 8, 9, 11, 12, 13, 14, 15, 16] {
+        assert_eq!(
+            trace[index].phase(),
+            None,
+            "trace event {index} has no phase"
+        );
+    }
+    for index in 11..15 {
+        assert_eq!(
+            trace[index].cleanup_disposition(),
+            Some(CleanupDisposition::Removed),
+            "fallback cleanup receipt {index} must be Removed"
+        );
+    }
+    for index in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 16] {
+        assert_eq!(
+            trace[index].cleanup_disposition(),
+            None,
+            "trace event {index} has no cleanup receipt disposition"
+        );
+    }
+    for (index, event) in trace.iter().enumerate() {
+        assert_eq!(event.outlet(), None, "trace event {index} has no outlet");
+        assert_eq!(event.slot(), None, "trace event {index} has no slot");
+        assert_eq!(
+            event.mount_rejection(),
+            None,
+            "trace event {index} has no mount rejection"
+        );
+    }
+}
+
+fn assert_succeeded_back_trace(snapshot: &NavigationRequestSnapshot) {
+    assert_succeeded(snapshot);
+    let trace = snapshot.trace();
+    assert_eq!(
+        trace
+            .iter()
+            .map(NavigationTraceEvent::kind)
+            .collect::<Vec<_>>(),
+        vec![
+            NavigationTraceEventKind::FrameTaskIssued,
+            NavigationTraceEventKind::RequestPhaseChanged,
+            NavigationTraceEventKind::ShellPrepared,
+            NavigationTraceEventKind::ViewApplied,
+            NavigationTraceEventKind::RequestPhaseChanged,
+            NavigationTraceEventKind::FrameActivated,
+            NavigationTraceEventKind::CommitPublished,
+            NavigationTraceEventKind::RequestPhaseChanged,
+            NavigationTraceEventKind::CleanupSettled,
+            NavigationTraceEventKind::CleanupSettled,
+            NavigationTraceEventKind::CleanupSettled,
+            NavigationTraceEventKind::CleanupSettled,
+            NavigationTraceEventKind::CleanupSettled,
+            NavigationTraceEventKind::RequestTerminal,
+        ],
+        "successful Back trace must contain only the canonical target and post-commit cleanup events"
+    );
+    let frame = trace[0]
+        .frame()
+        .expect("successful Back must issue one matched-route frame");
+    assert!(matches!(frame.origin(), FrameOrigin::MatchedRoute(_)));
+    for index in [0, 2, 3, 5] {
+        assert_eq!(
+            trace[index].frame(),
+            Some(frame),
+            "successful Back trace event {index} must retain its exact matched frame"
+        );
+    }
+    for index in [1, 4, 6, 7, 8, 9, 10, 11, 12, 13] {
+        assert_eq!(
+            trace[index].frame(),
+            None,
+            "trace event {index} has no frame"
+        );
+    }
+    assert_eq!(trace[1].phase(), Some(&NavigationPhase::ApplyingFrame(0)));
+    assert_eq!(trace[4].phase(), Some(&NavigationPhase::ReadyToSwitch));
+    assert_eq!(trace[7].phase(), Some(&NavigationPhase::PostCommitCleanup));
+    for index in [0, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13] {
+        assert_eq!(
+            trace[index].phase(),
+            None,
+            "trace event {index} has no phase"
+        );
+    }
+    for index in 8..12 {
+        assert_eq!(
+            trace[index].cleanup_disposition(),
+            Some(CleanupDisposition::Removed),
+            "successful Back cleanup receipt {index} must be Removed"
+        );
+    }
+    for index in [0, 1, 2, 3, 4, 5, 6, 7, 12, 13] {
+        assert_eq!(
+            trace[index].cleanup_disposition(),
+            None,
+            "trace event {index} has no cleanup receipt disposition"
+        );
+    }
+    for (index, event) in trace.iter().enumerate() {
+        assert_eq!(event.outlet(), None, "trace event {index} has no outlet");
+        assert_eq!(event.slot(), None, "trace event {index} has no slot");
+        assert_eq!(
+            event.mount_rejection(),
+            None,
+            "trace event {index} has no mount rejection"
+        );
+    }
+}
+
+fn assert_no_target_back_trace(snapshot: &NavigationRequestSnapshot) {
+    assert_failed(snapshot, NavigationFailureKind::BackTargetUnavailable);
+    assert_eq!(snapshot.requested(), None);
+    assert_eq!(
+        snapshot
+            .trace()
+            .iter()
+            .map(NavigationTraceEvent::kind)
+            .collect::<Vec<_>>(),
+        vec![
+            NavigationTraceEventKind::HistoryIntentRejected,
+            NavigationTraceEventKind::RequestPhaseChanged,
+            NavigationTraceEventKind::CleanupSettled,
+            NavigationTraceEventKind::RequestTerminal,
+        ],
+        "the canonical no-target branch must publish only rejection, zero cleanup, and terminal"
+    );
+    assert_eq!(
+        snapshot.trace()[1].phase(),
+        Some(&NavigationPhase::CleanupPending)
+    );
+    for index in [0, 2, 3] {
+        assert_eq!(snapshot.trace()[index].phase(), None);
+    }
+    assert_eq!(snapshot.trace()[2].cleanup_disposition(), None);
+    for (index, event) in snapshot.trace().iter().enumerate() {
+        assert_eq!(event.frame(), None, "trace event {index} has no frame");
+        assert_eq!(event.outlet(), None, "trace event {index} has no outlet");
+        assert_eq!(event.slot(), None, "trace event {index} has no slot");
+        assert_eq!(
+            event.mount_rejection(),
+            None,
+            "trace event {index} has no mount rejection"
+        );
+        assert_eq!(
+            event.cleanup_disposition(),
+            None,
+            "trace event {index} has no cleanup receipt disposition"
+        );
+    }
+}
+
 fn assert_host_intact(app: &App, fingerprint: &HostBoundaryFingerprint) {
     let host = fingerprint.host;
     let existing_child = fingerprint.existing_children[0];
@@ -945,6 +1199,262 @@ fn history_c1_replace_then_back_restores_prior_route() {
     assert_eq!(after.history().current(), Some(&route_a));
     assert_eq!(after.active().frames()[0], protected_layout);
     assert_eq!(after.active().frames()[1].slot(), protected_child_slot);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
+fn history_c2_failed_back_preserves_cursor_and_resolved_target() {
+    let mut fixture = root_fixture("/items/:id");
+    let route_a = RouteLocation::new("/items/1");
+    let route_b = RouteLocation::new("/items/2");
+
+    let first = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        route_a.clone(),
+        None,
+        None,
+    );
+    let second = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        route_b.clone(),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, first));
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, second));
+    let published_history = router_snapshot(&fixture.app, fixture.router)
+        .history()
+        .clone();
+
+    fixture
+        .control
+        .set_mode(&fixture.normal, FixtureMode::BuildFailure);
+    let back = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(fixture.router)
+        .expect("the published B entry has A as a Back target");
+    let terminal = drive_request_to_terminal(&mut fixture.app, fixture.router, back);
+
+    assert_failed_route_trace_settles_before_fallback(&terminal, NavigationFailureKind::Build);
+    assert_eq!(terminal.requested(), Some(&route_a));
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after.history(), &published_history);
+    assert_eq!(after.history().entries(), [route_a.clone(), route_b]);
+    assert_eq!(after.history().cursor(), Some(1));
+    assert_eq!(after.active().kind(), ActivePresentationKind::Error);
+    assert_eq!(after.active().requested(), Some(&route_a));
+    assert_eq!(
+        after.active().failure().map(NavigationFailure::kind),
+        Some(NavigationFailureKind::Build)
+    );
+    assert_eq!(
+        fixture.control.effects().last().unwrap().origin,
+        FrameOrigin::RouterFallback
+    );
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
+fn history_c3_first_success_makes_second_back_no_target() {
+    let mut fixture = root_fixture("/items/:id");
+    let route_a = RouteLocation::new("/items/1");
+    let route_b = RouteLocation::new("/items/2");
+
+    let first = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        route_a.clone(),
+        None,
+        None,
+    );
+    let second = push_and_settle(&mut fixture.app, fixture.router, route_b, None, None);
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, first));
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, second));
+
+    let first_back = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(fixture.router)
+        .expect("the published B entry has a first Back target");
+    let second_back = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(fixture.router)
+        .expect("the queued second Back is admitted before the first publishes");
+    let first_terminal = drive_request_to_terminal(&mut fixture.app, fixture.router, first_back);
+    let second_terminal = drive_request_to_terminal(&mut fixture.app, fixture.router, second_back);
+
+    assert_succeeded_back_trace(&first_terminal);
+    assert_eq!(first_terminal.requested(), Some(&route_a));
+    assert_no_target_back_trace(&second_terminal);
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(
+        after.history().entries(),
+        [route_a.clone(), RouteLocation::new("/items/2")]
+    );
+    assert_eq!(after.history().cursor(), Some(0));
+    assert_eq!(after.active().location(), Some(&route_a));
+    assert_eq!(
+        fixture
+            .control
+            .effects()
+            .iter()
+            .filter(|effect| effect.origin == FrameOrigin::RouterFallback)
+            .count(),
+        0,
+        "a no-target Back must not run the fallback driver"
+    );
+    assert_eq!(fixture.control.effects().len(), 3);
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
+fn history_c3_first_failure_retargets_second_back_to_same_entry() {
+    let mut fixture = root_fixture("/items/:id");
+    let route_a = RouteLocation::new("/items/1");
+    let route_b = RouteLocation::new("/items/2");
+
+    let first = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        route_a.clone(),
+        None,
+        None,
+    );
+    let second = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        route_b.clone(),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, first));
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, second));
+    let published_history = router_snapshot(&fixture.app, fixture.router)
+        .history()
+        .clone();
+
+    fixture
+        .control
+        .set_one_shot_mode(&fixture.normal, FixtureMode::BuildFailure);
+    let first_back = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(fixture.router)
+        .expect("the published B entry has a first Back target");
+    let second_back = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(fixture.router)
+        .expect("the queued second Back is admitted before the first fails");
+    let first_terminal = drive_request_to_terminal(&mut fixture.app, fixture.router, first_back);
+
+    assert_failed_route_trace_settles_before_fallback(
+        &first_terminal,
+        NavigationFailureKind::Build,
+    );
+    assert_eq!(first_terminal.requested(), Some(&route_a));
+    let after_first_failure = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after_first_failure.history(), &published_history);
+    assert_eq!(after_first_failure.history().cursor(), Some(1));
+
+    let second_terminal = drive_request_to_terminal(&mut fixture.app, fixture.router, second_back);
+
+    assert_succeeded_back_trace(&second_terminal);
+    assert_eq!(second_terminal.requested(), Some(&route_a));
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after.history().entries(), [route_a.clone(), route_b]);
+    assert_eq!(after.history().cursor(), Some(0));
+    assert_eq!(after.active().location(), Some(&route_a));
+    assert_eq!(
+        fixture
+            .control
+            .effects()
+            .iter()
+            .filter(|effect| effect.origin == FrameOrigin::RouterFallback)
+            .count(),
+        1,
+        "only the first failed Back may run fallback"
+    );
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
+fn history_back_from_error_presentation_uses_published_history() {
+    let mut fixture = root_fixture("/items/:id");
+    let route_a = RouteLocation::new("/items/1");
+    let route_b = RouteLocation::new("/items/2");
+
+    let first = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        route_a.clone(),
+        None,
+        None,
+    );
+    let second = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        route_b.clone(),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, first));
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, second));
+    let published_history = router_snapshot(&fixture.app, fixture.router)
+        .history()
+        .clone();
+
+    fixture
+        .control
+        .set_mode(&fixture.normal, FixtureMode::BuildFailure);
+    let failed_push = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        RouteLocation::new("/items/3"),
+        None,
+        None,
+    );
+    let failed_push = request_snapshot(&fixture.app, fixture.router, failed_push);
+    assert_failed_route_trace_settles_before_fallback(&failed_push, NavigationFailureKind::Build);
+    let error = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(error.active().kind(), ActivePresentationKind::Error);
+    assert_eq!(error.history(), &published_history);
+
+    fixture.control.set_mode(
+        &fixture.normal,
+        FixtureMode::Success {
+            width: NORMAL_RECT_WIDTH,
+        },
+    );
+    let back = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(fixture.router)
+        .expect("published history B must admit Back while Error is presented");
+    let terminal = drive_request_to_terminal(&mut fixture.app, fixture.router, back);
+
+    assert_succeeded(&terminal);
+    assert_eq!(terminal.requested(), Some(&route_a));
+    assert_cleanup_trace_is_ordered(&terminal, true);
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after.active().kind(), ActivePresentationKind::Route);
+    assert_eq!(after.active().location(), Some(&route_a));
+    assert_eq!(after.history().entries(), [route_a.clone(), route_b]);
+    assert_eq!(after.history().cursor(), Some(0));
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
     assert_host_intact(&fixture.app, &fixture.host_fingerprint);
 }
 

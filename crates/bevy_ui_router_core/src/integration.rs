@@ -635,6 +635,14 @@ pub struct ViewReportIdentity {
 }
 
 impl FrameTask {
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_duplicate(&self) -> Self {
+        Self {
+            inner: self.inner.testing_duplicate(),
+        }
+    }
+
     pub fn report_identity(&self) -> ViewReportIdentity {
         ViewReportIdentity {
             inner: self.inner.identity().clone(),
@@ -772,6 +780,14 @@ pub struct CommitTicket {
 }
 
 impl CommitTicket {
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn testing_duplicate(&self) -> Self {
+        Self {
+            inner: self.inner.testing_duplicate(),
+        }
+    }
+
     #[doc(hidden)]
     pub fn report_identity(&self) -> ViewReportIdentity {
         ViewReportIdentity {
@@ -1121,6 +1137,16 @@ pub enum BackTargetCommitPreparationFailure {
 #[doc(hidden)]
 pub struct RouteFailureContinuationOwner {
     inner: PreparedPostCommitContinuation,
+}
+
+#[doc(hidden)]
+pub enum BackTargetPendingRejectedConsumeOutcome {
+    FailureCleanup(FailureCleanupRequest),
+    Mismatch {
+        owner: RouteFailureContinuationOwner,
+        ticket: CommitTicket,
+        mismatch: PreparationReceiverMismatchView,
+    },
 }
 
 #[doc(hidden)]
@@ -4091,6 +4117,39 @@ impl RouterEngine {
         self.accept_back_target_capacity(capacity, scope, |inner| RouteFailureContinuationOwner {
             inner,
         })
+    }
+
+    #[doc(hidden)]
+    pub fn consume_back_target_pending_rejected(
+        &mut self,
+        owner: RouteFailureContinuationOwner,
+        ticket: CommitTicket,
+    ) -> BackTargetPendingRejectedConsumeOutcome {
+        let RouteFailureContinuationOwner {
+            inner:
+                PreparedPostCommitContinuation {
+                    binding: LifecycleContinuationBinding { scope },
+                },
+        } = owner;
+        match self
+            .inner
+            .consume_back_target_pending_rejected(scope, ticket.inner)
+        {
+            Ok(inner) => {
+                BackTargetPendingRejectedConsumeOutcome::FailureCleanup(FailureCleanupRequest {
+                    inner,
+                })
+            }
+            Err((scope, ticket, inner)) => BackTargetPendingRejectedConsumeOutcome::Mismatch {
+                owner: RouteFailureContinuationOwner {
+                    inner: PreparedPostCommitContinuation {
+                        binding: LifecycleContinuationBinding { scope },
+                    },
+                },
+                ticket: CommitTicket { inner: ticket },
+                mismatch: PreparationReceiverMismatchView { inner },
+            },
+        }
     }
 
     #[doc(hidden)]

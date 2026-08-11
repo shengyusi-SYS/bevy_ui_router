@@ -916,7 +916,7 @@ History rows 只能在 owning slice 的真实 RED/GREEN、public journey 与 rev
 | --- | --- | --- | --- |
 | `NavigationRequestSnapshot::requested -> Option` | Back execution | active | Back execution public contract PASS |
 | `NavigationEnqueueErrorKind::IdentityExhausted` | Replace | active | allocator-derived public RED/GREEN PASS |
-| late-bound back complete evidence | Back failure | planned | complete C3 two-branch PASS |
+| late-bound back complete evidence | Back failure | active | complete C3 two-branch PASS |
 
 `State` vocabulary 固定为 `planned | active`
 
@@ -930,7 +930,7 @@ contract-delta harness 固定使用本节 exact heading 与四列表头，并校
 
 | Test function | Owning slice | State |
 | --- | --- | --- |
-| `active_cycle_enters_authority_settlement` | Back failure | planned |
+| `active_cycle_enters_authority_settlement` | Back failure | active |
 
 `State` vocabulary 固定为 `planned | active`
 

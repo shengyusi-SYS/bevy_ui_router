@@ -85,6 +85,16 @@ pub(crate) struct ValidatedHostCandidate {
     revision: HostCandidateRevision,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedHostCandidateObservation(Option<HostTopologyFingerprint>);
+
+pub(crate) fn observe_validated_host_candidate(
+    world: &World,
+    candidate: &ValidatedHostCandidate,
+) -> ValidatedHostCandidateObservation {
+    ValidatedHostCandidateObservation(inspect_topology(world, candidate.host))
+}
+
 impl ValidatedHostCandidate {
     pub(crate) const fn host(&self) -> Entity {
         self.host

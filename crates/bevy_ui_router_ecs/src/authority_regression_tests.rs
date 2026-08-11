@@ -1086,6 +1086,11 @@ fn cleanup_observer_reentry_supersedes_attempt() {
     );
 }
 
+#[test]
+fn active_cycle_enters_authority_settlement() {
+    crate::navigation::tests::active_cycle_enters_authority_settlement();
+}
+
 pub(crate) fn partial_receipt_then_missing_pickable_still_quarantines_and_terminals() {
     let mut harness = harness("partial-persistent-drift");
     first_push(&mut harness);

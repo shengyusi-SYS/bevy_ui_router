@@ -254,7 +254,7 @@ impl FrameTask {
         true
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn testing_duplicate(&self) -> Self {
         Self {
             identity: self.identity.clone(),
@@ -1417,8 +1417,8 @@ pub(crate) struct CommitTicket {
 }
 
 impl CommitTicket {
-    #[cfg(test)]
-    fn testing_duplicate(&self) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_duplicate(&self) -> Self {
         Self {
             identity: self.identity.clone(),
         }
@@ -8051,6 +8051,33 @@ impl RouterEngine {
                 observed,
             })
         }
+    }
+
+    pub(crate) fn consume_back_target_pending_rejected(
+        &mut self,
+        scope: BackResolutionScopeProjection,
+        ticket: CommitTicket,
+    ) -> Result<
+        FailureCleanupRequest,
+        (
+            BackResolutionScopeProjection,
+            CommitTicket,
+            CorePreparationReceiverMismatchProjection,
+        ),
+    > {
+        if let Err(mismatch) = self.inspect_back_target_continuation(&scope, Some(&ticket)) {
+            return Err((scope, ticket, mismatch));
+        }
+        drop(scope);
+        drop(ticket);
+        Ok(self.begin_failure_cleanup_with_continuation(
+            PendingFailureKind::Apply,
+            NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "frame final preflight rejected",
+            ),
+            FailureCleanupContinuation::BeginFallback,
+        ))
     }
 
     pub(crate) fn accepts_back_target_continuation(
@@ -15269,6 +15296,68 @@ mod tests {
             Err(CommitError::Stale),
         );
         assert_eq!(engine.snapshot(), before);
+    }
+
+    #[test]
+    fn cross_incarnation_history_replay_is_zero_write() {
+        fn stage_equal_history_owner(
+            engine: &mut RouterEngine,
+        ) -> (super::NavigationRequestId, super::SealedCommit) {
+            engine.push(RouteLocation::new("/items/1")).unwrap();
+            settle_current(engine);
+            let request = engine
+                .replace(RouteLocation::new("/items/2"))
+                .expect("the equal-shape fixture reserves its replacement");
+            let action = engine.action().expect("the replacement has real work");
+            let ticket = drive_to_commit(engine, action);
+            (request, seal_current(engine, ticket))
+        }
+
+        let mut source = ready_engine();
+        let mut receiver = ready_engine();
+        let (source_request, source_owner) = stage_equal_history_owner(&mut source);
+        let (receiver_request, receiver_owner) = stage_equal_history_owner(&mut receiver);
+
+        assert_ne!(source.router, receiver.router);
+        assert_eq!(source.history_snapshot(), receiver.history_snapshot());
+        let source_engine_before = source.snapshot();
+        let receiver_engine_before = receiver.snapshot();
+        let source_history_before = source.testing_history_authority_snapshot();
+        let receiver_history_before = receiver.testing_history_authority_snapshot();
+        let source_request_before = source.request(source_request).unwrap().clone();
+        let receiver_request_before = receiver.request(receiver_request).unwrap().clone();
+        let source_owner_before = super::PreparedPublicationOwnerSnapshot::from(&source_owner);
+        let receiver_owner_before = super::PreparedPublicationOwnerSnapshot::from(&receiver_owner);
+
+        assert_eq!(
+            receiver.probe_sealed_commit_evidence(source_owner.evidence()),
+            Err(CommitError::Stale),
+            "equal raw history shape cannot cross the router/history incarnation boundary"
+        );
+
+        assert_eq!(source.snapshot(), source_engine_before);
+        assert_eq!(receiver.snapshot(), receiver_engine_before);
+        assert_eq!(
+            source.testing_history_authority_snapshot(),
+            source_history_before
+        );
+        assert_eq!(
+            receiver.testing_history_authority_snapshot(),
+            receiver_history_before
+        );
+        assert_eq!(source.request(source_request), Some(&source_request_before));
+        assert_eq!(
+            receiver.request(receiver_request),
+            Some(&receiver_request_before)
+        );
+        assert_eq!(
+            super::PreparedPublicationOwnerSnapshot::from(&source_owner),
+            source_owner_before
+        );
+        assert_eq!(
+            super::PreparedPublicationOwnerSnapshot::from(&receiver_owner),
+            receiver_owner_before
+        );
     }
 
     #[test]

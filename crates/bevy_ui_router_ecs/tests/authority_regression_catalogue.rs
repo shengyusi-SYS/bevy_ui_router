@@ -30,6 +30,7 @@ pub const AUTHORITY_REGRESSION_CATALOGUE: &[&str] = &[
     "mount_grant_observer_drift_rejects_after_mutation",
     "mount_token_replay_is_zero_write",
     "slot_lifecycle_has_no_orphans",
+    "active_cycle_enters_authority_settlement",
 ];
 
 fn package_root() -> PathBuf {
@@ -562,11 +563,11 @@ fn catalogue_matches_root_nested_and_active_history_profiles_and_final_mvp_vocab
     let expected_set = expected.into_iter().collect::<BTreeSet<_>>();
     assert_eq!(
         expected_set.len(),
-        23,
-        "active History cumulative catalogue must be 23"
+        24,
+        "active History cumulative catalogue must be 24"
     );
     let catalogue = catalogue_set();
-    assert_eq!(catalogue.len(), 23, "Rust catalogue must stay locked at 23");
+    assert_eq!(catalogue.len(), 24, "Rust catalogue must stay locked at 24");
     assert_eq!(
         catalogue, expected_set,
         "Rust catalogue must match the Root, Nested, and active History profile union"

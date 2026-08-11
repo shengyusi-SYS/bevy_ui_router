@@ -26,22 +26,22 @@ use bevy_ui_router_core::{
         BackTargetCoreResumeOutcome, BackTargetDriverFailureConsumeOutcome,
         BackTargetDriverFailureCoreOutcome, BackTargetDriverFailureReportMode,
         BackTargetDriverFailureReportOutcome, BackTargetExecutionOwnerRef,
-        BackTargetExecutionPairingOutcome, BackTargetPermanentBeginOutcome,
-        BackTargetPermanentBeginOwner, BackTargetPermanentBeginPermanentEvidence,
-        BackTargetPermanentCleanupBatchOwner, BackTargetPermanentCleanupCompletionOutcome,
-        BackTargetPermanentCleanupCompletionOwner, BackTargetPermanentCleanupMismatchEvidence,
-        BackTargetPermanentOwner, BackTargetPermanentRequestFailureKind,
-        BackTargetPermanentTerminalFailureKind, BackTargetPermanentTerminalOperation,
-        BackTargetPhysicalOwnerRef, BackTargetPreparationAcceptance, BackTargetStart,
-        BeginAuthoritySettlementErrorKind, CleanupManifest, CleanupManifestView, CommitTicket,
-        EngineAction, EnqueueBackErrorKind, FailedAuthoritySettlementTrigger,
-        FailedAuthorityTriggerError, FailureCleanupRequest, FrameMountTarget,
-        HistoryAdmissionStamp, HistoryAdmissionWorldSeal, HistoryExecutionBindingView, HostLease,
-        IntegrationError, LifecycleContinuationCapacity, MountMutationArtifact, MountReceiptProof,
-        MountRegistrationBeginError, MountRequest, PreparationBoundaryScopeView,
-        PreparationReceiverMismatchView, PrepareBackAdmissionErrorKind,
-        PreparedPostCommitContinuationOwner, ResolveMountOwner, RootFrameTask,
-        RouteFailureContinuationOwner, RouterEngine, TargetAuthoritySettlementOwner,
+        BackTargetExecutionPairingOutcome, BackTargetPendingRejectedConsumeOutcome,
+        BackTargetPermanentBeginOutcome, BackTargetPermanentBeginOwner,
+        BackTargetPermanentBeginPermanentEvidence, BackTargetPermanentCleanupBatchOwner,
+        BackTargetPermanentCleanupCompletionOutcome, BackTargetPermanentCleanupCompletionOwner,
+        BackTargetPermanentCleanupMismatchEvidence, BackTargetPermanentOwner,
+        BackTargetPermanentRequestFailureKind, BackTargetPermanentTerminalFailureKind,
+        BackTargetPermanentTerminalOperation, BackTargetPhysicalOwnerRef,
+        BackTargetPreparationAcceptance, BackTargetStart, BeginAuthoritySettlementErrorKind,
+        CleanupManifest, CleanupManifestView, CommitTicket, EngineAction, EnqueueBackErrorKind,
+        FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError, FailureCleanupRequest,
+        FrameMountTarget, HistoryAdmissionStamp, HistoryAdmissionWorldSeal,
+        HistoryExecutionBindingView, HostLease, IntegrationError, LifecycleContinuationCapacity,
+        MountMutationArtifact, MountReceiptProof, MountRegistrationBeginError, MountRequest,
+        PreparationBoundaryScopeView, PreparationReceiverMismatchView,
+        PrepareBackAdmissionErrorKind, PreparedPostCommitContinuationOwner, ResolveMountOwner,
+        RootFrameTask, RouteFailureContinuationOwner, RouterEngine, TargetAuthoritySettlementOwner,
         VerifiedBackNoTargetCandidate, VerifiedBackResolutionContradiction,
         VerifiedBackResolutionOwnerHandoff, VerifiedBackTargetExecutionOwner, ViewFailureKind,
         ViewReportIdentity,
@@ -97,10 +97,10 @@ use crate::{
     },
     host::{
         HostCandidateClassification, HostCandidateRevisionLatch, HostCandidateRevisionState,
-        ProvisionalHostSettlement, ValidatedHostCandidate, activate_granted_top_slot,
-        classify_host_candidate, retry_provisional_host_settlement,
-        settle_rejected_granted_top_slot, stage_granted_top_slot,
-        validated_host_candidate_is_current,
+        ProvisionalHostSettlement, ValidatedHostCandidate, ValidatedHostCandidateObservation,
+        activate_granted_top_slot, classify_host_candidate, observe_validated_host_candidate,
+        retry_provisional_host_settlement, settle_rejected_granted_top_slot,
+        stage_granted_top_slot, validated_host_candidate_is_current,
     },
     input::{
         PreparedInputGateIsolation, RouteFocusState, RouterInputGate, observed_descendant_closure,
@@ -313,6 +313,10 @@ enum PendingFailedBranchTerminal {
         message: &'static str,
     },
     Request(FailureCleanupRequest),
+    BackTargetPendingRejected {
+        request: FailureCleanupRequest,
+        evidence: LifecyclePreflightEvidence,
+    },
     RegistrationBegin(MountRegistrationBeginError),
 }
 
@@ -324,6 +328,19 @@ pub(crate) struct PendingFailedBranch {
 impl PendingFailedBranch {
     pub(crate) const fn branch(&self) -> &FailedPreparedBranch {
         &self.branch
+    }
+}
+
+#[cfg(test)]
+fn pending_failed_branch_preflight_evidence_for_test(
+    failed: &PendingFailedBranch,
+) -> Option<LifecyclePreflightEvidence> {
+    match &failed.terminal {
+        PendingFailedBranchTerminal::BackTargetPendingRejected { evidence, .. } => Some(*evidence),
+        PendingFailedBranchTerminal::Task { .. }
+        | PendingFailedBranchTerminal::TaskWithPhysicalResidual { .. }
+        | PendingFailedBranchTerminal::Request(_)
+        | PendingFailedBranchTerminal::RegistrationBegin(_) => None,
     }
 }
 
@@ -688,9 +705,34 @@ pub(crate) struct TargetPreparationOwner {
     continuation: LifecycleContinuationCapacity,
 }
 
+pub(crate) struct PendingBackTargetAuthorityProtocol {
+    active: RealizedBranch,
+    pending: PendingCommit,
+    history: HistoryExecutionBindingView,
+    continuation: LifecycleContinuationCapacity,
+    evidence: LifecyclePreflightEvidence,
+    source: BackTargetAuthorityProtocolSourceProjection,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct BackTargetAuthorityProtocolSourceProjection {
+    missing_resources: RequiredResourceSet,
+    host: Option<ProjectionlessHostProjection>,
+    host_candidate: Option<ValidatedHostCandidateObservation>,
+    observed: ProjectionlessObservedProjection,
+    authority_loss: Option<LifecyclePreflightEvidence>,
+}
+
 pub(crate) struct BackTargetClassifiedPhysicalOwner {
     splice: SealedReconciliationSplice,
     history: HistoryExecutionBindingView,
+    authority_preparation: Option<AcceptedBackTargetAuthorityPreparation>,
+}
+
+pub(crate) struct AcceptedBackTargetAuthorityPreparation {
+    physical: FrozenTargetPreparationPermanentPhysicalManifest,
+    ecs_manifest: FrozenCleanupManifest,
+    core_binding: BackTargetPermanentAuthorityManifest,
 }
 
 pub(crate) struct PreparedBackTargetPhysicalOwner {
@@ -739,6 +781,7 @@ pub(crate) struct FrozenTargetPreparationPermanentObservedEntity {
     parent: Option<bevy_ecs::entity::Entity>,
     children: Vec<bevy_ecs::entity::Entity>,
     registry_claim: Option<ExactRegistryClaim>,
+    registry_manifest: Option<ComponentManifest>,
     ownership_seal: Option<RouteOwnershipSeal>,
     manifest: Option<ComponentManifest>,
     frame_lifecycle: Option<FrameLifecycle>,
@@ -796,6 +839,7 @@ pub(crate) struct FrozenTargetPreparationPermanentPhysicalManifest {
     target_observed: Vec<FrozenTargetPreparationPermanentObservedEntity>,
     protected: FrozenTargetPreparationPermanentProtectedClosures,
     allowed_write: FrozenTargetPreparationPermanentAllowedWriteSet,
+    repair_missing_pickable: bool,
 }
 
 pub(crate) struct TargetPreparationPermanentCleanupOwner {
@@ -923,9 +967,16 @@ pub(crate) enum TargetPreparationPermanentInertEvidence {
     AttemptUnavailable(TargetPreparationPermanentSettlementBoundaryEvidence),
     SettlementRejected(TargetPreparationPermanentSettlementBoundaryEvidence),
     PostWriteRefreeze(LifecyclePreflightEvidence),
+    RepairPostWriteRefreeze(TargetPreparationPermanentRepairRefreezeEvidence),
     SettlementPrewriteRefreeze(TargetPreparationPermanentSettlementPrewriteEvidence),
     SettlementPostWriteRefreeze(TargetPreparationPermanentSettlementRefreezeEvidence),
     CompletionPreparationRejected(TargetPreparationPermanentCompletionPreparationEvidence),
+}
+
+pub(crate) struct TargetPreparationPermanentRepairRefreezeEvidence {
+    entity: bevy_ecs::entity::Entity,
+    expected: ProjectionlessObservedProjection,
+    observed: ProjectionlessObservedProjection,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1175,9 +1226,25 @@ pub(crate) enum PendingBackTargetClassification {
         continuation: RouteFailureContinuationOwner,
         evidence: LifecyclePreflightEvidence,
     },
+    PendingRejectedConsumeMismatch {
+        physical: BackTargetClassifiedPhysicalOwner,
+        continuation: RouteFailureContinuationOwner,
+        evidence: LifecyclePreflightEvidence,
+        mismatch: PreparationReceiverMismatchView,
+    },
     AuthorityLostUnaccepted {
         owner: TargetPreparationOwner,
         evidence: LifecyclePreflightEvidence,
+    },
+    AuthorityLostProtocol(PendingBackTargetAuthorityProtocol),
+    AuthorityLostProtocolSourceDrift {
+        protocol: PendingBackTargetAuthorityProtocol,
+        observed: BackTargetAuthorityProtocolSourceProjection,
+    },
+    AuthorityLostPhysicalMismatch {
+        owner: TargetPreparationOwner,
+        evidence: LifecyclePreflightEvidence,
+        mismatch: LifecyclePreflightEvidence,
     },
     AuthorityLostAcceptanceMismatch {
         owner: TargetPreparationOwner,
@@ -1189,6 +1256,12 @@ pub(crate) enum PendingBackTargetClassification {
         settlement: TargetAuthoritySettlementOwner,
         evidence: LifecyclePreflightEvidence,
     },
+    AuthorityLostPreparationMissing {
+        physical: BackTargetClassifiedPhysicalOwner,
+        settlement: TargetAuthoritySettlementOwner,
+        evidence: LifecyclePreflightEvidence,
+    },
+    AuthorityLostDispatchBlocked(BackTargetPermanentDispatchOutcome),
     Retry {
         owner: TargetPreparationOwner,
         evidence: PreparationRetryEvidence,
@@ -4695,7 +4768,14 @@ struct ProjectionlessObservedEntity {
     pickable: Option<(bool, bool)>,
     barrier: Option<crate::components::RouterInputBarrier>,
     registry_claim: Option<ExactRegistryClaim>,
+    registry_manifest: Option<ComponentManifest>,
     gate: Option<(bool, bool, bool)>,
+    ownership_seal: Option<RouteOwnershipSeal>,
+    frame_lifecycle: Option<FrameLifecycle>,
+    child_slot_lifecycle: Option<ChildSlotLifecycle>,
+    child_slot_authority: Option<ChildSlotAuthority>,
+    provisional_slot_lifecycle: Option<ProvisionalSlotLifecycle>,
+    host_registration: Option<(RouterHandle, u64)>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -4915,7 +4995,8 @@ impl RouterEntry {
         if let Some(failed) = self.pending_failed_branch.as_ref() {
             let allowance = failed.branch.mount_new_allowance()?;
             let terminal_is_exact = match &failed.terminal {
-                PendingFailedBranchTerminal::Request(request) => {
+                PendingFailedBranchTerminal::Request(request)
+                | PendingFailedBranchTerminal::BackTargetPendingRejected { request, .. } => {
                     allowance.matches_request(request.request())
                 }
                 PendingFailedBranchTerminal::RegistrationBegin(_) => true,
@@ -8161,7 +8242,11 @@ pub(crate) fn classify_back_target(
             ReconciliationPreparationOutcome::Matched(ReconciliationPreparationDecision::Ready(
                 BackTargetReadyAcceptanceOwner {
                     physical: PreparedBackTargetPhysicalOwner {
-                        classified: BackTargetClassifiedPhysicalOwner { splice, history },
+                        classified: BackTargetClassifiedPhysicalOwner {
+                            splice,
+                            history,
+                            authority_preparation: None,
+                        },
                         focus_leaving,
                     },
                     continuation,
@@ -8274,6 +8359,9 @@ fn observe_target_preparation_permanent_entity(
             .map(|children| children.iter().copied().collect())
             .unwrap_or_default(),
         registry_claim: registry.record(entity).map(|record| record.claim()),
+        registry_manifest: registry
+            .record(entity)
+            .map(|record| record.manifest().clone()),
         ownership_seal: world.get::<RouteOwnershipSeal>(entity).copied(),
         manifest: ComponentManifest::from_world(world, entity),
         frame_lifecycle: world.get::<FrameLifecycle>(entity).copied(),
@@ -8291,6 +8379,7 @@ fn target_preparation_permanent_structure_is_exact(
         && observed.parent == expected.parent
         && observed.children == expected.children
         && observed.registry_claim == expected.registry_claim
+        && observed.registry_manifest == expected.registry_manifest
         && observed.ownership_seal == expected.ownership_seal
         && observed.manifest == expected.manifest
 }
@@ -8373,11 +8462,102 @@ fn target_preparation_permanent_relationship_closure_is_exact(
     })
 }
 
+fn refreeze_back_target_authority_loss(
+    world: &World,
+    entry: &RouterEntry,
+    splice: &SealedReconciliationSplice,
+) -> Option<LifecyclePreflightEvidence> {
+    let entering_boundaries = splice
+        .entering()
+        .claims()
+        .map(ExactRegistryClaim::entity)
+        .collect::<Vec<_>>();
+    let has_leaving =
+        !splice.leaving().frames().is_empty() || !splice.leaving().child_slots().is_empty();
+    let current_loss = if world.get_resource::<RouteEntityRegistry>().is_none() {
+        Some(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::RequiredResources(RequiredResourceSet::ROUTE_ENTITY_REGISTRY),
+            LifecyclePreflightExpectation::ResourcePresent,
+            LifecyclePreflightObserved::Missing,
+        ))
+    } else if entry
+        .host
+        .as_ref()
+        .is_none_or(|host| !current_host_binding_is_exact(world, host))
+    {
+        Some(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::HostBinding,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ))
+    } else if validate_preserved_branch_local(
+        world,
+        splice.preserved(),
+        splice.slot_roles(),
+        &entering_boundaries,
+    )
+    .is_err()
+    {
+        Some(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::PreservedCurrent,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ))
+    } else if has_leaving
+        && validate_leaving_branch_for_splice(world, splice.leaving(), splice.slot_roles()).is_err()
+    {
+        Some(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::LeavingCurrent,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ))
+    } else {
+        None
+    };
+    current_loss.or_else(|| {
+        validate_branch_descendants(world, splice.leaving())
+            .err()
+            .map(|_| {
+                LifecyclePreflightEvidence::new(
+                    LifecyclePreflightSource::LeavingCurrent,
+                    LifecyclePreflightExpectation::ExactRelationshipClosure,
+                    LifecyclePreflightObserved::Drifted,
+                )
+            })
+    })
+}
+
 fn freeze_back_target_preparation_permanent_physical(
     world: &World,
     entry: &RouterEntry,
     splice: &SealedReconciliationSplice,
     continuation: &LifecycleContinuationCapacity,
+) -> Result<FrozenBackTargetPreparationPermanentPhysicalFacts, LifecyclePreflightEvidence> {
+    freeze_back_target_preparation_physical(world, entry, splice, continuation, None)
+}
+
+fn freeze_back_target_authority_lost_physical(
+    world: &World,
+    entry: &RouterEntry,
+    splice: &SealedReconciliationSplice,
+    continuation: &LifecycleContinuationCapacity,
+    expected_evidence: LifecyclePreflightEvidence,
+) -> Result<FrozenBackTargetPreparationPermanentPhysicalFacts, LifecyclePreflightEvidence> {
+    freeze_back_target_preparation_physical(
+        world,
+        entry,
+        splice,
+        continuation,
+        Some(expected_evidence),
+    )
+}
+
+fn freeze_back_target_preparation_physical(
+    world: &World,
+    entry: &RouterEntry,
+    splice: &SealedReconciliationSplice,
+    continuation: &LifecycleContinuationCapacity,
+    authority_loss: Option<LifecyclePreflightEvidence>,
 ) -> Result<FrozenBackTargetPreparationPermanentPhysicalFacts, LifecyclePreflightEvidence> {
     let mismatch = target_preparation_permanent_mismatch;
     if entry.pending_back_target_execution.is_some()
@@ -8441,59 +8621,70 @@ fn freeze_back_target_preparation_permanent_physical(
         ));
     }
 
-    let entering_boundaries = splice
-        .entering()
-        .claims()
-        .map(ExactRegistryClaim::entity)
-        .collect::<Vec<_>>();
-    if validate_preserved_branch_local(
-        world,
-        splice.preserved(),
-        splice.slot_roles(),
-        &entering_boundaries,
-    )
-    .is_err()
-    {
-        return Err(mismatch(
-            LifecyclePreflightSource::PreservedCurrent,
-            LifecyclePreflightExpectation::ExactAuthority,
-            LifecyclePreflightObserved::Drifted,
-        ));
-    }
-    if validate_leaving_branch_for_splice(world, splice.leaving(), splice.slot_roles()).is_err() {
-        return Err(mismatch(
-            LifecyclePreflightSource::LeavingCurrent,
-            LifecyclePreflightExpectation::ExactAuthority,
-            LifecyclePreflightObserved::Drifted,
-        ));
-    }
-    if validate_reconciliation_entering_branch(
-        world,
-        splice.entering(),
-        splice.preserved(),
-        splice.leaving(),
-    )
-    .is_err()
-    {
-        return Err(mismatch(
-            LifecyclePreflightSource::PendingEntering,
-            LifecyclePreflightExpectation::ExactAuthority,
-            LifecyclePreflightObserved::Drifted,
-        ));
-    }
-    if validate_active_branch_for_splice(
-        world,
-        splice.preserved(),
-        splice.entering(),
-        splice.slot_roles(),
-    )
-    .is_err()
-    {
-        return Err(mismatch(
-            LifecyclePreflightSource::CrossRoleRebase,
-            LifecyclePreflightExpectation::RebaseCompatible,
-            LifecyclePreflightObserved::Contradictory,
-        ));
+    if let Some(expected) = authority_loss {
+        if refreeze_back_target_authority_loss(world, entry, splice) != Some(expected) {
+            return Err(mismatch(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ));
+        }
+    } else {
+        let entering_boundaries = splice
+            .entering()
+            .claims()
+            .map(ExactRegistryClaim::entity)
+            .collect::<Vec<_>>();
+        if validate_preserved_branch_local(
+            world,
+            splice.preserved(),
+            splice.slot_roles(),
+            &entering_boundaries,
+        )
+        .is_err()
+        {
+            return Err(mismatch(
+                LifecyclePreflightSource::PreservedCurrent,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ));
+        }
+        if validate_leaving_branch_for_splice(world, splice.leaving(), splice.slot_roles()).is_err()
+        {
+            return Err(mismatch(
+                LifecyclePreflightSource::LeavingCurrent,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ));
+        }
+        if validate_reconciliation_entering_branch(
+            world,
+            splice.entering(),
+            splice.preserved(),
+            splice.leaving(),
+        )
+        .is_err()
+        {
+            return Err(mismatch(
+                LifecyclePreflightSource::PendingEntering,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ));
+        }
+        if validate_active_branch_for_splice(
+            world,
+            splice.preserved(),
+            splice.entering(),
+            splice.slot_roles(),
+        )
+        .is_err()
+        {
+            return Err(mismatch(
+                LifecyclePreflightSource::CrossRoleRebase,
+                LifecyclePreflightExpectation::RebaseCompatible,
+                LifecyclePreflightObserved::Contradictory,
+            ));
+        }
     }
 
     let normal_transitions = splice.lifecycle_transitions();
@@ -8537,15 +8728,23 @@ fn freeze_back_target_preparation_permanent_physical(
         }
     }
     if accepted_roles.iter().any(|(entity, claim)| {
-        *entity == host.host
-            || !host_closure.contains(entity)
-            || !target_preparation_permanent_claim_belongs_to_host(host, claim)
-            || !registered_claim_has_exact_authority_and_manifest_coverage(
+        let target_authority_is_usable = if authority_loss.is_some() {
+            registry
+                .record(*entity)
+                .is_some_and(|record| record.claim() == *claim)
+                && cleanup_claim_has_exact_authority(world, claim)
+        } else {
+            registered_claim_has_exact_authority_and_manifest_coverage(
                 world,
                 registry,
                 claim,
                 *entity == host.top_slot,
             )
+        };
+        *entity == host.host
+            || (authority_loss.is_none() && !host_closure.contains(entity))
+            || !target_preparation_permanent_claim_belongs_to_host(host, claim)
+            || !target_authority_is_usable
     }) {
         return Err(mismatch(
             LifecyclePreflightSource::TargetPartition,
@@ -8555,10 +8754,17 @@ fn freeze_back_target_preparation_permanent_physical(
     }
 
     if normal_transitions.iter().any(|(claim, _)| {
-        accepted_roles.get(&claim.entity()) != Some(claim)
-            || !registered_claim_has_exact_authority_and_manifest_coverage(
+        let target_authority_is_usable = if authority_loss.is_some() {
+            registry
+                .record(claim.entity())
+                .is_some_and(|record| record.claim() == *claim)
+                && cleanup_claim_has_exact_authority(world, claim)
+        } else {
+            registered_claim_has_exact_authority_and_manifest_coverage(
                 world, registry, claim, false,
             )
+        };
+        accepted_roles.get(&claim.entity()) != Some(claim) || !target_authority_is_usable
     }) {
         return Err(mismatch(
             LifecyclePreflightSource::TargetPartition,
@@ -8597,7 +8803,9 @@ fn freeze_back_target_preparation_permanent_physical(
         .map(ExactRegistryClaim::entity)
         .collect::<Vec<_>>();
     if splice_targets.iter().any(|target| {
-        *target == host.host || *target == host.top_slot || !host_closure.contains(target)
+        *target == host.host
+            || *target == host.top_slot
+            || (authority_loss.is_none() && !host_closure.contains(target))
     }) {
         return Err(mismatch(
             LifecyclePreflightSource::TargetPartition,
@@ -8706,24 +8914,25 @@ fn freeze_back_target_preparation_permanent_physical(
         .map(|entity| observe_target_preparation_permanent_entity(world, registry, entity))
         .collect::<Vec<_>>();
 
-    let normal_frozen_manifest = if splice.leaving().obligation_count() == 0 {
-        FrozenCleanupManifest::empty()
-    } else {
-        let Some(manifest) = FrozenCleanupManifest::from_leaving_branch(
-            world,
-            registry,
-            splice.leaving(),
-            normal_registry_plan.resulting_claims(),
-            (!splice.entering().frames().is_empty()).then_some(splice.entering()),
-        ) else {
-            return Err(mismatch(
-                LifecyclePreflightSource::TargetPartition,
-                LifecyclePreflightExpectation::ExactRelationshipClosure,
-                LifecyclePreflightObserved::Contradictory,
-            ));
+    let normal_frozen_manifest =
+        if authority_loss.is_some() || splice.leaving().obligation_count() == 0 {
+            FrozenCleanupManifest::empty()
+        } else {
+            let Some(manifest) = FrozenCleanupManifest::from_leaving_branch(
+                world,
+                registry,
+                splice.leaving(),
+                normal_registry_plan.resulting_claims(),
+                (!splice.entering().frames().is_empty()).then_some(splice.entering()),
+            ) else {
+                return Err(mismatch(
+                    LifecyclePreflightSource::TargetPartition,
+                    LifecyclePreflightExpectation::ExactRelationshipClosure,
+                    LifecyclePreflightObserved::Contradictory,
+                ));
+            };
+            manifest
         };
-        manifest
-    };
     let ecs_manifest = FrozenCleanupManifest::from_target_preparation_permanent(
         world,
         registry,
@@ -8780,11 +8989,123 @@ fn freeze_back_target_preparation_permanent_physical(
                 splice_targets,
                 host_edge,
             },
+            repair_missing_pickable: authority_loss.is_some(),
         },
         normal_frozen_manifest,
         ecs_manifest,
         scope,
     })
+}
+
+fn accept_classified_back_target_authority_lost(
+    world: &World,
+    entry: &mut RouterEntry,
+    owner: TargetPreparationOwner,
+    evidence: LifecyclePreflightEvidence,
+) -> PendingBackTargetClassification {
+    let frozen = match freeze_back_target_authority_lost_physical(
+        world,
+        entry,
+        &owner.splice,
+        &owner.continuation,
+        evidence,
+    ) {
+        Ok(frozen) => frozen,
+        Err(mismatch) => {
+            return PendingBackTargetClassification::AuthorityLostPhysicalMismatch {
+                owner,
+                evidence,
+                mismatch,
+            };
+        }
+    };
+    let FrozenBackTargetPreparationPermanentPhysicalFacts {
+        physical,
+        normal_frozen_manifest: _,
+        ecs_manifest,
+        scope,
+    } = frozen;
+    let TargetPreparationOwner {
+        splice,
+        history,
+        continuation,
+    } = owner;
+    let manifest = CleanupManifest::new(
+        logical_cleanup_roots(splice.leaving()),
+        ecs_manifest.digest(),
+        ecs_manifest.len(),
+    );
+    match entry
+        .engine
+        .accept_back_target_authority_lost(continuation, scope, &manifest)
+    {
+        BackTargetPreparationAcceptance::Matched(settlement) => {
+            PendingBackTargetClassification::AuthorityLost {
+                physical: BackTargetClassifiedPhysicalOwner {
+                    splice,
+                    history,
+                    authority_preparation: Some(AcceptedBackTargetAuthorityPreparation {
+                        physical,
+                        ecs_manifest,
+                        core_binding: BackTargetPermanentAuthorityManifest { cleanup: manifest },
+                    }),
+                },
+                settlement,
+                evidence,
+            }
+        }
+        BackTargetPreparationAcceptance::Mismatch { capacity, mismatch } => {
+            PendingBackTargetClassification::AuthorityLostAcceptanceMismatch {
+                owner: TargetPreparationOwner {
+                    splice,
+                    history,
+                    continuation: capacity,
+                },
+                evidence,
+                mismatch,
+            }
+        }
+    }
+}
+
+fn accept_classified_back_target_pending_rejected(
+    entry: &mut RouterEntry,
+    owner: TargetPreparationOwner,
+    evidence: LifecyclePreflightEvidence,
+) -> PendingBackTargetClassification {
+    let scope = owner.continuation.preparation_boundary_scope();
+    let TargetPreparationOwner {
+        splice,
+        history,
+        continuation,
+    } = owner;
+    match entry
+        .engine
+        .accept_back_target_pending_rejected(continuation, scope)
+    {
+        BackTargetPreparationAcceptance::Matched(continuation) => {
+            PendingBackTargetClassification::PendingRejected {
+                physical: BackTargetClassifiedPhysicalOwner {
+                    splice,
+                    history,
+                    authority_preparation: None,
+                },
+                continuation,
+                evidence,
+            }
+        }
+        BackTargetPreparationAcceptance::Mismatch { capacity, mismatch } => {
+            PendingBackTargetClassification::PendingRejectedAcceptanceMismatch {
+                owner: TargetPreparationOwner {
+                    splice,
+                    history,
+                    continuation: capacity,
+                },
+                evidence,
+                mismatch,
+            }
+        }
+    }
 }
 
 pub(crate) fn prepare_back_target_classifier_permanent(
@@ -8859,7 +9180,11 @@ pub(crate) fn prepare_back_target_classifier_permanent(
     let cleanup = TargetPreparationPermanentCleanupOwner {
         physical,
         branch: FrozenTargetPreparationPermanentBranch::Classifier {
-            physical: BackTargetClassifiedPhysicalOwner { splice, history },
+            physical: BackTargetClassifiedPhysicalOwner {
+                splice,
+                history,
+                authority_preparation: None,
+            },
             evidence,
         },
     };
@@ -8883,7 +9208,12 @@ pub(crate) fn prepare_back_target_classifier_permanent(
                 branch,
             } = cleanup;
             let FrozenTargetPreparationPermanentBranch::Classifier {
-                physical: BackTargetClassifiedPhysicalOwner { splice, history },
+                physical:
+                    BackTargetClassifiedPhysicalOwner {
+                        splice,
+                        history,
+                        authority_preparation: None,
+                    },
                 evidence,
             } = branch
             else {
@@ -9295,6 +9625,16 @@ where
         };
     }
     if validation.allowed_write != disposition.cleanup.physical.allowed_write {
+        return BackTargetPermanentDispatchOutcome::PreparedEntryMismatch {
+            disposition,
+            evidence: target_preparation_permanent_mismatch(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactTaskShape,
+                LifecyclePreflightObserved::Contradictory,
+            ),
+        };
+    }
+    if validation.repair_missing_pickable != disposition.cleanup.physical.repair_missing_pickable {
         return BackTargetPermanentDispatchOutcome::PreparedEntryMismatch {
             disposition,
             evidence: target_preparation_permanent_mismatch(
@@ -10923,9 +11263,14 @@ fn drive_back_target_applied_commit(world: &mut World, entry: &mut RouterEntry) 
         ReconciliationPreparationOutcome::Matched(
             ReconciliationPreparationDecision::AuthorityLost { owner, evidence },
         ) => {
-            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
-                PendingBackTargetClassification::AuthorityLostUnaccepted { owner, evidence },
-            ));
+            let classification =
+                if evidence.is_missing_resource() || evidence.is_host_binding_authority_loss() {
+                    PendingBackTargetClassification::AuthorityLostUnaccepted { owner, evidence }
+                } else {
+                    accept_classified_back_target_authority_lost(world, entry, owner, evidence)
+                };
+            entry.pending_back_target_execution =
+                Some(PendingBackTargetExecution::Classifying(classification));
         }
         ReconciliationPreparationOutcome::Matched(
             ReconciliationPreparationDecision::Permanent(owner),
@@ -10948,8 +11293,551 @@ fn drive_back_target_applied_commit(world: &mut World, entry: &mut RouterEntry) 
     true
 }
 
+fn drive_accepted_back_target_authority_lost(world: &World, entry: &mut RouterEntry) -> bool {
+    if !matches!(
+        entry.pending_back_target_execution.as_ref(),
+        Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::AuthorityLost { .. }
+        ))
+    ) {
+        return false;
+    }
+    let Some(PendingBackTargetExecution::Classifying(
+        PendingBackTargetClassification::AuthorityLost {
+            physical,
+            settlement,
+            evidence,
+        },
+    )) = entry.pending_back_target_execution.take()
+    else {
+        return true;
+    };
+    let BackTargetClassifiedPhysicalOwner {
+        splice,
+        history,
+        authority_preparation,
+    } = physical;
+    let Some(AcceptedBackTargetAuthorityPreparation {
+        physical,
+        ecs_manifest,
+        core_binding,
+    }) = authority_preparation
+    else {
+        entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::AuthorityLostPreparationMissing {
+                physical: BackTargetClassifiedPhysicalOwner {
+                    splice,
+                    history,
+                    authority_preparation: None,
+                },
+                settlement,
+                evidence,
+            },
+        ));
+        return true;
+    };
+    let cleanup = TargetPreparationPermanentCleanupOwner {
+        physical,
+        branch: FrozenTargetPreparationPermanentBranch::Classifier {
+            physical: BackTargetClassifiedPhysicalOwner {
+                splice,
+                history,
+                authority_preparation: None,
+            },
+            evidence: PreparationPermanentEvidence::PhysicalPreparationContradiction(evidence),
+        },
+    };
+    let outcome = dispatch_back_target_permanent(
+        world,
+        entry,
+        TargetPreparationPermanentDisposition {
+            cleanup,
+            settlement,
+            ecs_manifest,
+            core_binding,
+        },
+    );
+    if !matches!(outcome, BackTargetPermanentDispatchOutcome::Dispatched) {
+        entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::AuthorityLostDispatchBlocked(outcome),
+        ));
+    }
+    true
+}
+
+fn store_back_target_authority_protocol(
+    entry: &mut RouterEntry,
+    active: RealizedBranch,
+    pending: PendingCommit,
+    history: HistoryExecutionBindingView,
+    continuation: LifecycleContinuationCapacity,
+    evidence: LifecyclePreflightEvidence,
+    source: BackTargetAuthorityProtocolSourceProjection,
+) {
+    entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+        PendingBackTargetClassification::AuthorityLostProtocol(
+            PendingBackTargetAuthorityProtocol {
+                active,
+                pending,
+                history,
+                continuation,
+                evidence,
+                source,
+            },
+        ),
+    ));
+}
+
+fn observe_back_target_authority_protocol_source(
+    world: &World,
+    entry: &RouterEntry,
+    active: &RealizedBranch,
+    pending: &PendingCommit,
+) -> BackTargetAuthorityProtocolSourceProjection {
+    let missing_resources = RequiredResourceSet::missing_from(world);
+    let authority_loss = if !world.contains_resource::<RouteEntityRegistry>() {
+        Some(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::RequiredResources(RequiredResourceSet::ROUTE_ENTITY_REGISTRY),
+            LifecyclePreflightExpectation::ResourcePresent,
+            LifecyclePreflightObserved::Missing,
+        ))
+    } else if entry
+        .host
+        .as_ref()
+        .is_none_or(|host| !current_host_binding_is_exact(world, host))
+    {
+        Some(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::HostBinding,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ))
+    } else {
+        None
+    };
+    let host = entry.host.as_ref().map(ProjectionlessHostProjection::from);
+    let host_candidate = entry
+        .host
+        .as_ref()
+        .map(|host| observe_validated_host_candidate(world, &host.candidate));
+    let mut roots = active
+        .claims()
+        .chain(pending.branch.as_realized().claims())
+        .map(ExactRegistryClaim::entity)
+        .collect::<Vec<_>>();
+    if let Some(host) = entry.host.as_ref() {
+        roots.push(host.host);
+        roots.push(host.top_slot);
+    }
+    roots.sort_by_key(|entity| entity.to_bits());
+    roots.dedup();
+    BackTargetAuthorityProtocolSourceProjection {
+        missing_resources,
+        host,
+        host_candidate,
+        observed: ProjectionlessObservedProjection::capture(world, roots),
+        authority_loss,
+    }
+}
+
+fn drive_back_target_authority_protocol(world: &mut World, entry: &mut RouterEntry) -> bool {
+    if matches!(
+        entry.pending_back_target_execution.as_ref(),
+        Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::AuthorityLostUnaccepted { .. }
+        ))
+    ) {
+        let Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::AuthorityLostUnaccepted { owner, evidence },
+        )) = entry.pending_back_target_execution.take()
+        else {
+            return true;
+        };
+        if !evidence.is_missing_resource() && !evidence.is_host_binding_authority_loss() {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::AuthorityLostUnaccepted { owner, evidence },
+            ));
+            return true;
+        }
+        let Some(mut pending) = entry.pending_commit.take() else {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::AuthorityLostUnaccepted { owner, evidence },
+            ));
+            return true;
+        };
+        let TargetPreparationOwner {
+            splice,
+            history,
+            continuation,
+        } = owner;
+        let (active, entering, _roles) = splice.reject().into_parts();
+        pending.branch = entering;
+        let source = observe_back_target_authority_protocol_source(world, entry, &active, &pending);
+        if source.authority_loss != Some(evidence) {
+            let protocol = PendingBackTargetAuthorityProtocol {
+                active,
+                pending,
+                history,
+                continuation,
+                evidence,
+                source: BackTargetAuthorityProtocolSourceProjection {
+                    authority_loss: Some(evidence),
+                    ..source.clone()
+                },
+            };
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::AuthorityLostProtocolSourceDrift {
+                    protocol,
+                    observed: source,
+                },
+            ));
+            return true;
+        }
+        store_back_target_authority_protocol(
+            entry,
+            active,
+            pending,
+            history,
+            continuation,
+            evidence,
+            source,
+        );
+    }
+
+    if !matches!(
+        entry.pending_back_target_execution.as_ref(),
+        Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::AuthorityLostProtocol(_)
+        ))
+    ) {
+        return false;
+    }
+    let Some(pending_execution) = entry.pending_back_target_execution.take() else {
+        return false;
+    };
+    let protocol = match pending_execution {
+        PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::AuthorityLostProtocol(protocol),
+        ) => protocol,
+        other => {
+            entry.pending_back_target_execution = Some(other);
+            return false;
+        }
+    };
+    let observed = observe_back_target_authority_protocol_source(
+        world,
+        entry,
+        &protocol.active,
+        &protocol.pending,
+    );
+    if observed != protocol.source {
+        entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::AuthorityLostProtocolSourceDrift {
+                protocol,
+                observed,
+            },
+        ));
+        return true;
+    }
+    let PendingBackTargetAuthorityProtocol {
+        active,
+        pending,
+        history,
+        continuation,
+        evidence,
+        source,
+    } = protocol;
+
+    if evidence.is_missing_resource() {
+        match fail_closed_normal_owner_protocol(
+            world,
+            entry,
+            active,
+            pending,
+            AuthorityProtocolResidualKind::PreflightAuthorityLost(evidence),
+        ) {
+            Ok(()) => {
+                drop(history);
+                drop(continuation);
+            }
+            Err((active, pending)) => store_back_target_authority_protocol(
+                entry,
+                active,
+                pending,
+                history,
+                continuation,
+                evidence,
+                source,
+            ),
+        }
+        return true;
+    }
+
+    if !evidence.is_host_binding_authority_loss() {
+        store_back_target_authority_protocol(
+            entry,
+            active,
+            pending,
+            history,
+            continuation,
+            evidence,
+            source,
+        );
+        return true;
+    }
+
+    match begin_authority_settlement(world, entry, active, pending) {
+        AuthoritySettlementBeginOutcome::Begun => {
+            drop(history);
+            drop(continuation);
+        }
+        AuthoritySettlementBeginOutcome::RetryablePreparation { active, pending } => {
+            store_back_target_authority_protocol(
+                entry,
+                active,
+                pending,
+                history,
+                continuation,
+                evidence,
+                source,
+            );
+        }
+        AuthoritySettlementBeginOutcome::ProtocolContradiction {
+            active,
+            pending,
+            kind,
+        } => match fail_closed_normal_authority_protocol(world, entry, active, pending, kind) {
+            Ok(()) => {
+                drop(history);
+                drop(continuation);
+            }
+            Err((active, pending)) => store_back_target_authority_protocol(
+                entry,
+                active,
+                pending,
+                history,
+                continuation,
+                evidence,
+                source,
+            ),
+        },
+        AuthoritySettlementBeginOutcome::IsolationContradiction {
+            active,
+            pending,
+            contradiction,
+            isolation,
+        } => match fail_closed_normal_authority_protocol_prepared(
+            world,
+            entry,
+            active,
+            pending,
+            AuthorityProtocolResidualKind::AuthorityIsolation(contradiction.clone()),
+            isolation,
+            Some(contradiction),
+        ) {
+            Ok(()) => {
+                drop(history);
+                drop(continuation);
+            }
+            Err((active, pending)) => store_back_target_authority_protocol(
+                entry,
+                active,
+                pending,
+                history,
+                continuation,
+                evidence,
+                source,
+            ),
+        },
+        AuthoritySettlementBeginOutcome::LedgerContradiction {
+            active,
+            pending,
+            kind,
+        } => match fail_closed_normal_owner_protocol(
+            world,
+            entry,
+            active,
+            pending,
+            AuthorityProtocolResidualKind::CleanupLedger(kind),
+        ) {
+            Ok(()) => {
+                drop(history);
+                drop(continuation);
+            }
+            Err((active, pending)) => store_back_target_authority_protocol(
+                entry,
+                active,
+                pending,
+                history,
+                continuation,
+                evidence,
+                source,
+            ),
+        },
+    }
+    true
+}
+
+fn drive_back_target_pending_rejected(entry: &mut RouterEntry) -> bool {
+    if matches!(
+        entry.pending_back_target_execution.as_ref(),
+        Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::PendingRejectedUnaccepted { .. }
+        ))
+    ) {
+        let Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::PendingRejectedUnaccepted { owner, evidence },
+        )) = entry.pending_back_target_execution.take()
+        else {
+            return true;
+        };
+        let classification = accept_classified_back_target_pending_rejected(entry, owner, evidence);
+        let matched = matches!(
+            classification,
+            PendingBackTargetClassification::PendingRejected { .. }
+        );
+        entry.pending_back_target_execution =
+            Some(PendingBackTargetExecution::Classifying(classification));
+        if !matched {
+            return true;
+        }
+    }
+    let Some(PendingBackTargetExecution::Classifying(
+        PendingBackTargetClassification::PendingRejected { physical, .. },
+    )) = entry.pending_back_target_execution.as_ref()
+    else {
+        return false;
+    };
+    let pending_is_exact = entry.pending_commit.as_ref().is_some_and(|pending| {
+        pending.ticket.is_some()
+            && pending.final_task.is_none()
+            && pending.branch.frames().is_empty()
+            && pending.branch.child_slots().is_empty()
+    });
+    if physical.authority_preparation.is_some()
+        || !pending_is_exact
+        || entry.active.is_some()
+        || entry.pending_failed_branch.is_some()
+        || entry.pending_back_target_permanent_cleanup.is_some()
+        || entry.cleanup_ledger.is_some()
+        || entry.authority_protocol_residual.is_some()
+        || entry.pending_back_no_target_completion.is_some()
+        || entry.pending_back_no_target_preparation.is_some()
+        || entry.pending_back_no_target_authority_cleanup.is_some()
+    {
+        return true;
+    }
+    let Some(PendingBackTargetExecution::Classifying(
+        PendingBackTargetClassification::PendingRejected {
+            physical,
+            continuation,
+            evidence,
+        },
+    )) = entry.pending_back_target_execution.take()
+    else {
+        return true;
+    };
+    let BackTargetClassifiedPhysicalOwner {
+        splice,
+        history,
+        authority_preparation,
+    } = physical;
+    if let Some(authority_preparation) = authority_preparation {
+        entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::PendingRejected {
+                physical: BackTargetClassifiedPhysicalOwner {
+                    splice,
+                    history,
+                    authority_preparation: Some(authority_preparation),
+                },
+                continuation,
+                evidence,
+            },
+        ));
+        return true;
+    }
+    let Some(mut pending) = entry.pending_commit.take() else {
+        entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::PendingRejected {
+                physical: BackTargetClassifiedPhysicalOwner {
+                    splice,
+                    history,
+                    authority_preparation: None,
+                },
+                continuation,
+                evidence,
+            },
+        ));
+        return true;
+    };
+    let Some(ticket) = pending.ticket.take() else {
+        entry.pending_commit = Some(pending);
+        entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::PendingRejected {
+                physical: BackTargetClassifiedPhysicalOwner {
+                    splice,
+                    history,
+                    authority_preparation: None,
+                },
+                continuation,
+                evidence,
+            },
+        ));
+        return true;
+    };
+    match entry
+        .engine
+        .consume_back_target_pending_rejected(continuation, ticket)
+    {
+        BackTargetPendingRejectedConsumeOutcome::FailureCleanup(request) => {
+            drop(history);
+            let (active, entering, _roles) = splice.reject().into_parts();
+            entry.active = Some(active);
+            pending.branch = entering;
+            entry.pending_failed_branch = Some(PendingFailedBranch {
+                terminal: PendingFailedBranchTerminal::BackTargetPendingRejected {
+                    request,
+                    evidence,
+                },
+                branch: failed_prepared_branch(pending, None),
+            });
+        }
+        BackTargetPendingRejectedConsumeOutcome::Mismatch {
+            owner,
+            ticket,
+            mismatch,
+        } => {
+            pending.ticket = Some(ticket);
+            entry.pending_commit = Some(pending);
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::PendingRejectedConsumeMismatch {
+                    physical: BackTargetClassifiedPhysicalOwner {
+                        splice,
+                        history,
+                        authority_preparation: None,
+                    },
+                    continuation: owner,
+                    evidence,
+                    mismatch,
+                },
+            ));
+        }
+    }
+    true
+}
+
 fn drive_back_target_root_commit(world: &mut World, entry: &mut RouterEntry) -> bool {
     if drive_back_target_applied_commit(world, entry) {
+        let _ = drive_back_target_authority_protocol(world, entry);
+        let _ = drive_accepted_back_target_authority_lost(world, entry);
+        return true;
+    }
+    if drive_back_target_authority_protocol(world, entry) {
+        return true;
+    }
+    if drive_accepted_back_target_authority_lost(world, entry) {
+        return true;
+    }
+    if drive_back_target_pending_rejected(entry) {
         return true;
     }
     if !matches!(
@@ -12124,6 +13012,7 @@ struct PreparedAuthorityEntityIsolation {
     entity: bevy_ecs::entity::Entity,
     visibility: bool,
     pickable: bool,
+    insert_pickable: bool,
     barrier: bool,
 }
 
@@ -12289,6 +13178,7 @@ fn prepare_authority_isolation_targets<'a>(
                     entity,
                     visibility,
                     pickable,
+                    insert_pickable: false,
                     barrier,
                 },
             )
@@ -12331,6 +13221,117 @@ fn prepare_authority_isolation_targets<'a>(
             fail_closed: prepared,
         }
     }
+}
+
+fn target_authority_missing_pickable_repair_is_exact(
+    world: &World,
+    registry: &RouteEntityRegistry,
+    validation: &FrozenTargetPreparationPermanentPhysicalManifest,
+    entity: bevy_ecs::entity::Entity,
+) -> bool {
+    if !validation.repair_missing_pickable {
+        return false;
+    }
+    let Some(frozen) = validation
+        .target_observed
+        .iter()
+        .find(|observed| observed.entity == entity)
+    else {
+        return false;
+    };
+    let Some(record) = registry.record(entity) else {
+        return false;
+    };
+    let Some(actual) = ComponentManifest::from_world(world, entity) else {
+        return false;
+    };
+    let Some(frozen_actual) = frozen.manifest.as_ref() else {
+        return false;
+    };
+    let Some(pickable) = world.components().component_id::<Pickable>() else {
+        return false;
+    };
+    let projected_without_pickable = ComponentManifest::new(
+        record
+            .manifest()
+            .component_ids()
+            .iter()
+            .copied()
+            .filter(|component| *component != pickable),
+    );
+    frozen.registry_claim.as_ref() == Some(&record.claim())
+        && cleanup_claim_has_exact_authority(world, &record.claim())
+        && frozen.ownership_seal == Some(RouteOwnershipSeal::new(record.claim().seal()))
+        && actual == *frozen_actual
+        && !actual.component_ids().contains(&pickable)
+        && record.manifest().component_ids().contains(&pickable)
+        && actual == projected_without_pickable
+}
+
+fn prepare_target_preparation_permanent_isolation<'a>(
+    world: &World,
+    stored_claims: impl IntoIterator<Item = &'a ExactRegistryClaim>,
+    gate_targets: impl IntoIterator<Item = bevy_ecs::entity::Entity>,
+    capacity_probe: usize,
+    validation: &FrozenTargetPreparationPermanentPhysicalManifest,
+) -> AuthorityIsolationPreparation {
+    let prepared =
+        prepare_authority_isolation_targets(world, stored_claims, gate_targets, capacity_probe);
+    let AuthorityIsolationPreparation::PermanentContradiction {
+        contradiction,
+        mut fail_closed,
+    } = prepared
+    else {
+        return prepared;
+    };
+    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+        return AuthorityIsolationPreparation::PermanentContradiction {
+            contradiction,
+            fail_closed,
+        };
+    };
+    if contradiction.violations.is_empty()
+        || contradiction.violations.iter().any(|violation| {
+            violation.component != AuthorityIsolationComponent::Pickable
+                || violation.predicate != AuthorityIsolationPredicate::PresentForIgnoreWrite
+                || !target_authority_missing_pickable_repair_is_exact(
+                    world,
+                    registry,
+                    validation,
+                    violation.entity,
+                )
+        })
+    {
+        return AuthorityIsolationPreparation::PermanentContradiction {
+            contradiction,
+            fail_closed,
+        };
+    }
+    for violation in contradiction.violations {
+        if let Some(entity) = fail_closed
+            .entities
+            .iter_mut()
+            .find(|entity| entity.entity == violation.entity)
+        {
+            entity.insert_pickable = true;
+            continue;
+        }
+        if try_push(
+            &mut fail_closed.entities,
+            PreparedAuthorityEntityIsolation {
+                entity: violation.entity,
+                visibility: false,
+                pickable: false,
+                insert_pickable: true,
+                barrier: false,
+            },
+        )
+        .is_err()
+        {
+            return AuthorityIsolationPreparation::RetryableCapacity;
+        }
+    }
+    AuthorityIsolationPreparation::Ready(fail_closed)
 }
 
 fn prepare_normal_authority_isolation(
@@ -12854,6 +13855,9 @@ impl ProjectionlessObservedProjection {
                 registry_claim: registry
                     .and_then(|registry| registry.record(entity))
                     .map(|record| record.claim()),
+                registry_manifest: registry
+                    .and_then(|registry| registry.record(entity))
+                    .map(|record| record.manifest().clone()),
                 gate: gate.map(|gate| {
                     (
                         gate.allows_pointer(entity),
@@ -12861,6 +13865,14 @@ impl ProjectionlessObservedProjection {
                         gate.allows_gamepad(entity),
                     )
                 }),
+                ownership_seal: world.get::<RouteOwnershipSeal>(entity).copied(),
+                frame_lifecycle: world.get::<FrameLifecycle>(entity).copied(),
+                child_slot_lifecycle: world.get::<ChildSlotLifecycle>(entity).copied(),
+                child_slot_authority: world.get::<ChildSlotAuthority>(entity).cloned(),
+                provisional_slot_lifecycle: world.get::<ProvisionalSlotLifecycle>(entity).copied(),
+                host_registration: world
+                    .get::<crate::app_ext::RouterHostRegistration>(entity)
+                    .map(|registration| (registration.router(), registration.incarnation())),
             })
             .collect();
         Self {
@@ -14165,7 +15177,10 @@ fn failed_authority_logical_roots(
     manifest: &FrozenCleanupManifest,
 ) -> Vec<RouteFrameVersion> {
     match &failed.terminal {
-        PendingFailedBranchTerminal::Request(request) => request.logical_roots().to_vec(),
+        PendingFailedBranchTerminal::Request(request)
+        | PendingFailedBranchTerminal::BackTargetPendingRejected { request, .. } => {
+            request.logical_roots().to_vec()
+        }
         PendingFailedBranchTerminal::RegistrationBegin(_) => {
             failed_branch_logical_roots(&failed.branch)
         }
@@ -14206,7 +15221,8 @@ fn mint_failed_authority_trigger(
         | PendingFailedBranchTerminal::TaskWithPhysicalResidual { task, .. } => {
             engine.failed_authority_trigger_for_task(task)
         }
-        PendingFailedBranchTerminal::Request(request) => {
+        PendingFailedBranchTerminal::Request(request)
+        | PendingFailedBranchTerminal::BackTargetPendingRejected { request, .. } => {
             engine.failed_authority_trigger_for_cleanup(request)
         }
         PendingFailedBranchTerminal::RegistrationBegin(error) => {
@@ -14955,12 +15971,31 @@ struct PreparedTargetPreparationPermanentCurrentIsolation {
     rebind: PreparedPermanentIsolationClaimRebind,
     physical: PreparedTargetPreparationPermanentPhysicalMutation,
     isolation: PreparedAuthorityIsolation,
+    pickable_repairs: Vec<PreparedTargetPreparationPermanentPickableRepair>,
     projected_claims: Vec<ExactRegistryClaim>,
     expected_validation: FrozenTargetPreparationPermanentPhysicalManifest,
     expected_gate: Option<Vec<(bevy_ecs::entity::Entity, bool)>>,
     expected_input_focus: Option<Option<bevy_ecs::entity::Entity>>,
     expected_route_focus: Option<Option<bevy_ecs::entity::Entity>>,
     expected_top_slot_claim: ExactRegistryClaim,
+}
+
+struct PreparedTargetPreparationPermanentPickableRepair {
+    entity: bevy_ecs::entity::Entity,
+    expected_validation: FrozenTargetPreparationPermanentPhysicalManifest,
+    roots: Vec<bevy_ecs::entity::Entity>,
+    expected_input: ProjectionlessObservedProjection,
+}
+
+enum TargetPreparationPermanentCurrentIsolationApplyError {
+    Physical {
+        evidence: LifecyclePreflightEvidence,
+        validation: FrozenTargetPreparationPermanentPhysicalManifest,
+    },
+    Repair {
+        evidence: TargetPreparationPermanentRepairRefreezeEvidence,
+        validation: FrozenTargetPreparationPermanentPhysicalManifest,
+    },
 }
 
 struct AppliedTargetPreparationPermanentCurrentIsolation {
@@ -15052,6 +16087,8 @@ fn prepare_target_preparation_permanent_physical_mutation(
 fn target_preparation_permanent_expected_isolated_validation(
     source: &FrozenTargetPreparationPermanentPhysicalManifest,
     projected_claims: &[ExactRegistryClaim],
+    inserted_pickable: &[bevy_ecs::entity::Entity],
+    pickable_component: Option<bevy_ecs::component::ComponentId>,
 ) -> Option<FrozenTargetPreparationPermanentPhysicalManifest> {
     let mut expected = source.clone();
     for observed in &mut expected.target_observed {
@@ -15060,6 +16097,20 @@ fn target_preparation_permanent_expected_isolated_validation(
             .find(|claim| claim.entity() == observed.entity)?
             .clone();
         observed.registry_claim = Some(projected.clone());
+        if inserted_pickable.contains(&observed.entity) {
+            let pickable = pickable_component?;
+            let manifest = observed.manifest.take()?;
+            if manifest.component_ids().contains(&pickable) {
+                return None;
+            }
+            observed.manifest = Some(ComponentManifest::new(
+                manifest
+                    .component_ids()
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(pickable)),
+            ));
+        }
         if projected.lifecycle() != EntityLifecycle::Leaving {
             continue;
         }
@@ -15081,6 +16132,57 @@ fn target_preparation_permanent_expected_isolated_validation(
         }
     }
     Some(expected)
+}
+
+fn target_preparation_permanent_expected_pickable_repair_validation(
+    source: &FrozenTargetPreparationPermanentPhysicalManifest,
+    entity: bevy_ecs::entity::Entity,
+    pickable: bevy_ecs::component::ComponentId,
+) -> Option<FrozenTargetPreparationPermanentPhysicalManifest> {
+    let mut expected = source.clone();
+    let observed = expected
+        .target_observed
+        .iter_mut()
+        .find(|observed| observed.entity == entity)?;
+    let manifest = observed.manifest.take()?;
+    if manifest.component_ids().contains(&pickable) {
+        return None;
+    }
+    observed.manifest = Some(ComponentManifest::new(
+        manifest
+            .component_ids()
+            .iter()
+            .copied()
+            .chain(std::iter::once(pickable)),
+    ));
+    Some(expected)
+}
+
+fn target_preparation_permanent_expected_pickable_repair_input(
+    mut source: ProjectionlessObservedProjection,
+    entity: bevy_ecs::entity::Entity,
+    pickable: bevy_ecs::component::ComponentId,
+) -> Option<ProjectionlessObservedProjection> {
+    let observed = source
+        .entities
+        .iter_mut()
+        .find(|observed| observed.entity == entity)?;
+    let manifest = observed.manifest.take()?;
+    if manifest.component_ids().contains(&pickable) || observed.pickable.is_some() {
+        return None;
+    }
+    observed.manifest = Some(ComponentManifest::new(
+        manifest
+            .component_ids()
+            .iter()
+            .copied()
+            .chain(std::iter::once(pickable)),
+    ));
+    observed.pickable = Some((
+        bevy_picking::Pickable::IGNORE.should_block_lower,
+        bevy_picking::Pickable::IGNORE.is_hoverable,
+    ));
+    Some(source)
 }
 
 fn target_preparation_permanent_physical_error() -> LifecyclePreflightEvidence {
@@ -15142,9 +16244,6 @@ fn prepare_target_preparation_permanent_current_isolation(
     let physical =
         prepare_target_preparation_permanent_physical_mutation(validation, &projected_claims)
             .ok_or_else(target_preparation_permanent_physical_error)?;
-    let expected_validation =
-        target_preparation_permanent_expected_isolated_validation(validation, &projected_claims)
-            .ok_or_else(target_preparation_permanent_physical_error)?;
     let expected_top_slot_claim = projected_claims
         .iter()
         .find(|claim| claim.entity() == retired_host.top_slot)
@@ -15152,7 +16251,7 @@ fn prepare_target_preparation_permanent_current_isolation(
         .cloned()
         .ok_or_else(target_preparation_permanent_physical_error)?;
     let current_interactive = splice.current_interactive_entities();
-    let isolation = match prepare_authority_isolation_targets(
+    let mut isolation = match prepare_target_preparation_permanent_isolation(
         world,
         validation
             .target_observed
@@ -15160,6 +16259,7 @@ fn prepare_target_preparation_permanent_current_isolation(
             .filter_map(|observed| observed.registry_claim.as_ref()),
         current_interactive.iter().copied(),
         validation.target_observed.len(),
+        validation,
     ) {
         AuthorityIsolationPreparation::Ready(prepared) => prepared,
         AuthorityIsolationPreparation::RetryableCapacity
@@ -15167,6 +16267,67 @@ fn prepare_target_preparation_permanent_current_isolation(
             return Err(target_preparation_permanent_physical_error());
         }
     };
+    let mut inserted_pickable = isolation
+        .entities
+        .iter()
+        .filter(|entity| entity.insert_pickable)
+        .map(|entity| entity.entity)
+        .collect::<Vec<_>>();
+    inserted_pickable.sort_by_key(|entity| entity.to_bits());
+    let pickable_component = world
+        .components()
+        .component_id::<Pickable>()
+        .ok_or_else(target_preparation_permanent_physical_error)?;
+    let mut pickable_repairs = Vec::new();
+    pickable_repairs
+        .try_reserve_exact(inserted_pickable.len())
+        .map_err(|_| target_preparation_permanent_physical_error())?;
+    let mut repair_roots = validation
+        .target_observed
+        .iter()
+        .map(|observed| observed.entity)
+        .chain(validation.protected.roots.iter().copied())
+        .chain([
+            validation.allowed_write.host_edge.host,
+            validation.allowed_write.host_edge.top_slot,
+        ])
+        .collect::<Vec<_>>();
+    repair_roots.sort_by_key(|entity| entity.to_bits());
+    repair_roots.dedup();
+    let mut repair_input = ProjectionlessObservedProjection::capture(world, repair_roots.clone());
+    let mut repair_validation = validation.clone();
+    for entity in &inserted_pickable {
+        repair_validation = target_preparation_permanent_expected_pickable_repair_validation(
+            &repair_validation,
+            *entity,
+            pickable_component,
+        )
+        .ok_or_else(target_preparation_permanent_physical_error)?;
+        repair_input = target_preparation_permanent_expected_pickable_repair_input(
+            repair_input,
+            *entity,
+            pickable_component,
+        )
+        .ok_or_else(target_preparation_permanent_physical_error)?;
+        pickable_repairs.push(PreparedTargetPreparationPermanentPickableRepair {
+            entity: *entity,
+            expected_validation: repair_validation.clone(),
+            roots: repair_roots.clone(),
+            expected_input: repair_input.clone(),
+        });
+    }
+    for entity in &mut isolation.entities {
+        if entity.insert_pickable {
+            entity.insert_pickable = false;
+        }
+    }
+    let expected_validation = target_preparation_permanent_expected_isolated_validation(
+        validation,
+        &projected_claims,
+        &inserted_pickable,
+        Some(pickable_component),
+    )
+    .ok_or_else(target_preparation_permanent_physical_error)?;
     let expected_gate = Some({
         world
             .iter_entities()
@@ -15194,6 +16355,7 @@ fn prepare_target_preparation_permanent_current_isolation(
         rebind,
         physical,
         isolation,
+        pickable_repairs,
         projected_claims,
         expected_validation,
         expected_gate,
@@ -15209,12 +16371,16 @@ impl PreparedTargetPreparationPermanentCurrentIsolation {
         world: &mut World,
         cleanup: &mut TargetPreparationPermanentCleanupOwner,
         retired_host: &mut RetiredHostBinding,
-    ) -> AppliedTargetPreparationPermanentCurrentIsolation {
+    ) -> Result<
+        AppliedTargetPreparationPermanentCurrentIsolation,
+        TargetPreparationPermanentCurrentIsolationApplyError,
+    > {
         let Self {
             registry,
             rebind,
             physical,
             isolation,
+            pickable_repairs,
             projected_claims,
             expected_validation,
             expected_gate,
@@ -15222,19 +16388,49 @@ impl PreparedTargetPreparationPermanentCurrentIsolation {
             expected_route_focus,
             expected_top_slot_claim,
         } = self;
+        for repair in pickable_repairs {
+            world
+                .entity_mut(repair.entity)
+                .insert(bevy_picking::Pickable::IGNORE);
+            world.flush();
+            let observed_input =
+                ProjectionlessObservedProjection::capture(world, repair.roots.clone());
+            if observed_input != repair.expected_input {
+                return Err(
+                    TargetPreparationPermanentCurrentIsolationApplyError::Repair {
+                        evidence: TargetPreparationPermanentRepairRefreezeEvidence {
+                            entity: repair.entity,
+                            expected: repair.expected_input,
+                            observed: observed_input,
+                        },
+                        validation: repair.expected_validation,
+                    },
+                );
+            }
+            if let Err(evidence) =
+                target_preparation_permanent_prewrite_refreeze(world, &repair.expected_validation)
+            {
+                return Err(
+                    TargetPreparationPermanentCurrentIsolationApplyError::Physical {
+                        evidence,
+                        validation: repair.expected_validation,
+                    },
+                );
+            }
+        }
         registry.apply(&mut world.resource_mut::<RouteEntityRegistry>());
         physical.apply(world);
         isolation.apply(world);
         target_preparation_permanent_splice_mut(cleanup)
             .apply_permanent_isolation_claim_rebind(rebind);
         retired_host.top_slot_claim = expected_top_slot_claim;
-        AppliedTargetPreparationPermanentCurrentIsolation {
+        Ok(AppliedTargetPreparationPermanentCurrentIsolation {
             projected_claims,
             expected_validation,
             expected_gate,
             expected_input_focus,
             expected_route_focus,
-        }
+        })
     }
 }
 
@@ -16147,7 +17343,43 @@ fn drive_target_preparation_permanent_cleanup(world: &mut World, entry: &mut Rou
     } = current;
     let mut cleanup = cleanup;
     let mut retired_host = retired_host;
-    let applied = prepared.apply(world, &mut cleanup, &mut retired_host);
+    let applied = match prepared.apply(world, &mut cleanup, &mut retired_host) {
+        Ok(applied) => applied,
+        Err(error) => {
+            let (validation, inert) = match error {
+                TargetPreparationPermanentCurrentIsolationApplyError::Physical {
+                    evidence,
+                    validation,
+                } => (
+                    validation,
+                    TargetPreparationPermanentInertEvidence::PostWriteRefreeze(evidence),
+                ),
+                TargetPreparationPermanentCurrentIsolationApplyError::Repair {
+                    evidence,
+                    validation,
+                } => (
+                    validation,
+                    TargetPreparationPermanentInertEvidence::RepairPostWriteRefreeze(evidence),
+                ),
+            };
+            entry.pending_back_target_permanent_cleanup =
+                Some(PendingTargetPreparationPermanentCleanup::Installed(
+                    InstalledTargetPreparationPermanentCleanup {
+                        cleanup,
+                        ledger: TargetPreparationPermanentLedgerHolder::Active(
+                            ActiveTargetPreparationPermanentLedger::Current(
+                                CurrentTargetPreparationPermanentLedger { ledger, validation },
+                            ),
+                        ),
+                        batch,
+                        retired_host,
+                        inert: Some(inert),
+                    },
+                ));
+            return true;
+        }
+    };
+    world.flush();
     #[cfg(test)]
     if let Some(drift) = world.remove_resource::<TargetPreparationPermanentPostWriteDrift>() {
         *world
@@ -16227,7 +17459,8 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                         PendingFailedBranchTerminal::RegistrationBegin(error) => {
                             error.validate_rejection(&entry.engine).is_ok()
                         }
-                        PendingFailedBranchTerminal::Request(_) => true,
+                        PendingFailedBranchTerminal::Request(_)
+                        | PendingFailedBranchTerminal::BackTargetPendingRejected { .. } => true,
                     };
                     if !terminal_is_current {
                         entry.pending_failed_branch = Some(failed);
@@ -16411,14 +17644,14 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                         },
                     };
                     let PendingFailedBranch { terminal, branch } = failed;
-                    let request = match terminal {
+                    let (request, preflight_evidence) = match terminal {
                         PendingFailedBranchTerminal::Task {
                             task,
                             failure,
                             message,
                         } => {
                             match entry.engine.report_failed(task, failure, message) {
-                                Ok(Some(request)) => request,
+                                Ok(Some(request)) => (request, None),
                                 Ok(None) if obligation_count == 0 => continue,
                                 Ok(None) | Err(_) => {
                                     unreachable!(
@@ -16431,16 +17664,23 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                             task,
                             failure,
                             message,
-                        } => entry
-                            .engine
-                            .report_failed_with_physical_residual(task, failure, message)
-                            .expect(
-                                "an exact isolated physical residual retains its report task",
-                            ),
-                        PendingFailedBranchTerminal::Request(request) => request,
+                        } => (
+                            entry
+                                .engine
+                                .report_failed_with_physical_residual(task, failure, message)
+                                .expect(
+                                    "an exact isolated physical residual retains its report task",
+                                ),
+                            None,
+                        ),
+                        PendingFailedBranchTerminal::Request(request) => (request, None),
+                        PendingFailedBranchTerminal::BackTargetPendingRejected {
+                            request,
+                            evidence,
+                        } => (request, Some(evidence)),
                         PendingFailedBranchTerminal::RegistrationBegin(error) => {
                             match error.reject(&mut entry.engine) {
-                                Ok(request) => request,
+                                Ok(request) => (request, None),
                                 Err(error) => {
                                     entry.pending_failed_branch = Some(PendingFailedBranch {
                                         terminal: PendingFailedBranchTerminal::RegistrationBegin(
@@ -16464,16 +17704,27 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                     ) {
                         Ok(cleanup) => cleanup,
                         Err(error) => {
+                            let request = error.into_owner();
+                            let terminal = match preflight_evidence {
+                                Some(evidence) => {
+                                    PendingFailedBranchTerminal::BackTargetPendingRejected {
+                                        request,
+                                        evidence,
+                                    }
+                                }
+                                None => PendingFailedBranchTerminal::Request(request),
+                            };
                             entry.pending_failed_branch = Some(PendingFailedBranch {
-                                terminal: PendingFailedBranchTerminal::Request(error.into_owner()),
+                                terminal,
                                 branch,
                             });
                             continue;
                         }
                     };
-                    entry.cleanup_ledger = Some(CleanupLedger::activate_failed(
+                    entry.cleanup_ledger = Some(CleanupLedger::activate_failed_with_preflight(
                         reserved.bind_batch(cleanup),
                         branch,
+                        preflight_evidence,
                     ));
                 }
                 let Some(mut ledger) = entry.cleanup_ledger.take() else {
@@ -30455,6 +31706,1974 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn precommit_authority_takeover_preserves_history_until_settlement() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        install_provisional_detach_reentry(&mut app);
+        let (router, _) =
+            install_classifier_permanent_fixture(&mut app, "back-precommit-authority-takeover");
+        let request = stage_real_back_target_applied_commit(&mut app, router);
+        let (drifted_current, history_before, active_before) = {
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the real Back target retains its exact entry");
+            (
+                entry
+                    .active
+                    .as_ref()
+                    .and_then(RealizedBranch::first_frame)
+                    .and_then(|frame| frame.interactive_entities().first().copied())
+                    .expect("the current Back source has one real interactive output"),
+                entry.engine.history().clone(),
+                entry.engine.active().clone(),
+            )
+        };
+        app.world_mut()
+            .entity_mut(drifted_current)
+            .remove::<Pickable>();
+        app.world_mut().flush();
+
+        commit_presentation_system(app.world_mut());
+
+        {
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the authority takeover retains the RouterEntry");
+            assert_eq!(entry.engine.history(), &history_before);
+            assert_eq!(entry.engine.active(), &active_before);
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::RecoveringAuthority
+            );
+            assert!(
+                entry.pending_back_target_permanent_cleanup.is_some(),
+                "the classified current-authority loss must install the scoped settlement owner"
+            );
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(entry.authority_protocol_residual.is_none());
+            assert!(
+                entry
+                    .engine
+                    .request(request)
+                    .expect("the Back request remains retained during settlement")
+                    .trace()
+                    .iter()
+                    .all(|event| {
+                        event.kind() != NavigationTraceEventKind::HistoryIntentRejected
+                    })
+            );
+        }
+
+        let mut saw_scoped_settlement = false;
+        for _ in 0..32 {
+            settle_cleanup_system(app.world_mut());
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the settlement retains its RouterEntry shell");
+            let record = entry
+                .engine
+                .request(request)
+                .expect("the settlement request remains retained");
+            saw_scoped_settlement |= record.trace().iter().any(|event| {
+                event.kind() == NavigationTraceEventKind::CleanupSettled
+                    && event.cleanup_disposition().is_none()
+            });
+            assert_eq!(entry.engine.history(), &history_before);
+            if entry.pending_back_target_permanent_cleanup.is_some() {
+                assert_eq!(
+                    entry.engine.active(),
+                    &active_before,
+                    "active presentation cannot clear before scoped settlement completion"
+                );
+            }
+            if entry.pending_back_target_permanent_cleanup.is_none()
+                && matches!(record.status(), RequestStatus::Failed(_))
+            {
+                break;
+            }
+        }
+
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("terminal settlement retains the RouterEntry shell");
+        let record = entry
+            .engine
+            .request(request)
+            .expect("terminal authority failure remains retained");
+        assert!(saw_scoped_settlement);
+        assert!(matches!(
+            record.status(),
+            RequestStatus::Failed(failure)
+                if matches!(
+                    failure.kind(),
+                    NavigationFailureKind::HostLost | NavigationFailureKind::AuthorityLost
+                )
+        ));
+        assert!(
+            record
+                .trace()
+                .iter()
+                .all(|event| { event.kind() != NavigationTraceEventKind::HistoryIntentRejected })
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(entry.engine.active().kind(), ActivePresentationKind::None);
+        assert!(entry.pending_back_target_execution.is_none());
+        assert!(entry.pending_back_target_permanent_cleanup.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        let terminal_owners = entry.engine.testing_back_target_permanent_begin_state();
+        assert_eq!(terminal_owners.current_owner_count(), 0);
+        assert_eq!(terminal_owners.action_owner_count(), 0);
+        assert_eq!(terminal_owners.current_history_slot_count(), 0);
+        assert_eq!(terminal_owners.cleanup_history_owner_count(), 0);
+        assert_eq!(terminal_owners.cleanup_settlement_owner_count(), 0);
+        assert_eq!(terminal_owners.conflicting_owner_count(), 0);
+    }
+
+    #[test]
+    fn back_target_missing_pickable_repair_refreezes_after_each_hook_write() {
+        #[derive(Resource)]
+        struct MissingPickableRepairHookDrift {
+            targets: [Entity; 2],
+            protected_root: Entity,
+            first_insert: Option<Entity>,
+            later_insertions: usize,
+        }
+
+        let mut app = App::new();
+        app.world_mut()
+            .register_component_hooks::<Pickable>()
+            .on_insert(|mut world, HookContext { entity, .. }| {
+                let Some(mut drift) = world.get_resource_mut::<MissingPickableRepairHookDrift>()
+                else {
+                    return;
+                };
+                if !drift.targets.contains(&entity) {
+                    return;
+                }
+                if let Some(first) = drift.first_insert {
+                    if first != entity {
+                        drift.later_insertions += 1;
+                    }
+                    return;
+                }
+                drift.first_insert = Some(entity);
+                let protected_root = drift.protected_root;
+                drop(drift);
+                world
+                    .commands()
+                    .entity(protected_root)
+                    .insert(ChildOf(entity));
+            });
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, [protected_root, _]) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-missing-pickable-per-write-refreeze",
+        );
+        let request = stage_real_back_target_applied_commit(&mut app, router);
+        let (host, repair_targets, history_before, active_before) = {
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the real Back target retains its exact RouterEntry");
+            let current = entry
+                .active
+                .as_ref()
+                .and_then(RealizedBranch::first_frame)
+                .and_then(|frame| frame.interactive_entities().first().copied())
+                .expect("the current branch retains one real Pickable target");
+            let Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::AppliedCommitPending(applied),
+            )) = entry.pending_back_target_execution.as_ref()
+            else {
+                panic!("the real Back target must wait at its applied Commit owner")
+            };
+            let entering = applied
+                .pending
+                .branch
+                .last_frame()
+                .and_then(|frame| frame.interactive_entities().first().copied())
+                .expect("the entering branch retains a second real Pickable target");
+            assert_ne!(current, entering);
+            (
+                entry
+                    .host
+                    .as_ref()
+                    .expect("the admitted router retains its app-owned host")
+                    .host,
+                [current, entering],
+                entry.engine.history().clone(),
+                entry.engine.active().clone(),
+            )
+        };
+        assert_eq!(
+            app.world()
+                .get::<ChildOf>(protected_root)
+                .map(ChildOf::parent),
+            Some(host)
+        );
+        for target in repair_targets {
+            assert!(app.world().get::<Pickable>(target).is_some());
+            app.world_mut().entity_mut(target).remove::<Pickable>();
+        }
+        app.world_mut().flush();
+        let pickable_component = app
+            .world()
+            .components()
+            .component_id::<Pickable>()
+            .expect("the real fixture registers Pickable");
+        for target in repair_targets {
+            assert!(app.world().get::<Pickable>(target).is_none());
+            assert!(
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(target)
+                    .is_some_and(|record| record
+                        .manifest()
+                        .component_ids()
+                        .contains(&pickable_component)),
+                "both repairs must be real exact target-manifest contradictions"
+            );
+        }
+
+        commit_presentation_system(app.world_mut());
+        let (expected_cleanup, expected_batch, expected_ledger) =
+            target_permanent_installed_prepared_projection(&app, router);
+        app.world_mut()
+            .insert_resource(MissingPickableRepairHookDrift {
+                targets: repair_targets,
+                protected_root,
+                first_insert: None,
+                later_insertions: 0,
+            });
+
+        settle_cleanup_system(app.world_mut());
+        {
+            let world = app.world();
+            let entry = world
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("activation retains the exact RouterEntry");
+            let Some(PendingTargetPreparationPermanentCleanup::Installed(installed)) =
+                entry.pending_back_target_permanent_cleanup.as_ref()
+            else {
+                panic!("activation must retain the whole installed settlement owner")
+            };
+            let TargetPreparationPermanentLedgerHolder::Active(
+                ActiveTargetPreparationPermanentLedger::Current(current),
+            ) = &installed.ledger
+            else {
+                panic!("the first settlement tick must activate the unique Current owner")
+            };
+            let registry = world.resource::<RouteEntityRegistry>();
+            assert!(repair_targets.iter().all(|target| {
+                target_authority_missing_pickable_repair_is_exact(
+                    world,
+                    registry,
+                    &current.validation,
+                    *target,
+                )
+            }));
+            assert!(installed.inert.is_none());
+            assert_eq!(current.ledger.receipt_count(), 0);
+        }
+
+        settle_cleanup_system(app.world_mut());
+
+        let drift = app.world().resource::<MissingPickableRepairHookDrift>();
+        let first_insert = drift
+            .first_insert
+            .expect("the Current repair must perform its first real Pickable insertion");
+        let later_target = repair_targets
+            .into_iter()
+            .find(|target| *target != first_insert)
+            .expect("the fixture retains a later authorized repair target");
+        assert_eq!(
+            drift.later_insertions, 0,
+            "the first hook-triggered partition drift must stop all later component writes"
+        );
+        assert_eq!(
+            app.world().get::<Pickable>(first_insert),
+            Some(&Pickable::IGNORE)
+        );
+        assert!(
+            app.world().get::<Pickable>(later_target).is_none(),
+            "the later authorized target must remain untouched after first-write refreeze fails"
+        );
+        assert_eq!(
+            app.world()
+                .get::<ChildOf>(protected_root)
+                .map(ChildOf::parent),
+            Some(first_insert),
+            "the real deferred hook command must drift the frozen target/protected partition"
+        );
+
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the postwrite refreeze retains the exact RouterEntry");
+        let Some(PendingTargetPreparationPermanentCleanup::Installed(installed)) =
+            entry.pending_back_target_permanent_cleanup.as_ref()
+        else {
+            panic!("the failed per-write refreeze must retain the whole installed owner")
+        };
+        let TargetPreparationPermanentLedgerHolder::Active(
+            ActiveTargetPreparationPermanentLedger::Current(current),
+        ) = &installed.ledger
+        else {
+            panic!("partition drift must keep the unique ledger owner inert at Current")
+        };
+        assert!(matches!(
+            installed.inert,
+            Some(TargetPreparationPermanentInertEvidence::RepairPostWriteRefreeze(
+                ref evidence
+            )) if evidence.entity == first_insert && evidence.expected != evidence.observed
+        ));
+        assert!(
+            TargetPermanentDispositionProjection::capture_cleanup(&installed.cleanup)
+                == expected_cleanup
+        );
+        assert!(TargetPermanentBatchProjection::capture(&installed.batch) == expected_batch);
+        assert!(current.ledger.projection() == expected_ledger);
+        assert_eq!(current.ledger.receipt_count(), 0);
+        assert!(!current.ledger.issued_attempt_present_for_test());
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(entry.engine.active(), &active_before);
+        assert!(matches!(
+            entry
+                .engine
+                .request(request)
+                .map(|record| record.status().clone()),
+            Some(RequestStatus::Running(_))
+        ));
+    }
+
+    #[test]
+    fn back_target_missing_pickable_repair_refreezes_component_values_before_later_writes() {
+        #[derive(Resource)]
+        struct MissingPickableValueDrift {
+            targets: [Entity; 2],
+            first_insert: Option<Entity>,
+            later_insertions: usize,
+        }
+
+        let mut app = App::new();
+        app.world_mut()
+            .register_component_hooks::<Pickable>()
+            .on_insert(|mut world, HookContext { entity, .. }| {
+                let Some(mut drift) = world.get_resource_mut::<MissingPickableValueDrift>() else {
+                    return;
+                };
+                if !drift.targets.contains(&entity) {
+                    return;
+                }
+                if let Some(first) = drift.first_insert {
+                    if first != entity {
+                        drift.later_insertions += 1;
+                    }
+                    return;
+                }
+                drift.first_insert = Some(entity);
+                drop(drift);
+                world.commands().entity(entity).insert(Pickable {
+                    should_block_lower: true,
+                    is_hoverable: true,
+                });
+            });
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-missing-pickable-value-refreeze",
+        );
+        let _request = stage_real_back_target_applied_commit(&mut app, router);
+        let repair_targets = {
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the real Back target retains its exact RouterEntry");
+            let current = entry
+                .active
+                .as_ref()
+                .and_then(RealizedBranch::first_frame)
+                .and_then(|frame| frame.interactive_entities().first().copied())
+                .expect("the current branch retains one Pickable target");
+            let Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::AppliedCommitPending(applied),
+            )) = entry.pending_back_target_execution.as_ref()
+            else {
+                panic!("the real Back target must wait at its applied Commit owner")
+            };
+            let entering = applied
+                .pending
+                .branch
+                .last_frame()
+                .and_then(|frame| frame.interactive_entities().first().copied())
+                .expect("the entering branch retains a second Pickable target");
+            [current, entering]
+        };
+        for target in repair_targets {
+            app.world_mut().entity_mut(target).remove::<Pickable>();
+        }
+        app.world_mut().flush();
+
+        commit_presentation_system(app.world_mut());
+        app.world_mut().insert_resource(MissingPickableValueDrift {
+            targets: repair_targets,
+            first_insert: None,
+            later_insertions: 0,
+        });
+        settle_cleanup_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+
+        let drift = app.world().resource::<MissingPickableValueDrift>();
+        let first = drift
+            .first_insert
+            .expect("the Current repair must perform one real Pickable insertion");
+        let later = repair_targets
+            .into_iter()
+            .find(|target| *target != first)
+            .expect("the fixture retains a later repair target");
+        assert_eq!(
+            drift.later_insertions, 0,
+            "RED: the first hook value drift must stop every later component write"
+        );
+        assert_eq!(
+            app.world().get::<Pickable>(first),
+            Some(&Pickable {
+                should_block_lower: true,
+                is_hoverable: true,
+            }),
+            "the Router must not overwrite the observed hook drift after refreeze rejects it"
+        );
+        assert!(
+            app.world().get::<Pickable>(later).is_none(),
+            "the later repair target must remain untouched"
+        );
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the inert Current owner retains its RouterEntry");
+        let Some(PendingTargetPreparationPermanentCleanup::Installed(installed)) =
+            entry.pending_back_target_permanent_cleanup.as_ref()
+        else {
+            panic!("value drift must retain the whole installed owner")
+        };
+        assert!(matches!(
+            installed.ledger,
+            TargetPreparationPermanentLedgerHolder::Active(
+                ActiveTargetPreparationPermanentLedger::Current(_)
+            )
+        ));
+        assert!(matches!(
+            installed.inert,
+            Some(TargetPreparationPermanentInertEvidence::RepairPostWriteRefreeze(
+                ref evidence
+            )) if evidence.entity == first && evidence.expected != evidence.observed
+        ));
+    }
+
+    #[test]
+    fn back_target_missing_pickable_repair_refreezes_registry_manifest_before_later_writes() {
+        #[derive(Resource)]
+        struct MissingPickableRegistryManifestDrift {
+            targets: [(Entity, ExactRegistryClaim); 2],
+            first_insert: Option<Entity>,
+            later_insertions: usize,
+            manifest_drifted: bool,
+        }
+
+        let mut app = App::new();
+        app.world_mut()
+            .register_component_hooks::<Pickable>()
+            .on_insert(|mut world, HookContext { entity, .. }| {
+                let Some(mut drift) =
+                    world.get_resource_mut::<MissingPickableRegistryManifestDrift>()
+                else {
+                    return;
+                };
+                let Some((_, claim)) = drift.targets.iter().find(|(target, _)| *target == entity)
+                else {
+                    return;
+                };
+                let claim = claim.clone();
+                if let Some(first) = drift.first_insert {
+                    if first != entity {
+                        drift.later_insertions += 1;
+                    }
+                    return;
+                }
+                drift.first_insert = Some(entity);
+                drop(drift);
+
+                let changed = {
+                    let mut registry = world.resource_mut::<RouteEntityRegistry>();
+                    let Some(original) = registry
+                        .record(entity)
+                        .map(|record| record.manifest().clone())
+                    else {
+                        return;
+                    };
+                    let drifted =
+                        ComponentManifest::new(original.component_ids().iter().copied().skip(1));
+                    original != drifted
+                        && registry.compare_exchange_manifest_exact(&claim, &original, drifted)
+                };
+                world
+                    .resource_mut::<MissingPickableRegistryManifestDrift>()
+                    .manifest_drifted = changed;
+            });
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-target-missing-pickable-registry-manifest-refreeze",
+        );
+        let _request = stage_real_back_target_applied_commit(&mut app, router);
+        let repair_targets = {
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the real Back target retains its exact RouterEntry");
+            let current = entry
+                .active
+                .as_ref()
+                .and_then(RealizedBranch::first_frame)
+                .and_then(|frame| frame.interactive_entities().first().copied())
+                .expect("the current branch retains one Pickable target");
+            let Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::AppliedCommitPending(applied),
+            )) = entry.pending_back_target_execution.as_ref()
+            else {
+                panic!("the real Back target must wait at its applied Commit owner")
+            };
+            let entering = applied
+                .pending
+                .branch
+                .last_frame()
+                .and_then(|frame| frame.interactive_entities().first().copied())
+                .expect("the entering branch retains a second Pickable target");
+            [current, entering]
+        };
+        let repair_claims = repair_targets.map(|target| {
+            (
+                target,
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(target)
+                    .expect("each repair target retains its exact registry claim")
+                    .claim(),
+            )
+        });
+        for target in repair_targets {
+            app.world_mut().entity_mut(target).remove::<Pickable>();
+        }
+        app.world_mut().flush();
+
+        commit_presentation_system(app.world_mut());
+        app.world_mut()
+            .insert_resource(MissingPickableRegistryManifestDrift {
+                targets: repair_claims,
+                first_insert: None,
+                later_insertions: 0,
+                manifest_drifted: false,
+            });
+        settle_cleanup_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+
+        let drift = app
+            .world()
+            .resource::<MissingPickableRegistryManifestDrift>();
+        let first = drift
+            .first_insert
+            .expect("the Current repair must perform one real Pickable insertion");
+        let later = repair_targets
+            .into_iter()
+            .find(|target| *target != first)
+            .expect("the fixture retains a later repair target");
+        assert!(
+            drift.manifest_drifted,
+            "the hook must change only the real registry-manifest predicate input"
+        );
+        assert_eq!(
+            drift.later_insertions, 0,
+            "RED: registry-manifest drift after the first hook write must stop later writes"
+        );
+        assert!(app.world().get::<Pickable>(later).is_none());
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the inert Current owner retains its RouterEntry");
+        let Some(PendingTargetPreparationPermanentCleanup::Installed(installed)) =
+            entry.pending_back_target_permanent_cleanup.as_ref()
+        else {
+            panic!("registry-manifest drift must retain the whole installed owner")
+        };
+        assert!(matches!(
+            installed.ledger,
+            TargetPreparationPermanentLedgerHolder::Active(
+                ActiveTargetPreparationPermanentLedger::Current(_)
+            )
+        ));
+        assert!(matches!(
+            installed.inert,
+            Some(TargetPreparationPermanentInertEvidence::RepairPostWriteRefreeze(
+                ref evidence
+            )) if evidence.entity == first && evidence.expected != evidence.observed
+        ));
+    }
+
+    #[test]
+    fn precommit_host_binding_loss_enters_authority_settlement() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        install_provisional_detach_reentry(&mut app);
+        let (router, _) =
+            install_classifier_permanent_fixture(&mut app, "back-precommit-host-binding-loss");
+        let request = stage_real_back_target_applied_commit(&mut app, router);
+        let (host, history_before, active_before, registration_before) = {
+            let world = app.world();
+            let entry = world
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the real Back target retains its exact entry");
+            let host = entry
+                .host
+                .as_ref()
+                .expect("the applied Back target retains its live HostBinding");
+            assert!(validated_host_candidate_is_current(world, &host.candidate));
+            (
+                host.host,
+                entry.engine.history().clone(),
+                entry.engine.active().clone(),
+                world
+                    .get::<RouterHostRegistration>(host.host)
+                    .expect("the app-owned host retains its admitted registration")
+                    .testing_identity(),
+            )
+        };
+
+        app.world_mut()
+            .entity_mut(host)
+            .remove::<RouterHostRegistration>()
+            .insert(RouterHostRegistration::new(router));
+        app.world_mut().flush();
+        let registration_after = app
+            .world()
+            .get::<RouterHostRegistration>(host)
+            .expect("the app-owned host retains the replacement registration")
+            .testing_identity();
+        assert_ne!(registration_after, registration_before);
+        {
+            let world = app.world();
+            let entry = world
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("host incarnation drift retains the RouterEntry");
+            let binding = entry
+                .host
+                .as_ref()
+                .expect("the stale HostBinding remains linearly owned before settlement");
+            assert!(!validated_host_candidate_is_current(
+                world,
+                &binding.candidate
+            ));
+            assert!(!current_host_binding_is_exact(world, binding));
+            assert!(matches!(
+                entry.pending_back_target_execution.as_ref(),
+                Some(PendingBackTargetExecution::ResumeBlocked(
+                    PendingBackTargetResumeBlocked::AppliedCommitPending(_)
+                ))
+            ));
+        }
+
+        commit_presentation_system(app.world_mut());
+
+        {
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("authority recovery retains the RouterEntry shell");
+            assert_eq!(entry.engine.history(), &history_before);
+            assert_eq!(entry.engine.active(), &active_before);
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::RecoveringAuthority,
+                "precommit HostBinding loss must not safe-stop in AuthorityLostPhysicalMismatch or dispatch-blocked"
+            );
+            let settlement_owner_count = usize::from(entry.cleanup_ledger.is_some())
+                + usize::from(entry.pending_back_target_permanent_cleanup.is_some())
+                + usize::from(entry.pending_back_no_target_authority_cleanup.is_some());
+            assert_eq!(
+                settlement_owner_count, 1,
+                "HostBinding loss must enter exactly one existing authority settlement"
+            );
+            assert!(entry.pending_back_target_execution.is_none());
+            assert!(entry.authority_protocol_residual.is_none());
+            assert!(
+                entry
+                    .engine
+                    .request(request)
+                    .expect("the Back request remains retained during authority recovery")
+                    .trace()
+                    .iter()
+                    .all(|event| event.kind() != NavigationTraceEventKind::HistoryIntentRejected)
+            );
+        }
+
+        let mut saw_settlement_receipt = false;
+        for _ in 0..64 {
+            settle_cleanup_system(app.world_mut());
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("authority settlement retains its RouterEntry shell");
+            let record = entry
+                .engine
+                .request(request)
+                .expect("the authority settlement request remains retained");
+            saw_settlement_receipt |= record
+                .trace()
+                .iter()
+                .any(|event| event.kind() == NavigationTraceEventKind::CleanupSettled);
+            assert_eq!(entry.engine.history(), &history_before);
+            if matches!(record.status(), RequestStatus::Failed(_)) {
+                break;
+            }
+            assert_eq!(
+                entry.engine.active(),
+                &active_before,
+                "active cannot clear before the authority settlement receipt completes"
+            );
+        }
+
+        let world = app.world();
+        let entry = world
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("terminal authority settlement retains the RouterEntry shell");
+        let record = entry
+            .engine
+            .request(request)
+            .expect("terminal HostBinding loss remains retained");
+        assert!(saw_settlement_receipt);
+        assert!(matches!(
+            record.status(),
+            RequestStatus::Failed(failure)
+                if matches!(
+                    failure.kind(),
+                    NavigationFailureKind::HostLost | NavigationFailureKind::AuthorityLost
+                )
+        ));
+        assert!(
+            record
+                .trace()
+                .iter()
+                .all(|event| event.kind() != NavigationTraceEventKind::HistoryIntentRejected)
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(entry.engine.active().kind(), ActivePresentationKind::None);
+        assert!(entry.active.is_none());
+        assert!(entry.host.is_none());
+        assert!(entry.pending_commit.as_ref().is_none_or(|pending| {
+            pending.ticket.is_none()
+                && pending.final_task.is_none()
+                && pending.branch.frames().is_empty()
+                && pending.branch.child_slots().is_empty()
+        }));
+        assert!(entry.pending_back_target_execution.is_none());
+        assert!(entry.pending_back_target_permanent_cleanup.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(entry.authority_protocol_residual.is_none());
+        assert!(entry.pending_back_no_target_authority_cleanup.is_none());
+        assert!(entry.pending_back_resolution_action.is_none());
+        assert!(entry.pending_bound_back_resolution.is_none());
+        assert!(entry.back_capacity_reservations.is_empty());
+        let terminal_owners = entry.engine.testing_back_target_permanent_begin_state();
+        assert_eq!(terminal_owners.cleanup_owner_count(), 0);
+        assert_eq!(terminal_owners.current_owner_count(), 0);
+        assert_eq!(terminal_owners.action_owner_count(), 0);
+        assert_eq!(terminal_owners.current_history_slot_count(), 0);
+        assert_eq!(terminal_owners.cleanup_history_owner_count(), 0);
+        assert_eq!(terminal_owners.cleanup_settlement_owner_count(), 0);
+        assert_eq!(terminal_owners.queue_len(), 0);
+        assert_eq!(terminal_owners.conflicting_owner_count(), 0);
+        assert_eq!(
+            entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the terminal router retains its Back capacity issuer")
+                .semantic_snapshot_for_test()
+                .outstanding_count(),
+            0
+        );
+        assert!(world.get_entity(host).is_ok());
+        assert_eq!(
+            world
+                .get::<RouterHostRegistration>(host)
+                .expect("authority settlement preserves the app-owned replacement registration")
+                .testing_identity(),
+            registration_after
+        );
+        assert!(
+            world
+                .resource::<RouteEntityRegistry>()
+                .record(host)
+                .is_none()
+        );
+        assert!(world.get::<RouteOwnershipSeal>(host).is_none());
+    }
+
+    #[test]
+    fn back_target_authority_protocol_retry_refreezes_source_before_world_access() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-authority-protocol-retry-refreeze",
+        );
+        let request = stage_real_back_target_applied_commit(&mut app, router);
+        let (host, history_before, active_before) = {
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the real Back target retains its exact RouterEntry");
+            (
+                entry
+                    .host
+                    .as_ref()
+                    .expect("the retry fixture retains its live host")
+                    .host,
+                entry.engine.history().clone(),
+                entry.engine.active().clone(),
+            )
+        };
+        app.world_mut()
+            .entity_mut(host)
+            .remove::<RouterHostRegistration>()
+            .insert(RouterHostRegistration::new(router));
+        app.world_mut().flush();
+        crate::cleanup::fail_next_reservation_for_test();
+
+        commit_presentation_system(app.world_mut());
+        {
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("retry retains the RouterEntry shell");
+            assert!(matches!(
+                entry.pending_back_target_execution.as_ref(),
+                Some(PendingBackTargetExecution::Classifying(
+                    PendingBackTargetClassification::AuthorityLostProtocol(_)
+                ))
+            ));
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::Ready
+            );
+            assert!(entry.cleanup_ledger.is_none());
+            assert_eq!(entry.engine.history(), &history_before);
+            assert_eq!(entry.engine.active(), &active_before);
+        }
+        let world_before = authority_world_fingerprint(app.world());
+        let registry = app
+            .world_mut()
+            .remove_resource::<RouteEntityRegistry>()
+            .expect("the retry fixture can drift the exact required-resource predicate");
+
+        let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            commit_presentation_system(app.world_mut());
+        }));
+        app.world_mut().insert_resource(registry);
+        assert!(
+            second.is_ok(),
+            "a stale HostBinding evidence must be refrozen before any required-resource access"
+        );
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("typed source drift retains the RouterEntry shell");
+        let Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::AuthorityLostProtocolSourceDrift {
+                protocol,
+                observed,
+            },
+        )) = entry.pending_back_target_execution.as_ref()
+        else {
+            panic!("the exact retry mismatch must retain a typed whole-owner source drift")
+        };
+        assert_eq!(
+            protocol.source.authority_loss,
+            Some(LifecyclePreflightEvidence::new(
+                LifecyclePreflightSource::HostBinding,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ))
+        );
+        assert_eq!(protocol.evidence, protocol.source.authority_loss.unwrap());
+        assert_eq!(
+            observed.authority_loss,
+            Some(LifecyclePreflightEvidence::new(
+                LifecyclePreflightSource::RequiredResources(
+                    RequiredResourceSet::ROUTE_ENTITY_REGISTRY,
+                ),
+                LifecyclePreflightExpectation::ResourcePresent,
+                LifecyclePreflightObserved::Missing,
+            ))
+        );
+        assert!(&protocol.source != observed);
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(entry.authority_protocol_residual.is_none());
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::Ready
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(entry.engine.active(), &active_before);
+        assert!(matches!(
+            entry
+                .engine
+                .request(request)
+                .map(|record| record.status().clone()),
+            Some(RequestStatus::Running(_))
+        ));
+    }
+
+    #[test]
+    fn back_target_authority_protocol_retry_refreezes_registry_manifest_source() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) = install_classifier_permanent_fixture(
+            &mut app,
+            "back-authority-protocol-registry-manifest-refreeze",
+        );
+        let request = stage_real_back_target_applied_commit(&mut app, router);
+        let (host, target, history_before, active_before) = {
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the real Back target retains its exact RouterEntry");
+            (
+                entry
+                    .host
+                    .as_ref()
+                    .expect("the retry fixture retains its live host")
+                    .host,
+                entry
+                    .active
+                    .as_ref()
+                    .and_then(RealizedBranch::first_frame)
+                    .and_then(|frame| frame.interactive_entities().first().copied())
+                    .expect("the active branch retains one exact registry target"),
+                entry.engine.history().clone(),
+                entry.engine.active().clone(),
+            )
+        };
+        app.world_mut()
+            .entity_mut(host)
+            .remove::<RouterHostRegistration>()
+            .insert(RouterHostRegistration::new(router));
+        app.world_mut().flush();
+        crate::cleanup::fail_next_reservation_for_test();
+        commit_presentation_system(app.world_mut());
+        assert!(matches!(
+            app.world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .and_then(|entry| entry.pending_back_target_execution.as_ref()),
+            Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::AuthorityLostProtocol(_)
+            ))
+        ));
+
+        let (claim, original_manifest) = {
+            let record = app
+                .world()
+                .resource::<RouteEntityRegistry>()
+                .record(target)
+                .expect("the retry target retains its exact registry record");
+            (record.claim(), record.manifest().clone())
+        };
+        let drifted_manifest =
+            ComponentManifest::new(original_manifest.component_ids().iter().copied().skip(1));
+        assert_ne!(drifted_manifest, original_manifest);
+        assert!(
+            app.world_mut()
+                .resource_mut::<RouteEntityRegistry>()
+                .compare_exchange_manifest_exact(&claim, &original_manifest, drifted_manifest)
+        );
+        let world_before = authority_world_fingerprint(app.world());
+
+        commit_presentation_system(app.world_mut());
+
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("typed registry source drift retains the RouterEntry shell");
+        let Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::AuthorityLostProtocolSourceDrift {
+                protocol,
+                observed,
+            },
+        )) = entry.pending_back_target_execution.as_ref()
+        else {
+            panic!("registry-manifest-only drift must retain the whole protocol owner")
+        };
+        assert!(&protocol.source != observed);
+        assert_eq!(protocol.evidence, protocol.source.authority_loss.unwrap());
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(entry.engine.active(), &active_before);
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(entry.authority_protocol_residual.is_none());
+        assert!(matches!(
+            entry
+                .engine
+                .request(request)
+                .map(|record| record.status().clone()),
+            Some(RequestStatus::Running(_))
+        ));
+    }
+
+    #[test]
+    pub(crate) fn active_cycle_enters_authority_settlement() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) =
+            install_classifier_permanent_fixture(&mut app, "back-active-cycle-precedence");
+        let request = stage_real_back_target_applied_commit(&mut app, router);
+        let history_before = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("the cycle fixture retains its exact entry")
+            .engine
+            .history()
+            .clone();
+        let (cycle_child, cycle_parent, entering) = {
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the cycle fixture retains its exact entry");
+            let current = entry
+                .active
+                .as_ref()
+                .and_then(RealizedBranch::first_frame)
+                .expect("the Back source retains a real observed current frame");
+            let owned = current
+                .claims()
+                .map(ExactRegistryClaim::entity)
+                .collect::<std::collections::HashSet<_>>();
+            let (cycle_child, cycle_parent) = current
+                .cleanup_members()
+                .find_map(|(claim, parent)| {
+                    owned.contains(&parent).then_some((claim.entity(), parent))
+                })
+                .expect("the real current closure has an owned parent/child edge");
+            let Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::AppliedCommitPending(applied),
+            )) = entry.pending_back_target_execution.as_ref()
+            else {
+                panic!("the real Back target must wait at its applied Commit owner")
+            };
+            let entering = applied
+                .pending
+                .branch
+                .last_frame()
+                .and_then(|frame| frame.interactive_entities().first().copied())
+                .expect("the real entering branch has one independent drift target");
+            (cycle_child, cycle_parent, entering)
+        };
+        app.world_mut()
+            .entity_mut(cycle_parent)
+            .insert(ChildOf(cycle_child));
+        app.world_mut().entity_mut(entering).remove::<Pickable>();
+        app.world_mut().flush();
+        assert_eq!(
+            app.world()
+                .get::<ChildOf>(cycle_parent)
+                .map(ChildOf::parent),
+            Some(cycle_child)
+        );
+        assert!(app.world().get::<Pickable>(entering).is_none());
+
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the production classifier receives the exact Back entry");
+                assert!(drive_back_target_applied_commit(world, entry));
+            },
+        );
+
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("classification retains the exact RouterEntry");
+        let Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::AuthorityLost {
+                physical: _,
+                settlement: _,
+                evidence,
+            },
+        )) = entry.pending_back_target_execution.as_ref()
+        else {
+            panic!(
+                "current-cycle authority loss must win over entering rejection and install one accepted settlement owner"
+            )
+        };
+        assert_eq!(evidence.source(), LifecyclePreflightSource::LeavingCurrent);
+        assert_eq!(evidence.observed(), LifecyclePreflightObserved::Drifted);
+        assert!(entry.pending_back_target_permanent_cleanup.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(entry.authority_protocol_residual.is_none());
+        assert!(entry.pending_back_no_target_authority_cleanup.is_none());
+        assert_eq!(entry.engine.history(), &history_before);
+        assert!(matches!(
+            entry
+                .engine
+                .request(request)
+                .map(|record| record.status().clone()),
+            Some(RequestStatus::Running(_))
+        ));
+        assert_eq!(
+            app.world()
+                .get::<ChildOf>(cycle_parent)
+                .map(ChildOf::parent),
+            Some(cycle_child),
+            "classification must not mutate the observed current cycle"
+        );
+        assert!(app.world().get::<Pickable>(entering).is_none());
+    }
+
+    #[test]
+    fn back_target_pending_rejection_enters_existing_failed_cleanup() {
+        let mut app = App::new();
+        install_cleanup_despawn_drift_hook(&mut app);
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router_at_pattern(
+            &mut app,
+            "back-target-pending-rejected-failed-cleanup",
+            "/:id",
+        );
+        app.update();
+        for location in ["/a", "/b"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(location))
+                .expect("the real A/B history fixture accepts its forward request");
+            run_updates_until_succeeded(&mut app, request);
+        }
+
+        let request = stage_real_back_target_applied_commit(&mut app, router);
+        let (
+            entering,
+            history_before,
+            core_active_before,
+            active_frames_before,
+            active_claims_before,
+            active_facts_before,
+            requested_before,
+        ) = {
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the real Back target retains its exact RouterEntry");
+            let Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::AppliedCommitPending(applied),
+            )) = entry.pending_back_target_execution.as_ref()
+            else {
+                panic!("the real applied Back target must retain its CommitTicket owner")
+            };
+            let entering = applied
+                .pending
+                .branch
+                .last_frame()
+                .and_then(|frame| frame.interactive_entities().first().copied())
+                .expect("the real entering A branch has one interactive predicate input");
+            let active = entry
+                .active
+                .as_ref()
+                .expect("the published B branch remains the old active presentation");
+            let active_claims = active.claims().cloned().collect::<Vec<_>>();
+            (
+                entering,
+                entry.engine.history().clone(),
+                entry.engine.active().clone(),
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                active_claims.clone(),
+                active_claims
+                    .iter()
+                    .map(|claim| {
+                        (
+                            claim.entity(),
+                            nested_protected_fingerprint(app.world(), claim.entity()),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                entry
+                    .engine
+                    .request(request)
+                    .expect("the real Back request remains retained")
+                    .requested()
+                    .cloned(),
+            )
+        };
+        assert_eq!(requested_before, Some(RouteLocation::new("/a")));
+
+        app.world_mut().entity_mut(entering).remove::<Pickable>();
+        app.world_mut().flush();
+        assert!(app.world().get::<Pickable>(entering).is_none());
+
+        commit_presentation_system(app.world_mut());
+
+        {
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("PendingRejected retains the exact RouterEntry");
+            let evidence = match entry.pending_back_target_execution.as_ref() {
+                Some(PendingBackTargetExecution::Classifying(
+                    PendingBackTargetClassification::PendingRejectedUnaccepted { evidence, .. },
+                ))
+                | Some(PendingBackTargetExecution::Classifying(
+                    PendingBackTargetClassification::PendingRejected { evidence, .. },
+                )) => evidence,
+                _ => panic!(
+                    "the production classifier must preserve entering-only drift as a typed PendingRejected owner"
+                ),
+            };
+            assert_eq!(evidence.source(), LifecyclePreflightSource::PendingEntering);
+            assert_eq!(
+                evidence.expectation(),
+                LifecyclePreflightExpectation::ExactAuthority
+            );
+            assert_eq!(evidence.observed(), LifecyclePreflightObserved::Drifted);
+            assert_eq!(entry.engine.history(), &history_before);
+            assert_eq!(entry.engine.active(), &core_active_before);
+            assert!(entry.pending_back_target_permanent_cleanup.is_none());
+            assert!(entry.authority_protocol_residual.is_none());
+            assert!(
+                entry
+                    .engine
+                    .request(request)
+                    .expect("the classified Back request remains retained")
+                    .trace()
+                    .iter()
+                    .all(|event| event.kind() != NavigationTraceEventKind::HistoryIntentRejected)
+            );
+        }
+
+        let mut saw_existing_failed_cleanup = false;
+        for _ in 0..4 {
+            commit_presentation_system(app.world_mut());
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the pending rejection retains its RouterEntry");
+            saw_existing_failed_cleanup = matches!(
+                entry
+                    .pending_failed_branch
+                    .as_ref()
+                    .map(|failed| &failed.terminal),
+                Some(PendingFailedBranchTerminal::BackTargetPendingRejected { .. })
+            );
+            if saw_existing_failed_cleanup {
+                let expected_evidence = LifecyclePreflightEvidence::new(
+                    LifecyclePreflightSource::PendingEntering,
+                    LifecyclePreflightExpectation::ExactAuthority,
+                    LifecyclePreflightObserved::Drifted,
+                );
+                assert_eq!(
+                    pending_failed_branch_preflight_evidence_for_test(
+                        entry
+                            .pending_failed_branch
+                            .as_ref()
+                            .expect("the existing cleanup retains its pending owner")
+                    ),
+                    Some(expected_evidence),
+                    "RED: PendingRejected evidence must remain typed on the existing failure-cleanup owner"
+                );
+                assert_eq!(
+                    entry.active.as_ref().map(|active| {
+                        active
+                            .frames()
+                            .iter()
+                            .map(|frame| frame.frame().clone())
+                            .collect::<Vec<_>>()
+                    }),
+                    Some(active_frames_before.clone()),
+                    "rejecting the splice must restore the exact old active branch before cleanup"
+                );
+                assert_eq!(
+                    entry
+                        .active
+                        .as_ref()
+                        .expect("failed cleanup retains the old active branch")
+                        .claims()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    active_claims_before
+                );
+                for (entity, facts_before) in &active_facts_before {
+                    assert_eq!(
+                        nested_protected_fingerprint(app.world(), *entity),
+                        *facts_before,
+                        "pending-only cleanup must preserve every old-active physical fact"
+                    );
+                }
+                break;
+            }
+        }
+        assert!(
+            saw_existing_failed_cleanup,
+            "RED: accepted PendingRejected must enter the existing pending_failed_branch cleanup chain"
+        );
+
+        let (despawn_trigger, despawn_trigger_claim) = {
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the pending failure cleanup retains its RouterEntry");
+            let failed = entry
+                .pending_failed_branch
+                .as_ref()
+                .expect("the typed pending-rejected owner remains installed");
+            let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                app.world(),
+                app.world().resource::<RouteEntityRegistry>(),
+                &failed.branch,
+            )
+            .expect("the exact entering branch freezes its existing cleanup manifest");
+            let despawn_trigger = manifest.entities()[0];
+            let claim = app
+                .world()
+                .resource::<RouteEntityRegistry>()
+                .record(despawn_trigger)
+                .expect("the first cleanup target retains its exact registry record")
+                .claim();
+            (despawn_trigger, claim)
+        };
+        app.world_mut().insert_resource(CleanupDespawnDrift {
+            target: despawn_trigger,
+            action: CleanupDespawnDriftAction::TargetRegistryClaim(despawn_trigger_claim.clone()),
+        });
+        settle_cleanup_system(app.world_mut());
+        {
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("partial settlement retains its RouterEntry");
+            let ledger = entry.cleanup_ledger.as_ref().expect(
+                "the real despawn hook drift must retain the active failure-cleanup ledger",
+            );
+            assert_eq!(
+                ledger.failed_preflight_evidence(),
+                Some(LifecyclePreflightEvidence::new(
+                    LifecyclePreflightSource::PendingEntering,
+                    LifecyclePreflightExpectation::ExactAuthority,
+                    LifecyclePreflightObserved::Drifted,
+                )),
+                "the exact PendingRejected evidence must remain on the active cleanup ledger"
+            );
+            assert_eq!(
+                ledger.receipt_count(),
+                0,
+                "the rejected post-despawn refreeze must not issue a cleanup receipt"
+            );
+        }
+        assert!(
+            app.world().get_entity(despawn_trigger).is_err(),
+            "the real on_despawn hook must run after the target becomes physically absent"
+        );
+        let drifted_claim = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(despawn_trigger)
+            .expect("the rejected receipt retains the drifted registry record")
+            .claim();
+        assert_eq!(drifted_claim.lifecycle(), EntityLifecycle::Quarantined);
+        assert_ne!(
+            drifted_claim, despawn_trigger_claim,
+            "the hook must change the exact claim predicate before receipt commit"
+        );
+        app.world_mut().remove_resource::<CleanupDespawnDrift>();
+        let restored = app
+            .world_mut()
+            .resource_mut::<RouteEntityRegistry>()
+            .compare_exchange_lifecycle(&drifted_claim, despawn_trigger_claim.lifecycle())
+            .expect("the test restores only the real settlement predicate input");
+        assert_eq!(restored, despawn_trigger_claim);
+
+        let retained_after_physical_settlement = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the failure cleanup retains its RouterEntry");
+                let mut ledger = entry
+                    .cleanup_ledger
+                    .take()
+                    .expect("the partial settlement retains its unique ledger owner");
+                let attempt = ledger
+                    .attempt(world)
+                    .expect("restoring the exact claim permits a fresh cleanup attempt");
+                assert!(ledger.settle(world, attempt));
+                assert!(entry.observe_cleanup_receipts(&mut ledger));
+                assert!(ledger.is_settled());
+                assert!(ledger.pending_completion().is_some());
+                let evidence = ledger.failed_preflight_evidence();
+                let failed_owner_count = ledger.failed_prepared_frames().len();
+                entry.cleanup_ledger = Some(ledger);
+                (evidence, failed_owner_count)
+            },
+        );
+        assert_eq!(
+            retained_after_physical_settlement.0,
+            Some(LifecyclePreflightEvidence::new(
+                LifecyclePreflightSource::PendingEntering,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            )),
+            "RED: physical settlement must retain exact PendingRejected evidence until Core completion succeeds"
+        );
+        assert!(
+            retained_after_physical_settlement.1 > 0,
+            "the failed branch owner must remain linearly held before Core completion"
+        );
+
+        for _ in 0..32 {
+            app.update();
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("failure cleanup retains its RouterEntry shell");
+            if matches!(
+                entry
+                    .engine
+                    .request(request)
+                    .map(|record| record.status().clone()),
+                Some(RequestStatus::Failed(_))
+            ) && ProvenEmptyAttemptOwnerInventory::capture(entry, request).is_vacant()
+                && entry.pending_back_target_permanent_cleanup.is_none()
+            {
+                break;
+            }
+        }
+
+        let entry = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .expect("terminal failure cleanup retains its RouterEntry shell");
+        let record = entry
+            .engine
+            .request(request)
+            .expect("the terminal Back request remains retained");
+        assert!(matches!(record.status(), RequestStatus::Failed(_)));
+        assert_eq!(record.requested(), requested_before.as_ref());
+        assert_eq!(
+            record
+                .trace()
+                .iter()
+                .filter(|event| { event.kind() == NavigationTraceEventKind::HistoryIntentRejected })
+                .count(),
+            1,
+            "the existing fallback path rejects the failed Back history intent exactly once"
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(
+            entry.engine.active().kind(),
+            ActivePresentationKind::Error,
+            "the existing fallback path may publish Error without advancing history"
+        );
+        assert_eq!(
+            entry.active.as_ref().map(|active| {
+                active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>()
+            }),
+            Some(entry.engine.active().frames().to_vec()),
+            "terminal ECS mapping must match the fallback presentation published by Core"
+        );
+        assert!(
+            ProvenEmptyAttemptOwnerInventory::capture(entry, request).is_vacant(),
+            "terminal PendingRejected cleanup must leave no entry-local lifecycle owner"
+        );
+        assert!(entry.pending_back_target_permanent_cleanup.is_none());
+        assert_eq!(
+            entry
+                .back_capacity_issuer
+                .as_ref()
+                .expect("the exact router retains its Back capacity issuer")
+                .semantic_snapshot_for_test()
+                .outstanding_count(),
+            0,
+            "terminal failure must retire the sole Back capacity owner"
+        );
+    }
+
+    #[test]
+    fn stale_back_report_receipt_and_publication_are_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let (router, _) =
+            install_classifier_permanent_fixture(&mut app, "stale-back-artifact-replay");
+
+        let old_back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the two-entry fixture admits its older Back");
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let stale_task = {
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the older Back retains its exact entry");
+            entry
+                .pending_commit
+                .as_ref()
+                .and_then(|pending| pending.final_task.as_ref())
+                .expect("the older Back retains its real report task")
+                .testing_duplicate()
+        };
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the older Back report returns to its exact entry");
+                let mut pending = entry
+                    .pending_commit
+                    .take()
+                    .expect("the older Back retains its real pending branch");
+                let task = pending
+                    .final_task
+                    .take()
+                    .expect("the older Back retains its real final report task");
+                assert!(matches!(
+                    route_back_target_applied_report(
+                        world,
+                        entry,
+                        pending,
+                        task,
+                        BackTargetAppliedReport::LegacyLeaf,
+                    ),
+                    RouteBackTargetAppliedOutcome::Handled
+                ));
+            },
+        );
+        let stale_publication_ticket = {
+            let entry = app
+                .world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the older Back retains its exact entry");
+            let Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::AppliedCommitPending(applied),
+            )) = entry.pending_back_target_execution.as_ref()
+            else {
+                panic!("the older Back must produce one real Commit ticket")
+            };
+            applied.ticket.testing_duplicate()
+        };
+
+        commit_presentation_system(app.world_mut());
+        let stale_cleanup = app
+            .world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .and_then(|entry| entry.cleanup_ledger.as_ref())
+            .and_then(CleanupLedger::batch)
+            .cloned()
+            .expect("the published older Back exposes its real cleanup batch token");
+        for _ in 0..16 {
+            settle_cleanup_system(app.world_mut());
+            if matches!(
+                app.world()
+                    .resource::<RouterNavigation>()
+                    .entries
+                    .iter()
+                    .find(|entry| entry.handle == router)
+                    .and_then(|entry| entry.engine.request(old_back))
+                    .map(|record| record.status().clone()),
+                Some(RequestStatus::Succeeded)
+            ) {
+                break;
+            }
+        }
+        assert!(matches!(
+            app.world()
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .and_then(|entry| entry.engine.request(old_back))
+                .map(|record| record.status().clone()),
+            Some(RequestStatus::Succeeded)
+        ));
+
+        let forward = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/c"))
+            .expect("the newer lineage publishes one fresh forward entry");
+        run_updates_until_succeeded(&mut app, forward);
+        let current_back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .expect("the newer history admits its own Back lineage");
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        publish_snapshots_system(app.world_mut());
+
+        let (
+            engine_before,
+            history_before,
+            current_request_before,
+            owner_before,
+            requests_before,
+            issuer_before,
+            world_before,
+            registry_before,
+            seal_before,
+            public_router_before,
+            public_old_before,
+            public_current_before,
+        ) = {
+            let world = app.world();
+            let entry = world
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("the newer Back retains its exact entry");
+            let current = entry
+                .engine
+                .request(current_back)
+                .expect("the newer Back request remains retained");
+            let snapshots = world.resource::<RouterSnapshots>();
+            let public_old = match snapshots.request(router, old_back) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                _ => panic!("the older Back remains publicly retained"),
+            };
+            let public_current = match snapshots.request(router, current_back) {
+                crate::snapshots::RequestLookup::Found(snapshot) => snapshot.clone(),
+                _ => panic!("the newer Back remains publicly retained"),
+            };
+            (
+                entry.engine.snapshot(),
+                entry.engine.history().clone(),
+                (
+                    current.requested().cloned(),
+                    current.status().clone(),
+                    current.trace().to_vec(),
+                ),
+                ClassifierPermanentEntryLocalProjection::capture(entry),
+                entry.requests.clone(),
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("the newer Back retains its exact capacity issuer")
+                    .semantic_snapshot_for_test(),
+                authority_world_fingerprint(world),
+                world.resource::<RouteEntityRegistry>().records().to_vec(),
+                world.resource::<RouteEntityRegistry>().latest_issued_seal(),
+                snapshots
+                    .get(router)
+                    .expect("the newer Back has a public router snapshot")
+                    .clone(),
+                public_old,
+                public_current,
+            )
+        };
+        #[cfg(feature = "test-support")]
+        let audit_before = app
+            .world()
+            .resource::<RouterAuthorityAudits>()
+            .get(router)
+            .expect("the newer Back has one authority audit")
+            .clone();
+
+        let assert_current_exact = |app: &App| {
+            let world = app.world();
+            let entry = world
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .find(|entry| entry.handle == router)
+                .expect("stale replay retains the newer RouterEntry");
+            let current = entry
+                .engine
+                .request(current_back)
+                .expect("stale replay retains the newer Back request");
+            assert_eq!(entry.engine.snapshot(), engine_before);
+            assert_eq!(entry.engine.history(), &history_before);
+            assert_eq!(
+                (
+                    current.requested().cloned(),
+                    current.status().clone(),
+                    current.trace().to_vec(),
+                ),
+                current_request_before
+            );
+            assert!(
+                ClassifierPermanentEntryLocalProjection::capture(entry) == owner_before,
+                "stale replay must preserve the exact newer ECS owner projection"
+            );
+            assert_eq!(entry.requests, requests_before);
+            assert_eq!(
+                entry
+                    .back_capacity_issuer
+                    .as_ref()
+                    .expect("stale replay retains the newer capacity issuer")
+                    .semantic_snapshot_for_test(),
+                issuer_before
+            );
+            let (driving, task) = match (
+                entry.pending_back_target_execution.as_ref(),
+                entry
+                    .pending_commit
+                    .as_ref()
+                    .and_then(|pending| pending.final_task.as_ref()),
+            ) {
+                (Some(PendingBackTargetExecution::Driving(driving)), Some(task)) => (driving, task),
+                _ => panic!("stale replay must preserve the newer whole Driving owner"),
+            };
+            assert!(matches!(
+                entry.engine.validate_back_target_execution_pairing(
+                    BackTargetExecutionOwnerRef::Driving {
+                        history: &driving.history,
+                        continuation: &driving.continuation,
+                    },
+                    BackTargetPhysicalOwnerRef::FrameTask(task),
+                ),
+                BackTargetExecutionPairingOutcome::Matched
+            ));
+            assert_eq!(authority_world_fingerprint(world), world_before);
+            assert_eq!(
+                world.resource::<RouteEntityRegistry>().records(),
+                registry_before
+            );
+            assert_eq!(
+                world.resource::<RouteEntityRegistry>().latest_issued_seal(),
+                seal_before
+            );
+            let snapshots = world.resource::<RouterSnapshots>();
+            assert_eq!(snapshots.get(router), Some(&public_router_before));
+            assert!(matches!(
+                snapshots.request(router, old_back),
+                crate::snapshots::RequestLookup::Found(snapshot)
+                    if snapshot == &public_old_before
+            ));
+            assert!(matches!(
+                snapshots.request(router, current_back),
+                crate::snapshots::RequestLookup::Found(snapshot)
+                    if snapshot == &public_current_before
+            ));
+            #[cfg(feature = "test-support")]
+            assert_eq!(
+                world.resource::<RouterAuthorityAudits>().get(router),
+                Some(&audit_before)
+            );
+        };
+        assert_current_exact(&app);
+
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == router)
+                    .expect("the stale report reaches the newer entry's real consumer");
+                let mut pending = entry
+                    .pending_commit
+                    .take()
+                    .expect("the newer Back retains its whole pending commit");
+                let current_task = pending
+                    .final_task
+                    .take()
+                    .expect("the newer Back retains its real current final task");
+                assert!(entry.engine.is_current_root_back_frame_task(&current_task));
+
+                let RouteBackTargetAppliedOutcome::NonTarget {
+                    mut pending,
+                    task: returned_stale,
+                    report,
+                } = route_back_target_applied_report(
+                    world,
+                    entry,
+                    pending,
+                    stale_task,
+                    BackTargetAppliedReport::LegacyLeaf,
+                )
+                else {
+                    panic!(
+                        "the ECS current-task predicate must reject and return the whole stale applied input"
+                    )
+                };
+                assert!(!entry
+                    .engine
+                    .is_current_root_back_frame_task(&returned_stale));
+                assert!(pending.final_task.is_none());
+                pending.final_task = Some(current_task);
+                entry.pending_commit = Some(pending);
+                drop(returned_stale);
+                drop(report);
+            },
+        );
+        publish_snapshots_system(app.world_mut());
+        assert_current_exact(&app);
+
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the stale receipt reaches the newer entry's real consumer");
+            assert_eq!(
+                entry.engine.observe_cleanup_receipt(
+                    &stale_cleanup,
+                    bevy_ui_router_core::prelude::CleanupDisposition::AlreadyAbsent,
+                ),
+                Err(IntegrationError::Stale)
+            );
+        }
+        publish_snapshots_system(app.world_mut());
+        assert_current_exact(&app);
+
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .expect("the stale publication reaches the newer entry's real consumer");
+            assert!(matches!(
+                entry
+                    .engine
+                    .prepare_commit(&stale_publication_ticket, CleanupManifest::empty(),),
+                Err(IntegrationError::Stale)
+            ));
+        }
+        publish_snapshots_system(app.world_mut());
+        assert_current_exact(&app);
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct ReadyPlanPermanentSourceProjection {
         physical: ClassifierPermanentSourceProjection,
@@ -30708,8 +33927,14 @@ pub(crate) mod tests {
     }
 
     #[derive(Clone, Eq, PartialEq)]
+    enum TargetPermanentSourceProjection {
+        Classifier(ClassifierPermanentSourceProjection),
+        ReadyPlan(ReadyPlanPermanentSourceProjection),
+    }
+
+    #[derive(Clone, Eq, PartialEq)]
     struct TargetPermanentDispositionProjection {
-        source: ReadyPlanPermanentSourceProjection,
+        source: TargetPermanentSourceProjection,
         lineage_router: RouterHandle,
         lineage_host: Entity,
         lineage_ticket: ViewReportIdentity,
@@ -30738,26 +33963,36 @@ pub(crate) mod tests {
 
     impl TargetPermanentDispositionProjection {
         fn capture_cleanup(cleanup: &TargetPreparationPermanentCleanupOwner) -> Self {
-            let FrozenTargetPreparationPermanentBranch::ReadyPlan {
-                physical,
-                normal_frozen_manifest,
-                normal_manifest,
-                evidence,
-            } = &cleanup.branch
-            else {
-                panic!("the dispatch RED uses the real ReadyPlan branch producer")
+            let source = match &cleanup.branch {
+                FrozenTargetPreparationPermanentBranch::Classifier { physical, evidence } => {
+                    TargetPermanentSourceProjection::Classifier(
+                        ClassifierPermanentSourceProjection::capture_parts(
+                            &physical.splice,
+                            &physical.history,
+                            evidence,
+                        ),
+                    )
+                }
+                FrozenTargetPreparationPermanentBranch::ReadyPlan {
+                    physical,
+                    normal_frozen_manifest,
+                    normal_manifest,
+                    evidence,
+                } => {
+                    TargetPermanentSourceProjection::ReadyPlan(ReadyPlanPermanentSourceProjection {
+                        physical: ClassifierPermanentSourceProjection::capture_parts(
+                            &physical.classified.splice,
+                            &physical.classified.history,
+                            evidence,
+                        ),
+                        focus_leaving: physical.focus_leaving.clone(),
+                        frozen_manifest: normal_frozen_manifest.clone(),
+                        manifest: normal_manifest.projection(),
+                    })
+                }
             };
             Self {
-                source: ReadyPlanPermanentSourceProjection {
-                    physical: ClassifierPermanentSourceProjection::capture_parts(
-                        &physical.classified.splice,
-                        &physical.classified.history,
-                        evidence,
-                    ),
-                    focus_leaving: physical.focus_leaving.clone(),
-                    frozen_manifest: normal_frozen_manifest.clone(),
-                    manifest: normal_manifest.projection(),
-                },
+                source,
                 lineage_router: cleanup.physical.lineage.router,
                 lineage_host: cleanup.physical.lineage.host,
                 lineage_ticket: cleanup.physical.lineage.ticket.clone(),
@@ -31309,6 +34544,7 @@ pub(crate) mod tests {
         parent: Option<Entity>,
         children: Vec<Entity>,
         registry_claim: Option<ExactRegistryClaim>,
+        registry_manifest: Option<ComponentManifest>,
         ownership_seal: Option<RouteOwnershipSeal>,
         manifest: Option<ComponentManifest>,
         frame_lifecycle: Option<FrameLifecycle>,
@@ -31328,6 +34564,7 @@ pub(crate) mod tests {
                 parent: observed.parent,
                 children: observed.children.clone(),
                 registry_claim: observed.registry_claim.clone(),
+                registry_manifest: observed.registry_manifest.clone(),
                 ownership_seal: observed.ownership_seal,
                 manifest: observed.manifest.clone(),
                 frame_lifecycle: observed.frame_lifecycle,
@@ -31363,6 +34600,10 @@ pub(crate) mod tests {
                             .resource::<RouteEntityRegistry>()
                             .record(entity)
                             .map(|record| record.claim()),
+                        registry_manifest: world
+                            .resource::<RouteEntityRegistry>()
+                            .record(entity)
+                            .map(|record| record.manifest().clone()),
                         ownership_seal: world.get::<RouteOwnershipSeal>(entity).copied(),
                         manifest: ComponentManifest::from_world(world, entity),
                         frame_lifecycle: world.get::<FrameLifecycle>(entity).copied(),
@@ -34550,6 +37791,9 @@ pub(crate) mod tests {
             TargetPreparationPermanentInertEvidence::AttemptUnavailable(_) => "attempt",
             TargetPreparationPermanentInertEvidence::SettlementRejected(_) => "settlement",
             TargetPreparationPermanentInertEvidence::PostWriteRefreeze(_) => "postwrite",
+            TargetPreparationPermanentInertEvidence::RepairPostWriteRefreeze(_) => {
+                "repair-postwrite"
+            }
             TargetPreparationPermanentInertEvidence::SettlementPrewriteRefreeze(evidence) => {
                 let _ = (evidence.source, &evidence.failure);
                 "settlement-prewrite"
@@ -36542,7 +39786,7 @@ pub(crate) mod tests {
             .find("prepare_target_preparation_permanent_current_isolation(")
             .expect("a later Current tick must prepare isolation before writing");
         let isolation_apply = current_compact
-            .find("letapplied=prepared.apply(")
+            .find("letapplied=matchprepared.apply(")
             .expect("the fully prepared isolation must expose one apply boundary");
         let postwrite_refreeze = current_compact
             .find("target_preparation_permanent_postwrite_refreeze(")
@@ -36555,16 +39799,8 @@ pub(crate) mod tests {
             "Prepared activation, Current preparation, apply and postwrite refreeze must remain ordered"
         );
         for forbidden in [
-            "world.entity_mut",
             "world.despawn",
             ".despawn(",
-            ".flush(",
-            ".insert(",
-            ".remove(",
-            "resource_mut",
-            "get_resource_mut",
-            "UnsafeWorldCell",
-            "Commands",
             "observe_cleanup_receipts",
             "receipt",
             ".attempt(",
@@ -55376,7 +58612,7 @@ pub(crate) mod tests {
             panic!("live host binding drift must retain source evidence")
         };
         assert!(evidence.expected.host == evidence.observed.host);
-        assert!(evidence.expected.observed == evidence.observed.observed);
+        assert!(evidence.expected.observed != evidence.observed.observed);
         assert!(evidence.expected.host_binding_is_current);
         assert!(!evidence.observed.host_binding_is_current);
         assert!(
