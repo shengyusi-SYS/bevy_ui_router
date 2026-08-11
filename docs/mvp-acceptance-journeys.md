@@ -64,11 +64,11 @@ Facade journey 的“稳定”只依赖生产观察面：该 router 没有 runni
 - **When**：在一次 `App::update` 前连续入队两个 `back()`。
 - **Then**：两个 queued request 均可观察 `requested=None`。第一个成功后 cursor 到 `/items/1`；第二个成为 running 时重新预览，因没有前项而以 `requested=None + Failed(BackTargetUnavailable)` 终结，不渲染 fallback，不改变 active/history，并留下 `HistoryIntentRejected` trace。该 no-target terminal 必须由 `ProvenEmptyProjection`、canonical zero manifest 与 exact zero completion 证明，不能由空 logical roots 推导。若第一个 back 因 view failure 失败，cursor 不动，第二个可重新预览并独立冻结 `requested=Some(/items/1)` 后尝试。
 
-`late-bound back complete evidence` — PLANNED（Back failure；C3 双分支尚未激活）
+`late-bound back complete evidence` — ACTIVE（Back failure；`complete C3 two-branch PASS`）
 
 `NavigationEnqueueErrorKind::IdentityExhausted` — ACTIVE（Replace；allocator-derived public RED/GREEN PASS）
 
-`IdentityExhausted` 与 `NavigationRequestSnapshot::requested -> Option` 已分别在 Replace、Back execution slice 激活；只有 `late-bound back complete evidence` 仍是 Back failure slice 的计划合同，以上状态不声明整体 History PASS。独立 facade consumer gate 从真实 allocator/domain capacity predicate 导出 `IdentityExhausted`；test seam 只能改变该 predicate 的输入事实。该错误不创建 request、request id、公开 queue/request/World 变化或 terminal，已消费 private identity 不复用。back 的 enqueue precedence `UnknownRouter -> availability -> NoBackEntry -> IdentityExhausted` 已由 Back execution public contract 固定。
+`IdentityExhausted`、`NavigationRequestSnapshot::requested -> Option` 与 `late-bound back complete evidence` 已分别在 Replace、Back execution、Back failure slice 激活；这些状态只声明 History 公开合同 PASS，不声明 Recovery 或整体 MVP PASS。独立 facade consumer gate 从真实 allocator/domain capacity predicate 导出 `IdentityExhausted`；test seam 只能改变该 predicate 的输入事实。该错误不创建 request、request id、公开 queue/request/World 变化或 terminal，已消费 private identity 不复用。back 的 enqueue precedence `UnknownRouter -> availability -> NoBackEntry -> IdentityExhausted` 已由 Back execution public contract 固定。
 
 ### Journey D：view、mount 与 error recovery
 

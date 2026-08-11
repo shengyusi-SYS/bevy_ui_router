@@ -28,7 +28,7 @@ fn history_profile_has_exact_back_execution_slice_machine_state() {
         std::collections::BTreeSet::from([
             ("NavigationRequestSnapshot::requested -> Option", "active",),
             ("NavigationEnqueueErrorKind::IdentityExhausted", "active",),
-            ("late-bound back complete evidence", "planned"),
+            ("late-bound back complete evidence", "active"),
         ])
     );
     assert_eq!(profile.authority_additions.len(), 1);
@@ -36,7 +36,7 @@ fn history_profile_has_exact_back_execution_slice_machine_state() {
         profile
             .authority_additions
             .iter()
-            .all(|row| row.state == "planned")
+            .all(|row| row.state == "active")
     );
 }
 
