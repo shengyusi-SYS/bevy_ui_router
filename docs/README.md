@@ -1,8 +1,8 @@
 # Bevy UI Router 文档索引
 
-**状态**: Phase 3B.1 `Plan PASS`
-**基准提交**: `23fe826033d09716553dd6922dd204c4a45b1a6c`
-**更新时间**: 2026-07-11
+**状态**: Phase 3B.1 `History PASS`
+**基准提交**: History implementation `be25dbe` 至 `e001345`，contract activation `f0fcc2e`
+**更新时间**: 2026-08-11
 
 ## 权威顺序
 
@@ -19,7 +19,7 @@
 9. [Roadmap](roadmap.md) 的执行顺序。
 10. 历史计划、研究资料和审查记录仅作为证据，不定义当前目标。
 
-History 实施期间，唯一 active stage profile 是 [History 阶段设计](superpowers/specs/2026-07-20-history-design.md) 的机器表 `10.1–10.3`。它只登记本阶段的 exclusions、contract delta 与 authority catalogue，不取代以上 canonical 文档的权威顺序；其余历史 spec/plan 仍为 evidence-only。
+History completion gate 已通过，[History 阶段设计](superpowers/specs/2026-07-20-history-design.md) 的机器表 `10.1–10.3` 现作为已完成阶段的历史证据，记录最终 exclusions、三个 active contract delta 与 Root 20 + Nested 3 + History 1 = 24 的 authority catalogue。当前下一阶段是 Recovery；在 Recovery spec/plan 与完整矩阵独立 PASS 前，不存在可替代 canonical 文档的 Recovery active profile。
 
 ## 当前文档
 
@@ -36,8 +36,8 @@ History 实施期间，唯一 active stage profile 是 [History 阶段设计](su
 | [整体实施目标规划](implementation-goals.md) | 概括 MVP 实施目标、阶段主线、质量门槛与范围控制 |
 | [Root Push 阶段合同 Profile](root-push-contract-profile.md) | 从最终 facade 合同中选择 Root push 已兑现能力、延后项与回归 catalogue |
 | [Nested Push 阶段合同 Profile](nested-push-contract-profile.md) | 收窄首次嵌套 push、sealed child mount、逐层 apply 与阶段 exclusions |
-| [History 阶段设计](superpowers/specs/2026-07-20-history-design.md) | History 实施期间唯一 active stage profile；机器表位于 `10.1–10.3` |
-| [History 实施计划](superpowers/plans/2026-07-20-history-implementation-plan.md) | History 的任务顺序与验证边界，除 active profile 外作为实施证据 |
+| [History 阶段设计](superpowers/specs/2026-07-20-history-design.md) | 已完成 History 的规范与最终机器 profile 历史证据；机器表位于 `10.1–10.3` |
+| [History 实施计划](superpowers/plans/2026-07-20-history-implementation-plan.md) | 已完成 History 的任务顺序、实现范围、复审与 completion gate 证据 |
 | [Root Push 实施计划](superpowers/plans/2026-07-11-root-push-implementation-plan.md) | Root push 的任务顺序、TDD 门禁、文件范围与提交边界 |
 | [Root Push 计划审查记录](superpowers/plans/2026-07-11-root-push-plan-review-log.md) | 记录多角度审查的共同根因、修订、复审与无需重写结论 |
 | [Phase 3B.1 Review Log](phase-3b1-architecture-review-log.md) | 记录审查共同根因、负责人处置和复审结论 |

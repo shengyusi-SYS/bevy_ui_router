@@ -2,9 +2,9 @@
 
 **文档类型**: 当前事实
 
-**状态**: Reconciliation PASS
+**状态**: History PASS
 
-**as_of**: 精确干净树 `5806c59`
+**as_of**: History implementation `be25dbe` through `e001345` inclusive，final contract activation `f0fcc2e`
 
 **事实来源**: workspace manifest、实现、固定测试、公开旅程、已执行门禁与最终独立复审
 
@@ -12,16 +12,18 @@
 
 ## 1 当前定位
 
-Root Push、Nested Push 与 Reconciliation Tasks 1–8 已闭合
+Root Push、Nested Push、Reconciliation 与 History 已闭合；当前下一阶段是 Recovery
 
 Reconciliation 的当前事实必须按四个层次分别读取
 
 - **Implemented**：Core 已实现 slot-aware common-prefix projection、sealed frame/slot roles、common-prefix-preserving suffix splice、request ordering、逻辑 router/host/slot/frame/request/transaction/task IDs、与 exact frame identity 绑定的 generation 及 terminal ordering；ECS 已实现 exact Entity validation、manifest、physical authority identity、attempt、ledger、receipt、physical splice、cleanup 与最小 pre-commit authority settlement
 - **Integrated**：上述能力已接入既有 Core → View → ECS → facade 主链，仍由 Core 作为唯一逻辑 lifecycle publisher，没有第二套 reconciliation runtime、publisher 或逻辑 route/lifecycle allocator
-- **Facade reachable**：navigation 只通过推荐 facade `push` 与真实 `App::update` 驱动；稳定 consumer 事实由 snapshot、trace 与只读 opaque audit 观察，commit-boundary interactive-leaf cardinality 另由 test-local、只读、非权威的 `World + RouterInputGate` sampler 验证
+- **Facade reachable**：navigation 只通过推荐 facade `push`、`replace`、`back` 与真实 `App::update` 驱动；稳定 consumer 事实由 snapshot、trace 与只读 opaque audit 观察，commit-boundary interactive-leaf cardinality 另由 test-local、只读、非权威的 `World + RouterInputGate` sampler 验证
 - **Demonstrated**：公开旅程已证明 Journey B 与 nested fragment；Core/ECS 回归已证明 append、truncate、suffix replace、equivalent physical no-op、exact physical cleanup 与 Profile 所述的 scoped pre-commit authority-loss settlement。Equivalent 路径 zero entering/leaving/effect 且 physical zero mutation，但仍正常发布 request 与 push history
 
 Task 8 focused/full workspace 门禁已在精确干净 `5806c59` 树上通过，四路独立复审均通过，阶段结论为 Reconciliation PASS
+
+History 在唯一 Core history publisher 下接通了 facade `replace` 与 late-bound relative `back`。Back 只在成为 running 后从 live canonical history 解析一次 target；成功 publication 同步提交 presentation/history，no-target、route failure、pre-commit authority loss、stale/ABA replay 与 cleanup completion 都保留 exact typed owner/evidence 并有界终结。公共 C1–C3、authority audit、ECS 私有回归、facade consumer/compile-fail 与 workspace completion gate 已闭合，阶段结论为 History PASS。
 
 ## 2 Authority 与 owner 边界
 
@@ -81,7 +83,7 @@ Update: ObserveAuthority
 - locked Bevy layout、visibility、native picking 与 target event delivery
 - parent outlet 登记后 root-to-leaf apply，完整 branch 一次 preflight 与一次 Core publication
 - frame-local traversal、input/focus barrier、leaf-to-root exact cleanup 与 opaque outlet/content audit
-- Authority catalogue 为 Root 20 + Nested 3 = 23
+- Authority catalogue 为 Root 20 + Nested 3 + History 1 = 24
 
 ## 5 Reconciliation checkpoints
 
@@ -122,15 +124,28 @@ Update: ObserveAuthority
 - ECS ownership、slot lifecycle、physical preflight、cleanup 与 authority settlement：PASS after review fixes through draft5，no remaining Critical/Important/Minor
 - Public facade、Journey B、fragment 与 audit evidence：PASS after review fixes，no remaining Critical/Important/Minor
 
-## 8 后续边界
+## 8 History completion checkpoint
+
+- Planning/spec baseline：`be25dbe`
+- Runtime/evidence implementation range：`be25dbe` through `e001345` inclusive
+- Final contract activation sync：`f0fcc2e`
+- public/facade contract gate：101/101
+- workspace nextest：1108/1108，0 skipped，run ID `46cea8dc-76b7-4198-8ac4-2192716fc60c`
+- workspace doctest：28/28
+- workspace all-target/all-feature check、`cargo fmt --all -- --check` 与 `git diff --check`：exit `0`
+- authority catalogue/script：24/24/24
+- Core lifecycle/history authority、ECS physical authority/cleanup layering、public facade/canonical facts 三类复审均无剩余 Critical/Important
+
+以上只证明 History PASS；post-commit compound settlement、host re-admission/new epoch rebuild、background reaper、完整 Recovery journey 与最终 MVP gate 不在该结论内。
+
+## 9 后续边界
 
 尚未完成
 
-- `replace`/`back` 与完整 History
 - error presentation、mount recovery、post-commit host/registration loss 与 stale replay 的完整 Recovery
 - multi-router stress、完整 opaque audit、lease authority、background reaper 与 cleanup replay 的 Authority closure
 - `RouterInputProbes` 与对应公开 input journey
 - 最终 MVP gate
 - MVP 之后的 BSN adapter 与嵌套示例
 
-Reconciliation factual close 已完成。History runtime implementation 只能在其 spec/plan 与完整 role/topology/physical-drift/terminal matrix 分别通过独立复审后开始；后续切片继续复用唯一 authority、exact claim、registry-first、post-write validation 与 app-owned host zero-write 约束
+History factual close 已完成。Recovery runtime implementation 只能在其 spec/plan 与完整 role/topology/physical-drift/terminal matrix 分别通过独立复审后开始；后续切片继续复用唯一 authority、exact claim、registry-first、post-write validation 与 app-owned host zero-write 约束。

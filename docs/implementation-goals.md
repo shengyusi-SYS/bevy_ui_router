@@ -1,10 +1,10 @@
 # 整体实施目标规划
 
-**状态**：实施总纲 `Plan PASS`
+**状态**：实施总纲 `Plan PASS`；当前阶段 `History PASS`，Now = Recovery
 
 **前置条件**：Phase 3B.1 `Plan PASS`
 
-**更新日期**：2026-07-11
+**更新日期**：2026-08-11
 
 ## 总体目标
 
@@ -19,6 +19,8 @@
 5. **Recovery**：分别闭合三类终态：route-level match/view/mount 失败可提交 error presentation 或保留旧 active UI；host/authority loss 不渲染 fallback，并在安全 settlement 后清空失效 active；stale result 只丢弃或清理旧输出，不改变当前 request、presentation 与 history。
 6. **Authority closure**：补齐多 router、quarantine、后台 reaper、真实 input probe 和攻击性回归，关闭绕过 facade 或伪造生命周期身份的路径。
 7. **MVP gate**：统一运行 facade journeys、authority audit、ECS 私有回归、feature/consumer compile gates 与 workspace 验证，并进行最终事实性审查。
+
+当前事实：Root push、Nested push、Reconciliation 与 History 已完成；History implementation 为 `be25dbe` 至 `e001345`，最终 contract activation 为 `f0fcc2e`，authority catalogue 为 24，workspace completion gate 为 1108/1108。下一阶段只推进 Recovery；Authority closure、`RouterInputProbes` 与 MVP gate 仍未完成，因此当前结论不是 MVP PASS。
 
 ## 执行与质量门槛
 

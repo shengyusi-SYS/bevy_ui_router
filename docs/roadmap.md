@@ -1,8 +1,8 @@
 # Roadmap
 
-**状态**: Phase 3B.1 `Reconciliation PASS`
+**状态**: Phase 3B.1 `History PASS`
 
-**更新时间**: 2026-07-20
+**更新时间**: 2026-08-11
 
 ## 已完成
 
@@ -25,23 +25,26 @@
   - Journey B、nested fragment、equivalent physical no-op 与 common-prefix-preserving suffix splice
   - Task 7 prerequisite `2e5cb3d`，public evidence `5806c59`，Task 8 focused/full gates 与四路独立复审
 
+- [x] **History**
+  - 推荐 facade `replace`、late-bound relative `back`、canonical history identity 与 publication-last history commit
+  - C1–C3 成功/失败/queued Back 公开旅程，pre-commit authority settlement、ABA/cross-incarnation/stale replay 与 exact cleanup owner closure
+  - implementation `be25dbe` 至 `e001345`，contract activation `f0fcc2e`，authority catalogue 24，workspace nextest 1108/1108
+
 ## Now
 
-1. **History stage spec/plan and complete matrix**
-   - 定义 `replace`、`back`、zero-entering、成功后 history commit 与失败保持语义
-   - 在同一阶段 spec/plan 中冻结完整 role/topology/physical-drift/terminal matrix，不新增第二份状态源
-   - spec/plan 与该完整 matrix 分别通过独立复审后，才开始 History runtime implementation
+1. **Recovery**
+   - 先形成并独立复审 Recovery spec/plan 与完整 role/topology/physical-drift/terminal matrix
+   - 闭合 view/mount failure、error presentation、post-commit host/registration loss、stale result cleanup 与新 epoch re-admission
+   - History PASS 不授权从已提交 presentation/history 回滚，也不允许绕过 exact settlement owner
 
 ## Next
 
-1. **Recovery**
-   - view/mount failure、error presentation、post-commit host loss 与 stale replay
-2. **Authority closure**
+1. **Authority closure**
    - multi-router stress、完整 opaque audit、lease authority、background reaper 与 cleanup replay
-3. **MVP gate**
+2. **MVP gate**
    - facade journeys、authority regressions、feature matrix、workspace tests 与独立 factual review
 
-完整 History runtime、Recovery、Authority closure、`RouterInputProbes` 与 MVP 均仍未完成；Reconciliation PASS 不等于 MVP PASS
+Recovery、Authority closure、`RouterInputProbes` 与 MVP 仍未完成；History PASS 不等于 Recovery PASS 或 MVP PASS。
 
 ## MVP 后
 

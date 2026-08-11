@@ -4,11 +4,13 @@
 >
 > Use `test-driven-development` for every production semantic change and `verification-before-completion` before every PASS or commit claim
 
-**Status:** Approved, independent plan review PASS 2026-07-20
+**Status:** Completion gate PASS；documentation close pending
 
 **Review:** no open Critical or Important findings
 
 **Planning baseline:** `be25dbe7ed087a5b80dd020a942223838a563032`
+
+**Implementation range:** `be25dbe` through `e001345` inclusive；final contract activation sync `f0fcc2e`
 
 **Stage spec:** `docs/superpowers/specs/2026-07-20-history-design.md`
 
@@ -3615,6 +3617,7 @@ git commit -m "feat: close history failure authority"
 - Modify after all gates pass: `docs/README.md`
 - Modify after all gates pass: `docs/authority-transition-matrix.md`
 - Modify after all gates pass: `docs/implementation-goals.md`
+- Modify after all gates pass: `docs/superpowers/README.md`
 - Modify after all gates pass: `.superpowers/sdd/progress.md`
 - Modify after all gates pass: `docs/superpowers/specs/2026-07-20-history-design.md`
 - Modify after all gates pass: `docs/superpowers/plans/2026-07-20-history-implementation-plan.md`
@@ -3625,7 +3628,7 @@ git commit -m "feat: close history failure authority"
 - Produces: History PASS fact and Recovery as the next active stage
 - Production semantics: none
 
-- [ ] **Step 1: Run focused public journeys and regressions**
+- [x] **Step 1: Run focused public journeys and regressions**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --no-default-features --features test-support --test public_navigation_journeys history_ -j 1
@@ -3643,7 +3646,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --
 
 Expected: C1–C3、F1–F3 and existing A/B/D regressions pass, catalogue exact union passes
 
-- [ ] **Step 2: Run full facade and crate gates**
+- [x] **Step 2: Run full facade and crate gates**
 
 ```powershell
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_core -j 1
@@ -3658,7 +3661,7 @@ cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test
 
 Expected: all commands exit `0`
 
-- [ ] **Step 3: Run workspace gates serially**
+- [x] **Step 3: Run workspace gates serially**
 
 ```powershell
 cargo nextest run --locked --workspace --all-features --config "build.rustc-wrapper = ''" -j 1
@@ -3670,7 +3673,7 @@ git diff --check
 
 Expected: every command exits `0`
 
-- [ ] **Step 4: Obtain final independent reviews**
+- [x] **Step 4: Obtain final independent reviews**
 
 Required PASS records
 
@@ -3680,7 +3683,7 @@ Required PASS records
 
 If any review or gate produces a real RED, return to its owning slice and repeat that slice review before resuming completion
 
-- [ ] **Step 5: Update facts only after successful gates**
+- [x] **Step 5: Update facts only after successful gates**
 
 Record
 
@@ -3693,10 +3696,12 @@ Record
 
 Set plan status to `Complete` and spec status to completed historical evidence
 
-- [ ] **Step 6: Validate documentation closure**
+Completion evidence: facade profile/compile-fail 101/101；workspace nextest 1108/1108（run ID `46cea8dc-76b7-4198-8ac4-2192716fc60c`）；workspace doctest 28/28；all-target/all-feature check、format、diff gates exit `0`；authority catalogue/script 24/24/24。History PASS 不声明 Recovery、Authority closure 或 MVP PASS。
+
+- [x] **Step 6: Validate documentation closure**
 
 ```powershell
-rg -n "History PASS|Recovery|24|be25dbe" docs/current-architecture.md docs/roadmap.md docs/README.md docs/authority-transition-matrix.md docs/implementation-goals.md .superpowers/sdd/progress.md docs/superpowers/specs/2026-07-20-history-design.md docs/superpowers/plans/2026-07-20-history-implementation-plan.md
+rg -n "History PASS|Recovery|24|be25dbe" docs/current-architecture.md docs/roadmap.md docs/README.md docs/authority-transition-matrix.md docs/implementation-goals.md docs/superpowers/README.md .superpowers/sdd/progress.md docs/superpowers/specs/2026-07-20-history-design.md docs/superpowers/plans/2026-07-20-history-implementation-plan.md
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router --test facade_export_allowlist -j 1
 cargo test --locked --config "build.rustc-wrapper = ''" -p bevy_ui_router_ecs --test authority_regression_catalogue -j 1
 git diff --check
@@ -3707,7 +3712,8 @@ Expected: facts agree, profile remains machine-valid, no current document claims
 - [ ] **Step 7: Commit History completion facts**
 
 ```powershell
-git add -- docs/current-architecture.md docs/roadmap.md docs/README.md docs/authority-transition-matrix.md docs/implementation-goals.md .superpowers/sdd/progress.md docs/superpowers/specs/2026-07-20-history-design.md docs/superpowers/plans/2026-07-20-history-implementation-plan.md
+git add -- docs/current-architecture.md docs/roadmap.md docs/README.md docs/authority-transition-matrix.md docs/implementation-goals.md docs/superpowers/README.md docs/superpowers/specs/2026-07-20-history-design.md docs/superpowers/plans/2026-07-20-history-implementation-plan.md
+git add -f -- .superpowers/sdd/progress.md
 git diff --cached --name-only
 git commit -m "docs: close history stage"
 ```
@@ -3724,16 +3730,16 @@ Expected: clean tree, completion commit visible, diff check exits `0`
 
 ## Plan Self-Review Checklist
 
-- [ ] Every spec section `1–14` maps to at least one task or explicit non-goal
-- [ ] Replace, Back execution, Back failure and Completion match the approved slice ownership
-- [ ] `requested Option`、`IdentityExhausted`、late-bound evidence and authority addition each activate in exactly one owning slice
-- [ ] public exclusions are removed only after the owning production journey is green
-- [ ] exact history identity is private and cannot be reconstructed from snapshots
-- [ ] manifest-neutral capacity and exact Entity manifest remain separate owners
-- [ ] pure no-target creates no fake frame/task identity
-- [ ] retry has only the two named producers and returns the original owner
-- [ ] precommit and postcommit authority boundaries are not conflated
-- [ ] no Task 6 step adds production semantics
-- [ ] every code and edge-case step contains concrete content
-- [ ] all later signatures match the interfaces introduced earlier
-- [ ] every commit uses an exact staged file list
+- [x] Every spec section `1–14` maps to at least one task or explicit non-goal
+- [x] Replace, Back execution, Back failure and Completion match the approved slice ownership
+- [x] `requested Option`、`IdentityExhausted`、late-bound evidence and authority addition each activate in exactly one owning slice
+- [x] public exclusions are removed only after the owning production journey is green
+- [x] exact history identity is private and cannot be reconstructed from snapshots
+- [x] manifest-neutral capacity and exact Entity manifest remain separate owners
+- [x] pure no-target creates no fake frame/task identity
+- [x] retry has only the two named producers and returns the original owner
+- [x] precommit and postcommit authority boundaries are not conflated
+- [x] no Task 6 step adds production semantics
+- [x] every code and edge-case step contains concrete content
+- [x] all later signatures match the interfaces introduced earlier
+- [x] every commit uses an exact staged file list

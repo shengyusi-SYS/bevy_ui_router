@@ -4,15 +4,15 @@
 
 **Spec independent review**: PASS，Core lifecycle、canonical boundary、stage profile 三路复审关闭全部 Critical/Important
 
-**Plan independent review**: 尚未开始
+**Plan independent review**: PASS，实施前审查无剩余 Critical/Important
 
-**Runtime gate**: Spec 与 Plan 必须分别 PASS 后才能修改 runtime
+**阶段状态**: Complete，History PASS；本文现为 completed historical evidence
 
-**事实基线**: Reconciliation PASS，`2fa5332`
+**事实基线**: implementation `be25dbe` through `e001345` inclusive；final contract activation `f0fcc2e`
 
-**阶段顺序**: History → Recovery → Authority closure → MVP gate
+**阶段顺序**: History PASS → Recovery（next）→ Authority closure → MVP gate
 
-**规范关系**: 本文记录已确认的 History 决策，并在 canonical README 完成显式登记后兼任阶段 profile，实施前仍须按文档权威顺序修订 Target、Authority Matrix、Facade Fixture、golden 与 journeys
+**规范关系**: 本文记录已完成 History 的规范、最终机器 profile 与 completion evidence；Recovery 必须建立并独立审查自身 spec/plan，不得把本文当作 Recovery runtime 授权
 
 ## 目标
 
@@ -1027,23 +1027,22 @@ final review 分为
 
 Critical 与 Important 关闭后收敛，不以增加重复 review 代替证据
 
-## 13 Documentation close
+## 13 History completion record
 
-History completion gate 通过后才更新
+History implementation range 固定为 `be25dbe` through `e001345` inclusive；`f0fcc2e` 只同步最终 active contract evidence，不增加 production semantics。
 
-- `docs/current-architecture.md`
-- `docs/roadmap.md`
-- `docs/README.md`
-- `docs/authority-transition-matrix.md` 的实现 checkpoint，或记录复核后无需事实改动
-- `docs/implementation-goals.md` 中的当前阶段事实
-- `.superpowers/sdd/progress.md`
-- 本 profile 的 activation/exclusion 状态
+completion gate 的实际成功输出：
 
-事实文档只记录实际提交与成功命令输出
+- final facade profile/compile-fail gate：101/101
+- `cargo nextest run --locked --workspace --all-features --config "build.rustc-wrapper = ''" -j 1`：1108/1108，0 skipped，run ID `46cea8dc-76b7-4198-8ac4-2192716fc60c`
+- `cargo test --locked --workspace --doc --config "build.rustc-wrapper = ''" -j 1`：28/28
+- `cargo check --locked --workspace --all-targets --all-features --config "build.rustc-wrapper = ''" -j 1`：exit `0`
+- `cargo fmt --all -- --check` 与 `git diff --check`：exit `0`
+- Root 20 + Nested 3 + History 1 authority catalogue/script：24/24/24
 
-Roadmap 进入 Recovery，不能写 `MVP PASS`
+Core lifecycle/history authority、ECS physical authority/cleanup layering、public facade/canonical facts 三类审查均无剩余 Critical/Important。机器表 `10.1–10.3` 保留最终 active 行作为 completed historical evidence。
 
-历史 Reconciliation profile 保持为历史证据，不回写
+canonical facts 已同步到 current architecture、roadmap、README、Authority Matrix、implementation goals 与 SDD progress。Roadmap 进入 Recovery；Recovery、Authority closure 与 MVP gate 均未 PASS，不能写 `MVP PASS`。历史 Reconciliation profile 保持为历史证据，不回写。
 
 ## 14 实施纪律
 

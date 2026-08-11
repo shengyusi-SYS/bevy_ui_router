@@ -1,10 +1,10 @@
 # Authority Transition Matrix
 
 **文档类型**: Phase 3B.1 生命周期规范附录
-**状态**: Phase 3B.1 `Plan PASS`
+**状态**: Phase 3B.1 `History PASS`；Recovery semantics 仍为计划合同
 **架构上位规范**: [Target Architecture](target-architecture.md)
 
-**`ddce26d` pre-commit checkpoint**：仅最小 pre-commit settlement 已实现，post-commit Recovery 仍待完成
+**History checkpoint**：implementation `be25dbe` 至 `e001345`，contract activation `f0fcc2e`。History 的 pre-commit authority precedence、late-bound Back、failure/no-target cleanup 与 terminal owner closure 已通过 completion gate；post-commit compound settlement、host re-admission 与完整 Recovery 仍待完成。
 
 Target Architecture 拥有架构边界与不变量；本文拥有 token、closure、cleanup、quarantine 与 request terminal 的详细转换语义。本文不得改变 Target 的 ownership/依赖边界；若两者在生命周期细节上冲突，以本文为准。
 
@@ -238,7 +238,7 @@ terminal evidence 还必须证明该 request/settlement scope 不再持有 outst
 
 ### 9.1 History request and cleanup boundary
 
-以下是 runtime 前冻结的 History contract，不表示当前 runtime 已完成。pre-commit 的 host、current、preserved 或 leaving authority loss 优先于 resolved target、pending rejection、route failure 与 no-target；它取消或消费原 history owner、history 保持旧值，并进入既有 scoped authority settlement。`CommitPublished` 后 capability 已消费，History 只冻结不回滚边界；ordinary drift 保持原 immutable ledger，authority loss 或不能按 receipt/quarantine 收敛的异常属于 Recovery 的 compound settlement。
+以下 History contract 已由 implementation `be25dbe` 至 `e001345` 与 completion gate 闭合。pre-commit 的 host、current、preserved 或 leaving authority loss 优先于 resolved target、pending rejection、route failure 与 no-target；它取消或消费原 history owner、history 保持旧值，并进入既有 scoped authority settlement。`CommitPublished` 后 capability 已消费，History 只冻结不回滚边界；ordinary drift 保持原 immutable ledger，authority loss 或不能按 receipt/quarantine 收敛的异常仍属于下一阶段 Recovery 的 compound settlement，本文中的 Recovery 行不是当前完成事实。
 
 | Case | Cleanup scope | Continuation | requested / terminal |
 | --- | --- | --- | --- |

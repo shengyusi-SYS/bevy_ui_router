@@ -1,19 +1,19 @@
 # 历史计划与审查证据
 
-**状态**: History active-profile exception；其余 frozen historical evidence
-**冻结日期**: 2026-07-10
-**冻结基准**: `23fe826033d09716553dd6922dd204c4a45b1a6c`
+**状态**: frozen historical evidence；History profile 已完成
+**冻结日期**: 2026-08-11
+**冻结基准**: History final contract activation `f0fcc2e`
 **superseded_by**: `docs/current-architecture.md`、`docs/target-architecture.md`、`docs/mvp-acceptance-journeys.md`
 
-## 当前 History profile
+## 已完成 History profile
 
-[History 阶段设计](specs/2026-07-20-history-design.md) 的 `10.1 Public contract and stage exclusions`、`10.2 Contract delta activation` 与 `10.3 History authority regression additions` 是实施期间唯一 active stage profile。它们只选择当前切片的既有 canonical contract，不建立第二份 roadmap 或规范正文。
+[History 阶段设计](specs/2026-07-20-history-design.md) 的 `10.1 Public contract and stage exclusions`、`10.2 Contract delta activation` 与 `10.3 History authority regression additions` 保存 History PASS 时的最终机器 profile，现为 completed historical evidence。它们不建立第二份 roadmap 或规范正文，也不授权 Recovery runtime。
 
-[History 实施计划](plans/2026-07-20-history-implementation-plan.md) 只约束任务顺序与验证边界，不改变 canonical authority，也不定义当前完成度。其他 historical spec、plan 和审查记录均保持 evidence-only。
+[History 实施计划](plans/2026-07-20-history-implementation-plan.md) 记录已完成任务顺序、验证边界与 completion evidence，不改变 canonical authority。当前完成度只由 canonical current facts 与 roadmap 定义；所有 historical spec、plan 和审查记录均保持 evidence-only。
 
 ## 证据范围
 
-本目录下现有 `plans/` 与 `specs/` 文件记录过去的决策、任务拆分、审查过程和当时的验证结论。除上节列出的 History active profile 外，它们不定义当前架构、当前进度或 MVP 完成度。
+本目录下现有 `plans/` 与 `specs/` 文件记录过去的决策、任务拆分、审查过程和当时的验证结论。它们不定义当前架构、当前进度或 MVP 完成度。
 
 这些文件仍可用于：
 
