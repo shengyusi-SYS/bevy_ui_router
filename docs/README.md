@@ -1,8 +1,12 @@
 # Bevy UI Router 文档索引
 
-**状态**: Phase 3B.1 `History PASS`
+## Recovery current-stage activation
+
+The current active spec/plan pair is [Recovery 阶段设计](superpowers/specs/2026-08-12-recovery-design.md) and [Recovery 实施计划](superpowers/plans/2026-08-12-recovery-implementation-plan.md). History is completed historical evidence. The active profile takes Recovery 10.1 as the ten current exclusions, preserves History's three active deltas, appends three planned Recovery deltas, exposes zero active Recovery authority rows, and keeps the runtime catalogue at 24. This is not a Recovery PASS, full Journey G, or MVP PASS claim; background old-lease reap remains Authority-closure work.
+
+**状态**: Phase 3B.1 `Recovery` current stage; History is completed historical evidence
 **基准提交**: History implementation `be25dbe` 至 `e001345`，contract activation `f0fcc2e`
-**更新时间**: 2026-08-11
+**更新时间**: 2026-08-12
 
 ## 权威顺序
 
@@ -19,7 +23,7 @@
 9. [Roadmap](roadmap.md) 的执行顺序。
 10. 历史计划、研究资料和审查记录仅作为证据，不定义当前目标。
 
-History completion gate 已通过，[History 阶段设计](superpowers/specs/2026-07-20-history-design.md) 的机器表 `10.1–10.3` 现作为已完成阶段的历史证据，记录最终 exclusions、三个 active contract delta 与 Root 20 + Nested 3 + History 1 = 24 的 authority catalogue。当前下一阶段是 Recovery；在 Recovery spec/plan 与完整矩阵独立 PASS 前，不存在可替代 canonical 文档的 Recovery active profile。
+History completion gate 已通过，[History 阶段设计](superpowers/specs/2026-07-20-history-design.md) 的机器表 `10.1–10.3` 现作为已完成阶段的历史证据，记录三个 active contract delta 与 Root 20 + Nested 3 + History 1 = 24 的 authority catalogue。当前 canonical/profile pair 是 [Recovery 阶段设计](superpowers/specs/2026-08-12-recovery-design.md) 与 [Recovery 实施计划](superpowers/plans/2026-08-12-recovery-implementation-plan.md)：它保留 History active 3、追加 Recovery planned 3，当前 exclusions 为 10，Recovery active authority 为 0，runtime catalogue 保持 24。该 activation 不声明 Recovery PASS、完整 Journey G 或 MVP PASS；old-lease reap 仍属 Authority closure。
 
 ## 当前文档
 

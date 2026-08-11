@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -291,6 +291,186 @@ fn parse_history_authority_rows(markdown: &str) -> Vec<HistoryAuthorityRow> {
     rows
 }
 
+fn parse_recovery_authority_rows(markdown: &str) -> Vec<HistoryAuthorityRow> {
+    parse_recovery_authority_rows_with_source(
+        markdown,
+        &parse_rust(package_root().join("src/authority_regression_tests.rs")),
+    )
+}
+
+fn parse_recovery_authority_rows_with_source(
+    markdown: &str,
+    authority_source: &syn::File,
+) -> Vec<HistoryAuthorityRow> {
+    let lines = markdown.lines().collect::<Vec<_>>();
+    let heading = "### 10.3 Recovery authority regression additions";
+    let headings = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (*line == heading).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        headings.len(),
+        1,
+        "Recovery authority heading must occur exactly once"
+    );
+    let section_end = (headings[0] + 1..lines.len())
+        .find(|index| lines[*index].starts_with("## "))
+        .unwrap_or(lines.len());
+    let section = &lines[headings[0] + 1..section_end];
+    let table_start = section
+        .iter()
+        .position(|line| line.trim_start().starts_with('|'))
+        .expect("Recovery authority section must start with a table");
+    assert!(
+        !section[..table_start]
+            .iter()
+            .any(|line| line.trim_start().starts_with('|')),
+        "Recovery authority section must not skip an earlier table"
+    );
+    let table_end = table_start
+        + section[table_start..]
+            .iter()
+            .take_while(|line| line.trim_start().starts_with('|'))
+            .count();
+    assert!(
+        !section[table_end..]
+            .iter()
+            .any(|line| line.trim_start().starts_with('|')),
+        "Recovery authority section must contain one contiguous table"
+    );
+    let table = &section[table_start..table_end];
+    assert_eq!(
+        table.first().copied(),
+        Some("| Test function | Owning slice | State |"),
+        "Recovery authority table must use the exact header"
+    );
+    assert_eq!(
+        table.get(1).copied(),
+        Some("| --- | --- | --- |"),
+        "Recovery authority table must use the exact separator"
+    );
+    let rows = table[2..]
+        .iter()
+        .map(|row| {
+            let cells = row
+                .trim()
+                .trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().trim_matches(char::from(96)).to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(cells.len(), 3, "Recovery authority row width drifted");
+            HistoryAuthorityRow {
+                test_function: cells[0].clone(),
+                state: cells[2].clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !rows.is_empty(),
+        "Recovery authority table must not be empty"
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.test_function.as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        rows.len(),
+        "Recovery authority rows must have unique test functions"
+    );
+    let expected = BTreeMap::from([
+        (
+            "error_outlet_role_classification_is_preserved",
+            "R1 Error presentation",
+        ),
+        (
+            "post_commit_host_loss_preserves_committed_history",
+            "R2 Compound settlement",
+        ),
+        (
+            "host_reacceptance_detaches_old_top_slot",
+            "R3 Re-admission/stale output",
+        ),
+    ]);
+    let actual = table[2..]
+        .iter()
+        .map(|row| {
+            let cells = row
+                .trim()
+                .trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().trim_matches(char::from(96)))
+                .collect::<Vec<_>>();
+            assert!(
+                !cells[0].is_empty(),
+                "Recovery authority test function must not be empty"
+            );
+            assert!(
+                matches!(
+                    cells[1],
+                    "R1 Error presentation"
+                        | "R2 Compound settlement"
+                        | "R3 Re-admission/stale output"
+                ),
+                "unknown Recovery authority owning slice: {}",
+                cells[1]
+            );
+            assert!(
+                matches!(cells[2], "planned" | "active"),
+                "unknown Recovery authority state: {}",
+                cells[2]
+            );
+            (cells[0], cells[1])
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual,
+        expected.into_iter().collect::<BTreeSet<_>>(),
+        "Recovery authority rows must match the canonical test/slice vocabulary"
+    );
+    for row in rows.iter().filter(|row| row.state == "active") {
+        assert_exact_direct_authority_test(authority_source, &row.test_function);
+    }
+    rows
+}
+
+fn assert_exact_direct_authority_test(source: &syn::File, name: &str) {
+    let matches = source
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Fn(function) if function.sig.ident == name => Some(function),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matches.len(),
+        1,
+        "active Recovery authority row {name} must have one direct test"
+    );
+    let function = matches[0];
+    assert_eq!(
+        function
+            .attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("test"))
+            .count(),
+        1,
+        "active Recovery test {name} must have one #[test]"
+    );
+    assert!(
+        !has_attr(&function.attrs, "ignore"),
+        "active Recovery test {name} must not be ignored"
+    );
+    assert!(
+        !function
+            .attrs
+            .iter()
+            .any(|attr| attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr")),
+        "active Recovery test {name} must not have cfg filtering"
+    );
+}
+
 #[derive(Debug)]
 struct HistoryRequestBoundaryRow {
     case: String,
@@ -480,6 +660,145 @@ fn history_authority_parser_ignores_later_tables_in_the_same_section() {
     assert_eq!(rows.len(), 1);
 }
 
+fn recovery_authority_source() -> String {
+    fs::read_to_string(
+        workspace_root().join("docs/superpowers/specs/2026-08-12-recovery-design.md"),
+    )
+    .expect("Recovery profile must be readable")
+}
+
+#[test]
+fn recovery_authority_parser_requires_exact_unique_first_table() {
+    let source = recovery_authority_source();
+    let _control = parse_recovery_authority_rows(&source);
+    let malformed = [
+        source.replacen(
+            "### 10.3 Recovery authority regression additions",
+            "prefix ### 10.3 Recovery authority regression additions",
+            1,
+        ),
+        format!("{source}\n### 10.3 Recovery authority regression additions\n"),
+        source.replacen(
+            "### 10.3 Recovery authority regression additions\n\n| Test function |",
+            "### 10.3 Recovery authority regression additions\n\n | Test function | Owning slice | State |\n | --- | --- | --- |\n | `indented_before_table` | R1 Error presentation | planned |\n\n| Test function |",
+            1,
+        ),
+        source.replacen(
+            "\n## 11 Canonical amendments 与 profile activation",
+            "\n | Test function | Owning slice | State |\n | --- | --- | --- |\n | `indented_after_table` | R1 Error presentation | planned |\n\n## 11 Canonical amendments 与 profile activation",
+            1,
+        ),
+        source.replacen(
+            "| Test function | Owning slice | State |",
+            "| Wrong | Owning slice | State |\n| --- | --- | --- |\n| wrong | R1 Error presentation | planned |\n\n| Test function | Owning slice | State |",
+            1,
+        ),
+        source.replacen(
+            "| Test function | Owning slice | State |\n| --- | --- | --- |",
+            "| Test function | Owning slice | State |\n| --- | --- | -- |",
+            1,
+        ),
+    ];
+    for (index, document) in malformed.into_iter().enumerate() {
+        assert_ne!(
+            document, source,
+            "negative fixture {index} must mutate canonical source"
+        );
+        assert!(
+            std::panic::catch_unwind(|| parse_recovery_authority_rows(&document)).is_err(),
+            "Recovery authority fixture {index} must require one exact heading and first table"
+        );
+    }
+}
+
+#[test]
+fn recovery_authority_parser_rejects_invalid_rows() {
+    let source = recovery_authority_source();
+    let _control = parse_recovery_authority_rows(&source);
+    let rows = [
+        source.replacen(
+            "| `post_commit_host_loss_preserves_committed_history` | R2 Compound settlement | planned |",
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
+            1,
+        ),
+        source.replacen(
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
+            "| `` | R1 Error presentation | planned |",
+            1,
+        ),
+        source.replacen(
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
+            "| `unknown_recovery_test` | R1 Error presentation | planned |",
+            1,
+        ),
+        source.replacen(
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
+            "| `error_outlet_role_classification_is_preserved` | Unknown slice | planned |",
+            1,
+        ),
+        source.replacen(
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | unknown |",
+            1,
+        ),
+    ];
+    for row in rows {
+        assert!(
+            std::panic::catch_unwind(|| parse_recovery_authority_rows(&row)).is_err(),
+            "Recovery authority parser must reject empty, duplicate, or unknown rows"
+        );
+    }
+    let active = source.replacen(
+        "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
+        "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | active |",
+        1,
+    );
+    let direct = syn::parse_file("#[test] fn error_outlet_role_classification_is_preserved() {}")
+        .expect("synthetic authority source must parse");
+    parse_recovery_authority_rows_with_source(&active, &direct);
+    for source in [
+        "",
+        "#[test] fn error_outlet_role_classification_is_preserved() {} #[test] fn error_outlet_role_classification_is_preserved() {}",
+        "#[test] #[ignore] fn error_outlet_role_classification_is_preserved() {}",
+        "#[cfg(test)] #[test] fn error_outlet_role_classification_is_preserved() {}",
+        "#[cfg_attr(test, ignore)] #[test] fn error_outlet_role_classification_is_preserved() {}",
+    ] {
+        let source = syn::parse_file(source).expect("synthetic authority source must parse");
+        assert!(
+            std::panic::catch_unwind(|| parse_recovery_authority_rows_with_source(
+                &active, &source
+            ))
+            .is_err(),
+            "active Recovery authority rows must reject missing/duplicate/ignored/cfg direct tests"
+        );
+    }
+}
+
+#[test]
+fn recovery_planned_rows_do_not_enter_the_runtime_catalogue() {
+    let recovery = parse_recovery_authority_rows(&recovery_authority_source());
+    let planned = recovery
+        .into_iter()
+        .filter(|row| row.state == "planned")
+        .map(|row| row.test_function)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(planned.len(), 3, "Recovery must retain three planned rows");
+    let catalogue = catalogue_set();
+    assert_eq!(
+        catalogue.len(),
+        24,
+        "runtime catalogue must stay locked at 24"
+    );
+    let overlap = planned
+        .intersection(&catalogue)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        overlap.is_empty(),
+        "planned Recovery rows must not be registered in the runtime catalogue: {overlap:?}"
+    );
+}
+
 fn direct_tests(file: &syn::File) -> Vec<&ItemFn> {
     file.items
         .iter()
@@ -514,9 +833,14 @@ fn catalogue_matches_root_nested_and_active_history_profiles_and_final_mvp_vocab
         .into_iter()
         .filter_map(|row| (row.state == "active").then_some(row.test_function))
         .collect::<Vec<_>>();
+    let recovery_names = parse_recovery_authority_rows(&recovery_authority_source())
+        .into_iter()
+        .filter_map(|row| (row.state == "active").then_some(row.test_function))
+        .collect::<Vec<_>>();
     let mut expected = root_names.clone();
     expected.extend(nested_names.clone());
     expected.extend(history_names.clone());
+    expected.extend(recovery_names.clone());
     assert_eq!(
         root_names.len(),
         20,
@@ -534,9 +858,14 @@ fn catalogue_matches_root_nested_and_active_history_profiles_and_final_mvp_vocab
         "the Rust Nested suffix must preserve the profile table order"
     );
     assert_eq!(
-        AUTHORITY_REGRESSION_CATALOGUE[23..],
+        AUTHORITY_REGRESSION_CATALOGUE[23..24],
         history_names,
         "the Rust active History suffix must preserve the profile table order"
+    );
+    assert_eq!(
+        AUTHORITY_REGRESSION_CATALOGUE[24..],
+        recovery_names,
+        "the Rust active Recovery suffix must preserve the profile table order"
     );
     assert_eq!(
         AUTHORITY_REGRESSION_CATALOGUE, expected,
@@ -545,6 +874,7 @@ fn catalogue_matches_root_nested_and_active_history_profiles_and_final_mvp_vocab
     let root_set = root_names.into_iter().collect::<BTreeSet<_>>();
     let nested_set = nested_names.into_iter().collect::<BTreeSet<_>>();
     let history_set = history_names.into_iter().collect::<BTreeSet<_>>();
+    let recovery_set = recovery_names.into_iter().collect::<BTreeSet<_>>();
     let overlap = root_set.intersection(&nested_set).collect::<Vec<_>>();
     assert!(
         overlap.is_empty(),
@@ -559,6 +889,12 @@ fn catalogue_matches_root_nested_and_active_history_profiles_and_final_mvp_vocab
     assert!(
         nested_history_overlap.is_empty(),
         "Nested and active History catalogue tables must not overlap: {nested_history_overlap:?}"
+    );
+    assert!(
+        recovery_set.is_disjoint(&root_set)
+            && recovery_set.is_disjoint(&nested_set)
+            && recovery_set.is_disjoint(&history_set),
+        "active Recovery authority rows must be disjoint from the existing catalogue"
     );
     let expected_set = expected.into_iter().collect::<BTreeSet<_>>();
     assert_eq!(

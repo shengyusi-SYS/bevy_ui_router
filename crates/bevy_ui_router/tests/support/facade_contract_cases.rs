@@ -131,10 +131,124 @@ impl HistoryContractProfile {
 
 pub fn history_contract_profile() -> HistoryContractProfile {
     let source = read_workspace("docs/superpowers/specs/2026-07-20-history-design.md");
-    HistoryContractProfile::parse(&source)
+    parse_history_contract_profile(&source)
+}
+
+pub fn parse_history_contract_profile(source: &str) -> HistoryContractProfile {
+    HistoryContractProfile::parse(source)
+}
+
+pub fn parse_recovery_contract_profile(source: &str) -> HistoryContractProfile {
+    let headings = [
+        "### 10.1 Public contract and stage exclusions",
+        "### 10.2 Contract delta activation",
+        "### 10.3 Recovery authority regression additions",
+    ];
+    assert_profile_headings_are_exact_and_ordered(source, &headings, "Recovery");
+    let exclusions = strict_profile_table(
+        source,
+        headings[0],
+        &["Kind", "Canonical path or normalized item", "First slice"],
+        "Recovery",
+    );
+    let contract_deltas = strict_profile_table(
+        source,
+        headings[1],
+        &["Item", "Owning slice", "State", "Claim boundary"],
+        "Recovery",
+    )
+    .into_iter()
+    .map(|row| StagedProfileRow {
+        item: row.0[0].clone(),
+        owning_slice: row.0[1].clone(),
+        state: row.0[2].clone(),
+        claim_boundary: Some(row.0[3].clone()),
+    })
+    .collect::<Vec<_>>();
+    let authority_additions = strict_profile_table(
+        source,
+        headings[2],
+        &["Test function", "Owning slice", "State"],
+        "Recovery",
+    )
+    .into_iter()
+    .map(|row| StagedProfileRow {
+        item: row.0[0].clone(),
+        owning_slice: row.0[1].clone(),
+        state: row.0[2].clone(),
+        claim_boundary: None,
+    })
+    .collect::<Vec<_>>();
+    let profile = HistoryContractProfile {
+        exclusions,
+        contract_deltas,
+        authority_additions,
+    };
+    validate_recovery_contract_profile(&profile);
+    profile
+}
+
+pub fn stage_contract_profile() -> HistoryContractProfile {
+    let history = history_contract_profile();
+    let recovery = parse_recovery_contract_profile(&read_workspace(
+        "docs/superpowers/specs/2026-08-12-recovery-design.md",
+    ));
+    let mut contract_deltas = history.contract_deltas;
+    contract_deltas.extend(recovery.contract_deltas);
+    let mut authority_additions = history
+        .authority_additions
+        .into_iter()
+        .filter(|row| row.state == "active")
+        .collect::<Vec<_>>();
+    authority_additions.extend(
+        recovery
+            .authority_additions
+            .into_iter()
+            .filter(|row| row.state == "active"),
+    );
+    let profile = HistoryContractProfile {
+        exclusions: recovery.exclusions,
+        contract_deltas,
+        authority_additions,
+    };
+    profile.assert_disjoint_keys();
+    profile
 }
 
 fn strict_history_table(input: &str, heading: &str, expected_header: &[&str]) -> Vec<TableRow> {
+    strict_profile_table(input, heading, expected_header, "History")
+}
+
+fn assert_profile_headings_are_exact_and_ordered(source: &str, headings: &[&str], profile: &str) {
+    let lines = source.lines().collect::<Vec<_>>();
+    let positions = headings
+        .iter()
+        .map(|heading| {
+            let matches = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(index, line)| (*line == *heading).then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matches.len(),
+                1,
+                "{profile} table heading {heading} must occur exactly once"
+            );
+            matches[0]
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "{profile} table headings must occur in canonical order"
+    );
+}
+
+fn strict_profile_table(
+    input: &str,
+    heading: &str,
+    expected_header: &[&str],
+    profile: &str,
+) -> Vec<TableRow> {
     let lines = input.lines().collect::<Vec<_>>();
     let headings = lines
         .iter()
@@ -144,10 +258,10 @@ fn strict_history_table(input: &str, heading: &str, expected_header: &[&str]) ->
     assert_eq!(
         headings.len(),
         1,
-        "History table heading {heading} must occur exactly once"
+        "{profile} table heading {heading} must occur exactly once"
     );
 
-    let heading_level = markdown_heading_level(heading).expect("History heading must be valid");
+    let heading_level = markdown_heading_level(heading).expect("profile heading must be valid");
     let section_end = (headings[0] + 1..lines.len())
         .find(|index| {
             markdown_heading_level(lines[*index]).is_some_and(|level| level <= heading_level)
@@ -156,18 +270,18 @@ fn strict_history_table(input: &str, heading: &str, expected_header: &[&str]) ->
     let section = &lines[headings[0] + 1..section_end];
     let table_start = section
         .iter()
-        .position(|line| line.starts_with('|'))
-        .unwrap_or_else(|| panic!("History table {heading} must exist in its own section"));
+        .position(|line| line.trim_start().starts_with('|'))
+        .unwrap_or_else(|| panic!("{profile} table {heading} must exist in its own section"));
     let table_end = table_start
         + section[table_start..]
             .iter()
-            .take_while(|line| line.starts_with('|'))
+            .take_while(|line| line.trim_start().starts_with('|'))
             .count();
     assert!(
         !section[table_end..]
             .iter()
-            .any(|line| line.starts_with('|')),
-        "History section {heading} must contain one contiguous pipe-table block"
+            .any(|line| line.trim_start().starts_with('|')),
+        "{profile} section {heading} must contain one contiguous pipe-table block"
     );
     let table = &section[table_start..table_end];
 
@@ -183,12 +297,12 @@ fn strict_history_table(input: &str, heading: &str, expected_header: &[&str]) ->
     assert_eq!(
         table.first().copied(),
         Some(expected_header.as_str()),
-        "History table {heading} must use its exact header"
+        "{profile} table {heading} must use its exact header"
     );
     assert_eq!(
         table.get(1).copied(),
         Some(expected_separator.as_str()),
-        "History table {heading} must use its exact separator"
+        "{profile} table {heading} must use its exact separator"
     );
 
     let mut rows = Vec::new();
@@ -197,19 +311,19 @@ fn strict_history_table(input: &str, heading: &str, expected_header: &[&str]) ->
         assert_eq!(
             cells.len(),
             columns,
-            "History table {heading} row width drifted"
+            "{profile} table {heading} row width drifted"
         );
         rows.push(TableRow(cells));
     }
     assert!(
         !rows.is_empty(),
-        "History table {heading} must not be empty"
+        "{profile} table {heading} must not be empty"
     );
     let unique = rows.iter().cloned().collect::<BTreeSet<_>>();
     assert_eq!(
         unique.len(),
         rows.len(),
-        "History table {heading} must not contain duplicate rows"
+        "{profile} table {heading} must not contain duplicate rows"
     );
     rows
 }
@@ -220,6 +334,191 @@ fn markdown_heading_level(line: &str) -> Option<usize> {
         .take_while(|character| *character == '#')
         .count();
     (level > 0 && line.chars().nth(level) == Some(' ')).then_some(level)
+}
+
+fn validate_recovery_contract_profile(profile: &HistoryContractProfile) {
+    validate_recovery_exclusions(&profile.exclusions);
+    profile.assert_disjoint_keys();
+    validate_recovery_rows(
+        &profile.contract_deltas,
+        true,
+        &[
+            (
+                "boundary-bound error presentation complete evidence",
+                "R1 Error presentation",
+                "planned",
+                "Journey D public contract PASS",
+            ),
+            (
+                "post-commit compound settlement complete evidence",
+                "R2 Compound settlement",
+                "planned",
+                "Journey G post-commit foreground rows PASS",
+            ),
+            (
+                "host re-admission fresh-epoch complete evidence",
+                "R3 Re-admission/stale output",
+                "planned",
+                "Journey G foreground re-admission rows PASS",
+            ),
+        ],
+    );
+    validate_recovery_rows(
+        &profile.authority_additions,
+        false,
+        &[
+            (
+                "error_outlet_role_classification_is_preserved",
+                "R1 Error presentation",
+                "planned",
+                "",
+            ),
+            (
+                "post_commit_host_loss_preserves_committed_history",
+                "R2 Compound settlement",
+                "planned",
+                "",
+            ),
+            (
+                "host_reacceptance_detaches_old_top_slot",
+                "R3 Re-admission/stale output",
+                "planned",
+                "",
+            ),
+        ],
+    );
+    assert!(
+        profile
+            .authority_additions
+            .iter()
+            .all(|row| row.state != "active"),
+        "Recovery authority rows must remain planned"
+    );
+}
+
+fn validate_recovery_exclusions(exclusions: &[TableRow]) {
+    let actual = exclusions
+        .iter()
+        .map(|row| {
+            assert_eq!(row.0.len(), 3, "Recovery exclusion row width drifted");
+            assert!(
+                matches!(row.0[0].as_str(), "symbol" | "associated"),
+                "unknown Recovery exclusion kind: {}",
+                row.0[0]
+            );
+            assert!(
+                row.0[1].starts_with("bevy_ui_router::"),
+                "Recovery exclusion path is not canonical: {}",
+                row.0[1]
+            );
+            (row.0[0].as_str(), row.0[1].as_str(), row.0[2].as_str())
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual.len(),
+        exclusions.len(),
+        "Recovery exclusions must be unique"
+    );
+    let recovery_expected = BTreeSet::from([
+        (
+            "symbol",
+            "bevy_ui_router::ecs::InputProbeResult",
+            "Authority closure",
+        ),
+        (
+            "symbol",
+            "bevy_ui_router::ecs::QuarantineLeaseId",
+            "Authority closure",
+        ),
+        (
+            "symbol",
+            "bevy_ui_router::ecs::QuarantineOwnerKind",
+            "Authority closure",
+        ),
+        (
+            "symbol",
+            "bevy_ui_router::ecs::QuarantineOwnerSnapshot",
+            "Authority closure",
+        ),
+        (
+            "symbol",
+            "bevy_ui_router::ecs::QuarantineSnapshot",
+            "Authority closure",
+        ),
+        (
+            "symbol",
+            "bevy_ui_router::ecs::RouterInputModality",
+            "Authority closure",
+        ),
+        (
+            "symbol",
+            "bevy_ui_router::ecs::RouterInputProbes",
+            "Authority closure",
+        ),
+        (
+            "associated",
+            "bevy_ui_router::core::RouteNodeOptions::with_error_boundary",
+            "R1 Error presentation",
+        ),
+        (
+            "associated",
+            "bevy_ui_router::core::RouteNodeOptions::with_error_view",
+            "R1 Error presentation",
+        ),
+        (
+            "associated",
+            "bevy_ui_router::ecs::RouterAuthorityAuditSnapshot::quarantines",
+            "Authority closure",
+        ),
+    ]);
+    assert_eq!(
+        actual, recovery_expected,
+        "Recovery exclusions must match the canonical vocabulary"
+    );
+}
+
+fn validate_recovery_rows(
+    rows: &[StagedProfileRow],
+    has_claim_boundary: bool,
+    expected: &[(&str, &str, &str, &str)],
+) {
+    let actual = rows
+        .iter()
+        .map(|row| {
+            assert!(
+                !row.item.is_empty(),
+                "Recovery staged item must not be empty"
+            );
+            assert!(
+                matches!(row.state.as_str(), "planned" | "active"),
+                "unknown Recovery state: {}",
+                row.state
+            );
+            assert_eq!(
+                row.claim_boundary.is_some(),
+                has_claim_boundary,
+                "Recovery claim-boundary shape drifted for {}",
+                row.item
+            );
+            let boundary = row.claim_boundary.as_deref().unwrap_or("");
+            assert!(
+                !has_claim_boundary || !boundary.is_empty(),
+                "Recovery claim boundary is empty"
+            );
+            (
+                row.item.as_str(),
+                row.owning_slice.as_str(),
+                row.state.as_str(),
+                boundary,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(actual.len(), rows.len(), "Recovery rows must be unique");
+    assert_eq!(
+        actual,
+        expected.iter().copied().collect::<BTreeSet<_>>(),
+        "Recovery staged rows must match the canonical vocabulary"
+    );
 }
 
 fn validate_staged_rows(rows: &[StagedProfileRow], requires_claim_boundary: bool) {
@@ -754,7 +1053,13 @@ pub fn parse_golden(input: &str, exclusions: &[TableRow]) -> Vec<GoldenRow> {
 }
 
 fn validate_exclusion_vocabulary(exclusions: &[TableRow]) {
-    let slices = BTreeSet::from(["Authority closure", "History", "Nested push", "Recovery"]);
+    let slices = BTreeSet::from([
+        "Authority closure",
+        "History",
+        "Nested push",
+        "Recovery",
+        "R1 Error presentation",
+    ]);
     for row in exclusions {
         assert_eq!(row.0.len(), 3, "exclusion row width drifted");
         assert!(matches!(row.0[0].as_str(), "symbol" | "associated"));
@@ -773,7 +1078,7 @@ fn validate_exclusion_vocabulary(exclusions: &[TableRow]) {
         .iter()
         .map(|row| (row.0[0].as_str(), row.0[1].as_str(), row.0[2].as_str()))
         .collect::<BTreeSet<_>>();
-    let expected = BTreeSet::from([
+    let recovery_expected = BTreeSet::from([
         (
             "symbol",
             "bevy_ui_router::ecs::InputProbeResult",
@@ -812,12 +1117,12 @@ fn validate_exclusion_vocabulary(exclusions: &[TableRow]) {
         (
             "associated",
             "bevy_ui_router::core::RouteNodeOptions::with_error_boundary",
-            "Recovery",
+            "R1 Error presentation",
         ),
         (
             "associated",
             "bevy_ui_router::core::RouteNodeOptions::with_error_view",
-            "Recovery",
+            "R1 Error presentation",
         ),
         (
             "associated",
@@ -825,9 +1130,30 @@ fn validate_exclusion_vocabulary(exclusions: &[TableRow]) {
             "Authority closure",
         ),
     ]);
-    assert_eq!(
-        actual, expected,
-        "History profile exclusion path/slice mapping drifted"
+    let mut history_expected = recovery_expected.clone();
+    history_expected.remove(&(
+        "associated",
+        "bevy_ui_router::core::RouteNodeOptions::with_error_boundary",
+        "R1 Error presentation",
+    ));
+    history_expected.remove(&(
+        "associated",
+        "bevy_ui_router::core::RouteNodeOptions::with_error_view",
+        "R1 Error presentation",
+    ));
+    history_expected.insert((
+        "associated",
+        "bevy_ui_router::core::RouteNodeOptions::with_error_boundary",
+        "Recovery",
+    ));
+    history_expected.insert((
+        "associated",
+        "bevy_ui_router::core::RouteNodeOptions::with_error_view",
+        "Recovery",
+    ));
+    assert!(
+        actual == recovery_expected || actual == history_expected,
+        "profile exclusion path/slice mapping drifted: {actual:?}"
     );
 }
 
@@ -4294,7 +4620,7 @@ fn associated_exclusion_case(index: usize, path: &str) -> NegativeCase {
     } else if path.ends_with("RouteNodeOptions::with_error_view") {
         (
             "core-only",
-            "use bevy_ui_router::prelude::*; fn probe(options: RouteNodeOptions, view: RouteViewKey) { let _ = options.with_error_view(view); }".to_owned(),
+            "use bevy_ui_router::prelude::*; fn probe(options: RouteNodeOptions, boundary: ErrorBoundaryKey, view: RouteViewKey) { let _ = options.with_error_view(boundary, view); }".to_owned(),
         )
     } else if path.ends_with("RouterAuthorityAuditSnapshot::outlets") {
         (

@@ -1,5 +1,7 @@
 # MVP Acceptance Journeys
 
+> **Recovery activation status:** Journey D and Journey G remain planned acceptance work. This profile activation only makes Recovery current; background old-lease reap and the remaining full Journey G rows remain Authority-closure work. It is not a Recovery PASS or MVP PASS claim.
+
 **文档类型**: 外部行为验收规范
 **状态**: Phase 3B.1 `Plan PASS`
 **前置规范**: [Target Architecture](target-architecture.md)

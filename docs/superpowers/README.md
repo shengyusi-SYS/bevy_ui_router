@@ -1,5 +1,11 @@
 # 历史计划与审查证据
 
+## Recovery current profile
+
+[Recovery 阶段设计](specs/2026-08-12-recovery-design.md) and [Recovery 实施计划](plans/2026-08-12-recovery-implementation-plan.md) are the active spec/plan pair. They retain History active delta 3, add Recovery planned delta 3, use Recovery 10.1's ten current exclusions, and expose zero active Recovery authority rows while the runtime catalogue stays 24. History remains completed evidence; no Recovery PASS, full Journey G, or MVP PASS is claimed, and old-lease reap belongs to Authority closure.
+
+The registered Recovery spec/plan pair is the sole active exception to this directory's historical-evidence rule. Every other existing spec, plan, and review record remains evidence-only; Recovery is current-stage work, not completed evidence.
+
 **状态**: frozen historical evidence；History profile 已完成
 **冻结日期**: 2026-08-11
 **冻结基准**: History final contract activation `f0fcc2e`

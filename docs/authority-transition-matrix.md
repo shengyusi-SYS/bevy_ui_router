@@ -1,7 +1,9 @@
 # Authority Transition Matrix
 
+> **Recovery activation invariant:** never merge or infer ledgers after mutation. A post-commit host-loss transition prepares one `L + A + H` owner: old cleanup `L`, disjoint authority `A` including `A0`, and retired-host edge `H`. All fallible bindings, including final-fallible `retire_current`, finish before the callback installs the ECS compound; confirmation/publication are last. Admission is source-bound, confirmation-last, and exhausted identities are permanent. No Recovery PASS, full Journey G, or old-lease reap completion is claimed.
+
 **文档类型**: Phase 3B.1 生命周期规范附录
-**状态**: Phase 3B.1 `History PASS`；Recovery semantics 仍为计划合同
+**状态**: Recovery 为当前阶段合同；History 是已完成的历史证据；runtime Recovery 仍计划中，未宣称 Recovery PASS、full Journey G 或 MVP PASS
 **架构上位规范**: [Target Architecture](target-architecture.md)
 
 **History checkpoint**：implementation `be25dbe` 至 `e001345`，contract activation `f0fcc2e`。History 的 pre-commit authority precedence、late-bound Back、failure/no-target cleanup 与 terminal owner closure 已通过 completion gate；post-commit compound settlement、host re-admission 与完整 Recovery 仍待完成。
@@ -45,17 +47,17 @@ AuthorityLost(AuthoritySettlementPlan)
 
 | Event | Token/ID effect | ECS effect | Published state |
 | --- | --- | --- | --- |
-| unique candidate observed and candidate revision is not latched | issue `HostAdmissionToken(Requested)`; no host/slot ID | none | `AwaitingHost` |
+| source-bound availability incarnation and exact candidate source observed, with an unlatched revision | Core issues linear `HostAdmissionToken(Requested)` bound to that source; no host/slot ID | ECS freezes exact candidate source/preparation only | `AwaitingHost` |
 | candidate缺少 `Node`/required closure，或到 UI root 的实际 ancestry含 non-Node/cycle/ghost-only edge | engine consumes token as `Rejected` | none；Router不补写 host/ancestor | `Unavailable(InvalidHostUiTopology)`；同一registration拓扑修复后可重新 admission |
 | candidate conflict/disappears before grant | engine consumes token as `Rejected` | none | `Unavailable(HostConflict)` or `AwaitingHost` |
 | app cancels registration before grant | engine consumes token as `Cancelled` | none | `AwaitingHost` |
-| exclusive preflight succeeds | allocate new host id, epoch and top slot id; return `HostGrant` | none yet | unchanged |
-| grant staging + component/relationship mutation | grant remains `Granted` | allocate empty inert Entity; staging-register before reentrant mutation; write then validate | unchanged |
-| post-write validation succeeds | grant `Confirmed` | promote staging host/top-slot records | `Ready + None` |
+| all fallible preflight/preparation succeeds | allocate burned-on-consume host id, epoch and top slot id; return linear `HostGrant` | no binding installed yet | unchanged |
+| grant staging + component/relationship mutation | grant remains `Granted` | allocate empty inert Entity; staging-register before reentrant mutation; write then validate; return owners on any failure | unchanged |
+| final issuer confirmation succeeds | confirmation is the last fallible operation and produces `HostLease` | callback installs the complete ECS `HostBinding` only | callback return后，Core assignment-only tail publishes `ReadyNoActive` |
 | post-write validation fails or observer removes/rewrites Entity | grant `RejectedAfterMutation`; allocated IDs remain burned；latch current candidate revision | sealed cleanup/quarantine/`AlreadyAbsent` settles staging records | never publish host/slot；settlement后为 `Unavailable(AuthorityEstablishmentFailed)` |
 | replay rejected/rejected-after-mutation/cancelled/confirmed token or grant | no allocator or World effect | none | unchanged; stale diagnostic |
 
-Preflight failure always consumes the outstanding admission token through a sealed reject/cancel transition. 不存在“未消费但永久 outstanding”的 token。ID 只在 exclusive preflight 成功后分配，允许永久 gap；grant 后任何 Bevy mutation 都视为可重入且需写后复验。只有 validation 后 confirm 才可发布，失败 grant 的 staging residual 必须逐项 settlement。
+Preflight failure always consumes the outstanding admission token through a sealed reject/cancel transition and returns the original candidate/preparation owner through its typed path. 不存在“未消费但永久 outstanding”的 token。ID 只在 exclusive preflight 成功后分配，允许永久 gap；private candidate/admission identity exhaustion is permanent, bounded, and zero-retry for the current router instance, and a new candidate revision does not reopen it. Ordinary candidate/topology/staging rejection may make one new attempt only after an exact source/incarnation/revision/fingerprint change. Grant 后任何 Bevy mutation 都视为可重入且需写后复验。所有 fallible preparation 在 final issuer confirmation 前完成；confirmation 失败先 settlement/owner return，callback 为零；confirmation 后 callback 只安装完整 binding，随后才 assignment-only publish `ReadyNoActive`。
 
 `HostCandidateRevision` 是ECS私有、稳定单调的candidate revision，绑定registration component instance/revision、app host exact Entity generation与admission topology fingerprint：
 
@@ -75,7 +77,7 @@ ECS ownership record另遵守：
 | --- | --- | --- | --- |
 | registration removal, host exists，发生于 commit 前 | queued -> `Failed(HostLost)`；running -> `Running(CleanupPending)` | isolate；用旧 HostLease detach + validate old top-slot host edge；再 cleanup/quarantine并 confirm ticket | settlement 中 `RecoveringAuthority`；旧 edge 消失后为 `Unavailable(HostLost)`，request `Failed`且history不推进 |
 | host Entity despawn，发生于 commit 前 | queued -> `Failed(HostLost)`；running -> `Running(CleanupPending)` | exact Entity records become `AlreadyAbsent`，其余 detached records 逐项 settlement，confirm ticket | settlement 中 `RecoveringAuthority`；完成后 `Unavailable(HostLost)`，request `Failed`且history不推进 |
-| registration removal/host despawn，发生于 `CommitPublished` 后且 foreground cleanup 未完成 | committed request -> `Running(Recovering)`；queued仍 `Failed(HostLost)` | 已有 cleanup obligation ledger原子并入/转交 authority settlement，禁止重复 receipt；隔离并清空 active | availability `RecoveringAuthority -> Unavailable(HostLost)`；已提交 history不回滚；committed request settlement后 `Succeeded + Severe(PostCommitCleanupAnomaly)` |
+| registration removal/host despawn，发生于 `CommitPublished` 后且 foreground cleanup 未完成 | committed request -> `Running(Recovering)`；queued仍 `Failed(HostLost)` | normal `L` ledger is transferred unchanged with domain/attempt/receipts/owner; prepare Entity-disjoint authority `A` and retired-host edge proof `H`; `A0`, all fallible bindings, and final-fallible `retire_current` precede the sole callback that installs `L + A + H`; never merge/extend/duplicate `L` receipts | availability `RecoveringAuthority -> Unavailable(HostLost)`；已提交 history不回滚；committed request settlement后 `Succeeded + Severe(PostCommitCleanupAnomaly)` |
 | active authority drift with declaration still present | queued -> `Failed(AuthorityLost)`；running -> `Running(Recovering)` | isolate/cleanup/quarantine old epoch, confirm ticket | 对未闩锁的新candidate revision重跑一次完整admission；成功为新 id/epoch/top slot 的 `Ready + None`，post-write失败为 `Unavailable(AuthorityEstablishmentFailed)` |
 | registry self-audit detects duplicate identity/mapping, impossible owner transition or internal seal contradiction | queued -> `Failed(AuthorityLost)`；running -> `Running(Recovering)` | isolate every still-exact known owned record；unknown/conflicting records only isolate or quarantine；confirm settlement ticket | fail closed为`Unavailable(RegistryInvariantViolation)`；该router instance不自动re-admit，应用只能安装新的router instance |
 
@@ -175,7 +177,7 @@ Cleanup scope/manifest 与 post-cleanup continuation 必须分别冻结并持有
 4. 每个可能触发relationship/component/despawn hook或observer的mutation后立即post-write validation。若证据变化使剩余plan失效，当前attempt只保留已完成且可验证的receipts，其余未结算obligations由更高revision attempt重新分类；旧attempt不能继续mutation，也不能结算新attempt。
 5. 每个obligation只能由同batch、同exact Entity/owner的**实际**terminal disposition receipt结算一次。`Removed`、`RemovedDetached`、`AlreadyAbsent`、`RejectedProtected`、`QuarantinedForeignDescendant`、`QuarantinedProtectedParent`和`QuarantinedForeignComponent`都可终结前景obligation；quarantine receipt原子转交当时仍存在的immutable exact residual set给独立lease，因此持久drift不会让request永久nonterminal。
 6. 完全相同的重复receipt返回`DuplicateRejected`；错误batch、旧epoch、错误request/transaction、未知obligation、未知token或superseded attempt revision返回`StaleDiscarded`/`InvalidRejected`，均无ledger、presentation、history或request状态变化。
-7. 全部obligations恰好结算一次后，ECS把原token与completion digest交回engine。Engine只接受当前outstanding batch，随后才可消费预先封存的continuation或进入terminal；completion replay无副作用。Host/authority loss只能转交同一批未结算obligation identity，不能复制ledger或receipt。
+7. 全部obligations恰好结算一次后，ECS把原token与completion digest交回engine。Engine只接受当前outstanding batch，随后才可消费预先封存的continuation或进入terminal；completion replay无副作用。Host/authority loss只可原样转交 normal cleanup ledger `L` 的未结算 obligation identity 与既有 receipts；R2 post-commit 另签 Entity-disjoint authority ledger `A` 并携 retired-host proof `H`，绝不 copy、extend 或 merge `L` 的 ledger、obligation 或 receipt。
 8. obligation count为零时，batch在同一阶段签发并立即完成，仍留下batch trace；不得用“没有receipt”绕过terminal gate。History no-target back 的零 batch 只能来自 `ProvenEmptyProjection`，并使用 canonical zero manifest，不能从 logical roots、空数组或未证明的 empty manifest 推导。
 
 Core 只签发/验证 batch identity 和逻辑 roots，ECS 独占 Entity manifest 与 receipt authority，因此不存在 core 读取 World 或 ECS 自行终结 request 的反向依赖。

@@ -1,8 +1,10 @@
 # Roadmap
 
-**状态**: Phase 3B.1 `History PASS`
+> **Current-stage activation:** Recovery is now the active spec/plan pair. Its profile keeps ten exclusions, History active delta 3, Recovery planned delta 3, zero active Recovery authority rows, and catalogue 24. Journey D/G remain planned; background old-lease reap and full Journey G remain Authority-closure work. This is not Recovery PASS or MVP PASS.
 
-**更新时间**: 2026-08-11
+**状态**: Phase 3B.1 `Recovery` current stage; History completed
+
+**更新时间**: 2026-08-12
 
 ## 已完成
 

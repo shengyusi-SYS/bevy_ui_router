@@ -1,5 +1,9 @@
 # Target Architecture
 
+> **Recovery activation invariant:** post-commit host loss prepares a single `L + A + H` compound owner: existing cleanup ledger `L`, disjoint authority ledger `A` including `A0`, and retired-host edge `H`. Every fallible binding completes before the final-fallible `retire_current`; only then may the sole callback install the ECS compound. Admission is source-bound and confirmation-last; private candidate/admission identity exhaustion is permanent for the current router instance, while ordinary candidate/topology/staging rejection can retry only after an exact source/incarnation/revision/fingerprint change. This is a current-stage contract, not Recovery PASS; old-lease reap/full Journey G remain Authority closure.
+
+> **Host-admission sequence:** Core binds its permit to the observed availability incarnation and source; ECS freezes the exact candidate source and performs all fallible preparation. A linear ID/token becomes a linear grant. Issuer confirmation is the final fallible operation and alone produces `HostLease`; the callback only installs the complete ECS `HostBinding`, after which publication is assignment-only `ReadyNoActive`. Private candidate/admission identity exhaustion is permanent, bounded, and zero-retry for the current router instance; ordinary candidate/topology/staging rejection needs an exact source/incarnation/revision/fingerprint change before one new attempt. Every earlier failure returns its owner or settles it before any retry decision.
+
 **文档类型**: Phase 3B.1 规范性设计
 **状态**: Phase 3B.1 `Plan PASS`
 **取代范围**: 旧架构路线图中有关当前实现入口、Phase 3B Task 6 和 Phase 3C 前置条件的描述
@@ -235,7 +239,7 @@ ReportDisposition  = Accepted | StaleDiscarded | DuplicateRejected | InvalidReje
 - 尚未登记 host 时，同一 update 有多个候选则全部拒绝并进入 `Unavailable(HostConflict)`；只剩一个候选后可自动接受。已有合法 host 时，额外候选单独拒绝，既有映射不变。
 - `Ready` 时命令按全局 sequence 入队，每个 router 同时只有一个 running transaction。
 - `RecoveringAuthority` 时新命令返回 `AuthorityRecovering`，不创建 request id。
-- host/authority loss 使 queued request 立即失败；尚未 `CommitPublished` 的 running request先保持 `Running(CleanupPending|Recovering)`，receipt/settlement 完成后成为 `Failed(HostLost|AuthorityLost)`，history不推进。若外部 host loss发生在 `CommitPresentation` 已发布 presentation/history、但 `SettleCleanup` 尚未完成的窗口，请求改为 `Running(Recovering)`，原 cleanup obligations转入同一 authority settlement；已发布 history不回滚，active在 settlement中清空，最终请求为 `Succeeded` 并记录 `Severe + PostCommitCleanupAnomaly`（cause为 host/authority loss）。两种路径都不在新 slot 上静默重放。
+- host/authority loss 使 queued request 立即失败；尚未 `CommitPublished` 的 running request先保持 `Running(CleanupPending|Recovering)`，receipt/settlement 完成后成为 `Failed(HostLost|AuthorityLost)`，history不推进。若外部 host loss发生在 `CommitPresentation` 已发布 presentation/history、但 `SettleCleanup` 尚未完成的窗口，请求改为 `Running(Recovering)`：原 normal cleanup ledger `L`（domain、attempt、receipts 与 owner）原样移交，绝不复制、扩展或合并 receipt；ECS为 Entity-disjoint authority work准备独立 ledger `A`，并冻结 retired-host edge proof `H`。`A0`、所有 fallible bindings 与 final-fallible `retire_current` 完成后，唯一 callback 才安装完整 ECS `L + A + H` compound；callback 后只允许 assignment-only publication。已发布 history不回滚，active在 settlement中清空，最终请求为 `Succeeded` 并记录 `Severe + PostCommitCleanupAnomaly`。两种路径都不在新 slot 上静默重放。
 - stale report 只记录 disposition，不改变当前 request。
 
 Host loss settlement 期间 availability 为 `RecoveringAuthority`；registration 已移除或 host 已不存在且没有已确认新候选时，稳定态为 `Unavailable(HostLost)`。唯一candidate存在但不是合法全Node UI ancestry时稳定为 `Unavailable(InvalidHostUiTopology)`；Router只读观察同一registration，应用修复Node topology后自动重跑完整admission。上述 unavailable状态导航都返回 `HostUnavailable` 且不创建 request id。Active authority drift 保留合法 registration 时必须重新执行完整 admission：成功后为 `Ready + None`，post-write失败后为 `Unavailable(AuthorityEstablishmentFailed)`。Host admission对当前candidate revision闩锁任何`RejectedAfterMutation`；registration实例、host exact Entity generation或topology fingerprint未变化时不得自动重试、分配新ID或创建新lease，变化后才允许一次新attempt。
@@ -250,14 +254,16 @@ Host 是 app-owned **UI Node Entity**。`RouterHostRegistration` 只是声明；
 
 Host version 为 `router + host + registration_epoch`。安装 router 时只有 `RouterInstanceId`，没有预绑定 host id。Admission 使用 sealed handshake：
 
-1. ECS 对唯一候选 Entity 做存在性、冲突、跨 router以及完整 UI Node ancestry预检，然后向 RouterEngine 申请单次 `HostAdmissionToken`；token 不分配 host id。缺少 `Node`、required component、出现 non-Node ancestor/cycle或 ghost-only路径的候选以 `InvalidHostUiTopology` 拒绝。
-2. 在同一个 exclusive system 中再次验证候选 UI ancestry，并预检 host registry 与透明 top-slot Node spawn所需全部条件；失败时必须通过 sealed reject/cancel 转换消费 token，不分配 ID、不创建 Entity。
-3. 预检成功后，engine 消费 token，单调分配新的 `RouteHostId + registration_epoch + top RouteSlotId` 并返回 `HostGrant`。分配器允许永久 ID gap，绝不回收失败 grant 的 ID。
-4. ECS 先用无 component 的 allocation primitive 创建天然 inert Entity，并在任何可能触发 hook/observer 的 component/relationship mutation 前写入 private staging registry。随后先写 hidden、`Pickable::IGNORE` 和透明结构 `Node` 的完整 required closure，再写 authority/`ChildOf(host)`，最后对 exact Entity generation、host UI ancestry/edge、components、seal、registry 和 barrier 做写后复验。
-5. 复验成功时，ECS 交回 grant，engine 只接受当前 outstanding grant并转为 `Confirmed`、发布 `Ready`。复验失败时 grant 转为 terminal `RejectedAfterMutation`，永不发布 host/slot；staging residual 通过 sealed cleanup batch 删除、quarantine 或 `AlreadyAbsent` 收敛。任何时刻都允许 provisional，但不允许 untracked/non-inert provisional。
-6. ECS 为已确认 host 保留 opaque `HostLease`。registration removal 或 Entity loss 时，engine 消费当前 lease并签发 `HostSettlementTicket`；ECS 完成隔离/cleanup 后交回 ticket，engine 才使 running request 终结并发布新的 availability。
+1. Core 将单次 `HostAdmissionToken`/permit 绑定到观察到的 availability incarnation 与 observed registration source；ECS 候选只属于这份 source-bound handshake 的 outside half。token 不分配 host id。缺少 `Node`、required component、出现 non-Node ancestor/cycle或 ghost-only路径的候选以 `InvalidHostUiTopology` 拒绝。
+2. ECS 冻结 exact candidate source，完成 candidate/UI ancestry/registry/top-slot 的 preflight 及全部 fallible preparation；失败必须走类型化 owner-return 路径，不分配 ID、不创建 Entity。
+3. 仅在该 preparation 成功后，Core 消费 token，分配 burned `RouteHostId + registration_epoch + top RouteSlotId`，并产出线性的 `HostGrant`。分配器允许永久 ID gap，绝不回收失败 grant 的 ID。
+4. ECS staging 先登记 ownership，再创建无 component 的 inert allocation；每次可能触发 hook/observer 的 component 或 relationship 写入后均 flush，并对 exact candidate、authorized target 与 protected partition 重新 freeze/验证。失败进入独立 settlement：staging residual 只能删除、quarantine 或 `AlreadyAbsent` 收敛，且不得发布 host/slot。
+5. 所有 Core/ECS fallible bind 与 confirmation preparation 完成后，issuer confirmation 是最后一个可失败操作：它消费 `HostGrant` 并产生 `HostLease`。confirmation 失败时 callback/publication 均为零，whole owners 必须返还或 settlement，绝不留下 untracked/non-inert provisional。
+6. exact callback 只安装完整 ECS `HostBinding`。callback 返回后才由 Core 的 assignment-only tail 发布 `ReadyNoActive`；该 tail 不含 query、hook 或 fallible 工作。registration removal 或 Entity loss 后，engine 消费 `HostLease` 并签发 `HostSettlementTicket`；ECS 完成隔离/cleanup 后交回 ticket，engine 才终结 running request 并发布新的 availability。
 
 旧 epoch 的 admission token、grant、`HostLease`、cleanup token 或 settlement replay 一律 stale。已完成 transfer 的 live `QuarantineLease` 按自己的 generation/operation sequence 判断，不属于此规则。重新注册必得新的 host id、epoch、top slot 和后续 frame identity。
+
+private candidate/admission identity exhaustion 对当前 router instance 永久、有界、零 retry；即使出现新 candidate revision也不得重开。普通 candidate/topology/staging rejection 不是永久状态，只能在 exact source/incarnation/revision/fingerprint 变化后开始一次新的 admission。
 
 `RouterNavigation` 的同步 admission 判断只读取 RouterEngine 在上一系统阶段发布到该 Resource 的 immutable admission snapshot；它不直接查询 World，也不能提前猜测尚未确认的 host。
 

@@ -1,18 +1,315 @@
 #[path = "support/facade_contract_cases.rs"]
 mod facade_contract_cases;
 
+use std::collections::BTreeSet;
+
 use facade_contract_cases::{
     assert_consumer_case_files, assert_devtools_adds_no_public_symbols, assert_facade_exports,
     assert_golden_covers_symbols, assert_owner_source_matches_golden, facade_dir,
-    history_contract_profile, markdown_table, parse_golden, positive_consumer_cases,
-    prepare_consumer_cases, public_facade_source_violations, read_workspace, root_symbols,
-    run_positive_consumer,
+    history_contract_profile, markdown_table, parse_golden, parse_recovery_contract_profile,
+    positive_consumer_cases, prepare_consumer_cases, public_facade_source_violations,
+    read_workspace, root_symbols, run_positive_consumer, stage_contract_profile,
 };
 
 const BEVY_GIT: &str = "https://github.com/shengyusi-SYS/bevy.git";
 const BEVY_REV: &str = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7";
 const BEVY_VERSION: &str = "0.19.0";
 const DEPENDENCY_SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+
+fn recovery_profile_source() -> String {
+    read_workspace("docs/superpowers/specs/2026-08-12-recovery-design.md")
+}
+
+#[test]
+fn recovery_profile_has_exact_activation_machine_state() {
+    let profile = parse_recovery_contract_profile(&recovery_profile_source());
+    assert_eq!(profile.exclusions.len(), 10);
+    assert_eq!(
+        profile
+            .contract_deltas
+            .iter()
+            .map(|row| (
+                row.item.as_str(),
+                row.owning_slice.as_str(),
+                row.state.as_str()
+            ))
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            (
+                "boundary-bound error presentation complete evidence",
+                "R1 Error presentation",
+                "planned",
+            ),
+            (
+                "post-commit compound settlement complete evidence",
+                "R2 Compound settlement",
+                "planned",
+            ),
+            (
+                "host re-admission fresh-epoch complete evidence",
+                "R3 Re-admission/stale output",
+                "planned",
+            ),
+        ])
+    );
+    assert_eq!(
+        profile
+            .authority_additions
+            .iter()
+            .map(|row| (
+                row.item.as_str(),
+                row.owning_slice.as_str(),
+                row.state.as_str()
+            ))
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            (
+                "error_outlet_role_classification_is_preserved",
+                "R1 Error presentation",
+                "planned",
+            ),
+            (
+                "post_commit_host_loss_preserves_committed_history",
+                "R2 Compound settlement",
+                "planned",
+            ),
+            (
+                "host_reacceptance_detaches_old_top_slot",
+                "R3 Re-admission/stale output",
+                "planned",
+            ),
+        ])
+    );
+    assert!(
+        profile
+            .authority_additions
+            .iter()
+            .all(|row| row.state == "planned"),
+        "Recovery must activate no authority rows"
+    );
+}
+
+#[test]
+fn active_stage_profile_preserves_history_union_at_recovery_activation() {
+    let profile = stage_contract_profile();
+    assert_eq!(profile.exclusions.len(), 10);
+    assert_eq!(profile.contract_deltas.len(), 6);
+    assert_eq!(profile.authority_additions.len(), 1);
+    assert_eq!(
+        profile
+            .authority_additions
+            .iter()
+            .filter(|row| row.state == "active")
+            .count(),
+        1,
+        "only the completed History authority row is active"
+    );
+    assert_eq!(
+        profile
+            .contract_deltas
+            .iter()
+            .filter(|row| row.state == "active")
+            .map(|row| row.item.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "NavigationRequestSnapshot::requested -> Option",
+            "NavigationEnqueueErrorKind::IdentityExhausted",
+            "late-bound back complete evidence",
+        ])
+    );
+    assert_eq!(
+        profile
+            .contract_deltas
+            .iter()
+            .filter(|row| row.state == "planned")
+            .map(|row| row.item.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "boundary-bound error presentation complete evidence",
+            "post-commit compound settlement complete evidence",
+            "host re-admission fresh-epoch complete evidence",
+        ])
+    );
+}
+
+#[test]
+fn recovery_profile_keys_are_disjoint() {
+    let profile = parse_recovery_contract_profile(&recovery_profile_source());
+    profile.assert_disjoint_keys();
+}
+
+#[test]
+fn recovery_profile_rejects_invalid_10_1_rows() {
+    let source = recovery_profile_source();
+    let _control = parse_recovery_contract_profile(&source);
+    let rows = [
+        source.replacen(
+            "| symbol | `bevy_ui_router::ecs::QuarantineLeaseId` | Authority closure |",
+            "| symbol | `bevy_ui_router::ecs::InputProbeResult` | Authority closure |",
+            1,
+        ),
+        source.replacen(
+            "| symbol | `bevy_ui_router::ecs::InputProbeResult` | Authority closure |",
+            "| unknown | `bevy_ui_router::ecs::InputProbeResult` | Authority closure |",
+            1,
+        ),
+        source.replacen(
+            "| symbol | `bevy_ui_router::ecs::InputProbeResult` | Authority closure |",
+            "| symbol | `InputProbeResult` | Authority closure |",
+            1,
+        ),
+        source.replacen(
+            "| symbol | `bevy_ui_router::ecs::InputProbeResult` | Authority closure |",
+            "| symbol | `bevy_ui_router::ecs::InputProbeResult` | Unknown slice |",
+            1,
+        ),
+        source.replacen(
+            "| symbol | `bevy_ui_router::ecs::InputProbeResult` | Authority closure |",
+            "| symbol |  | Authority closure |",
+            1,
+        ),
+    ];
+    for row in rows {
+        assert!(
+            std::panic::catch_unwind(|| parse_recovery_contract_profile(&row)).is_err(),
+            "Recovery 10.1 invalid exclusion rows must be rejected"
+        );
+    }
+}
+
+#[test]
+fn recovery_profile_rejects_invalid_10_2_rows() {
+    let source = recovery_profile_source();
+    let _control = parse_recovery_contract_profile(&source);
+    let rows = [
+        source.replacen(
+            "| post-commit compound settlement complete evidence | R2 Compound settlement | planned | Journey G post-commit foreground rows PASS |",
+            "| boundary-bound error presentation complete evidence | R1 Error presentation | planned | Journey D public contract PASS |",
+            1,
+        ),
+        source.replacen(
+            "| boundary-bound error presentation complete evidence | R1 Error presentation | planned | Journey D public contract PASS |",
+            "|  | R1 Error presentation | planned | Journey D public contract PASS |",
+            1,
+        ),
+        source.replacen(
+            "| boundary-bound error presentation complete evidence | R1 Error presentation | planned | Journey D public contract PASS |",
+            "| unknown Recovery item | R1 Error presentation | planned | Journey D public contract PASS |",
+            1,
+        ),
+        source.replacen(
+            "| boundary-bound error presentation complete evidence | R1 Error presentation | planned | Journey D public contract PASS |",
+            "| boundary-bound error presentation complete evidence | Unknown slice | planned | Journey D public contract PASS |",
+            1,
+        ),
+        source.replacen(
+            "| boundary-bound error presentation complete evidence | R1 Error presentation | planned | Journey D public contract PASS |",
+            "| boundary-bound error presentation complete evidence | R1 Error presentation | unknown | Journey D public contract PASS |",
+            1,
+        ),
+    ];
+    for row in rows {
+        assert!(
+            std::panic::catch_unwind(|| parse_recovery_contract_profile(&row)).is_err(),
+            "Recovery 10.2 invalid contract-delta rows must be rejected"
+        );
+    }
+}
+
+#[test]
+fn recovery_profile_rejects_invalid_10_3_rows() {
+    let source = recovery_profile_source();
+    let _control = parse_recovery_contract_profile(&source);
+    let rows = [
+        source.replacen(
+            "| `post_commit_host_loss_preserves_committed_history` | R2 Compound settlement | planned |",
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
+            1,
+        ),
+        source.replacen(
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
+            "| `` | R1 Error presentation | planned |",
+            1,
+        ),
+        source.replacen(
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
+            "| `unknown_recovery_test` | R1 Error presentation | planned |",
+            1,
+        ),
+        source.replacen(
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
+            "| `error_outlet_role_classification_is_preserved` | Unknown slice | planned |",
+            1,
+        ),
+        source.replacen(
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | unknown |",
+            1,
+        ),
+    ];
+    for row in rows {
+        assert!(
+            std::panic::catch_unwind(|| parse_recovery_contract_profile(&row)).is_err(),
+            "Recovery 10.3 invalid authority rows must be rejected"
+        );
+    }
+}
+
+#[test]
+fn recovery_profile_requires_exact_unique_section_tables() {
+    let source = recovery_profile_source();
+    let _control = parse_recovery_contract_profile(&source);
+    let misordered = source
+        .replacen(
+            "### 10.1 Public contract and stage exclusions",
+            "### temporary Recovery heading",
+            1,
+        )
+        .replacen(
+            "### 10.2 Contract delta activation",
+            "### 10.1 Public contract and stage exclusions",
+            1,
+        )
+        .replacen(
+            "### temporary Recovery heading",
+            "### 10.2 Contract delta activation",
+            1,
+        );
+    let malformed = [
+        format!("{source}\n### 10.1 Public contract and stage exclusions\n"),
+        misordered,
+        source.replacen(
+            "### 10.1 Public contract and stage exclusions",
+            "### 10.1 Public contract and stage exclusions\n\n | Kind | Canonical path or normalized item | First slice |\n | --- | --- | --- |\n | symbol | `bevy_ui_router::ecs::IndentedBefore` | Authority closure |",
+            1,
+        ),
+        source.replacen(
+            "\n### 10.2 Contract delta activation",
+            "\n | Kind | Canonical path or normalized item | First slice |\n | --- | --- | --- |\n | symbol | `bevy_ui_router::ecs::IndentedAfter` | Authority closure |\n\n### 10.2 Contract delta activation",
+            1,
+        ),
+        source.replacen(
+            "| Item | Owning slice | State | Claim boundary |",
+            "| Wrong | Owning slice | State | Claim boundary |\n| --- | --- | --- | --- |\n| wrong | R1 Error presentation | planned | Journey D public contract PASS |\n\n| Item | Owning slice | State | Claim boundary |",
+            1,
+        ),
+        source.replacen(
+            "| Test function | Owning slice | State |\n| --- | --- | --- |",
+            "| Test function | Owning slice | State |\n| --- | --- | -- |",
+            1,
+        ),
+    ];
+    for (index, document) in malformed.into_iter().enumerate() {
+        assert_ne!(
+            document, source,
+            "negative fixture {index} must mutate canonical source"
+        );
+        assert!(
+            std::panic::catch_unwind(|| parse_recovery_contract_profile(&document)).is_err(),
+            "Recovery profile fixture {index} must use one ordered, exact first table"
+        );
+    }
+}
 
 #[test]
 fn history_profile_has_exact_back_execution_slice_machine_state() {
@@ -528,9 +825,9 @@ fn facade_manifest_is_closed_world() {
 }
 
 #[test]
-fn history_profile_tables_and_curated_facade_source_are_closed_world() {
+fn active_stage_profile_tables_and_curated_facade_source_are_closed_world() {
     let allowlist = read_workspace("docs/facade-export-allowlist.md");
-    let profile = history_contract_profile();
+    let profile = stage_contract_profile();
     let modules = markdown_table(
         &allowlist,
         "## 2. Allowed Modules",
@@ -564,9 +861,9 @@ fn history_profile_tables_and_curated_facade_source_are_closed_world() {
 }
 
 #[test]
-fn isolated_positive_consumers_cover_the_history_feature_matrix() {
+fn isolated_positive_consumers_cover_the_active_stage_feature_matrix() {
     let allowlist = read_workspace("docs/facade-export-allowlist.md");
-    let profile = history_contract_profile();
+    let profile = stage_contract_profile();
     let modules = markdown_table(
         &allowlist,
         "## 2. Allowed Modules",

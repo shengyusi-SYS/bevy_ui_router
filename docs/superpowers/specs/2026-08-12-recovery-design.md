@@ -1,12 +1,14 @@
 # Recovery 阶段设计
 
+**Activation status**: current active canonical/profile stage; History is completed historical evidence. This activation keeps Recovery rows planned, and does not claim Recovery PASS, full Journey G, or MVP PASS. Background old-lease reap remains Authority-closure work.
+
 **用户设计确认**: 用户已将 MVP PASS、阶段顺序与自主规划/调度权写入持续目标；本规范按该授权收敛 Recovery 设计
 
 **Spec independent review**: PASS；Core lifecycle、ECS physical authority、public/canonical profile 三路复审关闭全部 Critical / Important / Minor
 
-**Plan independent review**: Pending
+**Plan independent review**: PASS
 
-**阶段状态**: Independently reviewed draft；等待用户 written-spec review，未激活 canonical/profile，且不得据此声明 Recovery PASS 或 MVP PASS
+**阶段状态**: current active canonical/profile stage；History is completed historical evidence；不得据此声明 Recovery PASS、完整 Journey G 或 MVP PASS
 
 **事实基线**: `fe8532c`（History closure verified）；编写本规范时 tracked tree/index clean，用户未跟踪 `review-history-*` 材料不在本阶段范围
 

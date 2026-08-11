@@ -6,9 +6,9 @@ use std::collections::BTreeSet;
 use facade_contract_cases::{
     ConsumerCase, NegativeCase, assert_consumer_case_files, feature_disabled_cases,
     forbidden_capability_cases, forbidden_module_cases, forbidden_name_cases,
-    history_contract_profile, is_forbidden_capability, markdown_table, markdown_table_by_header,
-    opaque_struct_cases, parse_golden, prepare_consumer_cases, profile_exclusion_cases,
-    read_workspace, root_symbols, run_negative_consumer,
+    is_forbidden_capability, markdown_table, markdown_table_by_header, opaque_struct_cases,
+    parse_golden, prepare_consumer_cases, profile_exclusion_cases, read_workspace, root_symbols,
+    run_negative_consumer, stage_contract_profile,
 };
 
 fn back_target_facade_cases() -> Vec<NegativeCase> {
@@ -73,9 +73,9 @@ fn back_target_resume_action_is_not_facade_reachable() {
 }
 
 #[test]
-fn history_profile_forbidden_consumers_fail_with_expected_rustc_categories() {
+fn active_stage_profile_forbidden_consumers_fail_with_expected_rustc_categories() {
     let allowlist = read_workspace("docs/facade-export-allowlist.md");
-    let profile = history_contract_profile();
+    let profile = stage_contract_profile();
     let modules = markdown_table(
         &allowlist,
         "## 2. Allowed Modules",
