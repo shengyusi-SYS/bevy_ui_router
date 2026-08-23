@@ -255,7 +255,9 @@ fn recovery_profile_rejects_invalid_10_3_rows() {
 
 #[test]
 fn recovery_profile_requires_exact_unique_section_tables() {
-    let source = recovery_profile_source();
+    let source = recovery_profile_source()
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n");
     let _control = parse_recovery_contract_profile(&source);
     let misordered = source
         .replacen(
@@ -273,6 +275,22 @@ fn recovery_profile_requires_exact_unique_section_tables() {
             "### 10.2 Contract delta activation",
             1,
         );
+    let malformed_10_3_separator = {
+        let mut document = source.clone();
+        let section = document
+            .find("### 10.3 Recovery authority regression additions")
+            .expect("Recovery 10.3 section must exist");
+        let separator_text = "| --- | --- | --- |";
+        let separator = section
+            + document[section..]
+                .find(separator_text)
+                .expect("Recovery 10.3 separator must exist");
+        document.replace_range(
+            separator..separator + separator_text.len(),
+            "| --- | --- | -- |",
+        );
+        document
+    };
     let malformed = [
         format!("{source}\n### 10.1 Public contract and stage exclusions\n"),
         misordered,
@@ -291,11 +309,7 @@ fn recovery_profile_requires_exact_unique_section_tables() {
             "| Wrong | Owning slice | State | Claim boundary |\n| --- | --- | --- | --- |\n| wrong | R1 Error presentation | planned | Journey D public contract PASS |\n\n| Item | Owning slice | State | Claim boundary |",
             1,
         ),
-        source.replacen(
-            "| Test function | Owning slice | State |\n| --- | --- | --- |",
-            "| Test function | Owning slice | State |\n| --- | --- | -- |",
-            1,
-        ),
+        malformed_10_3_separator,
     ];
     for (index, document) in malformed.into_iter().enumerate() {
         assert_ne!(
