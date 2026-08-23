@@ -6077,7 +6077,7 @@ fn complete_zero_physical_failure(
         .expect("an exact empty cleanup completion is current");
     entry
         .engine
-        .complete_prepared_failure_cleanup_with_ledger(owner, || {
+        .complete_prepared_failure_cleanup_with_ledger(owner, ledger, |mut ledger| {
             drop(
                 ledger
                     .take_failed_prepared_owner()
@@ -17962,17 +17962,21 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                     }
                     match entry
                         .engine
-                        .complete_prepared_failure_cleanup_with_ledger(owner, || {
-                            drop(
-                                ledger
-                                    .take_failed_prepared_owner()
-                                    .expect("failure continuation retains its physical owner"),
-                            );
-                        })
+                        .complete_prepared_failure_cleanup_with_ledger(
+                            owner,
+                            ledger,
+                            |mut ledger| {
+                                drop(
+                                    ledger.take_failed_prepared_owner().expect(
+                                        "failure continuation retains its physical owner",
+                                    ),
+                                );
+                            },
+                        )
                     {
                         Ok(()) => bind_post_cleanup_back_resolution(entry),
                         Err(error) => {
-                            let (owner, mismatch) = error.into_parts();
+                            let (owner, ledger, mismatch) = error.into_parts();
                             let inert = FailureCleanupCompletionInertOwner {
                                 owner: Some(owner),
                                 ledger,

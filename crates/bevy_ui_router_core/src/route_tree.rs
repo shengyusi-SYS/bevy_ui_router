@@ -70,8 +70,7 @@ impl RouteNodeOptions {
         self
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn with_error_boundary(mut self, key: ErrorBoundaryKey) -> Self {
+    pub fn with_error_boundary(mut self, key: ErrorBoundaryKey) -> Self {
         self.error_boundary = Some(key);
         self.error_view = None;
         self
@@ -82,12 +81,7 @@ impl RouteNodeOptions {
         self
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn with_error_view(
-        mut self,
-        boundary: ErrorBoundaryKey,
-        view: RouteViewKey,
-    ) -> Self {
+    pub fn with_error_view(mut self, boundary: ErrorBoundaryKey, view: RouteViewKey) -> Self {
         self.error_boundary = Some(boundary.clone());
         self.error_view = Some((boundary, view));
         self

@@ -2450,21 +2450,24 @@ impl std::fmt::Debug for FailureCleanupCompletionPrepareError {
     }
 }
 
-pub(crate) struct FailureCleanupCompletionCommitError {
+pub(crate) struct FailureCleanupCompletionCommitError<Physical> {
     kind: CleanupError,
     owner: FailureCleanupCompletionOwner,
+    physical: Physical,
     mismatch: FailureCleanupCompletionReceiverMismatchProjection,
 }
 
-impl FailureCleanupCompletionCommitError {
+impl<Physical> FailureCleanupCompletionCommitError<Physical> {
     const fn new(
         kind: CleanupError,
         owner: FailureCleanupCompletionOwner,
+        physical: Physical,
         mismatch: FailureCleanupCompletionReceiverMismatchProjection,
     ) -> Self {
         Self {
             kind,
             owner,
+            physical,
             mismatch,
         }
     }
@@ -2473,21 +2476,18 @@ impl FailureCleanupCompletionCommitError {
         self.kind
     }
 
-    pub(crate) fn into_owner(self) -> FailureCleanupCompletionOwner {
-        self.owner
-    }
-
     pub(crate) fn into_parts(
         self,
     ) -> (
         FailureCleanupCompletionOwner,
+        Physical,
         FailureCleanupCompletionReceiverMismatchProjection,
     ) {
-        (self.owner, self.mismatch)
+        (self.owner, self.physical, self.mismatch)
     }
 }
 
-impl std::fmt::Debug for FailureCleanupCompletionCommitError {
+impl<Physical> std::fmt::Debug for FailureCleanupCompletionCommitError<Physical> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("FailureCleanupCompletionCommitError")
@@ -9031,7 +9031,7 @@ impl RouterEngine {
                 .prepare_failure_cleanup_completion(completion)
                 .map_err(|error| error.kind())?;
             return self
-                .complete_prepared_failure_cleanup_with_ledger(owner, || {})
+                .complete_prepared_failure_cleanup_with_ledger(owner, (), |()| {})
                 .map_err(|error| error.kind());
         }
         self.complete_cleanup_impl(completion, || {})
@@ -9159,13 +9159,14 @@ impl RouterEngine {
         current.identity.branch_index = current.identity.branch_index.saturating_add(1);
     }
 
-    pub(crate) fn complete_prepared_failure_cleanup_with_ledger<F>(
+    pub(crate) fn complete_prepared_failure_cleanup_with_ledger<Physical, F>(
         &mut self,
         owner: FailureCleanupCompletionOwner,
+        physical: Physical,
         commit_ledger_and_clear_holder: F,
-    ) -> Result<(), FailureCleanupCompletionCommitError>
+    ) -> Result<(), FailureCleanupCompletionCommitError<Physical>>
     where
-        F: FnOnce(),
+        F: FnOnce(Physical),
     {
         let expected = FailureCleanupCompletionReceiverProjection {
             router: owner.router,
@@ -9198,11 +9199,12 @@ impl RouterEngine {
             return Err(FailureCleanupCompletionCommitError::new(
                 CleanupError::Stale,
                 owner,
+                physical,
                 FailureCleanupCompletionReceiverMismatchProjection { expected, observed },
             ));
         }
 
-        commit_ledger_and_clear_holder();
+        commit_ledger_and_clear_holder(physical);
         let FailureCleanupCompletionOwner {
             router: _,
             identity,
@@ -19490,6 +19492,14 @@ mod tests {
 
     #[test]
     fn failure_cleanup_completion_receiver_mismatch_returns_whole_owner_and_calls_zero() {
+        struct PhysicalOwner<'a>(&'a std::cell::Cell<usize>);
+
+        impl Drop for PhysicalOwner<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
         let mut exact = ready_engine();
         let request = exact.push(RouteLocation::new("/items/1")).unwrap();
         let failure = exact.begin_failure_cleanup_with_roots(
@@ -19525,19 +19535,35 @@ mod tests {
 
         let mut foreign = ready_engine();
         let callback_count = std::cell::Cell::new(0);
+        let physical_drops = std::cell::Cell::new(0);
         let error = foreign
-            .complete_prepared_failure_cleanup_with_ledger(owner, || {
-                callback_count.set(callback_count.get() + 1);
-            })
+            .complete_prepared_failure_cleanup_with_ledger(
+                owner,
+                PhysicalOwner(&physical_drops),
+                |physical| {
+                    drop(physical);
+                    callback_count.set(callback_count.get() + 1);
+                },
+            )
             .expect_err("a foreign Core receiver must return the whole completion owner");
+        assert_eq!(error.kind(), CleanupError::Stale);
         assert_eq!(callback_count.get(), 0);
+        assert_eq!(
+            physical_drops.get(),
+            0,
+            "receiver mismatch must return rather than drop the typed physical owner"
+        );
+        let (owner, physical, mismatch) = error.into_parts();
+        assert_ne!(mismatch.expected, mismatch.observed);
 
         exact
-            .complete_prepared_failure_cleanup_with_ledger(error.into_owner(), || {
+            .complete_prepared_failure_cleanup_with_ledger(owner, physical, |physical| {
+                drop(physical);
                 callback_count.set(callback_count.get() + 1);
             })
             .expect("the returned owner remains consumable by its exact Core receiver");
         assert_eq!(callback_count.get(), 1);
+        assert_eq!(physical_drops.get(), 1);
         assert_eq!(
             exact.request(request).unwrap().status(),
             &RequestStatus::Running(NavigationPhase::Recovering)

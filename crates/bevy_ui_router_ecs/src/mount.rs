@@ -3385,7 +3385,7 @@ pub(crate) mod tests {
             .prepare_failure_cleanup_completion(completion)
             .expect("the settled mount cleanup must bind its exact Core receiver");
         engine
-            .complete_prepared_failure_cleanup_with_ledger(owner, || {
+            .complete_prepared_failure_cleanup_with_ledger(owner, ledger, |mut ledger| {
                 drop(
                     ledger
                         .take_failed_prepared_owner()

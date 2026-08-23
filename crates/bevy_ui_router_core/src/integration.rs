@@ -804,33 +804,31 @@ impl std::fmt::Debug for PrepareFailureCleanupCompletionError {
 }
 
 #[doc(hidden)]
-#[must_use = "a failed cleanup completion retains its linear Core owner"]
-pub struct CompleteFailureCleanupError {
+#[must_use = "a failed cleanup completion retains its linear Core and physical owners"]
+pub struct CompleteFailureCleanupError<Physical> {
     kind: IntegrationError,
     owner: FailureCleanupCompletionOwner,
+    physical: Physical,
     mismatch: FailureCleanupCompletionReceiverMismatchView,
 }
 
-impl CompleteFailureCleanupError {
+impl<Physical> CompleteFailureCleanupError<Physical> {
     pub const fn kind(&self) -> IntegrationError {
         self.kind
-    }
-
-    pub fn into_owner(self) -> FailureCleanupCompletionOwner {
-        self.owner
     }
 
     pub fn into_parts(
         self,
     ) -> (
         FailureCleanupCompletionOwner,
+        Physical,
         FailureCleanupCompletionReceiverMismatchView,
     ) {
-        (self.owner, self.mismatch)
+        (self.owner, self.physical, self.mismatch)
     }
 }
 
-impl std::fmt::Debug for CompleteFailureCleanupError {
+impl<Physical> std::fmt::Debug for CompleteFailureCleanupError<Physical> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         format_capability_error(formatter, "CompleteFailureCleanupError", self.kind)
     }
@@ -4658,25 +4656,28 @@ impl RouterEngine {
     }
 
     #[doc(hidden)]
-    pub fn complete_prepared_failure_cleanup_with_ledger<F>(
+    pub fn complete_prepared_failure_cleanup_with_ledger<Physical, F>(
         &mut self,
         owner: FailureCleanupCompletionOwner,
+        physical: Physical,
         commit_ledger_and_clear_holder: F,
-    ) -> Result<(), CompleteFailureCleanupError>
+    ) -> Result<(), CompleteFailureCleanupError<Physical>>
     where
-        F: FnOnce(),
+        F: FnOnce(Physical),
     {
         self.inner
             .complete_prepared_failure_cleanup_with_ledger(
                 owner.inner,
+                physical,
                 commit_ledger_and_clear_holder,
             )
-            .map_err(|error: CoreFailureCleanupCompletionCommitError| {
+            .map_err(|error: CoreFailureCleanupCompletionCommitError<Physical>| {
                 let kind = map_cleanup_error(error.kind());
-                let (owner, mismatch) = error.into_parts();
+                let (owner, physical, mismatch) = error.into_parts();
                 CompleteFailureCleanupError {
                     kind,
                     owner: FailureCleanupCompletionOwner { inner: owner },
+                    physical,
                     mismatch: FailureCleanupCompletionReceiverMismatchView { inner: mismatch },
                 }
             })

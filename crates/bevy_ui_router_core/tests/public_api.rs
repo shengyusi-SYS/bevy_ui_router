@@ -43,12 +43,14 @@ fn route_view_key_is_public_without_raw_value_access() {
 }
 
 #[test]
-fn nested_profile_exposes_only_the_child_route_declaration_methods() {
+fn recovery_profile_exposes_error_recovery_builders_with_exact_signatures() {
     use bevy_ui_router_core::{
         error::RouteError,
         ids::RouteId,
+        meta::ErrorBoundaryKey,
         pattern::RoutePattern,
         route_tree::{RouteNodeOptions, RouteTreeBuilder},
+        view_key::RouteViewKey,
     };
 
     let _: fn(&mut RouteTreeBuilder, RouteId, RoutePattern) -> Result<RouteId, RouteError> =
@@ -59,24 +61,29 @@ fn nested_profile_exposes_only_the_child_route_declaration_methods() {
         RoutePattern,
         RouteNodeOptions,
     ) -> Result<RouteId, RouteError> = RouteTreeBuilder::route_with_options;
+    let _: fn(RouteNodeOptions, ErrorBoundaryKey) -> RouteNodeOptions =
+        RouteNodeOptions::with_error_boundary;
+    let _: fn(RouteNodeOptions, ErrorBoundaryKey, RouteViewKey) -> RouteNodeOptions =
+        RouteNodeOptions::with_error_view;
 
     let source = include_str!("../src/route_tree.rs");
 
     assert!(source.contains("pub fn root_with_options("));
-    for forbidden in [
-        "pub fn with_error_boundary(",
-        "pub fn with_error_view(",
-        "#[cfg(feature = \"test-support\")]",
-    ] {
+    for forbidden in ["#[cfg(feature = \"test-support\")]"] {
         assert!(
             !source.contains(forbidden),
-            "nested profile must not publicly expose `{forbidden}`"
+            "Recovery public API must not be feature-gated by `{forbidden}`"
         );
     }
-    for required in ["pub fn route(", "pub fn route_with_options("] {
+    for required in [
+        "pub fn route(",
+        "pub fn route_with_options(",
+        "pub fn with_error_boundary(",
+        "pub fn with_error_view(",
+    ] {
         assert!(
             source.contains(required),
-            "nested profile must expose `{required}`"
+            "Recovery profile must expose `{required}`"
         );
     }
 }
