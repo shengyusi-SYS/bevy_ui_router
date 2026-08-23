@@ -202,9 +202,7 @@ test-support = []
 
 ```toml
 bevy_ui = {
-    git = "https://github.com/shengyusi-SYS/bevy.git",
-    rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7",
-    version = "0.19.0",
+    version = "0.19.1",
     default-features = false,
     features = ["bevy_picking"],
 }
@@ -212,9 +210,9 @@ bevy_ui = {
 
 Root push 必须用 feature tree/metadata 证明 `bevy_ui/bevy_picking` 在 `bevy_ui_router_ecs` 构建中实际启用且 `bevy_ui/ghost_nodes` 未启用，随后 native UI picking regression 才具有编译证据。
 
-所有 workspace Bevy git dependencies（包括 facade direct dev-dependencies）统一使用上述 exact `rev`，不得继续使用可移动 branch。Root push 必须生成、审查并提交 workspace `Cargo.lock`；从该提交起所有 workspace check/test/tree/metadata gate 使用 `--locked`。重构前基准和当前未跟踪 lock 不是可交付锁定证据。
+所有 workspace Bevy dependencies（包括 facade direct dev-dependencies）统一使用 crates.io 官方 `0.19.1`，不得声明 `git`、`rev`、`branch`、`path` 或替代 `registry`。Root push 必须生成、审查并提交 workspace `Cargo.lock`；从该提交起所有 workspace check/test/tree/metadata gate 使用 `--locked`。重构前基准和当前未跟踪 lock 不是可交付锁定证据。
 
-Facade integration tests直接使用`bevy_app`、`bevy_ecs`与`bevy_ui`的host/Node类型，因此三者必须以和ECS crate相同git/version/default-feature约束进入facade package的`[dev-dependencies]`，不能依赖传递依赖偶然可用。真实物理UI/picking regression位于ECS crate-private lib tests，所以exact-rev `bevy_internal`必须直接进入`bevy_ui_router_ecs [dev-dependencies]`，`default-features = false`且只启用`bevy_window, bevy_camera, bevy_ui, bevy_picking`；facade只有在自身test target实际引用时才声明该依赖。ECS测试只添加一次该配置产生的`DefaultPlugins`，由它唯一安装`UiPlugin`与`DefaultPickingPlugins`，不得再次手动添加`UiPickingPlugin`。`WindowPlugin::default()`已创建唯一primary window，测试必须查询并配置existing `PrimaryWindow`、断言数量恰为1，绝不再spawn第二个；随后只显式spawn一个`Camera2d`。由此获得input、transform、window、camera/visibility、UI layout、UI backend与picking hover/interaction主链。Facade export completeness target在facade package直接dev-depend `syn = { version = "2", features = ["full"] }`；ECS authority catalogue target在ECS package独立direct dev-depend同版`syn`，不能借用facade依赖。两者只补充、不能替代隔离consumer编译。Root push必须建立可扩展的固定harness、命名规则与本阶段profile所激活的test files/commands；[MVP Acceptance Journeys](mvp-acceptance-journeys.md) 第6节和 [Facade Export Allowlist](facade-export-allowlist.md) 第5节的完整文件、命令与catalogue是MVP gate，不要求未到所属切片的case在Root push伪通过。
+Facade integration tests直接使用`bevy_app`、`bevy_ecs`与`bevy_ui`的host/Node类型，因此三者必须以和ECS crate相同的官方version/default-feature约束进入facade package的`[dev-dependencies]`，不能依赖传递依赖偶然可用。真实物理UI/picking regression位于ECS crate-private lib tests，所以官方`0.19.1`的`bevy_internal`必须直接进入`bevy_ui_router_ecs [dev-dependencies]`，`default-features = false`且只启用`bevy_window, bevy_camera, bevy_ui, bevy_picking`；facade只有在自身test target实际引用时才声明该依赖。ECS测试只添加一次该配置产生的`DefaultPlugins`，由它唯一安装`UiPlugin`与`DefaultPickingPlugins`，不得再次手动添加`UiPickingPlugin`。`WindowPlugin::default()`已创建唯一primary window，测试必须查询并配置existing `PrimaryWindow`、断言数量恰为1，绝不再spawn第二个；随后只显式spawn一个`Camera2d`。由此获得input、transform、window、camera/visibility、UI layout、UI backend与picking hover/interaction主链。Facade export completeness target在facade package直接dev-depend `syn = { version = "2", features = ["full"] }`；ECS authority catalogue target在ECS package独立direct dev-depend同版`syn`，不能借用facade依赖。两者只补充、不能替代隔离consumer编译。Root push必须建立可扩展的固定harness、命名规则与本阶段profile所激活的test files/commands；[MVP Acceptance Journeys](mvp-acceptance-journeys.md) 第6节和 [Facade Export Allowlist](facade-export-allowlist.md) 第5节的完整文件、命令与catalogue是MVP gate，不要求未到所属切片的case在Root push伪通过。
 
 Fixture 可达的 public error types（key、registry、route、content write、driver registration、router install/enqueue）都必须实现 `Debug + Display + std::error::Error + Send + Sync + 'static`；这样规范 fixture 中的 `?` 和 `Box<dyn Error>` 是可编译合同。
 

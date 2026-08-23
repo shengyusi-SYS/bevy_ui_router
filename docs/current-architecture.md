@@ -8,7 +8,7 @@
 
 **事实来源**: workspace manifest、实现、固定测试、公开旅程、已执行门禁与最终独立复审
 
-`Cargo.lock` 已跟踪，全部 Bevy git dependencies 固定到 exact revision `61f78f75684e6b0bc28a13a5933f8f55ca653fa7`
+`Cargo.lock` 已跟踪，全部直接 Bevy dependencies 使用官方 crates.io `0.19.1`，workspace gate 通过 `--locked` 固定解析结果
 
 ## 1 当前定位
 

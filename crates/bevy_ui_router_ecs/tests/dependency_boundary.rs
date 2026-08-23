@@ -4,8 +4,7 @@ use std::path::Path;
 
 use toml::{Table, Value};
 
-const BEVY_GIT: &str = "https://github.com/shengyusi-SYS/bevy.git";
-const BEVY_REV: &str = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7";
+const BEVY_VERSION: &str = "0.19.1";
 
 fn parse_manifest(input: &str) -> Table {
     toml::from_str(input).expect("manifest should parse as a TOML table")
@@ -33,14 +32,15 @@ fn assert_keys(table: &Table, expected: &[&str], label: &str) {
 
 fn assert_bevy(table: &Table, features: &[&str], label: &str) {
     let expected_fields = if features.is_empty() {
-        &["git", "rev", "version", "default-features"][..]
+        &["version", "default-features"][..]
     } else {
-        &["git", "rev", "version", "default-features", "features"][..]
+        &["version", "default-features", "features"][..]
     };
     assert_keys(table, expected_fields, label);
-    assert_eq!(table.get("git").and_then(Value::as_str), Some(BEVY_GIT));
-    assert_eq!(table.get("rev").and_then(Value::as_str), Some(BEVY_REV));
-    assert_eq!(table.get("version").and_then(Value::as_str), Some("0.19.0"));
+    assert_eq!(
+        table.get("version").and_then(Value::as_str),
+        Some(BEVY_VERSION)
+    );
     assert_eq!(
         table.get("default-features").and_then(Value::as_bool),
         Some(false)
@@ -53,13 +53,9 @@ fn assert_bevy(table: &Table, features: &[&str], label: &str) {
         table.get("features").map(strings).unwrap_or_default(),
         expected
     );
-    assert!(
-        !table.contains_key("branch"),
-        "{label} must not declare branch"
-    );
 }
 
-fn assert_no_branch(manifest: &Table) {
+fn assert_official_bevy(manifest: &Table) {
     visit_dependency_tables(manifest, |entries| {
         for (name, value) in entries {
             let Some(dependency) = value.as_table() else {
@@ -67,19 +63,16 @@ fn assert_no_branch(manifest: &Table) {
             };
             if is_bevy_family(name, dependency) {
                 assert_eq!(
-                    dependency.get("git").and_then(Value::as_str),
-                    Some(BEVY_GIT),
-                    "dependency `{name}` must use the approved Bevy git source"
+                    dependency.get("version").and_then(Value::as_str),
+                    Some(BEVY_VERSION),
+                    "dependency `{name}` must use official Bevy {BEVY_VERSION}"
                 );
-                assert_eq!(
-                    dependency.get("rev").and_then(Value::as_str),
-                    Some(BEVY_REV),
-                    "dependency `{name}` must pin the approved Bevy revision"
-                );
-                assert!(
-                    !dependency.contains_key("branch"),
-                    "dependency `{name}` must not declare branch"
-                );
+                for field in ["git", "rev", "branch", "path", "registry"] {
+                    assert!(
+                        !dependency.contains_key(field),
+                        "dependency `{name}` must use the default crates.io registry without `{field}`"
+                    );
+                }
             }
         }
     });
@@ -107,8 +100,7 @@ fn is_bevy_family(name: &str, dependency: &Table) -> bool {
         .get("package")
         .and_then(Value::as_str)
         .unwrap_or(name);
-    (package.starts_with("bevy") && !package.starts_with("bevy_ui_router"))
-        || dependency.get("git").and_then(Value::as_str) == Some(BEVY_GIT)
+    package.starts_with("bevy") && !package.starts_with("bevy_ui_router")
 }
 
 #[test]
@@ -119,11 +111,11 @@ fn ecs_manifest_rejects_target_specific_bevy_branch() {
 [dev-dependencies]
 
 [target.'cfg(unix)'.dev-dependencies]
-bevy_internal = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "target-moving-branch", version = "0.19.0", default-features = false }
+bevy_internal = { git = "https://github.com/bevyengine/bevy.git", branch = "target-moving-branch", version = "0.19.1", default-features = false }
 "#,
     );
 
-    let result = std::panic::catch_unwind(|| assert_no_branch(&manifest));
+    let result = std::panic::catch_unwind(|| assert_official_bevy(&manifest));
     assert!(
         result.is_err(),
         "target-specific Bevy branches must be rejected"
@@ -135,10 +127,10 @@ fn ecs_manifest_rejects_target_alias_for_bevy_package() {
     let manifest = parse_manifest(
         r#"
 [target.'cfg(unix)'.build-dependencies]
-render = { package = "bevy_render", git = "https://github.com/shengyusi-SYS/bevy.git", branch = "moving" }
+render = { package = "bevy_render", git = "https://github.com/bevyengine/bevy.git", branch = "moving", version = "0.19.1" }
 "#,
     );
-    let result = std::panic::catch_unwind(|| assert_no_branch(&manifest));
+    let result = std::panic::catch_unwind(|| assert_official_bevy(&manifest));
     assert!(
         result.is_err(),
         "target Bevy package aliases must be rejected"
@@ -153,22 +145,22 @@ fn ecs_manifest_ignores_non_dependency_metadata() {
 branch = "not-a-dependency"
 "#,
     );
-    let result = std::panic::catch_unwind(|| assert_no_branch(&manifest));
+    let result = std::panic::catch_unwind(|| assert_official_bevy(&manifest));
     assert!(result.is_ok(), "package metadata is not a dependency table");
 }
 
 #[test]
-fn ecs_manifest_rejects_target_alias_with_wrong_bevy_revision() {
+fn ecs_manifest_rejects_target_alias_with_wrong_bevy_version() {
     let manifest = parse_manifest(
         r#"
 [target.'cfg(unix)'.build-dependencies]
-render = { package = "bevy_render", git = "https://github.com/shengyusi-SYS/bevy.git", rev = "different" }
+render = { package = "bevy_render", version = "0.19.0" }
 "#,
     );
-    let result = std::panic::catch_unwind(|| assert_no_branch(&manifest));
+    let result = std::panic::catch_unwind(|| assert_official_bevy(&manifest));
     assert!(
         result.is_err(),
-        "target Bevy package aliases must pin the approved revision"
+        "target Bevy package aliases must use official Bevy {BEVY_VERSION}"
     );
 }
 
@@ -261,5 +253,5 @@ fn ecs_manifest_locks_the_dependency_boundary() {
         BTreeSet::from(["full".to_owned()])
     );
     assert_eq!(dev.get("toml").and_then(Value::as_str), Some("1.1.2"));
-    assert_no_branch(&manifest);
+    assert_official_bevy(&manifest);
 }

@@ -11,9 +11,7 @@ use facade_contract_cases::{
     read_workspace, root_symbols, run_positive_consumer, stage_contract_profile,
 };
 
-const BEVY_GIT: &str = "https://github.com/shengyusi-SYS/bevy.git";
-const BEVY_REV: &str = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7";
-const BEVY_VERSION: &str = "0.19.0";
+const BEVY_VERSION: &str = "0.19.1";
 const DEPENDENCY_SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
 
 fn recovery_profile_source() -> String {
@@ -405,29 +403,14 @@ fn dependency_package_name<'a>(name: &'a str, value: &'a toml::Value) -> &'a str
 
 fn is_bevy_workspace_dependency(name: &str, value: &toml::Value) -> bool {
     let package = dependency_package_name(name, value);
-    (package == "bevy" || (package.starts_with("bevy_") && !package.starts_with("bevy_ui_router")))
-        || value
-            .as_table()
-            .and_then(|dependency| dependency.get("git"))
-            .and_then(toml::Value::as_str)
-            == Some(BEVY_GIT)
+    package == "bevy" || (package.starts_with("bevy_") && !package.starts_with("bevy_ui_router"))
 }
 
 fn assert_bevy_dependency(location: &str, name: &str, package: &str, dependency: &toml::Table) {
     assert_eq!(
-        dependency.get("git").and_then(toml::Value::as_str),
-        Some(BEVY_GIT),
-        "Bevy dependency `{name}` in [{location}] must use the approved git source"
-    );
-    assert_eq!(
-        dependency.get("rev").and_then(toml::Value::as_str),
-        Some(BEVY_REV),
-        "Bevy dependency `{name}` in [{location}] must pin the approved revision"
-    );
-    assert_eq!(
         dependency.get("version").and_then(toml::Value::as_str),
         Some(BEVY_VERSION),
-        "Bevy dependency `{name}` in [{location}] must pin the approved version"
+        "Bevy dependency `{name}` in [{location}] must use official Bevy {BEVY_VERSION}"
     );
     assert_eq!(
         dependency
@@ -441,10 +424,12 @@ fn assert_bevy_dependency(location: &str, name: &str, package: &str, dependency:
         std::collections::BTreeSet::new(),
         "Bevy dependency `{name}` in [{location}] must not enable features"
     );
-    assert!(
-        !dependency.contains_key("branch"),
-        "Bevy dependency `{name}` in [{location}] must not declare branch"
-    );
+    for field in ["git", "rev", "branch", "path", "registry"] {
+        assert!(
+            !dependency.contains_key(field),
+            "Bevy dependency `{name}` in [{location}] must use the default crates.io registry without `{field}`"
+        );
+    }
     assert!(
         matches!(
             package,
@@ -563,11 +548,11 @@ fn assert_facade_dependency_contract(manifest: &toml::Value, owner: &toml::Value
         let facade_dependency = dev_dependencies[dependency].as_table().unwrap();
         assert_table_keys(
             facade_dependency,
-            &["git", "rev", "version", "default-features"],
+            &["version", "default-features"],
             dependency,
         );
         let owner_dependency = &owner["dependencies"][dependency];
-        for field in ["git", "rev", "version", "default-features"] {
+        for field in ["version", "default-features"] {
             assert_eq!(
                 facade_dependency.get(field),
                 owner_dependency.get(field),
@@ -668,7 +653,7 @@ fn facade_manifest_rejects_dependencies_in_every_target_specific_table() {
 }
 
 #[test]
-fn facade_manifest_rejects_bevy_source_revision_and_feature_drift() {
+fn facade_manifest_rejects_bevy_source_version_and_feature_drift() {
     let hostile_fields = [
         (
             "git",

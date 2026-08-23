@@ -4925,16 +4925,31 @@ fn run_success(output: Output, case: &ConsumerCase, command: &str) -> Output {
 fn assert_lock_is_pinned(path: &Path) {
     let lock = fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("failed to read '{}': {error}", path.display()));
-    for line in lock
-        .lines()
-        .filter(|line| line.starts_with("source = \"git+"))
-    {
-        if line.contains("github.com/shengyusi-SYS/bevy") {
-            assert!(
-                line.ends_with("#61f78f75684e6b0bc28a13a5933f8f55ca653fa7\""),
-                "isolated lock contains a noncanonical Bevy revision: {line}"
+    assert!(
+        !lock.contains("github.com/shengyusi-SYS/bevy"),
+        "isolated lock still contains the retired Bevy fork"
+    );
+    let lock: toml::Value = toml::from_str(&lock)
+        .unwrap_or_else(|error| panic!("failed to parse '{}': {error}", path.display()));
+    for package in lock["package"].as_array().unwrap() {
+        let name = package["name"].as_str().unwrap();
+        if !name.starts_with("bevy") || name.starts_with("bevy_ui_router") {
+            continue;
+        }
+        let source = package
+            .get("source")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("isolated lock Bevy package `{name}` must have a source"));
+        assert_eq!(
+            source, "registry+https://github.com/rust-lang/crates.io-index",
+            "isolated lock Bevy package `{name}` must come from crates.io"
+        );
+        let version = package["version"].as_str().unwrap();
+        if version.starts_with("0.19") {
+            assert_eq!(
+                version, "0.19.1",
+                "isolated lock Bevy package `{name}` must resolve to 0.19.1"
             );
-            assert!(!line.contains("?branch="));
         }
     }
 }

@@ -4,8 +4,7 @@ use std::path::Path;
 
 use toml::{Table, Value};
 
-const BEVY_GIT: &str = "https://github.com/shengyusi-SYS/bevy.git";
-const BEVY_REV: &str = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7";
+const BEVY_VERSION: &str = "0.19.1";
 const SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
 
 fn parse_manifest(input: &str) -> Table {
@@ -37,14 +36,15 @@ fn assert_keys(table: &Table, expected: &[&str], label: &str) {
 
 fn assert_bevy(table: &Table, features: &[&str], label: &str) {
     let fields = if features.is_empty() {
-        &["git", "rev", "version", "default-features"][..]
+        &["version", "default-features"][..]
     } else {
-        &["git", "rev", "version", "default-features", "features"][..]
+        &["version", "default-features", "features"][..]
     };
     assert_keys(table, fields, label);
-    assert_eq!(table.get("git").and_then(Value::as_str), Some(BEVY_GIT));
-    assert_eq!(table.get("rev").and_then(Value::as_str), Some(BEVY_REV));
-    assert_eq!(table.get("version").and_then(Value::as_str), Some("0.19.0"));
+    assert_eq!(
+        table.get("version").and_then(Value::as_str),
+        Some(BEVY_VERSION)
+    );
     assert_eq!(
         table.get("default-features").and_then(Value::as_bool),
         Some(false)
@@ -56,10 +56,6 @@ fn assert_bevy(table: &Table, features: &[&str], label: &str) {
     assert_eq!(
         table.get("features").map(strings).unwrap_or_default(),
         expected
-    );
-    assert!(
-        !table.contains_key("branch"),
-        "{label} must not declare branch"
     );
 }
 
@@ -86,14 +82,15 @@ fn facade_safety_violations(manifest: &Table) -> Vec<String> {
                 continue;
             };
             if is_bevy_family(name, dependency) {
-                if dependency.get("git").and_then(Value::as_str) != Some(BEVY_GIT) {
-                    violations.push(format!("{name} must use the approved Bevy git source"));
+                if dependency.get("version").and_then(Value::as_str) != Some(BEVY_VERSION) {
+                    violations.push(format!("{name} must use official Bevy {BEVY_VERSION}"));
                 }
-                if dependency.get("rev").and_then(Value::as_str) != Some(BEVY_REV) {
-                    violations.push(format!("{name} must pin the approved Bevy revision"));
-                }
-                if dependency.contains_key("branch") {
-                    violations.push(format!("{name} must not declare branch"));
+                for field in ["git", "rev", "branch", "path", "registry"] {
+                    if dependency.contains_key(field) {
+                        violations.push(format!(
+                            "{name} must use the default crates.io registry without `{field}`"
+                        ));
+                    }
                 }
             }
         }
@@ -123,8 +120,7 @@ fn is_bevy_family(name: &str, dependency: &Table) -> bool {
         .get("package")
         .and_then(Value::as_str)
         .unwrap_or(name);
-    (package.starts_with("bevy") && !package.starts_with("bevy_ui_router"))
-        || dependency.get("git").and_then(Value::as_str) == Some(BEVY_GIT)
+    package.starts_with("bevy") && !package.starts_with("bevy_ui_router")
 }
 
 #[test]
@@ -133,10 +129,10 @@ fn manifest_contract_rejects_bevy_dependency_outside_dev_dependencies() {
         r#"
 [dependencies]
 [dev-dependencies]
-bevy_ecs = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
-bevy_ui = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+bevy_ecs = { version = "0.19.1", default-features = false }
+bevy_ui = { version = "0.19.1", default-features = false }
 [build-dependencies]
-bevy_app = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+bevy_app = { version = "0.19.1", default-features = false }
 "#,
     );
     assert_eq!(
@@ -151,15 +147,15 @@ fn manifest_contract_rejects_any_movable_bevy_branch() {
         r#"
 [dependencies]
 [dev-dependencies]
-bevy_app = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", branch = "arbitrary-moving-branch", version = "0.19.0", default-features = false }
-bevy_ecs = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
-bevy_ui = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+bevy_app = { version = "0.19.1", branch = "arbitrary-moving-branch", default-features = false }
+bevy_ecs = { version = "0.19.1", default-features = false }
+bevy_ui = { version = "0.19.1", default-features = false }
 [build-dependencies]
 "#,
     );
     assert_eq!(
         facade_safety_violations(&manifest),
-        vec!["bevy_app must not declare branch"]
+        vec!["bevy_app must use the default crates.io registry without `branch`"]
     );
 }
 
@@ -169,17 +165,17 @@ fn manifest_contract_rejects_target_specific_bevy_branch() {
         r#"
 [dependencies]
 [dev-dependencies]
-bevy_app = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
-bevy_ecs = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
-bevy_ui = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+bevy_app = { version = "0.19.1", default-features = false }
+bevy_ecs = { version = "0.19.1", default-features = false }
+bevy_ui = { version = "0.19.1", default-features = false }
 
 [target.'cfg(unix)'.build-dependencies]
-bevy_render = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", branch = "target-moving-branch", version = "0.19.0", default-features = false }
+bevy_render = { version = "0.19.1", branch = "target-moving-branch", default-features = false }
 "#,
     );
     assert_eq!(
         facade_safety_violations(&manifest),
-        vec!["bevy_render must not declare branch"]
+        vec!["bevy_render must use the default crates.io registry without `branch`"]
     );
 }
 
@@ -189,12 +185,12 @@ fn manifest_contract_classifies_only_cargo_dependency_tables() {
         r#"
 [dependencies]
 [dev-dependencies]
-bevy_app = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
-bevy_ecs = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
-bevy_ui = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+bevy_app = { version = "0.19.1", default-features = false }
+bevy_ecs = { version = "0.19.1", default-features = false }
+bevy_ui = { version = "0.19.1", default-features = false }
 
 [target.'cfg(unix)'.build-dependencies]
-render = { package = "bevy_render", git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", branch = "moving" }
+render = { package = "bevy_render", version = "0.19.1", branch = "moving" }
 
 [package.metadata.bevy_fake]
 branch = "not-a-dependency"
@@ -202,23 +198,23 @@ branch = "not-a-dependency"
     );
     assert_eq!(
         facade_safety_violations(&manifest),
-        vec!["render must not declare branch"]
+        vec!["render must use the default crates.io registry without `branch`"]
     );
 }
 
 #[test]
-fn manifest_contract_enforces_exact_bevy_sources_in_target_tables() {
+fn manifest_contract_enforces_official_bevy_version_and_source_in_target_tables() {
     let manifest = parse_manifest(
         r#"
 [dependencies]
 [dev-dependencies]
-bevy_app = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
-bevy_ecs = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
-bevy_ui = { git = "https://github.com/shengyusi-SYS/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7", version = "0.19.0", default-features = false }
+bevy_app = { version = "0.19.1", default-features = false }
+bevy_ecs = { version = "0.19.1", default-features = false }
+bevy_ui = { version = "0.19.1", default-features = false }
 
 [target.'cfg(unix)'.build-dependencies]
-render = { package = "bevy_render", git = "https://github.com/shengyusi-SYS/bevy.git", rev = "different" }
-profile = { package = "bevy_app", git = "https://example.invalid/bevy.git", rev = "61f78f75684e6b0bc28a13a5933f8f55ca653fa7" }
+render = { package = "bevy_render", version = "0.19.0" }
+profile = { package = "bevy_app", version = "0.19.1", git = "https://example.invalid/bevy.git" }
 "#,
     );
     assert_eq!(
@@ -226,8 +222,8 @@ profile = { package = "bevy_app", git = "https://example.invalid/bevy.git", rev 
             .into_iter()
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([
-            "render must pin the approved Bevy revision".to_owned(),
-            "profile must use the approved Bevy git source".to_owned(),
+            "render must use official Bevy 0.19.1".to_owned(),
+            "profile must use the default crates.io registry without `git`".to_owned(),
         ])
     );
 }
