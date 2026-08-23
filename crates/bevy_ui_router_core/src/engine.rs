@@ -35,11 +35,12 @@ use crate::history_authority::{
 };
 use crate::ids::{
     CleanupBatchId, CoreIdAllocator, FrameTaskId, NavigationRequestId, ReservedBranchAttempt,
-    ReservedFrameAttempt, RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId, RouterIdentity,
-    TransactionId,
+    ReservedFrameAttempt, RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId,
+    RouterIdentity, TransactionId,
 };
 use crate::location::RouteLocation;
 use crate::matcher::RouteMatcher;
+use crate::meta::ErrorBoundaryKey;
 use crate::mount::{
     MountConfirmation, MountError, MountGrant, MountIssuer, MountIssuerContextDisposition,
     MountIssuerRequestProjection, MountReceiptAttestation, MountReceiptProof,
@@ -433,11 +434,50 @@ enum FrozenParentMountSource {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum FailureCleanupContinuation {
+enum FailureCleanupRecoveryTargetProjection {
+    Terminal,
+    RouterFallback,
+    BoundError {
+        failure_branch_index: usize,
+        boundary_route: RouteId,
+        boundary: ErrorBoundaryKey,
+        view: RouteViewKey,
+    },
+    AuthoritySettlement,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum FailureCleanupContinuationOwner {
     Terminal,
     BeginFallback,
-    BeginBoundError(FrozenBoundErrorRecovery),
+    BeginBoundError(Box<FrozenBoundErrorRecovery>),
     AuthoritySettlement,
+}
+
+impl FailureCleanupContinuationOwner {
+    fn receiver_projection(&self) -> FailureCleanupRecoveryTargetProjection {
+        match self {
+            Self::Terminal => FailureCleanupRecoveryTargetProjection::Terminal,
+            Self::BeginFallback => FailureCleanupRecoveryTargetProjection::RouterFallback,
+            Self::BeginBoundError(recovery) => FailureCleanupRecoveryTargetProjection::BoundError {
+                failure_branch_index: recovery.failure_branch_index,
+                boundary_route: recovery.binding.boundary_route(),
+                boundary: recovery.binding.boundary().clone(),
+                view: recovery.binding.view().clone(),
+            },
+            Self::AuthoritySettlement => {
+                FailureCleanupRecoveryTargetProjection::AuthoritySettlement
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailureCleanupReceiverProjection {
+    identity: FrameTaskIdentity,
+    expected: PendingFailureKind,
+    logical_roots: Vec<RouteFrameVersion>,
+    recovery: FailureCleanupRecoveryTargetProjection,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -470,7 +510,7 @@ enum FailedAuthoritySettlementTerminal {
         current_roots: Vec<RouteFrameVersion>,
         target_and_current_roots: Option<Vec<RouteFrameVersion>>,
     },
-    FailureCleanup(FailureCleanupRequest),
+    FailureCleanup(FailureCleanupReceiverProjection),
     RegistrationBegin {
         identity: FrameTaskIdentity,
         permit: MountRegistrationPermit,
@@ -499,6 +539,7 @@ impl FailedAuthoritySettlementTrigger {
 enum FailedAuthoritySettlementTerminalRef<'a> {
     Task(&'a FrameTaskIdentity),
     FailureCleanup(&'a FailureCleanupRequest),
+    FailureCleanupProjection(&'a FailureCleanupReceiverProjection),
     RegistrationBegin(&'a MountRegistrationPermit),
 }
 
@@ -553,13 +594,11 @@ impl BeginAuthoritySettlementError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct FailureCleanupRequest {
-    identity: FrameTaskIdentity,
-    expected: PendingFailureKind,
-    logical_roots: Vec<RouteFrameVersion>,
+    receiver: FailureCleanupReceiverProjection,
     failure: NavigationFailure,
-    continuation: FailureCleanupContinuation,
+    continuation: FailureCleanupContinuationOwner,
 }
 
 pub(crate) struct FailureCleanupPrepareError {
@@ -591,21 +630,36 @@ impl std::fmt::Debug for FailureCleanupPrepareError {
 }
 
 impl FailureCleanupRequest {
+    fn new(
+        identity: FrameTaskIdentity,
+        expected: PendingFailureKind,
+        logical_roots: Vec<RouteFrameVersion>,
+        failure: NavigationFailure,
+        continuation: FailureCleanupContinuationOwner,
+    ) -> Self {
+        let recovery = continuation.receiver_projection();
+        Self {
+            receiver: FailureCleanupReceiverProjection {
+                identity,
+                expected,
+                logical_roots,
+                recovery,
+            },
+            failure,
+            continuation,
+        }
+    }
+
     pub(crate) const fn request(&self) -> NavigationRequestId {
-        self.identity.request()
+        self.receiver.identity.request()
     }
 
     pub(crate) fn logical_roots(&self) -> &[RouteFrameVersion] {
-        &self.logical_roots
+        &self.receiver.logical_roots
     }
 
     pub(crate) const fn failure(&self) -> &NavigationFailure {
         &self.failure
-    }
-
-    #[cfg(test)]
-    pub(crate) fn testing_duplicate(&self) -> Self {
-        self.clone()
     }
 }
 
@@ -1573,11 +1627,8 @@ pub(crate) struct CoreBackTargetDriverTerminalProjection {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CoreBackTargetFailureCleanupRequestProjection {
-    identity: FrameTaskIdentity,
-    expected: PendingFailureKind,
-    logical_roots: Vec<RouteFrameVersion>,
+    pub(crate) receiver: FailureCleanupReceiverProjection,
     failure: NavigationFailure,
-    continuation: FailureCleanupContinuation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1614,8 +1665,9 @@ pub(crate) enum CoreBackTargetReceiverStageProjection {
     ReadyToCommit,
     CommitSealed,
     PostCommitCleanup,
-    FailureCleanupManifestPending(CoreBackTargetFailureCleanupRequestProjection),
+    FailureCleanupManifestPending(FailureCleanupReceiverProjection),
     FailureCleanupPrepared,
+    FailureCleanupCompleting,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2045,10 +2097,10 @@ struct PreparedPublicationRejection {
     observed: PreparedPublicationObservation,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct PreparedPublicationObservation {
     identity: Option<FrameTaskIdentity>,
-    stage: Option<WorkStage>,
+    stage: Option<WorkStageProjection>,
     record: Option<NavigationRequestRecord>,
     history_revision: HistoryRevision,
     history_execution: Option<HistoryExecutionBindingProjection>,
@@ -2141,7 +2193,7 @@ impl PreparedPublicationObservation {
         self.identity.as_ref() == Some(&owner.identity)
             && matches!(
                 self.stage.as_ref(),
-                Some(WorkStage::CommitSealed { token }) if token == &owner.cleanup
+                Some(WorkStageProjection::CommitSealed(token)) if token == &owner.cleanup
             )
             && self.record.as_ref().map(NavigationRequestRecord::id) == Some(owner.identity.request)
             && owner
@@ -2231,7 +2283,7 @@ pub(crate) enum PrivateRequestLookup<'a> {
     Unknown,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 enum WorkStage {
     Applying,
     AwaitingMount,
@@ -2245,13 +2297,203 @@ enum WorkStage {
         outstanding: CleanupBatchToken,
     },
     FailureCleanupManifestPending {
-        expected: FailureCleanupRequest,
+        expected: FailureCleanupReceiverProjection,
     },
     FailureCleanupPrepared {
         outstanding: CleanupBatchToken,
         failure: NavigationFailure,
-        continuation: FailureCleanupContinuation,
+        continuation: FailureCleanupContinuationOwner,
     },
+    FailureCleanupCompleting {
+        outstanding: CleanupBatchToken,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WorkStageProjection {
+    Applying,
+    AwaitingMount,
+    AwaitingReceipt,
+    ConfirmingMount,
+    ReadyToCommit,
+    CommitSealed(CleanupBatchToken),
+    PostCommitCleanup(CleanupBatchToken),
+    FailureCleanupManifestPending(FailureCleanupReceiverProjection),
+    FailureCleanupPrepared {
+        outstanding: CleanupBatchToken,
+        failure: NavigationFailure,
+    },
+    FailureCleanupCompleting(CleanupBatchToken),
+}
+
+impl WorkStage {
+    fn projection(&self) -> WorkStageProjection {
+        match self {
+            Self::Applying => WorkStageProjection::Applying,
+            Self::AwaitingMount => WorkStageProjection::AwaitingMount,
+            Self::AwaitingReceipt => WorkStageProjection::AwaitingReceipt,
+            Self::ConfirmingMount => WorkStageProjection::ConfirmingMount,
+            Self::ReadyToCommit => WorkStageProjection::ReadyToCommit,
+            Self::CommitSealed { token } => WorkStageProjection::CommitSealed(token.clone()),
+            Self::PostCommitCleanup { outstanding } => {
+                WorkStageProjection::PostCommitCleanup(outstanding.clone())
+            }
+            Self::FailureCleanupManifestPending { expected } => {
+                WorkStageProjection::FailureCleanupManifestPending(expected.clone())
+            }
+            Self::FailureCleanupPrepared {
+                outstanding,
+                failure,
+                continuation: _,
+            } => WorkStageProjection::FailureCleanupPrepared {
+                outstanding: outstanding.clone(),
+                failure: failure.clone(),
+            },
+            Self::FailureCleanupCompleting { outstanding } => {
+                WorkStageProjection::FailureCleanupCompleting(outstanding.clone())
+            }
+        }
+    }
+
+    fn clone_pre_retirement(&self) -> Option<Self> {
+        match self {
+            Self::Applying => Some(Self::Applying),
+            Self::AwaitingMount => Some(Self::AwaitingMount),
+            Self::AwaitingReceipt => Some(Self::AwaitingReceipt),
+            Self::ConfirmingMount => Some(Self::ConfirmingMount),
+            Self::ReadyToCommit => Some(Self::ReadyToCommit),
+            Self::CommitSealed { token } => Some(Self::CommitSealed {
+                token: token.clone(),
+            }),
+            Self::PostCommitCleanup { outstanding } => Some(Self::PostCommitCleanup {
+                outstanding: outstanding.clone(),
+            }),
+            Self::FailureCleanupManifestPending { .. }
+            | Self::FailureCleanupPrepared { .. }
+            | Self::FailureCleanupCompleting { .. } => None,
+        }
+    }
+}
+
+pub(crate) struct FailureCleanupCompletionOwner {
+    router: RouterIdentity,
+    identity: FrameTaskIdentity,
+    outstanding: CleanupBatchToken,
+    failure: NavigationFailure,
+    continuation: FailureCleanupContinuationOwner,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailureCleanupCompletionReceiverProjection {
+    router: RouterIdentity,
+    identity: Option<FrameTaskIdentity>,
+    stage: Option<WorkStageProjection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailureCleanupCompletionReceiverMismatchProjection {
+    expected: FailureCleanupCompletionReceiverProjection,
+    observed: FailureCleanupCompletionReceiverProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FailureCleanupCompletionPreparationStageProjection {
+    Missing,
+    FailureCleanupPrepared {
+        outstanding: CleanupBatchToken,
+        authority_settlement: bool,
+    },
+    Other(WorkStageProjection),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailureCleanupCompletionPreparationReceiverProjection {
+    router: RouterIdentity,
+    identity: Option<FrameTaskIdentity>,
+    stage: FailureCleanupCompletionPreparationStageProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailureCleanupCompletionPreparationMismatchProjection {
+    expected: FailureCleanupCompletionPreparationReceiverProjection,
+    observed: FailureCleanupCompletionPreparationReceiverProjection,
+}
+
+pub(crate) struct FailureCleanupCompletionPrepareError {
+    kind: CleanupError,
+    mismatch: FailureCleanupCompletionPreparationMismatchProjection,
+}
+
+impl FailureCleanupCompletionPrepareError {
+    const fn new(
+        kind: CleanupError,
+        mismatch: FailureCleanupCompletionPreparationMismatchProjection,
+    ) -> Self {
+        Self { kind, mismatch }
+    }
+
+    pub(crate) const fn kind(&self) -> CleanupError {
+        self.kind
+    }
+
+    pub(crate) fn into_mismatch(self) -> FailureCleanupCompletionPreparationMismatchProjection {
+        self.mismatch
+    }
+}
+
+impl std::fmt::Debug for FailureCleanupCompletionPrepareError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FailureCleanupCompletionPrepareError")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) struct FailureCleanupCompletionCommitError {
+    kind: CleanupError,
+    owner: FailureCleanupCompletionOwner,
+    mismatch: FailureCleanupCompletionReceiverMismatchProjection,
+}
+
+impl FailureCleanupCompletionCommitError {
+    const fn new(
+        kind: CleanupError,
+        owner: FailureCleanupCompletionOwner,
+        mismatch: FailureCleanupCompletionReceiverMismatchProjection,
+    ) -> Self {
+        Self {
+            kind,
+            owner,
+            mismatch,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> CleanupError {
+        self.kind
+    }
+
+    pub(crate) fn into_owner(self) -> FailureCleanupCompletionOwner {
+        self.owner
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        FailureCleanupCompletionOwner,
+        FailureCleanupCompletionReceiverMismatchProjection,
+    ) {
+        (self.owner, self.mismatch)
+    }
+}
+
+impl std::fmt::Debug for FailureCleanupCompletionCommitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FailureCleanupCompletionCommitError")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2302,7 +2544,7 @@ impl CurrentWork {
             applied_frames: self.applied_frames.clone(),
             current_target: self.current_target.clone(),
             pending_mount: self.pending_mount.clone(),
-            stage: self.stage.clone(),
+            stage: self.stage.clone_pre_retirement()?,
             cleanup_batch: self.cleanup_batch,
             cleanup_roots: self.cleanup_roots.clone(),
             attempt: self.attempt.clone(),
@@ -2749,6 +2991,21 @@ impl RouterEngine {
                 })
             }
             FailedAuthoritySettlementTerminalRef::FailureCleanup(request) => {
+                if request.receiver.identity.router_identity() != self.router {
+                    return Err(FailedAuthorityTriggerError::Foreign);
+                }
+                if !matches!(
+                    &current.stage,
+                    WorkStage::FailureCleanupManifestPending { expected }
+                        if expected == &request.receiver
+                ) {
+                    return Err(FailedAuthorityTriggerError::Stale);
+                }
+                Ok(FailedAuthoritySettlementTerminal::FailureCleanup(
+                    request.receiver.clone(),
+                ))
+            }
+            FailedAuthoritySettlementTerminalRef::FailureCleanupProjection(request) => {
                 if request.identity.router_identity() != self.router {
                     return Err(FailedAuthorityTriggerError::Foreign);
                 }
@@ -2821,7 +3078,7 @@ impl RouterEngine {
                 FailedAuthoritySettlementTerminalRef::Task(identity)
             }
             FailedAuthoritySettlementTerminal::FailureCleanup(request) => {
-                FailedAuthoritySettlementTerminalRef::FailureCleanup(request)
+                FailedAuthoritySettlementTerminalRef::FailureCleanupProjection(request)
             }
             FailedAuthoritySettlementTerminal::RegistrationBegin { permit, .. } => {
                 FailedAuthoritySettlementTerminalRef::RegistrationBegin(permit)
@@ -2949,26 +3206,26 @@ impl RouterEngine {
             NavigationFailureKind::AuthorityLost,
             "physical reconciliation authority was lost",
         );
-        let request = FailureCleanupRequest {
-            identity: current_identity,
-            expected: PendingFailureKind::AuthorityLost,
+        let request = FailureCleanupRequest::new(
+            current_identity,
+            PendingFailureKind::AuthorityLost,
             logical_roots,
             failure,
-            continuation: FailureCleanupContinuation::AuthoritySettlement,
-        };
-        if request.logical_roots != seal.logical_roots() {
+            FailureCleanupContinuationOwner::AuthoritySettlement,
+        );
+        if request.logical_roots() != seal.logical_roots() {
             return Err(BeginAuthoritySettlementError::new(
                 BeginAuthoritySettlementErrorKind::InvalidManifest,
                 lease,
             ));
         }
         let cleanup = CleanupBatchToken::sealed(
-            request.identity.clone(),
+            request.receiver.identity.clone(),
             self.current
                 .as_ref()
                 .expect("authority settlement phase was preflighted")
                 .cleanup_batch,
-            &request.logical_roots,
+            request.logical_roots(),
             seal.manifest_digest(),
             seal.obligation_count(),
         );
@@ -3028,7 +3285,7 @@ impl RouterEngine {
         current.stage = WorkStage::FailureCleanupPrepared {
             outstanding: cleanup.clone(),
             failure: request.failure.clone(),
-            continuation: FailureCleanupContinuation::AuthoritySettlement,
+            continuation: FailureCleanupContinuationOwner::AuthoritySettlement,
         };
         self.action = None;
         *self
@@ -6235,16 +6492,16 @@ impl RouterEngine {
                             "child mount request issuer rejected internal identity"
                         }
                     };
-                    let failure = FailureCleanupRequest {
-                        identity: current.identity.clone(),
-                        expected: PendingFailureKind::MountIssue,
-                        logical_roots: current.applied_frames.iter().rev().cloned().collect(),
-                        failure: NavigationFailure::new(NavigationFailureKind::Mount, message),
-                        continuation: failure_continuation,
-                    };
+                    let failure = FailureCleanupRequest::new(
+                        current.identity.clone(),
+                        PendingFailureKind::MountIssue,
+                        current.applied_frames.iter().rev().cloned().collect(),
+                        NavigationFailure::new(NavigationFailureKind::Mount, message),
+                        failure_continuation,
+                    );
                     current.pending_mount = None;
                     current.stage = WorkStage::FailureCleanupManifestPending {
-                        expected: failure.clone(),
+                        expected: failure.receiver.clone(),
                     };
                     state.set_request(Some(RequestStatus::Running(failure_phase)));
                     PreparedBackTargetStart::FailureCleanup(PreparedBackTargetFailureCleanup {
@@ -7219,7 +7476,7 @@ impl RouterEngine {
         request: FailureCleanupRequest,
         seal: CleanupManifestSeal,
     ) -> Result<CleanupBatchToken, FailureCleanupPrepareError> {
-        if request.identity.router_identity() != self.router {
+        if request.receiver.identity.router_identity() != self.router {
             return Err(FailureCleanupPrepareError::new(
                 FailureCleanupError::Foreign,
                 request,
@@ -7233,7 +7490,7 @@ impl RouterEngine {
         };
         let valid_request = matches!(
             &current.stage,
-            WorkStage::FailureCleanupManifestPending { expected } if expected == &request
+            WorkStage::FailureCleanupManifestPending { expected } if expected == &request.receiver
         );
         if !valid_request {
             return Err(FailureCleanupPrepareError::new(
@@ -7241,7 +7498,7 @@ impl RouterEngine {
                 request,
             ));
         }
-        if request.logical_roots != seal.logical_roots() {
+        if request.logical_roots() != seal.logical_roots() {
             return Err(FailureCleanupPrepareError::new(
                 FailureCleanupError::InvalidManifest,
                 request,
@@ -7249,9 +7506,9 @@ impl RouterEngine {
         }
 
         let cleanup = CleanupBatchToken::sealed(
-            request.identity.clone(),
+            request.receiver.identity.clone(),
             current.cleanup_batch,
-            &request.logical_roots,
+            request.logical_roots(),
             seal.manifest_digest(),
             seal.obligation_count(),
         );
@@ -7317,11 +7574,8 @@ impl RouterEngine {
         request: &FailureCleanupRequest,
     ) -> CoreBackTargetFailureCleanupRequestProjection {
         CoreBackTargetFailureCleanupRequestProjection {
-            identity: request.identity.clone(),
-            expected: request.expected.clone(),
-            logical_roots: request.logical_roots.clone(),
+            receiver: request.receiver.clone(),
             failure: request.failure.clone(),
-            continuation: request.continuation.clone(),
         }
     }
 
@@ -7397,11 +7651,14 @@ impl RouterEngine {
             }
             Some(WorkStage::FailureCleanupManifestPending { expected }) => {
                 CoreBackTargetReceiverStageProjection::FailureCleanupManifestPending(
-                    Self::back_target_failure_cleanup_request_projection(expected),
+                    expected.clone(),
                 )
             }
             Some(WorkStage::FailureCleanupPrepared { .. }) => {
                 CoreBackTargetReceiverStageProjection::FailureCleanupPrepared
+            }
+            Some(WorkStage::FailureCleanupCompleting { .. }) => {
+                CoreBackTargetReceiverStageProjection::FailureCleanupCompleting
             }
             None => CoreBackTargetReceiverStageProjection::Missing,
         }
@@ -7808,10 +8065,10 @@ impl RouterEngine {
             observed.scope.world,
             observed.scope.router,
             observed.scope.history,
-        ) && observed.current.as_ref() == Some(&expected.request.identity)
+        ) && observed.current.as_ref() == Some(&expected.request.receiver.identity)
             && observed.stage
                 == CoreBackTargetReceiverStageProjection::FailureCleanupManifestPending(
-                    expected.request.clone(),
+                    expected.request.receiver.clone(),
                 );
         if exact {
             Ok(())
@@ -8244,7 +8501,7 @@ impl RouterEngine {
                 NavigationFailureKind::Apply,
                 "frame final preflight rejected",
             ),
-            FailureCleanupContinuation::BeginFallback,
+            FailureCleanupContinuationOwner::BeginFallback,
         ))
     }
 
@@ -8480,7 +8737,7 @@ impl RouterEngine {
         let current = self.current.as_ref();
         PreparedPublicationObservation {
             identity: current.map(|current| current.identity.clone()),
-            stage: current.map(|current| current.stage.clone()),
+            stage: current.map(|current| current.stage.projection()),
             record: self.records.get(record_index).cloned(),
             history_revision: self.history.revision(),
             history_execution: current.and_then(|current| match &current.attempt {
@@ -8769,7 +9026,227 @@ impl RouterEngine {
         if self.authority_settlement_cleanup_pending() {
             return Err(CleanupError::Invalid);
         }
+        if self.failure_cleanup_completion_pending() {
+            let owner = self
+                .prepare_failure_cleanup_completion(completion)
+                .map_err(|error| error.kind())?;
+            return self
+                .complete_prepared_failure_cleanup_with_ledger(owner, || {})
+                .map_err(|error| error.kind());
+        }
         self.complete_cleanup_impl(completion, || {})
+    }
+
+    fn failure_cleanup_completion_pending(&self) -> bool {
+        self.current.as_ref().is_some_and(|current| {
+            matches!(
+                &current.stage,
+                WorkStage::FailureCleanupPrepared { continuation, .. }
+                    if !matches!(
+                        continuation,
+                        FailureCleanupContinuationOwner::AuthoritySettlement
+                    )
+            )
+        })
+    }
+
+    pub(crate) fn prepare_failure_cleanup_completion(
+        &mut self,
+        completion: CleanupCompletion,
+    ) -> Result<FailureCleanupCompletionOwner, FailureCleanupCompletionPrepareError> {
+        let expected = FailureCleanupCompletionPreparationReceiverProjection {
+            router: completion.token().identity().router_identity(),
+            identity: Some(completion.token().identity().clone()),
+            stage: FailureCleanupCompletionPreparationStageProjection::FailureCleanupPrepared {
+                outstanding: completion.token().clone(),
+                authority_settlement: false,
+            },
+        };
+        let observed = FailureCleanupCompletionPreparationReceiverProjection {
+            router: self.router,
+            identity: self
+                .current
+                .as_ref()
+                .map(|current| current.identity.clone()),
+            stage: match self.current.as_ref().map(|current| &current.stage) {
+                Some(WorkStage::FailureCleanupPrepared {
+                    outstanding,
+                    continuation,
+                    ..
+                }) => FailureCleanupCompletionPreparationStageProjection::FailureCleanupPrepared {
+                    outstanding: outstanding.clone(),
+                    authority_settlement: matches!(
+                        continuation,
+                        FailureCleanupContinuationOwner::AuthoritySettlement
+                    ),
+                },
+                Some(stage) => {
+                    FailureCleanupCompletionPreparationStageProjection::Other(stage.projection())
+                }
+                None => FailureCleanupCompletionPreparationStageProjection::Missing,
+            },
+        };
+        let mismatch = || {
+            FailureCleanupCompletionPrepareError::new(
+                self.cleanup_completion_mismatch(&completion),
+                FailureCleanupCompletionPreparationMismatchProjection {
+                    expected: expected.clone(),
+                    observed: observed.clone(),
+                },
+            )
+        };
+        if expected != observed {
+            return Err(mismatch());
+        }
+        let Some(current) = self.current.as_ref() else {
+            return Err(mismatch());
+        };
+        let WorkStage::FailureCleanupPrepared {
+            outstanding,
+            continuation,
+            ..
+        } = &current.stage
+        else {
+            return Err(mismatch());
+        };
+        if matches!(
+            continuation,
+            FailureCleanupContinuationOwner::AuthoritySettlement
+        ) || !completion.matches(outstanding)
+        {
+            return Err(mismatch());
+        }
+
+        let identity = current.identity.clone();
+        let expected = outstanding.clone();
+        let current = self
+            .current
+            .as_mut()
+            .expect("failure cleanup completion was preflighted");
+        let stage = std::mem::replace(
+            &mut current.stage,
+            WorkStage::FailureCleanupCompleting {
+                outstanding: expected.clone(),
+            },
+        );
+        let WorkStage::FailureCleanupPrepared {
+            outstanding,
+            failure,
+            continuation,
+        } = stage
+        else {
+            unreachable!("failure cleanup completion consumed its preflighted stage")
+        };
+        Ok(FailureCleanupCompletionOwner {
+            router: self.router,
+            identity,
+            outstanding,
+            failure,
+            continuation,
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn drift_failure_cleanup_completion_receiver_for_test(&mut self) {
+        let current = self
+            .current
+            .as_mut()
+            .expect("failure completion receiver drift requires current work");
+        assert!(matches!(
+            current.stage,
+            WorkStage::FailureCleanupPrepared { .. } | WorkStage::FailureCleanupCompleting { .. }
+        ));
+        current.identity.branch_index = current.identity.branch_index.saturating_add(1);
+    }
+
+    pub(crate) fn complete_prepared_failure_cleanup_with_ledger<F>(
+        &mut self,
+        owner: FailureCleanupCompletionOwner,
+        commit_ledger_and_clear_holder: F,
+    ) -> Result<(), FailureCleanupCompletionCommitError>
+    where
+        F: FnOnce(),
+    {
+        let expected = FailureCleanupCompletionReceiverProjection {
+            router: owner.router,
+            identity: Some(owner.identity.clone()),
+            stage: Some(WorkStageProjection::FailureCleanupCompleting(
+                owner.outstanding.clone(),
+            )),
+        };
+        let observed = FailureCleanupCompletionReceiverProjection {
+            router: self.router,
+            identity: self
+                .current
+                .as_ref()
+                .map(|current| current.identity.clone()),
+            stage: self
+                .current
+                .as_ref()
+                .map(|current| current.stage.projection()),
+        };
+        let exact = owner.router == self.router
+            && self.current.as_ref().is_some_and(|current| {
+                current.identity == owner.identity
+                    && matches!(
+                        &current.stage,
+                        WorkStage::FailureCleanupCompleting { outstanding }
+                            if outstanding == &owner.outstanding
+                    )
+            });
+        if !exact {
+            return Err(FailureCleanupCompletionCommitError::new(
+                CleanupError::Stale,
+                owner,
+                FailureCleanupCompletionReceiverMismatchProjection { expected, observed },
+            ));
+        }
+
+        commit_ledger_and_clear_holder();
+        let FailureCleanupCompletionOwner {
+            router: _,
+            identity,
+            outstanding,
+            failure,
+            continuation,
+        } = owner;
+        let request = identity.request;
+        self.record_mut(request)
+            .expect("running record is retained")
+            .append_trace(NavigationTraceEvent::cleanup_settled(None))
+            .expect("cleanup trace is open");
+        self.completed_cleanup.push(CompletedCleanupTombstone {
+            request,
+            token: outstanding,
+        });
+        match continuation {
+            FailureCleanupContinuationOwner::BeginBoundError(binding) => {
+                let _ = self.begin_bound_error(request, failure, *binding);
+            }
+            FailureCleanupContinuationOwner::BeginFallback => {
+                let _ = self.begin_fallback(request, failure);
+            }
+            FailureCleanupContinuationOwner::Terminal => {
+                let record = self
+                    .record_mut(request)
+                    .expect("running record is retained");
+                record
+                    .transition(RequestStatus::Failed(failure))
+                    .expect("request is running");
+                record
+                    .append_trace(NavigationTraceEvent::request_terminal())
+                    .expect("terminal status precedes terminal event");
+                self.retire_history_authority();
+                self.current = None;
+                self.state.set_request(None);
+                self.retain_terminal_records();
+                self.start_next();
+            }
+            FailureCleanupContinuationOwner::AuthoritySettlement => {
+                unreachable!("authority settlement uses its dedicated composed owner")
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn complete_cleanup_with_authority_mutation<F>(
@@ -8791,7 +9268,7 @@ impl RouterEngine {
             matches!(
                 current.stage,
                 WorkStage::FailureCleanupPrepared {
-                    continuation: FailureCleanupContinuation::AuthoritySettlement,
+                    continuation: FailureCleanupContinuationOwner::AuthoritySettlement,
                     ..
                 }
             )
@@ -8814,18 +9291,17 @@ impl RouterEngine {
                 WorkStage::FailureCleanupPrepared {
                     outstanding,
                     failure,
-                    continuation,
-                } => Some((
-                    outstanding.clone(),
-                    Some((failure.clone(), continuation.clone())),
-                )),
+                    continuation: FailureCleanupContinuationOwner::AuthoritySettlement,
+                } => Some((outstanding.clone(), Some(failure.clone()))),
                 WorkStage::Applying
                 | WorkStage::AwaitingMount
                 | WorkStage::AwaitingReceipt
                 | WorkStage::ConfirmingMount
                 | WorkStage::ReadyToCommit
                 | WorkStage::CommitSealed { .. }
-                | WorkStage::FailureCleanupManifestPending { .. } => None,
+                | WorkStage::FailureCleanupManifestPending { .. }
+                | WorkStage::FailureCleanupPrepared { .. }
+                | WorkStage::FailureCleanupCompleting { .. } => None,
             });
         if !outstanding
             .as_ref()
@@ -8851,36 +9327,9 @@ impl RouterEngine {
 
         let current = self.current.as_ref().expect("validated current work");
         let request = current.identity.request;
-        let (completed_token, failure) =
+        let (completed_token, authority_failure) =
             outstanding.expect("validated cleanup has an outstanding token");
-        if let Some((failure, FailureCleanupContinuation::BeginBoundError(binding))) = &failure {
-            let failure = failure.clone();
-            let binding = binding.clone();
-            self.record_mut(request)
-                .expect("running record is retained")
-                .append_trace(NavigationTraceEvent::cleanup_settled(None))
-                .expect("cleanup trace is open");
-            self.completed_cleanup.push(CompletedCleanupTombstone {
-                request,
-                token: completed_token,
-            });
-            let _ = self.begin_bound_error(request, failure, binding);
-            return Ok(());
-        }
-        if let Some((failure, FailureCleanupContinuation::BeginFallback)) = &failure {
-            let failure = failure.clone();
-            self.record_mut(request)
-                .expect("running record is retained")
-                .append_trace(NavigationTraceEvent::cleanup_settled(None))
-                .expect("cleanup trace is open");
-            self.completed_cleanup.push(CompletedCleanupTombstone {
-                request,
-                token: completed_token,
-            });
-            let _ = self.begin_fallback(request, failure);
-            return Ok(());
-        }
-        if let Some((failure, FailureCleanupContinuation::AuthoritySettlement)) = &failure {
+        if let Some(failure) = &authority_failure {
             let retired = current.retired_host.as_ref().ok_or(CleanupError::Stale)?;
             let version = self.state.host().cloned().ok_or(CleanupError::Stale)?;
             let top_slot = self.state.top_slot().ok_or(CleanupError::Stale)?;
@@ -8923,17 +9372,11 @@ impl RouterEngine {
             self.retain_terminal_records();
             return Ok(());
         }
-        let terminal_status = match failure {
-            Some((failure, FailureCleanupContinuation::Terminal)) => RequestStatus::Failed(failure),
-            Some((_, FailureCleanupContinuation::BeginFallback)) => unreachable!(),
-            Some((_, FailureCleanupContinuation::BeginBoundError(_))) => unreachable!(),
-            Some((_, FailureCleanupContinuation::AuthoritySettlement)) => unreachable!(),
-            None => match &current.attempt {
-                AttemptKind::Normal(_) => RequestStatus::Succeeded,
-                AttemptKind::Fallback {
-                    original_failure, ..
-                } => RequestStatus::Failed(original_failure.clone()),
-            },
+        let terminal_status = match &current.attempt {
+            AttemptKind::Normal(_) => RequestStatus::Succeeded,
+            AttemptKind::Fallback {
+                original_failure, ..
+            } => RequestStatus::Failed(original_failure.clone()),
         };
         let record = self
             .record_mut(request)
@@ -8959,6 +9402,24 @@ impl RouterEngine {
         Ok(())
     }
 
+    fn cleanup_completion_mismatch(&self, completion: &CleanupCompletion) -> CleanupError {
+        if let Some(tombstone) = self
+            .completed_cleanup
+            .iter()
+            .find(|tombstone| completion.token() == &tombstone.token)
+        {
+            if completion.matches(&tombstone.token) {
+                CleanupError::Duplicate
+            } else {
+                CleanupError::Invalid
+            }
+        } else if completion.is_well_formed() {
+            CleanupError::Stale
+        } else {
+            CleanupError::Invalid
+        }
+    }
+
     pub(crate) fn observe_cleanup_receipt(
         &mut self,
         batch: &CleanupBatchToken,
@@ -8982,7 +9443,8 @@ impl RouterEngine {
                 | WorkStage::CommitSealed { .. }
                 | WorkStage::PostCommitCleanup { .. }
                 | WorkStage::FailureCleanupManifestPending { .. }
-                | WorkStage::FailureCleanupPrepared { .. } => None,
+                | WorkStage::FailureCleanupPrepared { .. }
+                | WorkStage::FailureCleanupCompleting { .. } => None,
             })
             .ok_or(CleanupError::Stale)?;
         self.record_mut(request)
@@ -9655,7 +10117,7 @@ impl RouterEngine {
             failure
         };
         let continuation = if expected == PendingFailureKind::AuthorityLost {
-            FailureCleanupContinuation::Terminal
+            FailureCleanupContinuationOwner::Terminal
         } else if self
             .current
             .as_ref()
@@ -9663,7 +10125,7 @@ impl RouterEngine {
         {
             self.frozen_failure_recovery_continuation(failure_branch_index)
         } else {
-            FailureCleanupContinuation::Terminal
+            FailureCleanupContinuationOwner::Terminal
         };
         self.begin_failure_cleanup_with_continuation(expected, failure, continuation)
     }
@@ -9671,9 +10133,9 @@ impl RouterEngine {
     fn frozen_failure_recovery_continuation(
         &self,
         failure_branch_index: usize,
-    ) -> FailureCleanupContinuation {
+    ) -> FailureCleanupContinuationOwner {
         let Some(current) = self.current.as_ref() else {
-            return FailureCleanupContinuation::Terminal;
+            return FailureCleanupContinuationOwner::Terminal;
         };
         self.frozen_failure_recovery_continuation_for(current, failure_branch_index)
     }
@@ -9682,15 +10144,15 @@ impl RouterEngine {
         &self,
         current: &CurrentWork,
         failure_branch_index: usize,
-    ) -> FailureCleanupContinuation {
+    ) -> FailureCleanupContinuationOwner {
         let Some(branch) = current.branch.as_ref() else {
-            return FailureCleanupContinuation::Terminal;
+            return FailureCleanupContinuationOwner::Terminal;
         };
         let Some(binding) = branch.nearest_error_view_for(failure_branch_index) else {
-            return FailureCleanupContinuation::BeginFallback;
+            return FailureCleanupContinuationOwner::BeginFallback;
         };
         let Some(boundary) = branch.routes().get(binding.branch_index()) else {
-            return FailureCleanupContinuation::Terminal;
+            return FailureCleanupContinuationOwner::Terminal;
         };
         if !self.reconciliation_matches_active_for(current)
             || binding.branch_index() > failure_branch_index
@@ -9698,16 +10160,16 @@ impl RouterEngine {
             || boundary.error_boundary() != Some(binding.boundary())
             || boundary.slot() != binding.outlet()
         {
-            return FailureCleanupContinuation::Terminal;
+            return FailureCleanupContinuationOwner::Terminal;
         }
         let Some(mount) = self.freeze_bound_error_mount_source(current, binding) else {
-            return FailureCleanupContinuation::Terminal;
+            return FailureCleanupContinuationOwner::Terminal;
         };
-        FailureCleanupContinuation::BeginBoundError(FrozenBoundErrorRecovery {
+        FailureCleanupContinuationOwner::BeginBoundError(Box::new(FrozenBoundErrorRecovery {
             failure_branch_index,
             binding: binding.clone(),
             mount,
-        })
+        }))
     }
 
     fn freeze_bound_error_mount_source(
@@ -9869,7 +10331,7 @@ impl RouterEngine {
         &mut self,
         expected: PendingFailureKind,
         failure: NavigationFailure,
-        continuation: FailureCleanupContinuation,
+        continuation: FailureCleanupContinuationOwner,
     ) -> FailureCleanupRequest {
         let logical_roots = self
             .current
@@ -9887,7 +10349,7 @@ impl RouterEngine {
         &mut self,
         expected: PendingFailureKind,
         failure: NavigationFailure,
-        continuation: FailureCleanupContinuation,
+        continuation: FailureCleanupContinuationOwner,
         logical_roots: Vec<RouteFrameVersion>,
     ) -> FailureCleanupRequest {
         self.current_history_capability = None;
@@ -9895,14 +10357,14 @@ impl RouterEngine {
             .current
             .as_ref()
             .expect("a nested failure belongs to current work");
-        let request = FailureCleanupRequest {
-            identity: current.identity.clone(),
+        let request = FailureCleanupRequest::new(
+            current.identity.clone(),
             expected,
             logical_roots,
             failure,
             continuation,
-        };
-        let phase = if request.expected == PendingFailureKind::AuthorityLost {
+        );
+        let phase = if request.receiver.expected == PendingFailureKind::AuthorityLost {
             NavigationPhase::Recovering
         } else {
             NavigationPhase::CleanupPending
@@ -9913,10 +10375,10 @@ impl RouterEngine {
             .expect("a nested failure belongs to current work");
         current.pending_mount = None;
         current.stage = WorkStage::FailureCleanupManifestPending {
-            expected: request.clone(),
+            expected: request.receiver.clone(),
         };
         self.action = None;
-        self.transition_with_trace(request.identity.request, phase);
+        self.transition_with_trace(request.receiver.identity.request, phase);
         request
     }
 
@@ -11958,7 +12420,7 @@ impl ViewReportSession<'_> {
                     NavigationFailureKind::RecoveryFailed,
                     "router fallback failed",
                 ),
-                FailureCleanupContinuation::Terminal,
+                FailureCleanupContinuationOwner::Terminal,
             ),
         };
         self.engine
@@ -17436,7 +17898,7 @@ mod tests {
         );
         assert!(matches!(
             &failure.continuation,
-            super::FailureCleanupContinuation::BeginFallback
+            super::FailureCleanupContinuationOwner::BeginFallback
         ));
         assert_eq!(engine.active(), &active_before);
         assert_eq!(engine.history(), &history_before);
@@ -18850,7 +19312,7 @@ mod tests {
         assert!(matches!(
             engine.current.as_ref().map(|current| &current.stage),
             Some(WorkStage::FailureCleanupPrepared {
-                continuation: super::FailureCleanupContinuation::AuthoritySettlement,
+                continuation: super::FailureCleanupContinuationOwner::AuthoritySettlement,
                 ..
             })
         ));
@@ -18860,7 +19322,7 @@ mod tests {
     fn failure_cleanup_roots_count_and_continuation_are_independent() {
         fn pending_failure(
             roots: Vec<RouteFrameVersion>,
-            continuation: super::FailureCleanupContinuation,
+            continuation: super::FailureCleanupContinuationOwner,
         ) -> (RouterEngine, super::FailureCleanupRequest) {
             let mut engine = ready_engine();
             engine.push(RouteLocation::new("/items/1")).unwrap();
@@ -18877,10 +19339,10 @@ mod tests {
         }
 
         let (mut empty, empty_request) =
-            pending_failure(Vec::new(), super::FailureCleanupContinuation::Terminal);
+            pending_failure(Vec::new(), super::FailureCleanupContinuationOwner::Terminal);
         let empty_digest = manifest_digest(0xC1EA);
         let empty_expected = CleanupBatchToken::sealed(
-            empty_request.identity.clone(),
+            empty_request.receiver.identity.clone(),
             empty.current.as_ref().unwrap().cleanup_batch,
             &[],
             empty_digest,
@@ -18896,7 +19358,7 @@ mod tests {
         assert!(matches!(
             empty.current.as_ref().map(|current| &current.stage),
             Some(WorkStage::FailureCleanupPrepared {
-                continuation: super::FailureCleanupContinuation::Terminal,
+                continuation: super::FailureCleanupContinuationOwner::Terminal,
                 ..
             })
         ));
@@ -18910,12 +19372,12 @@ mod tests {
                 NavigationFailureKind::Apply,
                 "zero entity obligation fixture",
             ),
-            super::FailureCleanupContinuation::BeginFallback,
+            super::FailureCleanupContinuationOwner::BeginFallback,
             vec![root.clone()],
         );
         let roots_digest = manifest_digest(0xC1EB);
         let roots_expected = CleanupBatchToken::sealed(
-            roots_request.identity.clone(),
+            roots_request.receiver.identity.clone(),
             roots_engine.current.as_ref().unwrap().cleanup_batch,
             std::slice::from_ref(&root),
             roots_digest,
@@ -18931,90 +19393,87 @@ mod tests {
         assert!(matches!(
             roots_engine.current.as_ref().map(|current| &current.stage),
             Some(WorkStage::FailureCleanupPrepared {
-                continuation: super::FailureCleanupContinuation::BeginFallback,
+                continuation: super::FailureCleanupContinuationOwner::BeginFallback,
                 ..
             })
         ));
     }
 
     #[test]
-    fn failure_cleanup_request_stage_manifest_and_replay_are_exact_zero_write() {
+    fn failure_cleanup_request_stage_manifest_is_exact_zero_write() {
         let mut engine = ready_engine();
         let (_request, parent, mount) = begin_nested_mount(&mut engine, Vec::new());
-        let failure = engine
+        let mut failure = engine
             .reject_mount(mount, crate::trace::MountRejectionKind::MissingOutlet)
             .unwrap();
-        let exact = failure.testing_duplicate();
-        let replay = failure.testing_duplicate();
 
-        let mut cross_router = failure.testing_duplicate();
-        cross_router
+        let router = failure.receiver.identity.router_identity();
+        failure
+            .receiver
             .identity
             .testing_set_router(distinct_identity().router_identity());
-        let cross_router_roots = cross_router.logical_roots().to_vec();
+        let roots = failure.logical_roots().to_vec();
         let before = engine.snapshot();
-        assert_eq!(
-            engine.prepare_failure_cleanup(
-                cross_router,
-                CleanupManifestSeal::new(cross_router_roots, manifest_digest(135), 1),
-            ),
-            Err(super::FailureCleanupError::Foreign)
-        );
+        let error = engine
+            .prepare_failure_cleanup_retaining(
+                failure,
+                CleanupManifestSeal::new(roots.clone(), manifest_digest(135), 1),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), super::FailureCleanupError::Foreign);
+        failure = error.into_owner();
         assert_eq!(engine.snapshot(), before);
 
-        let mut stale_identity = failure.testing_duplicate();
-        stale_identity
+        failure.receiver.identity.testing_set_router(router);
+        let host_epoch = failure.receiver.identity.host_epoch();
+        failure
+            .receiver
             .identity
-            .testing_set_host_epoch(stale_identity.identity.host_epoch() + 1);
-        let stale_roots = stale_identity.logical_roots().to_vec();
+            .testing_set_host_epoch(host_epoch + 1);
         let before = engine.snapshot();
-        assert_eq!(
-            engine.prepare_failure_cleanup(
-                stale_identity,
-                CleanupManifestSeal::new(stale_roots, manifest_digest(137), 1),
-            ),
-            Err(super::FailureCleanupError::Stale)
-        );
+        let error = engine
+            .prepare_failure_cleanup_retaining(
+                failure,
+                CleanupManifestSeal::new(roots.clone(), manifest_digest(137), 1),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), super::FailureCleanupError::Stale);
+        failure = error.into_owner();
         assert_eq!(engine.snapshot(), before);
 
-        let mut wrong_stage = failure.testing_duplicate();
-        wrong_stage.expected = super::PendingFailureKind::Build;
-        let wrong_stage_roots = wrong_stage.logical_roots().to_vec();
+        failure.receiver.identity.testing_set_host_epoch(host_epoch);
+        let expected = failure.receiver.expected.clone();
+        failure.receiver.expected = super::PendingFailureKind::Build;
         let before = engine.snapshot();
-        assert_eq!(
-            engine.prepare_failure_cleanup(
-                wrong_stage,
-                CleanupManifestSeal::new(wrong_stage_roots, manifest_digest(139), 1),
-            ),
-            Err(super::FailureCleanupError::Stale)
-        );
+        let error = engine
+            .prepare_failure_cleanup_retaining(
+                failure,
+                CleanupManifestSeal::new(roots.clone(), manifest_digest(139), 1),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), super::FailureCleanupError::Stale);
+        failure = error.into_owner();
         assert_eq!(engine.snapshot(), before);
 
+        failure.receiver.expected = expected;
         let before = engine.snapshot();
-        assert_eq!(
-            engine.prepare_failure_cleanup(
+        let error = engine
+            .prepare_failure_cleanup_retaining(
                 failure,
                 CleanupManifestSeal::new(Vec::new(), manifest_digest(149), 1),
-            ),
-            Err(super::FailureCleanupError::InvalidManifest)
-        );
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), super::FailureCleanupError::InvalidManifest);
+        failure = error.into_owner();
         assert_eq!(engine.snapshot(), before);
 
         let cleanup = engine
             .prepare_failure_cleanup(
-                exact,
-                CleanupManifestSeal::new(vec![parent.clone()], manifest_digest(151), 3),
+                failure,
+                CleanupManifestSeal::new(vec![parent], manifest_digest(151), 3),
             )
             .unwrap();
         let prepared = engine.snapshot();
-        assert_eq!(
-            engine.prepare_failure_cleanup(
-                replay,
-                CleanupManifestSeal::new(vec![parent], manifest_digest(151), 3),
-            ),
-            Err(super::FailureCleanupError::Stale)
-        );
-        assert_eq!(engine.snapshot(), prepared);
 
         let malformed = CleanupCompletion::attest(
             cleanup.clone(),
@@ -19027,6 +19486,66 @@ mod tests {
         );
         assert_eq!(engine.snapshot(), prepared);
         engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+    }
+
+    #[test]
+    fn failure_cleanup_completion_receiver_mismatch_returns_whole_owner_and_calls_zero() {
+        let mut exact = ready_engine();
+        let request = exact.push(RouteLocation::new("/items/1")).unwrap();
+        let failure = exact.begin_failure_cleanup_with_roots(
+            super::PendingFailureKind::Apply,
+            NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "completion owner receiver mismatch fixture",
+            ),
+            super::FailureCleanupContinuationOwner::BeginFallback,
+            Vec::new(),
+        );
+        assert!(matches!(
+            exact.observe_prepared_publication_source(0).stage,
+            Some(super::WorkStageProjection::FailureCleanupManifestPending(_))
+        ));
+        let cleanup = exact
+            .prepare_failure_cleanup(
+                failure,
+                CleanupManifestSeal::new(Vec::new(), manifest_digest(0xC1EC), 0),
+            )
+            .unwrap();
+        assert!(matches!(
+            exact.observe_prepared_publication_source(0).stage,
+            Some(super::WorkStageProjection::FailureCleanupPrepared { .. })
+        ));
+        let owner = exact
+            .prepare_failure_cleanup_completion(valid_completion(&cleanup))
+            .expect("the exact prepared cleanup mints one completion owner");
+        assert!(matches!(
+            exact.observe_prepared_publication_source(0).stage,
+            Some(super::WorkStageProjection::FailureCleanupCompleting(_))
+        ));
+
+        let mut foreign = ready_engine();
+        let callback_count = std::cell::Cell::new(0);
+        let error = foreign
+            .complete_prepared_failure_cleanup_with_ledger(owner, || {
+                callback_count.set(callback_count.get() + 1);
+            })
+            .expect_err("a foreign Core receiver must return the whole completion owner");
+        assert_eq!(callback_count.get(), 0);
+
+        exact
+            .complete_prepared_failure_cleanup_with_ledger(error.into_owner(), || {
+                callback_count.set(callback_count.get() + 1);
+            })
+            .expect("the returned owner remains consumable by its exact Core receiver");
+        assert_eq!(callback_count.get(), 1);
+        assert_eq!(
+            exact.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::Recovering)
+        );
+        let Some(EngineAction::FrameTask(fallback)) = exact.action() else {
+            panic!("the exact completion must continue through RouterFallback")
+        };
+        assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
     }
 
     #[test]

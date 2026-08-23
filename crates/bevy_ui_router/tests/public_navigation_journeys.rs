@@ -739,81 +739,102 @@ fn assert_terminal_owner_closure(app: &App, router: RouterHandle) {
 fn assert_failed_route_trace_settles_before_fallback(
     snapshot: &NavigationRequestSnapshot,
     expected: NavigationFailureKind,
+    expect_failed_cleanup: bool,
 ) {
     assert_failed(snapshot, expected);
     let trace = snapshot.trace();
+    let mut expected_kinds = vec![
+        NavigationTraceEventKind::FrameTaskIssued,
+        NavigationTraceEventKind::RequestPhaseChanged,
+    ];
+    if expect_failed_cleanup {
+        expected_kinds.extend([
+            NavigationTraceEventKind::RequestPhaseChanged,
+            NavigationTraceEventKind::CleanupSettled,
+        ]);
+    }
+    expected_kinds.extend([
+        NavigationTraceEventKind::HistoryIntentRejected,
+        NavigationTraceEventKind::FrameTaskIssued,
+        NavigationTraceEventKind::RequestPhaseChanged,
+        NavigationTraceEventKind::ShellPrepared,
+        NavigationTraceEventKind::ViewApplied,
+        NavigationTraceEventKind::RequestPhaseChanged,
+        NavigationTraceEventKind::FrameActivated,
+        NavigationTraceEventKind::CommitPublished,
+        NavigationTraceEventKind::RequestPhaseChanged,
+        NavigationTraceEventKind::CleanupSettled,
+        NavigationTraceEventKind::CleanupSettled,
+        NavigationTraceEventKind::CleanupSettled,
+        NavigationTraceEventKind::CleanupSettled,
+        NavigationTraceEventKind::CleanupSettled,
+        NavigationTraceEventKind::RequestTerminal,
+    ]);
     assert_eq!(
         trace
             .iter()
             .map(NavigationTraceEvent::kind)
             .collect::<Vec<_>>(),
-        vec![
-            NavigationTraceEventKind::FrameTaskIssued,
-            NavigationTraceEventKind::RequestPhaseChanged,
-            NavigationTraceEventKind::HistoryIntentRejected,
-            NavigationTraceEventKind::FrameTaskIssued,
-            NavigationTraceEventKind::RequestPhaseChanged,
-            NavigationTraceEventKind::ShellPrepared,
-            NavigationTraceEventKind::ViewApplied,
-            NavigationTraceEventKind::RequestPhaseChanged,
-            NavigationTraceEventKind::FrameActivated,
-            NavigationTraceEventKind::CommitPublished,
-            NavigationTraceEventKind::RequestPhaseChanged,
-            NavigationTraceEventKind::CleanupSettled,
-            NavigationTraceEventKind::CleanupSettled,
-            NavigationTraceEventKind::CleanupSettled,
-            NavigationTraceEventKind::CleanupSettled,
-            NavigationTraceEventKind::CleanupSettled,
-            NavigationTraceEventKind::RequestTerminal,
-        ],
+        expected_kinds,
         "failed route trace must contain only the canonical rejected attempt, fallback, and settlement events"
     );
+    let fallback_index = if expect_failed_cleanup { 5 } else { 3 };
     assert!(
         trace[0]
             .frame()
             .is_some_and(|frame| matches!(frame.origin(), FrameOrigin::MatchedRoute(_)))
     );
-    let fallback_frame = trace[3]
+    let fallback_frame = trace[fallback_index]
         .frame()
         .expect("failed route fallback must issue one frame");
     assert_eq!(fallback_frame.origin(), &FrameOrigin::RouterFallback);
-    for index in [3, 5, 6, 8] {
+    for (index, event) in trace.iter().enumerate().skip(1) {
+        let expected_frame = [
+            fallback_index,
+            fallback_index + 2,
+            fallback_index + 3,
+            fallback_index + 5,
+        ]
+        .contains(&index)
+        .then_some(fallback_frame);
         assert_eq!(
-            trace[index].frame(),
-            Some(fallback_frame),
-            "fallback trace event {index} must retain the exact fallback frame"
-        );
-    }
-    for index in [1, 2, 4, 7, 9, 10, 11, 12, 13, 14, 15, 16] {
-        assert_eq!(
-            trace[index].frame(),
-            None,
-            "trace event {index} has no frame"
+            event.frame(),
+            expected_frame,
+            "trace event {index} has the canonical frame projection"
         );
     }
     assert_eq!(trace[1].phase(), Some(&NavigationPhase::ApplyingFrame(0)));
-    assert_eq!(trace[4].phase(), Some(&NavigationPhase::Recovering));
-    assert_eq!(trace[7].phase(), Some(&NavigationPhase::ReadyToSwitch));
-    assert_eq!(trace[10].phase(), Some(&NavigationPhase::PostCommitCleanup));
-    for index in [0, 2, 3, 5, 6, 8, 9, 11, 12, 13, 14, 15, 16] {
+    if expect_failed_cleanup {
+        assert_eq!(trace[2].phase(), Some(&NavigationPhase::CleanupPending));
+    }
+    for (index, event) in trace.iter().enumerate() {
+        let expected_phase = if index == 1 {
+            Some(&NavigationPhase::ApplyingFrame(0))
+        } else if expect_failed_cleanup && index == 2 {
+            Some(&NavigationPhase::CleanupPending)
+        } else if index == fallback_index + 1 {
+            Some(&NavigationPhase::Recovering)
+        } else if index == fallback_index + 4 {
+            Some(&NavigationPhase::ReadyToSwitch)
+        } else if index == fallback_index + 7 {
+            Some(&NavigationPhase::PostCommitCleanup)
+        } else {
+            None
+        };
         assert_eq!(
-            trace[index].phase(),
-            None,
-            "trace event {index} has no phase"
+            event.phase(),
+            expected_phase,
+            "trace event {index} has the canonical phase projection"
         );
     }
-    for index in 11..15 {
+    for (index, event) in trace.iter().enumerate() {
+        let expected_disposition = (fallback_index + 8..fallback_index + 12)
+            .contains(&index)
+            .then_some(CleanupDisposition::Removed);
         assert_eq!(
-            trace[index].cleanup_disposition(),
-            Some(CleanupDisposition::Removed),
-            "fallback cleanup receipt {index} must be Removed"
-        );
-    }
-    for index in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 16] {
-        assert_eq!(
-            trace[index].cleanup_disposition(),
-            None,
-            "trace event {index} has no cleanup receipt disposition"
+            event.cleanup_disposition(),
+            expected_disposition,
+            "trace event {index} has the canonical cleanup disposition"
         );
     }
     for (index, event) in trace.iter().enumerate() {
@@ -1239,7 +1260,11 @@ fn history_c2_failed_back_preserves_cursor_and_resolved_target() {
         .expect("the published B entry has A as a Back target");
     let terminal = drive_request_to_terminal(&mut fixture.app, fixture.router, back);
 
-    assert_failed_route_trace_settles_before_fallback(&terminal, NavigationFailureKind::Build);
+    assert_failed_route_trace_settles_before_fallback(
+        &terminal,
+        NavigationFailureKind::Build,
+        false,
+    );
     assert_eq!(terminal.requested(), Some(&route_a));
     let after = router_snapshot(&fixture.app, fixture.router);
     assert_eq!(after.history(), &published_history);
@@ -1362,6 +1387,7 @@ fn history_c3_first_failure_retargets_second_back_to_same_entry() {
     assert_failed_route_trace_settles_before_fallback(
         &first_terminal,
         NavigationFailureKind::Build,
+        false,
     );
     assert_eq!(first_terminal.requested(), Some(&route_a));
     let after_first_failure = router_snapshot(&fixture.app, fixture.router);
@@ -1427,7 +1453,11 @@ fn history_back_from_error_presentation_uses_published_history() {
         None,
     );
     let failed_push = request_snapshot(&fixture.app, fixture.router, failed_push);
-    assert_failed_route_trace_settles_before_fallback(&failed_push, NavigationFailureKind::Build);
+    assert_failed_route_trace_settles_before_fallback(
+        &failed_push,
+        NavigationFailureKind::Build,
+        true,
+    );
     let error = router_snapshot(&fixture.app, fixture.router);
     assert_eq!(error.active().kind(), ActivePresentationKind::Error);
     assert_eq!(error.history(), &published_history);

@@ -35,13 +35,15 @@ use bevy_ui_router_core::{
         BackTargetPermanentTerminalOperation, BackTargetPhysicalOwnerRef,
         BackTargetPreparationAcceptance, BackTargetStart, BeginAuthoritySettlementErrorKind,
         CleanupManifest, CleanupManifestView, CommitTicket, EngineAction, EnqueueBackErrorKind,
-        FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError, FailureCleanupRequest,
-        FrameMountTarget, HistoryAdmissionStamp, HistoryAdmissionWorldSeal,
-        HistoryExecutionBindingView, HostLease, IntegrationError, LifecycleContinuationCapacity,
-        MountMutationArtifact, MountReceiptProof, MountRegistrationBeginError, MountRequest,
-        PreparationBoundaryScopeView, PreparationReceiverMismatchView,
-        PrepareBackAdmissionErrorKind, PreparedPostCommitContinuationOwner, ResolveMountOwner,
-        RootFrameTask, RouteFailureContinuationOwner, RouterEngine, TargetAuthoritySettlementOwner,
+        FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError,
+        FailureCleanupCompletionOwner, FailureCleanupCompletionPreparationMismatchView,
+        FailureCleanupCompletionReceiverMismatchView, FailureCleanupRequest, FrameMountTarget,
+        HistoryAdmissionStamp, HistoryAdmissionWorldSeal, HistoryExecutionBindingView, HostLease,
+        IntegrationError, LifecycleContinuationCapacity, MountMutationArtifact, MountReceiptProof,
+        MountRegistrationBeginError, MountRequest, PreparationBoundaryScopeView,
+        PreparationReceiverMismatchView, PrepareBackAdmissionErrorKind,
+        PreparedPostCommitContinuationOwner, ResolveMountOwner, RootFrameTask,
+        RouteFailureContinuationOwner, RouterEngine, TargetAuthoritySettlementOwner,
         VerifiedBackNoTargetCandidate, VerifiedBackResolutionContradiction,
         VerifiedBackResolutionOwnerHandoff, VerifiedBackTargetExecutionOwner, ViewFailureKind,
         ViewReportIdentity,
@@ -1501,6 +1503,17 @@ impl MountNewStagingSeed {
     }
 }
 
+struct FailureCleanupCompletionInertOwner {
+    owner: Option<FailureCleanupCompletionOwner>,
+    ledger: CleanupLedger,
+    mismatch: FailureCleanupCompletionMismatchView,
+}
+
+enum FailureCleanupCompletionMismatchView {
+    Preparation(FailureCleanupCompletionPreparationMismatchView),
+    Completion(FailureCleanupCompletionReceiverMismatchView),
+}
+
 pub(crate) struct RouterEntry {
     pub(crate) handle: RouterHandle,
     pub(crate) engine: RouterEngine,
@@ -1516,6 +1529,7 @@ pub(crate) struct RouterEntry {
     projectionless_fail_close: Option<ProjectionlessFailCloseContinuation>,
     pub(crate) active: Option<RealizedBranch>,
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
+    failure_cleanup_completion: Option<FailureCleanupCompletionInertOwner>,
     cleanup_observation: RouterCleanupObservation,
     pub(crate) authority_protocol_residual: Option<AuthorityProtocolResidualOwner>,
     back_capacity_enqueue_retire_residual: Option<BackCapacityEnqueueRetireResidual>,
@@ -1545,6 +1559,10 @@ pub(crate) struct RouterEntry {
     back_target_driver_report_receiver_drift_armed: bool,
     #[cfg(test)]
     back_target_driver_consume_receiver_drift_armed: bool,
+    #[cfg(test)]
+    failure_cleanup_completion_preparation_drift_armed: bool,
+    #[cfg(test)]
+    failure_cleanup_completion_receiver_drift_armed: bool,
     #[cfg(test)]
     back_no_target_completion_fact_drift: Option<BackNoTargetCompletionFactDrift>,
     #[cfg(feature = "test-support")]
@@ -4820,6 +4838,8 @@ pub(crate) struct AuthorityProtocolResidualOwner {
     active: Option<RealizedBranch>,
     pending: Option<PendingCommit>,
     failed: Option<PendingFailedBranch>,
+    failure_cleanup_completion: Option<FailureCleanupCompletionOwner>,
+    failure_cleanup_ledger: Option<CleanupLedger>,
     pub(crate) host: Option<RetiredHostBinding>,
 }
 
@@ -4831,6 +4851,7 @@ enum AuthorityProtocolResidualKind {
     FailedManifest(FailedPreparedTopologyError),
     PostReportSourceDrift(ProjectionlessSourceDriftEvidence),
     PreflightAuthorityLost(LifecyclePreflightEvidence),
+    FailureCleanupCompletion(FailureCleanupCompletionMismatchView),
 }
 
 impl RouterEntry {
@@ -5139,6 +5160,12 @@ impl RouterEntry {
                             .iter()
                             .flat_map(|failed| failed.branch.frames()),
                     )
+                    .chain(
+                        residual
+                            .failure_cleanup_ledger
+                            .iter()
+                            .flat_map(CleanupLedger::failed_prepared_frames),
+                    )
                     .collect()
             })
             .unwrap_or_default()
@@ -5173,6 +5200,24 @@ impl RouterEntry {
                             .flat_map(RealizedFrame::claims),
                     )
             }))
+            .chain(
+                residual
+                    .failure_cleanup_ledger
+                    .iter()
+                    .filter_map(CleanupLedger::failed_prepared_branch)
+                    .flat_map(|branch| {
+                        branch
+                            .frames()
+                            .iter()
+                            .flat_map(RealizedFrame::claims)
+                            .chain(
+                                branch
+                                    .detached_frames()
+                                    .iter()
+                                    .flat_map(RealizedFrame::claims),
+                            )
+                    }),
+            )
             .map(ExactRegistryClaim::entity)
             .collect::<Vec<_>>();
         if let Some(host) = &residual.host {
@@ -5293,6 +5338,7 @@ impl RouterNavigation {
             projectionless_fail_close: None,
             active: None,
             cleanup_ledger: None,
+            failure_cleanup_completion: None,
             cleanup_observation: RouterCleanupObservation::default(),
             authority_protocol_residual: None,
             back_capacity_enqueue_retire_residual: None,
@@ -5322,6 +5368,10 @@ impl RouterNavigation {
             back_target_driver_report_receiver_drift_armed: false,
             #[cfg(test)]
             back_target_driver_consume_receiver_drift_armed: false,
+            #[cfg(test)]
+            failure_cleanup_completion_preparation_drift_armed: false,
+            #[cfg(test)]
+            failure_cleanup_completion_receiver_drift_armed: false,
             #[cfg(test)]
             back_no_target_completion_fact_drift: None,
             #[cfg(feature = "test-support")]
@@ -6021,10 +6071,20 @@ fn complete_zero_physical_failure(
     let completion = ledger
         .pending_completion()
         .expect("an empty exact cleanup ledger settles immediately");
+    let owner = entry
+        .engine
+        .prepare_failure_cleanup_completion(completion)
+        .expect("an exact empty cleanup completion is current");
     entry
         .engine
-        .complete_cleanup(completion)
-        .expect("an exact empty cleanup completion is current");
+        .complete_prepared_failure_cleanup_with_ledger(owner, || {
+            drop(
+                ledger
+                    .take_failed_prepared_owner()
+                    .expect("the zero ledger retains its typed physical owner"),
+            );
+        })
+        .expect("the zero ledger commits before Core continuation");
     Ok(())
 }
 
@@ -13362,7 +13422,15 @@ fn prepare_failed_authority_isolation(
     failed: &PendingFailedBranch,
     host: Option<&HostBinding>,
 ) -> AuthorityIsolationPreparation {
-    let branch = &failed.branch;
+    prepare_failed_branch_authority_isolation(world, active, &failed.branch, host)
+}
+
+fn prepare_failed_branch_authority_isolation(
+    world: &World,
+    active: Option<&RealizedBranch>,
+    branch: &FailedPreparedBranch,
+    host: Option<&HostBinding>,
+) -> AuthorityIsolationPreparation {
     let stored_claims = branch
         .frames()
         .iter()
@@ -13530,6 +13598,8 @@ fn fail_closed_pending_owner_protocol_prepared(
         active,
         pending: Some(pending),
         failed: None,
+        failure_cleanup_completion: None,
+        failure_cleanup_ledger: None,
         host: retired_host,
     });
     let protocol_residual = &mut entry.authority_protocol_residual;
@@ -13639,6 +13709,8 @@ fn fail_closed_failed_owner_protocol_prepared(
         active,
         pending: None,
         failed: Some(failed),
+        failure_cleanup_completion: None,
+        failure_cleanup_ledger: None,
         host: retired_host,
     });
     let protocol_residual = &mut entry.authority_protocol_residual;
@@ -13663,6 +13735,85 @@ fn fail_closed_failed_owner_protocol_prepared(
             .failed
             .take()
             .expect("failed-manifest residual retains pending failed owner"));
+    }
+    Ok(())
+}
+
+fn fail_closed_failure_cleanup_completion_protocol(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    inert: FailureCleanupCompletionInertOwner,
+) -> Result<(), FailureCleanupCompletionInertOwner> {
+    let branch = inert
+        .ledger
+        .failed_prepared_branch()
+        .expect("failure completion mismatch retains its failed physical owner");
+    let (isolation, isolation_contradiction) = match prepare_failed_branch_authority_isolation(
+        world,
+        entry.active.as_ref(),
+        branch,
+        entry.host.as_ref(),
+    ) {
+        AuthorityIsolationPreparation::Ready(isolation) => (isolation, None),
+        AuthorityIsolationPreparation::RetryableCapacity => return Err(inert),
+        AuthorityIsolationPreparation::PermanentContradiction {
+            contradiction,
+            fail_closed,
+        } => (fail_closed, Some(contradiction)),
+    };
+
+    let FailureCleanupCompletionInertOwner {
+        owner: completion,
+        ledger,
+        mismatch,
+    } = inert;
+    let active = entry.active.take();
+    let (retired_host, lease) = match entry.host.take() {
+        Some(host) => {
+            let (retired, lease) = host.into_retired();
+            (Some(retired), Some(lease))
+        }
+        None => (None, None),
+    };
+    let mut residual = Some(AuthorityProtocolResidualOwner {
+        kind: AuthorityProtocolResidualKind::FailureCleanupCompletion(mismatch),
+        isolation_contradiction,
+        active,
+        pending: None,
+        failed: None,
+        failure_cleanup_completion: completion,
+        failure_cleanup_ledger: Some(ledger),
+        host: retired_host,
+    });
+    let protocol_residual = &mut entry.authority_protocol_residual;
+    if let Err(returned_lease) =
+        entry
+            .engine
+            .fail_closed_authority_protocol_retaining(lease, || {
+                isolation.apply(world);
+                *protocol_residual = residual.take();
+            })
+    {
+        let mut owner = residual
+            .take()
+            .expect("rejected completion-mismatch fail-close retains its paired owners");
+        match (owner.host.take(), returned_lease) {
+            (Some(retired), Some(lease)) => entry.host = Some(retired.restore(lease)),
+            (None, None) => {}
+            _ => unreachable!("completion-mismatch fail-close returns the exact host lease"),
+        }
+        entry.active = owner.active.take();
+        let AuthorityProtocolResidualKind::FailureCleanupCompletion(mismatch) = owner.kind else {
+            unreachable!("completion mismatch retains its typed evidence")
+        };
+        return Err(FailureCleanupCompletionInertOwner {
+            owner: owner.failure_cleanup_completion.take(),
+            ledger: owner
+                .failure_cleanup_ledger
+                .take()
+                .expect("completion mismatch retains its physical owner"),
+            mismatch,
+        });
     }
     Ok(())
 }
@@ -17443,6 +17594,14 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                 if drive_back_no_target_zero_completion(entry) {
                     continue;
                 }
+                if let Some(inert) = entry.failure_cleanup_completion.take() {
+                    if let Err(inert) =
+                        fail_closed_failure_cleanup_completion_protocol(world, entry, inert)
+                    {
+                        entry.failure_cleanup_completion = Some(inert);
+                    }
+                    continue;
+                }
                 if entry.pending_back_target_execution.is_some() {
                     continue;
                 }
@@ -17762,6 +17921,71 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                     }) {
                         Ok(()) => {}
                         Err(_) => entry.cleanup_ledger = Some(ledger),
+                    }
+                    continue;
+                }
+                if ledger.is_failed_prepared() {
+                    #[cfg(test)]
+                    if entry.failure_cleanup_completion_preparation_drift_armed {
+                        entry.failure_cleanup_completion_preparation_drift_armed = false;
+                        entry
+                            .engine
+                            .drift_failure_cleanup_completion_receiver_for_test();
+                    }
+                    let owner = match entry
+                        .engine
+                        .prepare_failure_cleanup_completion(completion)
+                    {
+                        Ok(owner) => owner,
+                        Err(error) => {
+                            let inert = FailureCleanupCompletionInertOwner {
+                                owner: None,
+                                ledger,
+                                mismatch: FailureCleanupCompletionMismatchView::Preparation(
+                                    error.into_mismatch(),
+                                ),
+                            };
+                            if let Err(inert) =
+                                fail_closed_failure_cleanup_completion_protocol(world, entry, inert)
+                            {
+                                entry.failure_cleanup_completion = Some(inert);
+                            }
+                            continue;
+                        }
+                    };
+                    #[cfg(test)]
+                    if entry.failure_cleanup_completion_receiver_drift_armed {
+                        entry.failure_cleanup_completion_receiver_drift_armed = false;
+                        entry
+                            .engine
+                            .drift_failure_cleanup_completion_receiver_for_test();
+                    }
+                    match entry
+                        .engine
+                        .complete_prepared_failure_cleanup_with_ledger(owner, || {
+                            drop(
+                                ledger
+                                    .take_failed_prepared_owner()
+                                    .expect("failure continuation retains its physical owner"),
+                            );
+                        })
+                    {
+                        Ok(()) => bind_post_cleanup_back_resolution(entry),
+                        Err(error) => {
+                            let (owner, mismatch) = error.into_parts();
+                            let inert = FailureCleanupCompletionInertOwner {
+                                owner: Some(owner),
+                                ledger,
+                                mismatch: FailureCleanupCompletionMismatchView::Completion(
+                                    mismatch,
+                                ),
+                            };
+                            if let Err(inert) =
+                                fail_closed_failure_cleanup_completion_protocol(world, entry, inert)
+                            {
+                                entry.failure_cleanup_completion = Some(inert);
+                            }
+                        }
                     }
                     continue;
                 }
@@ -19172,15 +19396,23 @@ pub(crate) mod tests {
         assert!(entry.pending_failed_branch.is_none());
         assert!(entry.cleanup_ledger.is_none());
         let request = entry.engine.request(request).unwrap();
-        assert!(matches!(request.status(), RequestStatus::Failed(_)));
+        assert_eq!(
+            request.status(),
+            &RequestStatus::Running(NavigationPhase::Recovering)
+        );
         assert!(request.trace().iter().any(|event| {
             event.kind() == NavigationTraceEventKind::CleanupSettled
                 && event.cleanup_disposition().is_some()
         }));
         assert_eq!(
             request.trace().last().map(|event| event.kind()),
-            Some(NavigationTraceEventKind::RequestTerminal)
+            Some(NavigationTraceEventKind::RequestPhaseChanged)
         );
+        assert!(request.trace().iter().any(|event| {
+            event
+                .frame()
+                .is_some_and(|frame| frame.origin() == &FrameOrigin::RouterFallback)
+        }));
         assert!(app.world().get_entity(slot).is_err());
         assert!(
             frame_entities
@@ -19258,7 +19490,7 @@ pub(crate) mod tests {
         assert!(entry.cleanup_ledger.is_none());
         assert!(matches!(
             entry.engine.request(request).unwrap().status(),
-            RequestStatus::Failed(_)
+            RequestStatus::Running(NavigationPhase::Recovering)
         ));
         assert_eq!(
             entry
@@ -23713,7 +23945,10 @@ pub(crate) mod tests {
         let entry = &mut navigation.entries[0];
         assert!(entry.pending_failed_branch.is_none());
         let request = entry.engine.request(request).unwrap();
-        assert!(matches!(request.status(), RequestStatus::Failed(_)));
+        assert_eq!(
+            request.status(),
+            &RequestStatus::Running(NavigationPhase::Recovering)
+        );
         let receipt_count = request
             .trace()
             .iter()
@@ -23729,10 +23964,15 @@ pub(crate) mod tests {
                 .take(2)
                 .collect::<Vec<_>>(),
             vec![
-                bevy_ui_router_core::prelude::NavigationTraceEventKind::RequestTerminal,
-                bevy_ui_router_core::prelude::NavigationTraceEventKind::CleanupSettled,
+                bevy_ui_router_core::prelude::NavigationTraceEventKind::RequestPhaseChanged,
+                bevy_ui_router_core::prelude::NavigationTraceEventKind::FrameTaskIssued,
             ]
         );
+        assert!(request.trace().iter().any(|event| {
+            event
+                .frame()
+                .is_some_and(|frame| frame.origin() == &FrameOrigin::RouterFallback)
+        }));
     }
 
     #[test]
@@ -23853,7 +24093,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 entry.engine.request(request).unwrap().status(),
-                RequestStatus::Failed(_)
+                RequestStatus::Running(NavigationPhase::Recovering)
             ),
             "status: {:?}",
             entry.engine.request(request).unwrap().status()
@@ -24064,7 +24304,10 @@ pub(crate) mod tests {
         assert!(entry.pending_failed_branch.is_none());
         assert!(entry.cleanup_ledger.is_none());
         let request = entry.engine.request(request).unwrap();
-        assert!(matches!(request.status(), RequestStatus::Failed(_)));
+        assert_eq!(
+            request.status(),
+            &RequestStatus::Running(NavigationPhase::Recovering)
+        );
         assert_eq!(
             request
                 .trace()
@@ -24082,10 +24325,15 @@ pub(crate) mod tests {
                 .take(2)
                 .collect::<Vec<_>>(),
             vec![
-                bevy_ui_router_core::prelude::NavigationTraceEventKind::RequestTerminal,
-                bevy_ui_router_core::prelude::NavigationTraceEventKind::CleanupSettled,
+                bevy_ui_router_core::prelude::NavigationTraceEventKind::RequestPhaseChanged,
+                bevy_ui_router_core::prelude::NavigationTraceEventKind::FrameTaskIssued,
             ]
         );
+        assert!(request.trace().iter().any(|event| {
+            event
+                .frame()
+                .is_some_and(|frame| frame.origin() == &FrameOrigin::RouterFallback)
+        }));
     }
 
     #[test]
@@ -24157,6 +24405,7 @@ pub(crate) mod tests {
             projectionless_fail_close: None,
             active: None,
             cleanup_ledger: None,
+            failure_cleanup_completion: None,
             cleanup_observation: RouterCleanupObservation::default(),
             authority_protocol_residual: None,
             back_capacity_enqueue_retire_residual: None,
@@ -24186,6 +24435,10 @@ pub(crate) mod tests {
             back_target_driver_report_receiver_drift_armed: false,
             #[cfg(test)]
             back_target_driver_consume_receiver_drift_armed: false,
+            #[cfg(test)]
+            failure_cleanup_completion_preparation_drift_armed: false,
+            #[cfg(test)]
+            failure_cleanup_completion_receiver_drift_armed: false,
             #[cfg(test)]
             back_no_target_completion_fact_drift: None,
             #[cfg(feature = "test-support")]
@@ -49932,9 +50185,17 @@ pub(crate) mod tests {
         let EngineAction::FrameTask(task) = engine.action().unwrap() else {
             panic!("foreign engine must issue one normal frame task")
         };
-        engine
+        let cleanup = engine
             .report_failed(task, ViewFailureKind::Build, "foreign fixture failure")
+            .unwrap()
+            .expect("normal fixture failure must issue canonical cleanup");
+        let cleanup = engine
+            .prepare_failure_cleanup_retaining(
+                cleanup,
+                CleanupManifest::new(Vec::new(), 0x464f_5245, 0),
+            )
             .unwrap();
+        engine.complete_cleanup(cleanup.complete_empty()).unwrap();
         let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
             panic!("foreign engine must issue one fallback task")
         };
@@ -50267,7 +50528,7 @@ pub(crate) mod tests {
         assert!(entry.cleanup_ledger.is_none());
         assert!(matches!(
             entry.engine.request(request).unwrap().status(),
-            RequestStatus::Failed(_)
+            RequestStatus::Running(NavigationPhase::Recovering)
         ));
         assert!(owned.iter().all(|entity| {
             app.world()
@@ -51227,7 +51488,7 @@ pub(crate) mod tests {
             assert_eq!(entry.engine.history(), &history_before);
             assert!(matches!(
                 entry.engine.request(request).unwrap().status(),
-                RequestStatus::Failed(_)
+                RequestStatus::Running(NavigationPhase::Recovering)
             ));
             assert_ne!(
                 entry.engine.snapshot().availability(),
@@ -51476,7 +51737,7 @@ pub(crate) mod tests {
                 );
                 assert!(matches!(
                     entry.engine.request(request).unwrap().status(),
-                    RequestStatus::Failed(_)
+                    RequestStatus::Running(NavigationPhase::Recovering)
                 ));
                 assert_ne!(
                     entry.engine.snapshot().availability(),
@@ -51702,6 +51963,114 @@ pub(crate) mod tests {
     #[test]
     pub(crate) fn failed_branch_relationship_cycle_quarantines_exact_set_and_releases_focus() {
         reconciliation_entering_cycle_is_rejected_without_retiring_active_branch();
+    }
+
+    #[test]
+    fn failure_cleanup_completion_receiver_mismatch_fails_closed_with_paired_owners() {
+        let mut app = App::new();
+        let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+            .failure_cleanup_completion_receiver_drift_armed = true;
+
+        for _ in 0..16 {
+            settle_cleanup_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .authority_protocol_residual
+                .is_some()
+            {
+                break;
+            }
+        }
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let residual = entry
+            .authority_protocol_residual
+            .as_ref()
+            .expect("a permanent completion receiver mismatch must fail closed once");
+        assert!(matches!(
+            residual.kind,
+            AuthorityProtocolResidualKind::FailureCleanupCompletion(_)
+        ));
+        assert!(residual.failure_cleanup_completion.is_some());
+        assert!(
+            residual
+                .failure_cleanup_ledger
+                .as_ref()
+                .is_some_and(|ledger| ledger.failed_prepared_branch().is_some())
+        );
+        assert!(entry.failure_cleanup_completion.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        let settled_trace_len = entry.engine.request(request).unwrap().trace().len();
+
+        for _ in 0..3 {
+            settle_cleanup_system(app.world_mut());
+        }
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace().len(),
+            settled_trace_len
+        );
+        assert!(entry.authority_protocol_residual.is_some());
+    }
+
+    #[test]
+    fn failure_cleanup_completion_preparation_mismatch_fails_closed_with_physical_owner() {
+        let mut app = App::new();
+        let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+            .failure_cleanup_completion_preparation_drift_armed = true;
+
+        for _ in 0..16 {
+            settle_cleanup_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .authority_protocol_residual
+                .is_some()
+            {
+                break;
+            }
+        }
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let residual = entry
+            .authority_protocol_residual
+            .as_ref()
+            .expect("a permanent completion preparation mismatch must fail closed once");
+        assert!(matches!(
+            residual.kind,
+            AuthorityProtocolResidualKind::FailureCleanupCompletion(
+                FailureCleanupCompletionMismatchView::Preparation(_)
+            )
+        ));
+        assert!(residual.failure_cleanup_completion.is_none());
+        assert!(
+            residual
+                .failure_cleanup_ledger
+                .as_ref()
+                .is_some_and(|ledger| ledger.failed_prepared_branch().is_some())
+        );
+        assert!(entry.failure_cleanup_completion.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::AuthorityLost
+        ));
+        let settled_trace_len = entry.engine.request(request).unwrap().trace().len();
+
+        for _ in 0..3 {
+            settle_cleanup_system(app.world_mut());
+        }
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace().len(),
+            settled_trace_len
+        );
+        assert!(entry.authority_protocol_residual.is_some());
     }
 
     #[test]
@@ -53656,14 +54025,12 @@ pub(crate) mod tests {
         assert!(app.world().get_entity(cycle_parent).is_ok());
         for _ in 0..12 {
             settle_cleanup_system(app.world_mut());
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
             if matches!(
-                app.world().resource::<RouterNavigation>().entries[0]
-                    .engine
-                    .request(_request)
-                    .unwrap()
-                    .status(),
-                RequestStatus::Failed(_)
-            ) {
+                entry.engine.request(_request).unwrap().status(),
+                RequestStatus::Running(NavigationPhase::Recovering)
+            ) && entry.cleanup_ledger.is_none()
+            {
                 break;
             }
         }
@@ -53671,7 +54038,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 entry.engine.request(_request).unwrap().status(),
-                RequestStatus::Failed(_)
+                RequestStatus::Running(NavigationPhase::Recovering)
             ),
             "status={:?}, pending_failed={}, ledger={:?}",
             entry.engine.request(_request).unwrap().status(),
@@ -53680,6 +54047,18 @@ pub(crate) mod tests {
                 .cleanup_ledger
                 .as_ref()
                 .map(|ledger| (ledger.is_settled(), ledger.receipt_count()))
+        );
+        assert!(
+            entry
+                .engine
+                .request(_request)
+                .unwrap()
+                .trace()
+                .iter()
+                .any(|event| event
+                    .frame()
+                    .is_some_and(|frame| { frame.origin() == &FrameOrigin::RouterFallback })),
+            "cycle cleanup must continue through RouterFallback"
         );
         assert_eq!(
             entry.engine.snapshot().availability(),
@@ -53774,15 +54153,15 @@ pub(crate) mod tests {
         if let Some(mount_claim) = mount_claim {
             assert_eq!(mount_record.claim(), mount_claim);
         }
-        let terminal_trace_len = entry.engine.request(_request).unwrap().trace().len();
-        let terminal_lease_count = quarantine.leases().len();
+        let settled_trace_len = entry.engine.request(_request).unwrap().trace().len();
+        let settled_lease_count = quarantine.leases().len();
         for _ in 0..3 {
             settle_cleanup_system(app.world_mut());
         }
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
         assert_eq!(
             entry.engine.request(_request).unwrap().trace().len(),
-            terminal_trace_len
+            settled_trace_len
         );
         assert_eq!(entry.engine.history(), &history_before);
         assert_eq!(
@@ -53790,7 +54169,7 @@ pub(crate) mod tests {
                 .resource::<QuarantineLeaseTable>()
                 .leases()
                 .len(),
-            terminal_lease_count
+            settled_lease_count
         );
         assert_eq!(
             app.world()
@@ -57148,9 +57527,12 @@ pub(crate) mod tests {
                 .unwrap();
             let settled = trace
                 .iter()
-                .position(|event| {
-                    event.kind() == NavigationTraceEventKind::CleanupSettled
-                        && event.cleanup_disposition().is_none()
+                .enumerate()
+                .skip(commit + 1)
+                .find_map(|(index, event)| {
+                    (event.kind() == NavigationTraceEventKind::CleanupSettled
+                        && event.cleanup_disposition().is_none())
+                    .then_some(index)
                 })
                 .unwrap();
             let terminal = trace

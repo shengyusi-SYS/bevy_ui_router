@@ -7228,6 +7228,22 @@ impl CleanupLedger {
         matches!(self.owner, Some(CleanupOwner::AuthoritySettlement(_)))
     }
 
+    pub(crate) fn is_failed_prepared(&self) -> bool {
+        matches!(self.owner, Some(CleanupOwner::FailedPrepared(_)))
+    }
+
+    pub(crate) fn failed_prepared_branch(&self) -> Option<&FailedPreparedBranch> {
+        match self.owner.as_ref() {
+            Some(CleanupOwner::FailedPrepared(owner)) => Some(&owner.branch),
+            Some(
+                CleanupOwner::Leaving(_)
+                | CleanupOwner::AuthoritySettlement(_)
+                | CleanupOwner::BackNoTargetAuthority(_),
+            )
+            | None => None,
+        }
+    }
+
     fn is_physical_authority_settlement(&self) -> bool {
         matches!(
             self.owner,
@@ -7248,6 +7264,16 @@ impl CleanupLedger {
     pub(crate) fn take_authority_settlement_owner(&mut self) -> Option<AuthoritySettlementOwner> {
         match self.owner.take() {
             Some(CleanupOwner::AuthoritySettlement(owner)) => Some(owner),
+            other => {
+                self.owner = other;
+                None
+            }
+        }
+    }
+
+    pub(crate) fn take_failed_prepared_owner(&mut self) -> Option<FailedPreparedCleanupOwner> {
+        match self.owner.take() {
+            Some(CleanupOwner::FailedPrepared(owner)) => Some(owner),
             other => {
                 self.owner = other;
                 None

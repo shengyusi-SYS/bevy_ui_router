@@ -9,8 +9,9 @@ use bevy_ecs::{
 use bevy_picking::Pickable;
 use bevy_ui::{Node, Val};
 use bevy_ui_router_core::prelude::{
-    FrameOrigin, NavigationPhase, NavigationRequestId, NavigationTraceEventKind, RequestStatus,
-    RouteLocation, RouteNodeOptions, RoutePattern, RouteSlotKey, RouteTree, RouteViewKey,
+    FrameOrigin, NavigationFailureKind, NavigationPhase, NavigationRequestId,
+    NavigationTraceEventKind, RequestStatus, RouteLocation, RouteNodeOptions, RoutePattern,
+    RouteSlotKey, RouteTree, RouteViewKey,
 };
 use bevy_ui_router_view::{RouteViewDescriptor, RouteViewRegistry, ViewBuildEffect, ViewDriverKey};
 
@@ -534,7 +535,17 @@ fn mount_grant_observer_drift_rejects_after_mutation() {
         .resource::<RouterSnapshots>()
         .get(router)
         .unwrap();
-    assert_eq!(after.active(), before.active());
+    assert_eq!(
+        after.active().failure().map(|failure| failure.kind()),
+        Some(NavigationFailureKind::Mount)
+    );
+    assert!(
+        after
+            .active()
+            .frames()
+            .iter()
+            .all(|frame| frame.origin() == &FrameOrigin::RouterFallback)
+    );
     assert_eq!(after.history(), before.history());
     assert_eq!(app_host_evidence(&app, host), host_before);
     assert!(app.world().get::<AppHostSentinel>(host).is_some());

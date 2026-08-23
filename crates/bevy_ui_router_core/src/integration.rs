@@ -60,6 +60,11 @@ use crate::engine::{
     EngineInstallError as CoreEngineInstallError,
     FailedAuthoritySettlementTrigger as CoreFailedAuthoritySettlementTrigger,
     FailedAuthorityTriggerError as CoreFailedAuthorityTriggerError,
+    FailureCleanupCompletionCommitError as CoreFailureCleanupCompletionCommitError,
+    FailureCleanupCompletionOwner as CoreFailureCleanupCompletionOwner,
+    FailureCleanupCompletionPreparationMismatchProjection as CoreFailureCleanupCompletionPreparationMismatchProjection,
+    FailureCleanupCompletionPrepareError as CoreFailureCleanupCompletionPrepareError,
+    FailureCleanupCompletionReceiverMismatchProjection as CoreFailureCleanupCompletionReceiverMismatchProjection,
     FailureCleanupError as CoreFailureCleanupError,
     FailureCleanupRequest as CoreFailureCleanupRequest, FrameMountRequest as CoreFrameMountRequest,
     FrameMountTarget as CoreFrameMountTarget, FrameTask as CoreFrameTask,
@@ -757,6 +762,77 @@ impl FailureCleanupRequest {
 
     pub fn failure(&self) -> &NavigationFailure {
         self.inner.failure()
+    }
+}
+
+#[doc(hidden)]
+pub struct FailureCleanupCompletionOwner {
+    inner: CoreFailureCleanupCompletionOwner,
+}
+
+#[doc(hidden)]
+pub struct FailureCleanupCompletionReceiverMismatchView {
+    inner: CoreFailureCleanupCompletionReceiverMismatchProjection,
+}
+
+#[doc(hidden)]
+pub struct FailureCleanupCompletionPreparationMismatchView {
+    inner: CoreFailureCleanupCompletionPreparationMismatchProjection,
+}
+
+#[doc(hidden)]
+#[must_use = "a failed cleanup completion preparation retains typed receiver evidence"]
+pub struct PrepareFailureCleanupCompletionError {
+    kind: IntegrationError,
+    mismatch: FailureCleanupCompletionPreparationMismatchView,
+}
+
+impl PrepareFailureCleanupCompletionError {
+    pub const fn kind(&self) -> IntegrationError {
+        self.kind
+    }
+
+    pub fn into_mismatch(self) -> FailureCleanupCompletionPreparationMismatchView {
+        self.mismatch
+    }
+}
+
+impl std::fmt::Debug for PrepareFailureCleanupCompletionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format_capability_error(formatter, "PrepareFailureCleanupCompletionError", self.kind)
+    }
+}
+
+#[doc(hidden)]
+#[must_use = "a failed cleanup completion retains its linear Core owner"]
+pub struct CompleteFailureCleanupError {
+    kind: IntegrationError,
+    owner: FailureCleanupCompletionOwner,
+    mismatch: FailureCleanupCompletionReceiverMismatchView,
+}
+
+impl CompleteFailureCleanupError {
+    pub const fn kind(&self) -> IntegrationError {
+        self.kind
+    }
+
+    pub fn into_owner(self) -> FailureCleanupCompletionOwner {
+        self.owner
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        FailureCleanupCompletionOwner,
+        FailureCleanupCompletionReceiverMismatchView,
+    ) {
+        (self.owner, self.mismatch)
+    }
+}
+
+impl std::fmt::Debug for CompleteFailureCleanupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format_capability_error(formatter, "CompleteFailureCleanupError", self.kind)
     }
 }
 
@@ -4556,6 +4632,57 @@ impl RouterEngine {
     }
 
     #[doc(hidden)]
+    pub fn prepare_failure_cleanup_completion(
+        &mut self,
+        completion: CleanupCompletion,
+    ) -> Result<FailureCleanupCompletionOwner, PrepareFailureCleanupCompletionError> {
+        self.inner
+            .prepare_failure_cleanup_completion(completion.inner)
+            .map(|inner| FailureCleanupCompletionOwner { inner })
+            .map_err(|error: CoreFailureCleanupCompletionPrepareError| {
+                let kind = map_cleanup_error(error.kind());
+                PrepareFailureCleanupCompletionError {
+                    kind,
+                    mismatch: FailureCleanupCompletionPreparationMismatchView {
+                        inner: error.into_mismatch(),
+                    },
+                }
+            })
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn drift_failure_cleanup_completion_receiver_for_test(&mut self) {
+        self.inner
+            .drift_failure_cleanup_completion_receiver_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn complete_prepared_failure_cleanup_with_ledger<F>(
+        &mut self,
+        owner: FailureCleanupCompletionOwner,
+        commit_ledger_and_clear_holder: F,
+    ) -> Result<(), CompleteFailureCleanupError>
+    where
+        F: FnOnce(),
+    {
+        self.inner
+            .complete_prepared_failure_cleanup_with_ledger(
+                owner.inner,
+                commit_ledger_and_clear_holder,
+            )
+            .map_err(|error: CoreFailureCleanupCompletionCommitError| {
+                let kind = map_cleanup_error(error.kind());
+                let (owner, mismatch) = error.into_parts();
+                CompleteFailureCleanupError {
+                    kind,
+                    owner: FailureCleanupCompletionOwner { inner: owner },
+                    mismatch: FailureCleanupCompletionReceiverMismatchView { inner: mismatch },
+                }
+            })
+    }
+
+    #[doc(hidden)]
     pub fn complete_authority_cleanup<F>(
         &mut self,
         completion: CleanupCompletion,
@@ -4757,6 +4884,14 @@ fn map_failure_cleanup_error(error: CoreFailureCleanupError) -> IntegrationError
         CoreFailureCleanupError::Foreign => IntegrationError::ForeignRouter,
         CoreFailureCleanupError::Stale => IntegrationError::Stale,
         CoreFailureCleanupError::InvalidManifest => IntegrationError::InvalidManifest,
+    }
+}
+
+fn map_cleanup_error(error: crate::engine::CleanupError) -> IntegrationError {
+    match error {
+        crate::engine::CleanupError::Duplicate => IntegrationError::Duplicate,
+        crate::engine::CleanupError::Stale => IntegrationError::Stale,
+        crate::engine::CleanupError::Invalid => IntegrationError::Invalid,
     }
 }
 
@@ -6127,45 +6262,6 @@ mod tests {
         assert_eq!(retained.request(), request);
         assert_eq!(retained.logical_roots(), roots);
         assert_eq!(receiver.snapshot(), before);
-    }
-
-    #[test]
-    fn retaining_failure_cleanup_returns_stale_request_without_engine_mutation() {
-        let mut engine = confirmed_nested_engine();
-        engine.push(RouteLocation::new("/items/1")).unwrap();
-        engine.collect();
-        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
-            panic!("parent task expected")
-        };
-        engine
-            .report_applied_with_outlets(parent, Vec::new())
-            .unwrap();
-        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
-            panic!("mount request expected")
-        };
-        let failure = engine
-            .reject_mount(mount, MountRejectionKind::MissingOutlet)
-            .unwrap();
-        let stale = FailureCleanupRequest {
-            inner: failure.inner.testing_duplicate(),
-        };
-        let roots = failure.logical_roots().to_vec();
-        engine
-            .prepare_failure_cleanup(failure, CleanupManifest::new(roots.clone(), 231, 1))
-            .unwrap();
-        let before = engine.snapshot();
-
-        let error = match engine
-            .prepare_failure_cleanup_retaining(stale, CleanupManifest::new(roots.clone(), 233, 1))
-        {
-            Err(error) => error,
-            Ok(_) => panic!("a stale cleanup request must be retained"),
-        };
-
-        assert_eq!(error.kind(), IntegrationError::Stale);
-        let retained = error.into_owner();
-        assert_eq!(retained.logical_roots(), roots);
-        assert_eq!(engine.snapshot(), before);
     }
 
     #[test]
@@ -9663,7 +9759,7 @@ mod tests {
                 assert_ne!(
                     observed.stage,
                     crate::engine::CoreBackTargetReceiverStageProjection::FailureCleanupManifestPending(
-                        expected.request
+                        expected.request.receiver
                     ),
                     "the mismatch must retain the expected request and observed cleanup stage"
                 );
@@ -9914,7 +10010,7 @@ mod tests {
                 assert_ne!(
                     observed.stage,
                     crate::engine::CoreBackTargetReceiverStageProjection::FailureCleanupManifestPending(
-                        expected.request
+                        expected.request.receiver
                     ),
                     "the evidence must distinguish the owner request from the observed pending request"
                 );

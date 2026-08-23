@@ -1645,9 +1645,11 @@ pub(crate) mod tests {
     use bevy_ui_router_core::{
         integration::{
             CleanupManifest, EngineAction, IntegrationError, MountGrant, MountMutationArtifact,
-            MountRequest, RouterEngine,
+            MountRequest, RouterEngine, ViewFailureKind,
         },
-        prelude::{RouteLocation, RouteSlotKey, RouteViewKey},
+        prelude::{
+            FrameOrigin, NavigationPhase, RequestStatus, RouteLocation, RouteSlotKey, RouteViewKey,
+        },
     };
 
     use crate::{
@@ -2502,6 +2504,17 @@ pub(crate) mod tests {
             )
             .unwrap();
         engine.complete_cleanup(cleanup.complete(709, 1)).unwrap();
+        let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
+            panic!("failed mount cleanup must continue through RouterFallback")
+        };
+        assert_eq!(fallback.frame().origin(), &FrameOrigin::RouterFallback);
+        engine
+            .report_failed(
+                fallback,
+                ViewFailureKind::Build,
+                "fixture finishes fallback before checking the next mount identity",
+            )
+            .unwrap();
         engine.push(RouteLocation::new("/items/2")).unwrap();
         engine.collect();
         let EngineAction::FrameTask(next_parent) = engine.action().unwrap() else {
@@ -3353,6 +3366,7 @@ pub(crate) mod tests {
         let obligation_count = manifest.len();
         let reserved = crate::cleanup::CleanupLedger::reserve(manifest)
             .expect("failed mount cleanup must reserve its receipt ledger");
+        let request_id = request.request();
         let logical_roots = request.logical_roots().to_vec();
         let cleanup = engine
             .prepare_failure_cleanup_retaining(
@@ -3367,7 +3381,35 @@ pub(crate) mod tests {
         let completion = ledger
             .pending_completion()
             .expect("every failed mount obligation must have one completion receipt");
-        engine.complete_cleanup(completion).unwrap();
+        let owner = engine
+            .prepare_failure_cleanup_completion(completion)
+            .expect("the settled mount cleanup must bind its exact Core receiver");
+        engine
+            .complete_prepared_failure_cleanup_with_ledger(owner, || {
+                drop(
+                    ledger
+                        .take_failed_prepared_owner()
+                        .expect("mount cleanup completion retains its physical owner"),
+                );
+            })
+            .unwrap();
+        match engine.request(request_id).unwrap().status() {
+            RequestStatus::Running(NavigationPhase::Recovering) => {
+                let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
+                    panic!("ordinary failed mount cleanup must continue through RouterFallback")
+                };
+                assert_eq!(fallback.frame().origin(), &FrameOrigin::RouterFallback);
+                engine
+                    .report_failed(
+                        fallback,
+                        ViewFailureKind::Build,
+                        "mount cleanup fixture finishes its RouterFallback attempt",
+                    )
+                    .unwrap();
+            }
+            RequestStatus::Failed(_) => assert!(engine.action().is_none()),
+            status => panic!("failed mount cleanup produced unexpected status {status:?}"),
+        }
         assert!(engine.snapshot().running_request().is_none());
         assert!(engine.action().is_none());
         assert!(
