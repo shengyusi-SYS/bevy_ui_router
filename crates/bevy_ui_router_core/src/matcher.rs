@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use crate::branch::{MatchedBranch, MatchedRoute, RouteParams};
+use crate::branch::{FrozenErrorViewBinding, MatchedBranch, MatchedRoute, RouteParams};
 use crate::error::{RouteError, RouteErrorKind, RouteErrorSourceCategory};
 use crate::fingerprint::{
     RouteBranchFingerprint, RouteParamsFingerprint, RouteSearchFingerprint, RouteSegmentReuseKey,
@@ -29,6 +29,7 @@ impl RouteMatcher {
             &segments,
             0,
             Vec::new(),
+            None,
             SpecificityKey::default(),
             &search_fingerprint,
             &mut candidates,
@@ -54,6 +55,7 @@ impl RouteMatcher {
         segments: &[&str],
         cursor: usize,
         branch: Vec<MatchedRoute>,
+        nearest_error_view: Option<FrozenErrorViewBinding>,
         specificity: SpecificityKey,
         search_fingerprint: &RouteSearchFingerprint,
         candidates: &mut Vec<Candidate>,
@@ -74,17 +76,34 @@ impl RouteMatcher {
             options.explicit_key(),
             &params_fingerprint,
         );
+        let branch_index = branch.len();
+        let nearest_error_view =
+            options
+                .error_view_binding()
+                .map_or(nearest_error_view, |binding| {
+                    Some(FrozenErrorViewBinding::new(
+                        route,
+                        branch_index,
+                        binding.0.clone(),
+                        binding.1.clone(),
+                        options.slot().clone(),
+                        self.tree.provenance().clone(),
+                    ))
+                });
         let mut next_branch = branch;
-        next_branch.push(MatchedRoute::new(
-            route,
-            matched.params,
-            options.slot().clone(),
-            options.explicit_key().cloned(),
-            options.error_boundary().cloned(),
-            options.meta().clone(),
-            params_fingerprint,
-            segment_reuse_key,
-        ));
+        next_branch.push(
+            MatchedRoute::new(
+                route,
+                matched.params,
+                options.slot().clone(),
+                options.explicit_key().cloned(),
+                options.error_boundary().cloned(),
+                options.meta().clone(),
+                params_fingerprint,
+                segment_reuse_key,
+            )
+            .with_nearest_error_view(nearest_error_view.clone()),
+        );
         let next_specificity = specificity.add(matched.specificity);
 
         if matched.next_cursor == segments.len() {
@@ -109,6 +128,7 @@ impl RouteMatcher {
                 segments,
                 matched.next_cursor,
                 next_branch.clone(),
+                nearest_error_view.clone(),
                 next_specificity,
                 search_fingerprint,
                 candidates,

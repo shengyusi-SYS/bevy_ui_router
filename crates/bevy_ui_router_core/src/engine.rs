@@ -6,7 +6,7 @@ use crate::admission::{
     AdmissionError, HostAdmissionConfirmation, HostAdmissionIssuer, HostAdmissionToken, HostGrant,
     HostLease, RetiredHostAuthority, RetiredHostAuthorityProjection,
 };
-use crate::branch::{MatchedBranch, MatchedRoute, RouteParams};
+use crate::branch::{FrozenErrorViewBinding, MatchedBranch, MatchedRoute, RouteParams};
 use crate::cleanup::{CleanupBatchToken, CleanupCompletion, CleanupManifestSeal};
 use crate::diagnostics::{DiagnosticEvent, ReportDisposition};
 use crate::frame::{
@@ -356,6 +356,7 @@ pub(crate) enum MountMutationArtifact {
 pub(crate) enum ResolveMountOwner {
     Returned(FrameMountRequest),
     Reissued,
+    Consumed,
 }
 
 pub(crate) struct MountCapabilityError<Owner> {
@@ -395,10 +396,47 @@ enum PendingFailureKind {
     AuthorityLost,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FrozenBoundErrorRecovery {
+    failure_branch_index: usize,
+    binding: FrozenErrorViewBinding,
+    mount: FrozenErrorMountSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FrozenErrorMountSource {
+    TopSlot {
+        host: HostVersion,
+        slot: RouteSlotId,
+    },
+    ExistingChild {
+        parent: RouteFrameVersion,
+        outlet: RouteSlotKey,
+        slot: RouteSlotId,
+    },
+    MountRequired {
+        parent: RouteFrameVersion,
+        outlet: RouteSlotKey,
+        parent_source: FrozenParentMountSource,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FrozenParentMountSource {
+    TopSlot {
+        host: HostVersion,
+        slot: RouteSlotId,
+    },
+    RegisteredChild {
+        claim: LogicalChildSlotBinding,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum FailureCleanupContinuation {
     Terminal,
     BeginFallback,
+    BeginBoundError(FrozenBoundErrorRecovery),
     AuthoritySettlement,
 }
 
@@ -2219,7 +2257,17 @@ enum WorkStage {
 #[derive(Clone, Debug)]
 enum AttemptKind {
     Normal(NavigationCommandKind),
-    Fallback { original_failure: NavigationFailure },
+    Fallback {
+        original_failure: NavigationFailure,
+        bound_error: Option<BoundErrorAttempt>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct BoundErrorAttempt {
+    binding: FrozenErrorViewBinding,
+    matched: MatchedRoute,
+    active_child_slots: Vec<LogicalChildSlotBinding>,
 }
 
 #[derive(Debug)]
@@ -2270,6 +2318,15 @@ struct PendingMount {
     parent: RouteFrameVersion,
     outlet: RouteSlotKey,
     from_preserved_parent: bool,
+    transaction: TransactionId,
+    reserved: ReservedFrameAttempt,
+    kind: PendingMountKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingMountKind {
+    Normal,
+    BoundError,
 }
 
 struct ConfirmedChildPublication {
@@ -6097,20 +6154,7 @@ impl RouterEngine {
             }
             let mut state = self.state.clone();
             state.set_request(Some(RequestStatus::Running(phase)));
-            let history_capability = match self.history.freeze_back(execution, destination) {
-                Ok(capability) => capability,
-                Err(drift) => {
-                    return PreparedBackTargetStart::Permanent(
-                        BackTargetPermanentOwner::source_drift(
-                            continuation,
-                            reservation,
-                            drift,
-                            expected_baseline,
-                            observed_baseline,
-                        ),
-                    );
-                }
-            };
+            let pending_reserved = reserved_frames[branch_index];
             let mut current = CurrentWork {
                 identity: identity.clone(),
                 branch: Some(branch),
@@ -6124,6 +6168,9 @@ impl RouterEngine {
                     parent: parent.clone(),
                     outlet: outlet.clone(),
                     from_preserved_parent: true,
+                    transaction: reservation.transaction(),
+                    reserved: pending_reserved,
+                    kind: PendingMountKind::Normal,
                 }),
                 stage: WorkStage::AwaitingMount,
                 cleanup_batch: reservation.cleanup_batch(),
@@ -6131,6 +6178,22 @@ impl RouterEngine {
                 attempt: AttemptKind::Normal(NavigationCommandKind::Back),
                 reconciliation: Some(reconciliation),
                 retired_host: None,
+            };
+            let failure_continuation =
+                self.frozen_failure_recovery_continuation_for(&current, branch_index);
+            let history_capability = match self.history.freeze_back(execution, destination) {
+                Ok(capability) => capability,
+                Err(drift) => {
+                    return PreparedBackTargetStart::Permanent(
+                        BackTargetPermanentOwner::source_drift(
+                            continuation,
+                            reservation,
+                            drift,
+                            expected_baseline,
+                            observed_baseline,
+                        ),
+                    );
+                }
             };
             let action_parent = parent.clone();
             let action_outlet = outlet.clone();
@@ -6177,7 +6240,7 @@ impl RouterEngine {
                         expected: PendingFailureKind::MountIssue,
                         logical_roots: current.applied_frames.iter().rev().cloned().collect(),
                         failure: NavigationFailure::new(NavigationFailureKind::Mount, message),
-                        continuation: FailureCleanupContinuation::Terminal,
+                        continuation: failure_continuation,
                     };
                     current.pending_mount = None;
                     current.stage = WorkStage::FailureCleanupManifestPending {
@@ -6556,6 +6619,7 @@ impl RouterEngine {
         if let Some(outlet) = next_outlet {
             let host = self.state.host().expect("confirmed host").clone();
             let transaction = report.identity.transaction;
+            let child_index = report.identity.branch_index + 1;
             let token = match self.mount.issue(
                 &mut self.ids,
                 host,
@@ -6572,21 +6636,25 @@ impl RouterEngine {
                             "child mount request issuer rejected internal identity"
                         }
                     };
-                    let failure = self.begin_failure_cleanup(
+                    let failure = self.begin_failure_cleanup_for_branch(
                         PendingFailureKind::MountIssue,
                         NavigationFailure::new(NavigationFailureKind::Mount, message),
+                        child_index,
                     );
                     return AppliedReportTransition::FailureCleanup(failure);
                 }
             };
-            let child_index = report.identity.branch_index + 1;
             let current = self.current.as_mut().expect("report was preflighted");
             current.identity = report.identity;
+            let pending_reserved = current.reservation[child_index];
             current.pending_mount = Some(PendingMount {
                 child_index,
                 parent: frame.clone(),
                 outlet: outlet.clone(),
                 from_preserved_parent: false,
+                transaction,
+                reserved: pending_reserved,
+                kind: PendingMountKind::Normal,
             });
             current.stage = WorkStage::AwaitingMount;
             self.record_mut(request)
@@ -6617,6 +6685,23 @@ impl RouterEngine {
         &mut self,
         request: FrameMountRequest,
     ) -> Result<MountGrant, MountCapabilityError<ResolveMountOwner>> {
+        let pending_bound_error_branch_index = self
+            .current
+            .as_ref()
+            .and_then(|current| current.pending_mount.as_ref())
+            .filter(|pending| pending.kind == PendingMountKind::BoundError)
+            .map(|pending| pending.child_index);
+        if pending_bound_error_branch_index.is_some()
+            && !self.has_live_mount_context(
+                &WorkStage::AwaitingMount,
+                Some((request.request, &request.parent, &request.outlet)),
+            )
+        {
+            return Err(MountCapabilityError::new(
+                MountError::WrongPhase,
+                ResolveMountOwner::Returned(request),
+            ));
+        }
         if let Err(kind) = self.mount.validate_request_token(&request.token) {
             return Err(MountCapabilityError::new(
                 kind,
@@ -6635,6 +6720,27 @@ impl RouterEngine {
         let grant = match self.mount.grant(&request.token, &mut self.ids) {
             Ok(grant) => grant,
             Err(MountError::Exhausted) => {
+                if let Some(failure_branch_index) = pending_bound_error_branch_index {
+                    if let Err(kind) = self.mount.reject(&request.token) {
+                        return Err(MountCapabilityError::new(
+                            kind,
+                            ResolveMountOwner::Returned(request),
+                        ));
+                    }
+                    let failure = self.begin_failure_cleanup_for_branch(
+                        PendingFailureKind::MountIssue,
+                        NavigationFailure::new(
+                            NavigationFailureKind::Mount,
+                            "bound error recovery slot allocation exhausted",
+                        ),
+                        failure_branch_index,
+                    );
+                    self.action = Some(EngineAction::FailureCleanup(failure));
+                    return Err(MountCapabilityError::new(
+                        MountError::Exhausted,
+                        ResolveMountOwner::Consumed,
+                    ));
+                }
                 self.action = Some(EngineAction::MountRequest(request));
                 return Err(MountCapabilityError::new(
                     MountError::Exhausted,
@@ -6828,6 +6934,12 @@ impl RouterEngine {
         ) {
             return Err(MountCapabilityError::new(MountError::WrongPhase, request));
         }
+        let failure_branch_index = self
+            .current
+            .as_ref()
+            .and_then(|current| current.pending_mount.as_ref())
+            .map(|pending| pending.child_index)
+            .expect("live mount context retains the failed child index");
         if let Err(kind) = self.mount.reject(&request.token) {
             return Err(MountCapabilityError::new(kind, request));
         }
@@ -6840,7 +6952,7 @@ impl RouterEngine {
             ))
             .expect("running trace is open");
         let (pending, failure) = mount_failure(rejection);
-        Ok(self.begin_failure_cleanup(pending, failure))
+        Ok(self.begin_failure_cleanup_for_branch(pending, failure, failure_branch_index))
     }
 
     pub(crate) fn reject_mount_after_mutation(
@@ -6868,7 +6980,7 @@ impl RouterEngine {
         if !self.has_live_mount_context(&expected_stage, None) {
             return Err(MountCapabilityError::new(MountError::WrongPhase, artifact));
         }
-        let (request, parent, outlet) = self
+        let (request, parent, outlet, failure_branch_index) = self
             .current
             .as_ref()
             .and_then(|current| {
@@ -6877,6 +6989,7 @@ impl RouterEngine {
                         current.identity.request,
                         pending.parent.clone(),
                         pending.outlet.clone(),
+                        pending.child_index,
                     )
                 })
             })
@@ -6902,12 +7015,13 @@ impl RouterEngine {
                 parent, outlet, slot,
             ))
             .expect("running trace is open");
-        Ok(self.begin_failure_cleanup(
+        Ok(self.begin_failure_cleanup_for_branch(
             PendingFailureKind::Mount(MountRejectionKind::RejectedAfterMutation),
             NavigationFailure::new(
                 NavigationFailureKind::Mount,
                 "child mount rejected after mutation",
             ),
+            failure_branch_index,
         ))
     }
 
@@ -6938,19 +7052,60 @@ impl RouterEngine {
         if pending.child_index != child_index {
             return false;
         }
+        if pending.kind == PendingMountKind::BoundError {
+            if !self.current_reconciliation_matches_active() {
+                return false;
+            }
+            let bound_is_exact = matches!(
+                &current.attempt,
+                AttemptKind::Fallback {
+                    bound_error: Some(bound),
+                    ..
+                } if bound.binding.branch_index() == pending.child_index
+                    && bound.binding.outlet() == &pending.outlet
+            ) && pending.from_preserved_parent
+                && pending.transaction == current.identity.transaction
+                && pending.reserved.frame_task() == current.identity.frame_task
+                && current.reservation.len() == 1
+                && current.reservation[0] == pending.reserved
+                && current.target_frames.len() == child_index
+                && current.target_frames.last() == Some(&pending.parent);
+            if !bound_is_exact {
+                return false;
+            }
+            if let Some((request, parent, outlet)) = expected_request {
+                if current.identity.request != request
+                    || pending.parent != *parent
+                    || pending.outlet != *outlet
+                {
+                    return false;
+                }
+            }
+            return self.mount.matches_outstanding_context(
+                host,
+                current.identity.request,
+                pending.transaction,
+                &pending.parent,
+                &pending.outlet,
+            );
+        }
         let reservation_matches = if pending.from_preserved_parent {
             current
                 .reservation
                 .get(pending.child_index)
-                .is_some_and(|reserved| reserved.frame_task() == current.identity.frame_task)
-        } else {
-            current
-                .reservation
-                .get(current.identity.branch_index)
                 .is_some_and(|reserved| {
-                    reserved.frame_task() == current.identity.frame_task
-                        && reserved.frame() == current.identity.frame
+                    reserved == &pending.reserved
+                        && reserved.frame_task() == current.identity.frame_task
                 })
+        } else {
+            current.reservation.get(pending.child_index) == Some(&pending.reserved)
+                && current
+                    .reservation
+                    .get(current.identity.branch_index)
+                    .is_some_and(|reserved| {
+                        reserved.frame_task() == current.identity.frame_task
+                            && reserved.frame() == current.identity.frame
+                    })
         };
         if !reservation_matches {
             return false;
@@ -7043,7 +7198,7 @@ impl RouterEngine {
         self.mount.matches_outstanding_context(
             host,
             current.identity.request,
-            current.identity.transaction,
+            pending.transaction,
             &pending.parent,
             &pending.outlet,
         )
@@ -7166,7 +7321,7 @@ impl RouterEngine {
             expected: request.expected.clone(),
             logical_roots: request.logical_roots.clone(),
             failure: request.failure.clone(),
-            continuation: request.continuation,
+            continuation: request.continuation.clone(),
         }
     }
 
@@ -7265,11 +7420,11 @@ impl RouterEngine {
             Some(AttemptKind::Normal(NavigationCommandKind::Back)) => {
                 CoreBackTargetReceiverAttemptProjection::NormalBack
             }
-            Some(AttemptKind::Fallback { original_failure }) => {
-                CoreBackTargetReceiverAttemptProjection::Fallback {
-                    original_failure: original_failure.clone(),
-                }
-            }
+            Some(AttemptKind::Fallback {
+                original_failure, ..
+            }) => CoreBackTargetReceiverAttemptProjection::Fallback {
+                original_failure: original_failure.clone(),
+            },
             None => CoreBackTargetReceiverAttemptProjection::Missing,
         }
     }
@@ -7904,6 +8059,19 @@ impl RouterEngine {
         &self,
         request: &FrameMountRequest,
     ) -> Result<(), MountError> {
+        let pending_bound_error = self
+            .current
+            .as_ref()
+            .and_then(|current| current.pending_mount.as_ref())
+            .is_some_and(|pending| pending.kind == PendingMountKind::BoundError);
+        if pending_bound_error
+            && !self.has_live_mount_context(
+                &WorkStage::AwaitingMount,
+                Some((request.request, &request.parent, &request.outlet)),
+            )
+        {
+            return Err(MountError::WrongPhase);
+        }
         self.mount.validate_request_token(&request.token)?;
         if self.has_live_mount_context(
             &WorkStage::AwaitingMount,
@@ -8153,7 +8321,9 @@ impl RouterEngine {
 
     #[cfg(test)]
     pub(crate) fn testing_drift_current_fallback_failure(&mut self) -> bool {
-        let Some(AttemptKind::Fallback { original_failure }) = self
+        let Some(AttemptKind::Fallback {
+            original_failure, ..
+        }) = self
             .current
             .as_mut()
             .filter(|current| current.stage == WorkStage::Applying)
@@ -8645,7 +8815,10 @@ impl RouterEngine {
                     outstanding,
                     failure,
                     continuation,
-                } => Some((outstanding.clone(), Some((failure.clone(), *continuation)))),
+                } => Some((
+                    outstanding.clone(),
+                    Some((failure.clone(), continuation.clone())),
+                )),
                 WorkStage::Applying
                 | WorkStage::AwaitingMount
                 | WorkStage::AwaitingReceipt
@@ -8680,6 +8853,20 @@ impl RouterEngine {
         let request = current.identity.request;
         let (completed_token, failure) =
             outstanding.expect("validated cleanup has an outstanding token");
+        if let Some((failure, FailureCleanupContinuation::BeginBoundError(binding))) = &failure {
+            let failure = failure.clone();
+            let binding = binding.clone();
+            self.record_mut(request)
+                .expect("running record is retained")
+                .append_trace(NavigationTraceEvent::cleanup_settled(None))
+                .expect("cleanup trace is open");
+            self.completed_cleanup.push(CompletedCleanupTombstone {
+                request,
+                token: completed_token,
+            });
+            let _ = self.begin_bound_error(request, failure, binding);
+            return Ok(());
+        }
         if let Some((failure, FailureCleanupContinuation::BeginFallback)) = &failure {
             let failure = failure.clone();
             self.record_mut(request)
@@ -8739,12 +8926,13 @@ impl RouterEngine {
         let terminal_status = match failure {
             Some((failure, FailureCleanupContinuation::Terminal)) => RequestStatus::Failed(failure),
             Some((_, FailureCleanupContinuation::BeginFallback)) => unreachable!(),
+            Some((_, FailureCleanupContinuation::BeginBoundError(_))) => unreachable!(),
             Some((_, FailureCleanupContinuation::AuthoritySettlement)) => unreachable!(),
             None => match &current.attempt {
                 AttemptKind::Normal(_) => RequestStatus::Succeeded,
-                AttemptKind::Fallback { original_failure } => {
-                    RequestStatus::Failed(original_failure.clone())
-                }
+                AttemptKind::Fallback {
+                    original_failure, ..
+                } => RequestStatus::Failed(original_failure.clone()),
             },
         };
         let record = self
@@ -9274,6 +9462,7 @@ impl RouterEngine {
                     outlet: branch.routes()[parent_index].slot().clone(),
                 }
             };
+            let pending_reserved = reserved_frames[branch_index];
             self.current = Some(CurrentWork {
                 identity,
                 branch: Some(branch),
@@ -9287,6 +9476,9 @@ impl RouterEngine {
                     parent: parent.clone(),
                     outlet: outlet.clone(),
                     from_preserved_parent: true,
+                    transaction: reservation.transaction(),
+                    reserved: pending_reserved,
+                    kind: PendingMountKind::Normal,
                 }),
                 stage: WorkStage::AwaitingMount,
                 cleanup_batch: reservation.cleanup_batch(),
@@ -9312,9 +9504,10 @@ impl RouterEngine {
                             "child mount request issuer rejected internal identity"
                         }
                     };
-                    let failure = self.begin_failure_cleanup(
+                    let failure = self.begin_failure_cleanup_for_branch(
                         PendingFailureKind::MountIssue,
                         NavigationFailure::new(NavigationFailureKind::Mount, message),
+                        branch_index,
                     );
                     self.action = Some(EngineAction::FailureCleanup(failure));
                     return StartReconciledRequestOutcome::Started(execution_projection);
@@ -9434,18 +9627,242 @@ impl RouterEngine {
         expected: PendingFailureKind,
         failure: NavigationFailure,
     ) -> FailureCleanupRequest {
-        let continuation = if expected != PendingFailureKind::AuthorityLost
-            && self.current.as_ref().is_some_and(|current| {
-                matches!(
-                    current.attempt,
-                    AttemptKind::Normal(NavigationCommandKind::Replace)
-                )
-            }) {
-            FailureCleanupContinuation::BeginFallback
+        let failure_branch_index = self
+            .current
+            .as_ref()
+            .expect("a failure belongs to current work")
+            .identity
+            .branch_index;
+        self.begin_failure_cleanup_for_branch(expected, failure, failure_branch_index)
+    }
+
+    fn begin_failure_cleanup_for_branch(
+        &mut self,
+        expected: PendingFailureKind,
+        failure: NavigationFailure,
+        failure_branch_index: usize,
+    ) -> FailureCleanupRequest {
+        let failure = if self
+            .current
+            .as_ref()
+            .is_some_and(|current| matches!(current.attempt, AttemptKind::Fallback { .. }))
+        {
+            NavigationFailure::new(
+                NavigationFailureKind::RecoveryFailed,
+                "bound error or router fallback recovery failed",
+            )
+        } else {
+            failure
+        };
+        let continuation = if expected == PendingFailureKind::AuthorityLost {
+            FailureCleanupContinuation::Terminal
+        } else if self
+            .current
+            .as_ref()
+            .is_some_and(|current| matches!(current.attempt, AttemptKind::Normal(_)))
+        {
+            self.frozen_failure_recovery_continuation(failure_branch_index)
         } else {
             FailureCleanupContinuation::Terminal
         };
         self.begin_failure_cleanup_with_continuation(expected, failure, continuation)
+    }
+
+    fn frozen_failure_recovery_continuation(
+        &self,
+        failure_branch_index: usize,
+    ) -> FailureCleanupContinuation {
+        let Some(current) = self.current.as_ref() else {
+            return FailureCleanupContinuation::Terminal;
+        };
+        self.frozen_failure_recovery_continuation_for(current, failure_branch_index)
+    }
+
+    fn frozen_failure_recovery_continuation_for(
+        &self,
+        current: &CurrentWork,
+        failure_branch_index: usize,
+    ) -> FailureCleanupContinuation {
+        let Some(branch) = current.branch.as_ref() else {
+            return FailureCleanupContinuation::Terminal;
+        };
+        let Some(binding) = branch.nearest_error_view_for(failure_branch_index) else {
+            return FailureCleanupContinuation::BeginFallback;
+        };
+        let Some(boundary) = branch.routes().get(binding.branch_index()) else {
+            return FailureCleanupContinuation::Terminal;
+        };
+        if !self.reconciliation_matches_active_for(current)
+            || binding.branch_index() > failure_branch_index
+            || boundary.route() != binding.boundary_route()
+            || boundary.error_boundary() != Some(binding.boundary())
+            || boundary.slot() != binding.outlet()
+        {
+            return FailureCleanupContinuation::Terminal;
+        }
+        let Some(mount) = self.freeze_bound_error_mount_source(current, binding) else {
+            return FailureCleanupContinuation::Terminal;
+        };
+        FailureCleanupContinuation::BeginBoundError(FrozenBoundErrorRecovery {
+            failure_branch_index,
+            binding: binding.clone(),
+            mount,
+        })
+    }
+
+    fn freeze_bound_error_mount_source(
+        &self,
+        current: &CurrentWork,
+        binding: &FrozenErrorViewBinding,
+    ) -> Option<FrozenErrorMountSource> {
+        let boundary_index = binding.branch_index();
+        let projection = current.reconciliation.as_ref()?;
+        let active_frames = self.state.active().frames();
+        let strict_prefix_is_exact = (0..boundary_index).all(|branch_index| {
+            projection
+                .preserved()
+                .iter()
+                .find(|preserved| preserved.branch_index() == branch_index)
+                .is_some_and(|preserved| {
+                    active_frames.get(branch_index) == Some(preserved.version())
+                        && current.target_frames.get(branch_index) == Some(preserved.version())
+                })
+        });
+        if !strict_prefix_is_exact {
+            return None;
+        }
+
+        let projected_slot = projection
+            .preserved()
+            .iter()
+            .find(|preserved| preserved.branch_index() == boundary_index)
+            .and_then(|preserved| {
+                current
+                    .target_frames
+                    .get(boundary_index)
+                    .filter(|frame| *frame == preserved.version())
+                    .map(|frame| ProjectedEnteringSlot::Existing(frame.slot()))
+            })
+            .or_else(|| {
+                projection
+                    .entering()
+                    .iter()
+                    .find(|entering| {
+                        entering.branch_index() == boundary_index
+                            && entering.route() == binding.boundary_route()
+                    })
+                    .and_then(|entering| match entering.slot() {
+                        ProjectedEnteringSlot::Existing(slot) => current
+                            .target_frames
+                            .get(boundary_index)
+                            .filter(|frame| {
+                                frame.slot() == slot
+                                    && frame.frame() == entering.frame()
+                                    && frame.generation() == entering.generation()
+                                    && frame.origin()
+                                        == &FrameOrigin::MatchedRoute(binding.boundary_route())
+                            })
+                            .map(|_| ProjectedEnteringSlot::Existing(slot)),
+                        ProjectedEnteringSlot::MountNew => Some(ProjectedEnteringSlot::MountNew),
+                    })
+            })?;
+
+        if boundary_index == 0 {
+            let host = self.state.host()?.clone();
+            let slot = self.state.top_slot()?;
+            return (projected_slot == ProjectedEnteringSlot::Existing(slot))
+                .then_some(FrozenErrorMountSource::TopSlot { host, slot });
+        }
+
+        let parent_index = boundary_index - 1;
+        let parent = projection
+            .preserved()
+            .iter()
+            .find(|preserved| preserved.branch_index() == parent_index)
+            .and_then(|preserved| {
+                current
+                    .target_frames
+                    .get(parent_index)
+                    .filter(|frame| *frame == preserved.version())
+            })?
+            .clone();
+        let role = projection.child_slots().iter().find(|role| {
+            role.parent_branch_index() == parent_index && role.outlet() == binding.outlet()
+        })?;
+        match projected_slot {
+            ProjectedEnteringSlot::Existing(slot) => {
+                let exact_binding = role.binding().is_some_and(|child_slot| {
+                    child_slot.parent_branch_index() == parent_index
+                        && child_slot.parent() == &parent
+                        && child_slot.outlet() == binding.outlet()
+                        && child_slot.slot() == slot
+                });
+                exact_binding.then_some(FrozenErrorMountSource::ExistingChild {
+                    parent,
+                    outlet: binding.outlet().clone(),
+                    slot,
+                })
+            }
+            ProjectedEnteringSlot::MountNew => {
+                if role.kind() != ProjectedChildSlotRoleKind::MountNew || role.binding().is_some() {
+                    return None;
+                }
+                let parent_source = self.freeze_bound_error_parent_mount_source(
+                    current,
+                    projection,
+                    parent_index,
+                    &parent,
+                )?;
+                Some(FrozenErrorMountSource::MountRequired {
+                    parent,
+                    outlet: binding.outlet().clone(),
+                    parent_source,
+                })
+            }
+        }
+    }
+
+    fn freeze_bound_error_parent_mount_source(
+        &self,
+        current: &CurrentWork,
+        projection: &RouteReconciliationProjection,
+        parent_index: usize,
+        parent: &RouteFrameVersion,
+    ) -> Option<FrozenParentMountSource> {
+        let parent_route = current.branch.as_ref()?.routes().get(parent_index)?;
+        if parent.origin() != &FrameOrigin::MatchedRoute(parent_route.route()) {
+            return None;
+        }
+        if parent_index == 0 {
+            let host = self.state.host()?.clone();
+            let slot = self.state.top_slot()?;
+            return (parent.router_identity() == self.router
+                && parent.host() == host.host()
+                && parent.slot() == slot)
+                .then_some(FrozenParentMountSource::TopSlot { host, slot });
+        }
+
+        let grandparent_index = parent_index - 1;
+        let claim = projection
+            .child_slots()
+            .iter()
+            .find(|role| {
+                role.parent_branch_index() == grandparent_index
+                    && role.outlet() == parent_route.slot()
+                    && role.kind() == ProjectedChildSlotRoleKind::PreservedActive
+            })?
+            .binding()?;
+        let grandparent_is_exact = projection.preserved().iter().any(|preserved| {
+            preserved.branch_index() == grandparent_index && preserved.version() == claim.parent()
+        });
+        (grandparent_is_exact
+            && claim.parent_branch_index() == grandparent_index
+            && claim.outlet() == parent_route.slot()
+            && claim.slot() == parent.slot()
+            && claim.child() == Some(parent))
+        .then(|| FrozenParentMountSource::RegisteredChild {
+            claim: claim.clone(),
+        })
     }
 
     fn begin_failure_cleanup_with_continuation(
@@ -9557,6 +9974,344 @@ impl RouterEngine {
         roots
     }
 
+    fn begin_bound_error(
+        &mut self,
+        request: NavigationRequestId,
+        original_failure: NavigationFailure,
+        recovery: FrozenBoundErrorRecovery,
+    ) -> Option<FrameTaskIdentity> {
+        self.current_history_capability = None;
+        let source_is_exact = self.current_reconciliation_matches_active();
+        let prepared = source_is_exact.then(|| {
+            let current = self.current.as_ref()?;
+            let branch = current.branch.as_ref()?;
+            let observed = branch.nearest_error_view_for(recovery.failure_branch_index)?;
+            let observed_mount = self.freeze_bound_error_mount_source(current, observed)?;
+            if observed != &recovery.binding || observed_mount.ne(&recovery.mount) {
+                return None;
+            }
+            let boundary_index = recovery.binding.branch_index();
+            let reconciliation = current.reconciliation.as_ref()?;
+            let mut preserved_roles = reconciliation
+                .preserved()
+                .iter()
+                .filter(|preserved| preserved.branch_index() < boundary_index)
+                .collect::<Vec<_>>();
+            preserved_roles.sort_by_key(|preserved| preserved.branch_index());
+            if preserved_roles
+                .iter()
+                .enumerate()
+                .any(|(branch_index, preserved)| preserved.branch_index() != branch_index)
+            {
+                return None;
+            }
+            let preserved = preserved_roles
+                .into_iter()
+                .map(|preserved| preserved.version().clone())
+                .collect::<Vec<_>>();
+            let mut cleanup_roles = reconciliation
+                .preserved()
+                .iter()
+                .chain(reconciliation.leaving())
+                .filter(|frame| frame.branch_index() >= boundary_index)
+                .map(|frame| (frame.branch_index(), frame.version().clone()))
+                .collect::<Vec<_>>();
+            cleanup_roles.sort_by(|left, right| right.0.cmp(&left.0));
+            let cleanup_roots = cleanup_roles
+                .into_iter()
+                .map(|(_, frame)| frame)
+                .collect::<Vec<_>>();
+            let retained_child_slots = self
+                .active_child_slots
+                .iter()
+                .filter(|slot| {
+                    slot.parent_branch_index()
+                        .checked_add(1)
+                        .is_some_and(|child_index| child_index < boundary_index)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            Some((
+                current.location.clone(),
+                branch.routes().get(boundary_index)?.clone(),
+                preserved,
+                cleanup_roots,
+                retained_child_slots,
+                reconciliation.clone(),
+            ))
+        });
+        let Some(Some((
+            location,
+            matched,
+            mut target_frames,
+            cleanup_roots,
+            mut active_child_slots,
+            reconciliation,
+        ))) = prepared
+        else {
+            self.retire_history_authority();
+            self.current = None;
+            self.action = None;
+            self.fail_reserved_request(
+                request,
+                NavigationFailure::new(
+                    NavigationFailureKind::RecoveryFailed,
+                    "bound error recovery source drifted",
+                ),
+            );
+            self.start_next();
+            return None;
+        };
+        self.record_mut(request)
+            .expect("recovering request is retained")
+            .append_trace(NavigationTraceEvent::new(
+                NavigationTraceEventKind::HistoryIntentRejected,
+            ))
+            .expect("running trace is open");
+        let reserved = match self.ids.reserve_attempt() {
+            Ok(reserved) => reserved,
+            Err(_) => {
+                self.retire_history_authority();
+                self.current = None;
+                self.action = None;
+                self.fail_reserved_request(
+                    request,
+                    NavigationFailure::new(
+                        NavigationFailureKind::RecoveryFailed,
+                        "bound error recovery identity reservation exhausted",
+                    ),
+                );
+                self.start_next();
+                return None;
+            }
+        };
+        let host = self
+            .state
+            .host()
+            .expect("accepted recovery has a confirmed host")
+            .clone();
+        let binding = recovery.binding;
+        let origin = FrameOrigin::RouteError(binding.boundary_route());
+        let generation = RouteGeneration::initial();
+        let direct_mount = match recovery.mount {
+            FrozenErrorMountSource::MountRequired {
+                parent,
+                outlet,
+                parent_source,
+            } => {
+                let parent_index = binding
+                    .branch_index()
+                    .checked_sub(1)
+                    .expect("a root boundary never requires a child mount");
+                let reserved_frame =
+                    ReservedFrameAttempt::new(reserved.frame_task(), reserved.candidate_frame());
+                let identity = FrameTaskIdentity {
+                    router: self.router,
+                    host: host.host(),
+                    host_epoch: host.epoch(),
+                    slot: parent.slot(),
+                    request,
+                    transaction: reserved.transaction(),
+                    frame_task: reserved.frame_task(),
+                    frame: parent.frame(),
+                    generation: parent.generation(),
+                    origin: parent.origin().clone(),
+                    branch_index: parent_index,
+                };
+                let parent_target = match parent_source {
+                    FrozenParentMountSource::TopSlot {
+                        host: parent_host,
+                        slot,
+                    } => FrameMountTarget::TopSlot {
+                        host: parent_host,
+                        slot,
+                    },
+                    FrozenParentMountSource::RegisteredChild { claim } => {
+                        FrameMountTarget::RegisteredChildSlot {
+                            parent: claim.parent().clone(),
+                            outlet: claim.outlet().clone(),
+                        }
+                    }
+                };
+                self.current = Some(CurrentWork {
+                    identity,
+                    branch: None,
+                    location: location.clone(),
+                    reservation: vec![reserved_frame],
+                    target_frames,
+                    applied_frames: Vec::new(),
+                    current_target: parent_target,
+                    pending_mount: Some(PendingMount {
+                        child_index: binding.branch_index(),
+                        parent: parent.clone(),
+                        outlet: outlet.clone(),
+                        from_preserved_parent: true,
+                        transaction: reserved.transaction(),
+                        reserved: reserved_frame,
+                        kind: PendingMountKind::BoundError,
+                    }),
+                    stage: WorkStage::AwaitingMount,
+                    cleanup_batch: reserved.cleanup_batch(),
+                    cleanup_roots,
+                    attempt: AttemptKind::Fallback {
+                        original_failure: original_failure.clone(),
+                        bound_error: Some(BoundErrorAttempt {
+                            binding,
+                            matched,
+                            active_child_slots,
+                        }),
+                    },
+                    reconciliation: Some(reconciliation),
+                    retired_host: None,
+                });
+                let token = match self.mount.issue(
+                    &mut self.ids,
+                    host.clone(),
+                    request,
+                    reserved.transaction(),
+                    parent.clone(),
+                    outlet.clone(),
+                ) {
+                    Ok(token) => token,
+                    Err(_) => {
+                        self.current = None;
+                        self.action = None;
+                        self.fail_reserved_request(
+                            request,
+                            NavigationFailure::new(
+                                NavigationFailureKind::RecoveryFailed,
+                                "bound error recovery mount request failed",
+                            ),
+                        );
+                        self.start_next();
+                        return None;
+                    }
+                };
+                self.record_mut(request)
+                    .expect("recovering request is retained")
+                    .append_trace(NavigationTraceEvent::mount_requested(
+                        parent.clone(),
+                        outlet.clone(),
+                    ))
+                    .expect("running trace is open");
+                self.transition_with_trace(request, NavigationPhase::ResolvingMount);
+                self.action = Some(EngineAction::MountRequest(FrameMountRequest {
+                    token,
+                    request,
+                    parent,
+                    outlet,
+                }));
+                return None;
+            }
+            direct_mount => direct_mount,
+        };
+        let (slot, target) = match direct_mount {
+            FrozenErrorMountSource::TopSlot {
+                host: frozen_host,
+                slot,
+            } => (
+                slot,
+                FrameMountTarget::TopSlot {
+                    host: frozen_host,
+                    slot,
+                },
+            ),
+            FrozenErrorMountSource::ExistingChild {
+                parent,
+                outlet,
+                slot,
+            } => (
+                slot,
+                FrameMountTarget::RegisteredChildSlot { parent, outlet },
+            ),
+            FrozenErrorMountSource::MountRequired { .. } => unreachable!(),
+        };
+        let identity = FrameTaskIdentity {
+            router: self.router,
+            host: host.host(),
+            host_epoch: host.epoch(),
+            slot,
+            request,
+            transaction: reserved.transaction(),
+            frame_task: reserved.frame_task(),
+            frame: reserved.candidate_frame(),
+            generation,
+            origin: origin.clone(),
+            branch_index: binding.branch_index(),
+        };
+        let target_frame = RouteFrameVersion::new(
+            self.router,
+            host.host(),
+            slot,
+            origin.clone(),
+            reserved.candidate_frame(),
+            generation,
+        );
+        if let FrameMountTarget::RegisteredChildSlot { parent, outlet } = &target {
+            active_child_slots.push(LogicalChildSlotBinding::occupied(
+                binding.branch_index() - 1,
+                parent.clone(),
+                outlet.clone(),
+                target_frame.clone(),
+            ));
+        }
+        target_frames.push(target_frame.clone());
+        let input = RouteViewInput::new(
+            location.clone(),
+            Some(matched.route()),
+            matched.params().clone(),
+            origin,
+            Some(original_failure.clone()),
+        );
+        let view = binding.view().clone();
+        self.current = Some(CurrentWork {
+            identity: identity.clone(),
+            branch: None,
+            location: location.clone(),
+            reservation: vec![ReservedFrameAttempt::new(
+                reserved.frame_task(),
+                reserved.candidate_frame(),
+            )],
+            target_frames,
+            applied_frames: Vec::new(),
+            current_target: target.clone(),
+            pending_mount: None,
+            stage: WorkStage::Applying,
+            cleanup_batch: reserved.cleanup_batch(),
+            cleanup_roots,
+            attempt: AttemptKind::Fallback {
+                original_failure,
+                bound_error: Some(BoundErrorAttempt {
+                    binding,
+                    matched: matched.clone(),
+                    active_child_slots,
+                }),
+            },
+            reconciliation: Some(reconciliation),
+            retired_host: None,
+        });
+        self.action = None;
+        self.record_mut(request)
+            .expect("recovering request is retained")
+            .append_trace(NavigationTraceEvent::frame_task_issued(
+                target_frame.clone(),
+            ))
+            .expect("running trace is open");
+        self.transition_with_trace(request, NavigationPhase::Recovering);
+        self.issued_view_tasks.push(identity.clone());
+        let recovery_identity = identity.clone();
+        self.action = Some(EngineAction::FrameTask(FrameTask {
+            identity,
+            frame: target_frame,
+            target,
+            location,
+            matched: Some(matched),
+            view,
+            input: Some(input),
+        }));
+        Some(recovery_identity)
+    }
+
     fn begin_fallback(
         &mut self,
         request: NavigationRequestId,
@@ -9659,7 +10414,10 @@ impl RouterEngine {
             stage: WorkStage::Applying,
             cleanup_batch: reserved.cleanup_batch(),
             cleanup_roots,
-            attempt: AttemptKind::Fallback { original_failure },
+            attempt: AttemptKind::Fallback {
+                original_failure,
+                bound_error: None,
+            },
             reconciliation: None,
             retired_host: None,
         });
@@ -9699,23 +10457,50 @@ impl RouterEngine {
             .ok_or(MountError::WrongPhase)?;
         let pending = current.pending_mount.take().ok_or(MountError::WrongPhase)?;
         let index = pending.child_index;
-        let matched = current
-            .branch
-            .as_ref()
-            .and_then(|branch| branch.routes().get(index))
-            .cloned()
-            .ok_or(MountError::WrongPhase)?;
-        let reserved = current
-            .reservation
-            .get(index)
-            .copied()
-            .ok_or(MountError::WrongPhase)?;
+        let (matched, origin, view, failure) = match &current.attempt {
+            AttemptKind::Normal(_) if pending.kind == PendingMountKind::Normal => {
+                let matched = current
+                    .branch
+                    .as_ref()
+                    .and_then(|branch| branch.routes().get(index))
+                    .cloned()
+                    .ok_or(MountError::WrongPhase)?;
+                let view = self
+                    .matcher
+                    .view_binding(matched.route())
+                    .cloned()
+                    .ok_or(MountError::WrongPhase)?;
+                (
+                    matched.clone(),
+                    FrameOrigin::MatchedRoute(matched.route()),
+                    view,
+                    None,
+                )
+            }
+            AttemptKind::Fallback {
+                original_failure,
+                bound_error: Some(bound),
+            } if pending.kind == PendingMountKind::BoundError
+                && bound.binding.branch_index() == index
+                && bound.binding.outlet() == &pending.outlet =>
+            {
+                (
+                    bound.matched.clone(),
+                    FrameOrigin::RouteError(bound.binding.boundary_route()),
+                    bound.binding.view().clone(),
+                    Some(original_failure.clone()),
+                )
+            }
+            AttemptKind::Normal(_) | AttemptKind::Fallback { .. } => {
+                return Err(MountError::WrongPhase);
+            }
+        };
+        let reserved = pending.reserved;
         let request = current.identity.request;
-        let transaction = current.identity.transaction;
+        let transaction = pending.transaction;
         let host = current.identity.host;
         let host_epoch = current.identity.host_epoch;
         let location = current.location.clone();
-        let origin = FrameOrigin::MatchedRoute(matched.route());
         let frame = RouteFrameVersion::new(
             self.router,
             host,
@@ -9738,23 +10523,32 @@ impl RouterEngine {
             branch_index: index,
         };
         let target = FrameMountTarget::ChildOutlet {
-            parent: pending.parent,
-            outlet: pending.outlet,
+            parent: pending.parent.clone(),
+            outlet: pending.outlet.clone(),
         };
-        let view = self
-            .matcher
-            .view_binding(matched.route())
-            .cloned()
-            .ok_or(MountError::WrongPhase)?;
         let input = RouteViewInput::new(
             location.clone(),
             Some(matched.route()),
             matched.params().clone(),
             origin,
-            None,
+            failure,
         );
         current.identity = identity.clone();
         current.target_frames.push(frame.clone());
+        if let AttemptKind::Fallback {
+            bound_error: Some(bound),
+            ..
+        } = &mut current.attempt
+        {
+            bound
+                .active_child_slots
+                .push(LogicalChildSlotBinding::occupied(
+                    index - 1,
+                    pending.parent.clone(),
+                    pending.outlet.clone(),
+                    frame.clone(),
+                ));
+        }
         current.current_target = target.clone();
         current.stage = WorkStage::Applying;
         let record_index = self
@@ -9829,11 +10623,17 @@ impl RouterEngine {
             .clone();
         let target = current.current_target.clone();
         let location = current.location.clone();
-        let matched = current
-            .branch
-            .as_ref()
-            .and_then(|branch| branch.routes().get(identity.branch_index))
-            .cloned();
+        let matched = match &current.attempt {
+            AttemptKind::Fallback {
+                bound_error: Some(attempt),
+                ..
+            } => Some(attempt.matched.clone()),
+            AttemptKind::Normal(_) | AttemptKind::Fallback { .. } => current
+                .branch
+                .as_ref()
+                .and_then(|branch| branch.routes().get(identity.branch_index))
+                .cloned(),
+        };
         let (view, failure) = match &current.attempt {
             AttemptKind::Normal(_) => (
                 self.matcher
@@ -9847,9 +10647,16 @@ impl RouterEngine {
                     .clone(),
                 None,
             ),
-            AttemptKind::Fallback { original_failure } => {
-                (self.fallback.clone(), Some(original_failure.clone()))
-            }
+            AttemptKind::Fallback {
+                original_failure,
+                bound_error,
+            } => (
+                bound_error.as_ref().map_or_else(
+                    || self.fallback.clone(),
+                    |attempt| attempt.binding.view().clone(),
+                ),
+                Some(original_failure.clone()),
+            ),
         };
         let input = RouteViewInput::new(
             location.clone(),
@@ -9941,11 +10748,13 @@ impl RouterEngine {
     }
 
     fn current_reconciliation_matches_active(&self) -> bool {
-        let Some(projection) = self
-            .current
+        self.current
             .as_ref()
-            .and_then(|current| current.reconciliation.as_ref())
-        else {
+            .is_none_or(|current| self.reconciliation_matches_active_for(current))
+    }
+
+    fn reconciliation_matches_active_for(&self, current: &CurrentWork) -> bool {
+        let Some(projection) = current.reconciliation.as_ref() else {
             return true;
         };
         let Some(host) = self.state.host() else {
@@ -10043,7 +10852,10 @@ impl RouterEngine {
                     active_child_slots,
                 )
             }
-            AttemptKind::Fallback { original_failure } => (
+            AttemptKind::Fallback {
+                original_failure,
+                bound_error,
+            } => (
                 ActivePresentation::error(
                     location,
                     self.request(request)
@@ -10054,7 +10866,10 @@ impl RouterEngine {
                     current.target_frames.clone(),
                 ),
                 None,
-                Vec::new(),
+                bound_error
+                    .as_ref()
+                    .map(|attempt| attempt.active_child_slots.clone())
+                    .unwrap_or_default(),
             ),
         };
         state.set_active(active.clone());
@@ -10961,7 +11776,11 @@ impl ViewReportSession<'_> {
                 CoreBackTargetDriverFailureReport::FailureCleanup(
                     CoreBackTargetDriverFailureCleanup {
                         scope,
-                        request: self.engine.begin_failure_cleanup(expected, failure),
+                        request: self.engine.begin_failure_cleanup_for_branch(
+                            expected,
+                            failure,
+                            branch_index,
+                        ),
                     },
                 )
             }
@@ -11048,17 +11867,16 @@ impl ViewReportSession<'_> {
         );
 
         match attempt {
-            AttemptKind::Normal(_) if branch_index > 0 => {
+            AttemptKind::Normal(_) => {
                 let expected = match failure.kind() {
                     NavigationFailureKind::Build => PendingFailureKind::Build,
                     NavigationFailureKind::Apply => PendingFailureKind::Apply,
                     _ => PendingFailureKind::Apply,
                 };
-                Some(self.engine.begin_failure_cleanup(expected, failure))
-            }
-            AttemptKind::Normal(_) => {
-                let _ = self.engine.begin_fallback(request, failure);
-                None
+                Some(
+                    self.engine
+                        .begin_failure_cleanup_for_branch(expected, failure, branch_index),
+                )
             }
             AttemptKind::Fallback { .. } => {
                 self.engine.retire_history_authority();
@@ -11130,18 +11948,11 @@ impl ViewReportSession<'_> {
             _ => PendingFailureKind::Apply,
         };
         let (failure, continuation) = match attempt {
-            AttemptKind::Normal(_) if branch_index == 0 => {
-                (failure, FailureCleanupContinuation::BeginFallback)
-            }
-            AttemptKind::Normal(NavigationCommandKind::Replace) => {
-                (failure, FailureCleanupContinuation::BeginFallback)
-            }
-            AttemptKind::Normal(NavigationCommandKind::Push) => {
-                (failure, FailureCleanupContinuation::Terminal)
-            }
-            AttemptKind::Normal(NavigationCommandKind::Back) => {
-                (failure, FailureCleanupContinuation::Terminal)
-            }
+            AttemptKind::Normal(_) => (
+                failure,
+                self.engine
+                    .frozen_failure_recovery_continuation(branch_index),
+            ),
             AttemptKind::Fallback { .. } => (
                 NavigationFailure::new(
                     NavigationFailureKind::RecoveryFailed,
@@ -11592,8 +12403,8 @@ mod tests {
         BackTargetResumeAction, BackTargetResumeOutcome, BackTargetStart, CleanupError,
         CommitError, CoreBackNoTargetPublicationPreparationFailureProjection,
         CoreBackNoTargetReadyMismatchProjection, CorePreparationReceiverMismatchProjection,
-        EngineAction, MountError, NavigationCommand, PrivateRequestLookup, PushError,
-        QueuedNavigation, QueuedReservation, ROUTER_DIAGNOSTIC_RETENTION, ReportError,
+        EngineAction, FrameMountTarget, MountError, NavigationCommand, PrivateRequestLookup,
+        PushError, QueuedNavigation, QueuedReservation, ROUTER_DIAGNOSTIC_RETENTION, ReportError,
         RootTaskIdentity, RouterEngine, TERMINAL_RETENTION, WorkStage, occupied_child_slots,
     };
     use crate::admission::{AdmissionError, HostAdmissionIssuer};
@@ -11614,6 +12425,7 @@ mod tests {
         CleanupBatchId, ReservationCounter, RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId,
     };
     use crate::location::RouteLocation;
+    use crate::meta::ErrorBoundaryKey;
     use crate::pattern::RoutePattern;
     use crate::presentation::{ActivePresentation, ActivePresentationKind};
     use crate::request::{
@@ -13010,13 +13822,23 @@ mod tests {
         let normal_identity = task.identity().clone();
         let normal_cleanup_batch = engine.current.as_ref().unwrap().cleanup_batch;
 
-        engine
+        let failure = engine
             .begin_view_report(task.identity())
             .unwrap()
             .failed(NavigationFailure::new(
                 NavigationFailureKind::Build,
                 "view build rejected",
-            ));
+            ))
+            .expect("zero-residual normal failure must enter cleanup");
+
+        assert!(failure.logical_roots().is_empty());
+        assert!(engine.action().is_none());
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::CleanupPending)
+        );
+        let cleanup = prepare_failure_cleanup(&mut engine, failure, 0xb11, 0);
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
 
         assert_eq!(
             engine.request(request).unwrap().status(),
@@ -13230,13 +14052,30 @@ mod tests {
             panic!("normal task expected")
         };
         let original_matched = engine.request(request).unwrap().matched().cloned();
-        engine
+        let normal_failure = engine
             .begin_view_report(normal.identity())
             .unwrap()
             .failed(NavigationFailure::new(
                 NavigationFailureKind::Apply,
                 "normal apply rejected",
-            ));
+            ))
+            .expect("normal failure must enter canonical cleanup before fallback");
+        assert!(normal_failure.logical_roots().is_empty());
+        assert_eq!(engine.active(), &old_active);
+        assert_eq!(engine.history(), &old_history);
+        assert!(engine.action().is_none());
+        assert!(
+            engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .all(|event| event.kind() != NavigationTraceEventKind::RequestTerminal)
+        );
+        let normal_cleanup = prepare_failure_cleanup(&mut engine, normal_failure, 0xb21, 0);
+        engine
+            .complete_cleanup(valid_completion(&normal_cleanup))
+            .unwrap();
         let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
             panic!("fallback task expected")
         };
@@ -13283,13 +14122,20 @@ mod tests {
         let EngineAction::FrameTask(normal) = engine.action().unwrap() else {
             panic!("normal task expected")
         };
-        engine
+        let normal_failure = engine
             .begin_view_report(normal.identity())
             .unwrap()
             .failed(NavigationFailure::new(
                 NavigationFailureKind::Apply,
                 "normal apply failed",
-            ));
+            ))
+            .expect("post-match failure must enter canonical cleanup");
+        assert!(normal_failure.logical_roots().is_empty());
+        assert!(engine.action().is_none());
+        let normal_cleanup = prepare_failure_cleanup(&mut engine, normal_failure, 0xb22, 0);
+        engine
+            .complete_cleanup(valid_completion(&normal_cleanup))
+            .unwrap();
         let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
             panic!("post-match failure must issue fallback")
         };
@@ -13343,13 +14189,20 @@ mod tests {
         let EngineAction::FrameTask(normal) = engine.action().unwrap() else {
             panic!("normal task expected")
         };
-        engine
+        let normal_failure = engine
             .begin_view_report(normal.identity())
             .unwrap()
             .failed(NavigationFailure::new(
                 NavigationFailureKind::Build,
                 "normal build failed",
-            ));
+            ))
+            .expect("normal build failure must enter canonical cleanup");
+        assert!(normal_failure.logical_roots().is_empty());
+        assert!(engine.action().is_none());
+        let normal_cleanup = prepare_failure_cleanup(&mut engine, normal_failure, 0xb23, 0);
+        engine
+            .complete_cleanup(valid_completion(&normal_cleanup))
+            .unwrap();
         let fallback_cleanup = publish_current(&mut engine);
         engine
             .complete_cleanup(valid_completion(&fallback_cleanup))
@@ -13462,13 +14315,20 @@ mod tests {
             panic!("normal task expected")
         };
         let stale_identity = stale_task.identity().clone();
-        stale_engine
+        let stale_failure = stale_engine
             .begin_view_report(&stale_identity)
             .unwrap()
             .failed(NavigationFailure::new(
                 NavigationFailureKind::Build,
                 "normal build failed",
-            ));
+            ))
+            .expect("normal build failure must enter canonical cleanup");
+        assert!(stale_failure.logical_roots().is_empty());
+        assert!(stale_engine.action().is_none());
+        let stale_cleanup = prepare_failure_cleanup(&mut stale_engine, stale_failure, 0xb24, 0);
+        stale_engine
+            .complete_cleanup(valid_completion(&stale_cleanup))
+            .unwrap();
         let stale_lifecycle = (
             stale_engine.state.snapshot(),
             stale_engine.ids.snapshot(),
@@ -13637,13 +14497,33 @@ mod tests {
             engine.testing_exhaust_reservation_counter(counter);
             let ids_before = engine.ids.snapshot();
 
-            engine
+            let failure = engine
                 .begin_view_report(normal.identity())
                 .unwrap()
                 .failed(NavigationFailure::new(
                     NavigationFailureKind::Build,
                     "normal build failed",
-                ));
+                ))
+                .expect("reservation exhaustion is observed after canonical cleanup");
+
+            assert_eq!(engine.ids.snapshot(), ids_before, "counter: {counter:?}");
+            assert!(failure.logical_roots().is_empty(), "counter: {counter:?}");
+            assert_eq!(
+                engine.request(request).unwrap().status(),
+                &RequestStatus::Running(NavigationPhase::CleanupPending),
+                "counter: {counter:?}"
+            );
+            assert!(engine.action().is_none());
+            assert!(
+                engine
+                    .request(request)
+                    .unwrap()
+                    .trace()
+                    .iter()
+                    .all(|event| event.kind() != NavigationTraceEventKind::RequestTerminal)
+            );
+            let cleanup = prepare_failure_cleanup(&mut engine, failure, 0xb25, 0);
+            engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
 
             assert_eq!(engine.ids.snapshot(), ids_before, "counter: {counter:?}");
             assert!(matches!(
@@ -16321,7 +17201,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_schedule_cleanup_settles_before_request_terminal() {
+    fn reconciliation_schedule_cleanup_settles_before_router_fallback() {
         let mut engine = ready_engine_with_tree(reconciliation_tree());
         engine.push(RouteLocation::new("/items/1")).unwrap();
         settle_current(&mut engine);
@@ -16343,22 +17223,48 @@ mod tests {
                 CleanupManifestSeal::new(Vec::new(), manifest_digest(0x905), 0),
             )
             .unwrap();
+        assert!(
+            engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .all(|event| event.kind() != NavigationTraceEventKind::RequestTerminal)
+        );
         engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
 
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::Recovering)
+        );
+        let Some(EngineAction::FrameTask(fallback)) = engine.action() else {
+            panic!("reconciliation failure cleanup must issue RouterFallback")
+        };
+        assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
         let trace = engine.request(request).unwrap().trace();
         let settled = trace
             .iter()
             .position(|event| event.kind() == NavigationTraceEventKind::CleanupSettled)
             .unwrap();
-        let terminal = trace
+        let fallback_issued = trace
             .iter()
-            .position(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+            .rposition(|event| {
+                event.kind() == NavigationTraceEventKind::FrameTaskIssued
+                    && event
+                        .frame()
+                        .is_some_and(|frame| frame.origin() == &FrameOrigin::RouterFallback)
+            })
             .unwrap();
-        assert!(settled < terminal);
+        assert!(settled < fallback_issued);
+        assert!(
+            trace
+                .iter()
+                .all(|event| event.kind() != NavigationTraceEventKind::RequestTerminal)
+        );
     }
 
     #[test]
-    fn reconciliation_schedule_fragment_residual_cleans_only_new_generation_before_terminal() {
+    fn reconciliation_schedule_fragment_residual_cleans_only_new_generation_before_fallback() {
         let mut engine = ready_engine_with_tree(reconciliation_tree());
         engine.push(RouteLocation::new("/items/1")).unwrap();
         settle_current(&mut engine);
@@ -16395,14 +17301,10 @@ mod tests {
             .unwrap();
         assert_eq!(engine.active(), &active_before);
         assert_eq!(engine.history(), &history_before);
-        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+        let _fallback =
+            complete_failure_cleanup_into_router_fallback(&mut engine, request, &cleanup);
         assert_eq!(engine.active(), &active_before);
         assert_eq!(engine.history(), &history_before);
-        assert!(matches!(
-            engine.request(request).unwrap().status(),
-            RequestStatus::Failed(failure)
-                if failure.kind() == NavigationFailureKind::Apply
-        ));
     }
 
     #[test]
@@ -16478,18 +17380,21 @@ mod tests {
             panic!("prefix-zero replacement root effect expected")
         };
         assert_eq!(task.identity().branch_index(), 0);
-        let failure_cleanup =
-            engine
-                .begin_view_report(task.identity())
-                .unwrap()
-                .failed(NavigationFailure::new(
-                    NavigationFailureKind::Apply,
-                    "replacement root effect rejected",
-                ));
+        let failure_cleanup = engine
+            .begin_view_report(task.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "replacement root effect rejected",
+            ))
+            .expect("prefix-zero root failure must enter cleanup");
 
-        assert!(failure_cleanup.is_none());
+        assert!(failure_cleanup.logical_roots().is_empty());
         assert_eq!(engine.active(), &active_before);
         assert_eq!(engine.history(), &history_before);
+        assert!(engine.action().is_none());
+        let cleanup = prepare_failure_cleanup(&mut engine, failure_cleanup, 0xb12, 0);
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
         let Some(EngineAction::FrameTask(fallback)) = engine.action() else {
             panic!("prefix-zero root failure must retain mandatory fallback")
         };
@@ -16530,7 +17435,7 @@ mod tests {
                 .all(|root| !old.contains(root))
         );
         assert!(matches!(
-            failure.continuation,
+            &failure.continuation,
             super::FailureCleanupContinuation::BeginFallback
         ));
         assert_eq!(engine.active(), &active_before);
@@ -17262,8 +18167,55 @@ mod tests {
         );
     }
 
+    fn complete_failure_cleanup_into_router_fallback(
+        engine: &mut RouterEngine,
+        request: crate::ids::NavigationRequestId,
+        cleanup: &CleanupBatchToken,
+    ) -> super::FrameTask {
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Running(_)
+        ));
+        assert!(
+            engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .all(|event| event.kind() != NavigationTraceEventKind::RequestTerminal)
+        );
+
+        engine.complete_cleanup(valid_completion(cleanup)).unwrap();
+
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::Recovering)
+        );
+        let Some(EngineAction::FrameTask(fallback)) = engine.action() else {
+            panic!("cleanup completion must issue RouterFallback")
+        };
+        assert_eq!(fallback.identity().request(), request);
+        assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
+        let trace = engine.request(request).unwrap().trace();
+        let settled = trace
+            .iter()
+            .rposition(|event| event.kind() == NavigationTraceEventKind::CleanupSettled)
+            .unwrap();
+        let fallback_issued = trace
+            .iter()
+            .rposition(|event| {
+                event.kind() == NavigationTraceEventKind::FrameTaskIssued
+                    && event
+                        .frame()
+                        .is_some_and(|frame| frame.origin() == &FrameOrigin::RouterFallback)
+            })
+            .unwrap();
+        assert!(settled < fallback_issued);
+        fallback
+    }
+
     #[test]
-    fn missing_outlet_waits_for_cleanup_before_mount_failure_terminal() {
+    fn missing_outlet_waits_for_cleanup_before_router_fallback() {
         let mut engine = ready_engine();
         let (request, parent, mount) = begin_nested_mount(&mut engine, Vec::new());
 
@@ -17289,12 +18241,44 @@ mod tests {
             rejected.mount_rejection(),
             Some(crate::trace::MountRejectionKind::MissingOutlet)
         );
-        assert_failure_waits_then_settles(
-            &mut engine,
-            request,
-            &cleanup,
-            NavigationFailureKind::Mount,
+        assert!(
+            engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .all(|event| event.kind() != NavigationTraceEventKind::RequestTerminal)
         );
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::Recovering)
+        );
+        let Some(EngineAction::FrameTask(fallback)) = engine.action() else {
+            panic!("missing outlet cleanup must issue RouterFallback")
+        };
+        assert_eq!(fallback.identity().request(), request);
+        assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
+        let trace = engine.request(request).unwrap().trace();
+        let rejected = trace
+            .iter()
+            .position(|event| event.kind() == NavigationTraceEventKind::MountRejected)
+            .unwrap();
+        let settled = trace
+            .iter()
+            .position(|event| event.kind() == NavigationTraceEventKind::CleanupSettled)
+            .unwrap();
+        let fallback_issued = trace
+            .iter()
+            .rposition(|event| {
+                event.kind() == NavigationTraceEventKind::FrameTaskIssued
+                    && event
+                        .frame()
+                        .is_some_and(|frame| frame.origin() == &FrameOrigin::RouterFallback)
+            })
+            .unwrap();
+        assert!(rejected < settled && settled < fallback_issued);
     }
 
     #[test]
@@ -17323,15 +18307,24 @@ mod tests {
         );
         assert_eq!(engine.active(), &old_active);
         assert_eq!(engine.history(), &old_history);
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::CleanupPending)
+        );
+        assert!(engine.action().is_none());
         let cleanup = prepare_failure_cleanup(&mut engine, failure, 102, 0);
         engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
         assert_eq!(engine.active(), &old_active);
         assert_eq!(engine.history(), &old_history);
-        assert!(matches!(
+        assert_eq!(
             engine.request(request).unwrap().status(),
-            RequestStatus::Failed(failure)
-                if failure.kind() == NavigationFailureKind::Mount
-        ));
+            &RequestStatus::Running(NavigationPhase::Recovering)
+        );
+        let Some(EngineAction::FrameTask(fallback)) = engine.action() else {
+            panic!("missing nested binding must recover through RouterFallback")
+        };
+        assert_eq!(fallback.identity().request(), request);
+        assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
     }
 
     #[test]
@@ -17401,16 +18394,12 @@ mod tests {
                 CleanupManifestSeal::new(vec![layout_frame, root_frame], manifest_digest(227), 2),
             )
             .unwrap();
-        assert_failure_waits_then_settles(
-            &mut engine,
-            request,
-            &cleanup,
-            NavigationFailureKind::Mount,
-        );
+        let _fallback =
+            complete_failure_cleanup_into_router_fallback(&mut engine, request, &cleanup);
     }
 
     #[test]
-    fn invalid_outlet_waits_for_cleanup_before_mount_failure_terminal() {
+    fn invalid_outlet_waits_for_cleanup_before_router_fallback() {
         let mut engine = ready_engine();
         let (request, parent, mount) =
             begin_nested_mount(&mut engine, vec![crate::slot::RouteSlotKey::default()]);
@@ -17432,12 +18421,8 @@ mod tests {
             rejected.mount_rejection(),
             Some(crate::trace::MountRejectionKind::InvalidOutlet)
         );
-        assert_failure_waits_then_settles(
-            &mut engine,
-            request,
-            &cleanup,
-            NavigationFailureKind::Mount,
-        );
+        let _fallback =
+            complete_failure_cleanup_into_router_fallback(&mut engine, request, &cleanup);
     }
 
     #[test]
@@ -17469,12 +18454,8 @@ mod tests {
             rejected.mount_rejection(),
             Some(crate::trace::MountRejectionKind::RejectedAfterMutation)
         );
-        assert_failure_waits_then_settles(
-            &mut engine,
-            request,
-            &cleanup,
-            NavigationFailureKind::Mount,
-        );
+        let _fallback =
+            complete_failure_cleanup_into_router_fallback(&mut engine, request, &cleanup);
     }
 
     #[test]
@@ -17503,7 +18484,8 @@ mod tests {
             assert_eq!(failure.logical_roots(), &[parent.clone()]);
             assert_ne!(failure.logical_roots(), &[child_frame]);
             let cleanup = prepare_failure_cleanup(&mut engine, failure, 127, 2);
-            assert_failure_waits_then_settles(&mut engine, request, &cleanup, kind);
+            let _fallback =
+                complete_failure_cleanup_into_router_fallback(&mut engine, request, &cleanup);
         }
     }
 
@@ -18113,16 +19095,12 @@ mod tests {
             .find(|event| event.kind() == NavigationTraceEventKind::MountRejectedAfterMutation)
             .unwrap();
         assert_eq!(rejected.slot(), Some(slot));
-        assert_failure_waits_then_settles(
-            &mut engine,
-            request,
-            &cleanup,
-            NavigationFailureKind::Mount,
-        );
+        let _fallback =
+            complete_failure_cleanup_into_router_fallback(&mut engine, request, &cleanup);
     }
 
     #[test]
-    fn failure_cleanup_completion_starts_next_request_and_replay_is_duplicate() {
+    fn recovery_cleanup_completion_starts_next_request_and_failure_replay_is_duplicate() {
         let mut engine = ready_engine();
         let (failed, parent, mount) = begin_nested_mount(&mut engine, Vec::new());
         let next = engine.enqueue_push(RouteLocation::new("/about")).unwrap();
@@ -18138,32 +19116,70 @@ mod tests {
         let completion = valid_completion(&cleanup);
         let replay = completion.clone();
 
+        assert!(
+            engine
+                .request(failed)
+                .unwrap()
+                .trace()
+                .iter()
+                .all(|event| event.kind() != NavigationTraceEventKind::RequestTerminal)
+        );
         engine.complete_cleanup(completion).unwrap();
+
+        assert_eq!(
+            engine.request(failed).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::Recovering)
+        );
+        assert_eq!(
+            engine.request(next).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        let Some(EngineAction::FrameTask(fallback)) = engine.action() else {
+            panic!("failure cleanup must issue RouterFallback before starting the queue")
+        };
+        assert_eq!(fallback.identity().request(), failed);
+        assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
+        let recovering = engine.snapshot();
+        assert_eq!(
+            engine.complete_cleanup(replay),
+            Err(CleanupError::Duplicate)
+        );
+        assert_eq!(engine.snapshot(), recovering);
+
+        let recovery_failure = engine
+            .begin_view_report(fallback.identity())
+            .unwrap()
+            .failed_with_physical_residual(NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "router fallback apply failed",
+            ));
+        assert!(recovery_failure.logical_roots().is_empty());
+        let recovery_cleanup = prepare_failure_cleanup(&mut engine, recovery_failure, 175, 0);
+        assert_eq!(
+            engine.request(next).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        engine
+            .complete_cleanup(valid_completion(&recovery_cleanup))
+            .unwrap();
 
         assert!(matches!(
             engine.request(failed).unwrap().status(),
             RequestStatus::Failed(failure)
-                if failure.kind() == NavigationFailureKind::Mount
+                if failure.kind() == NavigationFailureKind::RecoveryFailed
         ));
         assert_eq!(
             engine.request(next).unwrap().status(),
             &RequestStatus::Running(NavigationPhase::ApplyingFrame(0))
         );
         let Some(EngineAction::FrameTask(task)) = engine.action() else {
-            panic!("next queued request starts only after failure cleanup completion")
+            panic!("next queued request starts only after recovery cleanup completion")
         };
         assert_eq!(task.identity().request(), next);
-        engine.restore_action(EngineAction::FrameTask(task));
-        let started = engine.snapshot();
-        assert_eq!(
-            engine.complete_cleanup(replay),
-            Err(CleanupError::Duplicate)
-        );
-        assert_eq!(engine.snapshot(), started);
     }
 
     #[test]
-    fn mount_sequence_exhaustion_emits_failure_cleanup_action_without_fallback() {
+    fn mount_sequence_exhaustion_waits_for_cleanup_before_fallback() {
         let mut engine = ready_engine();
         let request = engine.push(RouteLocation::new("/items/1")).unwrap();
         let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
@@ -18208,12 +19224,8 @@ mod tests {
                 CleanupManifestSeal::new(vec![parent_frame], manifest_digest(179), 1),
             )
             .unwrap();
-        assert_failure_waits_then_settles(
-            &mut engine,
-            request,
-            &cleanup,
-            NavigationFailureKind::Mount,
-        );
+        let _fallback =
+            complete_failure_cleanup_into_router_fallback(&mut engine, request, &cleanup);
     }
 
     #[test]
@@ -18278,7 +19290,7 @@ mod tests {
     }
 
     #[test]
-    fn root_apply_failure_still_issues_router_fallback() {
+    fn root_apply_failure_waits_for_cleanup_before_router_fallback() {
         let mut engine = ready_engine();
         let request = engine.push(RouteLocation::new("/")).unwrap();
         let EngineAction::FrameTask(root) = engine.action().unwrap() else {
@@ -18294,12 +19306,947 @@ mod tests {
                     "root apply failed",
                 ));
 
-        assert!(failure_cleanup.is_none());
+        let failure_cleanup =
+            failure_cleanup.expect("root apply failure must enter canonical cleanup");
+        assert!(failure_cleanup.logical_roots().is_empty());
+        assert!(engine.action().is_none());
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::CleanupPending)
+        );
+        let cleanup = prepare_failure_cleanup(&mut engine, failure_cleanup, 0xb26, 0);
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
         let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
             panic!("Root apply failure must retain mandatory fallback")
         };
         assert_eq!(fallback.identity().request(), request);
         assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
+    }
+
+    #[test]
+    fn nested_apply_failure_selects_bound_error_view_before_router_fallback() {
+        let far_boundary = ErrorBoundaryKey::named("root-boundary").unwrap();
+        let far_error_view = RouteViewKey::new("root-error").unwrap();
+        let near_boundary = ErrorBoundaryKey::named("items-boundary").unwrap();
+        let near_error_view = RouteViewKey::new("items-error").unwrap();
+        let router_fallback = RouteViewKey::new("fallback").unwrap();
+        let mut builder = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(RouteViewKey::new("layout").unwrap())
+                    .with_error_view(far_boundary.clone(), far_error_view.clone()),
+            )
+            .unwrap();
+        let root_route = builder.root_id().unwrap();
+        let boundary_route = builder
+            .route_with_options(
+                root_route,
+                RoutePattern::path("items").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(RouteViewKey::new("items").unwrap())
+                    .with_error_view(near_boundary.clone(), near_error_view.clone()),
+            )
+            .unwrap();
+        builder
+            .route_with_options(
+                boundary_route,
+                RoutePattern::path(":id").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("item").unwrap()),
+            )
+            .unwrap();
+        assert_ne!(near_boundary, far_boundary);
+        assert_ne!(near_error_view, far_error_view);
+        assert_ne!(near_error_view, router_fallback);
+        let tree = builder.build().unwrap();
+        assert_eq!(
+            tree.node(boundary_route)
+                .unwrap()
+                .options()
+                .error_view_binding(),
+            Some((&near_boundary, &near_error_view)),
+        );
+
+        let mut engine = ready_engine_with_tree(tree);
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let committed = engine.active().frames().to_vec();
+        assert_eq!(committed.len(), 3);
+
+        let request = engine.replace(RouteLocation::new("/items/2")).unwrap();
+        let EngineAction::FrameTask(failing_leaf) = engine.action().unwrap() else {
+            panic!("nested replacement must issue the entering leaf task")
+        };
+        assert_eq!(failing_leaf.identity().branch_index(), 2);
+        let failure = engine
+            .begin_view_report(failing_leaf.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "nested leaf apply failed",
+            ))
+            .expect("nested replace apply failure must enter cleanup");
+        let cleanup = prepare_failure_cleanup(&mut engine, failure, 229, 0);
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        let Some(EngineAction::FrameTask(recovery)) = engine.action() else {
+            panic!("nested apply failure must issue a recovery view task")
+        };
+        assert_eq!(recovery.identity().request(), request);
+        let expected_origin = FrameOrigin::RouteError(boundary_route);
+        let expected_target = FrameMountTarget::RegisteredChildSlot {
+            parent: committed[0].clone(),
+            outlet: RouteSlotKey::default(),
+        };
+        assert_eq!(
+            (
+                recovery.identity().origin(),
+                recovery.identity().branch_index(),
+                recovery.view(),
+                recovery.mount_target(),
+            ),
+            (&expected_origin, 1, &near_error_view, &expected_target,),
+            "the nearest exact boundary binding must replace the boundary-and-below suffix while the strict ancestor prefix remains mounted",
+        );
+    }
+
+    #[test]
+    fn root_apply_failure_selects_bound_root_error_view() {
+        let root_boundary = ErrorBoundaryKey::named("root-boundary").unwrap();
+        let root_error_view = RouteViewKey::new("root-error").unwrap();
+        let builder = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(RouteViewKey::new("root").unwrap())
+                    .with_error_view(root_boundary.clone(), root_error_view.clone()),
+            )
+            .unwrap();
+        let root_route = builder.root_id().unwrap();
+        let tree = builder.build().unwrap();
+        assert_eq!(
+            tree.node(root_route)
+                .unwrap()
+                .options()
+                .error_view_binding(),
+            Some((&root_boundary, &root_error_view)),
+        );
+        let mut engine = ready_engine_with_tree(tree);
+        let request = engine.push(RouteLocation::new("/")).unwrap();
+        let EngineAction::FrameTask(root) = engine.action().unwrap() else {
+            panic!("root task expected")
+        };
+        assert_eq!(root.identity().branch_index(), 0);
+        let expected_target = root.mount_target().clone();
+        let failure = engine
+            .begin_view_report(root.identity())
+            .unwrap()
+            .failed_with_physical_residual(NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "bound root apply failed",
+            ));
+        let cleanup = prepare_failure_cleanup(&mut engine, failure, 231, 1);
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        let Some(EngineAction::FrameTask(recovery)) = engine.action() else {
+            panic!("root apply failure must issue the bound root error view")
+        };
+        let expected_origin = FrameOrigin::RouteError(root_route);
+        assert_eq!(recovery.identity().request(), request);
+        assert_eq!(
+            (
+                recovery.identity().origin(),
+                recovery.identity().branch_index(),
+                recovery.view(),
+                recovery.mount_target(),
+            ),
+            (&expected_origin, 0, &root_error_view, &expected_target),
+            "an exact root binding must win over RouterFallback after cleanup",
+        );
+    }
+
+    #[test]
+    fn root_zero_residual_failure_uses_canonical_zero_failure_ledger() {
+        for (kind, message, digest) in [
+            (
+                NavigationFailureKind::Build,
+                "bound root zero-residual build failed",
+                0xb01,
+            ),
+            (
+                NavigationFailureKind::Apply,
+                "bound root zero-residual apply failed",
+                0xb02,
+            ),
+        ] {
+            let root_boundary = ErrorBoundaryKey::named("root-boundary").unwrap();
+            let root_error_view = RouteViewKey::new("root-error").unwrap();
+            let builder = RouteTree::builder()
+                .root_with_options(
+                    RoutePattern::path("/").unwrap(),
+                    RouteNodeOptions::new()
+                        .with_view(RouteViewKey::new("root").unwrap())
+                        .with_error_view(root_boundary, root_error_view.clone()),
+                )
+                .unwrap();
+            let root_route = builder.root_id().unwrap();
+            let mut engine = ready_engine_with_tree(builder.build().unwrap());
+            let request = engine.push(RouteLocation::new("/")).unwrap();
+            let EngineAction::FrameTask(root) = engine.action().unwrap() else {
+                panic!("root task expected")
+            };
+            let expected_target = root.mount_target().clone();
+            let history_before = engine.history().clone();
+            let active_before = engine.active().clone();
+
+            let failure = engine
+                .begin_view_report(root.identity())
+                .unwrap()
+                .failed(NavigationFailure::new(kind, message))
+                .expect("every ordinary zero-residual root failure must enter cleanup first");
+            assert!(failure.logical_roots().is_empty());
+            assert!(engine.action().is_none());
+            assert_eq!(engine.history(), &history_before);
+            assert_eq!(engine.active(), &active_before);
+            assert_eq!(
+                engine.request(request).unwrap().status(),
+                &RequestStatus::Running(NavigationPhase::CleanupPending)
+            );
+            assert!(
+                engine
+                    .request(request)
+                    .unwrap()
+                    .trace()
+                    .iter()
+                    .all(|event| {
+                        event.kind() != NavigationTraceEventKind::CommitPublished
+                            && event.frame().is_none_or(|frame| {
+                                frame.origin() != &FrameOrigin::RouteError(root_route)
+                            })
+                    })
+            );
+
+            let cleanup = prepare_failure_cleanup(&mut engine, failure, digest, 0);
+            assert_eq!(cleanup.obligation_count(), 0);
+            assert!(engine.action().is_none());
+            engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+            let Some(EngineAction::FrameTask(recovery)) = engine.action() else {
+                panic!("canonical zero cleanup completion must issue the bound root error view")
+            };
+            assert_eq!(recovery.identity().request(), request);
+            assert_eq!(
+                recovery.identity().origin(),
+                &FrameOrigin::RouteError(root_route)
+            );
+            assert_eq!(recovery.identity().branch_index(), 0);
+            assert_eq!(recovery.view(), &root_error_view);
+            assert_eq!(recovery.mount_target(), &expected_target);
+            assert_eq!(engine.history(), &history_before);
+            assert_eq!(engine.active(), &active_before);
+        }
+    }
+
+    #[test]
+    fn nested_push_apply_failure_selects_nearest_bound_error_view() {
+        let root_boundary = ErrorBoundaryKey::named("root-boundary").unwrap();
+        let root_error_view = RouteViewKey::new("root-error").unwrap();
+        let items_boundary = ErrorBoundaryKey::named("items-boundary").unwrap();
+        let items_error_view = RouteViewKey::new("items-error").unwrap();
+        let mut builder = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(RouteViewKey::new("layout").unwrap())
+                    .with_error_view(root_boundary, root_error_view),
+            )
+            .unwrap();
+        let root_route = builder.root_id().unwrap();
+        let items_route = builder
+            .route_with_options(
+                root_route,
+                RoutePattern::path("items").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(RouteViewKey::new("items").unwrap())
+                    .with_error_view(items_boundary, items_error_view.clone()),
+            )
+            .unwrap();
+        builder
+            .route_with_options(
+                items_route,
+                RoutePattern::path(":id").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("item").unwrap()),
+            )
+            .unwrap();
+        let mut engine = ready_engine_with_tree(builder.build().unwrap());
+        engine.push(RouteLocation::new("/items")).unwrap();
+        settle_current(&mut engine);
+        let committed = engine.active().frames().to_vec();
+        assert_eq!(committed.len(), 2);
+
+        let request = engine.push(RouteLocation::new("/items/1")).unwrap();
+        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
+            panic!("nested push must request the missing child mount")
+        };
+        let grant = engine.resolve_mount(mount).unwrap();
+        let receipt = grant.attest_receipt(crate::mount::MountReceiptDigest::from_opaque(233));
+        let permit = engine.accept_mount_receipt(receipt).unwrap();
+        let completion = permit.complete(crate::mount::MountRegistrationDigest::from_opaque(235));
+        engine.complete_mount_registration(completion).unwrap();
+        let EngineAction::FrameTask(failing_leaf) = engine.action().unwrap() else {
+            panic!("confirmed nested push mount must issue the leaf task")
+        };
+        assert_eq!(failing_leaf.identity().branch_index(), 2);
+
+        let failure = engine
+            .begin_view_report(failing_leaf.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "nested push leaf apply failed",
+            ))
+            .expect("nested push apply failure must enter cleanup");
+        assert!(failure.logical_roots().is_empty());
+        let cleanup = prepare_failure_cleanup(&mut engine, failure, 237, 0);
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        let Some(EngineAction::FrameTask(recovery)) = engine.action() else {
+            panic!("nested push apply failure must issue the nearest bound error view")
+        };
+        let expected_origin = FrameOrigin::RouteError(items_route);
+        let expected_target = FrameMountTarget::RegisteredChildSlot {
+            parent: committed[0].clone(),
+            outlet: RouteSlotKey::default(),
+        };
+        assert_eq!(recovery.identity().request(), request);
+        assert_eq!(
+            (
+                recovery.identity().origin(),
+                recovery.identity().branch_index(),
+                recovery.view(),
+                recovery.mount_target(),
+            ),
+            (&expected_origin, 1, &items_error_view, &expected_target),
+            "a Push failure must preserve only the strict root prefix and must not settle Terminal",
+        );
+    }
+
+    #[test]
+    fn entering_boundary_recovery_preserves_only_strict_active_prefix() {
+        let items_boundary = ErrorBoundaryKey::named("items-boundary").unwrap();
+        let items_error_view = RouteViewKey::new("items-error").unwrap();
+        let mut builder = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("layout").unwrap()),
+            )
+            .unwrap();
+        let root_route = builder.root_id().unwrap();
+        builder
+            .route_with_options(
+                root_route,
+                RoutePattern::path("legacy").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("legacy").unwrap()),
+            )
+            .unwrap();
+        let items_route = builder
+            .route_with_options(
+                root_route,
+                RoutePattern::path("items").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(RouteViewKey::new("items").unwrap())
+                    .with_error_view(items_boundary, items_error_view.clone()),
+            )
+            .unwrap();
+        builder
+            .route_with_options(
+                items_route,
+                RoutePattern::path(":id").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("item").unwrap()),
+            )
+            .unwrap();
+        let mut engine = ready_engine_with_tree(builder.build().unwrap());
+        engine.push(RouteLocation::new("/legacy")).unwrap();
+        settle_current(&mut engine);
+        let committed = engine.active().frames().to_vec();
+        assert_eq!(committed.len(), 2);
+
+        let request = engine.replace(RouteLocation::new("/items/1")).unwrap();
+        let EngineAction::FrameTask(entering_boundary) = engine.action().unwrap() else {
+            panic!("replace must issue the entering boundary task in the registered child slot")
+        };
+        assert_eq!(entering_boundary.identity().branch_index(), 1);
+        let boundary_slot = entering_boundary.frame_version().slot();
+        engine
+            .accept_applied_report(
+                entering_boundary.into_applied_report(vec![RouteSlotKey::default()]),
+            )
+            .unwrap();
+        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
+            panic!("entering boundary must request its child mount")
+        };
+        let grant = engine.resolve_mount(mount).unwrap();
+        let receipt = grant.attest_receipt(crate::mount::MountReceiptDigest::from_opaque(239));
+        let permit = engine.accept_mount_receipt(receipt).unwrap();
+        let completion = permit.complete(crate::mount::MountRegistrationDigest::from_opaque(241));
+        engine.complete_mount_registration(completion).unwrap();
+        let EngineAction::FrameTask(failing_leaf) = engine.action().unwrap() else {
+            panic!("confirmed entering-boundary child mount must issue the leaf task")
+        };
+        assert_eq!(failing_leaf.identity().branch_index(), 2);
+
+        let failure = engine
+            .begin_view_report(failing_leaf.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "entering boundary child apply failed",
+            ))
+            .expect("entering boundary failure must enter cleanup");
+        let obligation_count = usize::from(!failure.logical_roots().is_empty());
+        let cleanup = prepare_failure_cleanup(&mut engine, failure, 243, obligation_count);
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        let Some(EngineAction::FrameTask(recovery)) = engine.action() else {
+            panic!("an entering boundary need not be preserved to issue its bound error view")
+        };
+        let expected_origin = FrameOrigin::RouteError(items_route);
+        let expected_target = FrameMountTarget::RegisteredChildSlot {
+            parent: committed[0].clone(),
+            outlet: RouteSlotKey::default(),
+        };
+        assert_eq!(recovery.identity().request(), request);
+        assert_eq!(recovery.frame_version().slot(), boundary_slot);
+        assert_eq!(
+            (
+                recovery.identity().origin(),
+                recovery.identity().branch_index(),
+                recovery.view(),
+                recovery.mount_target(),
+            ),
+            (&expected_origin, 1, &items_error_view, &expected_target),
+            "only the strict active root prefix is preserved; the replaced boundary itself is not required to be active",
+        );
+    }
+
+    #[test]
+    fn child_mount_rejection_selects_failed_child_boundary() {
+        let root_boundary = ErrorBoundaryKey::named("root-boundary").unwrap();
+        let root_error_view = RouteViewKey::new("root-error").unwrap();
+        let child_boundary = ErrorBoundaryKey::named("child-boundary").unwrap();
+        let child_error_view = RouteViewKey::new("child-error").unwrap();
+        let mut builder = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(RouteViewKey::new("root").unwrap())
+                    .with_error_view(root_boundary, root_error_view),
+            )
+            .unwrap();
+        let root_route = builder.root_id().unwrap();
+        let child_route = builder
+            .route_with_options(
+                root_route,
+                RoutePattern::path("items/:id").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(RouteViewKey::new("item").unwrap())
+                    .with_error_view(child_boundary, child_error_view.clone()),
+            )
+            .unwrap();
+        let mut engine = ready_engine_with_tree(builder.build().unwrap());
+        engine.push(RouteLocation::new("/")).unwrap();
+        settle_current(&mut engine);
+        let committed = engine.active().frames().to_vec();
+        assert_eq!(committed.len(), 1);
+
+        let request = engine.replace(RouteLocation::new("/items/1")).unwrap();
+        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
+            panic!("entering child without a registered slot must request a mount")
+        };
+        assert_eq!(
+            engine
+                .current
+                .as_ref()
+                .and_then(|current| current.pending_mount.as_ref())
+                .map(|pending| pending.child_index),
+            Some(1),
+            "the real rejected mount belongs to the failed child route index",
+        );
+        let failure = engine
+            .reject_mount(mount, crate::trace::MountRejectionKind::MissingOutlet)
+            .unwrap();
+        assert!(failure.logical_roots().is_empty());
+        let cleanup = prepare_failure_cleanup(&mut engine, failure, 245, 0);
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        let Some(EngineAction::MountRequest(recovery_mount)) = engine.action() else {
+            panic!("child mount rejection must issue a fresh recovery mount request")
+        };
+        assert_eq!(recovery_mount.request(), request);
+        assert_eq!(recovery_mount.parent(), &committed[0]);
+        assert_eq!(recovery_mount.outlet(), &RouteSlotKey::default());
+        let grant = engine.resolve_mount(recovery_mount).unwrap();
+        let recovery_slot = grant.slot();
+        let receipt = grant.attest_receipt(crate::mount::MountReceiptDigest::from_opaque(247));
+        let permit = engine.accept_mount_receipt(receipt).unwrap();
+        let completion = permit.complete(crate::mount::MountRegistrationDigest::from_opaque(249));
+        engine.complete_mount_registration(completion).unwrap();
+
+        let Some(EngineAction::FrameTask(recovery)) = engine.action() else {
+            panic!("confirmed recovery mount must issue the failed child's bound error view")
+        };
+        let expected_origin = FrameOrigin::RouteError(child_route);
+        let expected_target = FrameMountTarget::ChildOutlet {
+            parent: committed[0].clone(),
+            outlet: RouteSlotKey::default(),
+        };
+        assert_eq!(recovery.identity().request(), request);
+        assert_eq!(recovery.frame_version().slot(), recovery_slot);
+        assert_eq!(
+            (
+                recovery.identity().origin(),
+                recovery.identity().branch_index(),
+                recovery.view(),
+                recovery.mount_target(),
+            ),
+            (&expected_origin, 1, &child_error_view, &expected_target),
+            "mount rejection must select from pending.child_index rather than the parent frame identity",
+        );
+    }
+
+    fn entering_boundary_direct_recovery_fixture() -> (
+        RouterEngine,
+        crate::ids::NavigationRequestId,
+        super::FrameTask,
+    ) {
+        let items_boundary = ErrorBoundaryKey::named("items-boundary").unwrap();
+        let items_error_view = RouteViewKey::new("items-error").unwrap();
+        let mut builder = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("layout").unwrap()),
+            )
+            .unwrap();
+        let root_route = builder.root_id().unwrap();
+        builder
+            .route_with_options(
+                root_route,
+                RoutePattern::path("legacy").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("legacy").unwrap()),
+            )
+            .unwrap();
+        let items_route = builder
+            .route_with_options(
+                root_route,
+                RoutePattern::path("items").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(RouteViewKey::new("items").unwrap())
+                    .with_error_view(items_boundary, items_error_view.clone()),
+            )
+            .unwrap();
+        builder
+            .route_with_options(
+                items_route,
+                RoutePattern::path(":id").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("item").unwrap()),
+            )
+            .unwrap();
+        let mut engine = ready_engine_with_tree(builder.build().unwrap());
+        engine.push(RouteLocation::new("/legacy")).unwrap();
+        settle_current(&mut engine);
+
+        let request = engine.replace(RouteLocation::new("/items/1")).unwrap();
+        let EngineAction::FrameTask(entering_boundary) = engine.action().unwrap() else {
+            panic!("replace must issue the entering boundary task")
+        };
+        engine
+            .accept_applied_report(
+                entering_boundary.into_applied_report(vec![RouteSlotKey::default()]),
+            )
+            .unwrap();
+        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
+            panic!("entering boundary must request its child mount")
+        };
+        let grant = engine.resolve_mount(mount).unwrap();
+        let receipt = grant.attest_receipt(crate::mount::MountReceiptDigest::from_opaque(0xa11));
+        let permit = engine.accept_mount_receipt(receipt).unwrap();
+        let completion = permit.complete(crate::mount::MountRegistrationDigest::from_opaque(0xa12));
+        engine.complete_mount_registration(completion).unwrap();
+        let EngineAction::FrameTask(failing_leaf) = engine.action().unwrap() else {
+            panic!("confirmed child mount must issue the leaf task")
+        };
+        let failure = engine
+            .begin_view_report(failing_leaf.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "entering boundary child apply failed before direct recovery",
+            ))
+            .expect("leaf failure must enter cleanup");
+        let obligation_count = failure.logical_roots().len();
+        let cleanup = prepare_failure_cleanup(&mut engine, failure, 0xa13, obligation_count);
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        let Some(EngineAction::FrameTask(recovery)) = engine.action() else {
+            panic!("settled failure must issue the entering boundary's direct error task")
+        };
+        assert_eq!(
+            recovery.identity().origin(),
+            &FrameOrigin::RouteError(items_route)
+        );
+        assert_eq!(recovery.identity().branch_index(), 1);
+        assert_eq!(recovery.view(), &items_error_view);
+        (engine, request, recovery)
+    }
+
+    #[test]
+    fn bound_error_direct_task_refreezes_active_source_before_applied_report() {
+        let (mut engine, request, recovery) = entering_boundary_direct_recovery_fixture();
+        let history_before = engine.history().clone();
+        let published_before = engine
+            .request(request)
+            .unwrap()
+            .trace()
+            .iter()
+            .filter(|event| event.kind() == NavigationTraceEventKind::CommitPublished)
+            .count();
+
+        engine.testing_set_active_generation(RouteGeneration::testing_max());
+        assert_eq!(
+            engine.accept_applied_report(recovery.into_applied_report(Vec::new())),
+            Err(ReportError::Stale),
+            "the direct bound-error task must refreeze its active source before accepting applied output",
+        );
+        assert_eq!(engine.history(), &history_before);
+        assert_eq!(
+            engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::CommitPublished)
+                .count(),
+            published_before,
+        );
+
+        let Some(EngineAction::FailureCleanup(failure)) = engine.action() else {
+            panic!("stale bound-error output must clean the recovery attempt before terminalizing")
+        };
+        assert_eq!(failure.request(), request);
+        let obligation_count = failure.logical_roots().len();
+        let cleanup = prepare_failure_cleanup(&mut engine, failure, 0xa14, obligation_count);
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::RecoveryFailed
+        ));
+        assert_eq!(engine.history(), &history_before);
+        assert!(engine.action().is_none());
+    }
+
+    fn child_mount_required_recovery_fixture() -> (
+        RouterEngine,
+        crate::ids::NavigationRequestId,
+        super::FrameMountRequest,
+    ) {
+        let root_boundary = ErrorBoundaryKey::named("root-boundary").unwrap();
+        let root_error_view = RouteViewKey::new("root-error").unwrap();
+        let child_boundary = ErrorBoundaryKey::named("child-boundary").unwrap();
+        let child_error_view = RouteViewKey::new("child-error").unwrap();
+        let mut builder = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(RouteViewKey::new("root").unwrap())
+                    .with_error_view(root_boundary, root_error_view),
+            )
+            .unwrap();
+        let root_route = builder.root_id().unwrap();
+        builder
+            .route_with_options(
+                root_route,
+                RoutePattern::path("items/:id").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(RouteViewKey::new("item").unwrap())
+                    .with_error_view(child_boundary, child_error_view),
+            )
+            .unwrap();
+        let mut engine = ready_engine_with_tree(builder.build().unwrap());
+        engine.push(RouteLocation::new("/")).unwrap();
+        settle_current(&mut engine);
+        let committed_root = engine.active().frames()[0].clone();
+
+        let request = engine.replace(RouteLocation::new("/items/1")).unwrap();
+        let EngineAction::MountRequest(mount) = engine.action().unwrap() else {
+            panic!("entering child must request its missing mount")
+        };
+        let failure = engine
+            .reject_mount(mount, crate::trace::MountRejectionKind::MissingOutlet)
+            .unwrap();
+        let obligation_count = failure.logical_roots().len();
+        let cleanup = prepare_failure_cleanup(&mut engine, failure, 0xa15, obligation_count);
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        let Some(EngineAction::MountRequest(recovery_mount)) = engine.action() else {
+            panic!("settled child mount rejection must issue its recovery mount request")
+        };
+        assert_eq!(recovery_mount.request(), request);
+        assert_eq!(recovery_mount.parent(), &committed_root);
+        assert_eq!(recovery_mount.outlet(), &RouteSlotKey::default());
+        (engine, request, recovery_mount)
+    }
+
+    #[test]
+    fn bound_error_mount_required_refreezes_active_source_before_grant() {
+        let (mut engine, request, recovery_mount) = child_mount_required_recovery_fixture();
+        let source_request = recovery_mount.request();
+        let source_parent = recovery_mount.parent().clone();
+        let source_outlet = recovery_mount.outlet().clone();
+        let ids_before = engine.testing_id_allocator_snapshot();
+        let mount_issuer_before = engine.testing_mount_issuer_snapshot();
+        let status_before = engine.request(request).unwrap().status().clone();
+        let granted_before = engine
+            .request(request)
+            .unwrap()
+            .trace()
+            .iter()
+            .filter(|event| event.kind() == NavigationTraceEventKind::MountGranted)
+            .count();
+        let published_before = engine
+            .request(request)
+            .unwrap()
+            .trace()
+            .iter()
+            .filter(|event| event.kind() == NavigationTraceEventKind::CommitPublished)
+            .count();
+
+        engine.testing_set_active_generation(RouteGeneration::testing_max());
+        assert_eq!(
+            engine.validate_mount_request(&recovery_mount),
+            Err(crate::mount::MountError::WrongPhase),
+            "a recovery mount must refreeze its active source before granting a slot",
+        );
+        let error = match engine.resolve_mount(recovery_mount) {
+            Ok(_) => panic!("source-drifted recovery mount must not be granted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), crate::mount::MountError::WrongPhase);
+        let super::ResolveMountOwner::Returned(returned) = error.into_owner() else {
+            panic!("source drift must return the whole recovery mount request")
+        };
+        assert_eq!(returned.request(), source_request);
+        assert_eq!(returned.parent(), &source_parent);
+        assert_eq!(returned.outlet(), &source_outlet);
+        assert_eq!(engine.testing_id_allocator_snapshot(), ids_before);
+        assert_eq!(engine.testing_mount_issuer_snapshot(), mount_issuer_before);
+        assert_eq!(engine.request(request).unwrap().status(), &status_before);
+        assert_eq!(
+            engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::MountGranted)
+                .count(),
+            granted_before,
+        );
+        assert_eq!(
+            engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::CommitPublished)
+                .count(),
+            published_before,
+        );
+        assert!(engine.action().is_none());
+    }
+
+    #[test]
+    fn deep_bound_error_mount_required_retains_exact_parent_mount_source() {
+        let layout_outlet = RouteSlotKey::named("layout-outlet").unwrap();
+        let leaf_outlet = RouteSlotKey::named("leaf-outlet").unwrap();
+        assert_ne!(layout_outlet, leaf_outlet);
+        let leaf_boundary = ErrorBoundaryKey::named("leaf-boundary").unwrap();
+        let leaf_error_view = RouteViewKey::new("leaf-error").unwrap();
+        let mut builder = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("root").unwrap()),
+            )
+            .unwrap();
+        let root_route = builder.root_id().unwrap();
+        let layout_route = builder
+            .route_with_options(
+                root_route,
+                RoutePattern::path("layout").unwrap(),
+                RouteNodeOptions::new()
+                    .with_slot(layout_outlet.clone())
+                    .with_view(RouteViewKey::new("layout").unwrap()),
+            )
+            .unwrap();
+        builder
+            .route_with_options(
+                layout_route,
+                RoutePattern::path("leaf").unwrap(),
+                RouteNodeOptions::new()
+                    .with_slot(leaf_outlet.clone())
+                    .with_view(RouteViewKey::new("leaf").unwrap())
+                    .with_error_view(leaf_boundary, leaf_error_view),
+            )
+            .unwrap();
+        let mut engine = ready_engine_with_tree(builder.build().unwrap());
+        engine.push(RouteLocation::new("/layout")).unwrap();
+        settle_current(&mut engine);
+        let committed = engine.active().frames().to_vec();
+        assert_eq!(committed.len(), 2);
+        assert!(engine.active_child_slots.iter().any(|slot| {
+            slot.parent_branch_index() == 0
+                && slot.parent() == &committed[0]
+                && slot.outlet() == &layout_outlet
+                && slot.child() == Some(&committed[1])
+        }));
+
+        let request = engine.push(RouteLocation::new("/layout/leaf")).unwrap();
+        let EngineAction::MountRequest(failed_mount) = engine.action().unwrap() else {
+            panic!("the entering leaf must request its distinct child outlet")
+        };
+        assert_eq!(failed_mount.request(), request);
+        assert_eq!(failed_mount.parent(), &committed[1]);
+        assert_eq!(failed_mount.outlet(), &leaf_outlet);
+        let failure = engine
+            .reject_mount(
+                failed_mount,
+                crate::trace::MountRejectionKind::MissingOutlet,
+            )
+            .unwrap();
+        let obligation_count = failure.logical_roots().len();
+        let cleanup = prepare_failure_cleanup(&mut engine, failure, 0xa21, obligation_count);
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        let Some(EngineAction::MountRequest(recovery_mount)) = engine.action() else {
+            panic!("the failed leaf boundary must issue a recovery mount request")
+        };
+        assert_eq!(recovery_mount.request(), request);
+        assert_eq!(recovery_mount.parent(), &committed[1]);
+        assert_eq!(recovery_mount.outlet(), &leaf_outlet);
+        let current = engine
+            .current
+            .as_ref()
+            .expect("the recovery mount retains its parent task source");
+        assert_eq!(current.identity.branch_index(), 1);
+        assert_eq!(
+            current.current_target,
+            FrameMountTarget::RegisteredChildSlot {
+                parent: committed[0].clone(),
+                outlet: layout_outlet,
+            },
+            "the layout parent task must retain the layout's original mount source, not borrow the leaf boundary outlet",
+        );
+        let pending = current
+            .pending_mount
+            .as_ref()
+            .expect("the recovery mount remains pending");
+        assert_eq!(pending.child_index, 2);
+        assert_eq!(pending.parent, committed[1]);
+        assert_eq!(pending.outlet, leaf_outlet);
+    }
+
+    #[test]
+    fn bound_error_mount_slot_exhaustion_is_bounded_and_starts_queue() {
+        let (mut engine, request, recovery_mount) = child_mount_required_recovery_fixture();
+        let next = engine.enqueue_push(RouteLocation::new("/items/2")).unwrap();
+        assert_eq!(
+            engine.request(next).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        engine.testing_exhaust_slot_counter();
+        let ids_before_resolution = engine.testing_id_allocator_snapshot();
+        let granted_before = engine
+            .request(request)
+            .unwrap()
+            .trace()
+            .iter()
+            .filter(|event| event.kind() == NavigationTraceEventKind::MountGranted)
+            .count();
+        let published_before = engine
+            .request(request)
+            .unwrap()
+            .trace()
+            .iter()
+            .filter(|event| event.kind() == NavigationTraceEventKind::CommitPublished)
+            .count();
+
+        assert_eq!(
+            engine
+                .resolve_mount(recovery_mount)
+                .map(|_| ())
+                .map_err(|error| error.kind()),
+            Err(crate::mount::MountError::Exhausted),
+        );
+        assert_eq!(
+            engine.testing_id_allocator_snapshot(),
+            ids_before_resolution,
+            "slot exhaustion must not fabricate or advance a slot identity",
+        );
+        let Some(EngineAction::FailureCleanup(failure)) = engine.action() else {
+            panic!(
+                "bound-error slot exhaustion must fail the recovery attempt, not reissue its mount request"
+            )
+        };
+        assert_eq!(failure.request(), request);
+        assert_eq!(
+            failure.failure().kind(),
+            NavigationFailureKind::RecoveryFailed
+        );
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::CleanupPending)
+        );
+        assert_eq!(
+            engine.request(next).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        let obligation_count = failure.logical_roots().len();
+        let cleanup = prepare_failure_cleanup(&mut engine, failure, 0xa22, obligation_count);
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::RecoveryFailed
+        ));
+        assert!(matches!(
+            engine.request(next).unwrap().status(),
+            RequestStatus::Running(_)
+        ));
+        assert_eq!(
+            engine
+                .current
+                .as_ref()
+                .expect("the queued request must start after recovery cleanup")
+                .identity
+                .request,
+            next,
+        );
+        assert!(engine.action().is_some());
+        let trace = engine.request(request).unwrap().trace();
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::MountGranted)
+                .count(),
+            granted_before,
+        );
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::CommitPublished)
+                .count(),
+            published_before,
+        );
     }
 
     #[test]
@@ -18363,13 +20310,20 @@ mod tests {
         let EngineAction::FrameTask(root) = engine.action().unwrap() else {
             panic!("root task expected")
         };
-        engine
+        let normal_failure = engine
             .begin_view_report(root.identity())
             .unwrap()
             .failed(NavigationFailure::new(
                 NavigationFailureKind::Apply,
                 "normal root failed",
-            ));
+            ))
+            .expect("normal root failure must enter cleanup before fallback");
+        assert!(normal_failure.logical_roots().is_empty());
+        assert!(engine.action().is_none());
+        let normal_cleanup = prepare_failure_cleanup(&mut engine, normal_failure, 0xb13, 0);
+        engine
+            .complete_cleanup(valid_completion(&normal_cleanup))
+            .unwrap();
         let Some(EngineAction::FrameTask(fallback)) = engine.action() else {
             panic!("normal root failure must issue fallback")
         };

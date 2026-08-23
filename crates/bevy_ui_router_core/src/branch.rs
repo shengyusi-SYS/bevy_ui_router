@@ -58,6 +58,71 @@ use crate::fingerprint::{
 use crate::ids::RouteId;
 use crate::meta::{ErrorBoundaryKey, RouteExplicitKey, RouteMeta};
 use crate::slot::RouteSlotKey;
+use crate::view_key::RouteViewKey;
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct FrozenErrorViewBinding {
+    boundary_route: RouteId,
+    branch_index: usize,
+    boundary: ErrorBoundaryKey,
+    view: RouteViewKey,
+    outlet: RouteSlotKey,
+    tree: RouteBranchProvenance,
+}
+
+impl FrozenErrorViewBinding {
+    pub(crate) fn new(
+        boundary_route: RouteId,
+        branch_index: usize,
+        boundary: ErrorBoundaryKey,
+        view: RouteViewKey,
+        outlet: RouteSlotKey,
+        tree: RouteBranchProvenance,
+    ) -> Self {
+        Self {
+            boundary_route,
+            branch_index,
+            boundary,
+            view,
+            outlet,
+            tree,
+        }
+    }
+
+    pub(crate) const fn boundary_route(&self) -> RouteId {
+        self.boundary_route
+    }
+
+    pub(crate) const fn branch_index(&self) -> usize {
+        self.branch_index
+    }
+
+    pub(crate) const fn boundary(&self) -> &ErrorBoundaryKey {
+        &self.boundary
+    }
+
+    pub(crate) const fn view(&self) -> &RouteViewKey {
+        &self.view
+    }
+
+    pub(crate) const fn outlet(&self) -> &RouteSlotKey {
+        &self.outlet
+    }
+}
+
+impl fmt::Debug for FrozenErrorViewBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FrozenErrorViewBinding")
+            .field("boundary_route", &self.boundary_route)
+            .field("branch_index", &self.branch_index)
+            .field("boundary", &self.boundary)
+            .field("view", &self.view)
+            .field("outlet", &self.outlet)
+            .field("tree", &"sealed RouteBranchProvenance")
+            .finish()
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteParams {
@@ -101,6 +166,7 @@ pub struct MatchedRoute {
     slot: RouteSlotKey,
     explicit_key: Option<RouteExplicitKey>,
     error_boundary: Option<ErrorBoundaryKey>,
+    nearest_error_view: Option<FrozenErrorViewBinding>,
     meta: RouteMeta,
     params_fingerprint: RouteParamsFingerprint,
     segment_reuse_key: RouteSegmentReuseKey,
@@ -124,6 +190,7 @@ impl MatchedRoute {
             slot,
             explicit_key,
             error_boundary,
+            nearest_error_view: None,
             meta,
             params_fingerprint,
             segment_reuse_key,
@@ -148,6 +215,14 @@ impl MatchedRoute {
 
     pub const fn error_boundary(&self) -> Option<&ErrorBoundaryKey> {
         self.error_boundary.as_ref()
+    }
+
+    pub(crate) fn with_nearest_error_view(
+        mut self,
+        nearest_error_view: Option<FrozenErrorViewBinding>,
+    ) -> Self {
+        self.nearest_error_view = nearest_error_view;
+        self
     }
 
     pub const fn meta(&self) -> &RouteMeta {
@@ -233,6 +308,14 @@ impl MatchedBranch {
             .iter()
             .rev()
             .find_map(MatchedRoute::error_boundary)
+    }
+
+    pub(crate) fn nearest_error_view_for(
+        &self,
+        branch_index: usize,
+    ) -> Option<&FrozenErrorViewBinding> {
+        let binding = self.routes.get(branch_index)?.nearest_error_view.as_ref()?;
+        (binding.tree == self.provenance).then_some(binding)
     }
 }
 
