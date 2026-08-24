@@ -67,14 +67,23 @@ use crate::engine::{
     FailureCleanupCompletionReceiverMismatchProjection as CoreFailureCleanupCompletionReceiverMismatchProjection,
     FailureCleanupError as CoreFailureCleanupError,
     FailureCleanupManifestContradictionProjection as CoreFailureCleanupManifestContradictionProjection,
+    FailureCleanupPermanentAuthorityOwner as CoreFailureCleanupPermanentAuthorityOwner,
+    FailureCleanupPermanentCoreOutcome as CoreFailureCleanupPermanentOutcome,
+    FailureCleanupPermanentHolder as CoreFailureCleanupPermanentHolder,
     FailureCleanupPrepareOutcome as CoreFailureCleanupPrepareOutcome,
     FailureCleanupReceiverMismatchProjection as CoreFailureCleanupReceiverMismatchProjection,
-    FailureCleanupRequest as CoreFailureCleanupRequest, FrameMountRequest as CoreFrameMountRequest,
-    FrameMountTarget as CoreFrameMountTarget, FrameTask as CoreFrameTask,
-    MountMutationArtifact as CoreMountMutationArtifact, PreparedPublication, PrivateRequestLookup,
-    PushError as CorePushError, ReportError as CoreReportError,
-    ResolveMountOwner as CoreResolveMountOwner, RouterEngine as CoreRouterEngine,
-    ValidatedPublication as CoreValidatedPublication,
+    FailureCleanupRequest as CoreFailureCleanupRequest,
+    FailureCleanupZeroPhysicalMismatchProjection as CoreFailureCleanupZeroPhysicalMismatchProjection,
+    FailureCleanupZeroPhysicalProjection as CoreFailureCleanupZeroPhysicalProjection,
+    FailureCleanupZeroTerminalMismatchProjection as CoreFailureCleanupZeroTerminalMismatchProjection,
+    FailureCleanupZeroTerminalOutcome as CoreFailureCleanupZeroTerminalOutcome,
+    FailureCleanupZeroTerminalOwner as CoreFailureCleanupZeroTerminalOwner,
+    FrameMountRequest as CoreFrameMountRequest, FrameMountTarget as CoreFrameMountTarget,
+    FrameTask as CoreFrameTask, MountMutationArtifact as CoreMountMutationArtifact,
+    PreparedFailureCleanupZeroPhysical as CorePreparedFailureCleanupZeroPhysical,
+    PreparedPublication, PrivateRequestLookup, PushError as CorePushError,
+    ReportError as CoreReportError, ResolveMountOwner as CoreResolveMountOwner,
+    RouterEngine as CoreRouterEngine, ValidatedPublication as CoreValidatedPublication,
 };
 use crate::frame::{
     LogicalChildSlotBinding, ProjectedChildSlotRole, ProjectedChildSlotRoleKind,
@@ -832,6 +841,137 @@ pub enum FailureCleanupPrepareOutcome {
     Prepared(CleanupBatch),
     Mismatch(FailureCleanupPrepareMismatch),
     Permanent(PermanentFailureCleanup),
+}
+
+struct BoundFailureCleanupPhysical<Physical> {
+    physical: Physical,
+    observed: CoreFailureCleanupZeroPhysicalProjection,
+}
+
+#[doc(hidden)]
+pub struct PreparedFailureCleanupPhysical<Physical> {
+    batch: CleanupBatch,
+    physical: Physical,
+}
+
+impl<Physical> PreparedFailureCleanupPhysical<Physical> {
+    pub fn into_parts(self) -> (CleanupBatch, Physical) {
+        (self.batch, self.physical)
+    }
+}
+
+#[doc(hidden)]
+pub struct FailureCleanupPhysicalPrepareMismatch<Physical> {
+    request: FailureCleanupRequest,
+    evidence: FailureCleanupReceiverMismatchView,
+    physical: BoundFailureCleanupPhysical<Physical>,
+}
+
+impl<Physical> FailureCleanupPhysicalPrepareMismatch<Physical> {
+    pub fn physical(&self) -> &Physical {
+        &self.physical.physical
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        FailureCleanupRequest,
+        FailureCleanupReceiverMismatchView,
+        Physical,
+    ) {
+        (self.request, self.evidence, self.physical.physical)
+    }
+}
+
+#[doc(hidden)]
+pub struct FailureCleanupPermanentOwner<Physical> {
+    inner: CoreFailureCleanupPermanentHolder<BoundFailureCleanupPhysical<Physical>>,
+}
+
+impl<Physical> FailureCleanupPermanentOwner<Physical> {
+    pub fn request(&self) -> NavigationRequestId {
+        self.inner.request.request()
+    }
+
+    pub fn physical(&self) -> &Physical {
+        &self.inner.physical.physical
+    }
+}
+
+#[doc(hidden)]
+pub enum FailureCleanupPhysicalPrepareOutcome<Physical> {
+    Prepared(PreparedFailureCleanupPhysical<Physical>),
+    Mismatch(FailureCleanupPhysicalPrepareMismatch<Physical>),
+    Permanent(FailureCleanupPermanentOwner<Physical>),
+}
+
+#[doc(hidden)]
+pub struct FailureCleanupZeroPhysicalMismatchView {
+    inner: CoreFailureCleanupZeroPhysicalMismatchProjection,
+}
+
+#[doc(hidden)]
+pub struct FailureCleanupPermanentAuthorityOwner {
+    inner: CoreFailureCleanupPermanentAuthorityOwner,
+}
+
+#[doc(hidden)]
+pub struct FailureCleanupPermanentAuthorityPhysical<Physical> {
+    inner: BoundFailureCleanupPhysical<Physical>,
+}
+
+impl<Physical> FailureCleanupPermanentAuthorityPhysical<Physical> {
+    pub fn physical(&self) -> &Physical {
+        &self.inner.physical
+    }
+}
+
+#[doc(hidden)]
+pub struct PreparedFailureCleanupZeroPhysical<Physical> {
+    inner: CorePreparedFailureCleanupZeroPhysical<BoundFailureCleanupPhysical<Physical>>,
+}
+
+impl<Physical> PreparedFailureCleanupZeroPhysical<Physical> {
+    pub fn physical(&self) -> &Physical {
+        &self.inner.physical.physical
+    }
+}
+
+#[doc(hidden)]
+pub struct FailureCleanupZeroTerminalOwner {
+    inner: CoreFailureCleanupZeroTerminalOwner,
+}
+
+#[doc(hidden)]
+pub struct FailureCleanupZeroTerminalMismatchView {
+    inner: CoreFailureCleanupZeroTerminalMismatchProjection,
+}
+
+#[doc(hidden)]
+pub enum FailureCleanupPermanentOutcome<Physical> {
+    AuthoritySettlement {
+        physical: FailureCleanupPermanentAuthorityPhysical<Physical>,
+        owner: FailureCleanupPermanentAuthorityOwner,
+    },
+    ProvenZero {
+        zero: PreparedFailureCleanupZeroPhysical<Physical>,
+        owner: FailureCleanupZeroTerminalOwner,
+    },
+    ZeroMismatch {
+        holder: FailureCleanupPermanentOwner<Physical>,
+        evidence: FailureCleanupZeroPhysicalMismatchView,
+    },
+    Mismatch(FailureCleanupPermanentOwner<Physical>),
+}
+
+#[doc(hidden)]
+pub enum FailureCleanupZeroTerminalOutcome<Physical> {
+    Terminal,
+    Mismatch {
+        zero: PreparedFailureCleanupZeroPhysical<Physical>,
+        owner: FailureCleanupZeroTerminalOwner,
+        evidence: FailureCleanupZeroTerminalMismatchView,
+    },
 }
 
 #[doc(hidden)]
@@ -3972,6 +4112,127 @@ impl RouterEngine {
                     evidence: FailureCleanupManifestContradictionView { inner: evidence },
                 })
             }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_failure_cleanup_with_physical<Physical>(
+        &mut self,
+        request: FailureCleanupRequest,
+        manifest: CleanupManifest,
+        observed: CleanupManifestView,
+        physical: Physical,
+    ) -> FailureCleanupPhysicalPrepareOutcome<Physical> {
+        let observed = request.inner.freeze_zero_physical_projection(
+            CleanupManifestDigest::from_opaque(observed.manifest_digest),
+            observed.obligation_count,
+        );
+        let bound = BoundFailureCleanupPhysical { physical, observed };
+        let manifest_digest = manifest.manifest_digest;
+        let obligation_count = manifest.obligation_count;
+        match self.inner.prepare_failure_cleanup_retaining(
+            request.inner,
+            CleanupManifestSeal::new(
+                manifest.logical_roots,
+                CleanupManifestDigest::from_opaque(manifest_digest),
+                obligation_count,
+            ),
+        ) {
+            CoreFailureCleanupPrepareOutcome::Prepared(owner) => {
+                FailureCleanupPhysicalPrepareOutcome::Prepared(PreparedFailureCleanupPhysical {
+                    batch: CleanupBatch {
+                        inner: owner.into_token(),
+                        manifest_digest,
+                        obligation_count,
+                    },
+                    physical: bound.physical,
+                })
+            }
+            CoreFailureCleanupPrepareOutcome::Mismatch { request, evidence } => {
+                FailureCleanupPhysicalPrepareOutcome::Mismatch(
+                    FailureCleanupPhysicalPrepareMismatch {
+                        request: FailureCleanupRequest { inner: request },
+                        evidence: FailureCleanupReceiverMismatchView { inner: evidence },
+                        physical: bound,
+                    },
+                )
+            }
+            CoreFailureCleanupPrepareOutcome::Permanent { request, evidence } => {
+                FailureCleanupPhysicalPrepareOutcome::Permanent(FailureCleanupPermanentOwner {
+                    inner: CoreFailureCleanupPermanentHolder {
+                        request,
+                        physical: bound,
+                        evidence,
+                    },
+                })
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn classify_failure_cleanup_permanent<Physical>(
+        &mut self,
+        holder: FailureCleanupPermanentOwner<Physical>,
+    ) -> FailureCleanupPermanentOutcome<Physical> {
+        match self
+            .inner
+            .classify_failure_cleanup_permanent(holder.inner, |physical, expected| {
+                let observed = physical.observed.clone();
+                CorePreparedFailureCleanupZeroPhysical::bind_zero(physical, expected, observed)
+            }) {
+            CoreFailureCleanupPermanentOutcome::AuthoritySettlement { physical, owner } => {
+                FailureCleanupPermanentOutcome::AuthoritySettlement {
+                    physical: FailureCleanupPermanentAuthorityPhysical { inner: physical },
+                    owner: FailureCleanupPermanentAuthorityOwner { inner: owner },
+                }
+            }
+            CoreFailureCleanupPermanentOutcome::ProvenZero { zero, owner } => {
+                FailureCleanupPermanentOutcome::ProvenZero {
+                    zero: PreparedFailureCleanupZeroPhysical { inner: zero },
+                    owner: FailureCleanupZeroTerminalOwner { inner: owner },
+                }
+            }
+            CoreFailureCleanupPermanentOutcome::ZeroMismatch { holder, evidence } => {
+                FailureCleanupPermanentOutcome::ZeroMismatch {
+                    holder: FailureCleanupPermanentOwner { inner: holder },
+                    evidence: FailureCleanupZeroPhysicalMismatchView { inner: evidence },
+                }
+            }
+            CoreFailureCleanupPermanentOutcome::Mismatch(holder) => {
+                FailureCleanupPermanentOutcome::Mismatch(FailureCleanupPermanentOwner {
+                    inner: holder,
+                })
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn complete_failure_cleanup_zero_terminal<Physical, ConsumePhysical>(
+        &mut self,
+        owner: FailureCleanupZeroTerminalOwner,
+        zero: PreparedFailureCleanupZeroPhysical<Physical>,
+        consume_physical: ConsumePhysical,
+    ) -> FailureCleanupZeroTerminalOutcome<Physical>
+    where
+        ConsumePhysical: FnOnce(Physical),
+    {
+        match self
+            .inner
+            .complete_failure_cleanup_zero_terminal(owner.inner, zero.inner, |zero| {
+                consume_physical(zero.into_physical().physical)
+            }) {
+            CoreFailureCleanupZeroTerminalOutcome::Terminal(_terminal) => {
+                FailureCleanupZeroTerminalOutcome::Terminal
+            }
+            CoreFailureCleanupZeroTerminalOutcome::Mismatch {
+                zero,
+                owner,
+                evidence,
+            } => FailureCleanupZeroTerminalOutcome::Mismatch {
+                zero: PreparedFailureCleanupZeroPhysical { inner: zero },
+                owner: FailureCleanupZeroTerminalOwner { inner: owner },
+                evidence: FailureCleanupZeroTerminalMismatchView { inner: evidence },
+            },
         }
     }
 

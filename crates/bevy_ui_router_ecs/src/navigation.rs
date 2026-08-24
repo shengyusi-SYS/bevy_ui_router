@@ -37,12 +37,17 @@ use bevy_ui_router_core::{
         CleanupManifest, CleanupManifestView, CommitTicket, EngineAction, EnqueueBackErrorKind,
         FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError,
         FailureCleanupCompletionOwner, FailureCleanupCompletionPreparationMismatchView,
-        FailureCleanupCompletionReceiverMismatchView, FailureCleanupPrepareOutcome,
-        FailureCleanupRequest, FrameMountTarget, HistoryAdmissionStamp, HistoryAdmissionWorldSeal,
-        HistoryExecutionBindingView, HostLease, IntegrationError, LifecycleContinuationCapacity,
-        MountMutationArtifact, MountReceiptProof, MountRegistrationBeginError, MountRequest,
-        PreparationBoundaryScopeView, PreparationReceiverMismatchView,
-        PrepareBackAdmissionErrorKind, PreparedPostCommitContinuationOwner, ResolveMountOwner,
+        FailureCleanupCompletionReceiverMismatchView, FailureCleanupPermanentAuthorityOwner,
+        FailureCleanupPermanentAuthorityPhysical, FailureCleanupPermanentOutcome,
+        FailureCleanupPermanentOwner, FailureCleanupPhysicalPrepareMismatch,
+        FailureCleanupPhysicalPrepareOutcome, FailureCleanupPrepareOutcome, FailureCleanupRequest,
+        FailureCleanupZeroPhysicalMismatchView, FailureCleanupZeroTerminalMismatchView,
+        FailureCleanupZeroTerminalOutcome, FailureCleanupZeroTerminalOwner, FrameMountTarget,
+        HistoryAdmissionStamp, HistoryAdmissionWorldSeal, HistoryExecutionBindingView, HostLease,
+        IntegrationError, LifecycleContinuationCapacity, MountMutationArtifact, MountReceiptProof,
+        MountRegistrationBeginError, MountRequest, PreparationBoundaryScopeView,
+        PreparationReceiverMismatchView, PrepareBackAdmissionErrorKind,
+        PreparedFailureCleanupZeroPhysical, PreparedPostCommitContinuationOwner, ResolveMountOwner,
         RootFrameTask, RouteFailureContinuationOwner, RouterEngine, TargetAuthoritySettlementOwner,
         VerifiedBackNoTargetCandidate, VerifiedBackResolutionContradiction,
         VerifiedBackResolutionOwnerHandoff, VerifiedBackTargetExecutionOwner, ViewFailureKind,
@@ -237,6 +242,18 @@ struct TargetPreparationPermanentPostWriteDrift {
 }
 
 #[cfg(test)]
+#[derive(Resource)]
+struct FailureCleanupPermanentZeroBindMismatch {
+    request: NavigationRequestId,
+    submitted_logical_root: RouteFrameVersion,
+    observed_manifest_digest_xor: u64,
+    permanent_prepare_calls: usize,
+    observed_physical_digest_freezes: usize,
+    submitted_manifest_digest: Option<u64>,
+    observed_manifest_digest: Option<u64>,
+}
+
+#[cfg(test)]
 fn inject_failed_authority_begin_manifest_rejection(
     world: &mut World,
     logical_roots: &mut Vec<RouteFrameVersion>,
@@ -265,6 +282,75 @@ fn inject_failed_authority_begin_manifest_rejection(
     _logical_roots: &mut Vec<RouteFrameVersion>,
 ) {
 }
+
+#[cfg(test)]
+fn inject_failure_cleanup_permanent_logical_root_contradiction(
+    world: &mut World,
+    request: NavigationRequestId,
+    logical_roots: &mut Vec<RouteFrameVersion>,
+    manifest_digest: u64,
+) {
+    let Some(mut fault) = world.get_resource_mut::<FailureCleanupPermanentZeroBindMismatch>()
+    else {
+        return;
+    };
+    if fault.request != request {
+        return;
+    }
+    fault.submitted_manifest_digest = Some(manifest_digest);
+    logical_roots.push(fault.submitted_logical_root.clone());
+}
+
+#[cfg(not(test))]
+fn inject_failure_cleanup_permanent_logical_root_contradiction(
+    _world: &mut World,
+    _request: NavigationRequestId,
+    _logical_roots: &mut Vec<RouteFrameVersion>,
+    _manifest_digest: u64,
+) {
+}
+
+#[cfg(test)]
+fn freeze_failure_cleanup_observed_physical_manifest_digest(
+    world: &mut World,
+    request: NavigationRequestId,
+    manifest_digest: u64,
+) -> u64 {
+    let Some(mut fault) = world.get_resource_mut::<FailureCleanupPermanentZeroBindMismatch>()
+    else {
+        return manifest_digest;
+    };
+    if fault.request != request {
+        return manifest_digest;
+    }
+    fault.observed_physical_digest_freezes += 1;
+    let observed = manifest_digest ^ fault.observed_manifest_digest_xor;
+    fault.observed_manifest_digest = Some(observed);
+    observed
+}
+
+#[cfg(not(test))]
+fn freeze_failure_cleanup_observed_physical_manifest_digest(
+    _world: &mut World,
+    _request: NavigationRequestId,
+    manifest_digest: u64,
+) -> u64 {
+    manifest_digest
+}
+
+#[cfg(test)]
+fn record_failure_cleanup_permanent_prepare(world: &mut World, request: NavigationRequestId) {
+    let Some(mut fault) = world.get_resource_mut::<FailureCleanupPermanentZeroBindMismatch>()
+    else {
+        return;
+    };
+    if fault.request == request {
+        fault.permanent_prepare_calls += 1;
+    }
+}
+
+#[cfg(not(test))]
+fn record_failure_cleanup_permanent_prepare(_world: &mut World, _request: NavigationRequestId) {}
 
 #[cfg(test)]
 fn inject_projectionless_prepare_commit_rejection(world: &mut World) -> bool {
@@ -330,6 +416,71 @@ pub(crate) struct PendingFailedBranch {
 impl PendingFailedBranch {
     pub(crate) const fn branch(&self) -> &FailedPreparedBranch {
         &self.branch
+    }
+}
+
+struct FailureCleanupPhysicalPayload {
+    branch: FailedPreparedBranch,
+    reserved: PreparedCleanupLedger,
+    preflight: Option<LifecyclePreflightEvidence>,
+}
+
+impl FailureCleanupPhysicalPayload {
+    fn branch(&self) -> &FailedPreparedBranch {
+        &self.branch
+    }
+
+    fn into_ledger(self, batch: bevy_ui_router_core::integration::CleanupBatch) -> CleanupLedger {
+        CleanupLedger::activate_failed_with_preflight(
+            self.reserved.bind_batch(batch),
+            self.branch,
+            self.preflight,
+        )
+    }
+}
+
+struct FailureCleanupPhysicalCompound {
+    observed: CleanupManifestView,
+    physical: FailureCleanupPhysicalPayload,
+}
+
+impl FailureCleanupPhysicalCompound {
+    fn into_bridge_parts(self) -> (CleanupManifestView, FailureCleanupPhysicalPayload) {
+        (self.observed, self.physical)
+    }
+}
+
+struct R1FailureCleanupPermanentAuthorityPair {
+    physical: FailureCleanupPermanentAuthorityPhysical<FailureCleanupPhysicalPayload>,
+    core: FailureCleanupPermanentAuthorityOwner,
+}
+
+enum FailureCleanupPermanentStableInertOwner {
+    PrepareMismatch(FailureCleanupPhysicalPrepareMismatch<FailureCleanupPhysicalPayload>),
+    CoreMismatch(FailureCleanupPermanentOwner<FailureCleanupPhysicalPayload>),
+    ZeroBindMismatch {
+        holder: FailureCleanupPermanentOwner<FailureCleanupPhysicalPayload>,
+        evidence: FailureCleanupZeroPhysicalMismatchView,
+    },
+    ZeroTerminalMismatch {
+        zero: PreparedFailureCleanupZeroPhysical<FailureCleanupPhysicalPayload>,
+        owner: FailureCleanupZeroTerminalOwner,
+        evidence: FailureCleanupZeroTerminalMismatchView,
+    },
+    AuthorityPreparation(R1FailureCleanupPermanentAuthorityPair),
+    AuthorityRejected(R1FailureCleanupPermanentAuthorityPair),
+}
+
+impl FailureCleanupPermanentStableInertOwner {
+    fn physical(&self) -> &FailureCleanupPhysicalPayload {
+        match self {
+            Self::PrepareMismatch(mismatch) => mismatch.physical(),
+            Self::CoreMismatch(holder) | Self::ZeroBindMismatch { holder, .. } => holder.physical(),
+            Self::ZeroTerminalMismatch { zero, .. } => zero.physical(),
+            Self::AuthorityPreparation(pair) | Self::AuthorityRejected(pair) => {
+                pair.physical.physical()
+            }
+        }
     }
 }
 
@@ -1526,6 +1677,7 @@ pub(crate) struct RouterEntry {
     pending_mount_request: Option<MountRequest>,
     pending_mount_mutation_rejection: Option<PendingMountMutationRejection>,
     pending_failed_branch: Option<PendingFailedBranch>,
+    failure_cleanup_permanent: Option<FailureCleanupPermanentStableInertOwner>,
     projectionless_fail_close: Option<ProjectionlessFailCloseContinuation>,
     pub(crate) active: Option<RealizedBranch>,
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
@@ -1957,6 +2109,7 @@ struct ProvenEmptyAttemptOwnerInventory {
     pending_mount_request_vacant: bool,
     pending_mount_mutation_rejection_vacant: bool,
     pending_failed_branch_vacant: bool,
+    failure_cleanup_permanent_vacant: bool,
     projectionless_fail_close_vacant: bool,
     cleanup_ledger_vacant: bool,
     authority_protocol_residual_vacant: bool,
@@ -1983,6 +2136,7 @@ impl ProvenEmptyAttemptOwnerInventory {
                 .pending_mount_mutation_rejection
                 .is_none(),
             pending_failed_branch_vacant: entry.pending_failed_branch.is_none(),
+            failure_cleanup_permanent_vacant: entry.failure_cleanup_permanent.is_none(),
             projectionless_fail_close_vacant: entry.projectionless_fail_close.is_none(),
             cleanup_ledger_vacant: entry.cleanup_ledger.is_none(),
             authority_protocol_residual_vacant: entry.authority_protocol_residual.is_none(),
@@ -2013,6 +2167,7 @@ impl ProvenEmptyAttemptOwnerInventory {
             && self.pending_mount_request_vacant
             && self.pending_mount_mutation_rejection_vacant
             && self.pending_failed_branch_vacant
+            && self.failure_cleanup_permanent_vacant
             && self.projectionless_fail_close_vacant
             && self.cleanup_ledger_vacant
             && self.authority_protocol_residual_vacant
@@ -4840,6 +4995,7 @@ pub(crate) struct AuthorityProtocolResidualOwner {
     failed: Option<PendingFailedBranch>,
     failure_cleanup_completion: Option<FailureCleanupCompletionOwner>,
     failure_cleanup_ledger: Option<CleanupLedger>,
+    failure_cleanup_permanent_authority: Option<R1FailureCleanupPermanentAuthorityPair>,
     pub(crate) host: Option<RetiredHostBinding>,
 }
 
@@ -4852,6 +5008,7 @@ enum AuthorityProtocolResidualKind {
     PostReportSourceDrift(ProjectionlessSourceDriftEvidence),
     PreflightAuthorityLost(LifecyclePreflightEvidence),
     FailureCleanupCompletion(FailureCleanupCompletionMismatchView),
+    FailureCleanupPermanentAuthority,
 }
 
 impl RouterEntry {
@@ -5026,6 +5183,9 @@ impl RouterEntry {
             };
             return terminal_is_exact.then_some(allowance);
         }
+        if let Some(permanent) = self.failure_cleanup_permanent.as_ref() {
+            return permanent.physical().branch.mount_new_allowance();
+        }
         self.cleanup_ledger
             .as_ref()
             .and_then(CleanupLedger::mount_new_staging_allowance)
@@ -5035,6 +5195,7 @@ impl RouterEntry {
         self.cleanup_observation.summary(
             self.cleanup_ledger.is_some()
                 || self.pending_failed_branch.is_some()
+                || self.failure_cleanup_permanent.is_some()
                 || self.pending_mount_mutation_rejection.is_some()
                 || self.host_settlement.is_some()
                 || self.pending_back_no_target_completion.is_some()
@@ -5100,6 +5261,11 @@ impl RouterEntry {
                     .iter()
                     .flat_map(|pending| pending.branch.frames()),
             )
+            .chain(
+                self.failure_cleanup_permanent
+                    .iter()
+                    .flat_map(|permanent| permanent.physical().branch.frames()),
+            )
     }
 
     #[cfg(feature = "test-support")]
@@ -5133,6 +5299,9 @@ impl RouterEntry {
 
     #[cfg(feature = "test-support")]
     pub(crate) fn failed_cleanup_frames(&self) -> &[RealizedFrame] {
+        if let Some(permanent) = self.failure_cleanup_permanent.as_ref() {
+            return permanent.physical().branch.frames();
+        }
         self.cleanup_ledger
             .as_ref()
             .map(CleanupLedger::failed_prepared_frames)
@@ -5165,6 +5334,12 @@ impl RouterEntry {
                             .failure_cleanup_ledger
                             .iter()
                             .flat_map(CleanupLedger::failed_prepared_frames),
+                    )
+                    .chain(
+                        residual
+                            .failure_cleanup_permanent_authority
+                            .iter()
+                            .flat_map(|pair| pair.physical.physical().branch.frames()),
                     )
                     .collect()
             })
@@ -5218,6 +5393,27 @@ impl RouterEntry {
                             )
                     }),
             )
+            .chain(
+                residual
+                    .failure_cleanup_permanent_authority
+                    .iter()
+                    .flat_map(|pair| {
+                        pair.physical
+                            .physical()
+                            .branch
+                            .frames()
+                            .iter()
+                            .flat_map(RealizedFrame::claims)
+                            .chain(
+                                pair.physical
+                                    .physical()
+                                    .branch
+                                    .detached_frames()
+                                    .iter()
+                                    .flat_map(RealizedFrame::claims),
+                            )
+                    }),
+            )
             .map(ExactRegistryClaim::entity)
             .collect::<Vec<_>>();
         if let Some(host) = &residual.host {
@@ -5243,11 +5439,21 @@ impl RouterEntry {
         if let Some(pending) = &self.pending_failed_branch {
             slots.extend(pending.branch.tracked_child_slots());
         }
+        if let Some(permanent) = &self.failure_cleanup_permanent {
+            slots.extend(permanent.physical().branch.tracked_child_slots());
+        }
         if let Some(active) = &self.active {
             slots.extend(active.tracked_child_slots());
         }
         if let Some(ledger) = &self.cleanup_ledger {
             slots.extend(ledger.tracked_child_slots());
+        }
+        if let Some(pair) = self
+            .authority_protocol_residual
+            .as_ref()
+            .and_then(|residual| residual.failure_cleanup_permanent_authority.as_ref())
+        {
+            slots.extend(pair.physical.physical().branch.tracked_child_slots());
         }
         if let Some(pending) = &self.pending_back_no_target_authority_cleanup {
             match pending {
@@ -5335,6 +5541,7 @@ impl RouterNavigation {
             pending_mount_request: None,
             pending_mount_mutation_rejection: None,
             pending_failed_branch: None,
+            failure_cleanup_permanent: None,
             projectionless_fail_close: None,
             active: None,
             cleanup_ledger: None,
@@ -6008,6 +6215,127 @@ fn failed_prepared_branch(
     }
 }
 
+fn install_failure_cleanup_permanent_authority(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    pair: R1FailureCleanupPermanentAuthorityPair,
+) {
+    let (isolation, isolation_contradiction) = match prepare_failed_branch_authority_isolation(
+        world,
+        entry.active.as_ref(),
+        pair.physical.physical().branch(),
+        entry.host.as_ref(),
+    ) {
+        AuthorityIsolationPreparation::Ready(isolation) => (isolation, None),
+        AuthorityIsolationPreparation::RetryableCapacity => {
+            entry.failure_cleanup_permanent =
+                Some(FailureCleanupPermanentStableInertOwner::AuthorityPreparation(pair));
+            return;
+        }
+        AuthorityIsolationPreparation::PermanentContradiction {
+            contradiction,
+            fail_closed,
+        } => (fail_closed, Some(contradiction)),
+    };
+    let active = entry.active.take();
+    let (retired_host, lease) = match entry.host.take() {
+        Some(host) => {
+            let (retired, lease) = host.into_retired();
+            (Some(retired), Some(lease))
+        }
+        None => (None, None),
+    };
+    let mut residual = Some(AuthorityProtocolResidualOwner {
+        kind: AuthorityProtocolResidualKind::FailureCleanupPermanentAuthority,
+        isolation_contradiction,
+        active,
+        pending: None,
+        failed: None,
+        failure_cleanup_completion: None,
+        failure_cleanup_ledger: None,
+        failure_cleanup_permanent_authority: Some(pair),
+        host: retired_host,
+    });
+    let protocol_residual = &mut entry.authority_protocol_residual;
+    if let Err(returned_lease) =
+        entry
+            .engine
+            .fail_closed_authority_protocol_retaining(lease, || {
+                isolation.apply(world);
+                *protocol_residual = residual.take();
+            })
+    {
+        let mut owner = residual
+            .take()
+            .expect("rejected R1 permanent fail-close retains its exact owner pair");
+        match (owner.host.take(), returned_lease) {
+            (Some(retired), Some(lease)) => entry.host = Some(retired.restore(lease)),
+            (None, None) => {}
+            _ => unreachable!("R1 permanent fail-close returns the exact optional host lease"),
+        }
+        entry.active = owner.active.take();
+        entry.failure_cleanup_permanent =
+            Some(FailureCleanupPermanentStableInertOwner::AuthorityRejected(
+                owner
+                    .failure_cleanup_permanent_authority
+                    .take()
+                    .expect("rejected R1 fail-close returns the exact Core/physical pair"),
+            ));
+    }
+}
+
+fn install_failure_cleanup_permanent(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    holder: FailureCleanupPermanentOwner<FailureCleanupPhysicalPayload>,
+) {
+    match entry.engine.classify_failure_cleanup_permanent(holder) {
+        FailureCleanupPermanentOutcome::AuthoritySettlement { physical, owner } => {
+            install_failure_cleanup_permanent_authority(
+                world,
+                entry,
+                R1FailureCleanupPermanentAuthorityPair {
+                    physical,
+                    core: owner,
+                },
+            );
+        }
+        FailureCleanupPermanentOutcome::ProvenZero { zero, owner } => {
+            match entry
+                .engine
+                .complete_failure_cleanup_zero_terminal(owner, zero, drop)
+            {
+                FailureCleanupZeroTerminalOutcome::Terminal => {}
+                FailureCleanupZeroTerminalOutcome::Mismatch {
+                    zero,
+                    owner,
+                    evidence,
+                } => {
+                    entry.failure_cleanup_permanent = Some(
+                        FailureCleanupPermanentStableInertOwner::ZeroTerminalMismatch {
+                            zero,
+                            owner,
+                            evidence,
+                        },
+                    );
+                }
+            }
+        }
+        FailureCleanupPermanentOutcome::ZeroMismatch { holder, evidence } => {
+            entry.failure_cleanup_permanent =
+                Some(FailureCleanupPermanentStableInertOwner::ZeroBindMismatch {
+                    holder,
+                    evidence,
+                });
+        }
+        FailureCleanupPermanentOutcome::Mismatch(holder) => {
+            entry.failure_cleanup_permanent = Some(
+                FailureCleanupPermanentStableInertOwner::CoreMismatch(holder),
+            );
+        }
+    }
+}
+
 fn complete_zero_physical_failure(
     world: &mut World,
     entry: &mut RouterEntry,
@@ -6048,28 +6376,53 @@ fn complete_zero_physical_failure(
             };
         }
     };
-    let logical_roots = request.logical_roots().to_vec();
-    let cleanup = match entry.engine.prepare_failure_cleanup_retaining(
+    let observed_manifest_digest = freeze_failure_cleanup_observed_physical_manifest_digest(
+        world,
+        request.request(),
+        manifest_digest,
+    );
+    let physical = FailureCleanupPhysicalCompound {
+        observed: CleanupManifest::new(
+            request.logical_roots().to_vec(),
+            observed_manifest_digest,
+            0,
+        )
+        .projection(),
+        physical: FailureCleanupPhysicalPayload {
+            branch,
+            reserved,
+            preflight: None,
+        },
+    };
+    let mut logical_roots = request.logical_roots().to_vec();
+    inject_failure_cleanup_permanent_logical_root_contradiction(
+        world,
+        request.request(),
+        &mut logical_roots,
+        manifest_digest,
+    );
+    let (observed, physical) = physical.into_bridge_parts();
+    let prepared = match entry.engine.prepare_failure_cleanup_with_physical(
         request,
         CleanupManifest::new(logical_roots, manifest_digest, 0),
+        observed,
+        physical,
     ) {
-        FailureCleanupPrepareOutcome::Prepared(cleanup) => cleanup,
-        FailureCleanupPrepareOutcome::Mismatch(mismatch) => {
-            let (request, _evidence) = mismatch.into_parts();
-            return Err(PendingFailedBranch {
-                terminal: PendingFailedBranchTerminal::Request(request),
-                branch,
-            });
+        FailureCleanupPhysicalPrepareOutcome::Prepared(prepared) => prepared,
+        FailureCleanupPhysicalPrepareOutcome::Mismatch(mismatch) => {
+            entry.failure_cleanup_permanent = Some(
+                FailureCleanupPermanentStableInertOwner::PrepareMismatch(mismatch),
+            );
+            return Ok(());
         }
-        FailureCleanupPrepareOutcome::Permanent(permanent) => {
-            let (request, _evidence) = permanent.into_parts();
-            return Err(PendingFailedBranch {
-                terminal: PendingFailedBranchTerminal::Request(request),
-                branch,
-            });
+        FailureCleanupPhysicalPrepareOutcome::Permanent(permanent) => {
+            record_failure_cleanup_permanent_prepare(world, permanent.request());
+            install_failure_cleanup_permanent(world, entry, permanent);
+            return Ok(());
         }
     };
-    let mut ledger = CleanupLedger::activate_failed(reserved.bind_batch(cleanup), branch);
+    let (batch, physical) = prepared.into_parts();
+    let mut ledger = physical.into_ledger(batch);
     if !ledger.is_settled() {
         let Some(attempt) = ledger.attempt(world) else {
             unreachable!("an exact zero-physical cleanup ledger issues one attempt when needed")
@@ -6542,7 +6895,8 @@ fn dispatch_pending_back_target(entry: &mut RouterEntry) -> BackTargetDispatchOu
         && entry.pending_mount_frame_task.is_none()
         && entry.pending_mount_request.is_none()
         && entry.pending_mount_mutation_rejection.is_none()
-        && entry.pending_failed_branch.is_none();
+        && entry.pending_failed_branch.is_none()
+        && entry.failure_cleanup_permanent.is_none();
     if !physical_slots_are_vacant {
         return BackTargetDispatchOutcome::SafeStopped;
     }
@@ -6690,7 +7044,9 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                 );
                             continue;
                         }
-                        if entry.pending_failed_branch.is_some() {
+                        if entry.pending_failed_branch.is_some()
+                            || entry.failure_cleanup_permanent.is_some()
+                        {
                             continue;
                         }
                         let target_action = match dispatch_pending_back_target(entry) {
@@ -9493,6 +9849,7 @@ fn target_preparation_permanent_dispatch_entry_preflight(
         || entry.pending_mount_request.is_some()
         || entry.pending_mount_mutation_rejection.is_some()
         || entry.pending_failed_branch.is_some()
+        || entry.failure_cleanup_permanent.is_some()
         || entry.projectionless_fail_close.is_some()
         || entry.pending_back_target_execution.is_some()
         || entry.pending_back_target_permanent_cleanup.is_some()
@@ -11785,6 +12142,7 @@ fn drive_back_target_pending_rejected(entry: &mut RouterEntry) -> bool {
         || !pending_is_exact
         || entry.active.is_some()
         || entry.pending_failed_branch.is_some()
+        || entry.failure_cleanup_permanent.is_some()
         || entry.pending_back_target_permanent_cleanup.is_some()
         || entry.cleanup_ledger.is_some()
         || entry.authority_protocol_residual.is_some()
@@ -13608,6 +13966,7 @@ fn fail_closed_pending_owner_protocol_prepared(
         failed: None,
         failure_cleanup_completion: None,
         failure_cleanup_ledger: None,
+        failure_cleanup_permanent_authority: None,
         host: retired_host,
     });
     let protocol_residual = &mut entry.authority_protocol_residual;
@@ -13719,6 +14078,7 @@ fn fail_closed_failed_owner_protocol_prepared(
         failed: Some(failed),
         failure_cleanup_completion: None,
         failure_cleanup_ledger: None,
+        failure_cleanup_permanent_authority: None,
         host: retired_host,
     });
     let protocol_residual = &mut entry.authority_protocol_residual;
@@ -13791,6 +14151,7 @@ fn fail_closed_failure_cleanup_completion_protocol(
         failed: None,
         failure_cleanup_completion: completion,
         failure_cleanup_ledger: Some(ledger),
+        failure_cleanup_permanent_authority: None,
         host: retired_host,
     });
     let protocol_residual = &mut entry.authority_protocol_residual;
@@ -17613,6 +17974,9 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                 if entry.pending_back_target_execution.is_some() {
                     continue;
                 }
+                if entry.failure_cleanup_permanent.is_some() {
+                    continue;
+                }
                 if let Some(failed) = entry.pending_failed_branch.take() {
                     if entry.cleanup_ledger.is_some() {
                         entry.pending_failed_branch = Some(failed);
@@ -17860,56 +18224,62 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                             }
                         }
                     };
-                    let logical_roots = request.logical_roots().to_vec();
-                    let cleanup = match entry.engine.prepare_failure_cleanup_retaining(
+                    let observed_manifest_digest =
+                        freeze_failure_cleanup_observed_physical_manifest_digest(
+                            world,
+                            request.request(),
+                            manifest_digest,
+                        );
+                    let physical = FailureCleanupPhysicalCompound {
+                        observed: CleanupManifest::new(
+                            request.logical_roots().to_vec(),
+                            observed_manifest_digest,
+                            obligation_count,
+                        )
+                        .projection(),
+                        physical: FailureCleanupPhysicalPayload {
+                            branch,
+                            reserved,
+                            preflight: preflight_evidence,
+                        },
+                    };
+                    let mut logical_roots = request.logical_roots().to_vec();
+                    inject_failure_cleanup_permanent_logical_root_contradiction(
+                        world,
+                        request.request(),
+                        &mut logical_roots,
+                        manifest_digest,
+                    );
+                    let (observed, physical) = physical.into_bridge_parts();
+                    match entry.engine.prepare_failure_cleanup_with_physical(
                         request,
                         CleanupManifest::new(
                             logical_roots,
                             manifest_digest,
                             obligation_count,
                         ),
+                        observed,
+                        physical,
                     ) {
-                        FailureCleanupPrepareOutcome::Prepared(cleanup) => cleanup,
-                        FailureCleanupPrepareOutcome::Mismatch(mismatch) => {
-                            let (request, _evidence) = mismatch.into_parts();
-                            let terminal = match preflight_evidence {
-                                Some(evidence) => {
-                                    PendingFailedBranchTerminal::BackTargetPendingRejected {
-                                        request,
-                                        evidence,
-                                    }
-                                }
-                                None => PendingFailedBranchTerminal::Request(request),
-                            };
-                            entry.pending_failed_branch = Some(PendingFailedBranch {
-                                terminal,
-                                branch,
-                            });
+                        FailureCleanupPhysicalPrepareOutcome::Prepared(prepared) => {
+                            let (batch, physical) = prepared.into_parts();
+                            entry.cleanup_ledger = Some(physical.into_ledger(batch));
+                        }
+                        FailureCleanupPhysicalPrepareOutcome::Mismatch(mismatch) => {
+                            entry.failure_cleanup_permanent = Some(
+                                FailureCleanupPermanentStableInertOwner::PrepareMismatch(mismatch),
+                            );
                             continue;
                         }
-                        FailureCleanupPrepareOutcome::Permanent(permanent) => {
-                            let (request, _evidence) = permanent.into_parts();
-                            let terminal = match preflight_evidence {
-                                Some(evidence) => {
-                                    PendingFailedBranchTerminal::BackTargetPendingRejected {
-                                        request,
-                                        evidence,
-                                    }
-                                }
-                                None => PendingFailedBranchTerminal::Request(request),
-                            };
-                            entry.pending_failed_branch = Some(PendingFailedBranch {
-                                terminal,
-                                branch,
-                            });
+                        FailureCleanupPhysicalPrepareOutcome::Permanent(permanent) => {
+                            record_failure_cleanup_permanent_prepare(
+                                world,
+                                permanent.request(),
+                            );
+                            install_failure_cleanup_permanent(world, entry, permanent);
                             continue;
                         }
-                    };
-                    entry.cleanup_ledger = Some(CleanupLedger::activate_failed_with_preflight(
-                        reserved.bind_batch(cleanup),
-                        branch,
-                        preflight_evidence,
-                    ));
+                    }
                 }
                 let Some(mut ledger) = entry.cleanup_ledger.take() else {
                     continue;
@@ -24431,6 +24801,7 @@ pub(crate) mod tests {
             pending_mount_request: None,
             pending_mount_mutation_rejection: None,
             pending_failed_branch: None,
+            failure_cleanup_permanent: None,
             projectionless_fail_close: None,
             active: None,
             cleanup_ledger: None,
@@ -52049,6 +52420,286 @@ pub(crate) mod tests {
             settled_trace_len
         );
         assert!(entry.authority_protocol_residual.is_some());
+    }
+
+    #[test]
+    fn failure_cleanup_zero_bind_mismatch_retains_exact_evidence_and_redrives_zero() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let route_driver = ViewDriverKey::new("permanent-zero-route-driver").unwrap();
+        let fallback_driver = ViewDriverKey::new("permanent-zero-fallback-driver").unwrap();
+        app.register_ui_view_driver(FailOnceDriver {
+            key: route_driver.clone(),
+            failed: false,
+        })
+        .unwrap();
+        app.register_ui_view_driver(FailOnceDriver {
+            key: fallback_driver.clone(),
+            failed: false,
+        })
+        .unwrap();
+        let route_view = RouteViewKey::new("permanent-zero-route-view").unwrap();
+        let fallback_view = RouteViewKey::new("permanent-zero-fallback-view").unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(route_view.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut views = RouteViewRegistry::new();
+        views
+            .insert(route_view, RouteViewDescriptor::new(route_driver.clone()))
+            .unwrap();
+        views
+            .insert(
+                fallback_view.clone(),
+                RouteViewDescriptor::new(fallback_driver),
+            )
+            .unwrap();
+        let router = app
+            .add_ui_router(RouterConfig::new(routes, views, fallback_view))
+            .unwrap();
+        app.world_mut()
+            .spawn((Node::default(), RouterHostRegistration::new(router)));
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+
+        drive_navigation_system(app.world_mut());
+        let submitted_logical_root = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert_eq!(
+                entry.engine.request(request).unwrap().status(),
+                &RequestStatus::Running(NavigationPhase::Recovering)
+            );
+            let request_snapshot = entry.engine.request(request).unwrap();
+            request_snapshot
+                .trace()
+                .iter()
+                .rev()
+                .find_map(|event| {
+                    event
+                        .frame()
+                        .filter(|frame| frame.origin() == &FrameOrigin::RouterFallback)
+                        .cloned()
+                })
+                .expect("the normal zero cleanup must issue its real fallback task")
+        };
+        app.world_mut()
+            .insert_resource(FailureCleanupPermanentZeroBindMismatch {
+                request,
+                submitted_logical_root,
+                observed_manifest_digest_xor: 1,
+                permanent_prepare_calls: 0,
+                observed_physical_digest_freezes: 0,
+                submitted_manifest_digest: None,
+                observed_manifest_digest: None,
+            });
+
+        drive_navigation_system(app.world_mut());
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let FailureCleanupPermanentStableInertOwner::ZeroBindMismatch { holder, evidence } =
+                entry
+                    .failure_cleanup_permanent
+                    .as_ref()
+                    .expect("the real fallback recovery failure retains its zero physical owner")
+            else {
+                panic!("the observed zero digest drift must install exact typed bind evidence")
+            };
+            assert_eq!(holder.request(), request);
+            let _exact_evidence = evidence;
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+        }
+
+        let (stable_calls, stable_trace_len, stable_terminal_count) = {
+            let fault = app
+                .world()
+                .resource::<FailureCleanupPermanentZeroBindMismatch>();
+            assert_eq!(fault.permanent_prepare_calls, 1);
+            assert_eq!(fault.observed_physical_digest_freezes, 1);
+            assert!(fault.submitted_manifest_digest.is_some());
+            assert_eq!(
+                fault.submitted_manifest_digest,
+                fault
+                    .observed_manifest_digest
+                    .map(|observed| observed ^ fault.observed_manifest_digest_xor),
+                "the observed physical digest drift must be exact and independent of Core's submitted digest"
+            );
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(
+                matches!(
+                    entry.failure_cleanup_permanent.as_ref(),
+                    Some(FailureCleanupPermanentStableInertOwner::ZeroBindMismatch { .. })
+                ),
+                "the zero mismatch must retain the whole physical owner"
+            );
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Running(_)
+            ));
+            let request_snapshot = entry.engine.request(request).unwrap();
+            let trace = request_snapshot.trace();
+            (
+                (
+                    fault.permanent_prepare_calls,
+                    fault.observed_physical_digest_freezes,
+                ),
+                trace.len(),
+                trace
+                    .iter()
+                    .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                    .count(),
+            )
+        };
+        assert_eq!(stable_terminal_count, 0);
+
+        for _ in 0..3 {
+            settle_cleanup_system(app.world_mut());
+        }
+
+        let fault = app
+            .world()
+            .resource::<FailureCleanupPermanentZeroBindMismatch>();
+        assert_eq!(
+            (
+                fault.permanent_prepare_calls,
+                fault.observed_physical_digest_freezes,
+            ),
+            stable_calls,
+            "a stable zero-bind mismatch must not re-enter Permanent or bind on later settle ticks"
+        );
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(matches!(
+            entry.failure_cleanup_permanent.as_ref(),
+            Some(FailureCleanupPermanentStableInertOwner::ZeroBindMismatch { .. })
+        ));
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        let request_snapshot = entry.engine.request(request).unwrap();
+        let trace = request_snapshot.trace();
+        assert_eq!(trace.len(), stable_trace_len);
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                .count(),
+            stable_terminal_count,
+            "zero-bind mismatch must not invoke terminal publication on later ticks"
+        );
+    }
+
+    #[test]
+    fn failure_cleanup_nonzero_permanent_enters_bounded_r1_authority_owner_once() {
+        let mut app = App::new();
+        let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+        let submitted_logical_root = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let failed = entry
+                .pending_failed_branch
+                .as_ref()
+                .expect("the real stale child failure retains its cleanup owner");
+            assert!(
+                !failed.branch.frames().is_empty(),
+                "the R1 authority regression requires real nonzero physical cleanup"
+            );
+            match &failed.terminal {
+                PendingFailedBranchTerminal::Task { task, .. } => task.frame().clone(),
+                _ => panic!("the stale child fixture must retain its exact report task"),
+            }
+        };
+        app.world_mut()
+            .insert_resource(FailureCleanupPermanentZeroBindMismatch {
+                request,
+                submitted_logical_root,
+                observed_manifest_digest_xor: 0,
+                permanent_prepare_calls: 0,
+                observed_physical_digest_freezes: 0,
+                submitted_manifest_digest: None,
+                observed_manifest_digest: None,
+            });
+
+        settle_cleanup_system(app.world_mut());
+
+        let stable_trace_len = {
+            let fault = app
+                .world()
+                .resource::<FailureCleanupPermanentZeroBindMismatch>();
+            assert_eq!(fault.permanent_prepare_calls, 1);
+            assert_eq!(fault.observed_physical_digest_freezes, 1);
+            assert_eq!(
+                fault.submitted_manifest_digest, fault.observed_manifest_digest,
+                "the nonzero regression keeps the independently frozen physical digest exact"
+            );
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let residual = entry
+                .authority_protocol_residual
+                .as_ref()
+                .expect("nonzero Permanent must enter the bounded R1 authority residual");
+            assert!(matches!(
+                residual.kind,
+                AuthorityProtocolResidualKind::FailureCleanupPermanentAuthority
+            ));
+            let pair = residual
+                .failure_cleanup_permanent_authority
+                .as_ref()
+                .expect("the accepted residual retains the exact Core/physical pair");
+            let _core_owner = &pair.core;
+            assert!(
+                !pair.physical.physical().branch.frames().is_empty(),
+                "the authority residual must retain the same nonzero failed branch"
+            );
+            let _prepared_ledger = &pair.physical.physical().reserved;
+            assert!(entry.failure_cleanup_permanent.is_none());
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::AuthorityLost
+            ));
+            entry.engine.request(request).unwrap().trace().len()
+        };
+
+        for _ in 0..3 {
+            settle_cleanup_system(app.world_mut());
+        }
+
+        let fault = app
+            .world()
+            .resource::<FailureCleanupPermanentZeroBindMismatch>();
+        assert_eq!(
+            (
+                fault.permanent_prepare_calls,
+                fault.observed_physical_digest_freezes,
+            ),
+            (1, 1),
+            "the bounded nonzero authority result must not reprepare on later ticks"
+        );
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let residual = entry
+            .authority_protocol_residual
+            .as_ref()
+            .expect("later ticks retain the accepted R1 authority residual");
+        assert!(residual.failure_cleanup_permanent_authority.is_some());
+        assert!(entry.failure_cleanup_permanent.is_none());
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace().len(),
+            stable_trace_len
+        );
     }
 
     #[test]

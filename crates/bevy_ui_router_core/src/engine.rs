@@ -664,6 +664,18 @@ impl FailureCleanupRequest {
     pub(crate) const fn failure(&self) -> &NavigationFailure {
         &self.failure
     }
+
+    pub(crate) fn freeze_zero_physical_projection(
+        &self,
+        manifest_digest: CleanupManifestDigest,
+        obligation_count: usize,
+    ) -> FailureCleanupZeroPhysicalProjection {
+        FailureCleanupZeroPhysicalProjection {
+            receiver: self.receiver.clone(),
+            manifest_digest,
+            obligation_count,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -760,6 +772,10 @@ impl<Physical> PreparedFailureCleanupZeroPhysical<Physical> {
                 },
             ))
         }
+    }
+
+    pub(crate) fn into_physical(self) -> Physical {
+        self.physical
     }
 }
 
