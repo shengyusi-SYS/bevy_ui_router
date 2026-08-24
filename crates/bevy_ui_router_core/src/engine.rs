@@ -483,6 +483,12 @@ pub(crate) struct FailureCleanupReceiverProjection {
     recovery: FailureCleanupRecoveryTargetProjection,
 }
 
+impl FailureCleanupReceiverProjection {
+    pub(crate) const fn request(&self) -> NavigationRequestId {
+        self.identity.request()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BeginAuthoritySettlementErrorKind {
     Foreign,
@@ -675,6 +681,28 @@ impl FailureCleanupRequest {
             manifest_digest,
             obligation_count,
         }
+    }
+
+    pub(crate) fn physical_receiver_mismatch(
+        &self,
+        observed: &FailureCleanupZeroPhysicalProjection,
+    ) -> Option<FailureCleanupReceiverMismatchProjection> {
+        if observed.receiver == self.receiver {
+            return None;
+        }
+        let kind = if observed.receiver.identity.router_identity()
+            != self.receiver.identity.router_identity()
+        {
+            FailureCleanupError::Foreign
+        } else {
+            FailureCleanupError::Stale
+        };
+        Some(FailureCleanupReceiverMismatchProjection {
+            kind,
+            expected: self.receiver.clone(),
+            observed_router: observed.receiver.identity.router_identity(),
+            observed: Some(observed.receiver.clone()),
+        })
     }
 }
 
@@ -886,6 +914,10 @@ pub(crate) struct FailureCleanupPermanentAuthorityOwner {
 }
 
 impl FailureCleanupPermanentAuthorityOwner {
+    pub(crate) const fn request(&self) -> NavigationRequestId {
+        self.request.request()
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (

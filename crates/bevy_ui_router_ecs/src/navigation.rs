@@ -251,6 +251,8 @@ struct FailureCleanupPermanentZeroBindMismatch {
     observed_physical_digest_freezes: usize,
     submitted_manifest_digest: Option<u64>,
     observed_manifest_digest: Option<u64>,
+    physical_witness_address: Option<usize>,
+    authority_publication_calls: usize,
 }
 
 #[cfg(test)]
@@ -353,6 +355,41 @@ fn record_failure_cleanup_permanent_prepare(world: &mut World, request: Navigati
 fn record_failure_cleanup_permanent_prepare(_world: &mut World, _request: NavigationRequestId) {}
 
 #[cfg(test)]
+fn issue_failure_cleanup_physical_witness(
+    world: &mut World,
+    request: NavigationRequestId,
+) -> Box<u8> {
+    let witness = Box::new(0_u8);
+    if let Some(mut fault) = world
+        .get_resource_mut::<FailureCleanupPermanentZeroBindMismatch>()
+        .filter(|fault| fault.request == request)
+    {
+        fault.physical_witness_address = Some((&*witness as *const u8) as usize);
+    }
+    witness
+}
+
+#[cfg(test)]
+fn record_failure_cleanup_permanent_authority_publication(
+    world: &mut World,
+    request: NavigationRequestId,
+) {
+    if let Some(mut fault) = world
+        .get_resource_mut::<FailureCleanupPermanentZeroBindMismatch>()
+        .filter(|fault| fault.request == request)
+    {
+        fault.authority_publication_calls += 1;
+    }
+}
+
+#[cfg(not(test))]
+fn record_failure_cleanup_permanent_authority_publication(
+    _world: &mut World,
+    _request: NavigationRequestId,
+) {
+}
+
+#[cfg(test)]
 fn inject_projectionless_prepare_commit_rejection(world: &mut World) -> bool {
     world
         .get_resource_mut::<ProjectionlessPrepareCommitRejection>()
@@ -423,6 +460,8 @@ struct FailureCleanupPhysicalPayload {
     branch: FailedPreparedBranch,
     reserved: PreparedCleanupLedger,
     preflight: Option<LifecyclePreflightEvidence>,
+    #[cfg(test)]
+    witness: Box<u8>,
 }
 
 impl FailureCleanupPhysicalPayload {
@@ -437,16 +476,10 @@ impl FailureCleanupPhysicalPayload {
             self.preflight,
         )
     }
-}
 
-struct FailureCleanupPhysicalCompound {
-    observed: CleanupManifestView,
-    physical: FailureCleanupPhysicalPayload,
-}
-
-impl FailureCleanupPhysicalCompound {
-    fn into_bridge_parts(self) -> (CleanupManifestView, FailureCleanupPhysicalPayload) {
-        (self.observed, self.physical)
+    #[cfg(test)]
+    fn witness_address(&self) -> usize {
+        (&*self.witness as *const u8) as usize
     }
 }
 
@@ -6238,6 +6271,7 @@ fn install_failure_cleanup_permanent_authority(
         } => (fail_closed, Some(contradiction)),
     };
     let active = entry.active.take();
+    let request = pair.core.request();
     let (retired_host, lease) = match entry.host.take() {
         Some(host) => {
             let (retired, lease) = host.into_retired();
@@ -6261,6 +6295,7 @@ fn install_failure_cleanup_permanent_authority(
         entry
             .engine
             .fail_closed_authority_protocol_retaining(lease, || {
+                record_failure_cleanup_permanent_authority_publication(world, request);
                 isolation.apply(world);
                 *protocol_residual = residual.take();
             })
@@ -6381,19 +6416,21 @@ fn complete_zero_physical_failure(
         request.request(),
         manifest_digest,
     );
-    let physical = FailureCleanupPhysicalCompound {
-        observed: CleanupManifest::new(
-            request.logical_roots().to_vec(),
-            observed_manifest_digest,
-            0,
-        )
-        .projection(),
-        physical: FailureCleanupPhysicalPayload {
-            branch,
-            reserved,
-            preflight: None,
-        },
+    let observed = CleanupManifest::new(
+        request.logical_roots().to_vec(),
+        observed_manifest_digest,
+        0,
+    );
+    let physical = FailureCleanupPhysicalPayload {
+        branch,
+        reserved,
+        preflight: None,
+        #[cfg(test)]
+        witness: issue_failure_cleanup_physical_witness(world, request.request()),
     };
+    let physical = entry
+        .engine
+        .bind_failure_cleanup_physical(&request, observed, physical);
     let mut logical_roots = request.logical_roots().to_vec();
     inject_failure_cleanup_permanent_logical_root_contradiction(
         world,
@@ -6401,11 +6438,9 @@ fn complete_zero_physical_failure(
         &mut logical_roots,
         manifest_digest,
     );
-    let (observed, physical) = physical.into_bridge_parts();
     let prepared = match entry.engine.prepare_failure_cleanup_with_physical(
         request,
         CleanupManifest::new(logical_roots, manifest_digest, 0),
-        observed,
         physical,
     ) {
         FailureCleanupPhysicalPrepareOutcome::Prepared(prepared) => prepared,
@@ -18230,19 +18265,21 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                             request.request(),
                             manifest_digest,
                         );
-                    let physical = FailureCleanupPhysicalCompound {
-                        observed: CleanupManifest::new(
-                            request.logical_roots().to_vec(),
-                            observed_manifest_digest,
-                            obligation_count,
-                        )
-                        .projection(),
-                        physical: FailureCleanupPhysicalPayload {
-                            branch,
-                            reserved,
-                            preflight: preflight_evidence,
-                        },
+                    let observed = CleanupManifest::new(
+                        request.logical_roots().to_vec(),
+                        observed_manifest_digest,
+                        obligation_count,
+                    );
+                    let physical = FailureCleanupPhysicalPayload {
+                        branch,
+                        reserved,
+                        preflight: preflight_evidence,
+                        #[cfg(test)]
+                        witness: issue_failure_cleanup_physical_witness(world, request.request()),
                     };
+                    let physical = entry
+                        .engine
+                        .bind_failure_cleanup_physical(&request, observed, physical);
                     let mut logical_roots = request.logical_roots().to_vec();
                     inject_failure_cleanup_permanent_logical_root_contradiction(
                         world,
@@ -18250,7 +18287,6 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                         &mut logical_roots,
                         manifest_digest,
                     );
-                    let (observed, physical) = physical.into_bridge_parts();
                     match entry.engine.prepare_failure_cleanup_with_physical(
                         request,
                         CleanupManifest::new(
@@ -18258,7 +18294,6 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                             manifest_digest,
                             obligation_count,
                         ),
-                        observed,
                         physical,
                     ) {
                         FailureCleanupPhysicalPrepareOutcome::Prepared(prepared) => {
@@ -52502,10 +52537,17 @@ pub(crate) mod tests {
                 observed_physical_digest_freezes: 0,
                 submitted_manifest_digest: None,
                 observed_manifest_digest: None,
+                physical_witness_address: None,
+                authority_publication_calls: 0,
             });
 
         drive_navigation_system(app.world_mut());
         {
+            let fault = app
+                .world()
+                .resource::<FailureCleanupPermanentZeroBindMismatch>();
+            let submitted_manifest_digest = fault.submitted_manifest_digest.unwrap();
+            let observed_manifest_digest = fault.observed_manifest_digest.unwrap();
             let entry = &app.world().resource::<RouterNavigation>().entries[0];
             let FailureCleanupPermanentStableInertOwner::ZeroBindMismatch { holder, evidence } =
                 entry
@@ -52516,7 +52558,15 @@ pub(crate) mod tests {
                 panic!("the observed zero digest drift must install exact typed bind evidence")
             };
             assert_eq!(holder.request(), request);
-            let _exact_evidence = evidence;
+            assert_eq!(evidence.source_request(), request);
+            assert_eq!(evidence.expected_request(), request);
+            assert_eq!(evidence.observed_request(), request);
+            assert!(evidence.source_matches_expected_receiver());
+            assert!(evidence.source_matches_observed_receiver());
+            assert!(evidence.expected_manifest_digest_matches(submitted_manifest_digest));
+            assert!(evidence.observed_manifest_digest_matches(observed_manifest_digest));
+            assert_eq!(evidence.expected_obligation_count(), 0);
+            assert_eq!(evidence.observed_obligation_count(), 0);
             assert!(entry.pending_failed_branch.is_none());
             assert!(entry.cleanup_ledger.is_none());
         }
@@ -52628,6 +52678,8 @@ pub(crate) mod tests {
                 observed_physical_digest_freezes: 0,
                 submitted_manifest_digest: None,
                 observed_manifest_digest: None,
+                physical_witness_address: None,
+                authority_publication_calls: 0,
             });
 
         settle_cleanup_system(app.world_mut());
@@ -52638,6 +52690,7 @@ pub(crate) mod tests {
                 .resource::<FailureCleanupPermanentZeroBindMismatch>();
             assert_eq!(fault.permanent_prepare_calls, 1);
             assert_eq!(fault.observed_physical_digest_freezes, 1);
+            assert_eq!(fault.authority_publication_calls, 1);
             assert_eq!(
                 fault.submitted_manifest_digest, fault.observed_manifest_digest,
                 "the nonzero regression keeps the independently frozen physical digest exact"
@@ -52655,12 +52708,23 @@ pub(crate) mod tests {
                 .failure_cleanup_permanent_authority
                 .as_ref()
                 .expect("the accepted residual retains the exact Core/physical pair");
-            let _core_owner = &pair.core;
+            assert_eq!(pair.core.request(), request);
+            assert_eq!(
+                pair.physical.physical().witness_address(),
+                fault.physical_witness_address.unwrap(),
+                "accepted fail-close must retain the original non-Clone physical payload"
+            );
             assert!(
                 !pair.physical.physical().branch.frames().is_empty(),
                 "the authority residual must retain the same nonzero failed branch"
             );
-            let _prepared_ledger = &pair.physical.physical().reserved;
+            let ledger = pair.physical.physical().reserved.projection();
+            assert_eq!(
+                ledger.manifest_digest(),
+                fault.submitted_manifest_digest.unwrap()
+            );
+            assert!(ledger.obligation_count() > 0);
+            assert_eq!(ledger.receipt_count(), 0);
             assert!(entry.failure_cleanup_permanent.is_none());
             assert!(entry.pending_failed_branch.is_none());
             assert!(entry.cleanup_ledger.is_none());
@@ -52687,6 +52751,7 @@ pub(crate) mod tests {
             (1, 1),
             "the bounded nonzero authority result must not reprepare on later ticks"
         );
+        assert_eq!(fault.authority_publication_calls, 1);
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
         let residual = entry
             .authority_protocol_residual
@@ -52696,6 +52761,185 @@ pub(crate) mod tests {
         assert!(entry.failure_cleanup_permanent.is_none());
         assert!(entry.pending_failed_branch.is_none());
         assert!(entry.cleanup_ledger.is_none());
+        assert_eq!(
+            entry.engine.request(request).unwrap().trace().len(),
+            stable_trace_len
+        );
+    }
+
+    #[test]
+    fn failure_cleanup_nonzero_permanent_rejection_restores_exact_pair_stable_inert() {
+        let mut app = App::new();
+        let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+        let (submitted_logical_root, failed_frames, failed_claims, host_before, active_before) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let failed = entry
+                .pending_failed_branch
+                .as_ref()
+                .expect("the real stale child failure retains its cleanup owner");
+            let task = match &failed.terminal {
+                PendingFailedBranchTerminal::Task { task, .. } => task,
+                _ => panic!("the stale child fixture must retain its exact report task"),
+            };
+            let failed_frames = failed
+                .branch
+                .frames()
+                .iter()
+                .map(|frame| frame.frame().clone())
+                .collect::<Vec<_>>();
+            let failed_claims = failed_branch_primary_claims(&failed.branch)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let host = ProjectionlessHostProjection::from(
+                entry
+                    .host
+                    .as_ref()
+                    .expect("the rejection fixture has a live host"),
+            );
+            let active = entry.active.as_ref().map(|active| {
+                (
+                    active
+                        .frames()
+                        .iter()
+                        .map(|frame| frame.frame().clone())
+                        .collect::<Vec<_>>(),
+                    active.claims().cloned().collect::<Vec<_>>(),
+                )
+            });
+            (
+                task.frame().clone(),
+                failed_frames,
+                failed_claims,
+                host,
+                active,
+            )
+        };
+        app.world_mut()
+            .insert_resource(FailureCleanupPermanentZeroBindMismatch {
+                request,
+                submitted_logical_root,
+                observed_manifest_digest_xor: 0,
+                permanent_prepare_calls: 0,
+                observed_physical_digest_freezes: 0,
+                submitted_manifest_digest: None,
+                observed_manifest_digest: None,
+                physical_witness_address: None,
+                authority_publication_calls: 0,
+            });
+        assert!(
+            app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+                .engine
+                .testing_replace_host_admission_with_non_owning_issuer()
+        );
+
+        settle_cleanup_system(app.world_mut());
+
+        let stable_trace_len = {
+            let fault = app
+                .world()
+                .resource::<FailureCleanupPermanentZeroBindMismatch>();
+            assert_eq!(fault.permanent_prepare_calls, 1);
+            assert_eq!(fault.observed_physical_digest_freezes, 1);
+            assert_eq!(fault.authority_publication_calls, 0);
+            let witness_address = fault.physical_witness_address.unwrap();
+            let manifest_digest = fault.submitted_manifest_digest.unwrap();
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let FailureCleanupPermanentStableInertOwner::AuthorityRejected(pair) = entry
+                .failure_cleanup_permanent
+                .as_ref()
+                .expect("rejected fail-close retains the exact R1 pair")
+            else {
+                panic!("the non-owning issuer must reject the R1 authority publication")
+            };
+            assert_eq!(pair.core.request(), request);
+            let physical = pair.physical.physical();
+            assert_eq!(physical.witness_address(), witness_address);
+            assert_eq!(
+                physical
+                    .branch
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                failed_frames
+            );
+            assert_eq!(
+                failed_branch_primary_claims(&physical.branch)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                failed_claims
+            );
+            let ledger = physical.reserved.projection();
+            assert_eq!(ledger.manifest_digest(), manifest_digest);
+            assert!(ledger.obligation_count() > 0);
+            assert_eq!(ledger.receipt_count(), 0);
+            assert_eq!(
+                ProjectionlessHostProjection::from(
+                    entry
+                        .host
+                        .as_ref()
+                        .expect("rejection restores the exact host")
+                ),
+                host_before
+            );
+            assert_eq!(
+                entry.active.as_ref().map(|active| {
+                    (
+                        active
+                            .frames()
+                            .iter()
+                            .map(|frame| frame.frame().clone())
+                            .collect::<Vec<_>>(),
+                        active.claims().cloned().collect::<Vec<_>>(),
+                    )
+                }),
+                active_before
+            );
+            assert!(entry.authority_protocol_residual.is_none());
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Running(NavigationPhase::CleanupPending)
+            ));
+            let request_snapshot = entry.engine.request(request).unwrap();
+            assert!(
+                request_snapshot
+                    .trace()
+                    .iter()
+                    .all(|event| event.kind() != NavigationTraceEventKind::RequestTerminal)
+            );
+            request_snapshot.trace().len()
+        };
+
+        for _ in 0..3 {
+            settle_cleanup_system(app.world_mut());
+        }
+
+        let fault = app
+            .world()
+            .resource::<FailureCleanupPermanentZeroBindMismatch>();
+        assert_eq!(
+            (
+                fault.permanent_prepare_calls,
+                fault.observed_physical_digest_freezes,
+                fault.authority_publication_calls,
+            ),
+            (1, 1, 0)
+        );
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let Some(FailureCleanupPermanentStableInertOwner::AuthorityRejected(pair)) =
+            entry.failure_cleanup_permanent.as_ref()
+        else {
+            panic!("later ticks retain the rejected exact R1 pair")
+        };
+        assert_eq!(pair.core.request(), request);
+        assert_eq!(
+            pair.physical.physical().witness_address(),
+            fault.physical_witness_address.unwrap()
+        );
         assert_eq!(
             entry.engine.request(request).unwrap().trace().len(),
             stable_trace_len

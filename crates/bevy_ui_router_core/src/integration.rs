@@ -843,9 +843,20 @@ pub enum FailureCleanupPrepareOutcome {
     Permanent(PermanentFailureCleanup),
 }
 
-struct BoundFailureCleanupPhysical<Physical> {
+#[doc(hidden)]
+pub struct FailureCleanupPhysicalBinding<Physical> {
     physical: Physical,
     observed: CoreFailureCleanupZeroPhysicalProjection,
+}
+
+impl<Physical> FailureCleanupPhysicalBinding<Physical> {
+    pub fn request(&self) -> NavigationRequestId {
+        self.observed.receiver.request()
+    }
+
+    pub fn physical(&self) -> &Physical {
+        &self.physical
+    }
 }
 
 #[doc(hidden)]
@@ -864,7 +875,7 @@ impl<Physical> PreparedFailureCleanupPhysical<Physical> {
 pub struct FailureCleanupPhysicalPrepareMismatch<Physical> {
     request: FailureCleanupRequest,
     evidence: FailureCleanupReceiverMismatchView,
-    physical: BoundFailureCleanupPhysical<Physical>,
+    physical: FailureCleanupPhysicalBinding<Physical>,
 }
 
 impl<Physical> FailureCleanupPhysicalPrepareMismatch<Physical> {
@@ -872,20 +883,24 @@ impl<Physical> FailureCleanupPhysicalPrepareMismatch<Physical> {
         &self.physical.physical
     }
 
+    pub fn bound_request(&self) -> NavigationRequestId {
+        self.physical.request()
+    }
+
     pub fn into_parts(
         self,
     ) -> (
         FailureCleanupRequest,
         FailureCleanupReceiverMismatchView,
-        Physical,
+        FailureCleanupPhysicalBinding<Physical>,
     ) {
-        (self.request, self.evidence, self.physical.physical)
+        (self.request, self.evidence, self.physical)
     }
 }
 
 #[doc(hidden)]
 pub struct FailureCleanupPermanentOwner<Physical> {
-    inner: CoreFailureCleanupPermanentHolder<BoundFailureCleanupPhysical<Physical>>,
+    inner: CoreFailureCleanupPermanentHolder<FailureCleanupPhysicalBinding<Physical>>,
 }
 
 impl<Physical> FailureCleanupPermanentOwner<Physical> {
@@ -910,14 +925,58 @@ pub struct FailureCleanupZeroPhysicalMismatchView {
     inner: CoreFailureCleanupZeroPhysicalMismatchProjection,
 }
 
+impl FailureCleanupZeroPhysicalMismatchView {
+    pub fn source_request(&self) -> NavigationRequestId {
+        self.inner.source.request()
+    }
+
+    pub fn expected_request(&self) -> NavigationRequestId {
+        self.inner.expected.receiver.request()
+    }
+
+    pub fn observed_request(&self) -> NavigationRequestId {
+        self.inner.observed.receiver.request()
+    }
+
+    pub fn source_matches_expected_receiver(&self) -> bool {
+        self.inner.source == self.inner.expected.receiver
+    }
+
+    pub fn source_matches_observed_receiver(&self) -> bool {
+        self.inner.source == self.inner.observed.receiver
+    }
+
+    pub fn expected_manifest_digest_matches(&self, manifest_digest: u64) -> bool {
+        self.inner.expected.manifest_digest == CleanupManifestDigest::from_opaque(manifest_digest)
+    }
+
+    pub fn observed_manifest_digest_matches(&self, manifest_digest: u64) -> bool {
+        self.inner.observed.manifest_digest == CleanupManifestDigest::from_opaque(manifest_digest)
+    }
+
+    pub fn expected_obligation_count(&self) -> usize {
+        self.inner.expected.obligation_count
+    }
+
+    pub fn observed_obligation_count(&self) -> usize {
+        self.inner.observed.obligation_count
+    }
+}
+
 #[doc(hidden)]
 pub struct FailureCleanupPermanentAuthorityOwner {
     inner: CoreFailureCleanupPermanentAuthorityOwner,
 }
 
+impl FailureCleanupPermanentAuthorityOwner {
+    pub fn request(&self) -> NavigationRequestId {
+        self.inner.request()
+    }
+}
+
 #[doc(hidden)]
 pub struct FailureCleanupPermanentAuthorityPhysical<Physical> {
-    inner: BoundFailureCleanupPhysical<Physical>,
+    inner: FailureCleanupPhysicalBinding<Physical>,
 }
 
 impl<Physical> FailureCleanupPermanentAuthorityPhysical<Physical> {
@@ -928,7 +987,7 @@ impl<Physical> FailureCleanupPermanentAuthorityPhysical<Physical> {
 
 #[doc(hidden)]
 pub struct PreparedFailureCleanupZeroPhysical<Physical> {
-    inner: CorePreparedFailureCleanupZeroPhysical<BoundFailureCleanupPhysical<Physical>>,
+    inner: CorePreparedFailureCleanupZeroPhysical<FailureCleanupPhysicalBinding<Physical>>,
 }
 
 impl<Physical> PreparedFailureCleanupZeroPhysical<Physical> {
@@ -4116,18 +4175,37 @@ impl RouterEngine {
     }
 
     #[doc(hidden)]
+    pub fn bind_failure_cleanup_physical<Physical>(
+        &self,
+        request: &FailureCleanupRequest,
+        observed: CleanupManifest,
+        physical: Physical,
+    ) -> FailureCleanupPhysicalBinding<Physical> {
+        FailureCleanupPhysicalBinding {
+            physical,
+            observed: request.inner.freeze_zero_physical_projection(
+                CleanupManifestDigest::from_opaque(observed.manifest_digest),
+                observed.obligation_count,
+            ),
+        }
+    }
+
+    #[doc(hidden)]
     pub fn prepare_failure_cleanup_with_physical<Physical>(
         &mut self,
         request: FailureCleanupRequest,
         manifest: CleanupManifest,
-        observed: CleanupManifestView,
-        physical: Physical,
+        physical: FailureCleanupPhysicalBinding<Physical>,
     ) -> FailureCleanupPhysicalPrepareOutcome<Physical> {
-        let observed = request.inner.freeze_zero_physical_projection(
-            CleanupManifestDigest::from_opaque(observed.manifest_digest),
-            observed.obligation_count,
-        );
-        let bound = BoundFailureCleanupPhysical { physical, observed };
+        if let Some(evidence) = request.inner.physical_receiver_mismatch(&physical.observed) {
+            return FailureCleanupPhysicalPrepareOutcome::Mismatch(
+                FailureCleanupPhysicalPrepareMismatch {
+                    request,
+                    evidence: FailureCleanupReceiverMismatchView { inner: evidence },
+                    physical,
+                },
+            );
+        }
         let manifest_digest = manifest.manifest_digest;
         let obligation_count = manifest.obligation_count;
         match self.inner.prepare_failure_cleanup_retaining(
@@ -4145,7 +4223,7 @@ impl RouterEngine {
                         manifest_digest,
                         obligation_count,
                     },
-                    physical: bound.physical,
+                    physical: physical.physical,
                 })
             }
             CoreFailureCleanupPrepareOutcome::Mismatch { request, evidence } => {
@@ -4153,7 +4231,7 @@ impl RouterEngine {
                     FailureCleanupPhysicalPrepareMismatch {
                         request: FailureCleanupRequest { inner: request },
                         evidence: FailureCleanupReceiverMismatchView { inner: evidence },
-                        physical: bound,
+                        physical,
                     },
                 )
             }
@@ -4161,7 +4239,7 @@ impl RouterEngine {
                 FailureCleanupPhysicalPrepareOutcome::Permanent(FailureCleanupPermanentOwner {
                     inner: CoreFailureCleanupPermanentHolder {
                         request,
-                        physical: bound,
+                        physical,
                         evidence,
                     },
                 })
@@ -6609,6 +6687,79 @@ mod tests {
         let (retained, _) = mismatch.into_parts();
         assert_eq!(retained.request(), request);
         assert_eq!(retained.logical_roots(), roots);
+        assert_eq!(receiver.snapshot(), before);
+    }
+
+    #[test]
+    fn prebound_failure_cleanup_physical_rejects_crossed_request_and_returns_exact_owners() {
+        let mut source = confirmed_nested_engine();
+        source.push(RouteLocation::new("/items/1")).unwrap();
+        source.collect();
+        let EngineAction::FrameTask(source_parent) = source.action().unwrap() else {
+            panic!("source parent task expected")
+        };
+        source
+            .report_applied_with_outlets(source_parent, Vec::new())
+            .unwrap();
+        let EngineAction::MountRequest(source_mount) = source.action().unwrap() else {
+            panic!("source mount request expected")
+        };
+        let source_failure = source
+            .reject_mount(source_mount, MountRejectionKind::MissingOutlet)
+            .unwrap();
+        let source_request = source_failure.request();
+        let source_roots = source_failure.logical_roots().to_vec();
+        let source_before = source.snapshot();
+        let physical = Box::new(0xA5_u8);
+        let physical_address = (&*physical as *const u8) as usize;
+        let bound = source.bind_failure_cleanup_physical(
+            &source_failure,
+            CleanupManifest::new(source_roots, 0xC201, 1),
+            physical,
+        );
+        assert_eq!(source.snapshot(), source_before);
+
+        let mut receiver = confirmed_nested_engine();
+        receiver.push(RouteLocation::new("/items/1")).unwrap();
+        receiver.collect();
+        let EngineAction::FrameTask(receiver_parent) = receiver.action().unwrap() else {
+            panic!("receiver parent task expected")
+        };
+        receiver
+            .report_applied_with_outlets(receiver_parent, Vec::new())
+            .unwrap();
+        let EngineAction::MountRequest(receiver_mount) = receiver.action().unwrap() else {
+            panic!("receiver mount request expected")
+        };
+        let receiver_failure = receiver
+            .reject_mount(receiver_mount, MountRejectionKind::MissingOutlet)
+            .unwrap();
+        let receiver_request = receiver_failure.request();
+        let receiver_roots = receiver_failure.logical_roots().to_vec();
+        let before = receiver.snapshot();
+
+        let mismatch = match receiver.prepare_failure_cleanup_with_physical(
+            receiver_failure,
+            CleanupManifest::new(receiver_roots.clone(), 0xC202, 1),
+            bound,
+        ) {
+            FailureCleanupPhysicalPrepareOutcome::Mismatch(mismatch) => mismatch,
+            FailureCleanupPhysicalPrepareOutcome::Prepared(_)
+            | FailureCleanupPhysicalPrepareOutcome::Permanent(_) => {
+                panic!("a request-A physical binding must reject request B")
+            }
+        };
+        assert_ne!(source_request, receiver_request);
+        assert_eq!(mismatch.bound_request(), source_request);
+        let (retained, evidence, physical) = mismatch.into_parts();
+        assert_eq!(retained.request(), receiver_request);
+        assert_eq!(retained.logical_roots(), receiver_roots);
+        assert_eq!(evidence.kind(), IntegrationError::ForeignRouter);
+        assert_eq!(physical.request(), source_request);
+        assert_eq!(
+            (&**physical.physical() as *const u8) as usize,
+            physical_address
+        );
         assert_eq!(receiver.snapshot(), before);
     }
 
