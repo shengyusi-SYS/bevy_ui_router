@@ -14,8 +14,9 @@ use bevy_ui_router_core::{
     frame::RouteFrameVersion,
     ids::RouteSlotId,
     integration::{
-        FailureCleanupRequest, MountGrant, MountReceiptProof, MountRegistrationBeginError,
-        MountRegistrationPermit, RouterEngine, mount_grant_matches_target,
+        FailureCleanupPrepareOutcome, FailureCleanupRequest, MountGrant, MountReceiptProof,
+        MountRegistrationBeginError, MountRegistrationPermit, RouterEngine,
+        mount_grant_matches_target,
     },
     slot::RouteSlotKey,
 };
@@ -2497,23 +2498,41 @@ pub(crate) mod tests {
         let cleanup_request = engine
             .reject_mount_after_mutation(MountMutationArtifact::Grant(grant))
             .unwrap();
-        let cleanup = engine
-            .prepare_failure_cleanup_retaining(
-                cleanup_request,
-                CleanupManifest::new(vec![parent.frame().clone()], 701, 1),
-            )
-            .unwrap();
+        let cleanup = match engine.prepare_failure_cleanup_retaining(
+            cleanup_request,
+            CleanupManifest::new(vec![parent.frame().clone()], 701, 1),
+        ) {
+            FailureCleanupPrepareOutcome::Prepared(cleanup) => cleanup,
+            FailureCleanupPrepareOutcome::Mismatch(_)
+            | FailureCleanupPrepareOutcome::Permanent(_) => {
+                panic!("exact failed mount cleanup must prepare")
+            }
+        };
         engine.complete_cleanup(cleanup.complete(709, 1)).unwrap();
         let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
             panic!("failed mount cleanup must continue through RouterFallback")
         };
         assert_eq!(fallback.frame().origin(), &FrameOrigin::RouterFallback);
-        engine
+        let recovery_failure = engine
             .report_failed(
                 fallback,
                 ViewFailureKind::Build,
                 "fixture finishes fallback before checking the next mount identity",
             )
+            .unwrap()
+            .expect("fallback failure must retain cleanup authority before terminal");
+        let recovery_cleanup = match engine.prepare_failure_cleanup_retaining(
+            recovery_failure,
+            CleanupManifest::new(Vec::new(), 0x4D4F_554E, 0),
+        ) {
+            FailureCleanupPrepareOutcome::Prepared(cleanup) => cleanup,
+            FailureCleanupPrepareOutcome::Mismatch(_)
+            | FailureCleanupPrepareOutcome::Permanent(_) => {
+                panic!("exact fallback cleanup must prepare")
+            }
+        };
+        engine
+            .complete_cleanup(recovery_cleanup.complete_empty())
             .unwrap();
         engine.push(RouteLocation::new("/items/2")).unwrap();
         engine.collect();
@@ -3368,12 +3387,16 @@ pub(crate) mod tests {
             .expect("failed mount cleanup must reserve its receipt ledger");
         let request_id = request.request();
         let logical_roots = request.logical_roots().to_vec();
-        let cleanup = engine
-            .prepare_failure_cleanup_retaining(
-                request,
-                CleanupManifest::new(logical_roots, manifest_digest, obligation_count),
-            )
-            .unwrap();
+        let cleanup = match engine.prepare_failure_cleanup_retaining(
+            request,
+            CleanupManifest::new(logical_roots, manifest_digest, obligation_count),
+        ) {
+            FailureCleanupPrepareOutcome::Prepared(cleanup) => cleanup,
+            FailureCleanupPrepareOutcome::Mismatch(_)
+            | FailureCleanupPrepareOutcome::Permanent(_) => {
+                panic!("exact failed mount cleanup must prepare")
+            }
+        };
         let mut ledger =
             crate::cleanup::CleanupLedger::activate_failed(reserved.bind_batch(cleanup), failed);
         let attempt = ledger.attempt(world).unwrap();
@@ -3399,12 +3422,26 @@ pub(crate) mod tests {
                     panic!("ordinary failed mount cleanup must continue through RouterFallback")
                 };
                 assert_eq!(fallback.frame().origin(), &FrameOrigin::RouterFallback);
-                engine
+                let recovery_failure = engine
                     .report_failed(
                         fallback,
                         ViewFailureKind::Build,
                         "mount cleanup fixture finishes its RouterFallback attempt",
                     )
+                    .unwrap()
+                    .expect("fallback failure must retain cleanup authority before terminal");
+                let recovery_cleanup = match engine.prepare_failure_cleanup_retaining(
+                    recovery_failure,
+                    CleanupManifest::new(Vec::new(), 0x4D4F_554F, 0),
+                ) {
+                    FailureCleanupPrepareOutcome::Prepared(cleanup) => cleanup,
+                    FailureCleanupPrepareOutcome::Mismatch(_)
+                    | FailureCleanupPrepareOutcome::Permanent(_) => {
+                        panic!("exact fallback cleanup must prepare")
+                    }
+                };
+                engine
+                    .complete_cleanup(recovery_cleanup.complete_empty())
                     .unwrap();
             }
             RequestStatus::Failed(_) => assert!(engine.action().is_none()),

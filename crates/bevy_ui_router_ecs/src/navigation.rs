@@ -37,13 +37,13 @@ use bevy_ui_router_core::{
         CleanupManifest, CleanupManifestView, CommitTicket, EngineAction, EnqueueBackErrorKind,
         FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError,
         FailureCleanupCompletionOwner, FailureCleanupCompletionPreparationMismatchView,
-        FailureCleanupCompletionReceiverMismatchView, FailureCleanupRequest, FrameMountTarget,
-        HistoryAdmissionStamp, HistoryAdmissionWorldSeal, HistoryExecutionBindingView, HostLease,
-        IntegrationError, LifecycleContinuationCapacity, MountMutationArtifact, MountReceiptProof,
-        MountRegistrationBeginError, MountRequest, PreparationBoundaryScopeView,
-        PreparationReceiverMismatchView, PrepareBackAdmissionErrorKind,
-        PreparedPostCommitContinuationOwner, ResolveMountOwner, RootFrameTask,
-        RouteFailureContinuationOwner, RouterEngine, TargetAuthoritySettlementOwner,
+        FailureCleanupCompletionReceiverMismatchView, FailureCleanupPrepareOutcome,
+        FailureCleanupRequest, FrameMountTarget, HistoryAdmissionStamp, HistoryAdmissionWorldSeal,
+        HistoryExecutionBindingView, HostLease, IntegrationError, LifecycleContinuationCapacity,
+        MountMutationArtifact, MountReceiptProof, MountRegistrationBeginError, MountRequest,
+        PreparationBoundaryScopeView, PreparationReceiverMismatchView,
+        PrepareBackAdmissionErrorKind, PreparedPostCommitContinuationOwner, ResolveMountOwner,
+        RootFrameTask, RouteFailureContinuationOwner, RouterEngine, TargetAuthoritySettlementOwner,
         VerifiedBackNoTargetCandidate, VerifiedBackResolutionContradiction,
         VerifiedBackResolutionOwnerHandoff, VerifiedBackTargetExecutionOwner, ViewFailureKind,
         ViewReportIdentity,
@@ -6053,10 +6053,18 @@ fn complete_zero_physical_failure(
         request,
         CleanupManifest::new(logical_roots, manifest_digest, 0),
     ) {
-        Ok(cleanup) => cleanup,
-        Err(error) => {
+        FailureCleanupPrepareOutcome::Prepared(cleanup) => cleanup,
+        FailureCleanupPrepareOutcome::Mismatch(mismatch) => {
+            let (request, _evidence) = mismatch.into_parts();
             return Err(PendingFailedBranch {
-                terminal: PendingFailedBranchTerminal::Request(error.into_owner()),
+                terminal: PendingFailedBranchTerminal::Request(request),
+                branch,
+            });
+        }
+        FailureCleanupPrepareOutcome::Permanent(permanent) => {
+            let (request, _evidence) = permanent.into_parts();
+            return Err(PendingFailedBranch {
+                terminal: PendingFailedBranchTerminal::Request(request),
                 branch,
             });
         }
@@ -17861,9 +17869,26 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                             obligation_count,
                         ),
                     ) {
-                        Ok(cleanup) => cleanup,
-                        Err(error) => {
-                            let request = error.into_owner();
+                        FailureCleanupPrepareOutcome::Prepared(cleanup) => cleanup,
+                        FailureCleanupPrepareOutcome::Mismatch(mismatch) => {
+                            let (request, _evidence) = mismatch.into_parts();
+                            let terminal = match preflight_evidence {
+                                Some(evidence) => {
+                                    PendingFailedBranchTerminal::BackTargetPendingRejected {
+                                        request,
+                                        evidence,
+                                    }
+                                }
+                                None => PendingFailedBranchTerminal::Request(request),
+                            };
+                            entry.pending_failed_branch = Some(PendingFailedBranch {
+                                terminal,
+                                branch,
+                            });
+                            continue;
+                        }
+                        FailureCleanupPrepareOutcome::Permanent(permanent) => {
+                            let (request, _evidence) = permanent.into_parts();
                             let terminal = match preflight_evidence {
                                 Some(evidence) => {
                                     PendingFailedBranchTerminal::BackTargetPendingRejected {
@@ -50193,12 +50218,16 @@ pub(crate) mod tests {
             .report_failed(task, ViewFailureKind::Build, "foreign fixture failure")
             .unwrap()
             .expect("normal fixture failure must issue canonical cleanup");
-        let cleanup = engine
-            .prepare_failure_cleanup_retaining(
-                cleanup,
-                CleanupManifest::new(Vec::new(), 0x464f_5245, 0),
-            )
-            .unwrap();
+        let cleanup = match engine.prepare_failure_cleanup_retaining(
+            cleanup,
+            CleanupManifest::new(Vec::new(), 0x464f_5245, 0),
+        ) {
+            FailureCleanupPrepareOutcome::Prepared(cleanup) => cleanup,
+            FailureCleanupPrepareOutcome::Mismatch(_)
+            | FailureCleanupPrepareOutcome::Permanent(_) => {
+                panic!("foreign fallback fixture cleanup manifest must prepare")
+            }
+        };
         engine.complete_cleanup(cleanup.complete_empty()).unwrap();
         let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
             panic!("foreign engine must issue one fallback task")

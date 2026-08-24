@@ -66,6 +66,9 @@ use crate::engine::{
     FailureCleanupCompletionPrepareError as CoreFailureCleanupCompletionPrepareError,
     FailureCleanupCompletionReceiverMismatchProjection as CoreFailureCleanupCompletionReceiverMismatchProjection,
     FailureCleanupError as CoreFailureCleanupError,
+    FailureCleanupManifestContradictionProjection as CoreFailureCleanupManifestContradictionProjection,
+    FailureCleanupPrepareOutcome as CoreFailureCleanupPrepareOutcome,
+    FailureCleanupReceiverMismatchProjection as CoreFailureCleanupReceiverMismatchProjection,
     FailureCleanupRequest as CoreFailureCleanupRequest, FrameMountRequest as CoreFrameMountRequest,
     FrameMountTarget as CoreFrameMountTarget, FrameTask as CoreFrameTask,
     MountMutationArtifact as CoreMountMutationArtifact, PreparedPublication, PrivateRequestLookup,
@@ -763,6 +766,72 @@ impl FailureCleanupRequest {
     pub fn failure(&self) -> &NavigationFailure {
         self.inner.failure()
     }
+}
+
+#[doc(hidden)]
+pub struct FailureCleanupReceiverMismatchView {
+    inner: CoreFailureCleanupReceiverMismatchProjection,
+}
+
+impl FailureCleanupReceiverMismatchView {
+    pub fn kind(&self) -> IntegrationError {
+        map_failure_cleanup_error(self.inner.kind)
+    }
+}
+
+#[doc(hidden)]
+pub struct FailureCleanupManifestContradictionView {
+    inner: CoreFailureCleanupManifestContradictionProjection,
+}
+
+impl FailureCleanupManifestContradictionView {
+    pub const fn submitted_obligation_count(&self) -> usize {
+        self.inner.submitted_obligation_count
+    }
+
+    pub fn expected_logical_roots(&self) -> &[RouteFrameVersion] {
+        &self.inner.expected_logical_roots
+    }
+
+    pub fn observed_logical_roots(&self) -> &[RouteFrameVersion] {
+        &self.inner.observed_logical_roots
+    }
+}
+
+#[doc(hidden)]
+pub struct FailureCleanupPrepareMismatch {
+    request: FailureCleanupRequest,
+    evidence: FailureCleanupReceiverMismatchView,
+}
+
+impl FailureCleanupPrepareMismatch {
+    pub fn into_parts(self) -> (FailureCleanupRequest, FailureCleanupReceiverMismatchView) {
+        (self.request, self.evidence)
+    }
+}
+
+#[doc(hidden)]
+pub struct PermanentFailureCleanup {
+    request: FailureCleanupRequest,
+    evidence: FailureCleanupManifestContradictionView,
+}
+
+impl PermanentFailureCleanup {
+    pub fn into_parts(
+        self,
+    ) -> (
+        FailureCleanupRequest,
+        FailureCleanupManifestContradictionView,
+    ) {
+        (self.request, self.evidence)
+    }
+}
+
+#[doc(hidden)]
+pub enum FailureCleanupPrepareOutcome {
+    Prepared(CleanupBatch),
+    Mismatch(FailureCleanupPrepareMismatch),
+    Permanent(PermanentFailureCleanup),
 }
 
 #[doc(hidden)]
@@ -3861,8 +3930,11 @@ impl RouterEngine {
         request: FailureCleanupRequest,
         manifest: CleanupManifest,
     ) -> Result<CleanupBatch, IntegrationError> {
-        self.prepare_failure_cleanup_retaining(request, manifest)
-            .map_err(|error| error.kind())
+        match self.prepare_failure_cleanup_retaining(request, manifest) {
+            FailureCleanupPrepareOutcome::Prepared(batch) => Ok(batch),
+            FailureCleanupPrepareOutcome::Mismatch(mismatch) => Err(mismatch.evidence.kind()),
+            FailureCleanupPrepareOutcome::Permanent(_) => Err(IntegrationError::InvalidManifest),
+        }
     }
 
     #[doc(hidden)]
@@ -3870,30 +3942,37 @@ impl RouterEngine {
         &mut self,
         request: FailureCleanupRequest,
         manifest: CleanupManifest,
-    ) -> Result<CleanupBatch, PrepareFailureCleanupError> {
+    ) -> FailureCleanupPrepareOutcome {
         let manifest_digest = manifest.manifest_digest;
         let obligation_count = manifest.obligation_count;
-        let inner = self
-            .inner
-            .prepare_failure_cleanup_retaining(
-                request.inner,
-                CleanupManifestSeal::new(
-                    manifest.logical_roots,
-                    CleanupManifestDigest::from_opaque(manifest_digest),
+        match self.inner.prepare_failure_cleanup_retaining(
+            request.inner,
+            CleanupManifestSeal::new(
+                manifest.logical_roots,
+                CleanupManifestDigest::from_opaque(manifest_digest),
+                obligation_count,
+            ),
+        ) {
+            CoreFailureCleanupPrepareOutcome::Prepared(owner) => {
+                FailureCleanupPrepareOutcome::Prepared(CleanupBatch {
+                    inner: owner.into_token(),
+                    manifest_digest,
                     obligation_count,
-                ),
-            )
-            .map_err(|error| PrepareFailureCleanupError {
-                kind: map_failure_cleanup_error(error.kind()),
-                owner: FailureCleanupRequest {
-                    inner: error.into_owner(),
-                },
-            })?;
-        Ok(CleanupBatch {
-            inner,
-            manifest_digest,
-            obligation_count,
-        })
+                })
+            }
+            CoreFailureCleanupPrepareOutcome::Mismatch { request, evidence } => {
+                FailureCleanupPrepareOutcome::Mismatch(FailureCleanupPrepareMismatch {
+                    request: FailureCleanupRequest { inner: request },
+                    evidence: FailureCleanupReceiverMismatchView { inner: evidence },
+                })
+            }
+            CoreFailureCleanupPrepareOutcome::Permanent { request, evidence } => {
+                FailureCleanupPrepareOutcome::Permanent(PermanentFailureCleanup {
+                    request: FailureCleanupRequest { inner: request },
+                    evidence: FailureCleanupManifestContradictionView { inner: evidence },
+                })
+            }
+        }
     }
 
     pub fn prepare_commit(
@@ -5205,9 +5284,13 @@ mod tests {
             BeginAuthoritySettlementErrorKind::InvalidManifest
         );
 
-        engine
-            .prepare_failure_cleanup_retaining(cleanup, CleanupManifest::new(roots, 0xFA15, 1))
-            .expect("the caller still owns the consumable cleanup terminal");
+        assert!(matches!(
+            engine.prepare_failure_cleanup_retaining(
+                cleanup,
+                CleanupManifest::new(roots, 0xFA15, 1),
+            ),
+            FailureCleanupPrepareOutcome::Prepared(_)
+        ));
     }
 
     #[test]
@@ -6251,15 +6334,18 @@ mod tests {
 
         let mut receiver = confirmed_nested_engine();
         let before = receiver.snapshot();
-        let error = match receiver
+        let mismatch = match receiver
             .prepare_failure_cleanup_retaining(failure, CleanupManifest::new(roots.clone(), 229, 1))
         {
-            Err(error) => error,
-            Ok(_) => panic!("a foreign cleanup request must be retained"),
+            FailureCleanupPrepareOutcome::Mismatch(mismatch) => mismatch,
+            FailureCleanupPrepareOutcome::Prepared(_)
+            | FailureCleanupPrepareOutcome::Permanent(_) => {
+                panic!("a foreign cleanup request must be retained as receiver mismatch")
+            }
         };
 
-        assert_eq!(error.kind(), IntegrationError::ForeignRouter);
-        let retained = error.into_owner();
+        assert_eq!(mismatch.evidence.kind(), IntegrationError::ForeignRouter);
+        let (retained, _) = mismatch.into_parts();
         assert_eq!(retained.request(), request);
         assert_eq!(retained.logical_roots(), roots);
         assert_eq!(receiver.snapshot(), before);
@@ -6286,17 +6372,25 @@ mod tests {
         let roots = failure.logical_roots().to_vec();
         let before = engine.snapshot();
 
-        let error = match engine
+        let permanent = match engine
             .prepare_failure_cleanup_retaining(failure, CleanupManifest::new(Vec::new(), 237, 1))
         {
-            Err(error) => error,
-            Ok(_) => panic!("an invalid cleanup manifest must retain its request"),
+            FailureCleanupPrepareOutcome::Permanent(permanent) => permanent,
+            FailureCleanupPrepareOutcome::Prepared(_)
+            | FailureCleanupPrepareOutcome::Mismatch(_) => {
+                panic!("a logical-root contradiction must be permanently classified")
+            }
         };
 
-        assert_eq!(error.kind(), IntegrationError::InvalidManifest);
-        let retained = error.into_owner();
+        let PermanentFailureCleanup {
+            request: retained,
+            evidence,
+        } = permanent;
         assert_eq!(retained.request(), request);
         assert_eq!(retained.logical_roots(), roots);
+        assert_eq!(evidence.expected_logical_roots(), roots);
+        assert!(evidence.observed_logical_roots().is_empty());
+        assert_eq!(evidence.submitted_obligation_count(), 1);
         assert_eq!(engine.snapshot(), before);
     }
 

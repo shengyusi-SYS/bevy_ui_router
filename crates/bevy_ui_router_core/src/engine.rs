@@ -7,8 +7,11 @@ use crate::admission::{
     HostLease, RetiredHostAuthority, RetiredHostAuthorityProjection,
 };
 use crate::branch::{FrozenErrorViewBinding, MatchedBranch, MatchedRoute, RouteParams};
-use crate::cleanup::{CleanupBatchToken, CleanupCompletion, CleanupManifestSeal};
+use crate::cleanup::{
+    CleanupBatchToken, CleanupCompletion, CleanupManifestDigest, CleanupManifestSeal,
+};
 use crate::diagnostics::{DiagnosticEvent, ReportDisposition};
+use crate::fingerprint::{RouteBranchFingerprint, RouteBranchProvenance, RouteSearchFingerprint};
 use crate::frame::{
     FrameOrigin, LogicalChildSlotBinding, ProjectedChildSlotRoleKind, ProjectedEnteringSlot,
     ReconciliationProjectionError, RouteFrameVersion, RouteReconciliationProjection,
@@ -661,6 +664,245 @@ impl FailureCleanupRequest {
     pub(crate) const fn failure(&self) -> &NavigationFailure {
         &self.failure
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailureCleanupReceiverMismatchProjection {
+    pub(crate) kind: FailureCleanupError,
+    pub(crate) expected: FailureCleanupReceiverProjection,
+    pub(crate) observed_router: RouterIdentity,
+    pub(crate) observed: Option<FailureCleanupReceiverProjection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailureCleanupManifestContradictionProjection {
+    pub(crate) source: FailureCleanupReceiverProjection,
+    pub(crate) expected_logical_roots: Vec<RouteFrameVersion>,
+    pub(crate) observed_logical_roots: Vec<RouteFrameVersion>,
+    pub(crate) submitted_manifest_digest: CleanupManifestDigest,
+    pub(crate) submitted_obligation_count: usize,
+}
+
+pub(crate) struct CoreFailureCleanupBatchOwner {
+    token: CleanupBatchToken,
+}
+
+impl CoreFailureCleanupBatchOwner {
+    pub(crate) fn into_token(self) -> CleanupBatchToken {
+        self.token
+    }
+}
+
+pub(crate) enum FailureCleanupPrepareOutcome {
+    Prepared(CoreFailureCleanupBatchOwner),
+    Mismatch {
+        request: FailureCleanupRequest,
+        evidence: FailureCleanupReceiverMismatchProjection,
+    },
+    Permanent {
+        request: FailureCleanupRequest,
+        evidence: FailureCleanupManifestContradictionProjection,
+    },
+}
+
+pub(crate) struct FailureCleanupPermanentHolder<Physical> {
+    pub(crate) request: FailureCleanupRequest,
+    pub(crate) physical: Physical,
+    pub(crate) evidence: FailureCleanupManifestContradictionProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailureCleanupZeroPhysicalProjection {
+    pub(crate) receiver: FailureCleanupReceiverProjection,
+    pub(crate) manifest_digest: CleanupManifestDigest,
+    pub(crate) obligation_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailureCleanupZeroPhysicalMismatchProjection {
+    pub(crate) source: FailureCleanupReceiverProjection,
+    pub(crate) expected: FailureCleanupZeroPhysicalProjection,
+    pub(crate) observed: FailureCleanupZeroPhysicalProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailureCleanupZeroTerminalBindingProjection {
+    receiver: FailureCleanupReceiverProjection,
+    contradiction: FailureCleanupManifestContradictionProjection,
+    physical: FailureCleanupZeroPhysicalProjection,
+}
+
+pub(crate) struct PreparedFailureCleanupZeroPhysical<Physical> {
+    pub(crate) physical: Physical,
+    pub(crate) proof: FailureCleanupZeroPhysicalProjection,
+    binding: FailureCleanupZeroTerminalBindingProjection,
+}
+
+impl<Physical> PreparedFailureCleanupZeroPhysical<Physical> {
+    pub(crate) fn bind_zero(
+        physical: Physical,
+        expected: &FailureCleanupZeroTerminalBindingProjection,
+        observed: FailureCleanupZeroPhysicalProjection,
+    ) -> Result<Self, (Physical, FailureCleanupZeroPhysicalMismatchProjection)> {
+        if expected.physical == observed && observed.obligation_count == 0 {
+            Ok(Self {
+                physical,
+                proof: observed,
+                binding: expected.clone(),
+            })
+        } else {
+            Err((
+                physical,
+                FailureCleanupZeroPhysicalMismatchProjection {
+                    source: expected.receiver.clone(),
+                    expected: expected.physical.clone(),
+                    observed,
+                },
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailureCleanupTerminalProjection {
+    pub(crate) identity: RootTaskIdentity,
+    pub(crate) status: RequestStatus,
+    pub(crate) failure: NavigationFailure,
+    pub(crate) trace_digest: u64,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct FailureCleanupZeroTerminalSourceProjection {
+    records: VecDeque<NavigationRequestRecord>,
+    queue: Vec<NavigationRequestId>,
+    state: RouterNavigationState,
+    evicted_through: Option<u64>,
+    issued_view_tasks: Vec<FrameTaskIdentity>,
+    report_dispositions: Vec<ReportDispositionRecord>,
+    completed_cleanup: Vec<CompletedCleanupTombstone>,
+    current: Option<FailureCleanupZeroTerminalCurrentProjection>,
+    action_present: bool,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct FailureCleanupZeroTerminalBranchProjection {
+    routes: Vec<MatchedRoute>,
+    provenance: RouteBranchProvenance,
+    search_fingerprint: RouteSearchFingerprint,
+    branch_fingerprint: RouteBranchFingerprint,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FailureCleanupZeroTerminalPendingMountProjection {
+    child_index: usize,
+    parent: RouteFrameVersion,
+    outlet: RouteSlotKey,
+    from_preserved_parent: bool,
+    transaction: TransactionId,
+    reserved: ReservedFrameAttempt,
+    kind: PendingMountKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FailureCleanupZeroTerminalBoundErrorProjection {
+    binding: FrozenErrorViewBinding,
+    matched: MatchedRoute,
+    active_child_slots: Vec<LogicalChildSlotBinding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FailureCleanupZeroTerminalAttemptProjection {
+    Normal(NavigationCommandKind),
+    Fallback {
+        original_failure: NavigationFailure,
+        bound_error: Option<FailureCleanupZeroTerminalBoundErrorProjection>,
+    },
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct FailureCleanupZeroTerminalCurrentProjection {
+    identity: FrameTaskIdentity,
+    branch: Option<FailureCleanupZeroTerminalBranchProjection>,
+    location: RouteLocation,
+    reservation: Vec<ReservedFrameAttempt>,
+    target_frames: Vec<RouteFrameVersion>,
+    applied_frames: Vec<RouteFrameVersion>,
+    current_target: FrameMountTarget,
+    pending_mount: Option<FailureCleanupZeroTerminalPendingMountProjection>,
+    stage: WorkStageProjection,
+    cleanup_batch: CleanupBatchId,
+    cleanup_roots: Vec<RouteFrameVersion>,
+    attempt: FailureCleanupZeroTerminalAttemptProjection,
+    reconciliation: Option<RouteReconciliationProjection>,
+    retired_host: Option<RetiredHostAuthorityProjection>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct FailureCleanupZeroTerminalMismatchProjection {
+    expected: FailureCleanupZeroTerminalSourceProjection,
+    observed: FailureCleanupZeroTerminalSourceProjection,
+    expected_binding: FailureCleanupZeroTerminalBindingProjection,
+    observed_binding: FailureCleanupZeroTerminalBindingProjection,
+}
+
+struct PreparedFailureTerminal {
+    projection: FailureCleanupTerminalProjection,
+    records: VecDeque<NavigationRequestRecord>,
+    state: RouterNavigationState,
+    evicted_through: Option<u64>,
+    issued_view_tasks: Vec<FrameTaskIdentity>,
+    report_dispositions: Vec<ReportDispositionRecord>,
+    completed_cleanup: Vec<CompletedCleanupTombstone>,
+}
+
+pub(crate) struct FailureCleanupZeroTerminalOwner {
+    pub(crate) receiver: FailureCleanupReceiverProjection,
+    failure: NavigationFailure,
+    continuation: FailureCleanupContinuationOwner,
+    binding: FailureCleanupZeroTerminalBindingProjection,
+    source: FailureCleanupZeroTerminalSourceProjection,
+    terminal: PreparedFailureTerminal,
+}
+
+pub(crate) struct FailureCleanupPermanentAuthorityOwner {
+    request: FailureCleanupRequest,
+    evidence: FailureCleanupManifestContradictionProjection,
+}
+
+impl FailureCleanupPermanentAuthorityOwner {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        FailureCleanupRequest,
+        FailureCleanupManifestContradictionProjection,
+    ) {
+        (self.request, self.evidence)
+    }
+}
+
+pub(crate) enum FailureCleanupPermanentCoreOutcome<Physical> {
+    AuthoritySettlement {
+        physical: Physical,
+        owner: FailureCleanupPermanentAuthorityOwner,
+    },
+    ProvenZero {
+        zero: PreparedFailureCleanupZeroPhysical<Physical>,
+        owner: FailureCleanupZeroTerminalOwner,
+    },
+    ZeroMismatch {
+        holder: FailureCleanupPermanentHolder<Physical>,
+        evidence: FailureCleanupZeroPhysicalMismatchProjection,
+    },
+    Mismatch(FailureCleanupPermanentHolder<Physical>),
+}
+
+pub(crate) enum FailureCleanupZeroTerminalOutcome<Physical> {
+    Terminal(FailureCleanupTerminalProjection),
+    Mismatch {
+        zero: PreparedFailureCleanupZeroPhysical<Physical>,
+        owner: FailureCleanupZeroTerminalOwner,
+        evidence: FailureCleanupZeroTerminalMismatchProjection,
+    },
 }
 
 impl FrameMountRequest {
@@ -1667,6 +1909,7 @@ pub(crate) enum CoreBackTargetReceiverStageProjection {
     PostCommitCleanup,
     FailureCleanupManifestPending(FailureCleanupReceiverProjection),
     FailureCleanupPrepared,
+    FailureCleanupZeroTerminalPending(FailureCleanupReceiverProjection),
     FailureCleanupCompleting,
 }
 
@@ -2304,6 +2547,9 @@ enum WorkStage {
         failure: NavigationFailure,
         continuation: FailureCleanupContinuationOwner,
     },
+    FailureCleanupZeroTerminalPending {
+        expected: FailureCleanupZeroTerminalBindingProjection,
+    },
     FailureCleanupCompleting {
         outstanding: CleanupBatchToken,
     },
@@ -2323,6 +2569,7 @@ enum WorkStageProjection {
         outstanding: CleanupBatchToken,
         failure: NavigationFailure,
     },
+    FailureCleanupZeroTerminalPending(FailureCleanupZeroTerminalBindingProjection),
     FailureCleanupCompleting(CleanupBatchToken),
 }
 
@@ -2349,6 +2596,9 @@ impl WorkStage {
                 outstanding: outstanding.clone(),
                 failure: failure.clone(),
             },
+            Self::FailureCleanupZeroTerminalPending { expected } => {
+                WorkStageProjection::FailureCleanupZeroTerminalPending(expected.clone())
+            }
             Self::FailureCleanupCompleting { outstanding } => {
                 WorkStageProjection::FailureCleanupCompleting(outstanding.clone())
             }
@@ -2370,6 +2620,7 @@ impl WorkStage {
             }),
             Self::FailureCleanupManifestPending { .. }
             | Self::FailureCleanupPrepared { .. }
+            | Self::FailureCleanupZeroTerminalPending { .. }
             | Self::FailureCleanupCompleting { .. } => None,
         }
     }
@@ -2569,6 +2820,80 @@ struct PendingMount {
 enum PendingMountKind {
     Normal,
     BoundError,
+}
+
+impl From<&MatchedBranch> for FailureCleanupZeroTerminalBranchProjection {
+    fn from(branch: &MatchedBranch) -> Self {
+        Self {
+            routes: branch.routes().to_vec(),
+            provenance: branch.provenance().clone(),
+            search_fingerprint: branch.search_fingerprint().clone(),
+            branch_fingerprint: branch.branch_fingerprint().clone(),
+        }
+    }
+}
+
+impl From<&PendingMount> for FailureCleanupZeroTerminalPendingMountProjection {
+    fn from(pending: &PendingMount) -> Self {
+        Self {
+            child_index: pending.child_index,
+            parent: pending.parent.clone(),
+            outlet: pending.outlet.clone(),
+            from_preserved_parent: pending.from_preserved_parent,
+            transaction: pending.transaction,
+            reserved: pending.reserved,
+            kind: pending.kind,
+        }
+    }
+}
+
+impl From<&BoundErrorAttempt> for FailureCleanupZeroTerminalBoundErrorProjection {
+    fn from(bound_error: &BoundErrorAttempt) -> Self {
+        Self {
+            binding: bound_error.binding.clone(),
+            matched: bound_error.matched.clone(),
+            active_child_slots: bound_error.active_child_slots.clone(),
+        }
+    }
+}
+
+impl From<&AttemptKind> for FailureCleanupZeroTerminalAttemptProjection {
+    fn from(attempt: &AttemptKind) -> Self {
+        match attempt {
+            AttemptKind::Normal(kind) => Self::Normal(*kind),
+            AttemptKind::Fallback {
+                original_failure,
+                bound_error,
+            } => Self::Fallback {
+                original_failure: original_failure.clone(),
+                bound_error: bound_error.as_ref().map(Into::into),
+            },
+        }
+    }
+}
+
+impl From<&CurrentWork> for FailureCleanupZeroTerminalCurrentProjection {
+    fn from(current: &CurrentWork) -> Self {
+        Self {
+            identity: current.identity.clone(),
+            branch: current.branch.as_ref().map(Into::into),
+            location: current.location.clone(),
+            reservation: current.reservation.clone(),
+            target_frames: current.target_frames.clone(),
+            applied_frames: current.applied_frames.clone(),
+            current_target: current.current_target.clone(),
+            pending_mount: current.pending_mount.as_ref().map(Into::into),
+            stage: current.stage.projection(),
+            cleanup_batch: current.cleanup_batch,
+            cleanup_roots: current.cleanup_roots.clone(),
+            attempt: (&current.attempt).into(),
+            reconciliation: current.reconciliation.clone(),
+            retired_host: current
+                .retired_host
+                .as_ref()
+                .map(RetiredHostAuthority::projection),
+        }
+    }
 }
 
 struct ConfirmedChildPublication {
@@ -7467,47 +7792,72 @@ impl RouterEngine {
         request: FailureCleanupRequest,
         seal: CleanupManifestSeal,
     ) -> Result<CleanupBatchToken, FailureCleanupError> {
-        self.prepare_failure_cleanup_retaining(request, seal)
-            .map_err(|error| error.kind())
+        match self.prepare_failure_cleanup_retaining(request, seal) {
+            FailureCleanupPrepareOutcome::Prepared(owner) => Ok(owner.into_token()),
+            FailureCleanupPrepareOutcome::Mismatch { evidence, .. } => Err(evidence.kind),
+            FailureCleanupPrepareOutcome::Permanent { .. } => {
+                Err(FailureCleanupError::InvalidManifest)
+            }
+        }
     }
 
     pub(crate) fn prepare_failure_cleanup_retaining(
         &mut self,
         request: FailureCleanupRequest,
         seal: CleanupManifestSeal,
-    ) -> Result<CleanupBatchToken, FailureCleanupPrepareError> {
-        if request.receiver.identity.router_identity() != self.router {
-            return Err(FailureCleanupPrepareError::new(
-                FailureCleanupError::Foreign,
-                request,
-            ));
-        }
-        let Some(current) = self.current.as_ref() else {
-            return Err(FailureCleanupPrepareError::new(
-                FailureCleanupError::Stale,
-                request,
-            ));
+    ) -> FailureCleanupPrepareOutcome {
+        let observed = self
+            .current
+            .as_ref()
+            .and_then(|current| match &current.stage {
+                WorkStage::FailureCleanupManifestPending { expected } => Some(expected.clone()),
+                WorkStage::Applying
+                | WorkStage::AwaitingMount
+                | WorkStage::AwaitingReceipt
+                | WorkStage::ConfirmingMount
+                | WorkStage::ReadyToCommit
+                | WorkStage::CommitSealed { .. }
+                | WorkStage::PostCommitCleanup { .. }
+                | WorkStage::FailureCleanupPrepared { .. }
+                | WorkStage::FailureCleanupZeroTerminalPending { .. }
+                | WorkStage::FailureCleanupCompleting { .. } => None,
+            });
+        let mismatch_kind = if request.receiver.identity.router_identity() != self.router {
+            Some(FailureCleanupError::Foreign)
+        } else if observed.as_ref() != Some(&request.receiver) {
+            Some(FailureCleanupError::Stale)
+        } else {
+            None
         };
-        let valid_request = matches!(
-            &current.stage,
-            WorkStage::FailureCleanupManifestPending { expected } if expected == &request.receiver
-        );
-        if !valid_request {
-            return Err(FailureCleanupPrepareError::new(
-                FailureCleanupError::Stale,
+        if let Some(kind) = mismatch_kind {
+            let expected = request.receiver.clone();
+            return FailureCleanupPrepareOutcome::Mismatch {
                 request,
-            ));
+                evidence: FailureCleanupReceiverMismatchProjection {
+                    kind,
+                    expected,
+                    observed_router: self.router,
+                    observed,
+                },
+            };
         }
         if request.logical_roots() != seal.logical_roots() {
-            return Err(FailureCleanupPrepareError::new(
-                FailureCleanupError::InvalidManifest,
-                request,
-            ));
+            let evidence = FailureCleanupManifestContradictionProjection {
+                source: request.receiver.clone(),
+                expected_logical_roots: request.logical_roots().to_vec(),
+                observed_logical_roots: seal.logical_roots().to_vec(),
+                submitted_manifest_digest: seal.manifest_digest(),
+                submitted_obligation_count: seal.obligation_count(),
+            };
+            return FailureCleanupPrepareOutcome::Permanent { request, evidence };
         }
 
         let cleanup = CleanupBatchToken::sealed(
             request.receiver.identity.clone(),
-            current.cleanup_batch,
+            self.current
+                .as_ref()
+                .expect("failure cleanup receiver was preflighted")
+                .cleanup_batch,
             request.logical_roots(),
             seal.manifest_digest(),
             seal.obligation_count(),
@@ -7520,7 +7870,257 @@ impl RouterEngine {
             failure: request.failure,
             continuation: request.continuation,
         };
-        Ok(cleanup)
+        FailureCleanupPrepareOutcome::Prepared(CoreFailureCleanupBatchOwner { token: cleanup })
+    }
+
+    fn prepare_failure_cleanup_zero_terminal_plan(
+        &self,
+        request: &FailureCleanupRequest,
+    ) -> Option<PreparedFailureTerminal> {
+        if !matches!(
+            &request.continuation,
+            FailureCleanupContinuationOwner::Terminal
+        ) || request.failure.kind() != NavigationFailureKind::RecoveryFailed
+            || self.current_history_capability.is_some()
+            || self.pending_history_preparation_error.is_some()
+            || self.prepared_publication_authority.is_some()
+        {
+            return None;
+        }
+        let record_index = self
+            .records
+            .iter()
+            .position(|record| record.id() == request.request())?;
+        let mut records = self.records.clone();
+        let record = records.get_mut(record_index)?;
+        record
+            .transition(RequestStatus::Failed(request.failure.clone()))
+            .ok()?;
+        record
+            .append_trace(NavigationTraceEvent::request_terminal())
+            .ok()?;
+
+        let mut state = self.state.clone();
+        state.set_request(None);
+        let mut evicted_through = self.evicted_through;
+        let mut issued_view_tasks = self.issued_view_tasks.clone();
+        let mut report_dispositions = self.report_dispositions.clone();
+        let mut completed_cleanup = self.completed_cleanup.clone();
+        while records
+            .iter()
+            .filter(|record| is_terminal(record.status()))
+            .count()
+            > TERMINAL_RETENTION
+        {
+            let index = records
+                .iter()
+                .position(|record| is_terminal(record.status()))?;
+            let evicted = records.remove(index)?;
+            let evicted_request = evicted.id();
+            issued_view_tasks.retain(|identity| identity.request != evicted_request);
+            report_dispositions
+                .retain(|record| record.target != DiagnosticTarget::Request(evicted_request));
+            completed_cleanup.retain(|tombstone| tombstone.request != evicted_request);
+            let sequence = evicted_request.sequence();
+            evicted_through =
+                Some(evicted_through.map_or(sequence, |current| current.max(sequence)));
+        }
+        let terminal_record = records
+            .iter()
+            .find(|record| record.id() == request.request())?;
+        let projection = FailureCleanupTerminalProjection {
+            identity: request.receiver.identity.clone(),
+            status: terminal_record.status().clone(),
+            failure: request.failure.clone(),
+            trace_digest: terminal_record.trace().len() as u64,
+        };
+        Some(PreparedFailureTerminal {
+            projection,
+            records,
+            state,
+            evicted_through,
+            issued_view_tasks,
+            report_dispositions,
+            completed_cleanup,
+        })
+    }
+
+    fn failure_cleanup_zero_terminal_source_projection(
+        &self,
+    ) -> FailureCleanupZeroTerminalSourceProjection {
+        FailureCleanupZeroTerminalSourceProjection {
+            records: self.records.clone(),
+            queue: self.queue.iter().map(|queued| queued.request).collect(),
+            state: self.state.clone(),
+            evicted_through: self.evicted_through,
+            issued_view_tasks: self.issued_view_tasks.clone(),
+            report_dispositions: self.report_dispositions.clone(),
+            completed_cleanup: self.completed_cleanup.clone(),
+            current: self.current.as_ref().map(Into::into),
+            action_present: self.action.is_some(),
+        }
+    }
+
+    pub(crate) fn classify_failure_cleanup_permanent<Physical, BindZero>(
+        &mut self,
+        holder: FailureCleanupPermanentHolder<Physical>,
+        bind_zero: BindZero,
+    ) -> FailureCleanupPermanentCoreOutcome<Physical>
+    where
+        BindZero: FnOnce(
+            Physical,
+            &FailureCleanupZeroTerminalBindingProjection,
+        ) -> Result<
+            PreparedFailureCleanupZeroPhysical<Physical>,
+            (Physical, FailureCleanupZeroPhysicalMismatchProjection),
+        >,
+    {
+        let FailureCleanupPermanentHolder {
+            request,
+            physical,
+            evidence,
+        } = holder;
+        let receiver_is_exact = request.receiver == evidence.source
+            && request.logical_roots() == evidence.expected_logical_roots.as_slice()
+            && evidence.expected_logical_roots != evidence.observed_logical_roots
+            && self.current.as_ref().is_some_and(|current| {
+                current.identity == request.receiver.identity
+                    && matches!(
+                        &current.stage,
+                        WorkStage::FailureCleanupManifestPending { expected }
+                            if expected == &request.receiver
+                    )
+            });
+        if !receiver_is_exact {
+            return FailureCleanupPermanentCoreOutcome::Mismatch(FailureCleanupPermanentHolder {
+                request,
+                physical,
+                evidence,
+            });
+        }
+
+        let terminal = if evidence.submitted_obligation_count == 0 {
+            self.prepare_failure_cleanup_zero_terminal_plan(&request)
+        } else {
+            None
+        };
+        let Some(terminal) = terminal else {
+            return FailureCleanupPermanentCoreOutcome::AuthoritySettlement {
+                physical,
+                owner: FailureCleanupPermanentAuthorityOwner { request, evidence },
+            };
+        };
+        let expected_physical = FailureCleanupZeroPhysicalProjection {
+            receiver: request.receiver.clone(),
+            manifest_digest: evidence.submitted_manifest_digest,
+            obligation_count: evidence.submitted_obligation_count,
+        };
+        let binding = FailureCleanupZeroTerminalBindingProjection {
+            receiver: request.receiver.clone(),
+            contradiction: evidence.clone(),
+            physical: expected_physical,
+        };
+        let zero = match bind_zero(physical, &binding) {
+            Ok(zero) => zero,
+            Err((physical, mismatch)) => {
+                return FailureCleanupPermanentCoreOutcome::ZeroMismatch {
+                    holder: FailureCleanupPermanentHolder {
+                        request,
+                        physical,
+                        evidence,
+                    },
+                    evidence: mismatch,
+                };
+            }
+        };
+        let FailureCleanupRequest {
+            receiver,
+            failure,
+            continuation,
+        } = request;
+        self.current
+            .as_mut()
+            .expect("permanent failure cleanup receiver was preflighted")
+            .stage = WorkStage::FailureCleanupZeroTerminalPending {
+            expected: binding.clone(),
+        };
+        let source = self.failure_cleanup_zero_terminal_source_projection();
+        FailureCleanupPermanentCoreOutcome::ProvenZero {
+            zero,
+            owner: FailureCleanupZeroTerminalOwner {
+                receiver,
+                failure,
+                continuation,
+                binding,
+                source,
+                terminal,
+            },
+        }
+    }
+
+    pub(crate) fn complete_failure_cleanup_zero_terminal<Physical, ConsumeZero>(
+        &mut self,
+        owner: FailureCleanupZeroTerminalOwner,
+        zero: PreparedFailureCleanupZeroPhysical<Physical>,
+        consume_zero_and_clear_holder: ConsumeZero,
+    ) -> FailureCleanupZeroTerminalOutcome<Physical>
+    where
+        ConsumeZero: FnOnce(PreparedFailureCleanupZeroPhysical<Physical>),
+    {
+        let observed_source = self.failure_cleanup_zero_terminal_source_projection();
+        let exact = observed_source == owner.source
+            && owner.binding == zero.binding
+            && zero.proof == zero.binding.physical
+            && owner.receiver == owner.binding.receiver
+            && owner.receiver.identity.router_identity() == self.router
+            && matches!(
+                &owner.continuation,
+                FailureCleanupContinuationOwner::Terminal
+            )
+            && owner.failure.kind() == NavigationFailureKind::RecoveryFailed
+            && owner.terminal.projection.failure == owner.failure
+            && owner.terminal.projection.status == RequestStatus::Failed(owner.failure.clone());
+        if !exact {
+            let observed_binding = zero.binding.clone();
+            return FailureCleanupZeroTerminalOutcome::Mismatch {
+                zero,
+                evidence: FailureCleanupZeroTerminalMismatchProjection {
+                    expected: owner.source.clone(),
+                    observed: observed_source,
+                    expected_binding: owner.binding.clone(),
+                    observed_binding,
+                },
+                owner,
+            };
+        }
+
+        let FailureCleanupZeroTerminalOwner {
+            receiver: _,
+            failure: _,
+            continuation: _,
+            binding: _,
+            source: _,
+            terminal,
+        } = owner;
+        consume_zero_and_clear_holder(zero);
+        let PreparedFailureTerminal {
+            projection,
+            records,
+            state,
+            evicted_through,
+            issued_view_tasks,
+            report_dispositions,
+            completed_cleanup,
+        } = terminal;
+        self.records = records;
+        self.state = state;
+        self.evicted_through = evicted_through;
+        self.issued_view_tasks = issued_view_tasks;
+        self.report_dispositions = report_dispositions;
+        self.completed_cleanup = completed_cleanup;
+        self.current = None;
+        self.action = None;
+        FailureCleanupZeroTerminalOutcome::Terminal(projection)
     }
 
     pub(crate) fn begin_view_report<'a>(
@@ -7656,6 +8256,11 @@ impl RouterEngine {
             }
             Some(WorkStage::FailureCleanupPrepared { .. }) => {
                 CoreBackTargetReceiverStageProjection::FailureCleanupPrepared
+            }
+            Some(WorkStage::FailureCleanupZeroTerminalPending { expected }) => {
+                CoreBackTargetReceiverStageProjection::FailureCleanupZeroTerminalPending(
+                    expected.receiver.clone(),
+                )
             }
             Some(WorkStage::FailureCleanupCompleting { .. }) => {
                 CoreBackTargetReceiverStageProjection::FailureCleanupCompleting
@@ -9303,6 +9908,7 @@ impl RouterEngine {
                 | WorkStage::CommitSealed { .. }
                 | WorkStage::FailureCleanupManifestPending { .. }
                 | WorkStage::FailureCleanupPrepared { .. }
+                | WorkStage::FailureCleanupZeroTerminalPending { .. }
                 | WorkStage::FailureCleanupCompleting { .. } => None,
             });
         if !outstanding
@@ -9446,6 +10052,7 @@ impl RouterEngine {
                 | WorkStage::PostCommitCleanup { .. }
                 | WorkStage::FailureCleanupManifestPending { .. }
                 | WorkStage::FailureCleanupPrepared { .. }
+                | WorkStage::FailureCleanupZeroTerminalPending { .. }
                 | WorkStage::FailureCleanupCompleting { .. } => None,
             })
             .ok_or(CleanupError::Stale)?;
@@ -12303,7 +12910,6 @@ impl ViewReportSession<'_> {
     }
 
     pub(crate) fn failed(self, failure: NavigationFailure) -> Option<FailureCleanupRequest> {
-        let request = self.identity.request;
         let branch_index = self.identity.branch_index;
         let attempt = self
             .engine
@@ -12343,18 +12949,19 @@ impl ViewReportSession<'_> {
                 )
             }
             AttemptKind::Fallback { .. } => {
-                self.engine.retire_history_authority();
-                self.engine.current = None;
-                self.engine.action = None;
-                self.engine.fail_reserved_request(
-                    request,
+                let expected = match failure.kind() {
+                    NavigationFailureKind::Build => PendingFailureKind::Build,
+                    NavigationFailureKind::Apply => PendingFailureKind::Apply,
+                    _ => PendingFailureKind::Apply,
+                };
+                Some(self.engine.begin_failure_cleanup_with_continuation(
+                    expected,
                     NavigationFailure::new(
                         NavigationFailureKind::RecoveryFailed,
                         "router fallback failed",
                     ),
-                );
-                self.engine.start_next();
-                None
+                    FailureCleanupContinuationOwner::Terminal,
+                ))
             }
         }
     }
@@ -14429,13 +15036,18 @@ mod tests {
             panic!("replace match failure starts a fresh fallback attempt")
         };
         assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
-        engine
+        let recovery_failure = engine
             .begin_view_report(fallback.identity())
             .unwrap()
             .failed(NavigationFailure::new(
                 NavigationFailureKind::Build,
                 "replace match fallback failed",
-            ));
+            ))
+            .expect("fallback failure must retain cleanup authority before terminal");
+        let recovery_cleanup = prepare_failure_cleanup(&mut engine, recovery_failure, 0xA0E1, 0);
+        engine
+            .complete_cleanup(valid_completion(&recovery_cleanup))
+            .unwrap();
 
         assert!(matches!(
             engine.request(request).unwrap().status(),
@@ -14487,13 +15099,18 @@ mod tests {
             panic!("replace mount failure continues through a fresh fallback")
         };
         assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
-        engine
+        let recovery_failure = engine
             .begin_view_report(fallback.identity())
             .unwrap()
             .failed(NavigationFailure::new(
                 NavigationFailureKind::Build,
                 "replace mount fallback failed",
-            ));
+            ))
+            .expect("fallback failure must retain cleanup authority before terminal");
+        let recovery_cleanup = prepare_failure_cleanup(&mut engine, recovery_failure, 0xA0F2, 0);
+        engine
+            .complete_cleanup(valid_completion(&recovery_cleanup))
+            .unwrap();
 
         assert!(matches!(
             engine.request(request).unwrap().status(),
@@ -14548,13 +15165,23 @@ mod tests {
             original_matched.as_ref()
         );
 
-        engine
+        let recovery_failure = engine
             .begin_view_report(fallback.identity())
             .unwrap()
             .failed(NavigationFailure::new(
                 NavigationFailureKind::Build,
                 "fallback build rejected",
-            ));
+            ))
+            .expect("fallback failure must retain cleanup authority before terminal");
+
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::CleanupPending)
+        ));
+        let recovery_cleanup = prepare_failure_cleanup(&mut engine, recovery_failure, 0xB22, 0);
+        engine
+            .complete_cleanup(valid_completion(&recovery_cleanup))
+            .unwrap();
 
         assert_eq!(engine.active(), &old_active);
         assert_eq!(engine.history(), &old_history);
@@ -17292,13 +17919,22 @@ mod tests {
         let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
             panic!("failed request must issue fallback before advancing the queue")
         };
-        engine
+        let recovery_failure = engine
             .begin_view_report(fallback.identity())
             .unwrap()
             .failed(NavigationFailure::new(
                 NavigationFailureKind::Build,
                 "fallback build failed",
-            ));
+            ))
+            .expect("fallback failure must retain cleanup authority before terminal");
+        assert_eq!(
+            engine.request(next).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        let recovery_cleanup = prepare_failure_cleanup(&mut engine, recovery_failure, 0xB24, 0);
+        engine
+            .complete_cleanup(valid_completion(&recovery_cleanup))
+            .unwrap();
         assert!(matches!(
             engine.request(failed).unwrap().status(),
             RequestStatus::Failed(failure)
@@ -18678,6 +19314,738 @@ mod tests {
         fallback
     }
 
+    struct ZeroFailureCleanupPhysical<'a> {
+        owner_id: u64,
+        receiver: super::FailureCleanupReceiverProjection,
+        manifest_digest: CleanupManifestDigest,
+        obligation_count: usize,
+        drops: &'a std::cell::Cell<usize>,
+        panic_on_drop: &'a std::cell::Cell<bool>,
+    }
+
+    impl ZeroFailureCleanupPhysical<'_> {
+        fn observed_projection(&self) -> super::FailureCleanupZeroPhysicalProjection {
+            super::FailureCleanupZeroPhysicalProjection {
+                receiver: self.receiver.clone(),
+                manifest_digest: self.manifest_digest,
+                obligation_count: self.obligation_count,
+            }
+        }
+    }
+
+    impl Drop for ZeroFailureCleanupPhysical<'_> {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            assert!(
+                !self.panic_on_drop.get(),
+                "zero failure-cleanup physical consumption panicked"
+            );
+        }
+    }
+
+    fn permanent_zero_recovery_failure_fixture() -> (
+        RouterEngine,
+        crate::ids::NavigationRequestId,
+        crate::ids::NavigationRequestId,
+        super::FailureCleanupRequest,
+        super::FailureCleanupReceiverProjection,
+        RouteFrameVersion,
+    ) {
+        let mut engine = ready_engine();
+        let failed = engine.push(RouteLocation::new("/about")).unwrap();
+        let next = engine.enqueue_push(RouteLocation::new("/items/1")).unwrap();
+        let Some(EngineAction::FrameTask(normal)) = engine.action() else {
+            panic!("permanent-zero fixture requires one normal frame task")
+        };
+        let normal_failure = engine
+            .begin_view_report(normal.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "permanent-zero fixture normal apply failed",
+            ))
+            .expect("normal failure must clean up before RouterFallback");
+        let normal_cleanup = prepare_failure_cleanup(&mut engine, normal_failure, 0xA001, 0);
+        engine
+            .complete_cleanup(valid_completion(&normal_cleanup))
+            .unwrap();
+        let Some(EngineAction::FrameTask(fallback)) = engine.action() else {
+            panic!("normal cleanup must issue the RouterFallback recovery attempt")
+        };
+        assert_eq!(fallback.identity().origin(), &FrameOrigin::RouterFallback);
+
+        let submitted_logical_root = fallback.frame_version().clone();
+        let recovery_failure = engine
+            .begin_view_report(fallback.identity())
+            .unwrap()
+            .failed_with_physical_residual(NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "permanent-zero fixture RouterFallback apply failed",
+            ));
+        assert!(recovery_failure.logical_roots().is_empty());
+        assert_eq!(
+            recovery_failure.failure().kind(),
+            NavigationFailureKind::RecoveryFailed
+        );
+        assert!(matches!(
+            &recovery_failure.continuation,
+            super::FailureCleanupContinuationOwner::Terminal
+        ));
+        let receiver = recovery_failure.receiver.clone();
+        assert_eq!(
+            engine.request(failed).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::CleanupPending)
+        );
+        assert_eq!(
+            engine.request(next).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        assert!(engine.action().is_none());
+
+        (
+            engine,
+            failed,
+            next,
+            recovery_failure,
+            receiver,
+            submitted_logical_root,
+        )
+    }
+
+    #[test]
+    fn failure_cleanup_zero_terminal_consumes_typed_physical_before_publication() {
+        let physical_drops = std::cell::Cell::new(0);
+        let panic_on_drop = std::cell::Cell::new(false);
+        let panic_callback_count = std::cell::Cell::new(0);
+        let (mut engine, failed, next, recovery_failure, receiver, submitted_logical_root) =
+            permanent_zero_recovery_failure_fixture();
+        let submitted_digest = manifest_digest(0xA002);
+        let permanent = engine.prepare_failure_cleanup_retaining(
+            recovery_failure,
+            CleanupManifestSeal::new(vec![submitted_logical_root.clone()], submitted_digest, 0),
+        );
+        let super::FailureCleanupPrepareOutcome::Permanent { request, evidence } = permanent else {
+            panic!("a real logical-root contradiction must be permanently classified")
+        };
+        assert_eq!(request.request(), failed);
+        assert_eq!(
+            evidence,
+            super::FailureCleanupManifestContradictionProjection {
+                source: receiver.clone(),
+                expected_logical_roots: Vec::new(),
+                observed_logical_roots: vec![submitted_logical_root],
+                submitted_manifest_digest: submitted_digest,
+                submitted_obligation_count: 0,
+            }
+        );
+        let expected_zero = super::FailureCleanupZeroPhysicalProjection {
+            receiver: receiver.clone(),
+            manifest_digest: submitted_digest,
+            obligation_count: 0,
+        };
+        let holder = super::FailureCleanupPermanentHolder {
+            request,
+            physical: ZeroFailureCleanupPhysical {
+                owner_id: 0xA003,
+                receiver: receiver.clone(),
+                manifest_digest: submitted_digest,
+                obligation_count: 0,
+                drops: &physical_drops,
+                panic_on_drop: &panic_on_drop,
+            },
+            evidence,
+        };
+        let classified = engine.classify_failure_cleanup_permanent(holder, |physical, expected| {
+            assert_eq!(&expected.physical, &expected_zero);
+            let observed = physical.observed_projection();
+            super::PreparedFailureCleanupZeroPhysical::bind_zero(physical, expected, observed)
+        });
+        let super::FailureCleanupPermanentCoreOutcome::ProvenZero { zero, owner } = classified
+        else {
+            panic!("exact independently observed zero physical facts must bind once")
+        };
+        assert_eq!(zero.proof, expected_zero);
+        assert_eq!(zero.physical.owner_id, 0xA003);
+        assert_eq!(owner.receiver, receiver);
+        assert_eq!(physical_drops.get(), 0);
+
+        panic_on_drop.set(true);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = engine.complete_failure_cleanup_zero_terminal(owner, zero, |zero| {
+                panic_callback_count.set(panic_callback_count.get() + 1);
+                drop(zero);
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(panic_callback_count.get(), 1);
+        assert_eq!(physical_drops.get(), 1);
+        assert!(matches!(
+            engine.request(failed).unwrap().status(),
+            RequestStatus::Running(_)
+        ));
+        assert!(
+            engine
+                .request(failed)
+                .unwrap()
+                .trace()
+                .iter()
+                .all(|event| event.kind() != NavigationTraceEventKind::RequestTerminal)
+        );
+        assert_eq!(
+            engine.request(next).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        assert_eq!(
+            engine
+                .current
+                .as_ref()
+                .map(|current| current.identity.request),
+            Some(failed)
+        );
+        assert!(engine.action().is_none());
+
+        let successful_drops = std::cell::Cell::new(0);
+        let successful_panic_on_drop = std::cell::Cell::new(false);
+        let callback_count = std::cell::Cell::new(0);
+        let (mut engine, failed, next, recovery_failure, receiver, submitted_logical_root) =
+            permanent_zero_recovery_failure_fixture();
+        let submitted_digest = manifest_digest(0xA004);
+        let permanent = engine.prepare_failure_cleanup_retaining(
+            recovery_failure,
+            CleanupManifestSeal::new(vec![submitted_logical_root], submitted_digest, 0),
+        );
+        let super::FailureCleanupPrepareOutcome::Permanent { request, evidence } = permanent else {
+            panic!("the fresh fixture must preserve the permanent contradiction")
+        };
+        let expected_zero = super::FailureCleanupZeroPhysicalProjection {
+            receiver: receiver.clone(),
+            manifest_digest: submitted_digest,
+            obligation_count: 0,
+        };
+        let holder = super::FailureCleanupPermanentHolder {
+            request,
+            physical: ZeroFailureCleanupPhysical {
+                owner_id: 0xA005,
+                receiver,
+                manifest_digest: submitted_digest,
+                obligation_count: 0,
+                drops: &successful_drops,
+                panic_on_drop: &successful_panic_on_drop,
+            },
+            evidence,
+        };
+        let classified = engine.classify_failure_cleanup_permanent(holder, |physical, expected| {
+            assert_eq!(&expected.physical, &expected_zero);
+            let observed = physical.observed_projection();
+            super::PreparedFailureCleanupZeroPhysical::bind_zero(physical, expected, observed)
+        });
+        let super::FailureCleanupPermanentCoreOutcome::ProvenZero { zero, owner } = classified
+        else {
+            panic!("the fresh exact fixture must bind one zero owner")
+        };
+        let completed = engine.complete_failure_cleanup_zero_terminal(owner, zero, |zero| {
+            drop(zero);
+            assert_eq!(successful_drops.get(), 1);
+            callback_count.set(callback_count.get() + 1);
+        });
+        let super::FailureCleanupZeroTerminalOutcome::Terminal(terminal) = completed else {
+            panic!("the exact zero owner must publish one prepared terminal")
+        };
+        assert_eq!(callback_count.get(), 1);
+        assert_eq!(successful_drops.get(), 1);
+        assert_eq!(terminal.identity.request(), failed);
+        assert!(matches!(
+            terminal.status,
+            RequestStatus::Failed(ref failure)
+                if failure.kind() == NavigationFailureKind::RecoveryFailed
+        ));
+        assert_eq!(
+            terminal.failure.kind(),
+            NavigationFailureKind::RecoveryFailed
+        );
+        assert!(matches!(
+            engine.request(failed).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::RecoveryFailed
+        ));
+        assert_eq!(
+            engine
+                .request(failed)
+                .unwrap()
+                .trace()
+                .last()
+                .map(NavigationTraceEvent::kind),
+            Some(NavigationTraceEventKind::RequestTerminal)
+        );
+        assert_eq!(
+            engine.request(next).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        assert!(engine.current.is_none());
+        assert!(engine.action().is_none());
+
+        engine.collect();
+        assert!(matches!(
+            engine.request(next).unwrap().status(),
+            RequestStatus::Running(_)
+        ));
+        assert_eq!(
+            engine
+                .current
+                .as_ref()
+                .map(|current| current.identity.request),
+            Some(next)
+        );
+        let Some(EngineAction::FrameTask(next_action)) = engine.action() else {
+            panic!("an explicit collect starts the queued request after terminal publication")
+        };
+        assert_eq!(next_action.identity().request(), next);
+    }
+
+    #[test]
+    fn failure_cleanup_zero_terminal_refreezes_records_and_queue_before_consumption() {
+        let physical_drops = std::cell::Cell::new(0);
+        let panic_on_drop = std::cell::Cell::new(false);
+        let callback_count = std::cell::Cell::new(0);
+        let (mut engine, failed, next, recovery_failure, receiver, submitted_logical_root) =
+            permanent_zero_recovery_failure_fixture();
+        let submitted_digest = manifest_digest(0xA009);
+        let permanent = engine.prepare_failure_cleanup_retaining(
+            recovery_failure,
+            CleanupManifestSeal::new(vec![submitted_logical_root], submitted_digest, 0),
+        );
+        let super::FailureCleanupPrepareOutcome::Permanent { request, evidence } = permanent else {
+            panic!("the delayed-source fixture must preserve the permanent contradiction")
+        };
+        let holder = super::FailureCleanupPermanentHolder {
+            request,
+            physical: ZeroFailureCleanupPhysical {
+                owner_id: 0xA00A,
+                receiver: receiver.clone(),
+                manifest_digest: submitted_digest,
+                obligation_count: 0,
+                drops: &physical_drops,
+                panic_on_drop: &panic_on_drop,
+            },
+            evidence,
+        };
+        let classified = engine.classify_failure_cleanup_permanent(holder, |physical, expected| {
+            let observed = physical.observed_projection();
+            super::PreparedFailureCleanupZeroPhysical::bind_zero(physical, expected, observed)
+        });
+        let super::FailureCleanupPermanentCoreOutcome::ProvenZero { zero, owner } = classified
+        else {
+            panic!("the exact physical facts must produce a delayed zero-terminal owner")
+        };
+
+        let drift = engine
+            .enqueue_push(RouteLocation::new("/items/2"))
+            .expect("a queued push is a real delayed-source mutation");
+        let after_drift = engine.snapshot();
+        let completed = engine.complete_failure_cleanup_zero_terminal(owner, zero, |zero| {
+            callback_count.set(callback_count.get() + 1);
+            drop(zero);
+        });
+        let super::FailureCleanupZeroTerminalOutcome::Mismatch {
+            zero,
+            owner,
+            evidence,
+        } = completed
+        else {
+            panic!("record and queue drift must reject delayed terminal publication")
+        };
+
+        assert_eq!(callback_count.get(), 0);
+        assert_eq!(physical_drops.get(), 0);
+        assert_eq!(owner.receiver, receiver);
+        assert_eq!(zero.physical.owner_id, 0xA00A);
+        assert_eq!(evidence.expected.queue, vec![next]);
+        assert_eq!(evidence.observed.queue, vec![next, drift]);
+        assert_eq!(
+            evidence.observed.records.len(),
+            evidence.expected.records.len() + 1
+        );
+        assert_eq!(
+            evidence.observed.records.back().map(|record| record.id()),
+            Some(drift)
+        );
+        assert_eq!(engine.snapshot(), after_drift);
+        assert_eq!(
+            engine.request(failed).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::CleanupPending)
+        );
+        assert_eq!(
+            engine.request(next).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        assert_eq!(
+            engine.request(drift).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        assert!(engine.action().is_none());
+
+        drop(owner);
+        drop(zero);
+        assert_eq!(physical_drops.get(), 1);
+    }
+
+    #[test]
+    fn failure_cleanup_zero_terminal_refreezes_non_stage_current_facts() {
+        let physical_drops = std::cell::Cell::new(0);
+        let panic_on_drop = std::cell::Cell::new(false);
+        let callback_count = std::cell::Cell::new(0);
+        let (mut engine, failed, _next, recovery_failure, receiver, submitted_logical_root) =
+            permanent_zero_recovery_failure_fixture();
+        let drift_root = submitted_logical_root.clone();
+        let submitted_digest = manifest_digest(0xA00F);
+        let permanent = engine.prepare_failure_cleanup_retaining(
+            recovery_failure,
+            CleanupManifestSeal::new(vec![submitted_logical_root], submitted_digest, 0),
+        );
+        let super::FailureCleanupPrepareOutcome::Permanent { request, evidence } = permanent else {
+            panic!("the current-source fixture must preserve the permanent contradiction")
+        };
+        let classified = engine.classify_failure_cleanup_permanent(
+            super::FailureCleanupPermanentHolder {
+                request,
+                physical: ZeroFailureCleanupPhysical {
+                    owner_id: 0xA010,
+                    receiver: receiver.clone(),
+                    manifest_digest: submitted_digest,
+                    obligation_count: 0,
+                    drops: &physical_drops,
+                    panic_on_drop: &panic_on_drop,
+                },
+                evidence,
+            },
+            |physical, binding| {
+                let observed = physical.observed_projection();
+                super::PreparedFailureCleanupZeroPhysical::bind_zero(physical, binding, observed)
+            },
+        );
+        let super::FailureCleanupPermanentCoreOutcome::ProvenZero { zero, owner } = classified
+        else {
+            panic!("exact physical facts must produce one delayed terminal pair")
+        };
+
+        engine
+            .current
+            .as_mut()
+            .expect("classification retains the dedicated current stage")
+            .cleanup_roots
+            .push(drift_root.clone());
+        let after_drift = engine.snapshot();
+        let completed = engine.complete_failure_cleanup_zero_terminal(owner, zero, |zero| {
+            callback_count.set(callback_count.get() + 1);
+            drop(zero);
+        });
+        let super::FailureCleanupZeroTerminalOutcome::Mismatch {
+            zero,
+            owner,
+            evidence,
+        } = completed
+        else {
+            panic!("same-stage cleanup-root drift must reject terminal publication")
+        };
+
+        let expected_current = evidence
+            .expected
+            .current
+            .as_ref()
+            .expect("the terminal owner freezes one expected current projection");
+        let observed_current = evidence
+            .observed
+            .current
+            .as_ref()
+            .expect("the mismatch observes one current projection");
+        assert!(expected_current.cleanup_roots.is_empty());
+        assert_eq!(observed_current.cleanup_roots, vec![drift_root]);
+        assert_eq!(expected_current.identity, observed_current.identity);
+        assert_eq!(expected_current.stage, observed_current.stage);
+        assert_eq!(callback_count.get(), 0);
+        assert_eq!(physical_drops.get(), 0);
+        assert_eq!(owner.receiver, receiver);
+        assert_eq!(zero.physical.owner_id, 0xA010);
+        assert_eq!(engine.snapshot(), after_drift);
+        assert!(matches!(
+            engine.request(failed).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::CleanupPending)
+        ));
+        assert!(
+            engine
+                .request(failed)
+                .unwrap()
+                .trace()
+                .iter()
+                .all(|event| event.kind() != NavigationTraceEventKind::RequestTerminal)
+        );
+
+        drop(owner);
+        drop(zero);
+        assert_eq!(physical_drops.get(), 1);
+    }
+
+    #[test]
+    fn failure_cleanup_zero_terminal_rejects_crossed_exact_pairs() {
+        let physical_drops = std::cell::Cell::new(0);
+        let panic_on_drop = std::cell::Cell::new(false);
+        let callback_count = std::cell::Cell::new(0);
+
+        let (mut engine_a, failed_a, _next_a, recovery_failure_a, receiver_a, submitted_root_a) =
+            permanent_zero_recovery_failure_fixture();
+        let digest_a = manifest_digest(0xA00B);
+        let permanent_a = engine_a.prepare_failure_cleanup_retaining(
+            recovery_failure_a,
+            CleanupManifestSeal::new(vec![submitted_root_a], digest_a, 0),
+        );
+        let super::FailureCleanupPrepareOutcome::Permanent {
+            request: request_a,
+            evidence: evidence_a,
+        } = permanent_a
+        else {
+            panic!("pair A must preserve one real permanent contradiction")
+        };
+        let classified_a = engine_a.classify_failure_cleanup_permanent(
+            super::FailureCleanupPermanentHolder {
+                request: request_a,
+                physical: ZeroFailureCleanupPhysical {
+                    owner_id: 0xA00C,
+                    receiver: receiver_a.clone(),
+                    manifest_digest: digest_a,
+                    obligation_count: 0,
+                    drops: &physical_drops,
+                    panic_on_drop: &panic_on_drop,
+                },
+                evidence: evidence_a,
+            },
+            |physical, binding| {
+                let observed = physical.observed_projection();
+                super::PreparedFailureCleanupZeroPhysical::bind_zero(physical, binding, observed)
+            },
+        );
+        let super::FailureCleanupPermanentCoreOutcome::ProvenZero {
+            zero: zero_a,
+            owner: owner_a,
+        } = classified_a
+        else {
+            panic!("pair A must bind exactly")
+        };
+
+        let (mut engine_b, failed_b, _next_b, recovery_failure_b, receiver_b, submitted_root_b) =
+            permanent_zero_recovery_failure_fixture();
+        let digest_b = manifest_digest(0xA00D);
+        let permanent_b = engine_b.prepare_failure_cleanup_retaining(
+            recovery_failure_b,
+            CleanupManifestSeal::new(vec![submitted_root_b], digest_b, 0),
+        );
+        let super::FailureCleanupPrepareOutcome::Permanent {
+            request: request_b,
+            evidence: evidence_b,
+        } = permanent_b
+        else {
+            panic!("pair B must preserve one real permanent contradiction")
+        };
+        let classified_b = engine_b.classify_failure_cleanup_permanent(
+            super::FailureCleanupPermanentHolder {
+                request: request_b,
+                physical: ZeroFailureCleanupPhysical {
+                    owner_id: 0xA00E,
+                    receiver: receiver_b.clone(),
+                    manifest_digest: digest_b,
+                    obligation_count: 0,
+                    drops: &physical_drops,
+                    panic_on_drop: &panic_on_drop,
+                },
+                evidence: evidence_b,
+            },
+            |physical, binding| {
+                let observed = physical.observed_projection();
+                super::PreparedFailureCleanupZeroPhysical::bind_zero(physical, binding, observed)
+            },
+        );
+        let super::FailureCleanupPermanentCoreOutcome::ProvenZero {
+            zero: zero_b,
+            owner: owner_b,
+        } = classified_b
+        else {
+            panic!("pair B must bind exactly")
+        };
+
+        let before_a = engine_a.snapshot();
+        let crossed_a = engine_a.complete_failure_cleanup_zero_terminal(owner_a, zero_b, |zero| {
+            callback_count.set(callback_count.get() + 1);
+            drop(zero);
+        });
+        let super::FailureCleanupZeroTerminalOutcome::Mismatch {
+            zero: zero_b,
+            owner: owner_a,
+            evidence: mismatch_a,
+        } = crossed_a
+        else {
+            panic!("owner A must reject prepared-zero B")
+        };
+        assert_eq!(callback_count.get(), 0);
+        assert_eq!(zero_b.physical.owner_id, 0xA00E);
+        assert_eq!(owner_a.receiver, receiver_a);
+        assert_ne!(mismatch_a.expected_binding, mismatch_a.observed_binding);
+        assert_eq!(engine_a.snapshot(), before_a);
+        assert_eq!(
+            engine_a.request(failed_a).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::CleanupPending)
+        );
+
+        let before_b = engine_b.snapshot();
+        let crossed_b = engine_b.complete_failure_cleanup_zero_terminal(owner_b, zero_a, |zero| {
+            callback_count.set(callback_count.get() + 1);
+            drop(zero);
+        });
+        let super::FailureCleanupZeroTerminalOutcome::Mismatch {
+            zero: zero_a,
+            owner: owner_b,
+            evidence: mismatch_b,
+        } = crossed_b
+        else {
+            panic!("owner B must reject prepared-zero A")
+        };
+        assert_eq!(callback_count.get(), 0);
+        assert_eq!(zero_a.physical.owner_id, 0xA00C);
+        assert_eq!(owner_b.receiver, receiver_b);
+        assert_ne!(mismatch_b.expected_binding, mismatch_b.observed_binding);
+        assert_eq!(engine_b.snapshot(), before_b);
+        assert_eq!(
+            engine_b.request(failed_b).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::CleanupPending)
+        );
+
+        drop(owner_a);
+        drop(owner_b);
+        drop(zero_a);
+        drop(zero_b);
+        assert_eq!(physical_drops.get(), 2);
+    }
+
+    #[test]
+    fn failure_cleanup_zero_bind_mismatch_retains_exact_evidence_and_redrives_zero() {
+        let physical_drops = std::cell::Cell::new(0);
+        let panic_on_drop = std::cell::Cell::new(false);
+        let bind_calls = std::cell::Cell::new(0);
+        let (mut engine, failed, next, recovery_failure, receiver, submitted_logical_root) =
+            permanent_zero_recovery_failure_fixture();
+        let submitted_digest = manifest_digest(0xA006);
+        let observed_digest = manifest_digest(0xA007);
+        let permanent = engine.prepare_failure_cleanup_retaining(
+            recovery_failure,
+            CleanupManifestSeal::new(vec![submitted_logical_root.clone()], submitted_digest, 0),
+        );
+        let super::FailureCleanupPrepareOutcome::Permanent { request, evidence } = permanent else {
+            panic!("a real logical-root contradiction must be permanently classified")
+        };
+        let contradiction = super::FailureCleanupManifestContradictionProjection {
+            source: receiver.clone(),
+            expected_logical_roots: Vec::new(),
+            observed_logical_roots: vec![submitted_logical_root],
+            submitted_manifest_digest: submitted_digest,
+            submitted_obligation_count: 0,
+        };
+        assert_eq!(evidence, contradiction);
+        let holder = super::FailureCleanupPermanentHolder {
+            request,
+            physical: ZeroFailureCleanupPhysical {
+                owner_id: 0xA008,
+                receiver: receiver.clone(),
+                manifest_digest: observed_digest,
+                obligation_count: 0,
+                drops: &physical_drops,
+                panic_on_drop: &panic_on_drop,
+            },
+            evidence,
+        };
+        let expected = super::FailureCleanupZeroPhysicalProjection {
+            receiver: receiver.clone(),
+            manifest_digest: submitted_digest,
+            obligation_count: 0,
+        };
+        let observed = super::FailureCleanupZeroPhysicalProjection {
+            receiver: receiver.clone(),
+            manifest_digest: observed_digest,
+            obligation_count: 0,
+        };
+        let expected_mismatch = super::FailureCleanupZeroPhysicalMismatchProjection {
+            source: receiver,
+            expected,
+            observed,
+        };
+        let before_classification = engine.snapshot();
+
+        let classified = engine.classify_failure_cleanup_permanent(holder, |physical, expected| {
+            bind_calls.set(bind_calls.get() + 1);
+            let observed = physical.observed_projection();
+            super::PreparedFailureCleanupZeroPhysical::bind_zero(physical, expected, observed)
+        });
+        let super::FailureCleanupPermanentCoreOutcome::ZeroMismatch { holder, evidence } =
+            classified
+        else {
+            panic!("digest drift must return the whole permanent holder")
+        };
+        assert_eq!(bind_calls.get(), 1);
+        assert_eq!(physical_drops.get(), 0);
+        assert_eq!(holder.request.request(), failed);
+        assert_eq!(holder.physical.owner_id, 0xA008);
+        assert_eq!(holder.evidence, contradiction);
+        assert_eq!(evidence, expected_mismatch);
+        assert_eq!(engine.snapshot(), before_classification);
+        assert!(matches!(
+            engine.request(failed).unwrap().status(),
+            RequestStatus::Running(_)
+        ));
+        assert!(
+            engine
+                .request(failed)
+                .unwrap()
+                .trace()
+                .iter()
+                .all(|event| event.kind() != NavigationTraceEventKind::RequestTerminal)
+        );
+        assert_eq!(
+            engine.request(next).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        assert!(engine.action().is_none());
+
+        let classified = engine.classify_failure_cleanup_permanent(holder, |physical, expected| {
+            bind_calls.set(bind_calls.get() + 1);
+            let observed = physical.observed_projection();
+            super::PreparedFailureCleanupZeroPhysical::bind_zero(physical, expected, observed)
+        });
+        let super::FailureCleanupPermanentCoreOutcome::ZeroMismatch { holder, evidence } =
+            classified
+        else {
+            panic!("an explicit retry must reproduce the same typed zero mismatch")
+        };
+        assert_eq!(bind_calls.get(), 2);
+        assert_eq!(physical_drops.get(), 0);
+        assert_eq!(holder.request.request(), failed);
+        assert_eq!(holder.physical.owner_id, 0xA008);
+        assert_eq!(holder.evidence, contradiction);
+        assert_eq!(evidence, expected_mismatch);
+        assert_eq!(engine.snapshot(), before_classification);
+        assert!(
+            engine
+                .request(failed)
+                .unwrap()
+                .trace()
+                .iter()
+                .all(|event| event.kind() != NavigationTraceEventKind::RequestTerminal)
+        );
+        assert_eq!(
+            engine.request(next).unwrap().status(),
+            &RequestStatus::Queued
+        );
+        assert!(engine.action().is_none());
+        drop(holder);
+        assert_eq!(physical_drops.get(), 1);
+    }
+
     #[test]
     fn missing_outlet_waits_for_cleanup_before_router_fallback() {
         let mut engine = ready_engine();
@@ -19416,14 +20784,15 @@ mod tests {
             .testing_set_router(distinct_identity().router_identity());
         let roots = failure.logical_roots().to_vec();
         let before = engine.snapshot();
-        let error = engine
-            .prepare_failure_cleanup_retaining(
-                failure,
-                CleanupManifestSeal::new(roots.clone(), manifest_digest(135), 1),
-            )
-            .unwrap_err();
-        assert_eq!(error.kind(), super::FailureCleanupError::Foreign);
-        failure = error.into_owner();
+        let outcome = engine.prepare_failure_cleanup_retaining(
+            failure,
+            CleanupManifestSeal::new(roots.clone(), manifest_digest(135), 1),
+        );
+        let super::FailureCleanupPrepareOutcome::Mismatch { request, evidence } = outcome else {
+            panic!("foreign prepare must return the request and typed receiver evidence")
+        };
+        assert_eq!(evidence.kind, super::FailureCleanupError::Foreign);
+        failure = request;
         assert_eq!(engine.snapshot(), before);
 
         failure.receiver.identity.testing_set_router(router);
@@ -19433,40 +20802,47 @@ mod tests {
             .identity
             .testing_set_host_epoch(host_epoch + 1);
         let before = engine.snapshot();
-        let error = engine
-            .prepare_failure_cleanup_retaining(
-                failure,
-                CleanupManifestSeal::new(roots.clone(), manifest_digest(137), 1),
-            )
-            .unwrap_err();
-        assert_eq!(error.kind(), super::FailureCleanupError::Stale);
-        failure = error.into_owner();
+        let outcome = engine.prepare_failure_cleanup_retaining(
+            failure,
+            CleanupManifestSeal::new(roots.clone(), manifest_digest(137), 1),
+        );
+        let super::FailureCleanupPrepareOutcome::Mismatch { request, evidence } = outcome else {
+            panic!("stale identity must return the request and typed receiver evidence")
+        };
+        assert_eq!(evidence.kind, super::FailureCleanupError::Stale);
+        failure = request;
         assert_eq!(engine.snapshot(), before);
 
         failure.receiver.identity.testing_set_host_epoch(host_epoch);
         let expected = failure.receiver.expected.clone();
         failure.receiver.expected = super::PendingFailureKind::Build;
         let before = engine.snapshot();
-        let error = engine
-            .prepare_failure_cleanup_retaining(
-                failure,
-                CleanupManifestSeal::new(roots.clone(), manifest_digest(139), 1),
-            )
-            .unwrap_err();
-        assert_eq!(error.kind(), super::FailureCleanupError::Stale);
-        failure = error.into_owner();
+        let outcome = engine.prepare_failure_cleanup_retaining(
+            failure,
+            CleanupManifestSeal::new(roots.clone(), manifest_digest(139), 1),
+        );
+        let super::FailureCleanupPrepareOutcome::Mismatch { request, evidence } = outcome else {
+            panic!("stale failure kind must return the request and typed receiver evidence")
+        };
+        assert_eq!(evidence.kind, super::FailureCleanupError::Stale);
+        failure = request;
         assert_eq!(engine.snapshot(), before);
 
         failure.receiver.expected = expected;
         let before = engine.snapshot();
-        let error = engine
-            .prepare_failure_cleanup_retaining(
-                failure,
-                CleanupManifestSeal::new(Vec::new(), manifest_digest(149), 1),
-            )
-            .unwrap_err();
-        assert_eq!(error.kind(), super::FailureCleanupError::InvalidManifest);
-        failure = error.into_owner();
+        let outcome = engine.prepare_failure_cleanup_retaining(
+            failure,
+            CleanupManifestSeal::new(Vec::new(), manifest_digest(149), 1),
+        );
+        let super::FailureCleanupPrepareOutcome::Permanent { request, evidence } = outcome else {
+            panic!("logical-root contradiction must be permanently classified")
+        };
+        assert_eq!(evidence.source, request.receiver);
+        assert_eq!(evidence.expected_logical_roots, roots);
+        assert!(evidence.observed_logical_roots.is_empty());
+        assert_eq!(evidence.submitted_manifest_digest, manifest_digest(149));
+        assert_eq!(evidence.submitted_obligation_count, 1);
+        failure = request;
         assert_eq!(engine.snapshot(), before);
 
         let cleanup = engine
@@ -20947,13 +22323,18 @@ mod tests {
         let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
             panic!("settled replace failure must issue the fallback branch")
         };
-        engine
+        let recovery_failure = engine
             .begin_view_report(fallback.identity())
             .unwrap()
             .failed(NavigationFailure::new(
                 NavigationFailureKind::Build,
                 "replace fallback failed",
-            ));
+            ))
+            .expect("fallback failure must retain cleanup authority before terminal");
+        let recovery_cleanup = prepare_failure_cleanup(&mut engine, recovery_failure, 0xE4, 0);
+        engine
+            .complete_cleanup(valid_completion(&recovery_cleanup))
+            .unwrap();
 
         assert!(matches!(
             engine.request(request).unwrap().status(),
