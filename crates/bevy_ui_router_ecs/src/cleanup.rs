@@ -23,6 +23,7 @@ use bevy_ui_router_core::{
 };
 
 use crate::{
+    app_ext::{RouterHandle, RouterHostRegistration},
     branch_transaction::{
         FailedPreparedBranch, RealizedBranch, RejectedChildSlot, SealedReconciliationSlotRole,
         SealedReconciliationSplice,
@@ -1835,6 +1836,187 @@ pub(crate) struct FrozenCleanupManifest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FrozenFailureCleanupObservedEntity {
+    entity: Entity,
+    present: bool,
+    parent: Option<Entity>,
+    children: Vec<Entity>,
+    children_component_present: bool,
+    registry_claim: Option<ExactRegistryClaim>,
+    registry_manifest: Option<ComponentManifest>,
+    ownership_seal: Option<RouteOwnershipSeal>,
+    manifest: Option<ComponentManifest>,
+    visibility: Option<Visibility>,
+    pickable: Option<(bool, bool)>,
+    barrier: Option<RouterInputBarrier>,
+    frame_lifecycle: Option<FrameLifecycle>,
+    child_slot_lifecycle: Option<ChildSlotLifecycle>,
+    child_slot_authority: Option<ChildSlotAuthority>,
+    provisional_slot_lifecycle: Option<ProvisionalSlotLifecycle>,
+    host_registration: Option<(RouterHandle, u64)>,
+}
+
+impl FrozenFailureCleanupObservedEntity {
+    fn observe(world: &World, registry: &RouteEntityRegistry, entity: Entity) -> Self {
+        Self {
+            entity,
+            present: world.get_entity(entity).is_ok(),
+            parent: world.get::<ChildOf>(entity).map(ChildOf::parent),
+            children: observed_children(world, entity),
+            children_component_present: world.get::<Children>(entity).is_some(),
+            registry_claim: registry.record(entity).map(|record| record.claim()),
+            registry_manifest: registry
+                .record(entity)
+                .map(|record| record.manifest().clone()),
+            ownership_seal: world.get::<RouteOwnershipSeal>(entity).copied(),
+            manifest: ComponentManifest::from_world(world, entity),
+            visibility: world.get::<Visibility>(entity).copied(),
+            pickable: world
+                .get::<Pickable>(entity)
+                .map(|pickable| (pickable.should_block_lower, pickable.is_hoverable)),
+            barrier: world.get::<RouterInputBarrier>(entity).copied(),
+            frame_lifecycle: world.get::<FrameLifecycle>(entity).copied(),
+            child_slot_lifecycle: world.get::<ChildSlotLifecycle>(entity).copied(),
+            child_slot_authority: world.get::<ChildSlotAuthority>(entity).cloned(),
+            provisional_slot_lifecycle: world.get::<ProvisionalSlotLifecycle>(entity).copied(),
+            host_registration: world
+                .get::<RouterHostRegistration>(entity)
+                .map(|registration| (registration.router(), registration.incarnation())),
+        }
+    }
+
+    pub(crate) const fn is_present(&self) -> bool {
+        self.present
+    }
+
+    pub(crate) const fn registry_claim(&self) -> Option<&ExactRegistryClaim> {
+        self.registry_claim.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FrozenFailureCleanupSource {
+    manifest_digest: u64,
+    targets: Vec<ExactRegistryClaim>,
+    logical: FailureCleanupSourceProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FailureCleanupHostSourceProjection {
+    version: bevy_ui_router_core::HostVersion,
+    slot: RouteSlotId,
+    host: Entity,
+    top_slot: Entity,
+    top_slot_claim: ExactRegistryClaim,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FailureCleanupActiveSourceProjection {
+    frames: Vec<RouteFrameVersion>,
+    claims: Vec<ExactRegistryClaim>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailureCleanupSourceProjection {
+    host: Option<FailureCleanupHostSourceProjection>,
+    active: Option<FailureCleanupActiveSourceProjection>,
+}
+
+impl FailureCleanupSourceProjection {
+    pub(crate) fn observe(host: Option<&HostBinding>, active: Option<&RealizedBranch>) -> Self {
+        Self {
+            host: host.map(|host| FailureCleanupHostSourceProjection {
+                version: host.version.clone(),
+                slot: host.slot_id,
+                host: host.host,
+                top_slot: host.top_slot,
+                top_slot_claim: host.top_slot_claim.clone(),
+            }),
+            active: active.map(|active| FailureCleanupActiveSourceProjection {
+                frames: active
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect(),
+                claims: active.claims().cloned().collect(),
+            }),
+        }
+    }
+
+    fn host_entity(&self) -> Option<Entity> {
+        self.host.as_ref().map(|host| host.host)
+    }
+
+    fn top_slot(&self) -> Option<Entity> {
+        self.host.as_ref().map(|host| host.top_slot)
+    }
+}
+
+pub(crate) struct FrozenFailureCleanupPartition {
+    source: FrozenFailureCleanupSource,
+    roots: Vec<Entity>,
+    target_observed: Vec<FrozenFailureCleanupObservedEntity>,
+    protected_observed: Vec<FrozenFailureCleanupObservedEntity>,
+    allowed_writes: Vec<Entity>,
+    input_focus: Option<Option<Entity>>,
+    route_focus: Option<Option<Entity>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FailureCleanupTransitionStage {
+    Prewrite(Entity),
+    PhysicalAbsent(Entity),
+    ReceiptCommitted(Entity),
+    MountParentsCommitted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FailureCleanupPartitionRefreezeFailure {
+    Source {
+        expected: FailureCleanupSourceProjection,
+        observed: Option<FailureCleanupSourceProjection>,
+    },
+    Target {
+        entity: Entity,
+        expected: FrozenFailureCleanupObservedEntity,
+        observed: Option<FrozenFailureCleanupObservedEntity>,
+    },
+    Protected {
+        entity: Entity,
+        expected: FrozenFailureCleanupObservedEntity,
+        observed: Option<FrozenFailureCleanupObservedEntity>,
+    },
+    Closure {
+        expected: Vec<Entity>,
+        observed: Vec<Entity>,
+    },
+    Focus {
+        expected_input: Option<Option<Entity>>,
+        observed_input: Option<Option<Entity>>,
+        expected_route: Option<Option<Entity>>,
+        observed_route: Option<Option<Entity>>,
+    },
+    MountParents,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailureCleanupSettlementRefreezeEvidence {
+    source: FrozenFailureCleanupSource,
+    stage: FailureCleanupTransitionStage,
+    failure: FailureCleanupPartitionRefreezeFailure,
+}
+
+impl FailureCleanupSettlementRefreezeEvidence {
+    pub(crate) const fn stage(&self) -> FailureCleanupTransitionStage {
+        self.stage
+    }
+
+    pub(crate) const fn failure(&self) -> &FailureCleanupPartitionRefreezeFailure {
+        &self.failure
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct FrozenBackNoTargetAuthorityEntity {
     entity: Entity,
     parent: Option<Entity>,
@@ -3152,6 +3334,118 @@ impl FrozenCleanupManifest {
                             && mount_parent_physical_matches(world, registry, parent)
                     })
                 })
+    }
+
+    pub(crate) fn freeze_failure_cleanup_partition(
+        &self,
+        world: &World,
+        registry: &RouteEntityRegistry,
+        active: Option<&RealizedBranch>,
+        host: &HostBinding,
+    ) -> Option<FrozenFailureCleanupPartition> {
+        let targets = self
+            .obligations
+            .iter()
+            .map(|obligation| obligation.claim.clone())
+            .collect::<Vec<_>>();
+        let mut allowed_writes = targets
+            .iter()
+            .map(ExactRegistryClaim::entity)
+            .collect::<Vec<_>>();
+        let target_count = allowed_writes.len();
+        allowed_writes.sort_by_key(|entity| entity.to_bits());
+        allowed_writes.dedup();
+        if allowed_writes.len() != target_count
+            || allowed_writes.contains(&host.host)
+            || allowed_writes.contains(&host.top_slot)
+            || !cleanup_claim_has_exact_authority(world, &host.top_slot_claim)
+        {
+            return None;
+        }
+        let active_claims = active
+            .map(|active| active.claims().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if active_claims
+            .iter()
+            .any(|claim| allowed_writes.contains(&claim.entity()))
+        {
+            return None;
+        }
+        let mut roots = vec![host.host, host.top_slot];
+        roots.extend(allowed_writes.iter().copied());
+        roots.extend(active_claims.iter().map(ExactRegistryClaim::entity));
+        roots.extend(
+            self.obligations
+                .iter()
+                .flat_map(|obligation| [obligation.expected_parent, obligation.authorized_parent]),
+        );
+        roots.extend(
+            self.mount_parents
+                .iter()
+                .map(|parent| parent.claim.entity()),
+        );
+        roots.sort_by_key(|entity| entity.to_bits());
+        roots.dedup();
+        let target_observed = allowed_writes
+            .iter()
+            .copied()
+            .map(|entity| FrozenFailureCleanupObservedEntity::observe(world, registry, entity))
+            .collect::<Vec<_>>();
+        let frozen_absent_targets = target_observed
+            .iter()
+            .filter_map(|observed| (!observed.present).then_some(observed.entity))
+            .collect::<Vec<_>>();
+        let closure_roots = roots
+            .iter()
+            .copied()
+            .filter(|entity| !frozen_absent_targets.contains(entity))
+            .collect::<Vec<_>>();
+        let closure = freeze_failure_cleanup_closure(world, &closure_roots, &allowed_writes)?;
+        if closure_roots.iter().any(|root| !closure.contains(root)) {
+            return None;
+        }
+        if frozen_absent_targets
+            .iter()
+            .any(|entity| closure.contains(entity))
+        {
+            return None;
+        }
+        let protected_entities = closure
+            .iter()
+            .copied()
+            .filter(|entity| !allowed_writes.contains(entity))
+            .collect::<Vec<_>>();
+        if !protected_entities.contains(&host.host)
+            || !protected_entities.contains(&host.top_slot)
+            || active_claims
+                .iter()
+                .any(|claim| !protected_entities.contains(&claim.entity()))
+        {
+            return None;
+        }
+        let protected_observed = protected_entities
+            .iter()
+            .copied()
+            .map(|entity| FrozenFailureCleanupObservedEntity::observe(world, registry, entity))
+            .collect::<Vec<_>>();
+        if protected_observed.iter().any(|observed| !observed.present) {
+            return None;
+        }
+        Some(FrozenFailureCleanupPartition {
+            source: FrozenFailureCleanupSource {
+                manifest_digest: self.digest,
+                targets,
+                logical: FailureCleanupSourceProjection::observe(Some(host), active),
+            },
+            roots,
+            target_observed,
+            protected_observed,
+            allowed_writes,
+            input_focus: world.get_resource::<InputFocus>().map(InputFocus::get),
+            route_focus: world
+                .get_resource::<RouteFocusState>()
+                .map(RouteFocusState::focused),
+        })
     }
 
     #[cfg(test)]
@@ -5627,6 +5921,432 @@ fn observed_manifest_differs_only_by_allowed_relationships(
         })
 }
 
+fn freeze_failure_cleanup_closure(
+    world: &World,
+    roots: &[Entity],
+    cycle_permitted: &[Entity],
+) -> Option<Vec<Entity>> {
+    let mut closure = observed_descendant_closure(world, roots.iter().copied())
+        .into_iter()
+        .collect::<Vec<_>>();
+    closure.sort_by_key(|entity| entity.to_bits());
+    let closure_set = closure.iter().copied().collect::<HashSet<_>>();
+    let mut observed_parents = HashMap::<Entity, Entity>::new();
+    for parent in &closure {
+        let children = observed_children(world, *parent);
+        let mut unique = HashSet::new();
+        for child in children {
+            if !unique.insert(child)
+                || !closure_set.contains(&child)
+                || world.get::<ChildOf>(child).map(ChildOf::parent) != Some(*parent)
+                || observed_parents
+                    .insert(child, *parent)
+                    .is_some_and(|previous| previous != *parent)
+            {
+                return None;
+            }
+        }
+    }
+    for entity in &closure {
+        let mut path = Vec::new();
+        let mut current = *entity;
+        while closure_set.contains(&current) {
+            if let Some(cycle_start) = path.iter().position(|observed| *observed == current) {
+                // Failed cleanup may quarantine a malformed cycle wholly inside its exact
+                // target set; a cycle that reaches protected state is still invalid.
+                if path[cycle_start..]
+                    .iter()
+                    .all(|observed| cycle_permitted.contains(observed))
+                {
+                    break;
+                }
+                return None;
+            }
+            path.push(current);
+            let Some(parent) = world.get::<ChildOf>(current).map(ChildOf::parent) else {
+                break;
+            };
+            current = parent;
+        }
+    }
+    Some(closure)
+}
+
+fn failure_cleanup_observed_entity_matches(
+    world: &World,
+    expected: &FrozenFailureCleanupObservedEntity,
+    observed: &FrozenFailureCleanupObservedEntity,
+    removed: &[Entity],
+    registry_manifest: Option<&ComponentManifest>,
+) -> bool {
+    let expected_children = expected
+        .children
+        .iter()
+        .copied()
+        .filter(|child| !removed.contains(child))
+        .collect::<Vec<_>>();
+    let children_changed = expected_children != expected.children;
+    let expected_children_component_present = if children_changed {
+        !expected_children.is_empty()
+    } else {
+        expected.children_component_present
+    };
+    let manifest_is_exact = match expected.manifest.as_ref() {
+        Some(manifest) => observed_manifest_differs_only_by_allowed_relationships(
+            world,
+            expected.entity,
+            manifest,
+            children_changed,
+            false,
+        ),
+        None => !expected.present && observed.manifest.is_none(),
+    };
+    observed.entity == expected.entity
+        && observed.present == expected.present
+        && !expected
+            .parent
+            .is_some_and(|parent| removed.contains(&parent))
+        && observed.parent == expected.parent
+        && observed.children == expected_children
+        && observed.children_component_present == expected_children_component_present
+        && observed.registry_claim == expected.registry_claim
+        && observed.registry_manifest.as_ref()
+            == registry_manifest.or(expected.registry_manifest.as_ref())
+        && observed.ownership_seal == expected.ownership_seal
+        && manifest_is_exact
+        && observed.visibility == expected.visibility
+        && observed.pickable == expected.pickable
+        && observed.barrier == expected.barrier
+        && observed.frame_lifecycle == expected.frame_lifecycle
+        && observed.child_slot_lifecycle == expected.child_slot_lifecycle
+        && observed.child_slot_authority == expected.child_slot_authority
+        && observed.provisional_slot_lifecycle == expected.provisional_slot_lifecycle
+        && observed.host_registration == expected.host_registration
+}
+
+impl FrozenFailureCleanupPartition {
+    fn evidence(
+        &self,
+        stage: FailureCleanupTransitionStage,
+        failure: FailureCleanupPartitionRefreezeFailure,
+    ) -> FailureCleanupSettlementRefreezeEvidence {
+        FailureCleanupSettlementRefreezeEvidence {
+            source: self.source.clone(),
+            stage,
+            failure,
+        }
+    }
+
+    fn refreeze(
+        &self,
+        world: &World,
+        current_source: Option<&FailureCleanupSourceProjection>,
+        obligations: &[CleanupObligation],
+        mount_parents: &[CleanupMountParentSettlement],
+        receipts: &[Option<CleanupReceipt>],
+        manifest_digest: u64,
+        mount_parent_next: Option<&[(ExactRegistryClaim, ComponentManifest)]>,
+        stage: FailureCleanupTransitionStage,
+    ) -> Result<(), FailureCleanupSettlementRefreezeEvidence> {
+        let obligation_claims = obligations
+            .iter()
+            .map(|obligation| obligation.claim.clone())
+            .collect::<Vec<_>>();
+        let obligation_entities = obligation_claims
+            .iter()
+            .map(ExactRegistryClaim::entity)
+            .collect::<Vec<_>>();
+        if current_source != Some(&self.source.logical) {
+            return Err(self.evidence(
+                stage,
+                FailureCleanupPartitionRefreezeFailure::Source {
+                    expected: self.source.logical.clone(),
+                    observed: current_source.cloned(),
+                },
+            ));
+        }
+        if self.source.manifest_digest != manifest_digest
+            || self.source.targets != obligation_claims
+            || receipts.len() != obligations.len()
+            || self.allowed_writes.len() != obligations.len()
+            || obligation_entities
+                .iter()
+                .any(|entity| !self.allowed_writes.contains(entity))
+            || self
+                .target_observed
+                .iter()
+                .map(|observed| observed.entity)
+                .collect::<Vec<_>>()
+                != self.allowed_writes
+            || self
+                .protected_observed
+                .iter()
+                .any(|observed| self.allowed_writes.contains(&observed.entity))
+            || !self
+                .protected_observed
+                .iter()
+                .any(|observed| Some(observed.entity) == self.source.logical.host_entity())
+            || !self
+                .protected_observed
+                .iter()
+                .any(|observed| Some(observed.entity) == self.source.logical.top_slot())
+        {
+            return Err(self.evidence(
+                stage,
+                FailureCleanupPartitionRefreezeFailure::Source {
+                    expected: self.source.logical.clone(),
+                    observed: current_source.cloned(),
+                },
+            ));
+        }
+        let transition_entity = match stage {
+            FailureCleanupTransitionStage::Prewrite(entity)
+            | FailureCleanupTransitionStage::PhysicalAbsent(entity)
+            | FailureCleanupTransitionStage::ReceiptCommitted(entity) => Some(entity),
+            FailureCleanupTransitionStage::MountParentsCommitted => None,
+        };
+        if transition_entity.is_none() && receipts.iter().any(Option::is_none) {
+            return Err(self.evidence(
+                stage,
+                FailureCleanupPartitionRefreezeFailure::Source {
+                    expected: self.source.logical.clone(),
+                    observed: current_source.cloned(),
+                },
+            ));
+        }
+        if let Some(transition_entity) = transition_entity {
+            let Some(transition_index) = obligations
+                .iter()
+                .position(|obligation| obligation.claim.entity() == transition_entity)
+            else {
+                return Err(self.evidence(
+                    stage,
+                    FailureCleanupPartitionRefreezeFailure::Source {
+                        expected: self.source.logical.clone(),
+                        observed: current_source.cloned(),
+                    },
+                ));
+            };
+            let transition_expected = self
+                .target_observed
+                .iter()
+                .find(|expected| expected.entity == transition_entity)
+                .expect("the frozen allowed-write set retains every exact target");
+            let transition_is_exact = match stage {
+                FailureCleanupTransitionStage::Prewrite(_) => {
+                    receipts[transition_index].is_none()
+                        && world.get_entity(transition_entity).is_ok()
+                            == transition_expected.present
+                }
+                FailureCleanupTransitionStage::PhysicalAbsent(_) => {
+                    receipts[transition_index].is_none()
+                        && world.get_entity(transition_entity).is_err()
+                }
+                FailureCleanupTransitionStage::ReceiptCommitted(_) => {
+                    receipts[transition_index].is_some()
+                        && world.get_entity(transition_entity).is_err()
+                }
+                FailureCleanupTransitionStage::MountParentsCommitted => {
+                    unreachable!("mount-parent final refreeze has no single target transition")
+                }
+            };
+            if !transition_is_exact {
+                let expected = transition_expected.clone();
+                let observed = FrozenFailureCleanupObservedEntity::observe(
+                    world,
+                    world.resource::<RouteEntityRegistry>(),
+                    transition_entity,
+                );
+                return Err(self.evidence(
+                    stage,
+                    FailureCleanupPartitionRefreezeFailure::Target {
+                        entity: transition_entity,
+                        expected,
+                        observed: Some(observed),
+                    },
+                ));
+            }
+        }
+        let mut removed = receipts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, receipt)| {
+                receipt
+                    .is_some()
+                    .then_some(obligations[index].claim.entity())
+            })
+            .collect::<Vec<_>>();
+        if let FailureCleanupTransitionStage::PhysicalAbsent(entity) = stage {
+            removed.push(entity);
+        }
+        removed.sort_by_key(|entity| entity.to_bits());
+        removed.dedup();
+        let mut unavailable = removed.clone();
+        unavailable.extend(
+            self.target_observed
+                .iter()
+                .filter_map(|observed| (!observed.present).then_some(observed.entity)),
+        );
+        unavailable.sort_by_key(|entity| entity.to_bits());
+        unavailable.dedup();
+        let registry = world.resource::<RouteEntityRegistry>();
+        for expected in &self.target_observed {
+            if removed.contains(&expected.entity) {
+                let registry_is_exact = if matches!(
+                    stage,
+                    FailureCleanupTransitionStage::PhysicalAbsent(entity)
+                        if entity == expected.entity
+                ) {
+                    registry.record(expected.entity).is_some_and(|record| {
+                        Some(record.claim()) == expected.registry_claim.clone()
+                    })
+                } else {
+                    registry.record(expected.entity).is_none()
+                };
+                if world.get_entity(expected.entity).is_ok() || !registry_is_exact {
+                    let observed = FrozenFailureCleanupObservedEntity::observe(
+                        world,
+                        &registry,
+                        expected.entity,
+                    );
+                    return Err(self.evidence(
+                        stage,
+                        FailureCleanupPartitionRefreezeFailure::Target {
+                            entity: expected.entity,
+                            expected: expected.clone(),
+                            observed: Some(observed),
+                        },
+                    ));
+                }
+                continue;
+            }
+            let observed =
+                FrozenFailureCleanupObservedEntity::observe(world, &registry, expected.entity);
+            if !failure_cleanup_observed_entity_matches(
+                world,
+                expected,
+                &observed,
+                &unavailable,
+                None,
+            ) {
+                let observed = Some(observed);
+                return Err(self.evidence(
+                    stage,
+                    FailureCleanupPartitionRefreezeFailure::Target {
+                        entity: expected.entity,
+                        expected: expected.clone(),
+                        observed,
+                    },
+                ));
+            }
+        }
+        for expected in &self.protected_observed {
+            let observed =
+                FrozenFailureCleanupObservedEntity::observe(world, &registry, expected.entity);
+            let registry_manifest = mount_parent_next.and_then(|next| {
+                next.iter().find_map(|(claim, manifest)| {
+                    (claim.entity() == expected.entity).then_some(manifest)
+                })
+            });
+            if !failure_cleanup_observed_entity_matches(
+                world,
+                expected,
+                &observed,
+                &unavailable,
+                registry_manifest,
+            ) {
+                let observed = Some(observed);
+                return Err(self.evidence(
+                    stage,
+                    FailureCleanupPartitionRefreezeFailure::Protected {
+                        entity: expected.entity,
+                        expected: expected.clone(),
+                        observed,
+                    },
+                ));
+            }
+        }
+        let mut expected_closure = self
+            .protected_observed
+            .iter()
+            .map(|observed| observed.entity)
+            .chain(
+                self.target_observed
+                    .iter()
+                    .map(|observed| observed.entity)
+                    .filter(|entity| !unavailable.contains(entity)),
+            )
+            .collect::<Vec<_>>();
+        expected_closure.sort_by_key(|entity| entity.to_bits());
+        expected_closure.dedup();
+        let observed_roots = self
+            .roots
+            .iter()
+            .copied()
+            .filter(|entity| !unavailable.contains(entity))
+            .collect::<Vec<_>>();
+        let observed_closure =
+            freeze_failure_cleanup_closure(world, &observed_roots, &self.allowed_writes)
+                .unwrap_or_else(|| {
+                    let mut observed = observed_descendant_closure(world, observed_roots)
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    observed.sort_by_key(|entity| entity.to_bits());
+                    observed
+                });
+        if observed_closure != expected_closure {
+            return Err(self.evidence(
+                stage,
+                FailureCleanupPartitionRefreezeFailure::Closure {
+                    expected: expected_closure,
+                    observed: observed_closure,
+                },
+            ));
+        }
+        let observed_input = world.get_resource::<InputFocus>().map(InputFocus::get);
+        let observed_route = world
+            .get_resource::<RouteFocusState>()
+            .map(RouteFocusState::focused);
+        if observed_input != self.input_focus || observed_route != self.route_focus {
+            return Err(self.evidence(
+                stage,
+                FailureCleanupPartitionRefreezeFailure::Focus {
+                    expected_input: self.input_focus,
+                    observed_input,
+                    expected_route: self.route_focus,
+                    observed_route,
+                },
+            ));
+        }
+        let mount_parent_next_is_exact = mount_parent_next.is_none_or(|next| {
+            next.len() == mount_parents.len()
+                && mount_parents.iter().all(|parent| {
+                    next.iter()
+                        .filter(|(claim, _)| claim == &parent.claim)
+                        .count()
+                        == 1
+                })
+        });
+        if !mount_parent_next_is_exact
+            || mount_parents.iter().any(|parent| {
+                let expected_manifest = mount_parent_next
+                    .and_then(|next| {
+                        next.iter().find_map(|(claim, manifest)| {
+                            (claim == &parent.claim).then_some(manifest)
+                        })
+                    })
+                    .unwrap_or(&parent.manifest);
+                registry.record(parent.claim.entity()).is_none_or(|record| {
+                    record.claim() != parent.claim || record.manifest() != expected_manifest
+                }) || !mount_parent_physical_matches(world, &registry, parent)
+            })
+        {
+            return Err(self.evidence(stage, FailureCleanupPartitionRefreezeFailure::MountParents));
+        }
+        Ok(())
+    }
+}
+
 fn manifest_contains_required_allowing_children(
     world: &World,
     actual: &ComponentManifest,
@@ -6228,6 +6948,7 @@ pub(crate) struct PreparedCleanupLedger {
     batch: Option<CleanupBatch>,
     obligations: Vec<CleanupObligation>,
     mount_parents: Vec<CleanupMountParentSettlement>,
+    failure_cleanup_partition: Option<FrozenFailureCleanupPartition>,
     manifest_digest: u64,
     receipts: Vec<Option<CleanupReceipt>>,
     ledger_domain: u64,
@@ -6296,6 +7017,15 @@ impl PreparedCleanupLedger {
         self.batch = Some(batch);
         self
     }
+
+    pub(crate) fn bind_failure_cleanup_partition(
+        mut self,
+        partition: FrozenFailureCleanupPartition,
+    ) -> Self {
+        debug_assert!(self.failure_cleanup_partition.is_none());
+        self.failure_cleanup_partition = Some(partition);
+        self
+    }
 }
 
 pub(crate) struct CleanupLedger {
@@ -6315,6 +7045,8 @@ pub(crate) struct CleanupLedger {
     post_settlement_focus: Vec<PostSettlementFocusRoot>,
     authority_host_children: Option<Vec<Entity>>,
     back_no_target_authority_partition: Option<FrozenBackNoTargetAuthorityPartition>,
+    failure_cleanup_partition: Option<FrozenFailureCleanupPartition>,
+    failure_cleanup_inert: Option<FailureCleanupSettlementRefreezeEvidence>,
 }
 
 pub(crate) struct TargetPreparationPermanentHostEdge<'a> {
@@ -6595,6 +7327,25 @@ struct PreparedTargetPreparationPermanentRemoval {
     children_before: Vec<Entity>,
     retirement: PreparedExactRegistryRetirement,
     receipt: PreparedCleanupReceiptBatch,
+}
+
+struct PreparedFailureCleanupRemoval {
+    index: usize,
+    entity: Entity,
+    action: FailureCleanupRemovalAction,
+    retirement: Option<PreparedExactRegistryRetirement>,
+    receipt: PreparedCleanupReceiptBatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailureCleanupRemovalAction {
+    AlreadyAbsent,
+    Despawn,
+}
+
+struct PreparedFailureCleanupMountParentExchanges {
+    apply: Vec<(ExactRegistryClaim, ComponentManifest)>,
+    expected: Vec<(ExactRegistryClaim, ComponentManifest)>,
 }
 
 impl PreparedTargetPreparationPermanentRemoval {
@@ -7069,6 +7820,7 @@ impl CleanupLedger {
             batch,
             obligations: manifest.obligations,
             mount_parents: manifest.mount_parents,
+            failure_cleanup_partition: None,
             manifest_digest: manifest.digest,
             receipts,
             ledger_domain,
@@ -7311,6 +8063,8 @@ impl CleanupLedger {
             post_settlement_focus: Vec::new(),
             authority_host_children: None,
             back_no_target_authority_partition: None,
+            failure_cleanup_partition: prepared.failure_cleanup_partition,
+            failure_cleanup_inert: None,
         }
     }
 
@@ -7343,6 +8097,8 @@ impl CleanupLedger {
             post_settlement_focus: Vec::new(),
             authority_host_children: None,
             back_no_target_authority_partition: None,
+            failure_cleanup_partition: None,
+            failure_cleanup_inert: None,
         }
     }
 
@@ -7692,7 +8448,7 @@ impl CleanupLedger {
     }
 
     pub(crate) fn attempt(&mut self, world: &World) -> Option<CleanupAttempt> {
-        if self.completion_digest.is_some() {
+        if self.completion_digest.is_some() || self.failure_cleanup_inert.is_some() {
             return None;
         }
         let revision = self.next_attempt;
@@ -8279,6 +9035,24 @@ impl CleanupLedger {
     }
 
     pub(crate) fn settle(&mut self, world: &mut World, attempt: CleanupAttempt) -> bool {
+        self.settle_with_failure_source(world, attempt, None)
+    }
+
+    pub(crate) fn settle_failure_cleanup(
+        &mut self,
+        world: &mut World,
+        attempt: CleanupAttempt,
+        source: &FailureCleanupSourceProjection,
+    ) -> bool {
+        self.settle_with_failure_source(world, attempt, Some(source))
+    }
+
+    fn settle_with_failure_source(
+        &mut self,
+        world: &mut World,
+        attempt: CleanupAttempt,
+        failure_source: Option<&FailureCleanupSourceProjection>,
+    ) -> bool {
         if self.issued_attempt.as_ref() != Some(&attempt)
             || attempt.ledger_domain != self.ledger_domain
             || attempt.manifest_digest != self.manifest_digest
@@ -8310,6 +9084,19 @@ impl CleanupLedger {
             world,
             quarantine_focus_closure(&current_evidence, &self.obligations),
         );
+
+        if self.is_failed_prepared()
+            && self.failure_cleanup_partition.is_some()
+            && let Some(settled) = self.settle_failed_prepared_exact(
+                world,
+                &attempt,
+                &current_evidence,
+                &focus_closure,
+                failure_source,
+            )
+        {
+            return settled;
+        }
 
         if self.is_physical_authority_settlement() {
             if !self.settle_authority_evidence(world, &attempt, focus_closure) {
@@ -8447,6 +9234,242 @@ impl CleanupLedger {
         self.release_settled_owner();
         self.finish_if_settled();
         self.completion_digest.is_some()
+    }
+
+    fn retain_failure_cleanup_refreeze_stop(
+        &mut self,
+        partition: FrozenFailureCleanupPartition,
+        evidence: FailureCleanupSettlementRefreezeEvidence,
+    ) -> bool {
+        self.failure_cleanup_partition = Some(partition);
+        self.failure_cleanup_inert = Some(evidence);
+        self.issued_attempt = None;
+        false
+    }
+
+    fn settle_failed_prepared_exact(
+        &mut self,
+        world: &mut World,
+        attempt: &CleanupAttempt,
+        current_evidence: &[(usize, CleanupEvidence)],
+        focus_closure: &[Entity],
+        current_source: Option<&FailureCleanupSourceProjection>,
+    ) -> Option<bool> {
+        if quarantine_disposition(current_evidence, &self.obligations).is_some() {
+            return None;
+        }
+        if current_evidence.iter().any(|(_, evidence)| {
+            !matches!(
+                evidence,
+                CleanupEvidence::AlreadyAbsent | CleanupEvidence::Exact { .. }
+            )
+        }) {
+            return None;
+        }
+        let partition = self.failure_cleanup_partition.take()?;
+        let Some((first_index, _)) = current_evidence.first() else {
+            self.failure_cleanup_partition = Some(partition);
+            return None;
+        };
+        let first_entity = self.obligations[*first_index].claim.entity();
+        if let Err(evidence) = partition.refreeze(
+            world,
+            current_source,
+            &self.obligations,
+            &self.mount_parents,
+            &self.receipts,
+            self.manifest_digest,
+            None,
+            FailureCleanupTransitionStage::Prewrite(first_entity),
+        ) {
+            return Some(self.retain_failure_cleanup_refreeze_stop(partition, evidence));
+        }
+        release_cleanup_focus(world, focus_closure);
+        let Some(mount_parent_exchanges) =
+            self.prepare_failure_cleanup_mount_parent_exchanges(world)
+        else {
+            self.issued_attempt = None;
+            self.failure_cleanup_partition = Some(partition);
+            return Some(false);
+        };
+        let mut removals = Vec::new();
+        if removals.try_reserve_exact(current_evidence.len()).is_err() {
+            self.issued_attempt = None;
+            self.failure_cleanup_partition = Some(partition);
+            return Some(false);
+        }
+        for (index, evidence) in current_evidence {
+            let obligation = &self.obligations[*index];
+            let (action, disposition, retirement) = match evidence {
+                CleanupEvidence::AlreadyAbsent => {
+                    let retirement = match world
+                        .resource::<RouteEntityRegistry>()
+                        .record(obligation.claim.entity())
+                    {
+                        Some(record) if record.claim() == obligation.claim => {
+                            match prepare_exact_registry_retirement(
+                                world.resource::<RouteEntityRegistry>(),
+                                vec![obligation.claim.clone()],
+                            ) {
+                                Ok(retirement) => Some(retirement),
+                                Err(_) => {
+                                    self.issued_attempt = None;
+                                    self.failure_cleanup_partition = Some(partition);
+                                    return Some(false);
+                                }
+                            }
+                        }
+                        None => None,
+                        Some(_) => {
+                            self.issued_attempt = None;
+                            self.failure_cleanup_partition = Some(partition);
+                            return Some(false);
+                        }
+                    };
+                    (
+                        FailureCleanupRemovalAction::AlreadyAbsent,
+                        CleanupDisposition::AlreadyAbsent,
+                        retirement,
+                    )
+                }
+                CleanupEvidence::Exact { actual_parent, .. } => {
+                    let disposition = if *actual_parent == Some(obligation.expected_parent) {
+                        CleanupDisposition::Removed
+                    } else {
+                        CleanupDisposition::RemovedDetached
+                    };
+                    let retirement = match prepare_exact_registry_retirement(
+                        world.resource::<RouteEntityRegistry>(),
+                        vec![obligation.claim.clone()],
+                    ) {
+                        Ok(retirement) => retirement,
+                        Err(_) => {
+                            self.issued_attempt = None;
+                            self.failure_cleanup_partition = Some(partition);
+                            return Some(false);
+                        }
+                    };
+                    (
+                        FailureCleanupRemovalAction::Despawn,
+                        disposition,
+                        Some(retirement),
+                    )
+                }
+                CleanupEvidence::AuthorityLostResidual { .. } | CleanupEvidence::StaleClaim => {
+                    unreachable!("the failed exact path prevalidates its evidence kinds")
+                }
+            };
+            let Some(receipt) = self.prepare_receipt_batch(
+                attempt,
+                vec![CleanupReceipt::new(
+                    self.ledger_domain,
+                    attempt.revision,
+                    *index,
+                    disposition,
+                    obligation,
+                )],
+            ) else {
+                self.issued_attempt = None;
+                self.failure_cleanup_partition = Some(partition);
+                return Some(false);
+            };
+            removals.push(PreparedFailureCleanupRemoval {
+                index: *index,
+                entity: obligation.claim.entity(),
+                action,
+                retirement,
+                receipt,
+            });
+        }
+
+        for removal in removals {
+            if let Err(evidence) = partition.refreeze(
+                world,
+                current_source,
+                &self.obligations,
+                &self.mount_parents,
+                &self.receipts,
+                self.manifest_digest,
+                None,
+                FailureCleanupTransitionStage::Prewrite(removal.entity),
+            ) {
+                return Some(self.retain_failure_cleanup_refreeze_stop(partition, evidence));
+            }
+            let planned = attempt
+                .evidence
+                .iter()
+                .find_map(|(index, evidence)| (*index == removal.index).then_some(evidence));
+            if planned.is_none_or(|planned| {
+                &classify_obligation(world, &self.obligations, &self.receipts, removal.index)
+                    != planned
+            }) {
+                self.issued_attempt = None;
+                self.failure_cleanup_partition = Some(partition);
+                return Some(false);
+            }
+            if removal.action == FailureCleanupRemovalAction::Despawn {
+                if !world.despawn(removal.entity) {
+                    self.issued_attempt = None;
+                    self.failure_cleanup_partition = Some(partition);
+                    return Some(false);
+                }
+                world.flush();
+                if let Err(evidence) = partition.refreeze(
+                    world,
+                    current_source,
+                    &self.obligations,
+                    &self.mount_parents,
+                    &self.receipts,
+                    self.manifest_digest,
+                    None,
+                    FailureCleanupTransitionStage::PhysicalAbsent(removal.entity),
+                ) {
+                    return Some(self.retain_failure_cleanup_refreeze_stop(partition, evidence));
+                }
+            }
+            if let Some(retirement) = removal.retirement {
+                apply_prepared_exact_registry_retirement(
+                    &mut world.resource_mut::<RouteEntityRegistry>(),
+                    retirement,
+                );
+            }
+            self.commit_receipt_batch(removal.receipt);
+            if let Err(evidence) = partition.refreeze(
+                world,
+                current_source,
+                &self.obligations,
+                &self.mount_parents,
+                &self.receipts,
+                self.manifest_digest,
+                None,
+                FailureCleanupTransitionStage::ReceiptCommitted(removal.entity),
+            ) {
+                return Some(self.retain_failure_cleanup_refreeze_stop(partition, evidence));
+            }
+        }
+        let mount_parent_next =
+            Self::apply_failure_cleanup_mount_parent_exchanges(world, mount_parent_exchanges);
+        if let Err(evidence) = partition.refreeze(
+            world,
+            current_source,
+            &self.obligations,
+            &self.mount_parents,
+            &self.receipts,
+            self.manifest_digest,
+            Some(&mount_parent_next),
+            FailureCleanupTransitionStage::MountParentsCommitted,
+        ) {
+            return Some(self.retain_failure_cleanup_refreeze_stop(partition, evidence));
+        }
+        if !focus_is_released(world, focus_closure) {
+            self.issued_attempt = None;
+            self.failure_cleanup_partition = Some(partition);
+            return Some(false);
+        }
+        self.post_settlement_focus.clear();
+        self.finish_if_settled();
+        self.failure_cleanup_partition = Some(partition);
+        Some(self.completion_digest.is_some())
     }
 
     fn prepare_authority_host_edge(
@@ -9144,6 +10167,52 @@ impl CleanupLedger {
             .collect()
     }
 
+    fn prepare_failure_cleanup_mount_parent_exchanges(
+        &self,
+        world: &World,
+    ) -> Option<PreparedFailureCleanupMountParentExchanges> {
+        let children = world.components().component_id::<Children>();
+        let registry = world.get_resource::<RouteEntityRegistry>()?;
+        let mut apply = Vec::new();
+        let mut expected = Vec::new();
+        apply.try_reserve_exact(self.mount_parents.len()).ok()?;
+        expected.try_reserve_exact(self.mount_parents.len()).ok()?;
+        for parent in &self.mount_parents {
+            if !mount_parent_physical_matches(world, registry, parent) {
+                return None;
+            }
+            let record = registry.record(parent.claim.entity())?;
+            if record.claim() != parent.claim || record.manifest() != &parent.manifest {
+                return None;
+            }
+            let next = ComponentManifest::new(
+                parent
+                    .manifest
+                    .component_ids()
+                    .iter()
+                    .copied()
+                    .filter(|component| Some(*component) != children)
+                    .chain(children.filter(|_| !parent.children_after.is_empty())),
+            );
+            apply.push((parent.claim.clone(), next.clone()));
+            expected.push((parent.claim.clone(), next));
+        }
+        Some(PreparedFailureCleanupMountParentExchanges { apply, expected })
+    }
+
+    fn apply_failure_cleanup_mount_parent_exchanges(
+        world: &mut World,
+        prepared: PreparedFailureCleanupMountParentExchanges,
+    ) -> Vec<(ExactRegistryClaim, ComponentManifest)> {
+        for (claim, next) in prepared.apply {
+            let applied = world
+                .resource_mut::<RouteEntityRegistry>()
+                .compare_exchange_manifest(&claim, next);
+            debug_assert_eq!(applied.as_ref(), Some(&claim));
+        }
+        prepared.expected
+    }
+
     fn settle_mount_parents(&self, world: &mut World) -> bool {
         let Some(exchanges) = self.prepare_mount_parent_exchanges(world) else {
             return false;
@@ -9663,6 +10732,13 @@ impl CleanupLedger {
     #[cfg(test)]
     pub(crate) fn issued_attempt_present_for_test(&self) -> bool {
         self.issued_attempt.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failure_cleanup_refreeze_evidence_for_test(
+        &self,
+    ) -> Option<&FailureCleanupSettlementRefreezeEvidence> {
+        self.failure_cleanup_inert.as_ref()
     }
 
     #[cfg(test)]
@@ -11658,6 +12734,8 @@ pub(crate) mod tests {
             post_settlement_focus: Vec::new(),
             authority_host_children: None,
             back_no_target_authority_partition: None,
+            failure_cleanup_partition: None,
+            failure_cleanup_inert: None,
         };
         let source = ledger.back_no_target_zero_completion_source_identity();
         let prepared = PreparedBackNoTargetZeroCompletion {
