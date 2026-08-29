@@ -31,6 +31,7 @@ pub const AUTHORITY_REGRESSION_CATALOGUE: &[&str] = &[
     "mount_token_replay_is_zero_write",
     "slot_lifecycle_has_no_orphans",
     "active_cycle_enters_authority_settlement",
+    "error_outlet_role_classification_is_preserved",
 ];
 
 fn package_root() -> PathBuf {
@@ -718,26 +719,26 @@ fn recovery_authority_parser_rejects_invalid_rows() {
     let rows = [
         source.replacen(
             "| `post_commit_host_loss_preserves_committed_history` | R2 Compound settlement | planned |",
-            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | active |",
             1,
         ),
         source.replacen(
-            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
-            "| `` | R1 Error presentation | planned |",
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | active |",
+            "| `` | R1 Error presentation | active |",
             1,
         ),
         source.replacen(
-            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
-            "| `unknown_recovery_test` | R1 Error presentation | planned |",
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | active |",
+            "| `unknown_recovery_test` | R1 Error presentation | active |",
             1,
         ),
         source.replacen(
-            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
-            "| `error_outlet_role_classification_is_preserved` | Unknown slice | planned |",
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | active |",
+            "| `error_outlet_role_classification_is_preserved` | Unknown slice | active |",
             1,
         ),
         source.replacen(
-            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | active |",
             "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | unknown |",
             1,
         ),
@@ -748,11 +749,7 @@ fn recovery_authority_parser_rejects_invalid_rows() {
             "Recovery authority parser must reject empty, duplicate, or unknown rows"
         );
     }
-    let active = source.replacen(
-        "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
-        "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | active |",
-        1,
-    );
+    let active = source.clone();
     let direct = syn::parse_file("#[test] fn error_outlet_role_classification_is_preserved() {}")
         .expect("synthetic authority source must parse");
     parse_recovery_authority_rows_with_source(&active, &direct);
@@ -782,12 +779,12 @@ fn recovery_planned_rows_do_not_enter_the_runtime_catalogue() {
         .filter(|row| row.state == "planned")
         .map(|row| row.test_function)
         .collect::<BTreeSet<_>>();
-    assert_eq!(planned.len(), 3, "Recovery must retain three planned rows");
+    assert_eq!(planned.len(), 2, "Recovery must retain two planned rows");
     let catalogue = catalogue_set();
     assert_eq!(
         catalogue.len(),
-        24,
-        "runtime catalogue must stay locked at 24"
+        25,
+        "runtime catalogue must contain the completed R1 row"
     );
     let overlap = planned
         .intersection(&catalogue)
@@ -810,7 +807,7 @@ fn direct_tests(file: &syn::File) -> Vec<&ItemFn> {
 }
 
 #[test]
-fn catalogue_matches_root_nested_and_active_history_profiles_and_final_mvp_vocabulary() {
+fn catalogue_matches_root_nested_and_active_history_recovery_profiles_and_final_mvp_vocabulary() {
     let root_profile =
         fs::read_to_string(workspace_root().join("docs/root-push-contract-profile.md"))
             .expect("Root profile must be readable");
@@ -869,7 +866,7 @@ fn catalogue_matches_root_nested_and_active_history_profiles_and_final_mvp_vocab
     );
     assert_eq!(
         AUTHORITY_REGRESSION_CATALOGUE, expected,
-        "Rust catalogue must preserve the Root, Nested, and active History profile union order"
+        "Rust catalogue must preserve the Root, Nested, active History, and active Recovery profile union order"
     );
     let root_set = root_names.into_iter().collect::<BTreeSet<_>>();
     let nested_set = nested_names.into_iter().collect::<BTreeSet<_>>();
@@ -899,14 +896,18 @@ fn catalogue_matches_root_nested_and_active_history_profiles_and_final_mvp_vocab
     let expected_set = expected.into_iter().collect::<BTreeSet<_>>();
     assert_eq!(
         expected_set.len(),
-        24,
-        "active History cumulative catalogue must be 24"
+        25,
+        "active History plus Recovery R1 cumulative catalogue must be 25"
     );
     let catalogue = catalogue_set();
-    assert_eq!(catalogue.len(), 24, "Rust catalogue must stay locked at 24");
+    assert_eq!(
+        catalogue.len(),
+        25,
+        "Rust catalogue must include the active Recovery R1 row"
+    );
     assert_eq!(
         catalogue, expected_set,
-        "Rust catalogue must match the Root, Nested, and active History profile union"
+        "Rust catalogue must match the Root, Nested, active History, and active Recovery profile union"
     );
     let final_names = parse_final_mvp_catalogue(&final_mvp);
     let unknown = catalogue

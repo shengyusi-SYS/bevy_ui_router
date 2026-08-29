@@ -24,10 +24,15 @@ use bevy_ui::{BackgroundColor, Node, Val};
 #[cfg(feature = "test-support")]
 use bevy_ui_router::ecs::{AuthorityFrameLifecycle, RouterAuthorityAudits};
 use bevy_ui_router::prelude::*;
+#[cfg(feature = "test-support")]
+use bevy_ui_router_ecs::test_support::{
+    testing_back_request_inventory, testing_router_request_inventory,
+};
 
 const NORMAL_RECT_WIDTH: u16 = 31;
 const FALLBACK_RECT_WIDTH: u16 = 79;
 const PARTIAL_RECT_WIDTH: u16 = 199;
+const RECOVERY_PARTIAL_RECT_WIDTH: u16 = 197;
 
 #[derive(Component, Debug, Eq, PartialEq)]
 struct HostSentinel(u32);
@@ -55,6 +60,10 @@ enum FixtureMode {
     Success { width: u16 },
     BuildFailure,
     ApplyFailure,
+    DuplicateOutlet,
+    ForeignSession,
+    RelationshipCycle,
+    MissingOutlet { width: u16 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,7 +155,28 @@ impl FixtureControl {
 struct FixtureDriver {
     key: ViewDriverKey,
     control: FixtureControl,
-    outlet_view: Option<RouteViewKey>,
+    outlet_views: Vec<RouteViewKey>,
+    prior_content: Option<ContentEntity>,
+}
+
+struct InstallMatrixDriver {
+    key: ViewDriverKey,
+}
+
+impl EcsViewDriver for InstallMatrixDriver {
+    fn key(&self) -> ViewDriverKey {
+        self.key.clone()
+    }
+
+    fn apply(
+        &mut self,
+        _effect: &ViewBuildEffect,
+        content: &mut FrameContentWriter<'_>,
+        report: EcsViewReportSession<'_>,
+    ) -> ViewBuildReport {
+        content.spawn_empty().expect("install matrix driver stages");
+        report.applied()
+    }
 }
 
 impl EcsViewDriver for FixtureDriver {
@@ -163,7 +193,8 @@ impl EcsViewDriver for FixtureDriver {
         match self.control.mode_and_record(effect) {
             FixtureMode::Success { width } => {
                 let container = stage_rect(content, width);
-                if self.outlet_view.as_ref() == Some(effect.view()) {
+                self.prior_content = Some(container);
+                if self.outlet_views.iter().any(|view| view == effect.view()) {
                     content
                         .declare_outlet(container, RouteSlotKey::default())
                         .expect("layout outlet should stage");
@@ -172,8 +203,52 @@ impl EcsViewDriver for FixtureDriver {
             }
             FixtureMode::BuildFailure => report.build_failed("fixture build failure"),
             FixtureMode::ApplyFailure => {
-                stage_rect(content, PARTIAL_RECT_WIDTH);
+                let width = match effect.input().origin() {
+                    FrameOrigin::RouteError(_) | FrameOrigin::RouterFallback => {
+                        RECOVERY_PARTIAL_RECT_WIDTH
+                    }
+                    FrameOrigin::MatchedRoute(_) => PARTIAL_RECT_WIDTH,
+                };
+                self.prior_content = Some(stage_rect(content, width));
                 report.apply_failed("fixture apply failure after partial plan")
+            }
+            FixtureMode::DuplicateOutlet => {
+                let anchor = content
+                    .spawn_empty()
+                    .expect("duplicate outlet anchor stages");
+                content
+                    .declare_outlet(anchor, RouteSlotKey::default())
+                    .expect("first outlet declaration stages");
+                let error = content
+                    .declare_outlet(anchor, RouteSlotKey::default())
+                    .expect_err("duplicate outlet must be rejected by the production writer");
+                report.apply_failed(error.to_string())
+            }
+            FixtureMode::ForeignSession => {
+                let foreign = self
+                    .prior_content
+                    .expect("the preceding committed frame supplies a foreign session handle");
+                let error = content
+                    .declare_outlet(foreign, RouteSlotKey::default())
+                    .expect_err(
+                        "a foreign-session outlet anchor must be rejected by the production writer",
+                    );
+                report.apply_failed(error.to_string())
+            }
+            FixtureMode::RelationshipCycle => {
+                let parent = content.spawn_empty().expect("cycle parent stages");
+                let child = content.spawn_empty().expect("cycle child stages");
+                content
+                    .add_child(parent, child)
+                    .expect("the acyclic prefix stages");
+                let error = content
+                    .add_child(child, parent)
+                    .expect_err("relationship cycle must be rejected by the production writer");
+                report.apply_failed(error.to_string())
+            }
+            FixtureMode::MissingOutlet { width } => {
+                self.prior_content = Some(stage_rect(content, width));
+                report.applied()
             }
         }
     }
@@ -230,7 +305,8 @@ fn root_fixture(pattern: &str) -> RootFixture {
         .register_ui_view_driver(FixtureDriver {
             key: ViewDriverKey::new("fixture-driver").unwrap(),
             control: control.clone(),
-            outlet_view: None,
+            outlet_views: Vec::new(),
+            prior_content: None,
         })
         .unwrap();
     let routes = RouteTree::builder()
@@ -325,6 +401,155 @@ struct NestedFixture {
     host_fingerprint: HostBoundaryFingerprint,
 }
 
+struct RecoveryR1Fixture {
+    app: App,
+    router: RouterHandle,
+    control: FixtureControl,
+    section: RouteViewKey,
+    leaf: RouteViewKey,
+    error: RouteViewKey,
+    fallback: RouteViewKey,
+    root_route: RouteId,
+    boundary_route: RouteId,
+    host_fingerprint: HostBoundaryFingerprint,
+}
+
+fn recovery_r1_fixture(label: &str) -> RecoveryR1Fixture {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+
+    let root = RouteViewKey::new(format!("{label}-normal-root")).unwrap();
+    let section = RouteViewKey::new(format!("{label}-normal-section")).unwrap();
+    let leaf = RouteViewKey::new(format!("{label}-normal-leaf")).unwrap();
+    let error = RouteViewKey::new(format!("{label}-bound-error")).unwrap();
+    let fallback = RouteViewKey::new(format!("{label}-router-fallback")).unwrap();
+    let boundary = ErrorBoundaryKey::named(format!("{label}-boundary")).unwrap();
+    let control = FixtureControl::default();
+    for (view, width) in [
+        (root.clone(), 51),
+        (section.clone(), 53),
+        (leaf.clone(), 55),
+        (error.clone(), 57),
+        (fallback.clone(), 59),
+    ] {
+        control.set_mode(&view, FixtureMode::Success { width });
+    }
+    let driver = app
+        .register_ui_view_driver(FixtureDriver {
+            key: ViewDriverKey::new(format!("{label}-driver")).unwrap(),
+            control: control.clone(),
+            outlet_views: vec![root.clone(), section.clone()],
+            prior_content: None,
+        })
+        .unwrap();
+
+    let mut routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::pathless(),
+            RouteNodeOptions::new().with_view(root.clone()),
+        )
+        .unwrap();
+    let root_route = routes.root_id().unwrap();
+    let boundary_route = routes
+        .route_with_options(
+            root_route,
+            RoutePattern::path("section").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(section.clone())
+                .with_slot(RouteSlotKey::default())
+                .with_error_view(boundary, error.clone()),
+        )
+        .unwrap();
+    routes
+        .route_with_options(
+            boundary_route,
+            RoutePattern::path("items/:id").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(leaf.clone())
+                .with_slot(RouteSlotKey::default()),
+        )
+        .unwrap();
+    let mut views = RouteViewRegistry::new();
+    for view in [
+        root.clone(),
+        section.clone(),
+        leaf.clone(),
+        error.clone(),
+        fallback.clone(),
+    ] {
+        views
+            .insert(view, RouteViewDescriptor::new(driver.clone()))
+            .unwrap();
+    }
+    let router = app
+        .add_ui_router(RouterConfig::new(
+            routes.build().unwrap(),
+            views,
+            fallback.clone(),
+        ))
+        .unwrap();
+    let host = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(640.0),
+                height: Val::Px(360.0),
+                ..Node::default()
+            },
+            HostSentinel(7),
+            HostMetadata(73),
+            RouterHostRegistration::new(router),
+        ))
+        .id();
+    let existing_child = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(13.0),
+                height: Val::Px(17.0),
+                ..Node::default()
+            },
+            ExistingChild(11),
+            ChildOf(host),
+        ))
+        .id();
+    let existing_sibling = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(19.0),
+                height: Val::Px(29.0),
+                ..Node::default()
+            },
+            ExistingSibling(17),
+            ChildOf(host),
+        ))
+        .id();
+    let existing_children = vec![existing_child, existing_sibling];
+    let mut host_fingerprint = capture_host_boundary(&app, host, &existing_children);
+    app.update();
+    host_fingerprint.top_slot = app
+        .world()
+        .get::<Children>(host)
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|child| !existing_children.contains(child));
+
+    RecoveryR1Fixture {
+        app,
+        router,
+        control,
+        section,
+        leaf,
+        error,
+        fallback,
+        root_route,
+        boundary_route,
+        host_fingerprint,
+    }
+}
+
 fn nested_fixture() -> NestedFixture {
     let mut app = App::new();
     app.add_plugins(BevyUiRouterPlugin::default());
@@ -344,7 +569,8 @@ fn nested_fixture() -> NestedFixture {
         .register_ui_view_driver(FixtureDriver {
             key: ViewDriverKey::new("nested-driver").unwrap(),
             control: control.clone(),
-            outlet_view: Some(layout.clone()),
+            outlet_views: vec![layout.clone()],
+            prior_content: None,
         })
         .unwrap();
     let mut routes = RouteTree::builder()
@@ -441,6 +667,134 @@ fn component_manifest(app: &App, entity: Entity) -> Vec<ComponentId> {
         .archetype()
         .components()
         .to_vec()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorldComponentFingerprint {
+    entities: Vec<(Entity, Vec<ComponentId>, Option<Entity>, Vec<Entity>)>,
+}
+
+fn world_component_fingerprint(app: &App) -> WorldComponentFingerprint {
+    let mut entities = app
+        .world()
+        .iter_entities()
+        .map(|entity| {
+            (
+                entity.id(),
+                entity.archetype().components().to_vec(),
+                entity.get::<ChildOf>().map(ChildOf::parent),
+                entity
+                    .get::<Children>()
+                    .map(|children| children.iter().copied().collect())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    entities.sort_by_key(|(entity, _, _, _)| entity.to_bits());
+    WorldComponentFingerprint { entities }
+}
+
+fn install_matrix_baseline(app: &mut App, label: &str) -> RouterHandle {
+    let driver = app
+        .register_ui_view_driver(InstallMatrixDriver {
+            key: ViewDriverKey::new(format!("{label}-baseline-driver")).unwrap(),
+        })
+        .unwrap();
+    let view = RouteViewKey::new(format!("{label}-baseline-view")).unwrap();
+    let routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("baseline").unwrap(),
+            RouteNodeOptions::new().with_view(view.clone()),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut views = RouteViewRegistry::new();
+    views
+        .insert(view.clone(), RouteViewDescriptor::new(driver))
+        .unwrap();
+    app.add_ui_router(RouterConfig::new(routes, views, view))
+        .unwrap()
+}
+
+#[derive(Clone, Copy)]
+enum InstallMatrixCase {
+    Valid,
+    MissingError,
+    MissingNormalPrecedence,
+    UnknownNormal,
+    UnknownError,
+    UnregisteredNormal,
+    UnregisteredError,
+    UnregisteredFallback,
+    MissingFallback,
+}
+
+fn recovery_install_config(app: &mut App, label: &str, case: InstallMatrixCase) -> RouterConfig {
+    let registered_driver = app
+        .register_ui_view_driver(InstallMatrixDriver {
+            key: ViewDriverKey::new(format!("{label}-registered-driver")).unwrap(),
+        })
+        .unwrap();
+    let absent_driver = ViewDriverKey::new(format!("{label}-absent-driver")).unwrap();
+    let normal = RouteViewKey::new(format!("{label}-normal")).unwrap();
+    let error = RouteViewKey::new(format!("{label}-error")).unwrap();
+    let fallback = RouteViewKey::new(format!("{label}-fallback")).unwrap();
+    let boundary = ErrorBoundaryKey::named(format!("{label}-boundary")).unwrap();
+
+    let options = match case {
+        InstallMatrixCase::MissingNormalPrecedence => {
+            RouteNodeOptions::new().with_error_boundary(boundary)
+        }
+        InstallMatrixCase::MissingError => RouteNodeOptions::new()
+            .with_view(normal.clone())
+            .with_error_boundary(boundary),
+        _ => RouteNodeOptions::new()
+            .with_view(normal.clone())
+            .with_error_view(boundary, error.clone()),
+    };
+    let routes = RouteTree::builder()
+        .root_with_options(RoutePattern::path("candidate").unwrap(), options)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut views = RouteViewRegistry::new();
+    if !matches!(case, InstallMatrixCase::UnknownNormal) {
+        let driver = if matches!(case, InstallMatrixCase::UnregisteredNormal) {
+            absent_driver.clone()
+        } else {
+            registered_driver.clone()
+        };
+        views
+            .insert(normal, RouteViewDescriptor::new(driver))
+            .unwrap();
+    }
+    if !matches!(
+        case,
+        InstallMatrixCase::MissingError
+            | InstallMatrixCase::MissingNormalPrecedence
+            | InstallMatrixCase::UnknownError
+    ) {
+        let driver = if matches!(case, InstallMatrixCase::UnregisteredError) {
+            absent_driver.clone()
+        } else {
+            registered_driver.clone()
+        };
+        views
+            .insert(error, RouteViewDescriptor::new(driver))
+            .unwrap();
+    }
+    if !matches!(case, InstallMatrixCase::MissingFallback) {
+        let driver = if matches!(case, InstallMatrixCase::UnregisteredFallback) {
+            absent_driver
+        } else {
+            registered_driver
+        };
+        views
+            .insert(fallback.clone(), RouteViewDescriptor::new(driver))
+            .unwrap();
+    }
+    RouterConfig::new(routes, views, fallback)
 }
 
 fn capture_host_boundary(
@@ -587,6 +941,58 @@ fn drive_request_to_terminal(
         }
     }
     panic!("fixture request did not settle within 16 App::update calls")
+}
+
+fn drive_r1_request_to_terminal_preserving_old_active(
+    app: &mut App,
+    router: RouterHandle,
+    request: NavigationRequestId,
+    old_active: Option<&ActivePresentation>,
+) -> (NavigationRequestSnapshot, usize) {
+    let mut precommit_observations = 0;
+    for _ in 0..24 {
+        app.update();
+        let request_snapshot = match app
+            .world()
+            .resource::<RouterSnapshots>()
+            .request(router, request)
+        {
+            RequestLookup::Found(snapshot) => snapshot.clone(),
+            RequestLookup::NotRetained | RequestLookup::Unknown => continue,
+        };
+        let committed = request_snapshot
+            .trace()
+            .iter()
+            .any(|event| event.kind() == NavigationTraceEventKind::CommitPublished);
+        if !committed {
+            if let Some(old_active) = old_active {
+                assert_eq!(
+                    router_snapshot(app, router).active(),
+                    old_active,
+                    "the previously published presentation remains visible before error commit"
+                );
+                precommit_observations += 1;
+            }
+        }
+        if matches!(
+            request_snapshot.status(),
+            RequestStatus::Succeeded | RequestStatus::Failed(_)
+        ) {
+            return (request_snapshot, precommit_observations);
+        }
+    }
+    let snapshot = router_snapshot(app, router);
+    let request = match app
+        .world()
+        .resource::<RouterSnapshots>()
+        .request(router, request)
+    {
+        RequestLookup::Found(request) => Some(request.clone()),
+        _ => None,
+    };
+    panic!(
+        "R1 request did not settle within 24 App::update calls: router={snapshot:?} request={request:?}"
+    )
 }
 
 fn request_snapshot(
@@ -1149,6 +1555,130 @@ fn next_trace_event(
         .skip(after.map_or(0, |index| index + 1))
         .find_map(|(index, event)| (event.kind() == kind && predicate(event)).then_some(index))
         .unwrap_or_else(|| panic!("missing ordered {kind:?} event after {after:?}: {trace:?}"))
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn recovery_r1_install_matrix_is_synchronous_and_world_zero() {
+    {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let config =
+            recovery_install_config(&mut app, "r1-install-valid", InstallMatrixCase::Valid);
+        let world_before = world_component_fingerprint(&app);
+        let router = app
+            .add_ui_router(config)
+            .expect("bound normal and error views with registered drivers install synchronously");
+        assert!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .get(router)
+                .is_some()
+        );
+        assert_eq!(world_component_fingerprint(&app), world_before);
+    }
+
+    let rows = [
+        (
+            "missing-error",
+            InstallMatrixCase::MissingError,
+            RouterInstallErrorKind::MissingErrorView,
+        ),
+        (
+            "missing-normal-precedence",
+            InstallMatrixCase::MissingNormalPrecedence,
+            RouterInstallErrorKind::MissingRouteView,
+        ),
+        (
+            "unknown-normal",
+            InstallMatrixCase::UnknownNormal,
+            RouterInstallErrorKind::UnknownRouteView,
+        ),
+        (
+            "unknown-error",
+            InstallMatrixCase::UnknownError,
+            RouterInstallErrorKind::UnknownRouteView,
+        ),
+        (
+            "unregistered-normal",
+            InstallMatrixCase::UnregisteredNormal,
+            RouterInstallErrorKind::UnknownViewDriver,
+        ),
+        (
+            "unregistered-error",
+            InstallMatrixCase::UnregisteredError,
+            RouterInstallErrorKind::UnknownViewDriver,
+        ),
+        (
+            "unregistered-fallback",
+            InstallMatrixCase::UnregisteredFallback,
+            RouterInstallErrorKind::UnknownViewDriver,
+        ),
+        (
+            "missing-fallback",
+            InstallMatrixCase::MissingFallback,
+            RouterInstallErrorKind::MissingFallbackView,
+        ),
+    ];
+
+    for (label, case, expected) in rows {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let baseline = install_matrix_baseline(&mut app, label);
+        let config = recovery_install_config(&mut app, label, case);
+        let router_before = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(baseline)
+            .expect("baseline router is synchronously visible")
+            .clone();
+        let requests_before =
+            testing_back_request_inventory(&app.world().resource::<RouterNavigation>(), baseline)
+                .expect("baseline router has a request inventory");
+        let inventory_before = testing_router_request_inventory(
+            app.world().resource::<RouterNavigation>(),
+            app.world().resource::<RouterSnapshots>(),
+        );
+        let world_before = world_component_fingerprint(&app);
+        let host_registrations_before = app
+            .world()
+            .iter_entities()
+            .filter(|entity| entity.get::<RouterHostRegistration>().is_some())
+            .count();
+
+        let error = app
+            .add_ui_router(config)
+            .expect_err("invalid installation must fail synchronously without App::update");
+
+        assert_eq!(error.kind(), expected, "install row {label}");
+        assert_eq!(world_component_fingerprint(&app), world_before, "{label}");
+        assert_eq!(
+            app.world()
+                .iter_entities()
+                .filter(|entity| entity.get::<RouterHostRegistration>().is_some())
+                .count(),
+            host_registrations_before,
+            "{label}"
+        );
+        assert_eq!(
+            app.world().resource::<RouterSnapshots>().get(baseline),
+            Some(&router_before),
+            "{label}"
+        );
+        assert_eq!(
+            testing_back_request_inventory(&app.world().resource::<RouterNavigation>(), baseline,),
+            Some(requests_before),
+            "{label}"
+        );
+        assert_eq!(
+            testing_router_request_inventory(
+                app.world().resource::<RouterNavigation>(),
+                app.world().resource::<RouterSnapshots>(),
+            ),
+            inventory_before,
+            "install row {label} must add neither a router nor a request to any inventory",
+        );
+    }
 }
 
 #[test]
@@ -2306,5 +2836,466 @@ fn root_push_fallback_failure_preserves_old_state_and_does_not_poison_the_queue(
         Some(&RouteLocation::new("/known/two"))
     );
     assert_eq!(recovered_router.history().len(), 2);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
+fn recovery_r1_journey_d_uses_bound_error_views_for_failure_matrix() {
+    {
+        let mut fixture = recovery_r1_fixture("r1-match");
+        let first = push_and_settle(
+            &mut fixture.app,
+            fixture.router,
+            RouteLocation::new("/section/items/1"),
+            None,
+            None,
+        );
+        assert_succeeded(&request_snapshot(&fixture.app, fixture.router, first));
+        let before = router_snapshot(&fixture.app, fixture.router);
+        let old_active = before.active().clone();
+        let old_history = before.history().clone();
+        let requested = RouteLocation::new("/does-not-match");
+        let request = fixture
+            .app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(fixture.router, requested.clone())
+            .unwrap();
+        let (failed, _observed) = drive_r1_request_to_terminal_preserving_old_active(
+            &mut fixture.app,
+            fixture.router,
+            request,
+            Some(&old_active),
+        );
+        assert_failed(&failed, NavigationFailureKind::Match);
+        assert_eq!(failed.requested(), Some(&requested));
+        assert!(failed.matched().is_none());
+        let after = router_snapshot(&fixture.app, fixture.router);
+        assert_eq!(after.history(), &old_history);
+        assert_eq!(after.active().requested(), Some(&requested));
+        assert!(after.active().matched().is_none());
+        assert_eq!(
+            after.active().failure().map(NavigationFailure::kind),
+            Some(NavigationFailureKind::Match)
+        );
+        assert_eq!(after.active().frames().len(), 1);
+        assert_eq!(
+            after.active().frames()[0].origin(),
+            &FrameOrigin::RouterFallback
+        );
+        assert_eq!(
+            fixture.control.effects().last().unwrap().view,
+            fixture.fallback
+        );
+        assert_terminal_owner_closure(&fixture.app, fixture.router);
+        assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+    }
+
+    let rows = [
+        (
+            "build",
+            FixtureMode::BuildFailure,
+            NavigationFailureKind::Build,
+            false,
+        ),
+        (
+            "apply-partial",
+            FixtureMode::ApplyFailure,
+            NavigationFailureKind::Apply,
+            false,
+        ),
+        (
+            "duplicate-outlet",
+            FixtureMode::DuplicateOutlet,
+            NavigationFailureKind::Apply,
+            true,
+        ),
+        (
+            "foreign-session",
+            FixtureMode::ForeignSession,
+            NavigationFailureKind::Apply,
+            true,
+        ),
+        (
+            "relationship-cycle",
+            FixtureMode::RelationshipCycle,
+            NavigationFailureKind::Apply,
+            true,
+        ),
+    ];
+    for (label, mode, expected, plan_failure) in rows {
+        let mut fixture = recovery_r1_fixture(&format!("r1-{label}"));
+        let first_location = RouteLocation::new("/section/items/1");
+        let first = push_and_settle(
+            &mut fixture.app,
+            fixture.router,
+            first_location.clone(),
+            None,
+            None,
+        );
+        assert_succeeded(&request_snapshot(&fixture.app, fixture.router, first));
+        let before = router_snapshot(&fixture.app, fixture.router);
+        let old_active = before.active().clone();
+        let old_frames = old_active.frames().to_vec();
+        let old_history = before.history().clone();
+        assert_eq!(old_frames.len(), 3);
+        fixture.control.set_mode(&fixture.leaf, mode);
+        let requested = RouteLocation::new("/section/items/2");
+        let request = fixture
+            .app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(fixture.router, requested.clone())
+            .unwrap();
+        let (failed, observed) = drive_r1_request_to_terminal_preserving_old_active(
+            &mut fixture.app,
+            fixture.router,
+            request,
+            Some(&old_active),
+        );
+        assert!(
+            observed > 0,
+            "row {label} must expose a pre-commit interval"
+        );
+        assert_failed(&failed, expected);
+        assert_eq!(failed.requested(), Some(&requested));
+        let matched = failed
+            .matched()
+            .expect("post-match failure retains the exact matched fingerprint")
+            .clone();
+        let terminal = failed
+            .trace()
+            .iter()
+            .position(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+            .unwrap();
+        assert_eq!(terminal + 1, failed.trace().len(), "row {label}");
+        assert!(
+            failed
+                .trace()
+                .iter()
+                .enumerate()
+                .all(
+                    |(index, event)| event.kind() != NavigationTraceEventKind::CleanupSettled
+                        || index < terminal
+                ),
+            "row {label} settles every cleanup before terminal"
+        );
+        if mode == FixtureMode::ApplyFailure {
+            let cleanup_phase = failed
+                .trace()
+                .iter()
+                .position(|event| event.kind() == NavigationTraceEventKind::CleanupSettled)
+                .expect("partial output cleanup settles before recovery issuance");
+            let continuation = failed
+                .trace()
+                .iter()
+                .position(|event| event.kind() == NavigationTraceEventKind::HistoryIntentRejected)
+                .expect("cleanup completion resumes the frozen recovery continuation");
+            let recovery_issued = failed
+                .trace()
+                .iter()
+                .position(|event| {
+                    event.kind() == NavigationTraceEventKind::FrameTaskIssued
+                        && event.frame().is_some_and(|frame| {
+                            frame.origin() == &FrameOrigin::RouteError(fixture.boundary_route)
+                        })
+                })
+                .expect("bound error frame task is issued");
+            let cleanup_receipts = failed.trace()[cleanup_phase..continuation]
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::CleanupSettled)
+                .collect::<Vec<_>>();
+            assert!(!cleanup_receipts.is_empty());
+            assert_eq!(
+                cleanup_receipts.last().unwrap().cleanup_disposition(),
+                None,
+                "the aggregate receipt closes the entire failed-output cleanup ledger",
+            );
+            assert!(cleanup_phase < continuation && continuation < recovery_issued);
+            assert!(
+                failed.trace()[continuation + 1..recovery_issued]
+                    .iter()
+                    .all(|event| event.kind() != NavigationTraceEventKind::CleanupSettled)
+            );
+        }
+        if plan_failure {
+            assert!(
+                failed.trace().iter().all(|event| {
+                    !matches!(
+                        event.kind(),
+                        NavigationTraceEventKind::MountRequested
+                            | NavigationTraceEventKind::MountResolved
+                            | NavigationTraceEventKind::MountGranted
+                            | NavigationTraceEventKind::MountRejected
+                            | NavigationTraceEventKind::MountRejectedAfterMutation
+                    )
+                }),
+                "plan failure row {label} must remain World-zero and emit no mount event"
+            );
+        }
+        let after = router_snapshot(&fixture.app, fixture.router);
+        assert_eq!(after.history(), &old_history, "row {label}");
+        assert_eq!(after.active().requested(), Some(&requested), "row {label}");
+        assert_eq!(after.active().matched(), Some(&matched), "row {label}");
+        assert_eq!(
+            after.active().failure().map(NavigationFailure::kind),
+            Some(expected),
+            "row {label}"
+        );
+        assert_eq!(after.active().frames().len(), 2, "row {label}");
+        assert_eq!(after.active().frames()[0], old_frames[0], "row {label}");
+        assert_eq!(
+            after.active().frames()[0].origin(),
+            &FrameOrigin::MatchedRoute(fixture.root_route),
+            "row {label}"
+        );
+        let error_frame = &after.active().frames()[1];
+        assert_eq!(
+            error_frame.origin(),
+            &FrameOrigin::RouteError(fixture.boundary_route),
+            "row {label}"
+        );
+        assert_ne!(error_frame, &old_frames[1], "row {label}");
+        assert_ne!(error_frame, &old_frames[2], "row {label}");
+        assert_ne!(error_frame.frame(), old_frames[1].frame(), "row {label}");
+        let effects = fixture.control.effects();
+        let recovery = effects.last().unwrap();
+        assert_eq!(recovery.view, fixture.error, "row {label}");
+        assert_eq!(
+            recovery.origin,
+            FrameOrigin::RouteError(fixture.boundary_route),
+            "row {label}"
+        );
+        assert_eq!(recovery.failure, Some(expected), "row {label}");
+        assert!(
+            node_entities_with_width(&mut fixture.app, PARTIAL_RECT_WIDTH).is_empty(),
+            "row {label} removes failed output before error publication"
+        );
+        assert_terminal_owner_closure(&fixture.app, fixture.router);
+        assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+    }
+
+    {
+        let mut fixture = recovery_r1_fixture("r1-missing-outlet");
+        let before = router_snapshot(&fixture.app, fixture.router);
+        assert!(before.requested().is_none());
+        assert!(before.matched().is_none());
+        assert!(before.active().frames().is_empty());
+        assert_eq!(before.history().len(), 0);
+        fixture
+            .control
+            .set_mode(&fixture.section, FixtureMode::MissingOutlet { width: 53 });
+        let requested = RouteLocation::new("/section/items/1");
+        let request = fixture
+            .app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(fixture.router, requested.clone())
+            .unwrap();
+        let (failed, _) = drive_r1_request_to_terminal_preserving_old_active(
+            &mut fixture.app,
+            fixture.router,
+            request,
+            None,
+        );
+        assert_failed(&failed, NavigationFailureKind::Mount);
+        assert_eq!(failed.requested(), Some(&requested));
+        let matched = failed
+            .matched()
+            .expect("a mount failure retains the exact matched branch")
+            .clone();
+        let rejected = failed
+            .trace()
+            .iter()
+            .position(|event| {
+                event.kind() == NavigationTraceEventKind::MountRejected
+                    && event.mount_rejection() == Some(MountRejectionKind::MissingOutlet)
+            })
+            .expect("missing entering outlet emits the real rejection");
+        assert!(rejected > 0);
+        assert_eq!(
+            failed.trace()[rejected - 1].kind(),
+            NavigationTraceEventKind::MountRequested
+        );
+        assert_eq!(
+            failed.trace()[rejected - 1].frame(),
+            failed.trace()[rejected].frame()
+        );
+        assert_eq!(
+            failed.trace()[rejected - 1].outlet(),
+            failed.trace()[rejected].outlet()
+        );
+        let rejected_frame = failed.trace()[rejected]
+            .frame()
+            .expect("mount rejection names its exact parent frame");
+        assert_eq!(
+            rejected_frame.origin(),
+            &FrameOrigin::MatchedRoute(fixture.boundary_route),
+        );
+        assert_eq!(
+            failed.trace()[rejected].outlet(),
+            Some(&RouteSlotKey::default()),
+        );
+        assert!(failed.trace()[..=rejected].iter().all(|event| {
+            event.kind() != NavigationTraceEventKind::MountGranted
+                || event.frame() != Some(rejected_frame)
+        }));
+        let after = router_snapshot(&fixture.app, fixture.router);
+        assert_eq!(after.history(), before.history());
+        assert_eq!(after.active().requested(), Some(&requested));
+        assert_eq!(after.active().matched(), Some(&matched));
+        assert_eq!(
+            after.active().failure().map(NavigationFailure::kind),
+            Some(NavigationFailureKind::Mount),
+        );
+        assert_eq!(after.active().frames().len(), 2);
+        assert_eq!(
+            after.active().frames()[0].origin(),
+            &FrameOrigin::MatchedRoute(fixture.root_route)
+        );
+        assert_eq!(
+            after.active().frames()[1].origin(),
+            &FrameOrigin::RouteError(fixture.boundary_route)
+        );
+        assert_eq!(
+            fixture.control.effects().last().unwrap().view,
+            fixture.error
+        );
+        assert_terminal_owner_closure(&fixture.app, fixture.router);
+        assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+    }
+}
+
+#[test]
+fn recovery_r1_journey_d_recovery_failure_cleans_all_attempts_and_queue_continues() {
+    let mut fixture = recovery_r1_fixture("r1-recovery-failure");
+    let first_location = RouteLocation::new("/section/items/1");
+    let first = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        first_location.clone(),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, first));
+    let before = router_snapshot(&fixture.app, fixture.router);
+    let old_active = before.active().clone();
+    let old_history = before.history().clone();
+    let old_entities = entity_set(&fixture.app);
+    fixture
+        .control
+        .set_one_shot_mode(&fixture.leaf, FixtureMode::ApplyFailure);
+    fixture
+        .control
+        .set_one_shot_mode(&fixture.error, FixtureMode::ApplyFailure);
+
+    let failed_location = RouteLocation::new("/section/items/2");
+    let queued_location = RouteLocation::new("/section/items/3");
+    let failed_id = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(fixture.router, failed_location.clone())
+        .unwrap();
+    let queued_id = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(fixture.router, queued_location.clone())
+        .unwrap();
+    let mut observed_queued_before_cleanup_closed = false;
+    let mut failed_terminal = None;
+    for _ in 0..32 {
+        fixture.app.update();
+        let snapshots = fixture.app.world().resource::<RouterSnapshots>();
+        let RequestLookup::Found(failed) = snapshots.request(fixture.router, failed_id) else {
+            continue;
+        };
+        let RequestLookup::Found(queued) = snapshots.request(fixture.router, queued_id) else {
+            continue;
+        };
+        if !matches!(failed.status(), RequestStatus::Failed(_)) {
+            assert_eq!(queued.status(), &RequestStatus::Queued);
+            observed_queued_before_cleanup_closed = true;
+            assert_eq!(snapshots.get(fixture.router).unwrap().active(), &old_active);
+            assert_eq!(
+                snapshots.get(fixture.router).unwrap().history(),
+                &old_history
+            );
+        }
+        if matches!(failed.status(), RequestStatus::Failed(_)) {
+            failed_terminal = Some(failed.clone());
+            break;
+        }
+    }
+    let failed = failed_terminal.expect("recovery failure settles within 32 updates");
+    assert!(observed_queued_before_cleanup_closed);
+    assert_failed(&failed, NavigationFailureKind::RecoveryFailed);
+    assert_eq!(failed.requested(), Some(&failed_location));
+    assert!(failed.diagnostics().iter().any(|event| {
+        event.request() == Some(failed_id)
+            && event.frame().is_some_and(|frame| {
+                frame.origin() == &FrameOrigin::RouteError(fixture.boundary_route)
+            })
+            && event.report_disposition() == Some(ReportDisposition::Accepted)
+    }));
+    let recovery_effect = fixture
+        .control
+        .effects()
+        .into_iter()
+        .find(|effect| {
+            effect.view == fixture.error
+                && effect.origin == FrameOrigin::RouteError(fixture.boundary_route)
+        })
+        .expect("the bound error driver is invoked before recovery failure settles");
+    assert_eq!(recovery_effect.location, failed_location);
+    assert_eq!(recovery_effect.failure, Some(NavigationFailureKind::Apply),);
+    let terminal = failed
+        .trace()
+        .iter()
+        .position(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+        .unwrap();
+    let receipts = failed
+        .trace()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            (event.kind() == NavigationTraceEventKind::CleanupSettled).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert!(receipts.len() >= 2);
+    assert!(receipts.iter().all(|index| *index < terminal));
+    assert_eq!(terminal + 1, failed.trace().len());
+    assert!(node_entities_with_width(&mut fixture.app, PARTIAL_RECT_WIDTH).is_empty());
+    assert!(node_entities_with_width(&mut fixture.app, RECOVERY_PARTIAL_RECT_WIDTH).is_empty());
+
+    let after_failure = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after_failure.active(), &old_active);
+    assert_eq!(after_failure.history(), &old_history);
+    assert_eq!(entity_set(&fixture.app), old_entities);
+    assert!(!after_failure.cleanup().foreground_pending());
+    assert_eq!(after_failure.cleanup().quarantine_count(), 0);
+    #[cfg(feature = "test-support")]
+    {
+        let audit = fixture
+            .app
+            .world()
+            .resource::<RouterAuthorityAudits>()
+            .get(fixture.router)
+            .expect("the failed attempt leaves a public authority audit");
+        assert_eq!(audit.frames().len(), old_active.frames().len());
+        assert!(audit.orphan_slots().is_empty());
+    }
+
+    let queued = drive_request_to_terminal(&mut fixture.app, fixture.router, queued_id);
+    assert_succeeded(&queued);
+    assert_eq!(queued.requested(), Some(&queued_location));
+    let after_queue = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after_queue.active().location(), Some(&queued_location));
+    assert_eq!(
+        after_queue.history().entries(),
+        [first_location, queued_location]
+    );
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
     assert_host_intact(&fixture.app, &fixture.host_fingerprint);
 }

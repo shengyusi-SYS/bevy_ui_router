@@ -1,12 +1,15 @@
 use bevy_ui_router_core::{
     frame::{FrameOrigin, RouteFrameVersion},
-    ids::{NavigationRequestId, RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId},
+    ids::{NavigationRequestId, RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId},
     integration::{
         CommitTicket, FrameMountTarget, ReconciliationChildSlotRoleKind,
         ReconciliationEnteringSlotKind, ReconciliationProjectionView, RootFrameTask,
     },
     slot::RouteSlotKey,
 };
+
+#[cfg(test)]
+use bevy_ui_router_core::ids::RouteId;
 
 use crate::{
     mount::{ChildSlotResidual, MountedChildSlot},
@@ -228,7 +231,7 @@ enum ReconciliationEnteringSlot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReconciliationEnteringFrame {
     branch_index: usize,
-    route: RouteId,
+    origin: FrameOrigin,
     frame: RouteFrameId,
     generation: RouteGeneration,
     slot: ReconciliationEnteringSlot,
@@ -303,21 +306,30 @@ impl ReconciliationProjectionFacts {
             .collect();
         let frames = projection
             .entering()
-            .map(|frame| ReconciliationEnteringFrame {
-                branch_index: frame.branch_index(),
-                route: frame.route(),
-                frame: frame.frame(),
-                generation: frame.generation(),
-                slot: match frame.slot() {
-                    ReconciliationEnteringSlotKind::Existing(slot) => {
-                        ReconciliationEnteringSlot::Existing(slot)
-                    }
-                    ReconciliationEnteringSlotKind::MountNew => {
-                        ReconciliationEnteringSlot::MountNew
-                    }
-                },
+            .map(|frame| {
+                if !matches!(
+                    frame.origin(),
+                    FrameOrigin::MatchedRoute(route) | FrameOrigin::RouteError(route)
+                        if *route == frame.route()
+                ) {
+                    return None;
+                }
+                Some(ReconciliationEnteringFrame {
+                    branch_index: frame.branch_index(),
+                    origin: frame.origin().clone(),
+                    frame: frame.frame(),
+                    generation: frame.generation(),
+                    slot: match frame.slot() {
+                        ReconciliationEnteringSlotKind::Existing(slot) => {
+                            ReconciliationEnteringSlot::Existing(slot)
+                        }
+                        ReconciliationEnteringSlotKind::MountNew => {
+                            ReconciliationEnteringSlot::MountNew
+                        }
+                    },
+                })
             })
-            .collect();
+            .collect::<Option<Vec<_>>>()?;
         let mut child_slots = Vec::new();
         let mut mount_new_slots = Vec::new();
         for slot in projection.child_slots() {
@@ -379,10 +391,7 @@ pub(crate) fn seal_reconciliation_staging_mount<'a>(
     let projected = facts.entering.frames.iter().find(|projected| {
         projected.frame == task.frame().frame()
             && projected.generation == task.frame().generation()
-            && matches!(
-                task.frame().origin(),
-                FrameOrigin::MatchedRoute(route) if *route == projected.route
-            )
+            && task.frame().origin() == &projected.origin
     })?;
     let FrameMountTarget::ChildOutlet { parent, outlet } = task.mount_target() else {
         return None;
@@ -409,7 +418,7 @@ pub(crate) fn seal_reconciliation_staging_mount<'a>(
     }
     let role = match projected.slot {
         ReconciliationEnteringSlot::Existing(slot) if slot == slots[0].slot_id() => {
-            facts
+            let existing = facts
                 .existing
                 .child_slots
                 .iter()
@@ -418,8 +427,18 @@ pub(crate) fn seal_reconciliation_staging_mount<'a>(
                         && candidate.parent == parent
                         && candidate.outlet == outlet
                         && candidate.slot == slot
-                })?
-                .role
+                })
+                .map(|candidate| candidate.role);
+            existing.or_else(|| {
+                facts
+                    .entering
+                    .mount_new_slots
+                    .iter()
+                    .find(|candidate| {
+                        candidate.parent_branch_index == parent_index && candidate.outlet == outlet
+                    })
+                    .map(|_| ReconciliationSlotRoleKind::MountNew)
+            })?
         }
         ReconciliationEnteringSlot::MountNew => {
             facts.entering.mount_new_slots.iter().find(|candidate| {
@@ -1749,10 +1768,7 @@ fn validate_entering_reconciliation(
             || !sealed.authority.matches(frame.frame())
             || frame.frame().frame() != projected.frame
             || frame.frame().generation() != projected.generation
-            || !matches!(
-                frame.frame().origin(),
-                FrameOrigin::MatchedRoute(route) if *route == projected.route
-            )
+            || frame.frame().origin() != &projected.origin
         {
             return Err(ReconciliationSpliceError::InvalidEnteringBranch);
         }
@@ -1795,24 +1811,71 @@ fn validate_entering_reconciliation(
                             && frame.mount_binding().matches_mounted_child_slot(slot)
                     })
                     .collect::<Vec<_>>();
-                if candidates.len() != 1 || used_existing.contains(&candidates[0].0) {
-                    return Err(ReconciliationSpliceError::InvalidEnteringBranch);
+                match candidates.as_slice() {
+                    [(candidate_index, candidate)] => {
+                        if used_existing.contains(candidate_index) {
+                            return Err(ReconciliationSpliceError::InvalidEnteringBranch);
+                        }
+                        let role = sealed
+                            .slot_roles
+                            .iter()
+                            .find(|role| role.entity() == candidate.slot());
+                        if role.is_none_or(|role| {
+                            role.entering_use != ReconciliationSlotEnteringUse::Required
+                                || !matches!(
+                                    role.kind(),
+                                    ReconciliationSlotRoleKind::PreservedActive
+                                        | ReconciliationSlotRoleKind::ActivateExisting
+                                )
+                        }) {
+                            return Err(ReconciliationSpliceError::InvalidEnteringBranch);
+                        }
+                        used_existing.push(*candidate_index);
+                    }
+                    [] => {
+                        let candidates = entering
+                            .child_slots
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, slot)| {
+                                slot.slot_id() == slot_id
+                                    && slot.parent() == *parent
+                                    && frame.mount_binding().matches_mounted_child_slot(slot)
+                            })
+                            .collect::<Vec<_>>();
+                        if candidates.len() != 1 || used_entering_slots.contains(&candidates[0].0) {
+                            return Err(ReconciliationSpliceError::InvalidEnteringBranch);
+                        }
+                        let specs = sealed
+                            .entering
+                            .mount_new_slots
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, spec)| {
+                                spec.parent_branch_index == parent_index
+                                    && spec.outlet == *candidates[0].1.outlet()
+                            })
+                            .collect::<Vec<_>>();
+                        if specs.len() != 1
+                            || used_mount_new.contains(&specs[0].0)
+                            || slot_role_next(
+                                ReconciliationSlotRoleKind::MountNew,
+                                candidates[0].1.slot_claim().lifecycle(),
+                            )
+                            .is_none()
+                        {
+                            return Err(ReconciliationSpliceError::InvalidEnteringBranch);
+                        }
+                        used_entering_slots.push(candidates[0].0);
+                        used_mount_new.push(specs[0].0);
+                        mount_new_roles.push(sealed_slot_role(
+                            candidates[0].1,
+                            ReconciliationSlotRoleKind::MountNew,
+                            ReconciliationSlotEnteringUse::Required,
+                        ));
+                    }
+                    _ => return Err(ReconciliationSpliceError::InvalidEnteringBranch),
                 }
-                let role = sealed
-                    .slot_roles
-                    .iter()
-                    .find(|role| role.entity() == candidates[0].1.slot());
-                if role.is_none_or(|role| {
-                    role.entering_use != ReconciliationSlotEnteringUse::Required
-                        || !matches!(
-                            role.kind(),
-                            ReconciliationSlotRoleKind::PreservedActive
-                                | ReconciliationSlotRoleKind::ActivateExisting
-                        )
-                }) {
-                    return Err(ReconciliationSpliceError::InvalidEnteringBranch);
-                }
-                used_existing.push(candidates[0].0);
             }
             ReconciliationEnteringSlot::MountNew => {
                 let candidates = entering
@@ -2747,6 +2810,7 @@ impl PendingCommit {
 
 pub(crate) struct FailedPreparedBranch {
     realized: RealizedBranch,
+    retained_prepared_prefix: Option<PreparedBranch>,
     mount_residuals: Vec<ChildSlotResidual>,
     detached_frames: Vec<RealizedFrame>,
     rejected_child_slots: Vec<RejectedChildSlot>,
@@ -2757,6 +2821,7 @@ impl FailedPreparedBranch {
     pub(crate) fn new(branch: PreparedBranch) -> Self {
         Self {
             realized: branch.into_realized(),
+            retained_prepared_prefix: None,
             mount_residuals: Vec::new(),
             detached_frames: Vec::new(),
             rejected_child_slots: Vec::new(),
@@ -2767,6 +2832,7 @@ impl FailedPreparedBranch {
     pub(crate) fn with_mount_residual(branch: PreparedBranch, residual: ChildSlotResidual) -> Self {
         Self {
             realized: branch.into_realized(),
+            retained_prepared_prefix: None,
             mount_residuals: vec![residual],
             detached_frames: Vec::new(),
             rejected_child_slots: Vec::new(),
@@ -2777,6 +2843,7 @@ impl FailedPreparedBranch {
     pub(crate) fn with_detached_frame(branch: PreparedBranch, frame: RealizedFrame) -> Self {
         Self {
             realized: branch.into_realized(),
+            retained_prepared_prefix: None,
             mount_residuals: Vec::new(),
             detached_frames: vec![frame],
             rejected_child_slots: Vec::new(),
@@ -2790,6 +2857,7 @@ impl FailedPreparedBranch {
     ) -> Self {
         Self {
             realized: branch.into_realized(),
+            retained_prepared_prefix: None,
             mount_residuals: Vec::new(),
             detached_frames: Vec::new(),
             rejected_child_slots: vec![slot],
@@ -2807,6 +2875,121 @@ impl FailedPreparedBranch {
 
     pub(crate) const fn mount_new_allowance(&self) -> Option<&SealedMountNewStagingAllowance> {
         self.mount_new_allowance.as_ref()
+    }
+
+    pub(crate) fn retain_prepared_prefix(&mut self, expected: &[RouteFrameVersion]) -> bool {
+        if expected.is_empty() {
+            return self.retained_prepared_prefix.is_none();
+        }
+        if let Some(retained) = self.retained_prepared_prefix.as_ref() {
+            return retained
+                .frames()
+                .iter()
+                .map(RealizedFrame::frame)
+                .eq(expected.iter())
+                && retained.frames().iter().all(|frame| {
+                    frame
+                        .claims()
+                        .all(|claim| claim.lifecycle() == EntityLifecycle::PreparedInert)
+                })
+                && retained
+                    .child_slots()
+                    .iter()
+                    .all(|slot| slot.slot_claim().lifecycle() == EntityLifecycle::PreparedInert)
+                && self
+                    .realized
+                    .frames()
+                    .iter()
+                    .all(|frame| !expected.contains(frame.frame()));
+        }
+        if expected.len() > self.realized.frames.len()
+            || self.realized.frames[..expected.len()]
+                .iter()
+                .map(RealizedFrame::frame)
+                .ne(expected.iter())
+            || self.realized.frames[..expected.len()].iter().any(|frame| {
+                frame
+                    .claims()
+                    .any(|claim| claim.lifecycle() != EntityLifecycle::PreparedInert)
+            })
+        {
+            return false;
+        }
+        let retained_slot_roles = self
+            .realized
+            .child_slots
+            .iter()
+            .map(|slot| {
+                let exact_parent = |frame: &RealizedFrame| {
+                    frame.frame() == slot.parent()
+                        && frame.outlet(slot.outlet()).is_some_and(|outlet| {
+                            outlet.anchor() == slot.anchor()
+                                && outlet.anchor_claim() == slot.anchor_claim()
+                        })
+                        && matches!(
+                            slot.slot_claim().owner(),
+                            RegistryOwner::Committed(EntityOwner::ChildSlot {
+                                parent,
+                                outlet,
+                                slot: slot_id,
+                            }) if parent == frame.frame()
+                                && outlet == slot.outlet()
+                                && *slot_id == slot.slot_id()
+                        )
+                };
+                let retained_matches = self.realized.frames[..expected.len()]
+                    .iter()
+                    .filter(|frame| exact_parent(frame))
+                    .count();
+                let cleanup_matches = self.realized.frames[expected.len()..]
+                    .iter()
+                    .filter(|frame| exact_parent(frame))
+                    .count();
+                match (retained_matches, cleanup_matches) {
+                    (1, 0) if slot.slot_claim().lifecycle() == EntityLifecycle::PreparedInert => {
+                        Some(true)
+                    }
+                    (0, 1) => Some(false),
+                    _ => None,
+                }
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(retained_slot_roles) = retained_slot_roles else {
+            return false;
+        };
+
+        let realized = std::mem::replace(&mut self.realized, RealizedBranch::empty());
+        let RealizedBranch {
+            mut frames,
+            child_slots,
+        } = realized;
+        let cleanup_frames = frames.split_off(expected.len());
+        let mut retained_child_slots = Vec::new();
+        let mut cleanup_child_slots = Vec::new();
+        for (slot, retained) in child_slots.into_iter().zip(retained_slot_roles) {
+            if retained {
+                retained_child_slots.push(slot);
+            } else {
+                cleanup_child_slots.push(slot);
+            }
+        }
+        self.realized = RealizedBranch {
+            frames: cleanup_frames,
+            child_slots: cleanup_child_slots,
+        };
+        self.retained_prepared_prefix = Some(PreparedBranch::from_realized(RealizedBranch {
+            frames,
+            child_slots: retained_child_slots,
+        }));
+        true
+    }
+
+    pub(crate) fn retained_prepared_prefix(&self) -> Option<&PreparedBranch> {
+        self.retained_prepared_prefix.as_ref()
+    }
+
+    pub(crate) fn take_retained_prepared_prefix(&mut self) -> Option<PreparedBranch> {
+        self.retained_prepared_prefix.take()
     }
 
     pub(crate) fn frames(&self) -> &[RealizedFrame] {
@@ -2936,6 +3119,24 @@ mod tests {
                 .prepare_active_sparse_claim_rebind(&resulting, EntityLifecycle::Leaving)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn retained_prepared_prefix_keeps_exact_parent_owned_empty_slot() {
+        let (_app, branch, _, _, _) = failed_nested_branch_fixture();
+        let root = branch.frames()[0].frame().clone();
+        let mut failed = branch;
+
+        assert!(failed.retain_prepared_prefix(std::slice::from_ref(&root)));
+        let retained = failed
+            .retained_prepared_prefix()
+            .expect("the exact root prefix remains linearly retained");
+        assert_eq!(retained.frames().len(), 1);
+        assert_eq!(retained.frames()[0].frame(), &root);
+        assert_eq!(retained.child_slots().len(), 1);
+        assert_eq!(retained.child_slots()[0].parent(), &root);
+        assert!(failed.child_slots().is_empty());
+        assert_eq!(failed.frames().len(), 1);
     }
 
     fn activate_branch(app: &mut bevy_app::App, branch: &mut RealizedBranch) {
@@ -3279,14 +3480,14 @@ mod tests {
                 frames: vec![
                     ReconciliationEnteringFrame {
                         branch_index: 0,
-                        route: matched_route(&root),
+                        origin: FrameOrigin::MatchedRoute(matched_route(&root)),
                         frame: root.frame(),
                         generation: root.generation(),
                         slot: ReconciliationEnteringSlot::Existing(root.slot()),
                     },
                     ReconciliationEnteringFrame {
                         branch_index: 1,
-                        route: matched_route(&child),
+                        origin: FrameOrigin::MatchedRoute(matched_route(&child)),
                         frame: child.frame(),
                         generation: child.generation(),
                         slot: ReconciliationEnteringSlot::MountNew,
@@ -3331,14 +3532,14 @@ mod tests {
                 frames: vec![
                     ReconciliationEnteringFrame {
                         branch_index: 0,
-                        route: matched_route(&root),
+                        origin: FrameOrigin::MatchedRoute(matched_route(&root)),
                         frame: root.frame(),
                         generation: root.generation(),
                         slot: ReconciliationEnteringSlot::Existing(root.slot()),
                     },
                     ReconciliationEnteringFrame {
                         branch_index: 1,
-                        route: matched_route(&child),
+                        origin: FrameOrigin::MatchedRoute(matched_route(&child)),
                         frame: child.frame(),
                         generation: child.generation(),
                         slot: ReconciliationEnteringSlot::MountNew,
@@ -3453,7 +3654,7 @@ mod tests {
             entering: ReconciliationEnteringProjection {
                 frames: vec![ReconciliationEnteringFrame {
                     branch_index: 1,
-                    route: matched_route(&child_version),
+                    origin: FrameOrigin::MatchedRoute(matched_route(&child_version)),
                     frame: child_version.frame(),
                     generation: child_version.generation(),
                     slot: ReconciliationEnteringSlot::Existing(retained.slot_id()),
@@ -3497,14 +3698,14 @@ mod tests {
                 frames: vec![
                     ReconciliationEnteringFrame {
                         branch_index: 0,
-                        route: matched_route(&root),
+                        origin: FrameOrigin::MatchedRoute(matched_route(&root)),
                         frame: root.frame(),
                         generation: root.generation(),
                         slot: ReconciliationEnteringSlot::Existing(root.slot()),
                     },
                     ReconciliationEnteringFrame {
                         branch_index: 1,
-                        route: matched_route(&child),
+                        origin: FrameOrigin::MatchedRoute(matched_route(&child)),
                         frame: child.frame(),
                         generation: child.generation(),
                         slot: ReconciliationEnteringSlot::MountNew,
@@ -3548,14 +3749,14 @@ mod tests {
                 frames: vec![
                     ReconciliationEnteringFrame {
                         branch_index: 0,
-                        route: matched_route(&root),
+                        origin: FrameOrigin::MatchedRoute(matched_route(&root)),
                         frame: root.frame(),
                         generation: root.generation(),
                         slot: ReconciliationEnteringSlot::Existing(root.slot()),
                     },
                     ReconciliationEnteringFrame {
                         branch_index: 1,
-                        route: matched_route(&child),
+                        origin: FrameOrigin::MatchedRoute(matched_route(&child)),
                         frame: child.frame(),
                         generation: child.generation(),
                         slot: ReconciliationEnteringSlot::MountNew,
@@ -3637,7 +3838,7 @@ mod tests {
             entering: ReconciliationEnteringProjection {
                 frames: vec![ReconciliationEnteringFrame {
                     branch_index: 1,
-                    route: matched_route(&child_version),
+                    origin: FrameOrigin::MatchedRoute(matched_route(&child_version)),
                     frame: child_version.frame(),
                     generation: child_version.generation(),
                     slot: ReconciliationEnteringSlot::MountNew,
@@ -3850,7 +4051,7 @@ mod tests {
             entering: ReconciliationEnteringProjection {
                 frames: vec![ReconciliationEnteringFrame {
                     branch_index: 1,
-                    route: matched_route(&child_version),
+                    origin: FrameOrigin::MatchedRoute(matched_route(&child_version)),
                     frame: child_version.frame(),
                     generation: child_version.generation(),
                     slot: ReconciliationEnteringSlot::Existing(retained.slot_id()),

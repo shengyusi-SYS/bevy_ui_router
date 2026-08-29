@@ -65,7 +65,7 @@ impl RouteViewDescriptor {
 impl RouteNodeOptions {
     pub fn new() -> Self;
     pub fn with_view(self, view: RouteViewKey) -> Self;
-    pub fn with_error_boundary(self, boundary: ErrorBoundaryKey) -> Self;
+    pub fn with_error_boundary(self, key: ErrorBoundaryKey) -> Self;
     pub fn with_error_view(
         self,
         boundary: ErrorBoundaryKey,
@@ -677,7 +677,7 @@ enum FixtureMode {
     ApplyFailure,
     MissingOutlet,
     DuplicateOutlet(RouteSlotKey),
-    ForeignOutlet(RouteSlotKey),
+    ForeignSession,
     RelationshipCycle,
 }
 
@@ -758,7 +758,7 @@ impl EcsViewDriver for FixtureDriver {
                     .expect_err("duplicate outlet must be rejected");
                 report.apply_failed(error.to_string())
             }
-            FixtureMode::ForeignOutlet(key) => {
+            FixtureMode::ForeignSession => {
                 let anchor = self
                     .control
                     .captured_anchor
@@ -766,7 +766,7 @@ impl EcsViewDriver for FixtureDriver {
                     .expect("fixture captured-anchor lock must not be poisoned")
                     .expect("a prior settled session must capture an anchor");
                 let error = content
-                    .declare_outlet(anchor, key)
+                    .declare_outlet(anchor, RouteSlotKey::default())
                     .expect_err("foreign session anchor must be rejected");
                 report.apply_failed(error.to_string())
             }
@@ -979,11 +979,13 @@ fn first_navigation_fixture() -> Result<(), Box<dyn std::error::Error>> {
 | apply failure with partial output | `FixtureMode::ApplyFailure` | facade Journey D |
 | missing outlet | layout `MissingOutlet` 返回 accepted plan，child mount 发出 token 后以 `MountRejected(MissingOutlet)` 失败 | facade Journey D |
 | duplicate outlet | `FixtureMode::DuplicateOutlet` 在 plan 阶段返回 `ApplyFailed`；无 `MountRequested` | facade Journey D；crate-private fingerprint证明driver-return零写入 |
-| foreign-session outlet | 首次成功 apply 捕获 anchor，后续 `FixtureMode::ForeignOutlet` 在 plan 阶段返回 `ApplyFailed`；无 `MountRequested` | facade Journey D；crate-private fingerprint证明driver-return零写入 |
+| foreign-session outlet | 首次成功 apply 捕获 anchor，后续 `FixtureMode::ForeignSession` 在 plan 阶段返回 `ApplyFailed`；无 `MountRequested` | facade Journey D；crate-private fingerprint证明driver-return零写入 |
 | relationship cycle | `FixtureMode::RelationshipCycle` 只构造 plan handles | facade Journey D；crate-private fingerprint证明driver-return零写入 |
 | entering realized outlet corruption | crate-private seam 在 accepted plan realization/post-write 后破坏 anchor identity/owner/seal/唯一映射 | ECS regression；`MountRejected(InvalidOutlet)` -> `PendingRejected` |
 | preserved/current outlet corruption | crate-private seam 在 mount resolution 前破坏既有 anchor identity/owner/seal/Entity | ECS regression；`MountRejected(ParentAuthorityLost)` -> `AuthorityLost`，无 fallback |
 | forged/stale identity | crate-private authority test | Scenario E / ECS regression |
+
+`boundary-bound error presentation complete evidence` 已激活：公开 Journey D 覆盖 boundary error view、router fallback、plan/mount failure matrix、recovery failure cleanup 与后续合法导航；该标签只声明 R1 Error presentation 合同 PASS。
 
 ## 5. Trace 断言
 

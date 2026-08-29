@@ -516,11 +516,12 @@ default | bevy_ui_router::core::RouteNode | bevy_ui_router_core | method | pub c
 default | bevy_ui_router::core::RouteNode | bevy_ui_router_core | trait-impl | impl Clone for Self
 default | bevy_ui_router::core::RouteNode | bevy_ui_router_core | trait-impl | impl Debug for Self
 default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | struct | pub struct RouteNodeOptions
+# active contract delta: boundary-bound error presentation complete evidence
 default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub fn new() -> Self
 default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub fn with_slot(self, slot: RouteSlotKey) -> Self
 default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub fn with_explicit_key(self, key: RouteExplicitKey) -> Self
 default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub fn with_view(self, view: RouteViewKey) -> Self
-default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub fn with_error_boundary(self, boundary: ErrorBoundaryKey) -> Self
+default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub fn with_error_boundary(self, key: ErrorBoundaryKey) -> Self
 default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub fn with_error_view(self, boundary: ErrorBoundaryKey, view: RouteViewKey) -> Self
 default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub fn with_meta(self, meta: RouteMeta) -> Self
 default | bevy_ui_router::core::RouteNodeOptions | bevy_ui_router_core | method | pub const fn slot(&self) -> &RouteSlotKey

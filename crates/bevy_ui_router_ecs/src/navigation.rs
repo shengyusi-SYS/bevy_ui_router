@@ -4,7 +4,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::atomic::AtomicUsize;
 
 use bevy_camera::visibility::Visibility;
-use bevy_ecs::{entity::Entity, prelude::World, resource::Resource};
+use bevy_ecs::{
+    entity::Entity,
+    hierarchy::{ChildOf, Children},
+    prelude::World,
+    resource::Resource,
+};
 use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
 use bevy_ui_router_core::{
@@ -36,7 +41,8 @@ use bevy_ui_router_core::{
         BackTargetPreparationAcceptance, BackTargetStart, BeginAuthoritySettlementErrorKind,
         CleanupManifest, CleanupManifestView, CommitTicket, EngineAction, EnqueueBackErrorKind,
         FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError,
-        FailureCleanupCompletionOwner, FailureCleanupCompletionPreparationMismatchView,
+        FailureCleanupCompletionDisposition, FailureCleanupCompletionOwner,
+        FailureCleanupCompletionPreparationMismatchView,
         FailureCleanupCompletionReceiverMismatchView, FailureCleanupPermanentAuthorityOwner,
         FailureCleanupPermanentAuthorityPhysical, FailureCleanupPermanentOutcome,
         FailureCleanupPermanentOwner, FailureCleanupPhysicalPrepareMismatch,
@@ -125,7 +131,8 @@ use crate::{
     presentation::{
         DeferredRealizationFailure, FrameLifecycle, FrameMountBinding, RealizedFrame,
         expected_children, frame_is_isolated_for_settlement, isolate_frame_for_settlement,
-        prepare_presentation_mutation, realize_child_frame_deferred, realize_frame_deferred,
+        isolate_frame_for_settlement_guarded, prepare_presentation_mutation,
+        realize_child_frame_deferred, realize_frame_deferred,
         realize_reconciliation_child_frame_deferred, validate_active_frame,
         validate_realized_frame,
     },
@@ -480,6 +487,18 @@ pub(crate) struct PendingFailedBranch {
 impl PendingFailedBranch {
     pub(crate) const fn branch(&self) -> &FailedPreparedBranch {
         &self.branch
+    }
+
+    fn retained_prepared_prefix(&self) -> &[RouteFrameVersion] {
+        match &self.terminal {
+            PendingFailedBranchTerminal::Request(request)
+            | PendingFailedBranchTerminal::BackTargetPendingRejected { request, .. } => {
+                request.retained_prepared_prefix()
+            }
+            PendingFailedBranchTerminal::Task { .. }
+            | PendingFailedBranchTerminal::TaskWithPhysicalResidual { .. }
+            | PendingFailedBranchTerminal::RegistrationBegin(_) => &[],
+        }
     }
 }
 
@@ -5873,6 +5892,18 @@ pub(crate) fn back_request_inventory_projection(
 }
 
 #[cfg(feature = "test-support")]
+pub(crate) fn router_request_inventory_counts(navigation: &RouterNavigation) -> (usize, usize) {
+    (
+        navigation.entries.len(),
+        navigation
+            .entries
+            .iter()
+            .map(|entry| entry.requests.len())
+            .sum(),
+    )
+}
+
+#[cfg(feature = "test-support")]
 pub(crate) fn install_back_capacity_order_observer_with<F>(
     navigation: &mut RouterNavigation,
     router: RouterHandle,
@@ -6402,8 +6433,20 @@ fn complete_zero_physical_failure(
     world: &mut World,
     entry: &mut RouterEntry,
     request: FailureCleanupRequest,
-    branch: FailedPreparedBranch,
+    mut branch: FailedPreparedBranch,
 ) -> Result<(), PendingFailedBranch> {
+    if entry.pending_commit.is_some() {
+        return Err(PendingFailedBranch {
+            terminal: PendingFailedBranchTerminal::Request(request),
+            branch,
+        });
+    }
+    if !branch.retain_prepared_prefix(request.retained_prepared_prefix()) {
+        return Err(PendingFailedBranch {
+            terminal: PendingFailedBranchTerminal::Request(request),
+            branch,
+        });
+    }
     let manifest = world
         .get_resource::<RouteEntityRegistry>()
         .and_then(|registry| {
@@ -6498,16 +6541,44 @@ fn complete_zero_physical_failure(
         .engine
         .prepare_failure_cleanup_completion(completion)
         .expect("an exact empty cleanup completion is current");
-    entry
+    let mut retained_prepared_prefix = None;
+    let disposition = entry
         .engine
         .complete_prepared_failure_cleanup_with_ledger(owner, ledger, |mut ledger| {
-            drop(
-                ledger
-                    .take_failed_prepared_owner()
-                    .expect("the zero ledger retains its typed physical owner"),
-            );
+            retained_prepared_prefix = ledger
+                .take_failed_prepared_owner()
+                .expect("the zero ledger retains its typed physical owner")
+                .into_retained_prepared_prefix();
         })
         .expect("the zero ledger commits before Core continuation");
+    match disposition {
+        FailureCleanupCompletionDisposition::RetainedPreparedPrefixBound => {
+            let branch = retained_prepared_prefix
+                .expect("a bound retained-prefix continuation keeps its physical owner");
+            entry.pending_commit = Some(PendingCommit {
+                ticket: None,
+                final_task: None,
+                branch,
+            });
+        }
+        FailureCleanupCompletionDisposition::RetainedPreparedPrefixCleanup => {
+            let branch = retained_prepared_prefix
+                .expect("a retained-prefix cleanup continuation keeps its physical owner");
+            let Some(EngineAction::FailureCleanup(request)) = entry.engine.action() else {
+                unreachable!("a typed retained-prefix cleanup disposition owns its cleanup request")
+            };
+            entry.pending_failed_branch = Some(PendingFailedBranch {
+                terminal: PendingFailedBranchTerminal::Request(request),
+                branch: FailedPreparedBranch::new(branch),
+            });
+        }
+        FailureCleanupCompletionDisposition::Settled => {
+            assert!(
+                retained_prepared_prefix.is_none(),
+                "a settled continuation cannot return a retained physical prefix",
+            );
+        }
+    }
     Ok(())
 }
 
@@ -6646,6 +6717,53 @@ fn focus_is_outside_closure(world: &World, closure: &[bevy_ecs::prelude::Entity]
             .is_none_or(|focused| !closure.contains(&focused))
 }
 
+fn retained_prepared_prefix_protected_closure(
+    world: &World,
+    branch: &FailedPreparedBranch,
+    target_boundaries: &[Entity],
+) -> Option<Vec<Entity>> {
+    let Some(prepared) = branch.retained_prepared_prefix() else {
+        return Some(Vec::new());
+    };
+    validate_prepared_branch(world, prepared.as_realized()).ok()?;
+    let mut protected = validate_branch_descendants(world, prepared.as_realized()).ok()?;
+    protected.extend(
+        prepared
+            .as_realized()
+            .claims()
+            .map(ExactRegistryClaim::entity),
+    );
+    protected.sort_by_key(|entity| entity.to_bits());
+    protected.dedup();
+    (!protected
+        .iter()
+        .any(|entity| target_boundaries.contains(entity)))
+    .then_some(protected)
+}
+
+fn target_boundary_parent_bindings(
+    world: &World,
+    target_boundaries: &[Entity],
+) -> Option<Vec<(Entity, Option<Entity>)>> {
+    target_boundaries
+        .iter()
+        .map(|boundary| {
+            if world.get_entity(*boundary).is_err() {
+                return None;
+            }
+            let parent = world.get::<ChildOf>(*boundary).map(ChildOf::parent);
+            if parent.is_some_and(|parent| {
+                world
+                    .get::<Children>(parent)
+                    .is_none_or(|children| !children.contains(boundary))
+            }) {
+                return None;
+            }
+            Some((*boundary, parent))
+        })
+        .collect()
+}
+
 fn isolate_failed_prepared_branch(
     world: &mut World,
     branch: &FailedPreparedBranch,
@@ -6664,29 +6782,68 @@ fn isolate_failed_prepared_branch(
         .filter(|claim| !active_claims.contains(claim))
         .cloned()
         .collect::<Vec<_>>();
+    let mut target_boundaries = exact_isolation_claims
+        .iter()
+        .map(ExactRegistryClaim::entity)
+        .collect::<Vec<Entity>>();
+    target_boundaries.sort_by_key(|entity| entity.to_bits());
+    target_boundaries.dedup();
+    let Some(target_boundary_parents_before) =
+        target_boundary_parent_bindings(world, &target_boundaries)
+    else {
+        return false;
+    };
+    let Some(retained_protected_before) =
+        retained_prepared_prefix_protected_closure(world, branch, &target_boundaries)
+    else {
+        return false;
+    };
     let requires_exact_isolation =
         |claim: &ExactRegistryClaim| exact_isolation_claims.contains(claim);
     let mut focus_closure = failed_branch_focus_closure(world, &exact_isolation_claims);
     let active_focus_before = match active {
         Some(active) => {
-            let Ok(closure) = validate_branch_descendants(world, active) else {
+            let Ok(closure) = validate_active_branch_local(world, active, &target_boundaries)
+            else {
                 return false;
             };
             closure
         }
         None => Vec::new(),
     };
-    if focus_closure
-        .iter()
-        .any(|entity| active_focus_before.contains(entity))
-    {
+    if focus_closure.iter().any(|entity| {
+        active_focus_before.contains(entity) || retained_protected_before.contains(entity)
+    }) {
         return false;
     }
-    let frames_are_isolated = branch
-        .frames()
-        .iter()
-        .chain(branch.detached_frames())
-        .all(|frame| isolate_frame_for_settlement(world, frame, &requires_exact_isolation));
+    let protected_partition_is_exact = |world: &World| {
+        target_boundary_parent_bindings(world, &target_boundaries).as_ref()
+            == Some(&target_boundary_parents_before)
+            && retained_prepared_prefix_protected_closure(world, branch, &target_boundaries)
+                .as_ref()
+                == Some(&retained_protected_before)
+            && active
+                .map(|active| validate_active_branch_local(world, active, &target_boundaries).ok())
+                .unwrap_or_else(|| Some(Vec::new()))
+                .as_ref()
+                == Some(&active_focus_before)
+    };
+    let mut frames_are_isolated = true;
+    for frame in branch.frames().iter().chain(branch.detached_frames()) {
+        if !isolate_frame_for_settlement_guarded(
+            world,
+            frame,
+            &requires_exact_isolation,
+            &protected_partition_is_exact,
+        ) || !protected_partition_is_exact(world)
+        {
+            frames_are_isolated = false;
+            break;
+        }
+    }
+    if !frames_are_isolated {
+        return false;
+    }
     let child_slots_are_isolated = branch
         .child_slots()
         .iter()
@@ -6753,22 +6910,36 @@ fn isolate_failed_prepared_branch(
     revalidated_focus_closure.dedup();
     let active_focus_after = match active {
         Some(active) => {
-            let Ok(closure) = validate_branch_descendants(world, active) else {
+            let Ok(closure) = validate_active_branch_local(world, active, &target_boundaries)
+            else {
                 return false;
             };
             closure
         }
         None => Vec::new(),
     };
+    let retained_protected_after =
+        retained_prepared_prefix_protected_closure(world, branch, &target_boundaries);
     if revalidated_focus_closure != focus_closure
         || active_focus_after != active_focus_before
-        || revalidated_focus_closure
-            .iter()
-            .any(|entity| active_focus_after.contains(entity))
+        || retained_protected_after.as_ref() != Some(&retained_protected_before)
+        || revalidated_focus_closure.iter().any(|entity| {
+            active_focus_after.contains(entity) || retained_protected_before.contains(entity)
+        })
     {
         return false;
     }
     release_focus_for_closure(world, &focus_closure);
+    if retained_prepared_prefix_protected_closure(world, branch, &target_boundaries).as_ref()
+        != Some(&retained_protected_before)
+        || active
+            .map(|active| validate_active_branch_local(world, active, &target_boundaries).ok())
+            .unwrap_or_else(|| Some(Vec::new()))
+            .as_ref()
+            != Some(&active_focus_before)
+    {
+        return false;
+    }
     let primary_claim_snapshot_is_current = branch
         .frames()
         .iter()
@@ -13593,7 +13764,7 @@ fn prepare_authority_isolation_targets<'a>(
                 .is_none_or(|registry| {
                     registry
                         .record(claim.entity())
-                        .is_some_and(|record| record.claim() == *claim)
+                        .is_some_and(|record| record.claim() == claim.clone())
                 })
             && cleanup_claim_has_exact_authority(world, claim)
             && try_push(&mut exact, claim.entity()).is_err()
@@ -18039,7 +18210,7 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                 if entry.failure_cleanup_permanent.is_some() {
                     continue;
                 }
-                if let Some(failed) = entry.pending_failed_branch.take() {
+                if let Some(mut failed) = entry.pending_failed_branch.take() {
                     if entry.cleanup_ledger.is_some() {
                         entry.pending_failed_branch = Some(failed);
                         continue;
@@ -18057,6 +18228,21 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                     };
                     if !terminal_is_current {
                         entry.pending_failed_branch = Some(failed);
+                        continue;
+                    }
+                    let retained_prepared_prefix = failed.retained_prepared_prefix().to_vec();
+                    if !failed
+                        .branch
+                        .retain_prepared_prefix(&retained_prepared_prefix)
+                    {
+                        if let Err(failed) = fail_closed_failed_manifest_protocol(
+                            world,
+                            entry,
+                            failed,
+                            FailedPreparedTopologyError::AmbiguousBoundaryOwnership,
+                        ) {
+                            entry.pending_failed_branch = Some(failed);
+                        }
                         continue;
                     }
                     let manifest = {
@@ -18228,10 +18414,14 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                             }
                             continue;
                         };
-                        manifest.freeze_failure_cleanup_partition(
+                        manifest.freeze_failure_cleanup_partition_retaining(
                             world,
                             registry,
                             entry.active.as_ref(),
+                            failed
+                                .branch
+                                .retained_prepared_prefix()
+                                .map(PreparedBranch::as_realized),
                             host,
                         )
                     };
@@ -18392,9 +18582,13 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                         continue;
                     };
                     let settled = if ledger.is_failed_prepared() {
-                        let source = FailureCleanupSourceProjection::observe(
+                        let source = FailureCleanupSourceProjection::observe_with_prepared(
                             entry.host.as_ref(),
                             entry.active.as_ref(),
+                            ledger
+                                .failed_prepared_branch()
+                                .and_then(FailedPreparedBranch::retained_prepared_prefix)
+                                .map(PreparedBranch::as_realized),
                         );
                         ledger.settle_failure_cleanup(world, attempt, &source)
                     } else {
@@ -18426,6 +18620,10 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                     continue;
                 }
                 if ledger.is_failed_prepared() {
+                    if entry.pending_commit.is_some() {
+                        entry.cleanup_ledger = Some(ledger);
+                        continue;
+                    }
                     #[cfg(test)]
                     if entry.failure_cleanup_completion_preparation_drift_armed {
                         entry.failure_cleanup_completion_preparation_drift_armed = false;
@@ -18461,21 +18659,54 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                             .engine
                             .drift_failure_cleanup_completion_receiver_for_test();
                     }
+                    let mut retained_prepared_prefix = None;
                     match entry
                         .engine
                         .complete_prepared_failure_cleanup_with_ledger(
                             owner,
                             ledger,
                             |mut ledger| {
-                                drop(
-                                    ledger.take_failed_prepared_owner().expect(
-                                        "failure continuation retains its physical owner",
-                                    ),
-                                );
+                                retained_prepared_prefix = ledger
+                                    .take_failed_prepared_owner()
+                                    .expect("failure continuation retains its physical owner")
+                                    .into_retained_prepared_prefix();
                             },
                         )
                     {
-                        Ok(()) => bind_post_cleanup_back_resolution(entry),
+                        Ok(FailureCleanupCompletionDisposition::RetainedPreparedPrefixBound) => {
+                            let branch = retained_prepared_prefix.expect(
+                                "a bound retained-prefix continuation keeps its physical owner",
+                            );
+                            entry.pending_commit = Some(PendingCommit {
+                                ticket: None,
+                                final_task: None,
+                                branch,
+                            });
+                            bind_post_cleanup_back_resolution(entry);
+                        }
+                        Ok(FailureCleanupCompletionDisposition::RetainedPreparedPrefixCleanup) => {
+                            let branch = retained_prepared_prefix.expect(
+                                "a retained-prefix cleanup continuation keeps its physical owner",
+                            );
+                            let Some(EngineAction::FailureCleanup(request)) = entry.engine.action()
+                            else {
+                                unreachable!(
+                                    "a typed retained-prefix cleanup disposition owns its cleanup request"
+                                )
+                            };
+                            entry.pending_failed_branch = Some(PendingFailedBranch {
+                                terminal: PendingFailedBranchTerminal::Request(request),
+                                branch: FailedPreparedBranch::new(branch),
+                            });
+                            bind_post_cleanup_back_resolution(entry);
+                        }
+                        Ok(FailureCleanupCompletionDisposition::Settled) => {
+                            assert!(
+                                retained_prepared_prefix.is_none(),
+                                "a settled continuation cannot return a retained physical prefix",
+                            );
+                            bind_post_cleanup_back_resolution(entry);
+                        }
                         Err(error) => {
                             let (owner, ledger, mismatch) = error.into_parts();
                             let inert = FailureCleanupCompletionInertOwner {
@@ -18563,7 +18794,7 @@ pub(crate) mod tests {
             ProvisionalPostWriteProbe, ProvisionalSlotLifecycle, RouteOwnershipSeal,
             RouterInputBarrier,
         },
-        content::{ContentColor, SolidRect},
+        content::{ContentColor, ContentEntity, SolidRect},
         driver::{EcsViewDriver, ViewBuildReport},
         host::HostCandidateRevision,
         input::{RouteFocusState, RouterInputGate},
@@ -18580,6 +18811,7 @@ pub(crate) mod tests {
             take_authority_postmutation_manifest_materializations_for_test,
             take_authority_postmutation_reservation_attempts_for_test,
         },
+        snapshots::RequestLookup,
     };
     use bevy_app::{App, PostUpdate, PreUpdate, Update};
     use bevy_camera::visibility::{InheritedVisibility, Visibility};
@@ -18948,6 +19180,130 @@ pub(crate) mod tests {
     struct FailOnceDriver {
         key: ViewDriverKey,
         failed: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ErrorPlanMode {
+        Success,
+        DuplicateOutlet,
+        ForeignSession,
+        RelationshipCycle,
+    }
+
+    struct ErrorPlanDriver {
+        key: ViewDriverKey,
+        normal: RouteViewKey,
+        mode: std::sync::Arc<std::sync::Mutex<ErrorPlanMode>>,
+        prior_content: Option<ContentEntity>,
+    }
+
+    struct ErrorRoleDriver {
+        key: ViewDriverKey,
+        root_layout: RouteViewKey,
+        section: RouteViewKey,
+        leaf: RouteViewKey,
+        error: RouteViewKey,
+        fallback: RouteViewKey,
+    }
+
+    impl EcsViewDriver for ErrorRoleDriver {
+        fn key(&self) -> ViewDriverKey {
+            self.key.clone()
+        }
+
+        fn apply(
+            &mut self,
+            effect: &ViewBuildEffect,
+            content: &mut FrameContentWriter<'_>,
+            report: EcsViewReportSession<'_>,
+        ) -> ViewBuildReport {
+            assert!(
+                [
+                    &self.root_layout,
+                    &self.section,
+                    &self.leaf,
+                    &self.error,
+                    &self.fallback,
+                ]
+                .contains(&effect.view()),
+                "the role fixture only drives its five registered views"
+            );
+            content
+                .spawn_solid_rect(
+                    SolidRect::new(29, 17, ContentColor::srgba8(5, 13, 29, 255)).unwrap(),
+                )
+                .unwrap();
+            if effect.view() == &self.root_layout {
+                let anchor = content.spawn_empty().unwrap();
+                content
+                    .declare_outlet(
+                        anchor,
+                        bevy_ui_router_core::prelude::RouteSlotKey::default(),
+                    )
+                    .unwrap();
+            }
+            report.applied()
+        }
+    }
+
+    impl EcsViewDriver for ErrorPlanDriver {
+        fn key(&self) -> ViewDriverKey {
+            self.key.clone()
+        }
+
+        fn apply(
+            &mut self,
+            effect: &ViewBuildEffect,
+            content: &mut FrameContentWriter<'_>,
+            report: EcsViewReportSession<'_>,
+        ) -> ViewBuildReport {
+            let mode = if effect.view() == &self.normal {
+                *self.mode.lock().unwrap()
+            } else {
+                ErrorPlanMode::Success
+            };
+            match mode {
+                ErrorPlanMode::Success => {
+                    self.prior_content = Some(content.spawn_empty().unwrap());
+                    report.applied()
+                }
+                ErrorPlanMode::DuplicateOutlet => {
+                    let anchor = content.spawn_empty().unwrap();
+                    content
+                        .declare_outlet(
+                            anchor,
+                            bevy_ui_router_core::prelude::RouteSlotKey::default(),
+                        )
+                        .unwrap();
+                    let error = content
+                        .declare_outlet(
+                            anchor,
+                            bevy_ui_router_core::prelude::RouteSlotKey::default(),
+                        )
+                        .unwrap_err();
+                    report.apply_failed(error.to_string())
+                }
+                ErrorPlanMode::ForeignSession => {
+                    let foreign = self
+                        .prior_content
+                        .expect("the committed setup frame supplies a foreign content session");
+                    let error = content
+                        .declare_outlet(
+                            foreign,
+                            bevy_ui_router_core::prelude::RouteSlotKey::default(),
+                        )
+                        .unwrap_err();
+                    report.apply_failed(error.to_string())
+                }
+                ErrorPlanMode::RelationshipCycle => {
+                    let parent = content.spawn_empty().unwrap();
+                    let child = content.spawn_empty().unwrap();
+                    content.add_child(parent, child).unwrap();
+                    let error = content.add_child(child, parent).unwrap_err();
+                    report.apply_failed(error.to_string())
+                }
+            }
+        }
     }
 
     #[derive(Resource)]
@@ -24347,6 +24703,474 @@ pub(crate) mod tests {
         assert!(trace.iter().all(|event| {
             event.kind() != bevy_ui_router_core::prelude::NavigationTraceEventKind::MountGranted
         }));
+    }
+
+    #[test]
+    pub(crate) fn error_plan_failure_is_world_and_registry_zero_before_recovery() {
+        for (label, mode) in [
+            ("duplicate-outlet", ErrorPlanMode::DuplicateOutlet),
+            ("foreign-session", ErrorPlanMode::ForeignSession),
+            ("relationship-cycle", ErrorPlanMode::RelationshipCycle),
+        ] {
+            let mut app = App::new();
+            app.add_plugins(BevyUiRouterPlugin::default());
+            let normal = RouteViewKey::new(format!("error-plan-{label}-normal")).unwrap();
+            let error = RouteViewKey::new(format!("error-plan-{label}-error")).unwrap();
+            let fallback = RouteViewKey::new(format!("error-plan-{label}-fallback")).unwrap();
+            let control = std::sync::Arc::new(std::sync::Mutex::new(ErrorPlanMode::Success));
+            let driver = app
+                .register_ui_view_driver(ErrorPlanDriver {
+                    key: ViewDriverKey::new(format!("error-plan-{label}-driver")).unwrap(),
+                    normal: normal.clone(),
+                    mode: control.clone(),
+                    prior_content: None,
+                })
+                .unwrap();
+            let routes = RouteTree::builder()
+                .root_with_options(
+                    RoutePattern::path("/").unwrap(),
+                    RouteNodeOptions::new()
+                        .with_view(normal.clone())
+                        .with_error_view(
+                            bevy_ui_router_core::prelude::ErrorBoundaryKey::named(format!(
+                                "error-plan-{label}-boundary"
+                            ))
+                            .unwrap(),
+                            error.clone(),
+                        ),
+                )
+                .unwrap();
+            let boundary_route = routes.root_id().unwrap();
+            let mut views = RouteViewRegistry::new();
+            for view in [normal, error, fallback.clone()] {
+                views
+                    .insert(view, RouteViewDescriptor::new(driver.clone()))
+                    .unwrap();
+            }
+            let router = app
+                .add_ui_router(RouterConfig::new(routes.build().unwrap(), views, fallback))
+                .unwrap();
+            app.world_mut()
+                .spawn((Node::default(), RouterHostRegistration::new(router)));
+            app.update();
+            let setup = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new("/"))
+                .unwrap();
+            for _ in 0..16 {
+                app.update();
+                if matches!(
+                    app.world().resource::<RouterSnapshots>().request(router, setup),
+                    RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded
+                ) {
+                    break;
+                }
+            }
+            let active_before = app.world().resource::<RouterNavigation>().entries[0]
+                .active
+                .as_ref()
+                .unwrap()
+                .frames()
+                .iter()
+                .map(|frame| frame.frame().clone())
+                .collect::<Vec<_>>();
+            let history_before = app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .history()
+                .clone();
+            *control.lock().unwrap() = mode;
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new("/").with_fragment(label))
+                .unwrap();
+            collect_navigation_system(app.world_mut());
+            let world_before = authority_world_fingerprint(app.world());
+            let registry_before = app
+                .world()
+                .resource::<RouteEntityRegistry>()
+                .records()
+                .to_vec();
+            let seal_before = app
+                .world()
+                .resource::<RouteEntityRegistry>()
+                .latest_issued_seal();
+
+            drive_navigation_system(app.world_mut());
+
+            assert_eq!(
+                authority_world_fingerprint(app.world()),
+                world_before,
+                "{label}"
+            );
+            assert_eq!(
+                app.world().resource::<RouteEntityRegistry>().records(),
+                registry_before,
+                "{label}"
+            );
+            assert_eq!(
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .latest_issued_seal(),
+                seal_before,
+                "{label}"
+            );
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert_eq!(
+                entry
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                active_before,
+                "{label}"
+            );
+            assert_eq!(entry.engine.history(), &history_before, "{label}");
+            let request_view = entry.engine.request(request).unwrap();
+            assert_eq!(
+                request_view.status(),
+                &RequestStatus::Running(NavigationPhase::Recovering),
+                "{label}"
+            );
+            assert!(
+                request_view.trace().iter().all(|event| {
+                    !matches!(
+                        event.kind(),
+                        NavigationTraceEventKind::MountRequested
+                            | NavigationTraceEventKind::MountResolved
+                            | NavigationTraceEventKind::MountGranted
+                            | NavigationTraceEventKind::MountRejected
+                            | NavigationTraceEventKind::MountRejectedAfterMutation
+                    )
+                }),
+                "plan failure {label} must not issue a mount token or event"
+            );
+            assert!(request_view.trace().iter().any(|event| {
+                event.kind() == NavigationTraceEventKind::FrameTaskIssued
+                    && event.frame().is_some_and(|frame| {
+                        frame.origin() == &FrameOrigin::RouteError(boundary_route)
+                    })
+            }));
+        }
+    }
+
+    pub(crate) fn error_outlet_role_classification_is_preserved_fixture() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let root_layout = RouteViewKey::new("error-role-root-layout").unwrap();
+        let section = RouteViewKey::new("error-role-section").unwrap();
+        let leaf = RouteViewKey::new("error-role-leaf").unwrap();
+        let error = RouteViewKey::new("error-role-error").unwrap();
+        let fallback = RouteViewKey::new("error-role-fallback").unwrap();
+        let driver = app
+            .register_ui_view_driver(ErrorRoleDriver {
+                key: ViewDriverKey::new("error-role-driver").unwrap(),
+                root_layout: root_layout.clone(),
+                section: section.clone(),
+                leaf: leaf.clone(),
+                error: error.clone(),
+                fallback: fallback.clone(),
+            })
+            .unwrap();
+        let boundary =
+            bevy_ui_router_core::prelude::ErrorBoundaryKey::named("error-role-boundary").unwrap();
+        let mut routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(root_layout.clone())
+                    .with_error_view(boundary, error.clone()),
+            )
+            .unwrap();
+        let boundary_route = routes.root_id().unwrap();
+        let section_route = routes
+            .route_with_options(
+                boundary_route,
+                RoutePattern::path("section").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(section.clone())
+                    .with_slot(bevy_ui_router_core::prelude::RouteSlotKey::default()),
+            )
+            .unwrap();
+        routes
+            .route_with_options(
+                section_route,
+                RoutePattern::path("item").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(leaf.clone())
+                    .with_slot(bevy_ui_router_core::prelude::RouteSlotKey::default()),
+            )
+            .unwrap();
+        let mut views = RouteViewRegistry::new();
+        for view in [root_layout, section, leaf, error, fallback.clone()] {
+            views
+                .insert(view, RouteViewDescriptor::new(driver.clone()))
+                .unwrap();
+        }
+        let router = app
+            .add_ui_router(RouterConfig::new(routes.build().unwrap(), views, fallback))
+            .unwrap();
+        let host = app
+            .world_mut()
+            .spawn((Node::default(), RouterHostRegistration::new(router)))
+            .id();
+        let foreign = app.world_mut().spawn((Node::default(), ChildOf(host))).id();
+        app.update();
+        let setup = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        for _ in 0..16 {
+            app.update();
+            if matches!(
+                app.world().resource::<RouterSnapshots>().request(router, setup),
+                RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded
+            ) {
+                break;
+            }
+        }
+        assert!(matches!(
+            app.world().resource::<RouterSnapshots>().request(router, setup),
+            RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded
+        ));
+        let (
+            active_claims,
+            active_before,
+            active_frame_before,
+            active_outlet_before,
+            host_before,
+            foreign_before,
+            history_before,
+            top_slot,
+        ) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let active = entry.active.as_ref().unwrap();
+            assert_eq!(active.frames().len(), 1);
+            assert_eq!(active.frames()[0].outlets().len(), 1);
+            let active_frame = &active.frames()[0];
+            let active_outlet = &active_frame.outlets()[0];
+            let claims = active.claims().cloned().collect::<Vec<_>>();
+            assert!(
+                claims
+                    .iter()
+                    .all(|claim| claim.lifecycle() == EntityLifecycle::Active)
+            );
+            let host_binding = entry.host.as_ref().unwrap();
+            (
+                claims.clone(),
+                claims
+                    .iter()
+                    .map(|claim| {
+                        (
+                            claim.entity(),
+                            nested_protected_fingerprint(app.world(), claim.entity()),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                active_frame.frame().clone(),
+                (
+                    active_outlet.key().clone(),
+                    active_outlet.anchor(),
+                    active_outlet.anchor_claim().clone(),
+                ),
+                nested_protected_fingerprint(app.world(), host),
+                nested_protected_fingerprint(app.world(), foreign),
+                entry.engine.history().clone(),
+                host_binding.top_slot,
+            )
+        };
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/section/item"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        let mut drive_steps = 0;
+        for _ in 0..8 {
+            drive_navigation_system(app.world_mut());
+            drive_steps += 1;
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .pending_failed_branch
+                .is_some()
+            {
+                break;
+            }
+        }
+
+        let targets = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(
+                entry.pending_failed_branch.is_some(),
+                "the missing section outlet must retain its failed suffix within {drive_steps} drive steps; status={:?} pending_commit={} pending_mount_request={} pending_mount_frame_task={}",
+                entry
+                    .engine
+                    .request(request)
+                    .map(|request| format!("{:?}", request.status())),
+                entry.pending_commit.is_some(),
+                entry.pending_mount_request.is_some(),
+                entry.pending_mount_frame_task.is_some(),
+            );
+            let failed = entry
+                .pending_failed_branch
+                .as_ref()
+                .expect("the missing section outlet retains its physical failed suffix");
+            assert!(
+                entry
+                    .engine
+                    .request(request)
+                    .unwrap()
+                    .trace()
+                    .iter()
+                    .any(|event| {
+                        event.mount_rejection() == Some(MountRejectionKind::MissingOutlet)
+                    })
+            );
+            let registry = app.world().resource::<RouteEntityRegistry>();
+            let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                app.world(),
+                registry,
+                &failed.branch,
+            )
+            .expect("the physical failed suffix must freeze an exact cleanup manifest");
+            let targets = manifest
+                .entities()
+                .into_iter()
+                .map(|entity| {
+                    registry
+                        .record(entity)
+                        .expect("each physical cleanup target remains registered")
+                        .claim()
+                })
+                .collect::<Vec<_>>();
+            assert!(!targets.is_empty(), "the failed section suffix is physical");
+            assert!(targets.iter().all(|claim| {
+                claim.lifecycle() == EntityLifecycle::PreparedInert
+                    && registry
+                        .record(claim.entity())
+                        .is_some_and(|record| record.claim() == claim.clone())
+            }));
+            assert!(
+                manifest
+                    .freeze_failure_cleanup_partition(
+                        app.world(),
+                        registry,
+                        entry.active.as_ref(),
+                        entry.host.as_ref().unwrap(),
+                    )
+                    .is_some(),
+                "the production role partition must accept the physical target/protected split"
+            );
+            let target_entities = targets
+                .iter()
+                .map(ExactRegistryClaim::entity)
+                .collect::<std::collections::BTreeSet<_>>();
+            let protected_entities = active_claims
+                .iter()
+                .map(ExactRegistryClaim::entity)
+                .chain([host, top_slot, foreign])
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!(target_entities.is_disjoint(&protected_entities));
+            targets
+        };
+
+        let mut settle_steps = 0;
+        for _ in 0..12 {
+            settle_cleanup_system(app.world_mut());
+            settle_steps += 1;
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            if entry.pending_failed_branch.is_none()
+                && entry.cleanup_ledger.is_none()
+                && matches!(
+                    entry.engine.request(request).unwrap().status(),
+                    RequestStatus::Running(NavigationPhase::Recovering)
+                )
+            {
+                break;
+            }
+        }
+
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(
+                entry.pending_failed_branch.is_none()
+                    && entry.cleanup_ledger.is_none()
+                    && matches!(
+                        entry.engine.request(request).unwrap().status(),
+                        RequestStatus::Running(NavigationPhase::Recovering)
+                    ),
+                "the physical failed suffix must settle within {settle_steps} cleanup steps; status={:?} pending_failed={} ledger={:?}",
+                entry
+                    .engine
+                    .request(request)
+                    .map(|request| format!("{:?}", request.status())),
+                entry.pending_failed_branch.is_some(),
+                entry
+                    .cleanup_ledger
+                    .as_ref()
+                    .map(|ledger| (ledger.is_settled(), ledger.receipt_count())),
+            );
+            assert!(entry.pending_failed_branch.is_none());
+            assert!(entry.cleanup_ledger.is_none());
+            assert_eq!(entry.engine.history(), &history_before);
+            let request_view = entry.engine.request(request).unwrap();
+            assert!(matches!(
+                request_view.status(),
+                RequestStatus::Running(NavigationPhase::Recovering)
+            ));
+            assert!(request_view.trace().iter().any(|event| {
+                event.kind() == NavigationTraceEventKind::FrameTaskIssued
+                    && event.frame().is_some_and(|frame| {
+                        frame.origin() == &FrameOrigin::RouteError(boundary_route)
+                    })
+            }));
+            assert!(request_view.trace().iter().all(|event| {
+                event.kind() != NavigationTraceEventKind::FrameTaskIssued
+                    || event
+                        .frame()
+                        .is_none_or(|frame| frame.origin() != &FrameOrigin::RouterFallback)
+            }));
+            assert_eq!(
+                entry
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .claims()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                active_claims
+            );
+            let active = entry.active.as_ref().unwrap();
+            assert_eq!(active.frames().len(), 1);
+            assert_eq!(active.frames()[0].frame(), &active_frame_before);
+            assert_eq!(active.frames()[0].outlets().len(), 1);
+            let outlet = &active.frames()[0].outlets()[0];
+            assert_eq!(outlet.key(), &active_outlet_before.0);
+            assert_eq!(outlet.anchor(), active_outlet_before.1);
+            assert_eq!(outlet.anchor_claim(), &active_outlet_before.2);
+        }
+        for (entity, before) in &active_before {
+            assert_eq!(&nested_protected_fingerprint(app.world(), *entity), before);
+        }
+        assert_eq!(nested_protected_fingerprint(app.world(), host), host_before);
+        assert_eq!(
+            nested_protected_fingerprint(app.world(), foreign),
+            foreign_before
+        );
+        assert!(targets.iter().all(|target| {
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(target.entity())
+                .is_none()
+                && app.world().get_entity(target.entity()).is_err()
+        }));
+        assert!(app.world().get_entity(host).is_ok());
+        assert!(app.world().get_entity(foreign).is_ok());
     }
 
     #[test]

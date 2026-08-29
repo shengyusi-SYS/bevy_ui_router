@@ -2745,11 +2745,21 @@ pub(crate) fn isolate_frame_for_settlement(
     frame: &RealizedFrame,
     requires_exact_isolation: &impl Fn(&ExactRegistryClaim) -> bool,
 ) -> bool {
-    if !frame
-        .entities
-        .iter()
-        .filter(|realized| requires_exact_isolation(&realized.claim))
-        .all(|realized| frame_claim_is_current(world, realized))
+    isolate_frame_for_settlement_guarded(world, frame, requires_exact_isolation, &|_| true)
+}
+
+pub(crate) fn isolate_frame_for_settlement_guarded(
+    world: &mut World,
+    frame: &RealizedFrame,
+    requires_exact_isolation: &impl Fn(&ExactRegistryClaim) -> bool,
+    protected_partition_is_exact: &impl Fn(&World) -> bool,
+) -> bool {
+    if !protected_partition_is_exact(world)
+        || !frame
+            .entities
+            .iter()
+            .filter(|realized| requires_exact_isolation(&realized.claim))
+            .all(|realized| frame_claim_is_current(world, realized))
     {
         return false;
     }
@@ -2758,42 +2768,45 @@ pub(crate) fn isolate_frame_for_settlement(
         .iter()
         .filter(|realized| requires_exact_isolation(&realized.claim))
     {
-        if !frame_claim_is_current(world, realized) {
+        if !protected_partition_is_exact(world) || !frame_claim_is_current(world, realized) {
             return false;
         }
         if world.get::<Visibility>(realized.entity).is_none() {
-            if !frame_claim_is_current(world, realized) {
+            if !protected_partition_is_exact(world) || !frame_claim_is_current(world, realized) {
                 return false;
             }
             world.entity_mut(realized.entity).insert(Visibility::Hidden);
             world.flush();
-            if !frame_claim_is_current(world, realized)
+            if !protected_partition_is_exact(world)
+                || !frame_claim_is_current(world, realized)
                 || world.get::<Visibility>(realized.entity) != Some(&Visibility::Hidden)
             {
                 return false;
             }
         }
         if world.get::<Pickable>(realized.entity).is_none() {
-            if !frame_claim_is_current(world, realized) {
+            if !protected_partition_is_exact(world) || !frame_claim_is_current(world, realized) {
                 return false;
             }
             world.entity_mut(realized.entity).insert(Pickable::IGNORE);
             world.flush();
-            if !frame_claim_is_current(world, realized)
+            if !protected_partition_is_exact(world)
+                || !frame_claim_is_current(world, realized)
                 || world.get::<Pickable>(realized.entity) != Some(&Pickable::IGNORE)
             {
                 return false;
             }
         }
         if world.get::<RouterInputBarrier>(realized.entity).is_none() {
-            if !frame_claim_is_current(world, realized) {
+            if !protected_partition_is_exact(world) || !frame_claim_is_current(world, realized) {
                 return false;
             }
             world
                 .entity_mut(realized.entity)
                 .insert(RouterInputBarrier::deny_all());
             world.flush();
-            if !frame_claim_is_current(world, realized)
+            if !protected_partition_is_exact(world)
+                || !frame_claim_is_current(world, realized)
                 || !world
                     .get::<RouterInputBarrier>(realized.entity)
                     .is_some_and(RouterInputBarrier::denies_all)
@@ -2801,7 +2814,7 @@ pub(crate) fn isolate_frame_for_settlement(
                 return false;
             }
         }
-        if !frame_claim_is_current(world, realized) {
+        if !protected_partition_is_exact(world) || !frame_claim_is_current(world, realized) {
             return false;
         }
         {
@@ -2810,29 +2823,38 @@ pub(crate) fn isolate_frame_for_settlement(
             };
             *visibility = Visibility::Hidden;
         }
-        if !frame_claim_is_current(world, realized)
+        if !protected_partition_is_exact(world)
+            || !frame_claim_is_current(world, realized)
             || world.get::<Visibility>(realized.entity) != Some(&Visibility::Hidden)
         {
             return false;
         }
         {
+            if !protected_partition_is_exact(world) {
+                return false;
+            }
             let Some(mut pickable) = world.get_mut::<Pickable>(realized.entity) else {
                 return false;
             };
             *pickable = Pickable::IGNORE;
         }
-        if !frame_claim_is_current(world, realized)
+        if !protected_partition_is_exact(world)
+            || !frame_claim_is_current(world, realized)
             || world.get::<Pickable>(realized.entity) != Some(&Pickable::IGNORE)
         {
             return false;
         }
         {
+            if !protected_partition_is_exact(world) {
+                return false;
+            }
             let Some(mut barrier) = world.get_mut::<RouterInputBarrier>(realized.entity) else {
                 return false;
             };
             *barrier = RouterInputBarrier::deny_all();
         }
-        if !frame_claim_is_current(world, realized)
+        if !protected_partition_is_exact(world)
+            || !frame_claim_is_current(world, realized)
             || !world
                 .get::<RouterInputBarrier>(realized.entity)
                 .is_some_and(RouterInputBarrier::denies_all)
@@ -2840,7 +2862,8 @@ pub(crate) fn isolate_frame_for_settlement(
             return false;
         }
     }
-    frame_is_isolated_for_settlement(world, frame, requires_exact_isolation)
+    protected_partition_is_exact(world)
+        && frame_is_isolated_for_settlement(world, frame, requires_exact_isolation)
 }
 
 pub(crate) fn frame_is_isolated_for_settlement(
@@ -3644,8 +3667,12 @@ pub(crate) mod tests {
     use bevy_app::{App, PostUpdate, PreUpdate};
     use bevy_camera::visibility::InheritedVisibility;
     use bevy_ecs::{
-        component::Component, event::EntityEvent, lifecycle::HookContext, observer::On,
-        prelude::Resource, query::With,
+        component::Component,
+        event::EntityEvent,
+        lifecycle::{HookContext, Insert},
+        observer::On,
+        prelude::{Commands, Resource},
+        query::With,
     };
     use bevy_internal::{
         DefaultPlugins,
@@ -3678,6 +3705,9 @@ pub(crate) mod tests {
 
     #[derive(Component)]
     struct ForeignRealizationComponent;
+
+    #[derive(Component)]
+    struct ProtectedIsolationMarker;
 
     struct NestedPickingDriver {
         key: ViewDriverKey,
@@ -4011,6 +4041,38 @@ pub(crate) mod tests {
         )
         .unwrap();
         (world, host, top_slot, frame)
+    }
+
+    #[test]
+    fn guarded_settlement_stops_writes_after_protected_partition_drift() {
+        let (mut world, _host, _top_slot, frame) = realized_empty_fixture();
+        let target = frame.shell();
+        let protected = world.spawn(ProtectedIsolationMarker).id();
+        world.add_observer(
+            move |event: On<Insert, Visibility>, mut commands: Commands| {
+                if event.entity == target {
+                    commands
+                        .entity(protected)
+                        .remove::<ProtectedIsolationMarker>();
+                }
+            },
+        );
+        world.entity_mut(target).remove::<Visibility>();
+        world.entity_mut(target).remove::<Pickable>();
+        world.entity_mut(target).remove::<RouterInputBarrier>();
+
+        let isolated = isolate_frame_for_settlement_guarded(
+            &mut world,
+            &frame,
+            &|claim| claim.entity() == target,
+            &|world| world.get::<ProtectedIsolationMarker>(protected).is_some(),
+        );
+
+        assert!(!isolated);
+        assert!(world.get::<ProtectedIsolationMarker>(protected).is_none());
+        assert_eq!(world.get::<Visibility>(target), Some(&Visibility::Hidden));
+        assert!(world.get::<Pickable>(target).is_none());
+        assert!(world.get::<RouterInputBarrier>(target).is_none());
     }
 
     fn activate_realized_frame_for_committed_preflight(

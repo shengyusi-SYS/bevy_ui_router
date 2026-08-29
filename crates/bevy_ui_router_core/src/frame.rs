@@ -554,6 +554,7 @@ pub(crate) enum ProjectedEnteringSlot {
 pub(crate) struct ProjectedEnteringFrame {
     branch_index: usize,
     route: RouteId,
+    origin: FrameOrigin,
     frame: RouteFrameId,
     generation: RouteGeneration,
     slot: ProjectedEnteringSlot,
@@ -566,6 +567,10 @@ impl ProjectedEnteringFrame {
 
     pub(crate) const fn route(&self) -> RouteId {
         self.route
+    }
+
+    pub(crate) const fn origin(&self) -> &FrameOrigin {
+        &self.origin
     }
 
     pub(crate) const fn frame(&self) -> RouteFrameId {
@@ -630,6 +635,18 @@ pub(crate) struct RouteReconciliationProjection {
     entering: Vec<ProjectedEnteringFrame>,
     child_slots: Vec<ProjectedChildSlotRole>,
     target_fingerprint: RouteBranchFingerprint,
+    target: ReconciliationProjectionTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReconciliationProjectionTarget {
+    MatchedBranch,
+    BoundError {
+        boundary_index: usize,
+        boundary_route: RouteId,
+        frame: RouteFrameId,
+        generation: RouteGeneration,
+    },
 }
 
 impl RouteReconciliationProjection {
@@ -722,6 +739,7 @@ impl RouteReconciliationProjection {
             entering.push(ProjectedEnteringFrame {
                 branch_index,
                 route: route.route(),
+                origin: FrameOrigin::MatchedRoute(route.route()),
                 frame,
                 generation,
                 slot,
@@ -744,7 +762,205 @@ impl RouteReconciliationProjection {
             entering,
             child_slots,
             target_fingerprint: target.branch_fingerprint().clone(),
+            target: ReconciliationProjectionTarget::MatchedBranch,
         })
+    }
+
+    pub(crate) fn retarget_bound_error(
+        &self,
+        target: &MatchedBranch,
+        boundary_index: usize,
+        prepared_prefix: &[RouteFrameVersion],
+        frame: RouteFrameId,
+        generation: RouteGeneration,
+        slot: ProjectedEnteringSlot,
+    ) -> Option<Self> {
+        let boundary = target.routes().get(boundary_index)?;
+        if target.branch_fingerprint() != &self.target_fingerprint
+            || boundary_index > self.baseline.frames.len().max(target.routes().len())
+        {
+            return None;
+        }
+        let mut preserved = self
+            .preserved
+            .iter()
+            .filter(|candidate| candidate.branch_index < boundary_index)
+            .cloned()
+            .collect::<Vec<_>>();
+        preserved.sort_by_key(|candidate| candidate.branch_index);
+        if preserved
+            .iter()
+            .enumerate()
+            .any(|(index, candidate)| index != candidate.branch_index)
+        {
+            return None;
+        }
+        let prepared_start = preserved.len();
+        if prepared_start + prepared_prefix.len() != boundary_index {
+            return None;
+        }
+        let mut entering = Vec::with_capacity(prepared_prefix.len() + 1);
+        for (offset, version) in prepared_prefix.iter().enumerate() {
+            let branch_index = prepared_start + offset;
+            let route = target.routes().get(branch_index)?;
+            let projected = self
+                .entering
+                .iter()
+                .find(|candidate| candidate.branch_index == branch_index)?;
+            let slot_matches = match projected.slot {
+                ProjectedEnteringSlot::Existing(expected) => expected == version.slot(),
+                ProjectedEnteringSlot::MountNew => true,
+            };
+            if version.origin() != &FrameOrigin::MatchedRoute(route.route())
+                || projected.route != route.route()
+                || &projected.origin != version.origin()
+                || projected.frame != version.frame()
+                || projected.generation != version.generation()
+                || !slot_matches
+            {
+                return None;
+            }
+            entering.push(ProjectedEnteringFrame {
+                branch_index,
+                route: route.route(),
+                origin: version.origin().clone(),
+                frame: version.frame(),
+                generation: version.generation(),
+                slot: projected.slot,
+            });
+        }
+        entering.push(ProjectedEnteringFrame {
+            branch_index: boundary_index,
+            route: boundary.route(),
+            origin: FrameOrigin::RouteError(boundary.route()),
+            frame,
+            generation,
+            slot,
+        });
+
+        let leaving = self
+            .baseline
+            .frames
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|(index, _)| *index >= prepared_start)
+            .rev()
+            .map(|(index, version)| ProjectedExistingFrame::new(index, version))
+            .collect();
+        let mut child_slots = Vec::new();
+        let mut consumed = Vec::new();
+        for child_index in 1..boundary_index {
+            let route = target.routes().get(child_index)?;
+            let role = self.child_slots.iter().find(|role| {
+                role.parent_branch_index == child_index - 1 && role.outlet == *route.slot()
+            })?;
+            child_slots.push(role.clone());
+            if let Some(binding) = role.binding.as_ref() {
+                consumed.push(binding.slot());
+            }
+        }
+        if boundary_index > 0 {
+            let parent_index = boundary_index - 1;
+            match slot {
+                ProjectedEnteringSlot::Existing(expected) => {
+                    let parent = preserved
+                        .iter()
+                        .find(|candidate| candidate.branch_index == parent_index)
+                        .map(|candidate| candidate.version.clone())
+                        .or_else(|| {
+                            prepared_prefix
+                                .get(parent_index.checked_sub(prepared_start)?)
+                                .cloned()
+                        })?;
+                    let role = self.child_slots.iter().find(|role| {
+                        role.parent_branch_index == parent_index && role.outlet == *boundary.slot()
+                    })?;
+                    if let Some(binding) = role.binding.as_ref() {
+                        if binding.parent() != &parent
+                            || binding.outlet() != boundary.slot()
+                            || binding.slot() != expected
+                        {
+                            return None;
+                        }
+                        let kind = if binding.child().is_some() {
+                            ProjectedChildSlotRoleKind::PreservedActive
+                        } else {
+                            ProjectedChildSlotRoleKind::ActivateExisting
+                        };
+                        child_slots.push(ProjectedChildSlotRole::existing(kind, binding.clone()));
+                    } else if role.kind == ProjectedChildSlotRoleKind::MountNew {
+                        child_slots.push(role.clone());
+                    } else {
+                        return None;
+                    }
+                    consumed.push(expected);
+                }
+                ProjectedEnteringSlot::MountNew => child_slots.push(
+                    ProjectedChildSlotRole::mount_new(parent_index, boundary.slot().clone()),
+                ),
+            }
+        }
+        let mut residual = self
+            .baseline
+            .child_slots
+            .iter()
+            .filter(|binding| !consumed.contains(&binding.slot()))
+            .cloned()
+            .map(|binding| {
+                let kind = if binding.parent_branch_index() < prepared_start {
+                    ProjectedChildSlotRoleKind::RetainEmpty
+                } else {
+                    ProjectedChildSlotRoleKind::Leaving
+                };
+                ProjectedChildSlotRole::existing(kind, binding)
+            })
+            .collect::<Vec<_>>();
+        residual.sort_by(|left, right| {
+            right
+                .parent_branch_index()
+                .cmp(&left.parent_branch_index())
+                .then_with(|| left.outlet().cmp(right.outlet()))
+        });
+        child_slots.extend(residual);
+
+        Some(Self {
+            baseline: self.baseline.clone(),
+            preserved,
+            leaving,
+            entering,
+            child_slots,
+            target_fingerprint: self.target_fingerprint.clone(),
+            target: ReconciliationProjectionTarget::BoundError {
+                boundary_index,
+                boundary_route: boundary.route(),
+                frame,
+                generation,
+            },
+        })
+    }
+
+    pub(crate) fn matches_matched_target(&self, target: &MatchedBranch) -> bool {
+        self.target == ReconciliationProjectionTarget::MatchedBranch
+            && target.branch_fingerprint() == &self.target_fingerprint
+    }
+
+    pub(crate) fn matches_bound_error_target(
+        &self,
+        target_fingerprint: &RouteBranchFingerprint,
+        boundary_index: usize,
+        boundary_route: RouteId,
+        frame: RouteFrameId,
+        generation: RouteGeneration,
+    ) -> bool {
+        target_fingerprint == &self.target_fingerprint
+            && self.target
+                == ReconciliationProjectionTarget::BoundError {
+                    boundary_index,
+                    boundary_route,
+                    frame,
+                    generation,
+                }
     }
 
     #[allow(clippy::too_many_arguments)]

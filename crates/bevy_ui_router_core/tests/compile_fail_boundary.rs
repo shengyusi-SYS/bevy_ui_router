@@ -96,7 +96,7 @@ fn route_view_key_error_unit_literal_is_private() {
         features: &[],
         expected_stderr: &[
             "error[E0423]",
-            "expected value, found struct `RouteViewKeyError`",
+            "cannot find value `RouteViewKeyError` in this scope",
         ],
     });
 }

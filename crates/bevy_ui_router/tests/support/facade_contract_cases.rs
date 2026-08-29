@@ -346,7 +346,7 @@ fn validate_recovery_contract_profile(profile: &HistoryContractProfile) {
             (
                 "boundary-bound error presentation complete evidence",
                 "R1 Error presentation",
-                "planned",
+                "active",
                 "Journey D public contract PASS",
             ),
             (
@@ -370,7 +370,7 @@ fn validate_recovery_contract_profile(profile: &HistoryContractProfile) {
             (
                 "error_outlet_role_classification_is_preserved",
                 "R1 Error presentation",
-                "planned",
+                "active",
                 "",
             ),
             (
@@ -387,12 +387,15 @@ fn validate_recovery_contract_profile(profile: &HistoryContractProfile) {
             ),
         ],
     );
-    assert!(
+    assert_eq!(
         profile
             .authority_additions
             .iter()
-            .all(|row| row.state != "active"),
-        "Recovery authority rows must remain planned"
+            .filter(|row| row.state == "active")
+            .map(|row| row.item.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["error_outlet_role_classification_is_preserved"]),
+        "Recovery must activate exactly the completed R1 authority row"
     );
 }
 
@@ -454,16 +457,6 @@ fn validate_recovery_exclusions(exclusions: &[TableRow]) {
             "symbol",
             "bevy_ui_router::ecs::RouterInputProbes",
             "Authority closure",
-        ),
-        (
-            "associated",
-            "bevy_ui_router::core::RouteNodeOptions::with_error_boundary",
-            "R1 Error presentation",
-        ),
-        (
-            "associated",
-            "bevy_ui_router::core::RouteNodeOptions::with_error_view",
-            "R1 Error presentation",
         ),
         (
             "associated",
@@ -1116,31 +1109,11 @@ fn validate_exclusion_vocabulary(exclusions: &[TableRow]) {
         ),
         (
             "associated",
-            "bevy_ui_router::core::RouteNodeOptions::with_error_boundary",
-            "R1 Error presentation",
-        ),
-        (
-            "associated",
-            "bevy_ui_router::core::RouteNodeOptions::with_error_view",
-            "R1 Error presentation",
-        ),
-        (
-            "associated",
             "bevy_ui_router::ecs::RouterAuthorityAuditSnapshot::quarantines",
             "Authority closure",
         ),
     ]);
     let mut history_expected = recovery_expected.clone();
-    history_expected.remove(&(
-        "associated",
-        "bevy_ui_router::core::RouteNodeOptions::with_error_boundary",
-        "R1 Error presentation",
-    ));
-    history_expected.remove(&(
-        "associated",
-        "bevy_ui_router::core::RouteNodeOptions::with_error_view",
-        "R1 Error presentation",
-    ));
     history_expected.insert((
         "associated",
         "bevy_ui_router::core::RouteNodeOptions::with_error_boundary",

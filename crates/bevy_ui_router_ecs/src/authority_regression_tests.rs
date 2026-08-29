@@ -1102,6 +1102,11 @@ fn active_cycle_enters_authority_settlement() {
     crate::navigation::tests::active_cycle_enters_authority_settlement();
 }
 
+#[test]
+fn error_outlet_role_classification_is_preserved() {
+    crate::navigation::tests::error_outlet_role_classification_is_preserved_fixture();
+}
+
 pub(crate) fn partial_receipt_then_missing_pickable_still_quarantines_and_terminals() {
     let mut harness = harness("partial-persistent-drift");
     first_push(&mut harness);

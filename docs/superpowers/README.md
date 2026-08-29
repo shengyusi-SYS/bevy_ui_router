@@ -2,7 +2,7 @@
 
 ## Recovery current profile
 
-[Recovery 阶段设计](specs/2026-08-12-recovery-design.md) and [Recovery 实施计划](plans/2026-08-12-recovery-implementation-plan.md) are the active spec/plan pair. They retain History active delta 3, add Recovery planned delta 3, use Recovery 10.1's ten current exclusions, and expose zero active Recovery authority rows while the runtime catalogue stays 24. History remains completed evidence; no Recovery PASS, full Journey G, or MVP PASS is claimed, and old-lease reap belongs to Authority closure.
+[Recovery 阶段设计](specs/2026-08-12-recovery-design.md) and [Recovery 实施计划](plans/2026-08-12-recovery-implementation-plan.md) are the active spec/plan pair. They retain History active delta 3, activate Recovery R1 while keeping R2/R3 planned, use Recovery 10.1's eight current exclusions, and expose one active Recovery authority row while the runtime catalogue is 25. History remains completed evidence; no Recovery PASS, full Journey G, or MVP PASS is claimed, and old-lease reap belongs to Authority closure.
 
 The registered Recovery spec/plan pair is the sole active exception to this directory's historical-evidence rule. Every other existing spec, plan, and review record remains evidence-only; Recovery is current-stage work, not completed evidence.
 

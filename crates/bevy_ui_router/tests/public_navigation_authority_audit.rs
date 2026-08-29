@@ -5,7 +5,12 @@ use std::sync::{
 
 use bevy_app::{App, Update};
 use bevy_camera::visibility::Visibility;
-use bevy_ecs::{schedule::IntoScheduleConfigs, world::World};
+use bevy_ecs::{
+    component::{Component, ComponentId},
+    hierarchy::{ChildOf, Children},
+    schedule::IntoScheduleConfigs,
+    world::World,
+};
 use bevy_picking::Pickable;
 use bevy_ui::{Node, Val};
 use bevy_ui_router::ecs::RouterScheduleSet;
@@ -22,6 +27,59 @@ const LEAF_RECT_WIDTH: u16 = 41;
 struct AuditDriver {
     key: ViewDriverKey,
     outlet_view: Option<RouteViewKey>,
+}
+
+#[derive(Component, Debug, Eq, PartialEq)]
+struct RecoveryAuditHostSentinel(u64);
+
+#[derive(Component, Debug, Eq, PartialEq)]
+struct RecoveryAuditChildSentinel(u64);
+
+struct RecoveryAuditDriver {
+    key: ViewDriverKey,
+    failed_view: Option<RouteViewKey>,
+    error_view: RouteViewKey,
+    fallback_view: RouteViewKey,
+}
+
+impl EcsViewDriver for RecoveryAuditDriver {
+    fn key(&self) -> ViewDriverKey {
+        self.key.clone()
+    }
+
+    fn apply(
+        &mut self,
+        effect: &ViewBuildEffect,
+        content: &mut FrameContentWriter<'_>,
+        report: EcsViewReportSession<'_>,
+    ) -> ViewBuildReport {
+        let width = if effect.view() == &self.error_view {
+            67
+        } else if effect.view() == &self.fallback_view {
+            71
+        } else {
+            61
+        };
+        content
+            .spawn_solid_rect(
+                SolidRect::new(width, 21, ContentColor::srgba8(31, 47, 83, 255)).unwrap(),
+            )
+            .unwrap();
+        if self.failed_view.as_ref() == Some(effect.view()) {
+            report.apply_failed("recovery audit normal attempt fails after partial output")
+        } else {
+            report.applied()
+        }
+    }
+}
+
+fn audit_component_manifest(app: &App, entity: bevy_ecs::entity::Entity) -> Vec<ComponentId> {
+    app.world()
+        .get_entity(entity)
+        .expect("audited app-owned Entity remains present")
+        .archetype()
+        .components()
+        .to_vec()
 }
 
 impl EcsViewDriver for AuditDriver {
@@ -1053,4 +1111,207 @@ fn reconciliation_authority_is_preserved_and_old_leaf_is_removed() {
         audit.owned_entity_state(old_leaf_root),
         AuditEntityState::Removed
     );
+}
+
+#[test]
+fn recovery_r1_error_presentation_authority_maps_exact_frame() {
+    #[derive(Clone, Copy)]
+    enum Case {
+        Bound,
+        RouterFallback,
+    }
+
+    for (label, case) in [
+        ("r1-authority-bound", Case::Bound),
+        ("r1-authority-fallback", Case::RouterFallback),
+    ] {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let normal = RouteViewKey::new(format!("{label}-normal")).unwrap();
+        let error = RouteViewKey::new(format!("{label}-error")).unwrap();
+        let fallback = RouteViewKey::new(format!("{label}-fallback")).unwrap();
+        let driver = app
+            .register_ui_view_driver(RecoveryAuditDriver {
+                key: ViewDriverKey::new(format!("{label}-driver")).unwrap(),
+                failed_view: matches!(case, Case::Bound).then_some(normal.clone()),
+                error_view: error.clone(),
+                fallback_view: fallback.clone(),
+            })
+            .unwrap();
+        let options = match case {
+            Case::Bound => RouteNodeOptions::new()
+                .with_view(normal.clone())
+                .with_error_view(
+                    ErrorBoundaryKey::named(format!("{label}-boundary")).unwrap(),
+                    error.clone(),
+                ),
+            Case::RouterFallback => RouteNodeOptions::new().with_view(normal.clone()),
+        };
+        let routes = RouteTree::builder()
+            .root_with_options(RoutePattern::path("known").unwrap(), options)
+            .unwrap();
+        let boundary_route = routes.root_id().unwrap();
+        let routes = routes.build().unwrap();
+        let mut views = RouteViewRegistry::new();
+        for view in [normal, error.clone(), fallback.clone()] {
+            views
+                .insert(view, RouteViewDescriptor::new(driver.clone()))
+                .unwrap();
+        }
+        let router = app
+            .add_ui_router(RouterConfig::new(routes, views, fallback))
+            .unwrap();
+        let host = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(503.0),
+                    height: Val::Px(307.0),
+                    ..Node::default()
+                },
+                RecoveryAuditHostSentinel(0x51),
+                RouterHostRegistration::new(router),
+            ))
+            .id();
+        let child = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(13.0),
+                    ..Node::default()
+                },
+                RecoveryAuditChildSentinel(0x52),
+                ChildOf(host),
+            ))
+            .id();
+        let host_manifest_before = audit_component_manifest(&app, host);
+        let child_manifest_before = audit_component_manifest(&app, child);
+        app.update();
+        let top_slot = app
+            .world()
+            .get::<Children>(host)
+            .unwrap()
+            .iter()
+            .copied()
+            .find(|candidate| *candidate != child)
+            .expect("admission adds one exact top slot");
+
+        let requested = match case {
+            Case::Bound => RouteLocation::new("/known"),
+            Case::RouterFallback => RouteLocation::new("/missing"),
+        };
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, requested.clone())
+            .unwrap();
+        for _ in 0..16 {
+            app.update();
+            if matches!(
+                app.world().resource::<RouterSnapshots>().request(router, request),
+                RequestLookup::Found(snapshot) if matches!(snapshot.status(), RequestStatus::Failed(_))
+            ) {
+                break;
+            }
+        }
+
+        let snapshots = app.world().resource::<RouterSnapshots>();
+        let router_snapshot = snapshots.get(router).unwrap();
+        let RequestLookup::Found(request_snapshot) = snapshots.request(router, request) else {
+            panic!("recovery audit request remains retained")
+        };
+        let expected_failure = match case {
+            Case::Bound => NavigationFailureKind::Apply,
+            Case::RouterFallback => NavigationFailureKind::Match,
+        };
+        assert!(matches!(
+            request_snapshot.status(),
+            RequestStatus::Failed(failure) if failure.kind() == expected_failure
+        ));
+        assert_eq!(request_snapshot.requested(), Some(&requested));
+        assert_eq!(
+            request_snapshot
+                .trace()
+                .last()
+                .map(NavigationTraceEvent::kind),
+            Some(NavigationTraceEventKind::RequestTerminal)
+        );
+        assert_eq!(router_snapshot.active().frames().len(), 1);
+        let active = &router_snapshot.active().frames()[0];
+        let expected_origin = match case {
+            Case::Bound => FrameOrigin::RouteError(boundary_route),
+            Case::RouterFallback => FrameOrigin::RouterFallback,
+        };
+        assert_eq!(active.origin(), &expected_origin);
+        assert_eq!(router_snapshot.active().requested(), Some(&requested));
+        assert_eq!(
+            router_snapshot
+                .active()
+                .failure()
+                .map(NavigationFailure::kind),
+            Some(expected_failure)
+        );
+        assert!(router_snapshot.running_request().is_none());
+        assert!(router_snapshot.pending_phase().is_none());
+        assert!(!router_snapshot.cleanup().foreground_pending());
+        assert_eq!(router_snapshot.cleanup().quarantine_count(), 0);
+
+        let audits = app.world().resource::<RouterAuthorityAudits>();
+        let audit = audits
+            .get(router)
+            .expect("terminal router retains exact audit");
+        let host_mapping = audit.host().unwrap();
+        assert!(host_mapping.matches_app_entity(host));
+        assert_eq!(audit.frames().len(), 1);
+        let mapping = &audit.frames()[0];
+        assert_eq!(mapping.frame(), active);
+        assert_eq!(mapping.lifecycle(), AuthorityFrameLifecycle::Active);
+        assert_eq!(mapping.slot_entity(), host_mapping.top_slot());
+        assert_eq!(audit.slots().len(), 1);
+        assert_eq!(audit.slots()[0].entity(), host_mapping.top_slot());
+        assert_eq!(audit.slots()[0].kind(), AuthoritySlotKind::HostTop);
+        assert_eq!(audit.content().len(), 1);
+        assert_eq!(audit.content()[0].frame(), active);
+        assert_eq!(
+            audit.content()[0].primitive(),
+            ContentPrimitiveKind::SolidRect
+        );
+        assert_eq!(
+            audit.content()[0].width_px(),
+            match case {
+                Case::Bound => 67,
+                Case::RouterFallback => 71,
+            }
+        );
+        assert!(!audit.content()[0].visibility_hidden());
+        assert!(audit.content()[0].pickable_active());
+        assert!(audit.outlets().is_empty());
+        assert!(audit.orphan_slots().is_empty());
+
+        assert_eq!(audit_component_manifest(&app, host), host_manifest_before);
+        assert_eq!(audit_component_manifest(&app, child), child_manifest_before);
+        assert_eq!(
+            app.world().get::<RecoveryAuditHostSentinel>(host),
+            Some(&RecoveryAuditHostSentinel(0x51))
+        );
+        assert_eq!(
+            app.world().get::<RecoveryAuditChildSentinel>(child),
+            Some(&RecoveryAuditChildSentinel(0x52))
+        );
+        assert_eq!(
+            app.world().get::<ChildOf>(child).map(ChildOf::parent),
+            Some(host)
+        );
+        assert_eq!(
+            app.world()
+                .get::<Children>(host)
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![child, top_slot]
+        );
+        assert_eq!(app.world().get::<Node>(host).unwrap().width, Val::Px(503.0));
+        assert_eq!(app.world().get::<Node>(child).unwrap().width, Val::Px(13.0));
+    }
 }

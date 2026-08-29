@@ -25,8 +25,8 @@ use bevy_ui_router_core::{
 use crate::{
     app_ext::{RouterHandle, RouterHostRegistration},
     branch_transaction::{
-        FailedPreparedBranch, RealizedBranch, RejectedChildSlot, SealedReconciliationSlotRole,
-        SealedReconciliationSplice,
+        FailedPreparedBranch, PreparedBranch, RealizedBranch, RejectedChildSlot,
+        SealedReconciliationSlotRole, SealedReconciliationSplice,
     },
     components::{
         ChildSlotAuthority, ChildSlotLifecycle, ProvisionalSlotLifecycle, RouteOwnershipSeal,
@@ -1920,10 +1920,27 @@ struct FailureCleanupActiveSourceProjection {
 pub(crate) struct FailureCleanupSourceProjection {
     host: Option<FailureCleanupHostSourceProjection>,
     active: Option<FailureCleanupActiveSourceProjection>,
+    prepared: Option<FailureCleanupActiveSourceProjection>,
 }
 
 impl FailureCleanupSourceProjection {
     pub(crate) fn observe(host: Option<&HostBinding>, active: Option<&RealizedBranch>) -> Self {
+        Self::observe_with_prepared(host, active, None)
+    }
+
+    pub(crate) fn observe_with_prepared(
+        host: Option<&HostBinding>,
+        active: Option<&RealizedBranch>,
+        prepared: Option<&RealizedBranch>,
+    ) -> Self {
+        let observe_branch = |branch: &RealizedBranch| FailureCleanupActiveSourceProjection {
+            frames: branch
+                .frames()
+                .iter()
+                .map(|frame| frame.frame().clone())
+                .collect(),
+            claims: branch.claims().cloned().collect(),
+        };
         Self {
             host: host.map(|host| FailureCleanupHostSourceProjection {
                 version: host.version.clone(),
@@ -1932,14 +1949,8 @@ impl FailureCleanupSourceProjection {
                 top_slot: host.top_slot,
                 top_slot_claim: host.top_slot_claim.clone(),
             }),
-            active: active.map(|active| FailureCleanupActiveSourceProjection {
-                frames: active
-                    .frames()
-                    .iter()
-                    .map(|frame| frame.frame().clone())
-                    .collect(),
-                claims: active.claims().cloned().collect(),
-            }),
+            active: active.map(observe_branch),
+            prepared: prepared.map(observe_branch),
         }
     }
 
@@ -3343,6 +3354,17 @@ impl FrozenCleanupManifest {
         active: Option<&RealizedBranch>,
         host: &HostBinding,
     ) -> Option<FrozenFailureCleanupPartition> {
+        self.freeze_failure_cleanup_partition_retaining(world, registry, active, None, host)
+    }
+
+    pub(crate) fn freeze_failure_cleanup_partition_retaining(
+        &self,
+        world: &World,
+        registry: &RouteEntityRegistry,
+        active: Option<&RealizedBranch>,
+        prepared: Option<&RealizedBranch>,
+        host: &HostBinding,
+    ) -> Option<FrozenFailureCleanupPartition> {
         let targets = self
             .obligations
             .iter()
@@ -3365,15 +3387,34 @@ impl FrozenCleanupManifest {
         let active_claims = active
             .map(|active| active.claims().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
+        let prepared_claims = prepared
+            .map(|prepared| prepared.claims().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if prepared_claims.iter().any(|claim| {
+            claim.lifecycle() != EntityLifecycle::PreparedInert
+                || registry
+                    .record(claim.entity())
+                    .is_none_or(|record| record.claim() != *claim)
+                || !cleanup_claim_has_exact_authority(world, claim)
+        }) {
+            return None;
+        }
         if active_claims
             .iter()
+            .chain(&prepared_claims)
             .any(|claim| allowed_writes.contains(&claim.entity()))
+            || active_claims.iter().any(|claim| {
+                prepared_claims
+                    .iter()
+                    .any(|prepared| prepared.entity() == claim.entity())
+            })
         {
             return None;
         }
         let mut roots = vec![host.host, host.top_slot];
         roots.extend(allowed_writes.iter().copied());
         roots.extend(active_claims.iter().map(ExactRegistryClaim::entity));
+        roots.extend(prepared_claims.iter().map(ExactRegistryClaim::entity));
         roots.extend(
             self.obligations
                 .iter()
@@ -3419,6 +3460,7 @@ impl FrozenCleanupManifest {
             || !protected_entities.contains(&host.top_slot)
             || active_claims
                 .iter()
+                .chain(&prepared_claims)
                 .any(|claim| !protected_entities.contains(&claim.entity()))
         {
             return None;
@@ -3435,7 +3477,11 @@ impl FrozenCleanupManifest {
             source: FrozenFailureCleanupSource {
                 manifest_digest: self.digest,
                 targets,
-                logical: FailureCleanupSourceProjection::observe(Some(host), active),
+                logical: FailureCleanupSourceProjection::observe_with_prepared(
+                    Some(host),
+                    active,
+                    prepared,
+                ),
             },
             roots,
             target_observed,
@@ -7649,6 +7695,12 @@ pub(crate) enum CleanupOwner {
 pub(crate) struct FailedPreparedCleanupOwner {
     branch: FailedPreparedBranch,
     preflight: Option<LifecyclePreflightEvidence>,
+}
+
+impl FailedPreparedCleanupOwner {
+    pub(crate) fn into_retained_prepared_prefix(mut self) -> Option<PreparedBranch> {
+        self.branch.take_retained_prepared_prefix()
+    }
 }
 
 pub(crate) struct AuthoritySettlementOwner {

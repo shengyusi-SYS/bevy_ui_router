@@ -1,6 +1,6 @@
 # MVP Acceptance Journeys
 
-> **Recovery activation status:** Journey D and Journey G remain planned acceptance work. This profile activation only makes Recovery current; background old-lease reap and the remaining full Journey G rows remain Authority-closure work. It is not a Recovery PASS or MVP PASS claim.
+> **Recovery activation status:** Journey D 的 R1 Error presentation 合同已通过；Journey G 仍为后续 Recovery 验收工作。background old-lease reap 与剩余完整 Journey G rows 仍属于 Authority closure；当前不是 Recovery 或 MVP 整体 PASS 声明。
 
 **文档类型**: 外部行为验收规范
 **状态**: Phase 3B.1 `Plan PASS`
@@ -89,6 +89,8 @@ ECS crate-private regression 另外在 accepted entering output realization 后�
 match failure时对应`NavigationRequestSnapshot::matched()`与 committed error presentation 的 `matched()` 必须均为`None`；router snapshot的running摘要在该request terminal后清空，不能用来替代request记录或active presentation。mandatory fallback经顶层host outlet构建`RouterFallback` error frame。fallback成功后request按原始`Match` cause为`Failed`、history不推进、error presentation原子提交；fallback也失败时request为`Failed(RecoveryFailed)`，保留旧presentation，首次导航则保持`None`。
 
 缺少普通 view 的 route node、无法解析的 route/fallback binding 和未注册 driver 都是 `add_ui_router` 的同步 `RouterInstallError` 合同，由 facade consumer test 验证；MVP 没有动态 unregister，因此不伪造成 runtime Journey D。
+
+`boundary-bound error presentation complete evidence` — ACTIVE（R1 Error presentation；`Journey D public contract PASS`；只声明本 slice 的 public contract 与 owner closure 已通过，不声明 Recovery 或 MVP 整体 PASS）
 
 ### Journey F1：完全等价的零 entering 导航
 

@@ -405,6 +405,8 @@ struct FrozenBoundErrorRecovery {
     failure_branch_index: usize,
     binding: FrozenErrorViewBinding,
     mount: FrozenErrorMountSource,
+    prepared_prefix: Vec<RouteFrameVersion>,
+    reserved_attempt: Option<crate::ids::ReservedAttemptIds>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -445,6 +447,8 @@ enum FailureCleanupRecoveryTargetProjection {
         boundary_route: RouteId,
         boundary: ErrorBoundaryKey,
         view: RouteViewKey,
+        prepared_prefix: Vec<RouteFrameVersion>,
+        reserved_attempt: Option<crate::ids::ReservedAttemptIds>,
     },
     AuthoritySettlement,
 }
@@ -467,6 +471,8 @@ impl FailureCleanupContinuationOwner {
                 boundary_route: recovery.binding.boundary_route(),
                 boundary: recovery.binding.boundary().clone(),
                 view: recovery.binding.view().clone(),
+                prepared_prefix: recovery.prepared_prefix.clone(),
+                reserved_attempt: recovery.reserved_attempt,
             },
             Self::AuthoritySettlement => {
                 FailureCleanupRecoveryTargetProjection::AuthoritySettlement
@@ -665,6 +671,15 @@ impl FailureCleanupRequest {
 
     pub(crate) fn logical_roots(&self) -> &[RouteFrameVersion] {
         &self.receiver.logical_roots
+    }
+
+    pub(crate) fn retained_prepared_prefix(&self) -> &[RouteFrameVersion] {
+        match &self.continuation {
+            FailureCleanupContinuationOwner::BeginBoundError(recovery) => &recovery.prepared_prefix,
+            FailureCleanupContinuationOwner::Terminal
+            | FailureCleanupContinuationOwner::BeginFallback
+            | FailureCleanupContinuationOwner::AuthoritySettlement => &[],
+        }
     }
 
     pub(crate) const fn failure(&self) -> &NavigationFailure {
@@ -2682,6 +2697,19 @@ pub(crate) struct FailureCleanupCompletionOwner {
     continuation: FailureCleanupContinuationOwner,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FailureCleanupCompletionDisposition {
+    Settled,
+    RetainedPreparedPrefixBound,
+    RetainedPreparedPrefixCleanup,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoundErrorBeginDisposition {
+    Bound,
+    Cleanup,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FailureCleanupCompletionReceiverProjection {
     router: RouterIdentity,
@@ -2870,14 +2898,14 @@ enum PendingMountKind {
     BoundError,
 }
 
-impl From<&MatchedBranch> for FailureCleanupZeroTerminalBranchProjection {
-    fn from(branch: &MatchedBranch) -> Self {
-        Self {
-            routes: branch.routes().to_vec(),
-            provenance: branch.provenance().clone(),
-            search_fingerprint: branch.search_fingerprint().clone(),
-            branch_fingerprint: branch.branch_fingerprint().clone(),
-        }
+fn failure_cleanup_zero_terminal_branch_projection(
+    branch: &MatchedBranch,
+) -> FailureCleanupZeroTerminalBranchProjection {
+    FailureCleanupZeroTerminalBranchProjection {
+        routes: branch.routes().to_vec(),
+        provenance: branch.provenance().clone(),
+        search_fingerprint: branch.search_fingerprint().clone(),
+        branch_fingerprint: branch.branch_fingerprint().clone(),
     }
 }
 
@@ -2924,7 +2952,10 @@ impl From<&CurrentWork> for FailureCleanupZeroTerminalCurrentProjection {
     fn from(current: &CurrentWork) -> Self {
         Self {
             identity: current.identity.clone(),
-            branch: current.branch.as_ref().map(Into::into),
+            branch: current
+                .branch
+                .as_ref()
+                .map(failure_cleanup_zero_terminal_branch_projection),
             location: current.location.clone(),
             reservation: current.reservation.clone(),
             target_frames: current.target_frames.clone(),
@@ -9685,6 +9716,7 @@ impl RouterEngine {
                 .map_err(|error| error.kind())?;
             return self
                 .complete_prepared_failure_cleanup_with_ledger(owner, (), |()| {})
+                .map(|_| ())
                 .map_err(|error| error.kind());
         }
         self.complete_cleanup_impl(completion, || {})
@@ -9817,7 +9849,7 @@ impl RouterEngine {
         owner: FailureCleanupCompletionOwner,
         physical: Physical,
         commit_ledger_and_clear_holder: F,
-    ) -> Result<(), FailureCleanupCompletionCommitError<Physical>>
+    ) -> Result<FailureCleanupCompletionDisposition, FailureCleanupCompletionCommitError<Physical>>
     where
         F: FnOnce(Physical),
     {
@@ -9874,12 +9906,25 @@ impl RouterEngine {
             request,
             token: outstanding,
         });
-        match continuation {
+        let disposition = match continuation {
             FailureCleanupContinuationOwner::BeginBoundError(binding) => {
-                let _ = self.begin_bound_error(request, failure, *binding);
+                let retained_prepared_prefix = !binding.prepared_prefix.is_empty();
+                match (
+                    retained_prepared_prefix,
+                    self.begin_bound_error(request, failure, *binding),
+                ) {
+                    (true, BoundErrorBeginDisposition::Bound) => {
+                        FailureCleanupCompletionDisposition::RetainedPreparedPrefixBound
+                    }
+                    (true, BoundErrorBeginDisposition::Cleanup) => {
+                        FailureCleanupCompletionDisposition::RetainedPreparedPrefixCleanup
+                    }
+                    (false, _) => FailureCleanupCompletionDisposition::Settled,
+                }
             }
             FailureCleanupContinuationOwner::BeginFallback => {
                 let _ = self.begin_fallback(request, failure);
+                FailureCleanupCompletionDisposition::Settled
             }
             FailureCleanupContinuationOwner::Terminal => {
                 let record = self
@@ -9896,12 +9941,13 @@ impl RouterEngine {
                 self.state.set_request(None);
                 self.retain_terminal_records();
                 self.start_next();
+                FailureCleanupCompletionDisposition::Settled
             }
             FailureCleanupContinuationOwner::AuthoritySettlement => {
                 unreachable!("authority settlement uses its dedicated composed owner")
             }
-        }
-        Ok(())
+        };
+        Ok(disposition)
     }
 
     pub(crate) fn complete_cleanup_with_authority_mutation<F>(
@@ -10142,10 +10188,40 @@ impl RouterEngine {
     ) -> Option<&RouteReconciliationProjection> {
         self.current.as_ref().and_then(|current| {
             let projection = current.reconciliation.as_ref()?;
+            let target_is_exact = match (&current.attempt, current.branch.as_ref()) {
+                (AttemptKind::Normal(_), Some(branch)) => projection.matches_matched_target(branch),
+                (
+                    AttemptKind::Fallback {
+                        bound_error: Some(bound_error),
+                        ..
+                    },
+                    None,
+                ) => {
+                    self.request(current.identity.request)
+                        .and_then(NavigationRequestRecord::matched)
+                        .is_some_and(|target| {
+                            projection.matches_bound_error_target(
+                                target,
+                                bound_error.binding.branch_index(),
+                                bound_error.binding.boundary_route(),
+                                current.identity.frame,
+                                current.identity.generation,
+                            )
+                        })
+                        && current.identity.origin
+                            == FrameOrigin::RouteError(bound_error.binding.boundary_route())
+                }
+                (AttemptKind::Normal(_), None)
+                | (AttemptKind::Fallback { .. }, Some(_))
+                | (
+                    AttemptKind::Fallback {
+                        bound_error: None, ..
+                    },
+                    None,
+                ) => false,
+            };
             (current.identity == *identity
-                && current.branch.as_ref().is_some_and(|branch| {
-                    branch.branch_fingerprint() == projection.target_fingerprint()
-                })
+                && target_is_exact
                 && self.current_reconciliation_matches_active())
             .then_some(projection)
         })
@@ -10788,13 +10864,27 @@ impl RouterEngine {
     }
 
     fn frozen_failure_recovery_continuation(
-        &self,
+        &mut self,
         failure_branch_index: usize,
     ) -> FailureCleanupContinuationOwner {
-        let Some(current) = self.current.as_ref() else {
-            return FailureCleanupContinuationOwner::Terminal;
+        let continuation = {
+            let Some(current) = self.current.as_ref() else {
+                return FailureCleanupContinuationOwner::Terminal;
+            };
+            self.frozen_failure_recovery_continuation_for(current, failure_branch_index)
         };
-        self.frozen_failure_recovery_continuation_for(current, failure_branch_index)
+        match continuation {
+            FailureCleanupContinuationOwner::BeginBoundError(mut recovery)
+                if !recovery.prepared_prefix.is_empty() =>
+            {
+                let Ok(reserved) = self.ids.reserve_attempt() else {
+                    return FailureCleanupContinuationOwner::Terminal;
+                };
+                recovery.reserved_attempt = Some(reserved);
+                FailureCleanupContinuationOwner::BeginBoundError(recovery)
+            }
+            continuation => continuation,
+        }
     }
 
     fn frozen_failure_recovery_continuation_for(
@@ -10819,33 +10909,95 @@ impl RouterEngine {
         {
             return FailureCleanupContinuationOwner::Terminal;
         }
-        let Some(mount) = self.freeze_bound_error_mount_source(current, binding) else {
+        let Some(prepared_prefix) =
+            self.freeze_bound_error_prepared_prefix(current, binding.branch_index())
+        else {
+            return FailureCleanupContinuationOwner::Terminal;
+        };
+        let Some(mount) = self.freeze_bound_error_mount_source(current, binding, &prepared_prefix)
+        else {
             return FailureCleanupContinuationOwner::Terminal;
         };
         FailureCleanupContinuationOwner::BeginBoundError(Box::new(FrozenBoundErrorRecovery {
             failure_branch_index,
             binding: binding.clone(),
             mount,
+            prepared_prefix,
+            reserved_attempt: None,
         }))
+    }
+
+    fn freeze_bound_error_prepared_prefix(
+        &self,
+        current: &CurrentWork,
+        boundary_index: usize,
+    ) -> Option<Vec<RouteFrameVersion>> {
+        let branch = current.branch.as_ref()?;
+        let projection = current.reconciliation.as_ref()?;
+        let mut preserved = projection
+            .preserved()
+            .iter()
+            .filter(|frame| frame.branch_index() < boundary_index)
+            .collect::<Vec<_>>();
+        preserved.sort_by_key(|frame| frame.branch_index());
+        if preserved
+            .iter()
+            .enumerate()
+            .any(|(branch_index, frame)| frame.branch_index() != branch_index)
+        {
+            return None;
+        }
+        let prepared_start = preserved.len();
+        let mut prepared = Vec::with_capacity(boundary_index.saturating_sub(prepared_start));
+        for branch_index in prepared_start..boundary_index {
+            let route = branch.routes().get(branch_index)?;
+            let projected = projection
+                .entering()
+                .iter()
+                .find(|frame| frame.branch_index() == branch_index)?;
+            let frame = current.target_frames.get(branch_index)?;
+            let slot_matches = match projected.slot() {
+                ProjectedEnteringSlot::Existing(expected) => frame.slot() == expected,
+                ProjectedEnteringSlot::MountNew => true,
+            };
+            if projected.route() != route.route()
+                || projected.origin() != &FrameOrigin::MatchedRoute(route.route())
+                || frame.origin() != projected.origin()
+                || frame.frame() != projected.frame()
+                || frame.generation() != projected.generation()
+                || !slot_matches
+                || !current.applied_frames.contains(frame)
+            {
+                return None;
+            }
+            prepared.push(frame.clone());
+        }
+        Some(prepared)
     }
 
     fn freeze_bound_error_mount_source(
         &self,
         current: &CurrentWork,
         binding: &FrozenErrorViewBinding,
+        prepared_prefix: &[RouteFrameVersion],
     ) -> Option<FrozenErrorMountSource> {
         let boundary_index = binding.branch_index();
         let projection = current.reconciliation.as_ref()?;
         let active_frames = self.state.active().frames();
         let strict_prefix_is_exact = (0..boundary_index).all(|branch_index| {
-            projection
+            let preserved_is_exact = projection
                 .preserved()
                 .iter()
                 .find(|preserved| preserved.branch_index() == branch_index)
                 .is_some_and(|preserved| {
                     active_frames.get(branch_index) == Some(preserved.version())
                         && current.target_frames.get(branch_index) == Some(preserved.version())
-                })
+                });
+            let prepared_is_exact = current
+                .target_frames
+                .get(branch_index)
+                .is_some_and(|frame| prepared_prefix.contains(frame));
+            preserved_is_exact || prepared_is_exact
         });
         if !strict_prefix_is_exact {
             return None;
@@ -10882,7 +11034,18 @@ impl RouterEngine {
                                         == &FrameOrigin::MatchedRoute(binding.boundary_route())
                             })
                             .map(|_| ProjectedEnteringSlot::Existing(slot)),
-                        ProjectedEnteringSlot::MountNew => Some(ProjectedEnteringSlot::MountNew),
+                        ProjectedEnteringSlot::MountNew => current
+                            .target_frames
+                            .get(boundary_index)
+                            .filter(|frame| {
+                                frame.frame() == entering.frame()
+                                    && frame.generation() == entering.generation()
+                                    && frame.origin()
+                                        == &FrameOrigin::MatchedRoute(binding.boundary_route())
+                            })
+                            .map_or(Some(ProjectedEnteringSlot::MountNew), |frame| {
+                                Some(ProjectedEnteringSlot::Existing(frame.slot()))
+                            }),
                     })
             })?;
 
@@ -10894,17 +11057,13 @@ impl RouterEngine {
         }
 
         let parent_index = boundary_index - 1;
-        let parent = projection
-            .preserved()
-            .iter()
-            .find(|preserved| preserved.branch_index() == parent_index)
-            .and_then(|preserved| {
-                current
-                    .target_frames
-                    .get(parent_index)
-                    .filter(|frame| *frame == preserved.version())
-            })?
-            .clone();
+        let parent = current.target_frames.get(parent_index)?.clone();
+        let parent_is_exact = projection.preserved().iter().any(|preserved| {
+            preserved.branch_index() == parent_index && preserved.version() == &parent
+        }) || prepared_prefix.contains(&parent);
+        if !parent_is_exact {
+            return None;
+        }
         let role = projection.child_slots().iter().find(|role| {
             role.parent_branch_index() == parent_index && role.outlet() == binding.outlet()
         })?;
@@ -10916,11 +11075,23 @@ impl RouterEngine {
                         && child_slot.outlet() == binding.outlet()
                         && child_slot.slot() == slot
                 });
-                exact_binding.then_some(FrozenErrorMountSource::ExistingChild {
-                    parent,
-                    outlet: binding.outlet().clone(),
-                    slot,
-                })
+                let exact_staged_slot = role.kind() == ProjectedChildSlotRoleKind::MountNew
+                    && role.binding().is_none()
+                    && current
+                        .target_frames
+                        .get(boundary_index)
+                        .is_some_and(|frame| {
+                            frame.slot() == slot
+                                && frame.origin()
+                                    == &FrameOrigin::MatchedRoute(binding.boundary_route())
+                        });
+                (exact_binding || exact_staged_slot).then_some(
+                    FrozenErrorMountSource::ExistingChild {
+                        parent,
+                        outlet: binding.outlet().clone(),
+                        slot,
+                    },
+                )
             }
             ProjectedEnteringSlot::MountNew => {
                 if role.kind() != ProjectedChildSlotRoleKind::MountNew || role.binding().is_some() {
@@ -10931,6 +11102,7 @@ impl RouterEngine {
                     projection,
                     parent_index,
                     &parent,
+                    prepared_prefix,
                 )?;
                 Some(FrozenErrorMountSource::MountRequired {
                     parent,
@@ -10947,6 +11119,7 @@ impl RouterEngine {
         projection: &RouteReconciliationProjection,
         parent_index: usize,
         parent: &RouteFrameVersion,
+        prepared_prefix: &[RouteFrameVersion],
     ) -> Option<FrozenParentMountSource> {
         let parent_route = current.branch.as_ref()?.routes().get(parent_index)?;
         if parent.origin() != &FrameOrigin::MatchedRoute(parent_route.route()) {
@@ -10962,26 +11135,57 @@ impl RouterEngine {
         }
 
         let grandparent_index = parent_index - 1;
-        let claim = projection
-            .child_slots()
-            .iter()
-            .find(|role| {
-                role.parent_branch_index() == grandparent_index
-                    && role.outlet() == parent_route.slot()
-                    && role.kind() == ProjectedChildSlotRoleKind::PreservedActive
-            })?
-            .binding()?;
+        let role = projection.child_slots().iter().find(|role| {
+            role.parent_branch_index() == grandparent_index && role.outlet() == parent_route.slot()
+        })?;
+        let grandparent = current.target_frames.get(grandparent_index)?;
         let grandparent_is_exact = projection.preserved().iter().any(|preserved| {
-            preserved.branch_index() == grandparent_index && preserved.version() == claim.parent()
-        });
-        (grandparent_is_exact
-            && claim.parent_branch_index() == grandparent_index
-            && claim.outlet() == parent_route.slot()
-            && claim.slot() == parent.slot()
-            && claim.child() == Some(parent))
-        .then(|| FrozenParentMountSource::RegisteredChild {
-            claim: claim.clone(),
-        })
+            preserved.branch_index() == grandparent_index && preserved.version() == grandparent
+        }) || prepared_prefix.contains(grandparent);
+        if !grandparent_is_exact {
+            return None;
+        }
+        match role.binding() {
+            Some(claim)
+                if claim.parent_branch_index() == grandparent_index
+                    && claim.parent() == grandparent
+                    && claim.outlet() == parent_route.slot()
+                    && claim.slot() == parent.slot()
+                    && claim.child() == Some(parent) =>
+            {
+                Some(FrozenParentMountSource::RegisteredChild {
+                    claim: claim.clone(),
+                })
+            }
+            Some(claim)
+                if role.kind() == ProjectedChildSlotRoleKind::ActivateExisting
+                    && claim.parent_branch_index() == grandparent_index
+                    && claim.parent() == grandparent
+                    && claim.outlet() == parent_route.slot()
+                    && claim.slot() == parent.slot()
+                    && claim.child().is_none() =>
+            {
+                Some(FrozenParentMountSource::RegisteredChild {
+                    claim: LogicalChildSlotBinding::occupied(
+                        grandparent_index,
+                        grandparent.clone(),
+                        parent_route.slot().clone(),
+                        parent.clone(),
+                    ),
+                })
+            }
+            None if role.kind() == ProjectedChildSlotRoleKind::MountNew => {
+                Some(FrozenParentMountSource::RegisteredChild {
+                    claim: LogicalChildSlotBinding::occupied(
+                        grandparent_index,
+                        grandparent.clone(),
+                        parent_route.slot().clone(),
+                        parent.clone(),
+                    ),
+                })
+            }
+            Some(_) | None => None,
+        }
     }
 
     fn begin_failure_cleanup_with_continuation(
@@ -10990,6 +11194,14 @@ impl RouterEngine {
         failure: NavigationFailure,
         continuation: FailureCleanupContinuationOwner,
     ) -> FailureCleanupRequest {
+        let retained_prepared_prefix = match &continuation {
+            FailureCleanupContinuationOwner::BeginBoundError(recovery) => {
+                recovery.prepared_prefix.as_slice()
+            }
+            FailureCleanupContinuationOwner::Terminal
+            | FailureCleanupContinuationOwner::BeginFallback
+            | FailureCleanupContinuationOwner::AuthoritySettlement => &[],
+        };
         let logical_roots = self
             .current
             .as_ref()
@@ -10997,6 +11209,7 @@ impl RouterEngine {
             .applied_frames
             .iter()
             .rev()
+            .filter(|frame| !retained_prepared_prefix.contains(frame))
             .cloned()
             .collect();
         self.begin_failure_cleanup_with_roots(expected, failure, continuation, logical_roots)
@@ -11093,20 +11306,86 @@ impl RouterEngine {
         roots
     }
 
+    fn fail_bound_error_before_issue(
+        &mut self,
+        request: NavigationRequestId,
+        prepared_prefix: &[RouteFrameVersion],
+        reserved: Option<crate::ids::ReservedAttemptIds>,
+        failure: NavigationFailure,
+    ) {
+        self.retire_history_authority();
+        if prepared_prefix.is_empty() {
+            self.current = None;
+            self.action = None;
+            self.fail_reserved_request(request, failure);
+            self.start_next();
+            return;
+        }
+
+        let Some(reserved) = reserved else {
+            debug_assert!(
+                false,
+                "a retained bound-error prefix must own a pre-reserved cleanup attempt"
+            );
+            self.action = None;
+            return;
+        };
+        let current = self
+            .current
+            .as_mut()
+            .expect("a retained bound-error prefix remains current until recovery is bound");
+        let retained = prepared_prefix
+            .last()
+            .expect("a retained bound-error prefix is non-empty");
+        current.identity = FrameTaskIdentity {
+            router: self.router,
+            host: retained.host(),
+            host_epoch: current.identity.host_epoch,
+            slot: retained.slot(),
+            request,
+            transaction: reserved.transaction(),
+            frame_task: reserved.frame_task(),
+            frame: retained.frame(),
+            generation: retained.generation(),
+            origin: retained.origin().clone(),
+            branch_index: prepared_prefix.len() - 1,
+        };
+        current.reservation = vec![ReservedFrameAttempt::new(
+            reserved.frame_task(),
+            reserved.candidate_frame(),
+        )];
+        current.applied_frames = prepared_prefix.to_vec();
+        current.cleanup_batch = reserved.cleanup_batch();
+        let roots = prepared_prefix.iter().rev().cloned().collect();
+        let cleanup = self.begin_failure_cleanup_with_roots(
+            PendingFailureKind::Apply,
+            failure,
+            FailureCleanupContinuationOwner::Terminal,
+            roots,
+        );
+        self.action = Some(EngineAction::FailureCleanup(cleanup));
+    }
+
     fn begin_bound_error(
         &mut self,
         request: NavigationRequestId,
         original_failure: NavigationFailure,
-        recovery: FrozenBoundErrorRecovery,
-    ) -> Option<FrameTaskIdentity> {
+        mut recovery: FrozenBoundErrorRecovery,
+    ) -> BoundErrorBeginDisposition {
         self.current_history_capability = None;
         let source_is_exact = self.current_reconciliation_matches_active();
         let prepared = source_is_exact.then(|| {
             let current = self.current.as_ref()?;
             let branch = current.branch.as_ref()?;
             let observed = branch.nearest_error_view_for(recovery.failure_branch_index)?;
-            let observed_mount = self.freeze_bound_error_mount_source(current, observed)?;
-            if observed != &recovery.binding || observed_mount.ne(&recovery.mount) {
+            let observed_prepared_prefix =
+                self.freeze_bound_error_prepared_prefix(current, observed.branch_index())?;
+            let observed_mount =
+                self.freeze_bound_error_mount_source(current, observed, &observed_prepared_prefix)?;
+            if observed != &recovery.binding
+                || observed_mount != recovery.mount
+                || observed_prepared_prefix != recovery.prepared_prefix
+            {
                 return None;
             }
             let boundary_index = recovery.binding.branch_index();
@@ -11124,62 +11403,113 @@ impl RouterEngine {
             {
                 return None;
             }
-            let preserved = preserved_roles
+            let mut target_frames = preserved_roles
                 .into_iter()
                 .map(|preserved| preserved.version().clone())
                 .collect::<Vec<_>>();
+            target_frames.extend(recovery.prepared_prefix.iter().cloned());
+            if target_frames.len() != boundary_index {
+                return None;
+            }
             let mut cleanup_roles = reconciliation
                 .preserved()
                 .iter()
-                .chain(reconciliation.leaving())
                 .filter(|frame| frame.branch_index() >= boundary_index)
                 .map(|frame| (frame.branch_index(), frame.version().clone()))
                 .collect::<Vec<_>>();
+            cleanup_roles.extend(
+                reconciliation
+                    .leaving()
+                    .iter()
+                    .map(|frame| (frame.branch_index(), frame.version().clone())),
+            );
             cleanup_roles.sort_by(|left, right| right.0.cmp(&left.0));
             let cleanup_roots = cleanup_roles
                 .into_iter()
                 .map(|(_, frame)| frame)
                 .collect::<Vec<_>>();
-            let retained_child_slots = self
-                .active_child_slots
+            let mut retained_child_slots = Vec::new();
+            for child_index in 1..boundary_index {
+                let parent = target_frames.get(child_index - 1)?;
+                let child = target_frames.get(child_index)?;
+                let route = branch.routes().get(child_index)?;
+                let projected = reconciliation.child_slots().iter().find(|slot| {
+                    slot.parent_branch_index() == child_index - 1 && slot.outlet() == route.slot()
+                })?;
+                let slot_is_exact = projected.binding().is_none_or(|slot| {
+                    slot.parent() == parent
+                        && slot.outlet() == route.slot()
+                        && slot.slot() == child.slot()
+                });
+                if !slot_is_exact {
+                    return None;
+                }
+                retained_child_slots.push(LogicalChildSlotBinding::occupied(
+                    child_index - 1,
+                    parent.clone(),
+                    route.slot().clone(),
+                    child.clone(),
+                ));
+            }
+            for projected in reconciliation
+                .child_slots()
                 .iter()
-                .filter(|slot| {
-                    slot.parent_branch_index()
-                        .checked_add(1)
-                        .is_some_and(|child_index| child_index < boundary_index)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+                .filter(|slot| slot.kind() == ProjectedChildSlotRoleKind::RetainEmpty)
+            {
+                let binding = projected.binding()?;
+                let parent = target_frames.get(binding.parent_branch_index())?;
+                if binding.parent() != parent || binding.child().is_some() {
+                    return None;
+                }
+                let mapping_exists = retained_child_slots.iter().any(|candidate| {
+                    candidate.parent_branch_index() == binding.parent_branch_index()
+                        && candidate.outlet() == binding.outlet()
+                });
+                let slot_is_reused = retained_child_slots
+                    .iter()
+                    .any(|candidate| candidate.slot() == binding.slot());
+                if mapping_exists || slot_is_reused {
+                    return None;
+                }
+                retained_child_slots.push(LogicalChildSlotBinding::retained_empty(
+                    binding.parent_branch_index(),
+                    binding.parent().clone(),
+                    binding.outlet().clone(),
+                    binding.slot(),
+                ));
+            }
             Some((
                 current.location.clone(),
+                branch.clone(),
                 branch.routes().get(boundary_index)?.clone(),
-                preserved,
+                target_frames,
                 cleanup_roots,
                 retained_child_slots,
                 reconciliation.clone(),
+                recovery.prepared_prefix.clone(),
             ))
         });
         let Some(Some((
             location,
+            target_branch,
             matched,
             mut target_frames,
             cleanup_roots,
             mut active_child_slots,
             reconciliation,
+            prepared_prefix,
         ))) = prepared
         else {
-            self.retire_history_authority();
-            self.current = None;
-            self.action = None;
-            self.fail_reserved_request(
+            self.fail_bound_error_before_issue(
                 request,
+                &recovery.prepared_prefix,
+                recovery.reserved_attempt,
                 NavigationFailure::new(
                     NavigationFailureKind::RecoveryFailed,
                     "bound error recovery source drifted",
                 ),
             );
-            self.start_next();
-            return None;
+            return BoundErrorBeginDisposition::Cleanup;
         };
         self.record_mut(request)
             .expect("recovering request is retained")
@@ -11187,22 +11517,23 @@ impl RouterEngine {
                 NavigationTraceEventKind::HistoryIntentRejected,
             ))
             .expect("running trace is open");
-        let reserved = match self.ids.reserve_attempt() {
-            Ok(reserved) => reserved,
-            Err(_) => {
-                self.retire_history_authority();
-                self.current = None;
-                self.action = None;
-                self.fail_reserved_request(
-                    request,
-                    NavigationFailure::new(
-                        NavigationFailureKind::RecoveryFailed,
-                        "bound error recovery identity reservation exhausted",
-                    ),
-                );
-                self.start_next();
-                return None;
-            }
+        let reserved = match recovery.reserved_attempt.take() {
+            Some(reserved) => reserved,
+            None => match self.ids.reserve_attempt() {
+                Ok(reserved) => reserved,
+                Err(_) => {
+                    self.fail_bound_error_before_issue(
+                        request,
+                        &prepared_prefix,
+                        None,
+                        NavigationFailure::new(
+                            NavigationFailureKind::RecoveryFailed,
+                            "bound error recovery identity reservation exhausted",
+                        ),
+                    );
+                    return BoundErrorBeginDisposition::Cleanup;
+                }
+            },
         };
         let host = self
             .state
@@ -11210,8 +11541,35 @@ impl RouterEngine {
             .expect("accepted recovery has a confirmed host")
             .clone();
         let binding = recovery.binding;
+        let boundary_index = binding.branch_index();
         let origin = FrameOrigin::RouteError(binding.boundary_route());
         let generation = RouteGeneration::initial();
+        let projected_slot = match &recovery.mount {
+            FrozenErrorMountSource::TopSlot { slot, .. }
+            | FrozenErrorMountSource::ExistingChild { slot, .. } => {
+                ProjectedEnteringSlot::Existing(*slot)
+            }
+            FrozenErrorMountSource::MountRequired { .. } => ProjectedEnteringSlot::MountNew,
+        };
+        let Some(reconciliation) = reconciliation.retarget_bound_error(
+            &target_branch,
+            binding.branch_index(),
+            &prepared_prefix,
+            reserved.candidate_frame(),
+            generation,
+            projected_slot,
+        ) else {
+            self.fail_bound_error_before_issue(
+                request,
+                &prepared_prefix,
+                Some(reserved),
+                NavigationFailure::new(
+                    NavigationFailureKind::RecoveryFailed,
+                    "bound error recovery projection drifted",
+                ),
+            );
+            return BoundErrorBeginDisposition::Cleanup;
+        };
         let direct_mount = match recovery.mount {
             FrozenErrorMountSource::MountRequired {
                 parent,
@@ -11258,7 +11616,7 @@ impl RouterEngine {
                     location: location.clone(),
                     reservation: vec![reserved_frame],
                     target_frames,
-                    applied_frames: Vec::new(),
+                    applied_frames: prepared_prefix,
                     current_target: parent_target,
                     pending_mount: Some(PendingMount {
                         child_index: binding.branch_index(),
@@ -11293,17 +11651,16 @@ impl RouterEngine {
                 ) {
                     Ok(token) => token,
                     Err(_) => {
-                        self.current = None;
-                        self.action = None;
-                        self.fail_reserved_request(
-                            request,
+                        let failure = self.begin_failure_cleanup_for_branch(
+                            PendingFailureKind::MountIssue,
                             NavigationFailure::new(
                                 NavigationFailureKind::RecoveryFailed,
                                 "bound error recovery mount request failed",
                             ),
+                            boundary_index,
                         );
-                        self.start_next();
-                        return None;
+                        self.action = Some(EngineAction::FailureCleanup(failure));
+                        return BoundErrorBeginDisposition::Cleanup;
                     }
                 };
                 self.record_mut(request)
@@ -11320,7 +11677,7 @@ impl RouterEngine {
                     parent,
                     outlet,
                 }));
-                return None;
+                return BoundErrorBeginDisposition::Bound;
             }
             direct_mount => direct_mount,
         };
@@ -11392,7 +11749,7 @@ impl RouterEngine {
                 reserved.candidate_frame(),
             )],
             target_frames,
-            applied_frames: Vec::new(),
+            applied_frames: prepared_prefix,
             current_target: target.clone(),
             pending_mount: None,
             stage: WorkStage::Applying,
@@ -11418,7 +11775,6 @@ impl RouterEngine {
             .expect("running trace is open");
         self.transition_with_trace(request, NavigationPhase::Recovering);
         self.issued_view_tasks.push(identity.clone());
-        let recovery_identity = identity.clone();
         self.action = Some(EngineAction::FrameTask(FrameTask {
             identity,
             frame: target_frame,
@@ -11428,7 +11784,7 @@ impl RouterEngine {
             view,
             input: Some(input),
         }));
-        Some(recovery_identity)
+        BoundErrorBeginDisposition::Bound
     }
 
     fn begin_fallback(
@@ -13522,9 +13878,10 @@ mod tests {
         BackTargetResumeAction, BackTargetResumeOutcome, BackTargetStart, CleanupError,
         CommitError, CoreBackNoTargetPublicationPreparationFailureProjection,
         CoreBackNoTargetReadyMismatchProjection, CorePreparationReceiverMismatchProjection,
-        EngineAction, FrameMountTarget, MountError, NavigationCommand, PrivateRequestLookup,
-        PushError, QueuedNavigation, QueuedReservation, ROUTER_DIAGNOSTIC_RETENTION, ReportError,
-        RootTaskIdentity, RouterEngine, TERMINAL_RETENTION, WorkStage, occupied_child_slots,
+        EngineAction, FailureCleanupCompletionDisposition, FrameMountTarget, MountError,
+        NavigationCommand, PrivateRequestLookup, PushError, QueuedNavigation, QueuedReservation,
+        ROUTER_DIAGNOSTIC_RETENTION, ReportError, RootTaskIdentity, RouterEngine,
+        TERMINAL_RETENTION, WorkStage, occupied_child_slots,
     };
     use crate::admission::{AdmissionError, HostAdmissionIssuer};
     use crate::cleanup::{
@@ -21868,6 +22225,239 @@ mod tests {
         (engine, request, recovery)
     }
 
+    fn retained_bound_error_cleanup_fixture() -> (
+        RouterEngine,
+        crate::ids::NavigationRequestId,
+        crate::ids::NavigationRequestId,
+        RouteFrameVersion,
+        Vec<RouteFrameVersion>,
+        Vec<LogicalChildSlotBinding>,
+        CleanupBatchToken,
+    ) {
+        let boundary = ErrorBoundaryKey::named("items-boundary").unwrap();
+        let error_view = RouteViewKey::new("items-error").unwrap();
+        let mut builder = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("root").unwrap()),
+            )
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        builder
+            .route_with_options(
+                root,
+                RoutePattern::path("legacy").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("legacy").unwrap()),
+            )
+            .unwrap();
+        let section = builder
+            .route_with_options(
+                root,
+                RoutePattern::path("section").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("section").unwrap()),
+            )
+            .unwrap();
+        let items = builder
+            .route_with_options(
+                section,
+                RoutePattern::path("items").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(RouteViewKey::new("items").unwrap())
+                    .with_error_view(boundary, error_view),
+            )
+            .unwrap();
+        builder
+            .route_with_options(
+                items,
+                RoutePattern::path(":id").unwrap(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("leaf").unwrap()),
+            )
+            .unwrap();
+
+        let mut engine = ready_engine_with_tree(builder.build().unwrap());
+        engine.push(RouteLocation::new("/legacy")).unwrap();
+        settle_current(&mut engine);
+        let old_frames = engine.active().frames().to_vec();
+        let old_slots = engine.active_child_slots.clone();
+
+        let request = engine
+            .replace(RouteLocation::new("/section/items/1"))
+            .unwrap();
+        let next = engine
+            .enqueue_push(RouteLocation::new("/section/items/2"))
+            .unwrap();
+        let EngineAction::FrameTask(section_task) = engine.action().unwrap() else {
+            panic!("the replacement starts with the entering section")
+        };
+        let retained_section = section_task.frame_version().clone();
+        engine
+            .accept_applied_report(section_task.into_applied_report(vec![RouteSlotKey::default()]))
+            .unwrap();
+        let EngineAction::MountRequest(items_mount) = engine.action().unwrap() else {
+            panic!("the entering items boundary requires a child mount")
+        };
+        let items_grant = engine.resolve_mount(items_mount).unwrap();
+        let items_receipt =
+            items_grant.attest_receipt(crate::mount::MountReceiptDigest::from_opaque(0xa31));
+        let items_permit = engine.accept_mount_receipt(items_receipt).unwrap();
+        engine
+            .complete_mount_registration(
+                items_permit.complete(crate::mount::MountRegistrationDigest::from_opaque(0xa32)),
+            )
+            .unwrap();
+        let EngineAction::FrameTask(items_task) = engine.action().unwrap() else {
+            panic!("the confirmed child mount issues the items boundary task")
+        };
+        engine
+            .accept_applied_report(items_task.into_applied_report(vec![RouteSlotKey::default()]))
+            .unwrap();
+        let EngineAction::MountRequest(leaf_mount) = engine.action().unwrap() else {
+            panic!("the entering leaf requires the boundary outlet")
+        };
+        let leaf_grant = engine.resolve_mount(leaf_mount).unwrap();
+        let leaf_receipt =
+            leaf_grant.attest_receipt(crate::mount::MountReceiptDigest::from_opaque(0xa33));
+        let leaf_permit = engine.accept_mount_receipt(leaf_receipt).unwrap();
+        engine
+            .complete_mount_registration(
+                leaf_permit.complete(crate::mount::MountRegistrationDigest::from_opaque(0xa34)),
+            )
+            .unwrap();
+        let EngineAction::FrameTask(leaf_task) = engine.action().unwrap() else {
+            panic!("the confirmed boundary outlet issues the leaf task")
+        };
+        let first_failure = engine
+            .begin_view_report(leaf_task.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "leaf apply failed after retaining the section prefix",
+            ))
+            .expect("the leaf failure enters canonical cleanup");
+        assert_eq!(
+            first_failure.retained_prepared_prefix(),
+            &[retained_section.clone()],
+        );
+        assert!(!first_failure.logical_roots().contains(&retained_section));
+        let first_count = first_failure.logical_roots().len();
+        let first_cleanup = prepare_failure_cleanup(&mut engine, first_failure, 0xa35, first_count);
+
+        (
+            engine,
+            request,
+            next,
+            retained_section,
+            old_frames,
+            old_slots,
+            first_cleanup,
+        )
+    }
+
+    #[test]
+    fn retained_bound_error_prefix_is_cleaned_before_source_drift_terminalizes() {
+        let (mut engine, request, next, retained_section, _old_frames, _old_slots, first_cleanup) =
+            retained_bound_error_cleanup_fixture();
+        let active_before_drift = engine.state.active().clone();
+
+        engine.testing_set_active_generation(RouteGeneration::testing_max());
+        let owner = engine
+            .prepare_failure_cleanup_completion(valid_completion(&first_cleanup))
+            .expect("the exact first cleanup completion must retain its Core owner");
+        let disposition = engine
+            .complete_prepared_failure_cleanup_with_ledger(owner, (), |()| {})
+            .expect("source drift must hand the retained prefix to another cleanup");
+        assert_eq!(
+            disposition,
+            FailureCleanupCompletionDisposition::RetainedPreparedPrefixCleanup,
+        );
+
+        let Some(EngineAction::FailureCleanup(second_failure)) = engine.action() else {
+            panic!("source drift must clean the retained prefix before terminalizing")
+        };
+        assert_eq!(second_failure.request(), request);
+        assert_eq!(second_failure.logical_roots(), &[retained_section]);
+        assert!(second_failure.retained_prepared_prefix().is_empty());
+        assert_eq!(
+            engine.request(next).unwrap().status(),
+            &RequestStatus::Queued,
+        );
+        engine.state.set_active(active_before_drift);
+        let second_count = second_failure.logical_roots().len();
+        let second_cleanup =
+            prepare_failure_cleanup(&mut engine, second_failure, 0xa36, second_count);
+        engine
+            .complete_cleanup(valid_completion(&second_cleanup))
+            .unwrap();
+
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::RecoveryFailed
+        ));
+        assert!(
+            matches!(
+                engine.request(next).unwrap().status(),
+                RequestStatus::Running(_)
+            ),
+            "queued status after retained-prefix cleanup: {:?}",
+            engine.request(next).unwrap().status()
+        );
+    }
+
+    #[test]
+    fn bound_error_publication_rebuilds_child_slots_without_stale_baseline_entries() {
+        let (mut engine, request, _next, retained_section, old_frames, old_slots, first_cleanup) =
+            retained_bound_error_cleanup_fixture();
+        assert_eq!(old_frames.len(), 2);
+        assert_eq!(old_slots.len(), 1);
+        engine
+            .complete_cleanup(valid_completion(&first_cleanup))
+            .unwrap();
+        let Some(EngineAction::FrameTask(recovery)) = engine.action() else {
+            panic!("settled cleanup must issue the deep bound-error task")
+        };
+
+        let cleanup = publish_action(&mut engine, EngineAction::FrameTask(recovery));
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        let active = engine.active().frames();
+        assert_eq!(active.len(), 3);
+        assert_eq!(active[0], old_frames[0]);
+        assert_eq!(active[1], retained_section);
+        assert!(matches!(active[2].origin(), FrameOrigin::RouteError(_)));
+        assert_ne!(active[1], old_frames[1]);
+        assert_ne!(active[2], old_frames[1]);
+        assert_eq!(engine.active_child_slots.len(), 2);
+        let root_slot = engine
+            .active_child_slots
+            .iter()
+            .find(|slot| slot.parent_branch_index() == 0)
+            .expect("the exact root-to-section binding remains");
+        assert_eq!(root_slot.parent(), &active[0]);
+        assert_eq!(root_slot.child(), Some(&active[1]));
+        assert_eq!(root_slot.slot(), active[1].slot());
+        let error_slot = engine
+            .active_child_slots
+            .iter()
+            .find(|slot| slot.parent_branch_index() == 1)
+            .expect("the exact section-to-error binding is installed");
+        assert_eq!(error_slot.parent(), &active[1]);
+        assert_eq!(error_slot.child(), Some(&active[2]));
+        assert_eq!(error_slot.slot(), active[2].slot());
+        assert!(
+            engine
+                .active_child_slots
+                .iter()
+                .all(|slot| slot.child() != Some(&old_frames[1]))
+        );
+        assert_ne!(root_slot.slot(), error_slot.slot());
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::Apply
+        ));
+    }
+
     #[test]
     fn bound_error_direct_task_refreezes_active_source_before_applied_report() {
         let (mut engine, request, recovery) = entering_boundary_direct_recovery_fixture();
@@ -22273,8 +22863,9 @@ mod tests {
     }
 
     #[test]
-    fn fallback_partial_failure_waits_for_cleanup_before_recovery_terminal() {
+    fn recovery_attempt_failure_cleans_residual_before_recovery_failed_terminal() {
         let mut engine = ready_engine();
+        let history_before = engine.testing_history_authority_snapshot();
         let request = engine.push(RouteLocation::new("/")).unwrap();
         let EngineAction::FrameTask(root) = engine.action().unwrap() else {
             panic!("root task expected")
@@ -22319,6 +22910,7 @@ mod tests {
             engine.request(request).unwrap().status(),
             RequestStatus::Running(_)
         ));
+        assert!(engine.action().is_none());
         engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
 
         assert!(matches!(
@@ -22327,20 +22919,27 @@ mod tests {
                 if failure.kind() == NavigationFailureKind::RecoveryFailed
         ));
         assert!(engine.action().is_none());
+        assert_eq!(engine.testing_history_authority_snapshot(), history_before);
+        let trace = engine.request(request).unwrap().trace();
+        let aggregate_cleanup = trace
+            .iter()
+            .rposition(|event| {
+                event.kind() == NavigationTraceEventKind::CleanupSettled
+                    && event.cleanup_disposition().is_none()
+            })
+            .expect("recovery residual cleanup must emit its aggregate settlement");
+        let terminal = trace
+            .iter()
+            .position(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+            .expect("recovery failure must publish one terminal event");
+        assert!(aggregate_cleanup < terminal);
+        assert_eq!(terminal + 1, trace.len());
         assert_eq!(
-            engine
-                .request(request)
-                .unwrap()
-                .trace()
+            trace
                 .iter()
-                .map(|event| event.kind())
-                .rev()
-                .take(2)
-                .collect::<Vec<_>>(),
-            vec![
-                NavigationTraceEventKind::RequestTerminal,
-                NavigationTraceEventKind::CleanupSettled,
-            ]
+                .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                .count(),
+            1
         );
     }
 

@@ -21,7 +21,7 @@ fn recovery_profile_source() -> String {
 #[test]
 fn recovery_profile_has_exact_activation_machine_state() {
     let profile = parse_recovery_contract_profile(&recovery_profile_source());
-    assert_eq!(profile.exclusions.len(), 10);
+    assert_eq!(profile.exclusions.len(), 8);
     assert_eq!(
         profile
             .contract_deltas
@@ -36,7 +36,7 @@ fn recovery_profile_has_exact_activation_machine_state() {
             (
                 "boundary-bound error presentation complete evidence",
                 "R1 Error presentation",
-                "planned",
+                "active",
             ),
             (
                 "post-commit compound settlement complete evidence",
@@ -64,7 +64,7 @@ fn recovery_profile_has_exact_activation_machine_state() {
             (
                 "error_outlet_role_classification_is_preserved",
                 "R1 Error presentation",
-                "planned",
+                "active",
             ),
             (
                 "post_commit_host_loss_preserves_committed_history",
@@ -78,29 +78,32 @@ fn recovery_profile_has_exact_activation_machine_state() {
             ),
         ])
     );
-    assert!(
+    assert_eq!(
         profile
             .authority_additions
             .iter()
-            .all(|row| row.state == "planned"),
-        "Recovery must activate no authority rows"
+            .filter(|row| row.state == "active")
+            .map(|row| row.item.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["error_outlet_role_classification_is_preserved"]),
+        "Recovery must activate exactly the completed R1 authority row"
     );
 }
 
 #[test]
 fn active_stage_profile_preserves_history_union_at_recovery_activation() {
     let profile = stage_contract_profile();
-    assert_eq!(profile.exclusions.len(), 10);
+    assert_eq!(profile.exclusions.len(), 8);
     assert_eq!(profile.contract_deltas.len(), 6);
-    assert_eq!(profile.authority_additions.len(), 1);
+    assert_eq!(profile.authority_additions.len(), 2);
     assert_eq!(
         profile
             .authority_additions
             .iter()
             .filter(|row| row.state == "active")
             .count(),
-        1,
-        "only the completed History authority row is active"
+        2,
+        "the completed History and Recovery R1 authority rows are active"
     );
     assert_eq!(
         profile
@@ -112,6 +115,7 @@ fn active_stage_profile_preserves_history_union_at_recovery_activation() {
         BTreeSet::from([
             "NavigationRequestSnapshot::requested -> Option",
             "NavigationEnqueueErrorKind::IdentityExhausted",
+            "boundary-bound error presentation complete evidence",
             "late-bound back complete evidence",
         ])
     );
@@ -123,7 +127,6 @@ fn active_stage_profile_preserves_history_union_at_recovery_activation() {
             .map(|row| row.item.as_str())
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([
-            "boundary-bound error presentation complete evidence",
             "post-commit compound settlement complete evidence",
             "host re-admission fresh-epoch complete evidence",
         ])
@@ -182,26 +185,26 @@ fn recovery_profile_rejects_invalid_10_2_rows() {
     let rows = [
         source.replacen(
             "| post-commit compound settlement complete evidence | R2 Compound settlement | planned | Journey G post-commit foreground rows PASS |",
-            "| boundary-bound error presentation complete evidence | R1 Error presentation | planned | Journey D public contract PASS |",
+            "| boundary-bound error presentation complete evidence | R1 Error presentation | active | Journey D public contract PASS |",
             1,
         ),
         source.replacen(
-            "| boundary-bound error presentation complete evidence | R1 Error presentation | planned | Journey D public contract PASS |",
-            "|  | R1 Error presentation | planned | Journey D public contract PASS |",
+            "| boundary-bound error presentation complete evidence | R1 Error presentation | active | Journey D public contract PASS |",
+            "|  | R1 Error presentation | active | Journey D public contract PASS |",
             1,
         ),
         source.replacen(
-            "| boundary-bound error presentation complete evidence | R1 Error presentation | planned | Journey D public contract PASS |",
-            "| unknown Recovery item | R1 Error presentation | planned | Journey D public contract PASS |",
+            "| boundary-bound error presentation complete evidence | R1 Error presentation | active | Journey D public contract PASS |",
+            "| unknown Recovery item | R1 Error presentation | active | Journey D public contract PASS |",
             1,
         ),
         source.replacen(
-            "| boundary-bound error presentation complete evidence | R1 Error presentation | planned | Journey D public contract PASS |",
-            "| boundary-bound error presentation complete evidence | Unknown slice | planned | Journey D public contract PASS |",
+            "| boundary-bound error presentation complete evidence | R1 Error presentation | active | Journey D public contract PASS |",
+            "| boundary-bound error presentation complete evidence | Unknown slice | active | Journey D public contract PASS |",
             1,
         ),
         source.replacen(
-            "| boundary-bound error presentation complete evidence | R1 Error presentation | planned | Journey D public contract PASS |",
+            "| boundary-bound error presentation complete evidence | R1 Error presentation | active | Journey D public contract PASS |",
             "| boundary-bound error presentation complete evidence | R1 Error presentation | unknown | Journey D public contract PASS |",
             1,
         ),
@@ -221,26 +224,26 @@ fn recovery_profile_rejects_invalid_10_3_rows() {
     let rows = [
         source.replacen(
             "| `post_commit_host_loss_preserves_committed_history` | R2 Compound settlement | planned |",
-            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | active |",
             1,
         ),
         source.replacen(
-            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
-            "| `` | R1 Error presentation | planned |",
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | active |",
+            "| `` | R1 Error presentation | active |",
             1,
         ),
         source.replacen(
-            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
-            "| `unknown_recovery_test` | R1 Error presentation | planned |",
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | active |",
+            "| `unknown_recovery_test` | R1 Error presentation | active |",
             1,
         ),
         source.replacen(
-            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
-            "| `error_outlet_role_classification_is_preserved` | Unknown slice | planned |",
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | active |",
+            "| `error_outlet_role_classification_is_preserved` | Unknown slice | active |",
             1,
         ),
         source.replacen(
-            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |",
+            "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | active |",
             "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | unknown |",
             1,
         ),
@@ -840,7 +843,7 @@ fn active_stage_profile_tables_and_curated_facade_source_are_closed_world() {
     let exclusions = profile.exclusions;
     assert_eq!(modules.len(), 7);
     assert!(symbols.len() > 100);
-    assert_eq!(exclusions.len(), 10);
+    assert_eq!(exclusions.len(), 8);
 
     let source = std::fs::read_to_string(facade_dir().join("src/lib.rs")).unwrap();
     assert_eq!(

@@ -61,6 +61,7 @@ use crate::engine::{
     FailedAuthoritySettlementTrigger as CoreFailedAuthoritySettlementTrigger,
     FailedAuthorityTriggerError as CoreFailedAuthorityTriggerError,
     FailureCleanupCompletionCommitError as CoreFailureCleanupCompletionCommitError,
+    FailureCleanupCompletionDisposition as CoreFailureCleanupCompletionDisposition,
     FailureCleanupCompletionOwner as CoreFailureCleanupCompletionOwner,
     FailureCleanupCompletionPreparationMismatchProjection as CoreFailureCleanupCompletionPreparationMismatchProjection,
     FailureCleanupCompletionPrepareError as CoreFailureCleanupCompletionPrepareError,
@@ -772,6 +773,10 @@ impl FailureCleanupRequest {
         self.inner.logical_roots()
     }
 
+    pub fn retained_prepared_prefix(&self) -> &[RouteFrameVersion] {
+        self.inner.retained_prepared_prefix()
+    }
+
     pub fn failure(&self) -> &NavigationFailure {
         self.inner.failure()
     }
@@ -1036,6 +1041,14 @@ pub enum FailureCleanupZeroTerminalOutcome<Physical> {
 #[doc(hidden)]
 pub struct FailureCleanupCompletionOwner {
     inner: CoreFailureCleanupCompletionOwner,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FailureCleanupCompletionDisposition {
+    Settled,
+    RetainedPreparedPrefixBound,
+    RetainedPreparedPrefixCleanup,
 }
 
 #[doc(hidden)]
@@ -2700,6 +2713,10 @@ impl ReconciliationEnteringFrameView<'_> {
 
     pub fn route(&self) -> crate::ids::RouteId {
         self.inner.route()
+    }
+
+    pub fn origin(&self) -> &crate::frame::FrameOrigin {
+        self.inner.origin()
     }
 
     pub fn frame(&self) -> crate::ids::RouteFrameId {
@@ -5079,7 +5096,7 @@ impl RouterEngine {
         owner: FailureCleanupCompletionOwner,
         physical: Physical,
         commit_ledger_and_clear_holder: F,
-    ) -> Result<(), CompleteFailureCleanupError<Physical>>
+    ) -> Result<FailureCleanupCompletionDisposition, CompleteFailureCleanupError<Physical>>
     where
         F: FnOnce(Physical),
     {
@@ -5089,6 +5106,17 @@ impl RouterEngine {
                 physical,
                 commit_ledger_and_clear_holder,
             )
+            .map(|disposition| match disposition {
+                CoreFailureCleanupCompletionDisposition::Settled => {
+                    FailureCleanupCompletionDisposition::Settled
+                }
+                CoreFailureCleanupCompletionDisposition::RetainedPreparedPrefixBound => {
+                    FailureCleanupCompletionDisposition::RetainedPreparedPrefixBound
+                }
+                CoreFailureCleanupCompletionDisposition::RetainedPreparedPrefixCleanup => {
+                    FailureCleanupCompletionDisposition::RetainedPreparedPrefixCleanup
+                }
+            })
             .map_err(|error: CoreFailureCleanupCompletionCommitError<Physical>| {
                 let kind = map_cleanup_error(error.kind());
                 let (owner, physical, mismatch) = error.into_parts();

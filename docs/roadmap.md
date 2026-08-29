@@ -1,6 +1,6 @@
 # Roadmap
 
-> **Current-stage activation:** Recovery is now the active spec/plan pair. Its profile keeps ten exclusions, History active delta 3, Recovery planned delta 3, zero active Recovery authority rows, and catalogue 24. Journey D/G remain planned; background old-lease reap and full Journey G remain Authority-closure work. This is not Recovery PASS or MVP PASS.
+> **Current-stage activation:** Recovery is the active spec/plan pair. Its profile keeps eight exclusions, History active delta 3, Recovery R1 active with R2/R3 planned, one active Recovery authority row, and catalogue 25. Journey D's R1 contract is active while Journey G remains planned; background old-lease reap and full Journey G remain Authority-closure work. This is not Recovery PASS or MVP PASS.
 
 **状态**: Phase 3B.1 `Recovery` current stage; History completed
 

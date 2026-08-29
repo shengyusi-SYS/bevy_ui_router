@@ -1,6 +1,6 @@
 # Recovery 阶段设计
 
-**Activation status**: current active canonical/profile stage; History is completed historical evidence. This activation keeps Recovery rows planned, and does not claim Recovery PASS, full Journey G, or MVP PASS. Background old-lease reap remains Authority-closure work.
+**Activation status**: current active canonical/profile stage; History is completed historical evidence. R1 contract delta and authority row are active; R2/R3 remain planned. This does not claim Recovery PASS, full Journey G, or MVP PASS. Background old-lease reap remains Authority-closure work.
 
 **用户设计确认**: 用户已将 MVP PASS、阶段顺序与自主规划/调度权写入持续目标；本规范按该授权收敛 Recovery 设计
 
@@ -530,8 +530,6 @@ Recovery 开始时从 completed History profile继承：
 | symbol | `bevy_ui_router::ecs::QuarantineSnapshot` | Authority closure |
 | symbol | `bevy_ui_router::ecs::RouterInputModality` | Authority closure |
 | symbol | `bevy_ui_router::ecs::RouterInputProbes` | Authority closure |
-| associated | `bevy_ui_router::core::RouteNodeOptions::with_error_boundary` | R1 Error presentation |
-| associated | `bevy_ui_router::core::RouteNodeOptions::with_error_view` | R1 Error presentation |
 | associated | `bevy_ui_router::ecs::RouterAuthorityAuditSnapshot::quarantines` | Authority closure |
 
 R1只有在真实 public RED/GREEN、facade consumer、Journey D与review PASS后删除两个 Recovery-owned rows。Recovery completion时本表只剩 Authority closure rows。parser必须拒绝空表、重复path、未知kind/slice与非canonical path。
@@ -540,7 +538,7 @@ R1只有在真实 public RED/GREEN、facade consumer、Journey D与review PASS�
 
 | Item | Owning slice | State | Claim boundary |
 | --- | --- | --- | --- |
-| boundary-bound error presentation complete evidence | R1 Error presentation | planned | Journey D public contract PASS |
+| boundary-bound error presentation complete evidence | R1 Error presentation | active | Journey D public contract PASS |
 | post-commit compound settlement complete evidence | R2 Compound settlement | planned | Journey G post-commit foreground rows PASS |
 | host re-admission fresh-epoch complete evidence | R3 Re-admission/stale output | planned | Journey G foreground re-admission rows PASS |
 
@@ -556,7 +554,7 @@ Recovery profile不是替换History rows。全局active delta集合在Recovery�
 
 | Test function | Owning slice | State |
 | --- | --- | --- |
-| `error_outlet_role_classification_is_preserved` | R1 Error presentation | planned |
+| `error_outlet_role_classification_is_preserved` | R1 Error presentation | active |
 | `post_commit_host_loss_preserves_committed_history` | R2 Compound settlement | planned |
 | `host_reacceptance_detaches_old_top_slot` | R3 Re-admission/stale output | planned |
 

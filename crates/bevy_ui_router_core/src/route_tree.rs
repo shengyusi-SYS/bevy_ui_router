@@ -70,14 +70,14 @@ impl RouteNodeOptions {
         self
     }
 
-    pub fn with_error_boundary(mut self, key: ErrorBoundaryKey) -> Self {
-        self.error_boundary = Some(key);
-        self.error_view = None;
+    pub fn with_view(mut self, view: RouteViewKey) -> Self {
+        self.view = Some(view);
         self
     }
 
-    pub fn with_view(mut self, view: RouteViewKey) -> Self {
-        self.view = Some(view);
+    pub fn with_error_boundary(mut self, key: ErrorBoundaryKey) -> Self {
+        self.error_boundary = Some(key);
+        self.error_view = None;
         self
     }
 

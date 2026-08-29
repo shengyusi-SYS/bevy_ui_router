@@ -4,13 +4,22 @@ use crate::{
     app_ext::RouterHandle,
     navigation::{
         BackRequestInventoryProjection, RouterNavigation, back_request_inventory_projection,
-        install_back_capacity_order_observer_with,
+        install_back_capacity_order_observer_with, router_request_inventory_counts,
     },
+    snapshots::RouterSnapshots,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackRequestInventory {
     inner: BackRequestInventoryProjection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RouterRequestInventory {
+    navigation_routers: usize,
+    navigation_requests: usize,
+    snapshot_routers: usize,
+    snapshot_requests: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,4 +48,19 @@ pub fn testing_back_request_inventory(
 ) -> Option<BackRequestInventory> {
     back_request_inventory_projection(navigation, router)
         .map(|inner| BackRequestInventory { inner })
+}
+
+#[doc(hidden)]
+pub fn testing_router_request_inventory(
+    navigation: &RouterNavigation,
+    snapshots: &RouterSnapshots,
+) -> RouterRequestInventory {
+    let (navigation_routers, navigation_requests) = router_request_inventory_counts(navigation);
+    let (snapshot_routers, snapshot_requests) = snapshots.inventory_counts();
+    RouterRequestInventory {
+        navigation_routers,
+        navigation_requests,
+        snapshot_routers,
+        snapshot_requests,
+    }
 }
