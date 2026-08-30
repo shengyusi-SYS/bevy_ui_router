@@ -1442,6 +1442,7 @@ impl From<crate::engine::HostAdmissionUnavailableMismatchProjection>
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostAdmissionUnavailableIssuerOperation {
+    RefreezeCause,
     CancelToken,
     RejectGrant,
 }
@@ -1451,6 +1452,7 @@ impl From<crate::engine::HostAdmissionUnavailableIssuerOperation>
 {
     fn from(operation: CoreHostAdmissionUnavailableIssuerOperation) -> Self {
         match operation {
+            CoreHostAdmissionUnavailableIssuerOperation::RefreezeCause => Self::RefreezeCause,
             CoreHostAdmissionUnavailableIssuerOperation::CancelToken => Self::CancelToken,
             CoreHostAdmissionUnavailableIssuerOperation::RejectGrant => Self::RejectGrant,
         }

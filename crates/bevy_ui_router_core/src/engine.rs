@@ -5115,6 +5115,7 @@ impl HostAdmissionUnavailableOwnerInventoryProjection {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HostAdmissionUnavailableIssuerOperation {
+    RefreezeCause,
     CancelToken,
     RejectGrant,
 }
@@ -6423,6 +6424,19 @@ impl RouterEngine {
         {
             let evidence = HostAdmissionUnavailableFailureEvidence::Receiver(
                 self.unavailable_receiver_mismatch(&expected_source),
+            );
+            return HostAdmissionUnavailablePreStagingOutcome::Mismatch { source, evidence };
+        }
+        let expected_cause_issuer = source.prepared.core.expected_issuer.as_ref().clone();
+        let observed_cause_issuer = issuer.projection();
+        if observed_cause_issuer != expected_cause_issuer {
+            let evidence = HostAdmissionUnavailableFailureEvidence::Issuer(
+                HostAdmissionUnavailableIssuerMismatchProjection {
+                    receiver: self.unavailable_receiver_mismatch(&expected_source),
+                    operation: HostAdmissionUnavailableIssuerOperation::RefreezeCause,
+                    expected_issuer: expected_cause_issuer,
+                    observed_issuer: observed_cause_issuer,
+                },
             );
             return HostAdmissionUnavailablePreStagingOutcome::Mismatch { source, evidence };
         }
@@ -23014,6 +23028,70 @@ mod tests {
     }
 
     #[test]
+    fn pre_staging_permit_unavailable_refreeze_rejects_idle_issuer_counter_drift() {
+        let mut engine = RouterEngine::install(
+            tree(),
+            RouteViewKey::new("permit-unavailable-issuer-drift-fallback").unwrap(),
+        )
+        .unwrap();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+        let permit = r3_initial_host_admission_permit(&mut engine);
+        let source = permit.source.clone();
+        let prepared = r3_bind_candidate_unavailable(
+            &engine,
+            &issuer,
+            &source,
+            HostAdmissionUnavailableEvidenceKind::Conflict,
+            3,
+            0x3333,
+            0x4444,
+            Box::new(0x51A1_u64),
+        );
+        let expected_issuer = issuer.projection();
+        let token = issuer.issue(engine.router).unwrap();
+        issuer.cancel(&token).unwrap();
+        let observed_issuer = issuer.projection();
+        assert_ne!(observed_issuer, expected_issuer);
+        assert!(!issuer.has_outstanding());
+        let source = HostAdmissionUnavailablePreStagingSource {
+            prepared,
+            owner: HostAdmissionUnavailablePreStagingOwner::Permit(permit),
+            installation: Box::new(0x51A2_u64),
+        };
+        let callback_calls = std::cell::Cell::new(0usize);
+
+        let outcome = engine.complete_pre_staging_host_admission_unavailable(
+            &mut issuer,
+            source,
+            |installation| {
+                callback_calls.set(callback_calls.get() + 1);
+                installation
+            },
+        );
+        let HostAdmissionUnavailablePreStagingOutcome::Mismatch { source, evidence } = outcome
+        else {
+            panic!("permit completion must reject cause-bound issuer drift")
+        };
+        let HostAdmissionUnavailableFailureEvidence::Issuer(mismatch) = evidence else {
+            panic!("permit issuer drift must retain typed issuer evidence")
+        };
+        assert_eq!(
+            mismatch.operation,
+            HostAdmissionUnavailableIssuerOperation::RefreezeCause
+        );
+        assert_eq!(mismatch.expected_issuer, expected_issuer);
+        assert_eq!(mismatch.observed_issuer, observed_issuer);
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(*source.installation, 0x51A2_u64);
+        assert_eq!(*source.prepared.evidence, 0x51A1_u64);
+        let HostAdmissionUnavailablePreStagingOwner::Permit(permit) = source.owner else {
+            panic!("issuer drift must return the original permit owner")
+        };
+        assert_eq!(permit.source, source.prepared.core.source);
+        assert_eq!(engine.availability(), &RouterAvailability::AwaitingHost);
+    }
+
+    #[test]
     fn observed_host_unavailable_refreeze_rejects_idle_issuer_counter_drift() {
         let mut engine = RouterEngine::install(
             tree(),
@@ -23267,7 +23345,7 @@ mod tests {
         assert_eq!(callback_calls.get(), 0);
         assert_eq!(
             mismatch.operation,
-            HostAdmissionUnavailableIssuerOperation::CancelToken
+            HostAdmissionUnavailableIssuerOperation::RefreezeCause
         );
         assert_eq!(mismatch.expected_issuer, expected_issuer);
         assert_eq!(mismatch.observed_issuer, observed);
