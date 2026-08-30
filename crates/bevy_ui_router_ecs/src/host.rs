@@ -19,7 +19,9 @@ use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
 use bevy_ui::Node;
 
-use crate::app_ext::{RouterHandle, RouterHostRegistration};
+use crate::app_ext::{
+    HostRegistrationIncarnationExhaustionEvidence, RouterHandle, RouterHostRegistration,
+};
 use crate::components::{
     ProvisionalPostWriteProbe, ProvisionalSlotLifecycle, ProvisionalStagingProbe,
     RouteOwnershipSeal, RouterInputBarrier,
@@ -282,8 +284,16 @@ pub(crate) enum HostCandidateClassification {
     RetryableCapacity(HostCandidateCapacityEvidence),
     IdentityExhausted {
         source: HostCandidateObservationSource,
-        attempted_counter: u64,
+        counter: HostCandidateIdentityCounter,
+        current: u64,
+        attempted: u64,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostCandidateIdentityCounter {
+    RegistrationIncarnation,
+    CandidateRevision,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -693,8 +703,39 @@ fn observation_source_or_exhaustion(
             attempted_counter,
         } => Err(HostCandidateClassification::IdentityExhausted {
             source,
-            attempted_counter,
+            counter: HostCandidateIdentityCounter::CandidateRevision,
+            current: attempted_counter,
+            attempted: attempted_counter,
         }),
+    }
+}
+
+fn registration_exhaustion_classification(
+    router: RouterHandle,
+    fingerprint: &CandidateFingerprint,
+    revisions: &HostCandidateRevisionState,
+    evidence: HostRegistrationIncarnationExhaustionEvidence,
+) -> HostCandidateClassification {
+    match try_candidate_observation_source(
+        router,
+        fingerprint,
+        HostCandidateRevision(revisions.next),
+    ) {
+        Ok(source) => HostCandidateClassification::IdentityExhausted {
+            source,
+            counter: HostCandidateIdentityCounter::RegistrationIncarnation,
+            current: evidence.current,
+            attempted: evidence.attempted,
+        },
+        Err(()) => {
+            HostCandidateClassification::RetryableCapacity(HostCandidateCapacityEvidence::new(
+                router,
+                HostCandidateCapacityStage::ObservationSource,
+                fingerprint_item_count(fingerprint),
+                revisions.observed.len(),
+                HostCandidateRevision(revisions.next),
+            ))
+        }
     }
 }
 
@@ -840,6 +881,17 @@ pub(crate) fn classify_host_candidate(
                     );
                 }
             };
+            if let Some(evidence) = world
+                .get::<RouterHostRegistration>(*candidate)
+                .and_then(RouterHostRegistration::incarnation_exhaustion)
+            {
+                return registration_exhaustion_classification(
+                    router,
+                    &observation_fingerprint,
+                    revisions,
+                    evidence,
+                );
+            }
             let observation = revisions.observe(router, &observation_fingerprint);
             let source = match observation_source_or_exhaustion(observation) {
                 Ok(source) => source,
@@ -902,6 +954,18 @@ pub(crate) fn classify_host_candidate(
                     );
                 }
             };
+            if let Some(evidence) = candidates.iter().find_map(|candidate| {
+                world
+                    .get::<RouterHostRegistration>(*candidate)
+                    .and_then(RouterHostRegistration::incarnation_exhaustion)
+            }) {
+                return registration_exhaustion_classification(
+                    router,
+                    &observation_fingerprint,
+                    revisions,
+                    evidence,
+                );
+            }
             let observation = revisions.observe(router, &observation_fingerprint);
             let source = match observation_source_or_exhaustion(observation) {
                 Ok(source) => source,
@@ -1793,11 +1857,38 @@ impl ProvisionalHostSettlementReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProvisionalSettlementTargetExpectation {
+    claim: ExactRegistryClaim,
+    registry_manifest: ComponentManifest,
+    route_seal: Option<crate::registry::OwnershipSeal>,
+    lifecycle: Option<ProvisionalSlotLifecycle>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ObservedProvisionalSettlementTarget {
+    entity_present: bool,
+    claim: Option<ExactRegistryClaim>,
+    registry_manifest: Option<ComponentManifest>,
+    route_seal: Option<crate::registry::OwnershipSeal>,
+    lifecycle: Option<ProvisionalSlotLifecycle>,
+    visibility: Option<Visibility>,
+    pickable: Option<Pickable>,
+    barrier: Option<RouterInputBarrier>,
+    parent: Option<Entity>,
+    descendants: Vec<Entity>,
+    actual_manifest: Option<ComponentManifest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProvisionalHostSettlementMismatch {
     MissingPartition,
     AuthorityLost {
         expected: ExactRegistryClaim,
         observed: Option<ExactRegistryClaim>,
+    },
+    TargetDrift {
+        expected: ProvisionalSettlementTargetExpectation,
+        observed: ObservedProvisionalSettlementTarget,
     },
     ProtectedDrift,
     DetachBlocked,
@@ -2605,6 +2696,113 @@ fn provisional_settlement_receipt(
     }
 }
 
+fn provisional_settlement_target_expectation(
+    settlement: &ProvisionalHostSettlement,
+    lifecycle: ProvisionalSlotLifecycle,
+) -> ProvisionalSettlementTargetExpectation {
+    let bundle_was_written = settlement.staged.failure_evidence.stage
+        != ProvisionalTopSlotSettlementStage::OwnershipRegistered;
+    ProvisionalSettlementTargetExpectation {
+        claim: settlement.staged.claim.clone(),
+        registry_manifest: settlement.staged.manifest.clone(),
+        route_seal: bundle_was_written.then_some(settlement.staged.seal),
+        lifecycle: (bundle_was_written || lifecycle == ProvisionalSlotLifecycle::Quarantined)
+            .then_some(lifecycle),
+    }
+}
+
+fn observe_provisional_settlement_target(
+    world: &World,
+    slot: Entity,
+) -> Result<ObservedProvisionalSettlementTarget, ()> {
+    let (claim, registry_manifest) = match world
+        .get_resource::<RouteEntityRegistry>()
+        .and_then(|registry| registry.record(slot))
+    {
+        Some(record) => (Some(record.claim()), Some(record.manifest().try_clone()?)),
+        None => (None, None),
+    };
+    let entity_present = world.get_entity(slot).is_ok();
+    Ok(ObservedProvisionalSettlementTarget {
+        entity_present,
+        claim,
+        registry_manifest,
+        route_seal: world
+            .get::<RouteOwnershipSeal>(slot)
+            .copied()
+            .map(RouteOwnershipSeal::seal),
+        lifecycle: world.get::<ProvisionalSlotLifecycle>(slot).copied(),
+        visibility: world.get::<Visibility>(slot).cloned(),
+        pickable: world.get::<Pickable>(slot).cloned(),
+        barrier: world.get::<RouterInputBarrier>(slot).copied(),
+        parent: world.get::<ChildOf>(slot).map(ChildOf::parent),
+        descendants: entity_present
+            .then(|| collect_descendants(world, slot))
+            .unwrap_or_default(),
+        actual_manifest: ComponentManifest::try_from_world(world, slot)?,
+    })
+}
+
+fn validate_observed_provisional_settlement_target(
+    settlement: &ProvisionalHostSettlement,
+    lifecycle: ProvisionalSlotLifecycle,
+    require_isolated: bool,
+    observed: ObservedProvisionalSettlementTarget,
+) -> Result<ObservedProvisionalSettlementTarget, ProvisionalHostSettlementMismatch> {
+    let expected = provisional_settlement_target_expectation(settlement, lifecycle);
+    if observed.claim.as_ref() != Some(&expected.claim) {
+        return Err(ProvisionalHostSettlementMismatch::AuthorityLost {
+            expected: expected.claim,
+            observed: observed.claim,
+        });
+    }
+    let isolated = observed.visibility == Some(Visibility::Hidden)
+        && observed.pickable == Some(Pickable::IGNORE)
+        && observed.barrier.is_some_and(|barrier| barrier.denies_all());
+    if !observed.entity_present
+        || observed.registry_manifest.as_ref() != Some(&expected.registry_manifest)
+        || observed.route_seal != expected.route_seal
+        || observed.lifecycle != expected.lifecycle
+        || observed.actual_manifest.is_none()
+        || require_isolated && !isolated
+    {
+        return Err(ProvisionalHostSettlementMismatch::TargetDrift { expected, observed });
+    }
+    Ok(observed)
+}
+
+fn settle_missing_provisional_target(
+    world: &mut World,
+    partition: &FrozenProvisionalStagingPartition,
+    prepared_claim: &ExactRegistryClaim,
+) -> ProvisionalSettlementAttempt {
+    if !partition.protected_matches(world, false) {
+        return ProvisionalSettlementAttempt::Inert(
+            ProvisionalHostSettlementMismatch::ProtectedDrift,
+        );
+    }
+    let observed = world
+        .resource::<RouteEntityRegistry>()
+        .record(prepared_claim.entity())
+        .map(|record| record.claim());
+    if observed.as_ref() != Some(prepared_claim)
+        || !world
+            .resource_mut::<RouteEntityRegistry>()
+            .remove_exact(prepared_claim)
+    {
+        return ProvisionalSettlementAttempt::Inert(
+            ProvisionalHostSettlementMismatch::AuthorityLost {
+                expected: prepared_claim.clone(),
+                observed,
+            },
+        );
+    }
+    ProvisionalSettlementAttempt::Terminal(provisional_settlement_receipt(
+        prepared_claim.clone(),
+        ProvisionalHostSettlementDisposition::AlreadyRemoved,
+    ))
+}
+
 fn settle_failed_provisional(
     world: &mut World,
     settlement: &mut ProvisionalHostSettlement,
@@ -2612,59 +2810,29 @@ fn settle_failed_provisional(
 ) -> ProvisionalSettlementAttempt {
     let slot = settlement.staged.entity;
     let authorized_host = settlement.authorized_host;
-    let manifest = &settlement.staged.manifest;
+    let manifest = settlement.staged.manifest.clone();
     let prepared_claim = settlement.staged.claim.clone();
-    let partition = &settlement.staged.partition;
-    let entity_present = world.get_entity(slot).is_ok();
-    let initial_parent = world.get::<ChildOf>(slot).map(ChildOf::parent);
-    let edge_written = entity_present && initial_parent == Some(authorized_host);
+    let partition = Arc::clone(&settlement.staged.partition);
+    let initial = match observe_provisional_settlement_target(world, slot) {
+        Ok(observed) => observed,
+        Err(()) => return ProvisionalSettlementAttempt::Retryable,
+    };
+    let edge_written = initial.entity_present && initial.parent == Some(authorized_host);
     if !partition.protected_matches(world, edge_written) {
         return ProvisionalSettlementAttempt::Inert(
             ProvisionalHostSettlementMismatch::ProtectedDrift,
         );
     }
-    let observed_claim = world
-        .get_resource::<RouteEntityRegistry>()
-        .and_then(|registry| registry.record(slot))
-        .map(|record| record.claim());
-    if observed_claim.as_ref() != Some(&prepared_claim) {
-        return ProvisionalSettlementAttempt::Inert(
-            ProvisionalHostSettlementMismatch::AuthorityLost {
-                expected: prepared_claim,
-                observed: observed_claim,
-            },
-        );
+    if !initial.entity_present {
+        return settle_missing_provisional_target(world, &partition, &prepared_claim);
     }
-    if !entity_present {
-        let removed = world
-            .resource_mut::<RouteEntityRegistry>()
-            .remove_exact(&prepared_claim);
-        return if removed {
-            ProvisionalSettlementAttempt::Terminal(provisional_settlement_receipt(
-                prepared_claim,
-                ProvisionalHostSettlementDisposition::AlreadyRemoved,
-            ))
-        } else {
-            ProvisionalSettlementAttempt::Inert(ProvisionalHostSettlementMismatch::AuthorityLost {
-                expected: prepared_claim,
-                observed: world
-                    .resource::<RouteEntityRegistry>()
-                    .record(slot)
-                    .map(|record| record.claim()),
-            })
-        };
-    }
-    if world
-        .resource::<RouteEntityRegistry>()
-        .record(slot)
-        .is_none_or(|record| record.manifest() != manifest)
-    {
-        return ProvisionalSettlementAttempt::Inert(
-            ProvisionalHostSettlementMismatch::AuthorityLost {
-                expected: prepared_claim,
-                observed: observed_claim,
-            },
-        );
+    if let Err(mismatch) = validate_observed_provisional_settlement_target(
+        settlement,
+        ProvisionalSlotLifecycle::PreparedInert,
+        false,
+        initial,
+    ) {
+        return ProvisionalSettlementAttempt::Inert(mismatch);
     }
 
     world.entity_mut(slot).insert((
@@ -2673,14 +2841,31 @@ fn settle_failed_provisional(
         RouterInputBarrier::deny_all(),
     ));
     world.flush();
-    if !partition.protected_matches(world, edge_written) {
+    let first_isolation = match observe_provisional_settlement_target(world, slot) {
+        Ok(observed) => observed,
+        Err(()) => return ProvisionalSettlementAttempt::Retryable,
+    };
+    if !first_isolation.entity_present {
+        return settle_missing_provisional_target(world, &partition, &prepared_claim);
+    }
+    let first_isolation = match validate_observed_provisional_settlement_target(
+        settlement,
+        ProvisionalSlotLifecycle::PreparedInert,
+        true,
+        first_isolation,
+    ) {
+        Ok(observed) => observed,
+        Err(mismatch) => return ProvisionalSettlementAttempt::Inert(mismatch),
+    };
+    let first_edge_written = first_isolation.parent == Some(authorized_host);
+    if !partition.protected_matches(world, first_edge_written) {
         return ProvisionalSettlementAttempt::Inert(
             ProvisionalHostSettlementMismatch::ProtectedDrift,
         );
     }
     clear_focus_in_subtree(world, slot);
 
-    if initial_parent == Some(authorized_host) {
+    if first_edge_written {
         world.entity_mut(slot).remove::<ChildOf>();
         world.flush();
         if test_drift == StagingTestDrift::ReattachAuthorizedHostOnDetach
@@ -2690,35 +2875,23 @@ fn settle_failed_provisional(
             world.flush();
         }
     }
-    if world.get_entity(slot).is_err() {
-        if !partition.protected_matches(world, false) {
-            return ProvisionalSettlementAttempt::Inert(
-                ProvisionalHostSettlementMismatch::ProtectedDrift,
-            );
-        }
-        let observed = world
-            .resource::<RouteEntityRegistry>()
-            .record(slot)
-            .map(|record| record.claim());
-        if observed.as_ref() != Some(&prepared_claim)
-            || !world
-                .resource_mut::<RouteEntityRegistry>()
-                .remove_exact(&prepared_claim)
-        {
-            return ProvisionalSettlementAttempt::Inert(
-                ProvisionalHostSettlementMismatch::AuthorityLost {
-                    expected: prepared_claim,
-                    observed,
-                },
-            );
-        }
-        return ProvisionalSettlementAttempt::Terminal(provisional_settlement_receipt(
-            prepared_claim,
-            ProvisionalHostSettlementDisposition::AlreadyRemoved,
-        ));
+    let after_detach = match observe_provisional_settlement_target(world, slot) {
+        Ok(observed) => observed,
+        Err(()) => return ProvisionalSettlementAttempt::Retryable,
+    };
+    if !after_detach.entity_present {
+        return settle_missing_provisional_target(world, &partition, &prepared_claim);
     }
-    let actual_parent = world.get::<ChildOf>(slot).map(ChildOf::parent);
-    if actual_parent == Some(authorized_host) {
+    let after_detach = match validate_observed_provisional_settlement_target(
+        settlement,
+        ProvisionalSlotLifecycle::PreparedInert,
+        true,
+        after_detach,
+    ) {
+        Ok(observed) => observed,
+        Err(mismatch) => return ProvisionalSettlementAttempt::Inert(mismatch),
+    };
+    if after_detach.parent == Some(authorized_host) {
         return ProvisionalSettlementAttempt::Inert(
             ProvisionalHostSettlementMismatch::DetachBlocked,
         );
@@ -2734,22 +2907,44 @@ fn settle_failed_provisional(
         RouterInputBarrier::deny_all(),
     ));
     world.flush();
+    let second_isolation = match observe_provisional_settlement_target(world, slot) {
+        Ok(observed) => observed,
+        Err(()) => return ProvisionalSettlementAttempt::Retryable,
+    };
+    if !second_isolation.entity_present {
+        return settle_missing_provisional_target(world, &partition, &prepared_claim);
+    }
+    let second_isolation = match validate_observed_provisional_settlement_target(
+        settlement,
+        ProvisionalSlotLifecycle::PreparedInert,
+        true,
+        second_isolation,
+    ) {
+        Ok(observed) => observed,
+        Err(mismatch) => return ProvisionalSettlementAttempt::Inert(mismatch),
+    };
+    if second_isolation.parent == Some(authorized_host) {
+        return ProvisionalSettlementAttempt::Inert(
+            ProvisionalHostSettlementMismatch::DetachBlocked,
+        );
+    }
     if !partition.protected_matches(world, false) {
         return ProvisionalSettlementAttempt::Inert(
             ProvisionalHostSettlementMismatch::ProtectedDrift,
         );
     }
     clear_focus_in_subtree(world, slot);
-    let foreign_descendants = collect_descendants(world, slot);
-    let actual_manifest =
-        ComponentManifest::from_world(world, slot).unwrap_or_else(|| ComponentManifest::new([]));
+    let protected_parent = second_isolation.parent;
+    let foreign_descendants = second_isolation.descendants;
+    let actual_manifest = second_isolation
+        .actual_manifest
+        .expect("validated present target retains an exact component manifest");
     let foreign_components = actual_manifest
         .component_ids()
         .iter()
         .copied()
         .filter(|id| !manifest.component_ids().contains(id))
         .collect::<Vec<ComponentId>>();
-    let protected_parent = actual_parent;
 
     if protected_parent.is_some()
         || !foreign_descendants.is_empty()
@@ -2759,11 +2954,52 @@ fn settle_failed_provisional(
             .entity_mut(slot)
             .insert(ProvisionalSlotLifecycle::Quarantined);
         world.flush();
+        let quarantined = match observe_provisional_settlement_target(world, slot) {
+            Ok(observed) => observed,
+            Err(()) => return ProvisionalSettlementAttempt::Retryable,
+        };
+        if !quarantined.entity_present {
+            let expected = provisional_settlement_target_expectation(
+                settlement,
+                ProvisionalSlotLifecycle::Quarantined,
+            );
+            return ProvisionalSettlementAttempt::Inert(
+                ProvisionalHostSettlementMismatch::TargetDrift {
+                    expected,
+                    observed: quarantined,
+                },
+            );
+        }
+        let quarantined = match validate_observed_provisional_settlement_target(
+            settlement,
+            ProvisionalSlotLifecycle::Quarantined,
+            true,
+            quarantined,
+        ) {
+            Ok(observed) => observed,
+            Err(mismatch) => return ProvisionalSettlementAttempt::Inert(mismatch),
+        };
+        if quarantined.parent == Some(authorized_host) {
+            return ProvisionalSettlementAttempt::Inert(
+                ProvisionalHostSettlementMismatch::DetachBlocked,
+            );
+        }
         if !partition.protected_matches(world, false) {
             return ProvisionalSettlementAttempt::Inert(
                 ProvisionalHostSettlementMismatch::ProtectedDrift,
             );
         }
+        let protected_parent = quarantined.parent;
+        let foreign_descendants = quarantined.descendants;
+        let actual_manifest = quarantined
+            .actual_manifest
+            .expect("validated quarantined target retains an exact component manifest");
+        let foreign_components = actual_manifest
+            .component_ids()
+            .iter()
+            .copied()
+            .filter(|id| !manifest.component_ids().contains(id))
+            .collect::<Vec<ComponentId>>();
         let facts = QuarantineFacts::new(
             Some(authorized_host),
             protected_parent,
@@ -2950,7 +3186,9 @@ fn is_descendant_or_self(world: &World, root: Entity, mut current: Entity) -> bo
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::app_ext::{RouterHandle, RouterHostRegistration};
+    use crate::app_ext::{
+        HostRegistrationIncarnationExhaustionEvidence, RouterHandle, RouterHostRegistration,
+    };
     use crate::{
         components::{ProvisionalPostWriteProbe, ProvisionalStagingProbe, RouterInputBarrier},
         registry::{QuarantineLeaseTable, RouteEntityRegistry},
@@ -3182,6 +3420,45 @@ pub(crate) mod tests {
             Some(host_manifest)
         );
         assert!(children_of(&world, host).is_empty());
+    }
+
+    #[test]
+    fn exhausted_registration_incarnation_never_becomes_a_candidate_identity() {
+        let mut world = World::new();
+        let host = world
+            .spawn((Node::default(), RouterHostRegistration::new(router())))
+            .id();
+        let evidence = HostRegistrationIncarnationExhaustionEvidence {
+            current: u64::MAX,
+            attempted: u64::MAX,
+        };
+        world
+            .get_mut::<RouterHostRegistration>(host)
+            .unwrap()
+            .testing_mark_incarnation_exhausted(evidence);
+        let entity_count = world.iter_entities().count();
+        let mut revisions = HostCandidateRevisionState::default();
+
+        let HostCandidateClassification::IdentityExhausted {
+            source,
+            counter,
+            current,
+            attempted,
+        } = classify_host_candidate(&world, router(), &mut revisions)
+        else {
+            panic!("an exhausted registration must fail permanently before candidate admission")
+        };
+
+        assert_eq!(
+            counter,
+            HostCandidateIdentityCounter::RegistrationIncarnation
+        );
+        assert_eq!(current, u64::MAX);
+        assert_eq!(attempted, u64::MAX);
+        assert_eq!(source.revision(), HostCandidateRevision::fixture(0));
+        assert_eq!(world.iter_entities().count(), entity_count);
+        assert_eq!(revisions.next, 0);
+        assert!(revisions.observed.is_empty());
     }
 
     #[test]
@@ -3639,6 +3916,82 @@ pub(crate) mod tests {
         assert_eq!(children_of(&world, host), baseline);
         assert!(world.resource::<RouteEntityRegistry>().records().is_empty());
         assert!(world.resource::<QuarantineLeaseTable>().leases().is_empty());
+    }
+
+    #[test]
+    fn settlement_refreezes_parent_after_second_isolation_write() {
+        #[derive(Resource, Default)]
+        struct ReparentOnSecondIsolation {
+            armed: bool,
+            target: Option<Entity>,
+            protected_parent: Option<Entity>,
+            insertions: usize,
+        }
+
+        let mut world = World::new();
+        world.insert_resource(RouteEntityRegistry::new());
+        world.insert_resource(QuarantineLeaseTable::new());
+        world.insert_resource(ReparentOnSecondIsolation::default());
+        world
+            .register_component_hooks::<RouterInputBarrier>()
+            .on_insert(|mut world, HookContext { entity, .. }| {
+                let reparent = {
+                    let mut drift = world.resource_mut::<ReparentOnSecondIsolation>();
+                    if !drift.armed || drift.target != Some(entity) {
+                        None
+                    } else {
+                        drift.insertions += 1;
+                        (drift.insertions == 2).then_some(
+                            drift
+                                .protected_parent
+                                .expect("the armed cleanup hook has one protected parent"),
+                        )
+                    }
+                };
+                if let Some(parent) = reparent {
+                    world.commands().entity(parent).add_child(entity);
+                }
+            });
+        let protected = world.spawn((AppSentinel, Node::default())).id();
+        let host = world
+            .spawn((Node::default(), RouterHostRegistration::new(router())))
+            .id();
+        let mut revisions = HostCandidateRevisionState::default();
+        let candidate = unique_candidate(&world, &mut revisions);
+        let staged = stage_provisional_top_slot(
+            &mut world,
+            SealedProvisionalTopSlotSpec::new(&candidate, StagingTestDrift::None),
+        )
+        .expect("the cleanup fixture starts from one valid provisional slot");
+        let slot = staged.entity();
+        let mut settlement = staged.into_settlement(
+            &world,
+            &candidate,
+            ProvisionalTopSlotSettlementStage::ProbeWritten,
+        );
+        world.resource_mut::<ReparentOnSecondIsolation>().armed = true;
+        world.resource_mut::<ReparentOnSecondIsolation>().target = Some(slot);
+        world
+            .resource_mut::<ReparentOnSecondIsolation>()
+            .protected_parent = Some(protected);
+
+        let attempt =
+            settle_failed_provisional(&mut world, &mut settlement, StagingTestDrift::None);
+
+        assert!(matches!(
+            attempt,
+            ProvisionalSettlementAttempt::Terminal(ProvisionalHostSettlementReceipt {
+                disposition: ProvisionalHostSettlementDisposition::Quarantined,
+                ..
+            })
+        ));
+        assert_eq!(world.resource::<ReparentOnSecondIsolation>().insertions, 2);
+        assert_eq!(
+            world.get::<ChildOf>(slot).map(ChildOf::parent),
+            Some(protected)
+        );
+        assert!(world.get::<AppSentinel>(protected).is_some());
+        assert_eq!(world.resource::<QuarantineLeaseTable>().leases().len(), 1);
     }
 
     #[test]

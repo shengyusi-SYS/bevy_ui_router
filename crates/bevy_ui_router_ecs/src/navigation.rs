@@ -133,15 +133,15 @@ use crate::{
         validate_preserved_branch_local, validate_reconciliation_entering_branch,
     },
     host::{
-        HostCandidateCapacityEvidence, HostCandidateClassification, HostCandidateObservationSource,
-        HostCandidateRevisionLatch, HostCandidateRevisionState, PreparedEcsHostCandidateSource,
-        PreparedHostCandidateRejection, ProvisionalHostCleanupLedger, ProvisionalHostSettlement,
-        ProvisionalHostSettlementTerminal, ProvisionalStagingFailureEvidence,
-        StagedProvisionalTopSlot, ValidatedHostCandidate, ValidatedHostCandidateObservation,
-        activate_source_bound_granted_top_slot, classify_host_candidate,
-        hide_source_bound_granted_top_slot, observe_validated_host_candidate,
-        retain_staged_top_slot_for_settlement, stage_source_bound_granted_top_slot,
-        validated_host_candidate_is_current,
+        HostCandidateCapacityEvidence, HostCandidateClassification, HostCandidateIdentityCounter,
+        HostCandidateObservationSource, HostCandidateRevisionLatch, HostCandidateRevisionState,
+        PreparedEcsHostCandidateSource, PreparedHostCandidateRejection,
+        ProvisionalHostCleanupLedger, ProvisionalHostSettlement, ProvisionalHostSettlementTerminal,
+        ProvisionalStagingFailureEvidence, StagedProvisionalTopSlot, ValidatedHostCandidate,
+        ValidatedHostCandidateObservation, activate_source_bound_granted_top_slot,
+        classify_host_candidate, hide_source_bound_granted_top_slot,
+        observe_validated_host_candidate, retain_staged_top_slot_for_settlement,
+        stage_source_bound_granted_top_slot, validated_host_candidate_is_current,
     },
     input::{
         PreparedInputGateIsolation, RouteFocusState, RouterInputGate, observed_descendant_closure,
@@ -2373,7 +2373,9 @@ enum R3HostAdmissionUnavailableEvidence {
     InvalidTopology(HostCandidateObservationSource),
     IdentityExhausted {
         source: HostCandidateObservationSource,
-        attempted_counter: u64,
+        counter: HostCandidateIdentityCounter,
+        current: u64,
+        attempted: u64,
     },
     HostLost(HostCandidateObservationSource),
     Preallocation(HostCandidateObservationSource),
@@ -7207,14 +7209,18 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                         HostCandidateClassification::RetryableCapacity(_) => continue,
                         HostCandidateClassification::IdentityExhausted {
                             source,
-                            attempted_counter,
+                            counter,
+                            current,
+                            attempted,
                         } => {
                             drive_observed_candidate_rejection(
                                 entry,
                                 source.clone(),
                                 R3HostAdmissionUnavailableEvidence::IdentityExhausted {
                                     source,
-                                    attempted_counter,
+                                    counter,
+                                    current,
+                                    attempted,
                                 },
                                 previous_candidate_source.as_ref().map(|source| source.digest()),
                             );
@@ -7288,16 +7294,25 @@ fn r3_unavailable_projection(
         }
         R3HostAdmissionUnavailableEvidence::IdentityExhausted {
             source,
-            attempted_counter,
+            counter,
+            current,
+            attempted,
         } => r3_core::HostAdmissionUnavailableEvidenceProjection::authority_establishment_failed(
             core_source,
             Some(source.revision().raw()),
             expected_observation_digest.unwrap_or_else(|| source.digest()),
             source.digest(),
             Some(r3_core::HostAdmissionAllocatorExhaustionEvidence {
-                counter: r3_core::HostAdmissionAllocatorCounter::CandidateRevision,
-                current: *attempted_counter,
-                attempted: *attempted_counter,
+                counter: match counter {
+                    HostCandidateIdentityCounter::RegistrationIncarnation => {
+                        r3_core::HostAdmissionAllocatorCounter::RegistrationIncarnation
+                    }
+                    HostCandidateIdentityCounter::CandidateRevision => {
+                        r3_core::HostAdmissionAllocatorCounter::CandidateRevision
+                    }
+                },
+                current: *current,
+                attempted: *attempted,
             }),
         ),
         R3HostAdmissionUnavailableEvidence::HostLost(source) => {
@@ -7774,22 +7789,29 @@ fn drive_r3_staged_host_confirmation(
             .engine
             .testing_drift_prepared_host_confirmation_receiver_input();
     }
-    match entry
-        .engine
-        .confirm_host_admission_with_binding(prepared, |installation, lease| HostBinding {
-            version: installation.version,
-            slot_id: installation.slot_id,
-            host: installation.candidate.candidate.host(),
-            top_slot: installation.staged.entity(),
-            top_slot_claim: installation.claim,
-            registration_incarnation: installation.candidate.registration_incarnation,
-            candidate: installation.candidate.candidate,
-            lease,
-        }) {
-        r3_core::HostAdmissionConfirmationCoreOutcome::Ready { installed, .. } => {
-            entry.host = Some(installed);
-            let _ = entry.settled_retired_host_evidence.take();
-        }
+    let confirmation = {
+        let RouterEntry {
+            engine,
+            host,
+            settled_retired_host_evidence,
+            ..
+        } = entry;
+        engine.confirm_host_admission_with_binding(prepared, |installation, lease| {
+            *host = Some(HostBinding {
+                version: installation.version,
+                slot_id: installation.slot_id,
+                host: installation.candidate.candidate.host(),
+                top_slot: installation.staged.entity(),
+                top_slot_claim: installation.claim,
+                registration_incarnation: installation.candidate.registration_incarnation,
+                candidate: installation.candidate.candidate,
+                lease,
+            });
+            let _ = settled_retired_host_evidence.take();
+        })
+    };
+    match confirmation {
+        r3_core::HostAdmissionConfirmationCoreOutcome::Ready { installed: (), .. } => {}
         r3_core::HostAdmissionConfirmationCoreOutcome::ReceiverMismatch { owner, evidence } => {
             retain_r3_confirmation_failure(
                 world,

@@ -234,6 +234,7 @@ pub(crate) enum AdmissionError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HostAdmissionAllocatorCounter {
+    RegistrationIncarnation,
     CandidateRevision,
     RequestSequence,
     GrantEpoch,

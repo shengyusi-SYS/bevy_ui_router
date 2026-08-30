@@ -251,7 +251,6 @@ impl ReservedAttemptIds {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReservationCounter {
     Request,
@@ -259,6 +258,13 @@ pub(crate) enum ReservationCounter {
     FrameTask,
     CandidateFrame,
     CleanupBatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AttemptIdentityExhaustionEvidence {
+    pub(crate) counter: ReservationCounter,
+    pub(crate) current: u64,
+    pub(crate) attempted: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -474,10 +480,34 @@ impl CoreIdAllocator {
     }
 
     pub(crate) fn reserve_attempt(&mut self) -> Result<ReservedAttemptIds, IdExhaustion> {
-        let next_transaction = self.next_transaction.checked_add(1).ok_or(IdExhaustion)?;
-        let next_task = self.next_task.checked_add(1).ok_or(IdExhaustion)?;
-        let next_frame = self.next_frame.checked_add(1).ok_or(IdExhaustion)?;
-        let next_cleanup_batch = self.next_cleanup_batch.checked_add(1).ok_or(IdExhaustion)?;
+        self.reserve_attempt_with_evidence()
+            .map_err(|_| IdExhaustion)
+    }
+
+    pub(crate) fn reserve_attempt_with_evidence(
+        &mut self,
+    ) -> Result<ReservedAttemptIds, AttemptIdentityExhaustionEvidence> {
+        let exhausted = |counter, current| AttemptIdentityExhaustionEvidence {
+            counter,
+            current,
+            attempted: current,
+        };
+        let next_transaction = self
+            .next_transaction
+            .checked_add(1)
+            .ok_or_else(|| exhausted(ReservationCounter::Transaction, self.next_transaction))?;
+        let next_task = self
+            .next_task
+            .checked_add(1)
+            .ok_or_else(|| exhausted(ReservationCounter::FrameTask, self.next_task))?;
+        let next_frame = self
+            .next_frame
+            .checked_add(1)
+            .ok_or_else(|| exhausted(ReservationCounter::CandidateFrame, self.next_frame))?;
+        let next_cleanup_batch = self
+            .next_cleanup_batch
+            .checked_add(1)
+            .ok_or_else(|| exhausted(ReservationCounter::CleanupBatch, self.next_cleanup_batch))?;
 
         let reserved = ReservedAttemptIds {
             transaction: TransactionId(self.next_transaction),

@@ -40,9 +40,9 @@ use crate::history_authority::{
     HistoryAuthoritySnapshot, HistoryCapabilitySnapshot, HistoryDriftEvidenceSnapshot,
 };
 use crate::ids::{
-    CleanupBatchId, CoreIdAllocator, FrameTaskId, NavigationRequestId, ReservedBranchAttempt,
-    ReservedFrameAttempt, RouteFrameId, RouteGeneration, RouteHostId, RouteId, RouteSlotId,
-    RouterIdentity, TransactionId,
+    AttemptIdentityExhaustionEvidence, CleanupBatchId, CoreIdAllocator, FrameTaskId,
+    NavigationRequestId, ReservedBranchAttempt, ReservedFrameAttempt, RouteFrameId,
+    RouteGeneration, RouteHostId, RouteId, RouteSlotId, RouterIdentity, TransactionId,
 };
 use crate::location::RouteLocation;
 use crate::matcher::RouteMatcher;
@@ -415,6 +415,14 @@ struct FrozenBoundErrorRecovery {
     reserved_attempt: Option<crate::ids::ReservedAttemptIds>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct BoundErrorRecoveryIdentityExhaustedOwner {
+    recovery: Box<FrozenBoundErrorRecovery>,
+    original_failure: NavigationFailure,
+    terminal_failure: NavigationFailure,
+    exhaustion: AttemptIdentityExhaustionEvidence,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FrozenErrorMountSource {
     TopSlot {
@@ -445,6 +453,19 @@ enum FrozenParentMountSource {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundErrorIdentityExhaustedProjection {
+    failure_branch_index: usize,
+    boundary_route: RouteId,
+    boundary: ErrorBoundaryKey,
+    view: RouteViewKey,
+    mount: FrozenErrorMountSource,
+    prepared_prefix: Vec<RouteFrameVersion>,
+    original_failure: NavigationFailure,
+    terminal_failure: NavigationFailure,
+    exhaustion: AttemptIdentityExhaustionEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum FailureCleanupRecoveryTargetProjection {
     Terminal,
     RouterFallback,
@@ -456,12 +477,14 @@ enum FailureCleanupRecoveryTargetProjection {
         prepared_prefix: Vec<RouteFrameVersion>,
         reserved_attempt: Option<crate::ids::ReservedAttemptIds>,
     },
+    BoundErrorIdentityExhausted(Box<BoundErrorIdentityExhaustedProjection>),
     AuthoritySettlement,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 enum FailureCleanupContinuationOwner {
     Terminal,
+    TerminalRecoveryFailed(Box<BoundErrorRecoveryIdentityExhaustedOwner>),
     BeginFallback,
     BeginBoundError(Box<FrozenBoundErrorRecovery>),
     AuthoritySettlement,
@@ -471,6 +494,21 @@ impl FailureCleanupContinuationOwner {
     fn receiver_projection(&self) -> FailureCleanupRecoveryTargetProjection {
         match self {
             Self::Terminal => FailureCleanupRecoveryTargetProjection::Terminal,
+            Self::TerminalRecoveryFailed(owner) => {
+                FailureCleanupRecoveryTargetProjection::BoundErrorIdentityExhausted(Box::new(
+                    BoundErrorIdentityExhaustedProjection {
+                        failure_branch_index: owner.recovery.failure_branch_index,
+                        boundary_route: owner.recovery.binding.boundary_route(),
+                        boundary: owner.recovery.binding.boundary().clone(),
+                        view: owner.recovery.binding.view().clone(),
+                        mount: owner.recovery.mount.clone(),
+                        prepared_prefix: owner.recovery.prepared_prefix.clone(),
+                        original_failure: owner.original_failure.clone(),
+                        terminal_failure: owner.terminal_failure.clone(),
+                        exhaustion: owner.exhaustion,
+                    },
+                ))
+            }
             Self::BeginFallback => FailureCleanupRecoveryTargetProjection::RouterFallback,
             Self::BeginBoundError(recovery) => FailureCleanupRecoveryTargetProjection::BoundError {
                 failure_branch_index: recovery.failure_branch_index,
@@ -717,6 +755,7 @@ impl FailureCleanupRequest {
         match &self.continuation {
             FailureCleanupContinuationOwner::BeginBoundError(recovery) => &recovery.prepared_prefix,
             FailureCleanupContinuationOwner::Terminal
+            | FailureCleanupContinuationOwner::TerminalRecoveryFailed(_)
             | FailureCleanupContinuationOwner::BeginFallback
             | FailureCleanupContinuationOwner::AuthoritySettlement => &[],
         }
@@ -4962,6 +5001,24 @@ pub(crate) struct HostAdmissionUnavailableMismatchProjection {
     pub(crate) observed_pending: Option<CorePendingHostAdmissionProjection>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionUnavailableObservedMismatchProjection {
+    expected_source: HostAdmissionSourceProjection,
+    observed_source: HostAdmissionSourceProjection,
+    observed_source_open: bool,
+    observed_pending: Option<CorePendingHostAdmissionProjection>,
+    observed_availability: RouterAvailability,
+    observed_host: Option<HostVersion>,
+    observed_top_slot: Option<RouteSlotId>,
+    observed_active: ActivePresentation,
+    observed_request: Option<RequestStatus>,
+    observed_current_identity: Option<FrameTaskIdentity>,
+    observed_current_stage: Option<WorkStageProjection>,
+    observed_action_present: bool,
+    observed_internal_owner_count: usize,
+    observed_issuer: HostAdmissionIssuerProjection,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HostAdmissionUnavailableIssuerOperation {
     CancelToken,
@@ -4979,6 +5036,7 @@ pub(crate) struct HostAdmissionUnavailableIssuerMismatchProjection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum HostAdmissionUnavailableFailureEvidence {
     Receiver(HostAdmissionUnavailableMismatchProjection),
+    ObservedReceiver(Box<HostAdmissionUnavailableObservedMismatchProjection>),
     Issuer(HostAdmissionUnavailableIssuerMismatchProjection),
 }
 
@@ -5308,7 +5366,11 @@ pub(crate) fn bind_host_admission_unavailable_cause<Evidence>(
         };
     }
     let permanent_identity = projection.exhaustion.is_some_and(|exhaustion| {
-        exhaustion.counter == HostAdmissionAllocatorCounter::CandidateRevision
+        matches!(
+            exhaustion.counter,
+            HostAdmissionAllocatorCounter::RegistrationIncarnation
+                | HostAdmissionAllocatorCounter::CandidateRevision
+        )
     });
     let disposition = match projection.kind {
         HostAdmissionUnavailableEvidenceKind::NoCandidate
@@ -5874,6 +5936,82 @@ impl RouterEngine {
         }
     }
 
+    fn observed_unavailable_internal_owner_count(&self) -> usize {
+        usize::from(self.current_history_capability.is_some())
+            + usize::from(self.pending_history_preparation_error.is_some())
+            + usize::from(self.prepared_publication_authority.is_some())
+            + usize::from(self.pending_no_target_back.is_some())
+            + usize::from(self.pending_back_no_target_authority.is_some())
+            + usize::from(self.pending_back_target_permanent_cleanup.is_some())
+            + usize::from(self.pending_post_commit_terminal.is_some())
+            + usize::from(self.pending_post_commit_settlement_trace.is_some())
+            + usize::from(self.live_failed_authority_trigger_revision.is_some())
+            + self.queue.len()
+    }
+
+    fn observed_unavailable_receiver_mismatch(
+        &self,
+        issuer: &HostAdmissionIssuer,
+        expected_source: &HostAdmissionSourceProjection,
+    ) -> HostAdmissionUnavailableObservedMismatchProjection {
+        HostAdmissionUnavailableObservedMismatchProjection {
+            expected_source: expected_source.clone(),
+            observed_source: self.host_admission_source.clone(),
+            observed_source_open: self.host_admission_source_open,
+            observed_pending: self
+                .pending_host_admission
+                .as_ref()
+                .map(CorePendingHostAdmission::projection),
+            observed_availability: self.state.availability().clone(),
+            observed_host: self.state.host().cloned(),
+            observed_top_slot: self.state.top_slot(),
+            observed_active: self.state.active().clone(),
+            observed_request: self.state.current_request().cloned(),
+            observed_current_identity: self
+                .current
+                .as_ref()
+                .map(|current| current.identity.clone()),
+            observed_current_stage: self
+                .current
+                .as_ref()
+                .map(|current| current.stage.projection()),
+            observed_action_present: self.action.is_some(),
+            observed_internal_owner_count: self.observed_unavailable_internal_owner_count(),
+            observed_issuer: issuer.projection(),
+        }
+    }
+
+    fn observed_unavailable_receiver_is_exact(
+        &self,
+        issuer: &HostAdmissionIssuer,
+        expected_source: &HostAdmissionSourceProjection,
+    ) -> bool {
+        let expected_availability = match expected_source.kind {
+            HostAdmissionSourceKind::InitialAwaiting => RouterAvailability::AwaitingHost,
+            _ => {
+                let Some(reason) = expected_source.public_reason.clone() else {
+                    return false;
+                };
+                RouterAvailability::Unavailable(reason)
+            }
+        };
+        let expected_source_open = expected_source.kind == HostAdmissionSourceKind::InitialAwaiting;
+        let issuer = issuer.projection();
+        self.host_admission_source == *expected_source
+            && self.host_admission_source_open == expected_source_open
+            && self.pending_host_admission.is_none()
+            && self.state.availability() == &expected_availability
+            && self.state.host().is_none()
+            && self.state.top_slot().is_none()
+            && self.state.active() == &ActivePresentation::none()
+            && self.state.current_request().is_none()
+            && self.current.is_none()
+            && self.action.is_none()
+            && self.observed_unavailable_internal_owner_count() == 0
+            && issuer.outstanding.is_none()
+            && issuer.current.is_none()
+    }
+
     fn prepare_host_admission_unavailable_publication(
         &self,
         cause: HostAdmissionUnavailableCause,
@@ -6181,6 +6319,7 @@ impl RouterEngine {
 
     pub(crate) fn complete_observed_host_admission_unavailable<Evidence, Clear>(
         &mut self,
+        issuer: &HostAdmissionIssuer,
         prepared: PreparedHostAdmissionUnavailableCause<Evidence>,
         clear_holder: Clear,
     ) -> HostAdmissionUnavailableObservedOutcome<Evidence>
@@ -6188,10 +6327,10 @@ impl RouterEngine {
         Clear: FnOnce(),
     {
         let expected_source = prepared.core.source.clone();
-        if self.host_admission_source != expected_source || self.pending_host_admission.is_some() {
-            let evidence = HostAdmissionUnavailableFailureEvidence::Receiver(
-                self.unavailable_receiver_mismatch(&expected_source),
-            );
+        if !self.observed_unavailable_receiver_is_exact(issuer, &expected_source) {
+            let evidence = HostAdmissionUnavailableFailureEvidence::ObservedReceiver(Box::new(
+                self.observed_unavailable_receiver_mismatch(issuer, &expected_source),
+            ));
             return HostAdmissionUnavailableObservedOutcome::Mismatch { prepared, evidence };
         }
         if prepared.core.disposition == HostAdmissionUnavailableDisposition::Awaiting {
@@ -12379,6 +12518,7 @@ impl RouterEngine {
         if !matches!(
             &request.continuation,
             FailureCleanupContinuationOwner::Terminal
+                | FailureCleanupContinuationOwner::TerminalRecoveryFailed(_)
         ) || request.failure.kind() != NavigationFailureKind::RecoveryFailed
             || self.current_history_capability.is_some()
             || self.pending_history_preparation_error.is_some()
@@ -12575,6 +12715,7 @@ impl RouterEngine {
             && matches!(
                 &owner.continuation,
                 FailureCleanupContinuationOwner::Terminal
+                    | FailureCleanupContinuationOwner::TerminalRecoveryFailed(_)
             )
             && owner.failure.kind() == NavigationFailureKind::RecoveryFailed
             && owner.terminal.projection.failure == owner.failure
@@ -14377,7 +14518,8 @@ impl RouterEngine {
                 let _ = self.begin_fallback(request, failure);
                 FailureCleanupCompletionDisposition::Settled
             }
-            FailureCleanupContinuationOwner::Terminal => {
+            FailureCleanupContinuationOwner::Terminal
+            | FailureCleanupContinuationOwner::TerminalRecoveryFailed(_) => {
                 let record = self
                     .record_mut(request)
                     .expect("running record is retained");
@@ -15327,27 +15469,28 @@ impl RouterEngine {
         } else {
             failure
         };
-        let continuation = if expected == PendingFailureKind::AuthorityLost {
-            FailureCleanupContinuationOwner::Terminal
+        let (failure, continuation) = if expected == PendingFailureKind::AuthorityLost {
+            (failure, FailureCleanupContinuationOwner::Terminal)
         } else if self
             .current
             .as_ref()
             .is_some_and(|current| matches!(current.attempt, AttemptKind::Normal(_)))
         {
-            self.frozen_failure_recovery_continuation(failure_branch_index)
+            self.frozen_failure_recovery_continuation(failure, failure_branch_index)
         } else {
-            FailureCleanupContinuationOwner::Terminal
+            (failure, FailureCleanupContinuationOwner::Terminal)
         };
         self.begin_failure_cleanup_with_continuation(expected, failure, continuation)
     }
 
     fn frozen_failure_recovery_continuation(
         &mut self,
+        failure: NavigationFailure,
         failure_branch_index: usize,
-    ) -> FailureCleanupContinuationOwner {
+    ) -> (NavigationFailure, FailureCleanupContinuationOwner) {
         let continuation = {
             let Some(current) = self.current.as_ref() else {
-                return FailureCleanupContinuationOwner::Terminal;
+                return (failure, FailureCleanupContinuationOwner::Terminal);
             };
             self.frozen_failure_recovery_continuation_for(current, failure_branch_index)
         };
@@ -15355,13 +15498,34 @@ impl RouterEngine {
             FailureCleanupContinuationOwner::BeginBoundError(mut recovery)
                 if !recovery.prepared_prefix.is_empty() =>
             {
-                let Ok(reserved) = self.ids.reserve_attempt() else {
-                    return FailureCleanupContinuationOwner::Terminal;
+                let reserved = match self.ids.reserve_attempt_with_evidence() {
+                    Ok(reserved) => reserved,
+                    Err(exhaustion) => {
+                        let terminal_failure = NavigationFailure::new(
+                            NavigationFailureKind::RecoveryFailed,
+                            "bound error recovery attempt identity exhausted",
+                        );
+                        let owner = BoundErrorRecoveryIdentityExhaustedOwner {
+                            recovery,
+                            original_failure: failure,
+                            terminal_failure: terminal_failure.clone(),
+                            exhaustion,
+                        };
+                        return (
+                            terminal_failure,
+                            FailureCleanupContinuationOwner::TerminalRecoveryFailed(Box::new(
+                                owner,
+                            )),
+                        );
+                    }
                 };
                 recovery.reserved_attempt = Some(reserved);
-                FailureCleanupContinuationOwner::BeginBoundError(recovery)
+                (
+                    failure,
+                    FailureCleanupContinuationOwner::BeginBoundError(recovery),
+                )
             }
-            continuation => continuation,
+            continuation => (failure, continuation),
         }
     }
 
@@ -15677,6 +15841,7 @@ impl RouterEngine {
                 recovery.prepared_prefix.as_slice()
             }
             FailureCleanupContinuationOwner::Terminal
+            | FailureCleanupContinuationOwner::TerminalRecoveryFailed(_)
             | FailureCleanupContinuationOwner::BeginFallback
             | FailureCleanupContinuationOwner::AuthoritySettlement => &[],
         };
@@ -18331,11 +18496,9 @@ impl ViewReportSession<'_> {
             _ => PendingFailureKind::Apply,
         };
         let (failure, continuation) = match attempt {
-            AttemptKind::Normal(_) => (
-                failure,
-                self.engine
-                    .frozen_failure_recovery_continuation(branch_index),
-            ),
+            AttemptKind::Normal(_) => self
+                .engine
+                .frozen_failure_recovery_continuation(failure, branch_index),
             AttemptKind::Fallback { .. } => (
                 NavigationFailure::new(
                     NavigationFailureKind::RecoveryFailed,
@@ -22521,7 +22684,7 @@ mod tests {
             Box::new(2_u64),
         );
         let clear_calls = std::cell::Cell::new(0usize);
-        match engine.complete_observed_host_admission_unavailable(changed, || {
+        match engine.complete_observed_host_admission_unavailable(&issuer, changed, || {
             clear_calls.set(clear_calls.get() + 1);
         }) {
             HostAdmissionUnavailableObservedOutcome::Published(terminal) => {
@@ -22609,6 +22772,79 @@ mod tests {
                 panic!("a permanent source must never reopen")
             }
         }
+    }
+
+    #[test]
+    fn observed_host_unavailable_final_refreeze_rejects_ready_active_running_authority() {
+        let mut engine = RouterEngine::install(
+            tree(),
+            RouteViewKey::new("observed-unavailable-refreeze-fallback").unwrap(),
+        )
+        .unwrap();
+        let initial_source = engine.testing_host_admission_source_projection();
+        let stale_prepared = r3_bind_candidate_unavailable(
+            &initial_source,
+            HostAdmissionUnavailableEvidenceKind::Conflict,
+            2,
+            0x1111,
+            0x2222,
+            Box::new(0xC0DE_u64),
+        );
+
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+        let grant = r3_source_bound_grant(&mut engine, &mut issuer);
+        let owner = bind_granted_host_admission_source(grant, ());
+        let prepared = match engine.prepare_host_confirmation(owner) {
+            HostConfirmationPreparationOutcome::Prepared(prepared) => prepared,
+            HostConfirmationPreparationOutcome::ReceiverMismatch { .. } => {
+                panic!("the exact admission owner must prepare confirmation")
+            }
+        };
+        let lease =
+            match engine
+                .confirm_host_admission_with_binding(&mut issuer, prepared, |(), lease| lease)
+            {
+                HostAdmissionConfirmationCoreOutcome::Ready { installed, .. } => installed,
+                HostAdmissionConfirmationCoreOutcome::ReceiverMismatch { .. }
+                | HostAdmissionConfirmationCoreOutcome::IssuerRejected { .. } => {
+                    panic!("the exact source-bound admission must publish Ready")
+                }
+            };
+        engine.push(RouteLocation::new("/home")).unwrap();
+        settle_current(&mut engine);
+        engine.push(RouteLocation::new("/about")).unwrap();
+
+        let engine_before = engine.snapshot();
+        let issuer_before = issuer.projection();
+        let clear_calls = std::cell::Cell::new(0usize);
+        let outcome =
+            engine.complete_observed_host_admission_unavailable(&issuer, stale_prepared, || {
+                clear_calls.set(clear_calls.get() + 1);
+            });
+        let HostAdmissionUnavailableObservedOutcome::Mismatch { prepared, evidence } = outcome
+        else {
+            panic!("a stale unavailable observation must not overwrite live Ready authority")
+        };
+
+        assert_eq!(*prepared.evidence, 0xC0DE_u64);
+        let HostAdmissionUnavailableFailureEvidence::ObservedReceiver(mismatch) = evidence else {
+            panic!("the stale observation must retain its full observed receiver projection")
+        };
+        assert_eq!(mismatch.expected_source, initial_source);
+        assert_eq!(mismatch.observed_availability, RouterAvailability::Ready);
+        assert!(mismatch.observed_host.is_some());
+        assert!(mismatch.observed_top_slot.is_some());
+        assert_ne!(mismatch.observed_active, ActivePresentation::none());
+        assert!(mismatch.observed_request.is_some());
+        assert!(mismatch.observed_current_identity.is_some());
+        assert!(mismatch.observed_current_stage.is_some());
+        assert!(mismatch.observed_action_present);
+        assert!(mismatch.observed_internal_owner_count > 0);
+        assert!(mismatch.observed_issuer.current.is_some());
+        assert_eq!(clear_calls.get(), 0);
+        assert_eq!(engine.snapshot(), engine_before);
+        assert_eq!(issuer.projection(), issuer_before);
+        drop(lease);
     }
 
     #[test]
@@ -22810,7 +23046,8 @@ mod tests {
                 HostAdmissionAllocatorCounter::TopSlot => {
                     engine.ids.testing_exhaust_slot_counter();
                 }
-                HostAdmissionAllocatorCounter::CandidateRevision
+                HostAdmissionAllocatorCounter::RegistrationIncarnation
+                | HostAdmissionAllocatorCounter::CandidateRevision
                 | HostAdmissionAllocatorCounter::RequestSequence => unreachable!(),
             }
             let expected_issuer = issuer.projection();
@@ -27841,13 +28078,16 @@ mod tests {
         (engine, request, recovery)
     }
 
-    fn retained_bound_error_cleanup_fixture() -> (
+    fn retained_bound_error_cleanup_fixture(
+        exhaust_before_failure: Option<ReservationCounter>,
+    ) -> (
         RouterEngine,
         crate::ids::NavigationRequestId,
         crate::ids::NavigationRequestId,
         RouteFrameVersion,
         Vec<RouteFrameVersion>,
         Vec<LogicalChildSlotBinding>,
+        FailureCleanupReceiverProjection,
         CleanupBatchToken,
     ) {
         let boundary = ErrorBoundaryKey::named("items-boundary").unwrap();
@@ -27942,6 +28182,9 @@ mod tests {
         let EngineAction::FrameTask(leaf_task) = engine.action().unwrap() else {
             panic!("the confirmed boundary outlet issues the leaf task")
         };
+        if let Some(counter) = exhaust_before_failure {
+            engine.testing_exhaust_reservation_counter(counter);
+        }
         let first_failure = engine
             .begin_view_report(leaf_task.identity())
             .unwrap()
@@ -27950,11 +28193,14 @@ mod tests {
                 "leaf apply failed after retaining the section prefix",
             ))
             .expect("the leaf failure enters canonical cleanup");
-        assert_eq!(
-            first_failure.retained_prepared_prefix(),
-            &[retained_section.clone()],
-        );
-        assert!(!first_failure.logical_roots().contains(&retained_section));
+        if exhaust_before_failure.is_none() {
+            assert_eq!(
+                first_failure.retained_prepared_prefix(),
+                &[retained_section.clone()],
+            );
+            assert!(!first_failure.logical_roots().contains(&retained_section));
+        }
+        let first_receiver = first_failure.receiver.clone();
         let first_count = first_failure.logical_roots().len();
         let first_cleanup = prepare_failure_cleanup(&mut engine, first_failure, 0xa35, first_count);
 
@@ -27965,14 +28211,23 @@ mod tests {
             retained_section,
             old_frames,
             old_slots,
+            first_receiver,
             first_cleanup,
         )
     }
 
     #[test]
     fn retained_bound_error_prefix_is_cleaned_before_source_drift_terminalizes() {
-        let (mut engine, request, next, retained_section, _old_frames, _old_slots, first_cleanup) =
-            retained_bound_error_cleanup_fixture();
+        let (
+            mut engine,
+            request,
+            next,
+            retained_section,
+            _old_frames,
+            _old_slots,
+            _first_receiver,
+            first_cleanup,
+        ) = retained_bound_error_cleanup_fixture(None);
         let active_before_drift = engine.state.active().clone();
 
         engine.testing_set_active_generation(RouteGeneration::testing_max());
@@ -28022,8 +28277,16 @@ mod tests {
 
     #[test]
     fn bound_error_publication_rebuilds_child_slots_without_stale_baseline_entries() {
-        let (mut engine, request, _next, retained_section, old_frames, old_slots, first_cleanup) =
-            retained_bound_error_cleanup_fixture();
+        let (
+            mut engine,
+            request,
+            _next,
+            retained_section,
+            old_frames,
+            old_slots,
+            _first_receiver,
+            first_cleanup,
+        ) = retained_bound_error_cleanup_fixture(None);
         assert_eq!(old_frames.len(), 2);
         assert_eq!(old_slots.len(), 1);
         engine
@@ -28072,6 +28335,60 @@ mod tests {
             RequestStatus::Failed(failure)
                 if failure.kind() == NavigationFailureKind::Apply
         ));
+    }
+
+    #[test]
+    fn retained_bound_error_attempt_identity_exhaustion_terminalizes_recovery_failed() {
+        for counter in [
+            ReservationCounter::Transaction,
+            ReservationCounter::FrameTask,
+            ReservationCounter::CandidateFrame,
+            ReservationCounter::CleanupBatch,
+        ] {
+            let (mut engine, request, next, retained_section, _, _, receiver, cleanup) =
+                retained_bound_error_cleanup_fixture(Some(counter));
+
+            assert!(receiver.logical_roots.contains(&retained_section));
+            let FailureCleanupRecoveryTargetProjection::BoundErrorIdentityExhausted(projection) =
+                &receiver.recovery
+            else {
+                panic!("the receiver must retain exact bound-error exhaustion evidence")
+            };
+            assert_eq!(projection.prepared_prefix, &[retained_section]);
+            assert_eq!(
+                projection.original_failure.kind(),
+                NavigationFailureKind::Apply
+            );
+            assert_eq!(
+                projection.terminal_failure.kind(),
+                NavigationFailureKind::RecoveryFailed
+            );
+            assert_eq!(projection.exhaustion.counter, counter);
+            assert_eq!(projection.exhaustion.current, u64::MAX);
+            assert_eq!(projection.exhaustion.attempted, u64::MAX);
+            let Some(WorkStage::FailureCleanupPrepared { failure, .. }) =
+                engine.current.as_ref().map(|current| &current.stage)
+            else {
+                panic!("identity exhaustion must retain one prepared cleanup owner")
+            };
+            assert_eq!(failure.kind(), NavigationFailureKind::RecoveryFailed);
+            assert_eq!(
+                engine.request(next).unwrap().status(),
+                &RequestStatus::Queued
+            );
+
+            engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+            assert!(matches!(
+                engine.request(request).unwrap().status(),
+                RequestStatus::Failed(failure)
+                    if failure.kind() == NavigationFailureKind::RecoveryFailed
+            ));
+            assert!(matches!(
+                engine.request(next).unwrap().status(),
+                RequestStatus::Running(_)
+            ));
+        }
     }
 
     #[test]

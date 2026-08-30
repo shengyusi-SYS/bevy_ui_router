@@ -561,7 +561,6 @@ impl AuthorityOutletMapping {
 impl AuthorityFrameMapping {
     pub fn frame(&self) -> &RouteFrameVersion;
     pub fn root(&self) -> AuditEntityId;
-    pub fn entities(&self) -> &[AuditEntityId];
     pub fn slot_entity(&self) -> AuditEntityId;
     pub fn lifecycle(&self) -> AuthorityFrameLifecycle;
 }

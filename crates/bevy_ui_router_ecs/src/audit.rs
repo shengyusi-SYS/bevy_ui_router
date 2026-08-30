@@ -119,7 +119,6 @@ pub enum AuthorityFrameLifecycle {
 pub struct AuthorityFrameMapping {
     frame: RouteFrameVersion,
     root: AuditEntityId,
-    entities: Vec<AuditEntityId>,
     slot_entity: AuditEntityId,
     lifecycle: AuthorityFrameLifecycle,
 }
@@ -157,10 +156,6 @@ impl AuthorityFrameMapping {
 
     pub fn root(&self) -> AuditEntityId {
         self.root
-    }
-
-    pub fn entities(&self) -> &[AuditEntityId] {
-        &self.entities
     }
 
     pub fn slot_entity(&self) -> AuditEntityId {
@@ -665,7 +660,6 @@ impl RouterAuthorityAudits {
                     .map(|claim| claim.entity())
                     .collect::<Vec<_>>();
                 let mut root = None;
-                let mut entity_ids = Vec::new();
                 for entity in &entities {
                     let is_root = *entity == frame.shell();
                     let id = self.id_for(
@@ -680,7 +674,6 @@ impl RouterAuthorityAudits {
                     if !owned_states.iter().any(|(stored, _)| *stored == id) {
                         owned_states.push((id, AuditEntityState::PresentOwned));
                     }
-                    entity_ids.push(id);
                     if is_root {
                         root = Some(id);
                     }
@@ -710,7 +703,6 @@ impl RouterAuthorityAudits {
                 frames.push(AuthorityFrameMapping {
                     frame: frame.frame().clone(),
                     root,
-                    entities: entity_ids,
                     slot_entity,
                     lifecycle,
                 });

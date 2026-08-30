@@ -53,11 +53,32 @@ impl RouterHandle {
 
 static NEXT_HOST_REGISTRATION_INCARNATION: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HostRegistrationIncarnationExhaustionEvidence {
+    pub(crate) current: u64,
+    pub(crate) attempted: u64,
+}
+
+fn next_host_registration_incarnation(
+    counter: &AtomicU64,
+) -> Result<u64, HostRegistrationIncarnationExhaustionEvidence> {
+    counter
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map(|previous| previous + 1)
+        .map_err(|current| HostRegistrationIncarnationExhaustionEvidence {
+            current,
+            attempted: current,
+        })
+}
+
 #[derive(Component)]
 #[component(on_insert)]
 pub struct RouterHostRegistration {
     router: RouterHandle,
     incarnation: u64,
+    incarnation_exhaustion: Option<HostRegistrationIncarnationExhaustionEvidence>,
 }
 
 impl RouterHostRegistration {
@@ -65,19 +86,24 @@ impl RouterHostRegistration {
         Self {
             router,
             incarnation: 0,
+            incarnation_exhaustion: None,
         }
     }
 
     fn on_insert(mut world: DeferredWorld, context: HookContext) {
-        let previous = NEXT_HOST_REGISTRATION_INCARNATION
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .expect("host registration incarnation exhausted");
-        world
+        let mut registration = world
             .get_mut::<Self>(context.entity)
-            .expect("inserted host registration should exist")
-            .incarnation = previous + 1;
+            .expect("inserted host registration should exist");
+        match next_host_registration_incarnation(&NEXT_HOST_REGISTRATION_INCARNATION) {
+            Ok(incarnation) => {
+                registration.incarnation = incarnation;
+                registration.incarnation_exhaustion = None;
+            }
+            Err(evidence) => {
+                registration.incarnation = 0;
+                registration.incarnation_exhaustion = Some(evidence);
+            }
+        }
     }
 
     pub(crate) const fn router(&self) -> RouterHandle {
@@ -91,6 +117,21 @@ impl RouterHostRegistration {
 
     pub(crate) const fn incarnation(&self) -> u64 {
         self.incarnation
+    }
+
+    pub(crate) const fn incarnation_exhaustion(
+        &self,
+    ) -> Option<HostRegistrationIncarnationExhaustionEvidence> {
+        self.incarnation_exhaustion
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_mark_incarnation_exhausted(
+        &mut self,
+        evidence: HostRegistrationIncarnationExhaustionEvidence,
+    ) {
+        self.incarnation = 0;
+        self.incarnation_exhaustion = Some(evidence);
     }
 }
 
@@ -418,6 +459,22 @@ mod tests {
         let router = RouterHandle::fixture(11, 29);
         let registration = RouterHostRegistration::new(router);
         assert_eq!(registration.router(), router);
+    }
+
+    #[test]
+    fn host_registration_incarnation_exhaustion_is_bounded_and_typed() {
+        let counter = AtomicU64::new(u64::MAX);
+
+        let outcome = next_host_registration_incarnation(&counter);
+
+        assert_eq!(
+            outcome,
+            Err(HostRegistrationIncarnationExhaustionEvidence {
+                current: u64::MAX,
+                attempted: u64::MAX,
+            })
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[test]

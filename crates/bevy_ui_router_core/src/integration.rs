@@ -134,6 +134,7 @@ use crate::engine::{
     HostAdmissionUnavailableIssuerMismatchProjection as CoreHostAdmissionUnavailableIssuerMismatchProjection,
     HostAdmissionUnavailableIssuerOperation as CoreHostAdmissionUnavailableIssuerOperation,
     HostAdmissionUnavailableMismatchProjection as CoreHostAdmissionUnavailableMismatchProjection,
+    HostAdmissionUnavailableObservedMismatchProjection as CoreHostAdmissionUnavailableObservedMismatchProjection,
     HostAdmissionUnavailableObservedOutcome as CoreHostAdmissionUnavailableObservedOutcome,
     HostAdmissionUnavailablePreStagingOutcome as CoreHostAdmissionUnavailablePreStagingOutcome,
     HostAdmissionUnavailablePreStagingOwner as CoreHostAdmissionUnavailablePreStagingOwner,
@@ -236,6 +237,7 @@ impl From<crate::admission::AdmissionError> for AdmissionError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostAdmissionAllocatorCounter {
+    RegistrationIncarnation,
     CandidateRevision,
     RequestSequence,
     GrantEpoch,
@@ -246,6 +248,7 @@ pub enum HostAdmissionAllocatorCounter {
 impl From<HostAdmissionAllocatorCounter> for crate::admission::HostAdmissionAllocatorCounter {
     fn from(counter: HostAdmissionAllocatorCounter) -> Self {
         match counter {
+            HostAdmissionAllocatorCounter::RegistrationIncarnation => Self::RegistrationIncarnation,
             HostAdmissionAllocatorCounter::CandidateRevision => Self::CandidateRevision,
             HostAdmissionAllocatorCounter::RequestSequence => Self::RequestSequence,
             HostAdmissionAllocatorCounter::GrantEpoch => Self::GrantEpoch,
@@ -258,6 +261,9 @@ impl From<HostAdmissionAllocatorCounter> for crate::admission::HostAdmissionAllo
 impl From<crate::admission::HostAdmissionAllocatorCounter> for HostAdmissionAllocatorCounter {
     fn from(counter: CoreHostAdmissionAllocatorCounter) -> Self {
         match counter {
+            CoreHostAdmissionAllocatorCounter::RegistrationIncarnation => {
+                Self::RegistrationIncarnation
+            }
             CoreHostAdmissionAllocatorCounter::CandidateRevision => Self::CandidateRevision,
             CoreHostAdmissionAllocatorCounter::RequestSequence => Self::RequestSequence,
             CoreHostAdmissionAllocatorCounter::GrantEpoch => Self::GrantEpoch,
@@ -1441,6 +1447,11 @@ pub struct HostAdmissionUnavailableMismatchProjection {
     pub observed_pending: Option<PendingHostAdmissionProjection>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostAdmissionUnavailableObservedMismatchProjection {
+    inner: Box<CoreHostAdmissionUnavailableObservedMismatchProjection>,
+}
+
 impl From<crate::engine::HostAdmissionUnavailableMismatchProjection>
     for HostAdmissionUnavailableMismatchProjection
 {
@@ -1501,6 +1512,7 @@ impl From<crate::engine::HostAdmissionUnavailableIssuerMismatchProjection>
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostAdmissionUnavailableFailureEvidence {
     Receiver(HostAdmissionUnavailableMismatchProjection),
+    ObservedReceiver(HostAdmissionUnavailableObservedMismatchProjection),
     Issuer(HostAdmissionUnavailableIssuerMismatchProjection),
 }
 
@@ -1511,6 +1523,11 @@ impl From<crate::engine::HostAdmissionUnavailableFailureEvidence>
         match evidence {
             CoreHostAdmissionUnavailableFailureEvidence::Receiver(mismatch) => {
                 Self::Receiver(mismatch.into())
+            }
+            CoreHostAdmissionUnavailableFailureEvidence::ObservedReceiver(mismatch) => {
+                Self::ObservedReceiver(HostAdmissionUnavailableObservedMismatchProjection {
+                    inner: mismatch,
+                })
             }
             CoreHostAdmissionUnavailableFailureEvidence::Issuer(mismatch) => {
                 Self::Issuer(mismatch.into())
@@ -6623,10 +6640,11 @@ impl RouterEngine {
     where
         Clear: FnOnce(),
     {
-        match self
-            .inner
-            .complete_observed_host_admission_unavailable(prepared.into(), clear_holder)
-        {
+        match self.inner.complete_observed_host_admission_unavailable(
+            &self.admission,
+            prepared.into(),
+            clear_holder,
+        ) {
             CoreHostAdmissionUnavailableObservedOutcome::Published(terminal) => {
                 HostAdmissionUnavailableObservedOutcome::Published(terminal.into())
             }

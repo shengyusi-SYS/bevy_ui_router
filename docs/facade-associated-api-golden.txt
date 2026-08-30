@@ -1031,7 +1031,6 @@ ecs-test-support | bevy_ui_router::ecs::AuthorityFrameLifecycle | bevy_ui_router
 ecs-test-support | bevy_ui_router::ecs::AuthorityFrameMapping | bevy_ui_router_ecs | struct | pub struct AuthorityFrameMapping
 ecs-test-support | bevy_ui_router::ecs::AuthorityFrameMapping | bevy_ui_router_ecs | method | pub fn frame(&self) -> &RouteFrameVersion
 ecs-test-support | bevy_ui_router::ecs::AuthorityFrameMapping | bevy_ui_router_ecs | method | pub fn root(&self) -> AuditEntityId
-ecs-test-support | bevy_ui_router::ecs::AuthorityFrameMapping | bevy_ui_router_ecs | method | pub fn entities(&self) -> &[AuditEntityId]
 ecs-test-support | bevy_ui_router::ecs::AuthorityFrameMapping | bevy_ui_router_ecs | method | pub fn slot_entity(&self) -> AuditEntityId
 ecs-test-support | bevy_ui_router::ecs::AuthorityFrameMapping | bevy_ui_router_ecs | method | pub fn lifecycle(&self) -> AuthorityFrameLifecycle
 ecs-test-support | bevy_ui_router::ecs::AuthorityFrameMapping | bevy_ui_router_ecs | trait-impl | impl Clone for Self
