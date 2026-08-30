@@ -3,7 +3,8 @@ pub use bevy_ui_router_core::test_support::{BackCapacityOrderEvent, BackCapacity
 use crate::{
     app_ext::RouterHandle,
     navigation::{
-        BackRequestInventoryProjection, RouterNavigation, back_request_inventory_projection,
+        BackRequestInventoryProjection, RouterNavigation,
+        TestingDelayedDriverReportReplayControlError, back_request_inventory_projection,
         install_back_capacity_order_observer_with, router_request_inventory_counts,
     },
     snapshots::RouterSnapshots,
@@ -27,6 +28,41 @@ pub enum BackCapacityOrderInstallError {
     UnknownRouter,
     ForeignRouter,
     AlreadyInstalled,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Eq, PartialEq)]
+pub struct TestingDelayedDriverReportReplay {
+    router: RouterHandle,
+    control: u64,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TestingDelayedDriverReportReplayError {
+    UnknownRouter,
+    AlreadyArmed,
+    NothingCaptured,
+    ForeignControl,
+}
+
+fn map_delayed_driver_report_replay_error(
+    error: TestingDelayedDriverReportReplayControlError,
+) -> TestingDelayedDriverReportReplayError {
+    match error {
+        TestingDelayedDriverReportReplayControlError::UnknownRouter => {
+            TestingDelayedDriverReportReplayError::UnknownRouter
+        }
+        TestingDelayedDriverReportReplayControlError::AlreadyArmed => {
+            TestingDelayedDriverReportReplayError::AlreadyArmed
+        }
+        TestingDelayedDriverReportReplayControlError::NothingCaptured => {
+            TestingDelayedDriverReportReplayError::NothingCaptured
+        }
+        TestingDelayedDriverReportReplayControlError::ForeignControl => {
+            TestingDelayedDriverReportReplayError::ForeignControl
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -79,4 +115,26 @@ pub fn testing_commit_sealed_registration_removal_fired(
     router: RouterHandle,
 ) -> bool {
     navigation.testing_commit_sealed_registration_removal_fired(router)
+}
+
+#[doc(hidden)]
+pub fn testing_arm_next_applied_driver_report_replay(
+    navigation: &mut RouterNavigation,
+    router: RouterHandle,
+) -> Result<TestingDelayedDriverReportReplay, TestingDelayedDriverReportReplayError> {
+    navigation
+        .testing_arm_next_applied_driver_report_replay(router)
+        .map(|control| TestingDelayedDriverReportReplay { router, control })
+        .map_err(map_delayed_driver_report_replay_error)
+}
+
+#[doc(hidden)]
+pub fn testing_release_applied_driver_report_replay(
+    navigation: &mut RouterNavigation,
+    control: TestingDelayedDriverReportReplay,
+) -> Result<(), TestingDelayedDriverReportReplayError> {
+    let TestingDelayedDriverReportReplay { router, control } = control;
+    navigation
+        .testing_release_applied_driver_report_replay(router, control)
+        .map_err(map_delayed_driver_report_replay_error)
 }

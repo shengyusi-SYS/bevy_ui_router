@@ -33,6 +33,7 @@ pub const AUTHORITY_REGRESSION_CATALOGUE: &[&str] = &[
     "active_cycle_enters_authority_settlement",
     "error_outlet_role_classification_is_preserved",
     "post_commit_host_loss_preserves_committed_history",
+    "host_reacceptance_detaches_old_top_slot",
 ];
 
 fn package_root() -> PathBuf {
@@ -753,16 +754,17 @@ fn recovery_authority_parser_rejects_invalid_rows() {
     let active = source.clone();
     let direct = syn::parse_file(
         "#[test] fn error_outlet_role_classification_is_preserved() {} \
-         #[test] fn post_commit_host_loss_preserves_committed_history() {}",
+         #[test] fn post_commit_host_loss_preserves_committed_history() {} \
+         #[test] fn host_reacceptance_detaches_old_top_slot() {}",
     )
     .expect("synthetic authority source must parse");
     parse_recovery_authority_rows_with_source(&active, &direct);
     for source in [
         "",
-        "#[test] fn error_outlet_role_classification_is_preserved() {} #[test] fn error_outlet_role_classification_is_preserved() {} #[test] fn post_commit_host_loss_preserves_committed_history() {}",
-        "#[test] #[ignore] fn error_outlet_role_classification_is_preserved() {} #[test] fn post_commit_host_loss_preserves_committed_history() {}",
-        "#[cfg(test)] #[test] fn error_outlet_role_classification_is_preserved() {} #[test] fn post_commit_host_loss_preserves_committed_history() {}",
-        "#[cfg_attr(test, ignore)] #[test] fn error_outlet_role_classification_is_preserved() {} #[test] fn post_commit_host_loss_preserves_committed_history() {}",
+        "#[test] fn error_outlet_role_classification_is_preserved() {} #[test] fn error_outlet_role_classification_is_preserved() {} #[test] fn post_commit_host_loss_preserves_committed_history() {} #[test] fn host_reacceptance_detaches_old_top_slot() {}",
+        "#[test] #[ignore] fn error_outlet_role_classification_is_preserved() {} #[test] fn post_commit_host_loss_preserves_committed_history() {} #[test] fn host_reacceptance_detaches_old_top_slot() {}",
+        "#[cfg(test)] #[test] fn error_outlet_role_classification_is_preserved() {} #[test] fn post_commit_host_loss_preserves_committed_history() {} #[test] fn host_reacceptance_detaches_old_top_slot() {}",
+        "#[cfg_attr(test, ignore)] #[test] fn error_outlet_role_classification_is_preserved() {} #[test] fn post_commit_host_loss_preserves_committed_history() {} #[test] fn host_reacceptance_detaches_old_top_slot() {}",
     ] {
         let source = syn::parse_file(source).expect("synthetic authority source must parse");
         assert!(
@@ -776,19 +778,19 @@ fn recovery_authority_parser_rejects_invalid_rows() {
 }
 
 #[test]
-fn recovery_planned_rows_do_not_enter_the_runtime_catalogue() {
+fn recovery_activation_has_no_planned_runtime_rows() {
     let recovery = parse_recovery_authority_rows(&recovery_authority_source());
     let planned = recovery
         .into_iter()
         .filter(|row| row.state == "planned")
         .map(|row| row.test_function)
         .collect::<BTreeSet<_>>();
-    assert_eq!(planned.len(), 1, "Recovery must retain the R3 planned row");
+    assert!(planned.is_empty(), "R1–R3 activation leaves no planned row");
     let catalogue = catalogue_set();
     assert_eq!(
         catalogue.len(),
-        26,
-        "runtime catalogue must contain the completed R1 and R2 rows"
+        27,
+        "runtime catalogue must contain the completed R1–R3 rows"
     );
     let overlap = planned
         .intersection(&catalogue)
@@ -900,14 +902,14 @@ fn catalogue_matches_root_nested_and_active_history_recovery_profiles_and_final_
     let expected_set = expected.into_iter().collect::<BTreeSet<_>>();
     assert_eq!(
         expected_set.len(),
-        26,
-        "active History plus Recovery R1/R2 cumulative catalogue must be 26"
+        27,
+        "active History plus Recovery R1–R3 cumulative catalogue must be 27"
     );
     let catalogue = catalogue_set();
     assert_eq!(
         catalogue.len(),
-        26,
-        "Rust catalogue must include the active Recovery R1 and R2 rows"
+        27,
+        "Rust catalogue must include the active Recovery R1–R3 rows"
     );
     assert_eq!(
         catalogue, expected_set,

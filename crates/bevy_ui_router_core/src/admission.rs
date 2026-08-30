@@ -8,7 +8,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ids::{
-    CoreIdAllocator, IdExhaustion, RouteHostId, RouteSlotId, RouterIdentity, RouterInstanceId,
+    CoreIdAllocator, HostSlotAllocationError, IdExhaustion, RouteHostId, RouteSlotId,
+    RouterIdentity, RouterInstanceId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -129,12 +130,12 @@ struct AdmissionKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AdmissionIssuerId(u64);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct HostAdmissionToken {
     key: AdmissionKey,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct HostGrant {
     key: AdmissionKey,
     version: HostVersion,
@@ -211,6 +212,17 @@ impl GrantIdentity {
     }
 }
 
+impl HostIssuerGrantIdentityProjection {
+    fn from_identity(identity: &GrantIdentity) -> Self {
+        Self {
+            router: identity.key.router,
+            sequence: identity.key.sequence,
+            host: identity.version.clone(),
+            top_slot: identity.top_slot,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionError {
     OutstandingExists,
@@ -218,6 +230,74 @@ pub(crate) enum AdmissionError {
     ForeignRouter,
     Stale,
     Exhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionAllocatorCounter {
+    CandidateRevision,
+    RequestSequence,
+    GrantEpoch,
+    HostVersion,
+    TopSlot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionAllocatorExhaustionEvidence {
+    pub(crate) counter: HostAdmissionAllocatorCounter,
+    pub(crate) current: u64,
+    pub(crate) attempted: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostIssuerGrantIdentityProjection {
+    pub(crate) router: RouterIdentity,
+    pub(crate) sequence: u64,
+    pub(crate) host: HostVersion,
+    pub(crate) top_slot: RouteSlotId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionIssuerOutstandingProjection {
+    Requested {
+        router: RouterIdentity,
+        sequence: u64,
+    },
+    Granted(HostIssuerGrantIdentityProjection),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionIssuerProjection {
+    pub(crate) issuer_fingerprint: u64,
+    pub(crate) next_sequence: u64,
+    pub(crate) next_epoch: u64,
+    pub(crate) outstanding: Option<HostAdmissionIssuerOutstandingProjection>,
+    pub(crate) current: Option<HostIssuerGrantIdentityProjection>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AdmissionOperationError {
+    pub(crate) error: AdmissionError,
+    pub(crate) exhaustion: Option<HostAdmissionAllocatorExhaustionEvidence>,
+}
+
+impl AdmissionOperationError {
+    const fn plain(error: AdmissionError) -> Self {
+        Self {
+            error,
+            exhaustion: None,
+        }
+    }
+
+    const fn exhausted(counter: HostAdmissionAllocatorCounter, current: u64) -> Self {
+        Self {
+            error: AdmissionError::Exhausted,
+            exhaustion: Some(HostAdmissionAllocatorExhaustionEvidence {
+                counter,
+                current,
+                attempted: current,
+            }),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -248,16 +328,30 @@ impl HostAdmissionIssuer {
         &mut self,
         router: RouterIdentity,
     ) -> Result<HostAdmissionToken, AdmissionError> {
+        self.issue_with_evidence(router)
+            .map_err(|failure| failure.error)
+    }
+
+    pub(crate) fn issue_with_evidence(
+        &mut self,
+        router: RouterIdentity,
+    ) -> Result<HostAdmissionToken, AdmissionOperationError> {
         if self.current.is_some() {
-            return Err(AdmissionError::AuthorityExists);
+            return Err(AdmissionOperationError::plain(
+                AdmissionError::AuthorityExists,
+            ));
         }
         if self.outstanding.is_some() {
-            return Err(AdmissionError::OutstandingExists);
+            return Err(AdmissionOperationError::plain(
+                AdmissionError::OutstandingExists,
+            ));
         }
-        let next = self
-            .next_sequence
-            .checked_add(1)
-            .ok_or(AdmissionError::Exhausted)?;
+        let next = self.next_sequence.checked_add(1).ok_or_else(|| {
+            AdmissionOperationError::exhausted(
+                HostAdmissionAllocatorCounter::RequestSequence,
+                self.next_sequence,
+            )
+        })?;
         let token = HostAdmissionToken {
             key: AdmissionKey {
                 issuer: self.issuer,
@@ -276,19 +370,40 @@ impl HostAdmissionIssuer {
         token: &HostAdmissionToken,
         ids: &mut CoreIdAllocator,
     ) -> Result<HostGrant, AdmissionError> {
+        self.grant_with_evidence(token, ids)
+            .map_err(|failure| failure.error)
+    }
+
+    pub(crate) fn grant_with_evidence(
+        &mut self,
+        token: &HostAdmissionToken,
+        ids: &mut CoreIdAllocator,
+    ) -> Result<HostGrant, AdmissionOperationError> {
         if self.outstanding != Some(OutstandingAdmission::Requested(token.key)) {
-            return Err(AdmissionError::Stale);
+            return Err(AdmissionOperationError::plain(AdmissionError::Stale));
         }
         if !ids.owns_router_identity(token.key.router) {
-            return Err(AdmissionError::ForeignRouter);
+            return Err(AdmissionOperationError::plain(
+                AdmissionError::ForeignRouter,
+            ));
         }
-        let next_epoch = self
-            .next_epoch
-            .checked_add(1)
-            .ok_or(AdmissionError::Exhausted)?;
-        let (host, top_slot) = ids
-            .allocate_host_slot()
-            .map_err(|_| AdmissionError::Exhausted)?;
+        let next_epoch = self.next_epoch.checked_add(1).ok_or_else(|| {
+            AdmissionOperationError::exhausted(
+                HostAdmissionAllocatorCounter::GrantEpoch,
+                self.next_epoch,
+            )
+        })?;
+        let (host, top_slot) = ids.allocate_host_slot().map_err(|failure| match failure {
+            HostSlotAllocationError::HostVersion { current, .. } => {
+                AdmissionOperationError::exhausted(
+                    HostAdmissionAllocatorCounter::HostVersion,
+                    current,
+                )
+            }
+            HostSlotAllocationError::TopSlot { current, .. } => {
+                AdmissionOperationError::exhausted(HostAdmissionAllocatorCounter::TopSlot, current)
+            }
+        })?;
         let epoch = self.next_epoch;
         let grant = HostGrant {
             key: token.key,
@@ -304,6 +419,34 @@ impl HostAdmissionIssuer {
             &grant,
         )));
         Ok(grant)
+    }
+
+    pub(crate) fn projection(&self) -> HostAdmissionIssuerProjection {
+        HostAdmissionIssuerProjection {
+            issuer_fingerprint: self.issuer.0,
+            next_sequence: self.next_sequence,
+            next_epoch: self.next_epoch,
+            outstanding: self
+                .outstanding
+                .as_ref()
+                .map(|outstanding| match outstanding {
+                    OutstandingAdmission::Requested(key) => {
+                        HostAdmissionIssuerOutstandingProjection::Requested {
+                            router: key.router,
+                            sequence: key.sequence,
+                        }
+                    }
+                    OutstandingAdmission::Granted(identity) => {
+                        HostAdmissionIssuerOutstandingProjection::Granted(
+                            HostIssuerGrantIdentityProjection::from_identity(identity),
+                        )
+                    }
+                }),
+            current: self
+                .current
+                .as_ref()
+                .map(HostIssuerGrantIdentityProjection::from_identity),
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -393,13 +536,24 @@ impl HostAdmissionIssuer {
     }
 
     #[cfg(test)]
-    fn snapshot(&self) -> HostAdmissionIssuerSnapshot {
+    pub(crate) fn snapshot(&self) -> HostAdmissionIssuerSnapshot {
         HostAdmissionIssuerSnapshot {
+            issuer: self.issuer,
             next_sequence: self.next_sequence,
             next_epoch: self.next_epoch,
             outstanding: self.outstanding.clone(),
             current: self.current.clone(),
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_exhaust_request_sequence_counter(&mut self) {
+        self.next_sequence = u64::MAX;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_exhaust_grant_epoch_counter(&mut self) {
+        self.next_epoch = u64::MAX;
     }
 }
 
@@ -486,6 +640,14 @@ impl RetiredHostAuthority {
 }
 
 impl RetiredHostAuthorityProjection {
+    pub(crate) fn version(&self) -> &HostVersion {
+        &self.version
+    }
+
+    pub(crate) const fn top_slot(&self) -> RouteSlotId {
+        self.top_slot
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn matches(
         &self,
@@ -508,7 +670,8 @@ fn allocate_issuer(counter: &AtomicU64) -> Result<AdmissionIssuerId, IdExhaustio
 
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct HostAdmissionIssuerSnapshot {
+pub(crate) struct HostAdmissionIssuerSnapshot {
+    issuer: AdmissionIssuerId,
     next_sequence: u64,
     next_epoch: u64,
     outstanding: Option<OutstandingAdmission>,

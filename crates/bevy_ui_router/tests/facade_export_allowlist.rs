@@ -46,7 +46,7 @@ fn recovery_profile_has_exact_activation_machine_state() {
             (
                 "host re-admission fresh-epoch complete evidence",
                 "R3 Re-admission/stale output",
-                "planned",
+                "active",
             ),
         ])
     );
@@ -74,7 +74,7 @@ fn recovery_profile_has_exact_activation_machine_state() {
             (
                 "host_reacceptance_detaches_old_top_slot",
                 "R3 Re-admission/stale output",
-                "planned",
+                "active",
             ),
         ])
     );
@@ -87,9 +87,10 @@ fn recovery_profile_has_exact_activation_machine_state() {
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([
             "error_outlet_role_classification_is_preserved",
+            "host_reacceptance_detaches_old_top_slot",
             "post_commit_host_loss_preserves_committed_history",
         ]),
-        "Recovery must activate exactly the completed R1 and R2 authority rows"
+        "Recovery must activate exactly the completed R1–R3 authority rows"
     );
 }
 
@@ -98,15 +99,15 @@ fn active_stage_profile_preserves_history_union_at_recovery_activation() {
     let profile = stage_contract_profile();
     assert_eq!(profile.exclusions.len(), 8);
     assert_eq!(profile.contract_deltas.len(), 6);
-    assert_eq!(profile.authority_additions.len(), 3);
+    assert_eq!(profile.authority_additions.len(), 4);
     assert_eq!(
         profile
             .authority_additions
             .iter()
             .filter(|row| row.state == "active")
             .count(),
-        3,
-        "the completed History and Recovery R1/R2 authority rows are active"
+        4,
+        "the completed History and Recovery R1–R3 authority rows are active"
     );
     assert_eq!(
         profile
@@ -121,6 +122,7 @@ fn active_stage_profile_preserves_history_union_at_recovery_activation() {
             "boundary-bound error presentation complete evidence",
             "late-bound back complete evidence",
             "post-commit compound settlement complete evidence",
+            "host re-admission fresh-epoch complete evidence",
         ])
     );
     assert_eq!(
@@ -130,7 +132,7 @@ fn active_stage_profile_preserves_history_union_at_recovery_activation() {
             .filter(|row| row.state == "planned")
             .map(|row| row.item.as_str())
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["host re-admission fresh-epoch complete evidence"])
+        BTreeSet::new()
     );
 }
 

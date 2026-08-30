@@ -265,6 +265,12 @@ pub(crate) enum ReservationCounter {
 pub(crate) struct IdExhaustion;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostSlotAllocationError {
+    HostVersion { current: u64, attempted: u64 },
+    TopSlot { current: u64, attempted: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestAllocationError {
     ForeignRouter,
     Exhausted,
@@ -330,9 +336,21 @@ impl CoreIdAllocator {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn allocate_host_slot(
         &mut self,
-    ) -> Result<(RouteHostId, RouteSlotId), IdExhaustion> {
-        let next_host = self.next_host.checked_add(1).ok_or(IdExhaustion)?;
-        let next_slot = self.next_slot.checked_add(1).ok_or(IdExhaustion)?;
+    ) -> Result<(RouteHostId, RouteSlotId), HostSlotAllocationError> {
+        let next_host =
+            self.next_host
+                .checked_add(1)
+                .ok_or(HostSlotAllocationError::HostVersion {
+                    current: self.next_host,
+                    attempted: self.next_host,
+                })?;
+        let next_slot = self
+            .next_slot
+            .checked_add(1)
+            .ok_or(HostSlotAllocationError::TopSlot {
+                current: self.next_slot,
+                attempted: self.next_slot,
+            })?;
         let result = (
             RouteHostId::new(self.next_host),
             RouteSlotId::new(self.next_slot),
@@ -522,6 +540,11 @@ impl CoreIdAllocator {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn testing_exhaust_slot_counter(&mut self) {
         self.next_slot = u64::MAX;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_exhaust_host_counter(&mut self) {
+        self.next_host = u64::MAX;
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -775,7 +798,13 @@ mod tests {
         allocator.next_slot = u64::MAX;
         let before = allocator.snapshot();
 
-        assert_eq!(allocator.allocate_host_slot(), Err(IdExhaustion));
+        assert_eq!(
+            allocator.allocate_host_slot(),
+            Err(HostSlotAllocationError::TopSlot {
+                current: u64::MAX,
+                attempted: u64::MAX,
+            })
+        );
         assert_eq!(allocator.snapshot(), before);
     }
 

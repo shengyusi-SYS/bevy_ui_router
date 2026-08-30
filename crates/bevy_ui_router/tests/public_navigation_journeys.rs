@@ -23,14 +23,19 @@ use bevy_ecs::{
 };
 use bevy_picking::Pickable;
 use bevy_ui::{BackgroundColor, Node, Val};
-use bevy_ui_router::core::DiagnosticEventKind;
+use bevy_ui_router::core::{DiagnosticEvent, DiagnosticEventKind};
 use bevy_ui_router::ecs::RouterScheduleSet;
 #[cfg(feature = "test-support")]
-use bevy_ui_router::ecs::{AuthorityFrameLifecycle, RouterAuthorityAudits};
+use bevy_ui_router::ecs::{
+    AuditEntityId, AuditEntityState, AuthorityFrameLifecycle, RouterAuthorityAuditSnapshot,
+    RouterAuthorityAudits,
+};
 use bevy_ui_router::prelude::*;
 #[cfg(feature = "test-support")]
 use bevy_ui_router_ecs::test_support::{
-    testing_back_request_inventory, testing_commit_sealed_registration_removal_fired,
+    TestingDelayedDriverReportReplay, TestingDelayedDriverReportReplayError,
+    testing_arm_next_applied_driver_report_replay, testing_back_request_inventory,
+    testing_commit_sealed_registration_removal_fired, testing_release_applied_driver_report_replay,
     testing_remove_host_registration_after_next_commit_seal, testing_router_request_inventory,
 };
 
@@ -420,6 +425,11 @@ struct RecoveryR1Fixture {
     admission_entities: HashSet<Entity>,
 }
 
+struct RecoveryR3AdmissionFixture {
+    app: App,
+    router: RouterHandle,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecoveryR2LossKind {
     RegistrationRemoval,
@@ -432,6 +442,94 @@ struct RecoveryR2LossInjection {
     kind: RecoveryR2LossKind,
     armed: bool,
     fired: bool,
+}
+
+#[derive(Component, Debug, Eq, PartialEq)]
+struct RecoveryR3ForeignChildSentinel(u64);
+
+#[derive(Resource)]
+struct RecoveryR3SameHostOrderProbe {
+    host: Entity,
+    old_top_slot: Entity,
+    app_children: Vec<Entity>,
+    observed_new_top_slot: Option<Entity>,
+    violated: bool,
+}
+
+#[derive(Resource)]
+struct RecoveryR3SameHostLossInjection {
+    host: Entity,
+    old_top_slot: Entity,
+    foreign: Entity,
+    armed: bool,
+    fired: bool,
+}
+
+fn inject_recovery_r3_same_host_loss(world: &mut World) {
+    let (host, old_top_slot, foreign, armed, fired) = {
+        let injection = world.resource::<RecoveryR3SameHostLossInjection>();
+        (
+            injection.host,
+            injection.old_top_slot,
+            injection.foreign,
+            injection.armed,
+            injection.fired,
+        )
+    };
+    if !armed || fired {
+        return;
+    }
+    world.entity_mut(foreign).insert(ChildOf(old_top_slot));
+    assert!(
+        world
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .is_some(),
+        "the same-host seam removes only the real registration input fact"
+    );
+    world
+        .resource_mut::<RecoveryR3SameHostLossInjection>()
+        .fired = true;
+}
+
+fn observe_recovery_r3_same_host_order(world: &mut World) {
+    let (host, old_top_slot, app_children, already_observed) = {
+        let probe = world.resource::<RecoveryR3SameHostOrderProbe>();
+        (
+            probe.host,
+            probe.old_top_slot,
+            probe.app_children.clone(),
+            probe.observed_new_top_slot,
+        )
+    };
+    if already_observed.is_some() || world.get_entity(host).is_err() {
+        return;
+    }
+    let children = world
+        .get::<Children>(host)
+        .map(|children| children.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let new_top_slots = children
+        .iter()
+        .copied()
+        .filter(|child| !app_children.contains(child) && *child != old_top_slot)
+        .collect::<Vec<_>>();
+    if new_top_slots.is_empty() {
+        return;
+    }
+    let old_edge_is_detached = !children.contains(&old_top_slot)
+        && world
+            .get::<ChildOf>(old_top_slot)
+            .is_none_or(|edge| edge.parent() != host);
+    let expected_order = app_children
+        .iter()
+        .copied()
+        .chain(new_top_slots.iter().copied())
+        .collect::<Vec<_>>();
+    let probe = &mut *world.resource_mut::<RecoveryR3SameHostOrderProbe>();
+    probe.violated =
+        !old_edge_is_detached || new_top_slots.len() != 1 || children != expected_order;
+    probe.observed_new_top_slot = new_top_slots.first().copied();
 }
 
 fn inject_recovery_r2_host_loss(world: &mut World) {
@@ -580,6 +678,24 @@ fn recovery_r1_fixture(label: &str) -> RecoveryR1Fixture {
                 .with_slot(RouteSlotKey::default()),
         )
         .unwrap();
+    let alternate_section = routes
+        .route_with_options(
+            root_route,
+            RoutePattern::path("alternate").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(section.clone())
+                .with_slot(RouteSlotKey::default()),
+        )
+        .unwrap();
+    routes
+        .route_with_options(
+            alternate_section,
+            RoutePattern::path("items/:id").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(leaf.clone())
+                .with_slot(RouteSlotKey::default()),
+        )
+        .unwrap();
     let mut views = RouteViewRegistry::new();
     for view in [
         root.clone(),
@@ -661,6 +777,33 @@ fn recovery_r1_fixture(label: &str) -> RecoveryR1Fixture {
         host_fingerprint,
         admission_entities,
     }
+}
+
+fn recovery_r3_admission_fixture(label: &str) -> RecoveryR3AdmissionFixture {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let view = RouteViewKey::new(format!("{label}-view")).unwrap();
+    let driver = app
+        .register_ui_view_driver(InstallMatrixDriver {
+            key: ViewDriverKey::new(format!("{label}-driver")).unwrap(),
+        })
+        .unwrap();
+    let routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("/").unwrap(),
+            RouteNodeOptions::new().with_view(view.clone()),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut views = RouteViewRegistry::new();
+    views
+        .insert(view.clone(), RouteViewDescriptor::new(driver))
+        .unwrap();
+    let router = app
+        .add_ui_router(RouterConfig::new(routes, views, view))
+        .unwrap();
+    RecoveryR3AdmissionFixture { app, router }
 }
 
 fn nested_fixture() -> NestedFixture {
@@ -995,7 +1138,11 @@ fn push_and_settle(
             return request;
         }
     }
-    panic!("fixture request did not settle within 16 App::update calls")
+    panic!(
+        "fixture request did not settle within 16 App::update calls: router={:?} request={:?}",
+        router_snapshot(app, router),
+        request_snapshot(app, router, request)
+    )
 }
 
 fn replace_and_settle(
@@ -1716,6 +1863,437 @@ fn entity_descendant_closure(app: &App, root: Entity) -> HashSet<Entity> {
         }
     }
     closure
+}
+
+fn spawn_recovery_r3_app_host(app: &mut App, router: RouterHandle) -> HostBoundaryFingerprint {
+    let host = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(640.0),
+                height: Val::Px(360.0),
+                ..Node::default()
+            },
+            HostSentinel(7),
+            HostMetadata(73),
+            RouterHostRegistration::new(router),
+        ))
+        .id();
+    let child = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(13.0),
+                height: Val::Px(17.0),
+                ..Node::default()
+            },
+            ExistingChild(11),
+            ChildOf(host),
+        ))
+        .id();
+    let sibling = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(19.0),
+                height: Val::Px(29.0),
+                ..Node::default()
+            },
+            ExistingSibling(17),
+            ChildOf(host),
+        ))
+        .id();
+    capture_host_boundary(app, host, &[child, sibling])
+}
+
+fn drive_recovery_r3_availability(
+    app: &mut App,
+    router: RouterHandle,
+    expected: &RouterAvailability,
+) -> RouterSnapshot {
+    for _ in 0..24 {
+        app.update();
+        let snapshot = router_snapshot(app, router);
+        if snapshot.availability() == expected
+            && snapshot.running_request().is_none()
+            && snapshot.pending_phase().is_none()
+            && !snapshot.cleanup().foreground_pending()
+        {
+            return snapshot;
+        }
+    }
+    panic!(
+        "R3 router did not reach stable {expected:?}: {:?}",
+        router_snapshot(app, router)
+    )
+}
+
+fn assert_recovery_r3_enqueue_is_request_zero(
+    app: &mut App,
+    router: RouterHandle,
+    location: RouteLocation,
+) {
+    let snapshot_before = router_snapshot(app, router);
+    #[cfg(feature = "test-support")]
+    let inventory_before = {
+        let world = app.world();
+        testing_router_request_inventory(
+            world.resource::<RouterNavigation>(),
+            world.resource::<RouterSnapshots>(),
+        )
+    };
+    let error = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, location)
+        .expect_err("an unavailable host rejects before allocating a request");
+    assert_eq!(error.kind(), NavigationEnqueueErrorKind::HostUnavailable);
+    assert_eq!(router_snapshot(app, router), snapshot_before);
+    #[cfg(feature = "test-support")]
+    {
+        let world = app.world();
+        assert_eq!(
+            testing_router_request_inventory(
+                world.resource::<RouterNavigation>(),
+                world.resource::<RouterSnapshots>(),
+            ),
+            inventory_before,
+            "HostUnavailable must not allocate navigation or snapshot request state"
+        );
+    }
+}
+
+fn settle_recovery_r3_registration_loss(fixture: &mut RecoveryR1Fixture) -> RouterSnapshot {
+    install_recovery_r2_precommit_loss(fixture, RecoveryR2LossKind::RegistrationRemoval, false);
+    let unavailable = drive_recovery_r3_availability(
+        &mut fixture.app,
+        fixture.router,
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost),
+    );
+    assert!(
+        fixture
+            .app
+            .world()
+            .resource::<RecoveryR2LossInjection>()
+            .fired,
+        "the R3 loss seam removes the real registration input fact"
+    );
+    unavailable
+}
+
+fn settle_recovery_r3_postcommit_registration_loss(
+    fixture: &mut RecoveryR1Fixture,
+    location: RouteLocation,
+) -> RouterSnapshot {
+    install_recovery_r2_postcommit_loss(fixture, RecoveryR2LossKind::RegistrationRemoval);
+    let request = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(fixture.router, location)
+        .expect("the post-commit HostLost incident enqueues one real request");
+    arm_recovery_r2_loss(fixture);
+    let unavailable = drive_recovery_r3_availability(
+        &mut fixture.app,
+        fixture.router,
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost),
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, request));
+    assert!(
+        fixture
+            .app
+            .world()
+            .resource::<RecoveryR2LossInjection>()
+            .fired
+    );
+    unavailable
+}
+
+fn settle_recovery_r3_same_host_postcommit_registration_loss(
+    fixture: &mut RecoveryR1Fixture,
+    old_top_slot: Entity,
+    foreign: Entity,
+    location: RouteLocation,
+) -> RouterSnapshot {
+    fixture
+        .app
+        .world_mut()
+        .insert_resource(RecoveryR3SameHostLossInjection {
+            host: fixture.host_fingerprint.host,
+            old_top_slot,
+            foreign,
+            armed: true,
+            fired: false,
+        });
+    fixture.app.add_systems(
+        Update,
+        inject_recovery_r3_same_host_loss
+            .after(RouterScheduleSet::CommitPresentation)
+            .before(RouterScheduleSet::SettleCleanup),
+    );
+    let request = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(fixture.router, location)
+        .expect("the same-host HostLost incident enqueues one real request");
+    let unavailable = drive_recovery_r3_availability(
+        &mut fixture.app,
+        fixture.router,
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost),
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, request));
+    assert!(
+        fixture
+            .app
+            .world()
+            .resource::<RecoveryR3SameHostLossInjection>()
+            .fired
+    );
+    unavailable
+}
+
+#[cfg(feature = "test-support")]
+fn arm_recovery_r3_applied_report_replay(
+    app: &mut App,
+    router: RouterHandle,
+) -> TestingDelayedDriverReportReplay {
+    testing_arm_next_applied_driver_report_replay(
+        &mut app.world_mut().resource_mut::<RouterNavigation>(),
+        router,
+    )
+    .expect("the R3 replay seam arms one real applied-report delivery")
+}
+
+#[cfg(feature = "test-support")]
+fn release_recovery_r3_applied_report_replay(
+    app: &mut App,
+    control: TestingDelayedDriverReportReplay,
+) {
+    testing_release_applied_driver_report_replay(
+        &mut app.world_mut().resource_mut::<RouterNavigation>(),
+        control,
+    )
+    .expect("the R3 replay seam releases its captured applied-report artifact")
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecoveryR3FacadeProjection {
+    requested: Option<RouteLocation>,
+    matched: Option<RouteBranchFingerprint>,
+    active: ActivePresentation,
+    availability: RouterAvailability,
+    pending_phase: Option<NavigationPhase>,
+    history: HistorySnapshot,
+    running_request: Option<NavigationRequestId>,
+    earliest_retained_sequence: Option<u64>,
+    cleanup: CleanupSummary,
+    host: HostSnapshot,
+}
+
+#[cfg(feature = "test-support")]
+fn recovery_r3_facade_projection(snapshot: &RouterSnapshot) -> RecoveryR3FacadeProjection {
+    RecoveryR3FacadeProjection {
+        requested: snapshot.requested().cloned(),
+        matched: snapshot.matched().cloned(),
+        active: snapshot.active().clone(),
+        availability: snapshot.availability().clone(),
+        pending_phase: snapshot.pending_phase().cloned(),
+        history: snapshot.history().clone(),
+        running_request: snapshot.running_request(),
+        earliest_retained_sequence: snapshot.earliest_retained_sequence(),
+        cleanup: snapshot.cleanup().clone(),
+        host: snapshot.host().clone(),
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn assert_recovery_r3_current_audit_mapping_is_exact(
+    before: &RouterAuthorityAuditSnapshot,
+    after: &RouterAuthorityAuditSnapshot,
+) {
+    assert_eq!(after.host(), before.host());
+    let current_host = before.host().map(|host| host.version());
+    let current_frames = before
+        .frames()
+        .iter()
+        .filter(|mapping| mapping.lifecycle() == AuthorityFrameLifecycle::Active)
+        .map(|mapping| mapping.frame())
+        .collect::<Vec<_>>();
+    let before_slots = before
+        .slots()
+        .iter()
+        .filter(|slot| current_host.is_some_and(|host| slot.host() == host))
+        .collect::<Vec<_>>();
+    let after_slots = after
+        .slots()
+        .iter()
+        .filter(|slot| current_host.is_some_and(|host| slot.host() == host))
+        .collect::<Vec<_>>();
+    assert_eq!(after_slots, before_slots);
+    assert_eq!(
+        after
+            .frames()
+            .iter()
+            .filter(|mapping| mapping.lifecycle() == AuthorityFrameLifecycle::Active)
+            .collect::<Vec<_>>(),
+        before
+            .frames()
+            .iter()
+            .filter(|mapping| mapping.lifecycle() == AuthorityFrameLifecycle::Active)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        after
+            .outlets()
+            .iter()
+            .filter(|outlet| current_frames.contains(&outlet.parent()))
+            .collect::<Vec<_>>(),
+        before
+            .outlets()
+            .iter()
+            .filter(|outlet| current_frames.contains(&outlet.parent()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        after
+            .content()
+            .iter()
+            .filter(|content| current_frames.contains(&content.frame()))
+            .collect::<Vec<_>>(),
+        before
+            .content()
+            .iter()
+            .filter(|content| current_frames.contains(&content.frame()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        after
+            .orphan_slots()
+            .iter()
+            .all(|slot| !after_slots.iter().any(|mapping| mapping.id() == *slot))
+    );
+}
+
+#[cfg(feature = "test-support")]
+fn recovery_r3_audit_snapshot(app: &App, router: RouterHandle) -> RouterAuthorityAuditSnapshot {
+    app.world()
+        .resource::<RouterAuthorityAudits>()
+        .get(router)
+        .expect("the R3 router retains a public authority audit")
+        .clone()
+}
+
+#[cfg(feature = "test-support")]
+fn recovery_r3_prepared_output_entities(
+    audit: &RouterAuthorityAuditSnapshot,
+) -> Vec<AuditEntityId> {
+    let prepared_frames = audit
+        .frames()
+        .iter()
+        .filter(|mapping| mapping.lifecycle() == AuthorityFrameLifecycle::PreparedInert)
+        .map(|mapping| mapping.frame().clone())
+        .collect::<Vec<_>>();
+    let mut entities = audit
+        .frames()
+        .iter()
+        .filter(|mapping| mapping.lifecycle() == AuthorityFrameLifecycle::PreparedInert)
+        .flat_map(|mapping| mapping.entities().iter().copied())
+        .collect::<Vec<_>>();
+    entities.extend(audit.slots().iter().filter_map(|slot| {
+        slot.parent_frame()
+            .is_some_and(|parent| prepared_frames.contains(parent))
+            .then_some(slot.entity())
+    }));
+    let mut seen = HashSet::new();
+    entities.retain(|entity| seen.insert(*entity));
+    entities
+}
+
+#[cfg(feature = "test-support")]
+fn recovery_r3_current_owned_audit_entities(
+    audit: &RouterAuthorityAuditSnapshot,
+) -> Vec<AuditEntityId> {
+    let current_host = audit.host().map(|host| host.version().clone());
+    let active_frames = audit
+        .frames()
+        .iter()
+        .filter(|mapping| mapping.lifecycle() == AuthorityFrameLifecycle::Active)
+        .map(|mapping| mapping.frame().clone())
+        .collect::<Vec<_>>();
+    let mut entities = audit
+        .host()
+        .map(|host| vec![host.top_slot()])
+        .unwrap_or_default();
+    entities.extend(
+        audit
+            .slots()
+            .iter()
+            .filter(|slot| {
+                current_host
+                    .as_ref()
+                    .is_some_and(|host| slot.host() == host)
+            })
+            .map(|slot| slot.entity()),
+    );
+    entities.extend(
+        audit
+            .frames()
+            .iter()
+            .filter(|mapping| mapping.lifecycle() == AuthorityFrameLifecycle::Active)
+            .flat_map(|mapping| mapping.entities().iter().copied()),
+    );
+    entities.extend(
+        audit
+            .outlets()
+            .iter()
+            .filter(|outlet| active_frames.contains(outlet.parent()))
+            .map(|outlet| outlet.anchor()),
+    );
+    entities.extend(
+        audit
+            .content()
+            .iter()
+            .filter(|content| active_frames.contains(content.frame()))
+            .map(|content| content.entity()),
+    );
+    let mut seen = HashSet::new();
+    entities.retain(|entity| seen.insert(*entity));
+    entities
+}
+
+#[cfg(feature = "test-support")]
+fn drive_recovery_r3_effect_count(app: &mut App, control: &FixtureControl, minimum: usize) {
+    for _ in 0..16 {
+        app.update();
+        if control.effects().len() >= minimum {
+            return;
+        }
+    }
+    panic!(
+        "the real view driver did not produce {minimum} effects: {:?}",
+        control.effects()
+    );
+}
+
+#[cfg(feature = "test-support")]
+fn assert_recovery_r3_report_disposition_delta(
+    before: &[DiagnosticEvent],
+    after: &[DiagnosticEvent],
+    stale_request: NavigationRequestId,
+) {
+    assert!(after.starts_with(before));
+    let delta = &after[before.len()..];
+    assert!(
+        delta.len() <= 1,
+        "replaying one old artifact may add at most one diagnostic: {delta:?}"
+    );
+    assert!(delta.iter().all(|event| {
+        event.kind() == DiagnosticEventKind::ReportDisposition
+            && event.request() == Some(stale_request)
+            && event.report_disposition() == Some(ReportDisposition::StaleDiscarded)
+    }));
 }
 
 fn node_entities_with_width(app: &mut App, width: u16) -> Vec<Entity> {
@@ -3511,6 +4089,7 @@ fn recovery_r1_journey_d_recovery_failure_cleans_all_attempts_and_queue_continue
     assert_host_intact(&fixture.app, &fixture.host_fingerprint);
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn recovery_r2_characterization_precommit_host_loss_closes_foreground_owners() {
     #[derive(Clone, Copy)]
@@ -3778,4 +4357,872 @@ fn recovery_r2_journey_g_post_commit_host_despawn_preserves_committed_history() 
         "r2-postcommit-host-despawn",
         RecoveryR2LossKind::HostDespawn,
     );
+}
+
+#[test]
+fn recovery_r3_unavailable_reason_and_enqueue_mapping_are_source_bound() {
+    #[derive(Clone, Copy, Debug)]
+    enum Row {
+        InitialNoCandidate,
+        Conflict,
+        MissingAncestorNode,
+        CyclicAncestry,
+    }
+
+    for (label, row) in [
+        ("initial-none", Row::InitialNoCandidate),
+        ("conflict", Row::Conflict),
+        ("missing-ancestor-node", Row::MissingAncestorNode),
+        ("cyclic-ancestry", Row::CyclicAncestry),
+    ] {
+        let mut fixture = recovery_r3_admission_fixture(&format!("r3-source-{label}"));
+        let mut repair_parent = None;
+        match row {
+            Row::InitialNoCandidate => {}
+            Row::Conflict => {
+                fixture
+                    .app
+                    .world_mut()
+                    .spawn((Node::default(), RouterHostRegistration::new(fixture.router)));
+                fixture
+                    .app
+                    .world_mut()
+                    .spawn((Node::default(), RouterHostRegistration::new(fixture.router)));
+            }
+            Row::MissingAncestorNode => {
+                let parent = fixture.app.world_mut().spawn_empty().id();
+                fixture.app.world_mut().spawn((
+                    Node::default(),
+                    RouterHostRegistration::new(fixture.router),
+                    ChildOf(parent),
+                ));
+                repair_parent = Some(parent);
+            }
+            Row::CyclicAncestry => {
+                let grandparent = fixture.app.world_mut().spawn((Node::default(),)).id();
+                let intermediate = fixture
+                    .app
+                    .world_mut()
+                    .spawn((Node::default(), ChildOf(grandparent)))
+                    .id();
+                let host = fixture
+                    .app
+                    .world_mut()
+                    .spawn((
+                        Node::default(),
+                        RouterHostRegistration::new(fixture.router),
+                        ChildOf(intermediate),
+                    ))
+                    .id();
+                fixture
+                    .app
+                    .world_mut()
+                    .entity_mut(grandparent)
+                    .insert(ChildOf(host));
+            }
+        }
+        let invalid_entity_baseline = entity_set(&fixture.app);
+        let expected = match row {
+            Row::InitialNoCandidate => RouterAvailability::AwaitingHost,
+            Row::Conflict => RouterAvailability::Unavailable(RouterUnavailableReason::HostConflict),
+            Row::MissingAncestorNode | Row::CyclicAncestry => {
+                RouterAvailability::Unavailable(RouterUnavailableReason::InvalidHostUiTopology)
+            }
+        };
+        let unavailable =
+            drive_recovery_r3_availability(&mut fixture.app, fixture.router, &expected);
+        assert_eq!(unavailable.active().kind(), ActivePresentationKind::None);
+        assert!(unavailable.host().version().is_none());
+        assert!(unavailable.host().top_slot().is_none());
+        assert_eq!(
+            entity_set(&fixture.app),
+            invalid_entity_baseline,
+            "row {label} must classify before staging any router Entity"
+        );
+        assert_recovery_r3_enqueue_is_request_zero(
+            &mut fixture.app,
+            fixture.router,
+            RouteLocation::new("/"),
+        );
+
+        if let Some(parent) = repair_parent {
+            let ready_events_before = unavailable
+                .host()
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == HostTraceEventKind::HostReady)
+                .count();
+            fixture
+                .app
+                .world_mut()
+                .entity_mut(parent)
+                .insert(Node::default());
+            let ready = drive_recovery_r3_availability(
+                &mut fixture.app,
+                fixture.router,
+                &RouterAvailability::Ready,
+            );
+            assert!(ready.host().version().is_some());
+            assert!(ready.host().top_slot().is_some());
+            assert!(
+                ready
+                    .host()
+                    .trace()
+                    .iter()
+                    .map(HostTraceEvent::kind)
+                    .collect::<Vec<_>>()
+                    .ends_with(&[
+                        HostTraceEventKind::AdmissionRequested,
+                        HostTraceEventKind::HostGranted,
+                        HostTraceEventKind::TopSlotRegistered,
+                        HostTraceEventKind::HostReady,
+                    ]),
+                "the repaired revision must take the complete production admission path"
+            );
+            assert_eq!(ready.active().kind(), ActivePresentationKind::None);
+            assert_eq!(ready.history().len(), 0);
+            assert_eq!(
+                ready
+                    .host()
+                    .trace()
+                    .iter()
+                    .filter(|event| event.kind() == HostTraceEventKind::HostReady)
+                    .count(),
+                ready_events_before + 1,
+                "repairing one real topology revision permits exactly one Ready transition"
+            );
+            assert_eq!(
+                ready
+                    .host()
+                    .trace()
+                    .iter()
+                    .filter(|event| event.kind() == HostTraceEventKind::AdmissionRequested)
+                    .count(),
+                1,
+                "the rejected revision must not be retried before the topology changes"
+            );
+            assert_eq!(
+                entity_set(&fixture.app).len(),
+                invalid_entity_baseline.len() + 1
+            );
+            let stable_entities = entity_set(&fixture.app);
+            let stable_trace = ready.host().trace().to_vec();
+            fixture.app.update();
+            fixture.app.update();
+            let stable = router_snapshot(&fixture.app, fixture.router);
+            assert_eq!(stable.availability(), &RouterAvailability::Ready);
+            assert_eq!(stable.host().trace(), stable_trace);
+            assert_eq!(entity_set(&fixture.app), stable_entities);
+        }
+    }
+}
+
+#[test]
+fn recovery_r3_journey_g_re_admission_uses_fresh_epoch_and_explicit_restore() {
+    let mut fixture = recovery_r1_fixture("r3-fresh-host-readmission");
+    let location = RouteLocation::new("/section/items/1");
+    let first = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        location.clone(),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, first));
+    let before_loss = router_snapshot(&fixture.app, fixture.router);
+    let old_host_version = before_loss.host().version().unwrap().clone();
+    let old_top_slot = before_loss.host().top_slot().unwrap();
+    let old_frames = before_loss.active().frames().to_vec();
+    let restored_location = RouteLocation::new("/section/items/2");
+
+    let unavailable =
+        settle_recovery_r3_postcommit_registration_loss(&mut fixture, restored_location.clone());
+    let history_before = unavailable.history().clone();
+    assert_eq!(
+        history_before.entries(),
+        [location.clone(), restored_location.clone()]
+    );
+    assert_eq!(history_before.current(), Some(&restored_location));
+    let effects_before = fixture.control.effects();
+    assert_eq!(
+        unavailable.availability(),
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+    );
+    assert_eq!(unavailable.active().kind(), ActivePresentationKind::None);
+    assert_eq!(unavailable.history(), &history_before);
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    assert_host_after_registration_loss(&fixture.app, &fixture.host_fingerprint);
+    assert_recovery_r3_enqueue_is_request_zero(
+        &mut fixture.app,
+        fixture.router,
+        RouteLocation::new("/section/items/2"),
+    );
+
+    let mut new_host = spawn_recovery_r3_app_host(&mut fixture.app, fixture.router);
+    let readmission_baseline = entity_set(&fixture.app);
+    let ready = drive_recovery_r3_availability(
+        &mut fixture.app,
+        fixture.router,
+        &RouterAvailability::Ready,
+    );
+    assert_eq!(ready.active().kind(), ActivePresentationKind::None);
+    assert_eq!(ready.history(), &history_before);
+    assert_ne!(ready.host().version(), Some(&old_host_version));
+    assert_ne!(ready.host().top_slot(), Some(old_top_slot));
+    assert_eq!(fixture.control.effects(), effects_before);
+    assert_eq!(
+        entity_set(&fixture.app).len(),
+        readmission_baseline.len() + 1
+    );
+    new_host.top_slot = fixture
+        .app
+        .world()
+        .get::<Children>(new_host.host)
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|child| !new_host.existing_children.contains(child));
+    assert_host_intact(&fixture.app, &new_host);
+
+    fixture.app.update();
+    fixture.app.update();
+    let before_restore = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(before_restore.active().kind(), ActivePresentationKind::None);
+    assert_eq!(before_restore.history(), &history_before);
+    assert_eq!(fixture.control.effects(), effects_before);
+
+    let restored = replace_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        history_before.current().unwrap().clone(),
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, restored));
+    let after_restore = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after_restore.active().kind(), ActivePresentationKind::Route);
+    assert_eq!(after_restore.active().location(), Some(&restored_location));
+    assert_eq!(after_restore.history(), &history_before);
+    assert!(
+        after_restore
+            .active()
+            .frames()
+            .iter()
+            .all(|frame| !old_frames.contains(frame)),
+        "explicit restore must build only fresh frame identities"
+    );
+    assert_eq!(after_restore.host().version(), ready.host().version());
+    assert_eq!(after_restore.host().top_slot(), ready.host().top_slot());
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    assert_host_intact(&fixture.app, &new_host);
+}
+
+#[test]
+fn recovery_r3_journey_g_same_host_readmission_detaches_old_top_slot_before_new_epoch() {
+    let mut fixture = recovery_r1_fixture("r3-same-host-readmission");
+    let location = RouteLocation::new("/section/items/1");
+    let first = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        location.clone(),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, first));
+    let before_loss = router_snapshot(&fixture.app, fixture.router);
+    let old_host_version = before_loss.host().version().unwrap().clone();
+    let old_top_slot_id = before_loss.host().top_slot().unwrap();
+    #[cfg(feature = "test-support")]
+    let old_slot_ids = fixture
+        .app
+        .world()
+        .resource::<RouterAuthorityAudits>()
+        .get(fixture.router)
+        .expect("the initial same-host route has an authority audit")
+        .slots()
+        .iter()
+        .map(|mapping| mapping.id())
+        .collect::<Vec<_>>();
+    let old_top_slot = fixture.host_fingerprint.top_slot.unwrap();
+    let foreign = fixture
+        .app
+        .world_mut()
+        .spawn(RecoveryR3ForeignChildSentinel(0x731))
+        .id();
+    fixture
+        .app
+        .world_mut()
+        .insert_resource(RecoveryR3SameHostOrderProbe {
+            host: fixture.host_fingerprint.host,
+            old_top_slot,
+            app_children: fixture.host_fingerprint.existing_children.clone(),
+            observed_new_top_slot: None,
+            violated: false,
+        });
+    fixture.app.add_systems(
+        Update,
+        observe_recovery_r3_same_host_order
+            .after(RouterScheduleSet::ObserveAuthority)
+            .before(RouterScheduleSet::CollectNavigation),
+    );
+
+    let restored_location = RouteLocation::new("/section/items/2");
+    let unavailable = settle_recovery_r3_same_host_postcommit_registration_loss(
+        &mut fixture,
+        old_top_slot,
+        foreign,
+        restored_location.clone(),
+    );
+    let history_after_loss = unavailable.history().clone();
+    assert_eq!(
+        history_after_loss.entries(),
+        [location.clone(), restored_location.clone()]
+    );
+    assert_eq!(history_after_loss.current(), Some(&restored_location));
+    assert_eq!(
+        unavailable.availability(),
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+    );
+    assert_eq!(unavailable.active().kind(), ActivePresentationKind::None);
+    assert!(fixture.app.world().get_entity(old_top_slot).is_ok());
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get::<ChildOf>(foreign)
+            .map(ChildOf::parent),
+        Some(old_top_slot)
+    );
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get::<RecoveryR3ForeignChildSentinel>(foreign),
+        Some(&RecoveryR3ForeignChildSentinel(0x731))
+    );
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get::<Children>(fixture.host_fingerprint.host)
+            .unwrap()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        fixture.host_fingerprint.existing_children
+    );
+
+    fixture
+        .app
+        .world_mut()
+        .entity_mut(fixture.host_fingerprint.host)
+        .insert(RouterHostRegistration::new(fixture.router));
+    let ready = drive_recovery_r3_availability(
+        &mut fixture.app,
+        fixture.router,
+        &RouterAvailability::Ready,
+    );
+    let probe = fixture
+        .app
+        .world()
+        .resource::<RecoveryR3SameHostOrderProbe>();
+    assert!(!probe.violated);
+    let new_top_slot = probe
+        .observed_new_top_slot
+        .expect("the schedule probe observes the fresh top slot");
+    assert_ne!(new_top_slot, old_top_slot);
+    assert_ne!(ready.host().version(), Some(&old_host_version));
+    assert_ne!(ready.host().top_slot(), Some(old_top_slot_id));
+    assert_eq!(ready.active().kind(), ActivePresentationKind::None);
+    assert_eq!(ready.history(), &history_after_loss);
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get::<ChildOf>(old_top_slot)
+            .map(ChildOf::parent),
+        None,
+        "old HostLease must detach the retired top-slot edge before new admission"
+    );
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get::<ChildOf>(foreign)
+            .map(ChildOf::parent),
+        Some(old_top_slot)
+    );
+    fixture.host_fingerprint.top_slot = Some(new_top_slot);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+
+    let restored = replace_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        history_after_loss.current().unwrap().clone(),
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, restored));
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after.active().kind(), ActivePresentationKind::Route);
+    assert_eq!(after.active().location(), Some(&restored_location));
+    assert_eq!(after.host().version(), ready.host().version());
+    assert_eq!(after.host().top_slot(), ready.host().top_slot());
+    assert_eq!(after.history(), &history_after_loss);
+    assert!(after.running_request().is_none());
+    assert!(after.pending_phase().is_none());
+    assert!(!after.cleanup().foreground_pending());
+    #[cfg(feature = "test-support")]
+    {
+        let audit = fixture
+            .app
+            .world()
+            .resource::<RouterAuthorityAudits>()
+            .get(fixture.router)
+            .expect("the restored same-host router has an authority audit");
+        assert_eq!(audit.frames().len(), after.active().frames().len());
+        assert_eq!(audit.orphan_slots(), old_slot_ids);
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn recovery_scenario_e_sealed_stale_output_cleanup_preserves_current_epoch() {
+    let mut fixture = recovery_r1_fixture("r3-scenario-e-sealed");
+    let restored_location = RouteLocation::new("/section/items/1");
+    let history_before_loss = router_snapshot(&fixture.app, fixture.router)
+        .history()
+        .clone();
+    let effects_before_stale = fixture.control.effects();
+
+    let stale_request = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(fixture.router, restored_location.clone())
+        .expect("the sealed root navigation enqueues through the public facade");
+    fixture.app.update();
+    assert!(fixture.control.effects().len() > effects_before_stale.len());
+    let prepared_before_capture = recovery_r3_prepared_output_entities(
+        &recovery_r3_audit_snapshot(&fixture.app, fixture.router),
+    );
+    assert!(
+        !prepared_before_capture.is_empty(),
+        "the first entering output must be physically realized before capture"
+    );
+
+    let control = arm_recovery_r3_applied_report_replay(&mut fixture.app, fixture.router);
+    let captured_effect_count = fixture.control.effects().len() + 1;
+    drive_recovery_r3_effect_count(&mut fixture.app, &fixture.control, captured_effect_count);
+
+    let snapshot_before_second_arm = router_snapshot(&fixture.app, fixture.router);
+    let audit_before_second_arm = recovery_r3_audit_snapshot(&fixture.app, fixture.router);
+    let sealed_entities = recovery_r3_prepared_output_entities(&audit_before_second_arm);
+    assert!(
+        !sealed_entities.is_empty(),
+        "the captured stale artifact must retain a non-empty exact physical target"
+    );
+    let entities_before_second_arm = entity_set(&fixture.app);
+    let inventory_before_second_arm = {
+        let world = fixture.app.world();
+        testing_router_request_inventory(
+            world.resource::<RouterNavigation>(),
+            world.resource::<RouterSnapshots>(),
+        )
+    };
+    let second_arm = testing_arm_next_applied_driver_report_replay(
+        &mut fixture.app.world_mut().resource_mut::<RouterNavigation>(),
+        fixture.router,
+    )
+    .expect_err("one router cannot acquire a second delayed-report control");
+    assert_eq!(
+        second_arm,
+        TestingDelayedDriverReportReplayError::AlreadyArmed
+    );
+    assert_eq!(
+        router_snapshot(&fixture.app, fixture.router),
+        snapshot_before_second_arm
+    );
+    assert_eq!(
+        recovery_r3_audit_snapshot(&fixture.app, fixture.router),
+        audit_before_second_arm
+    );
+    assert_eq!(entity_set(&fixture.app), entities_before_second_arm);
+    {
+        let world = fixture.app.world();
+        assert_eq!(
+            testing_router_request_inventory(
+                world.resource::<RouterNavigation>(),
+                world.resource::<RouterSnapshots>(),
+            ),
+            inventory_before_second_arm
+        );
+    }
+
+    let unavailable = settle_recovery_r3_registration_loss(&mut fixture);
+    assert_failed(
+        &request_snapshot(&fixture.app, fixture.router, stale_request),
+        NavigationFailureKind::HostLost,
+    );
+    assert_eq!(unavailable.active().kind(), ActivePresentationKind::None);
+    assert_eq!(unavailable.history(), &history_before_loss);
+    let stale_after_loss = recovery_r3_audit_snapshot(&fixture.app, fixture.router);
+    let sealed_states = sealed_entities
+        .iter()
+        .map(|entity| (*entity, stale_after_loss.owned_entity_state(*entity)))
+        .collect::<Vec<_>>();
+    assert!(
+        sealed_states.iter().all(|(_, state)| matches!(
+            state,
+            AuditEntityState::PresentOwned
+                | AuditEntityState::Quarantined
+                | AuditEntityState::Removed
+        )),
+        "sealed states after loss: {sealed_states:?}"
+    );
+    let sealed_present_after_loss = sealed_states
+        .iter()
+        .filter_map(|(entity, state)| {
+            matches!(
+                state,
+                AuditEntityState::PresentOwned | AuditEntityState::Quarantined
+            )
+            .then_some(*entity)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !sealed_present_after_loss.is_empty(),
+        "the sealed replay retains a non-empty exact physical cleanup target after HostLost"
+    );
+    let old_top_slot = fixture.host_fingerprint.top_slot.unwrap();
+    assert_ne!(
+        fixture
+            .app
+            .world()
+            .get::<ChildOf>(old_top_slot)
+            .map(ChildOf::parent),
+        Some(fixture.host_fingerprint.host)
+    );
+    let mut detached_host_fingerprint = fixture.host_fingerprint.clone();
+    detached_host_fingerprint.top_slot = None;
+    assert_host_after_registration_loss(&fixture.app, &detached_host_fingerprint);
+
+    let mut fresh_host = spawn_recovery_r3_app_host(&mut fixture.app, fixture.router);
+    let ready = drive_recovery_r3_availability(
+        &mut fixture.app,
+        fixture.router,
+        &RouterAvailability::Ready,
+    );
+    assert_eq!(ready.active().kind(), ActivePresentationKind::None);
+    assert_eq!(ready.history(), &history_before_loss);
+    fresh_host.top_slot = fixture
+        .app
+        .world()
+        .get::<Children>(fresh_host.host)
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|child| !fresh_host.existing_children.contains(child));
+    assert_host_intact(&fixture.app, &fresh_host);
+
+    let restored = replace_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        restored_location.clone(),
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, restored));
+    let snapshot_before_release = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(
+        snapshot_before_release.active().location(),
+        Some(&restored_location)
+    );
+    let history_after_restore = snapshot_before_release.history().clone();
+    assert_eq!(history_after_restore.entries(), [restored_location.clone()]);
+    assert_eq!(history_after_restore.current(), Some(&restored_location));
+    let facade_before_release = recovery_r3_facade_projection(&snapshot_before_release);
+    let router_diagnostics_before = snapshot_before_release.diagnostics().events().to_vec();
+    let restored_before_release = request_snapshot(&fixture.app, fixture.router, restored);
+    let stale_before_release = request_snapshot(&fixture.app, fixture.router, stale_request);
+    let audit_before_release = recovery_r3_audit_snapshot(&fixture.app, fixture.router);
+    let current_owned = recovery_r3_current_owned_audit_entities(&audit_before_release);
+    let current_owned_states = current_owned
+        .iter()
+        .map(|entity| (*entity, audit_before_release.owned_entity_state(*entity)))
+        .collect::<Vec<_>>();
+    assert!(
+        current_owned_states
+            .iter()
+            .all(|(_, state)| *state == AuditEntityState::PresentOwned),
+        "every new-epoch mapped Entity starts present under current authority: {current_owned_states:?}"
+    );
+    let inventory_before_release = {
+        let world = fixture.app.world();
+        testing_router_request_inventory(
+            world.resource::<RouterNavigation>(),
+            world.resource::<RouterSnapshots>(),
+        )
+    };
+    let entities_before_release = entity_set(&fixture.app);
+    assert!(fixture.app.world().get_entity(old_top_slot).is_ok());
+    let effects_before_release = fixture.control.effects();
+
+    release_recovery_r3_applied_report_replay(&mut fixture.app, control);
+    for _ in 0..24 {
+        fixture.app.update();
+        let audit = recovery_r3_audit_snapshot(&fixture.app, fixture.router);
+        let snapshot = router_snapshot(&fixture.app, fixture.router);
+        if sealed_entities
+            .iter()
+            .all(|entity| audit.owned_entity_state(*entity) == AuditEntityState::Removed)
+            && snapshot.running_request().is_none()
+            && snapshot.pending_phase().is_none()
+            && !snapshot.cleanup().foreground_pending()
+        {
+            break;
+        }
+    }
+
+    let snapshot_after_release = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(
+        recovery_r3_facade_projection(&snapshot_after_release),
+        facade_before_release,
+        "independent stale cleanup cannot rewrite current facade state"
+    );
+    assert_recovery_r3_report_disposition_delta(
+        &router_diagnostics_before,
+        snapshot_after_release.diagnostics().events(),
+        stale_request,
+    );
+    assert_eq!(
+        request_snapshot(&fixture.app, fixture.router, restored),
+        restored_before_release
+    );
+    let stale_after_release = request_snapshot(&fixture.app, fixture.router, stale_request);
+    assert_eq!(
+        stale_after_release.requested(),
+        stale_before_release.requested()
+    );
+    assert_eq!(
+        stale_after_release.matched(),
+        stale_before_release.matched()
+    );
+    assert_eq!(stale_after_release.status(), stale_before_release.status());
+    assert_eq!(stale_after_release.trace(), stale_before_release.trace());
+    assert_recovery_r3_report_disposition_delta(
+        stale_before_release.diagnostics(),
+        stale_after_release.diagnostics(),
+        stale_request,
+    );
+    let audit_after_release = recovery_r3_audit_snapshot(&fixture.app, fixture.router);
+    assert_recovery_r3_current_audit_mapping_is_exact(&audit_before_release, &audit_after_release);
+    assert!(sealed_entities.iter().all(|entity| {
+        audit_after_release.owned_entity_state(*entity) == AuditEntityState::Removed
+    }));
+    assert!(current_owned.iter().all(|entity| {
+        audit_after_release.owned_entity_state(*entity) == AuditEntityState::PresentOwned
+    }));
+    let entities_after_release = entity_set(&fixture.app);
+    assert!(entities_after_release.is_subset(&entities_before_release));
+    let removed_entities = entities_before_release
+        .difference(&entities_after_release)
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        removed_entities.len(),
+        sealed_present_after_loss.len(),
+        "every sealed old-output entity still present at release must reach a physical terminal; removed={removed_entities:?}, old_top_slot={old_top_slot:?}"
+    );
+    {
+        let world = fixture.app.world();
+        assert_eq!(
+            testing_router_request_inventory(
+                world.resource::<RouterNavigation>(),
+                world.resource::<RouterSnapshots>(),
+            ),
+            inventory_before_release
+        );
+    }
+    assert_eq!(fixture.control.effects(), effects_before_release);
+    assert_host_after_registration_loss(&fixture.app, &detached_host_fingerprint);
+    assert_host_intact(&fixture.app, &fresh_host);
+    let terminal = router_snapshot(&fixture.app, fixture.router);
+    assert!(terminal.running_request().is_none());
+    assert!(terminal.pending_phase().is_none());
+    assert!(!terminal.cleanup().foreground_pending());
+    assert_eq!(terminal.cleanup().quarantine_count(), 1);
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn recovery_scenario_e_ownerless_old_artifact_is_public_snapshot_zero_write() {
+    let mut fixture = recovery_r1_fixture("r3-scenario-e-ownerless");
+    let restored_location = RouteLocation::new("/section/items/1");
+    let initial = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        restored_location.clone(),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, initial));
+    let committed_before_loss = router_snapshot(&fixture.app, fixture.router);
+    let history_before_loss = committed_before_loss.history().clone();
+    let effects_before_stale = fixture.control.effects();
+
+    let control = arm_recovery_r3_applied_report_replay(&mut fixture.app, fixture.router);
+    let stale_request = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(fixture.router, RouteLocation::new("/alternate/items/2"))
+        .expect("the ownerless sibling navigation enqueues through the facade");
+    drive_recovery_r3_effect_count(
+        &mut fixture.app,
+        &fixture.control,
+        effects_before_stale.len() + 1,
+    );
+    assert!(
+        recovery_r3_prepared_output_entities(&recovery_r3_audit_snapshot(
+            &fixture.app,
+            fixture.router,
+        ))
+        .is_empty(),
+        "capturing the first report must precede every pending frame/slot realization"
+    );
+
+    let snapshot_before_second_arm = router_snapshot(&fixture.app, fixture.router);
+    let audit_before_second_arm = recovery_r3_audit_snapshot(&fixture.app, fixture.router);
+    let entities_before_second_arm = entity_set(&fixture.app);
+    let second_arm = testing_arm_next_applied_driver_report_replay(
+        &mut fixture.app.world_mut().resource_mut::<RouterNavigation>(),
+        fixture.router,
+    )
+    .expect_err("the captured ownerless artifact keeps its control exclusive");
+    assert_eq!(
+        second_arm,
+        TestingDelayedDriverReportReplayError::AlreadyArmed
+    );
+    assert_eq!(
+        router_snapshot(&fixture.app, fixture.router),
+        snapshot_before_second_arm
+    );
+    assert_eq!(
+        recovery_r3_audit_snapshot(&fixture.app, fixture.router),
+        audit_before_second_arm
+    );
+    assert_eq!(entity_set(&fixture.app), entities_before_second_arm);
+
+    let unavailable = settle_recovery_r3_registration_loss(&mut fixture);
+    assert_failed(
+        &request_snapshot(&fixture.app, fixture.router, stale_request),
+        NavigationFailureKind::HostLost,
+    );
+    assert_eq!(unavailable.active().kind(), ActivePresentationKind::None);
+    assert_eq!(unavailable.history(), &history_before_loss);
+    assert_host_after_registration_loss(&fixture.app, &fixture.host_fingerprint);
+
+    let mut fresh_host = spawn_recovery_r3_app_host(&mut fixture.app, fixture.router);
+    let ready = drive_recovery_r3_availability(
+        &mut fixture.app,
+        fixture.router,
+        &RouterAvailability::Ready,
+    );
+    assert_eq!(ready.active().kind(), ActivePresentationKind::None);
+    assert_eq!(ready.history(), &history_before_loss);
+    fresh_host.top_slot = fixture
+        .app
+        .world()
+        .get::<Children>(fresh_host.host)
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|child| !fresh_host.existing_children.contains(child));
+    assert_host_intact(&fixture.app, &fresh_host);
+
+    let restored = replace_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        history_before_loss.current().unwrap().clone(),
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, restored));
+    let snapshot_before_release = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(
+        snapshot_before_release.active().location(),
+        Some(&restored_location)
+    );
+    let facade_before_release = recovery_r3_facade_projection(&snapshot_before_release);
+    let router_diagnostics_before = snapshot_before_release.diagnostics().events().to_vec();
+    let restored_before_release = request_snapshot(&fixture.app, fixture.router, restored);
+    let initial_before_release = request_snapshot(&fixture.app, fixture.router, initial);
+    let stale_before_release = request_snapshot(&fixture.app, fixture.router, stale_request);
+    let audit_before_release = recovery_r3_audit_snapshot(&fixture.app, fixture.router);
+    let current_owned = recovery_r3_current_owned_audit_entities(&audit_before_release);
+    let inventory_before_release = {
+        let world = fixture.app.world();
+        testing_router_request_inventory(
+            world.resource::<RouterNavigation>(),
+            world.resource::<RouterSnapshots>(),
+        )
+    };
+    let entities_before_release = entity_set(&fixture.app);
+    let effects_before_release = fixture.control.effects();
+
+    release_recovery_r3_applied_report_replay(&mut fixture.app, control);
+    for _ in 0..4 {
+        fixture.app.update();
+    }
+
+    let snapshot_after_release = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(
+        recovery_r3_facade_projection(&snapshot_after_release),
+        facade_before_release
+    );
+    assert_recovery_r3_report_disposition_delta(
+        &router_diagnostics_before,
+        snapshot_after_release.diagnostics().events(),
+        stale_request,
+    );
+    assert_eq!(
+        request_snapshot(&fixture.app, fixture.router, restored),
+        restored_before_release
+    );
+    assert_eq!(
+        request_snapshot(&fixture.app, fixture.router, initial),
+        initial_before_release
+    );
+    let stale_after_release = request_snapshot(&fixture.app, fixture.router, stale_request);
+    assert_eq!(
+        stale_after_release.requested(),
+        stale_before_release.requested()
+    );
+    assert_eq!(
+        stale_after_release.matched(),
+        stale_before_release.matched()
+    );
+    assert_eq!(stale_after_release.status(), stale_before_release.status());
+    assert_eq!(stale_after_release.trace(), stale_before_release.trace());
+    assert_recovery_r3_report_disposition_delta(
+        stale_before_release.diagnostics(),
+        stale_after_release.diagnostics(),
+        stale_request,
+    );
+    let audit_after_release = recovery_r3_audit_snapshot(&fixture.app, fixture.router);
+    assert_recovery_r3_current_audit_mapping_is_exact(&audit_before_release, &audit_after_release);
+    assert!(current_owned.iter().all(|entity| {
+        audit_after_release.owned_entity_state(*entity) == AuditEntityState::PresentOwned
+    }));
+    assert_eq!(entity_set(&fixture.app), entities_before_release);
+    {
+        let world = fixture.app.world();
+        assert_eq!(
+            testing_router_request_inventory(
+                world.resource::<RouterNavigation>(),
+                world.resource::<RouterSnapshots>(),
+            ),
+            inventory_before_release
+        );
+    }
+    assert_eq!(fixture.control.effects(), effects_before_release);
+    assert_host_intact(&fixture.app, &fresh_host);
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
 }

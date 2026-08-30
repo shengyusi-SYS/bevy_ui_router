@@ -209,6 +209,29 @@ impl RouterNavigationState {
         Ok(())
     }
 
+    pub(crate) fn prepare_host_ready(
+        &self,
+        version: &HostVersion,
+        top_slot: crate::ids::RouteSlotId,
+    ) -> Option<Self> {
+        if self.authority.is_some() || version.router_identity() != self.router {
+            return None;
+        }
+        if !matches!(
+            self.availability,
+            RouterAvailability::AwaitingHost | RouterAvailability::Unavailable(_)
+        ) {
+            return None;
+        }
+        let mut ready = self.clone();
+        ready.authority = Some(ConfirmedHostAuthority {
+            version: version.clone(),
+            top_slot,
+        });
+        ready.availability = RouterAvailability::Ready;
+        Some(ready)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_request(&mut self, status: Option<RequestStatus>) {
         self.current_request = status;

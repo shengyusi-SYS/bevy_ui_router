@@ -4010,7 +4010,7 @@ pub(crate) mod tests {
             crate::host::stage_granted_top_slot(&mut world, candidate.clone(), &grant).unwrap();
         let top_slot = staged.entity();
         assert!(crate::host::activate_granted_top_slot(
-            &mut world, &candidate, &grant, staged,
+            &mut world, &candidate, &grant, &staged,
         ));
         let top_slot_claim = world
             .resource::<RouteEntityRegistry>()
@@ -5292,7 +5292,7 @@ pub(crate) mod tests {
             crate::host::stage_granted_top_slot(&mut world, candidate.clone(), &grant).unwrap();
         let top_slot = staged.entity();
         assert!(crate::host::activate_granted_top_slot(
-            &mut world, &candidate, &grant, staged,
+            &mut world, &candidate, &grant, &staged,
         ));
         let top_slot_claim = world
             .resource::<RouteEntityRegistry>()
@@ -5448,7 +5448,7 @@ pub(crate) mod tests {
             crate::host::stage_granted_top_slot(&mut world, candidate.clone(), &grant).unwrap();
         let top_slot = staged.entity();
         assert!(crate::host::activate_granted_top_slot(
-            &mut world, &candidate, &grant, staged,
+            &mut world, &candidate, &grant, &staged,
         ));
         let top_slot_claim = world
             .resource::<RouteEntityRegistry>()
@@ -5562,7 +5562,7 @@ pub(crate) mod tests {
             crate::host::stage_granted_top_slot(&mut world, candidate.clone(), &grant).unwrap();
         let top_slot = staged.entity();
         assert!(crate::host::activate_granted_top_slot(
-            &mut world, &candidate, &grant, staged,
+            &mut world, &candidate, &grant, &staged,
         ));
         let top_slot_claim = world
             .resource::<RouteEntityRegistry>()

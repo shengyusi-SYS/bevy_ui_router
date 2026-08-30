@@ -3,8 +3,10 @@
 use std::collections::VecDeque;
 
 use crate::admission::{
-    AdmissionError, HostAdmissionConfirmation, HostAdmissionIssuer, HostAdmissionToken, HostGrant,
-    HostLease, RetiredHostAuthority, RetiredHostAuthorityProjection,
+    AdmissionError, HostAdmissionAllocatorCounter, HostAdmissionAllocatorExhaustionEvidence,
+    HostAdmissionConfirmation, HostAdmissionIssuer, HostAdmissionIssuerOutstandingProjection,
+    HostAdmissionIssuerProjection, HostAdmissionToken, HostGrant, HostLease, RetiredHostAuthority,
+    RetiredHostAuthorityProjection,
 };
 use crate::branch::{FrozenErrorViewBinding, MatchedBranch, MatchedRoute, RouteParams};
 use crate::cleanup::{
@@ -51,7 +53,10 @@ use crate::mount::{
     MountRegistrationCompletion, MountRegistrationDigest, MountRegistrationPermit,
     MountRequestReceiverDisposition, MountRequestToken, MountRequestTokenProjection,
 };
-use crate::presentation::{ActivePresentation, ActivePresentationKind, RouterNavigationState};
+use crate::presentation::{
+    ActivePresentation, ActivePresentationKind, RouterAvailability, RouterNavigationState,
+    RouterUnavailableReason,
+};
 use crate::request::{
     NavigationFailure, NavigationFailureKind, NavigationPhase, NavigationRequestRecord,
     RequestRecordError, RequestStatus,
@@ -4679,12 +4684,732 @@ struct CompletedCleanupTombstone {
     token: CleanupBatchToken,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct AvailabilityIncarnation(pub(crate) u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionSourceKind {
+    InitialAwaiting,
+    RetryableHostLost,
+    RetryableHostConflict,
+    RetryableInvalidHostUiTopology,
+    RetryableAuthorityEstablishmentFailed,
+    PermanentAuthorityEstablishmentFailed,
+    PermanentIdentityExhausted,
+    PermanentRegistryInvariantViolation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionSourceProjection {
+    pub(crate) router: RouterIdentity,
+    pub(crate) availability_incarnation: AvailabilityIncarnation,
+    pub(crate) kind: HostAdmissionSourceKind,
+    pub(crate) public_reason: Option<RouterUnavailableReason>,
+    pub(crate) host: Option<HostVersion>,
+    pub(crate) top_slot: Option<RouteSlotId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionSourcePermitKey {
+    pub(crate) router: RouterIdentity,
+    pub(crate) availability_incarnation: AvailabilityIncarnation,
+    pub(crate) sequence: u64,
+    pub(crate) binding: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionSourcePermit {
+    pub(crate) source: HostAdmissionSourceProjection,
+    pub(crate) key: HostAdmissionSourcePermitKey,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionSourceIneligibleProjection {
+    pub(crate) expected: HostAdmissionSourceProjection,
+    pub(crate) observed: Option<HostAdmissionSourceProjection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostGrantProjection {
+    pub(crate) source: HostAdmissionSourceProjection,
+    pub(crate) permit_key: HostAdmissionSourcePermitKey,
+    pub(crate) host: HostVersion,
+    pub(crate) top_slot: RouteSlotId,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct SourceBoundHostAdmissionToken {
+    pub(crate) permit: HostAdmissionSourcePermit,
+    pub(crate) token: HostAdmissionToken,
+    issuer: HostAdmissionIssuerProjection,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct SourceBoundHostGrant {
+    pub(crate) source: SourceBoundHostAdmissionToken,
+    pub(crate) grant: HostGrant,
+    issuer: HostAdmissionIssuerProjection,
+}
+
+impl SourceBoundHostGrant {
+    pub(crate) fn projection(&self) -> HostGrantProjection {
+        HostGrantProjection {
+            source: self.source.permit.source.clone(),
+            permit_key: self.source.permit.key,
+            host: self.grant.version().clone(),
+            top_slot: self.grant.top_slot(),
+        }
+    }
+
+    pub(crate) fn expected_issuer_projection(&self) -> HostAdmissionIssuerProjection {
+        self.issuer.clone()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CorePendingHostAdmissionStage {
+    Permit,
+    Token,
+    Grant,
+    Confirming,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePendingHostAdmissionProjection {
+    pub(crate) source: HostAdmissionSourceProjection,
+    pub(crate) stage: CorePendingHostAdmissionStage,
+    pub(crate) permit_key: Option<HostAdmissionSourcePermitKey>,
+    pub(crate) host: Option<HostVersion>,
+    pub(crate) top_slot: Option<RouteSlotId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostConfirmationReceiverProjection {
+    pub(crate) source: HostAdmissionSourceProjection,
+    pub(crate) grant: HostGrantProjection,
+    pub(crate) pending: CorePendingHostAdmissionProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostConfirmationReceiverMismatchProjection {
+    pub(crate) expected: HostConfirmationReceiverProjection,
+    pub(crate) observed: Option<HostConfirmationReceiverProjection>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum CorePendingHostAdmission {
+    Permit(CorePendingHostAdmissionProjection),
+    Token(CorePendingHostAdmissionProjection),
+    Grant(CorePendingHostAdmissionProjection),
+    Confirming(HostConfirmationReceiverProjection),
+}
+
+impl CorePendingHostAdmission {
+    fn projection(&self) -> CorePendingHostAdmissionProjection {
+        match self {
+            Self::Permit(projection) | Self::Token(projection) | Self::Grant(projection) => {
+                projection.clone()
+            }
+            Self::Confirming(receiver) => receiver.pending.clone(),
+        }
+    }
+
+    fn confirmation_receiver(&self) -> Option<HostConfirmationReceiverProjection> {
+        match self {
+            Self::Confirming(receiver) => Some(receiver.clone()),
+            Self::Permit(_) | Self::Token(_) | Self::Grant(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionUnavailableEvidenceKind {
+    NoCandidate,
+    Conflict,
+    InvalidTopology,
+    HostLost,
+    AuthorityEstablishmentFailed,
+    RegistryInvariantViolation,
+    IssuerOperationFailed,
+    ConfirmationFailed,
+    PreallocationRejected,
+    PostAllocationRejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionOperation {
+    Request,
+    Grant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionOperationFailureDisposition {
+    PermanentAuthorityConflict,
+    PermanentForeignOrStale,
+    PermanentIdentityExhausted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionOperationExhaustionExpectation {
+    Forbidden,
+    RequiredOneOf(Vec<HostAdmissionAllocatorCounter>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionOperationFailureContradiction {
+    OutstandingWithoutReturnedOwner {
+        observed: HostAdmissionIssuerOutstandingProjection,
+    },
+    ExhaustionPairMismatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionOperationFailureProjection {
+    pub(crate) source: HostAdmissionSourceProjection,
+    pub(crate) operation: HostAdmissionOperation,
+    pub(crate) error: AdmissionError,
+    pub(crate) disposition: HostAdmissionOperationFailureDisposition,
+    pub(crate) expected_issuer: HostAdmissionIssuerProjection,
+    pub(crate) observed_issuer: HostAdmissionIssuerProjection,
+    pub(crate) exhaustion: Option<HostAdmissionAllocatorExhaustionEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionOperationFailureEvidence {
+    pub(crate) projection: HostAdmissionOperationFailureProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionOperationFailureEvidenceMismatch {
+    pub(crate) source: HostAdmissionSourceProjection,
+    pub(crate) operation: HostAdmissionOperation,
+    pub(crate) error: AdmissionError,
+    pub(crate) expected_issuer: HostAdmissionIssuerProjection,
+    pub(crate) observed_issuer: HostAdmissionIssuerProjection,
+    pub(crate) expected_exhaustion: HostAdmissionOperationExhaustionExpectation,
+    pub(crate) observed_exhaustion: Option<HostAdmissionAllocatorExhaustionEvidence>,
+    pub(crate) contradiction: HostAdmissionOperationFailureContradiction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionOperationFailureFreezeOutcome {
+    Frozen(HostAdmissionOperationFailureEvidence),
+    Mismatch(HostAdmissionOperationFailureEvidenceMismatch),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionUnavailableEvidenceProjection {
+    pub(crate) source: HostAdmissionSourceProjection,
+    pub(crate) kind: HostAdmissionUnavailableEvidenceKind,
+    pub(crate) candidate_revision: Option<u64>,
+    pub(crate) expected_digest: u64,
+    pub(crate) observed_digest: u64,
+    pub(crate) exhaustion: Option<HostAdmissionAllocatorExhaustionEvidence>,
+    pub(crate) operation_failure: Option<HostAdmissionOperationFailureProjection>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionPermanence {
+    RetryableAfterCandidateChange,
+    PermanentForRouter,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionUnavailableDisposition {
+    Awaiting,
+    Unavailable {
+        reason: RouterUnavailableReason,
+        permanence: HostAdmissionPermanence,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionUnavailableCause {
+    pub(crate) source: HostAdmissionSourceProjection,
+    pub(crate) evidence: HostAdmissionUnavailableEvidenceProjection,
+    pub(crate) disposition: HostAdmissionUnavailableDisposition,
+    pub(crate) cause_digest: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct PreparedHostAdmissionUnavailableCause<Evidence> {
+    pub(crate) core: HostAdmissionUnavailableCause,
+    pub(crate) evidence: Evidence,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionUnavailableCauseBindOutcome<Evidence> {
+    Bound(PreparedHostAdmissionUnavailableCause<Evidence>),
+    Mismatch {
+        source: HostAdmissionSourceProjection,
+        evidence: Evidence,
+        projection: HostAdmissionUnavailableEvidenceProjection,
+        mismatch: HostAdmissionSourceIneligibleProjection,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionUnavailableTerminalProjection {
+    pub(crate) source: HostAdmissionSourceProjection,
+    pub(crate) cause_digest: u64,
+    pub(crate) reason: RouterUnavailableReason,
+    pub(crate) permanence: HostAdmissionPermanence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionUnavailableMismatchProjection {
+    pub(crate) expected_source: HostAdmissionSourceProjection,
+    pub(crate) observed_pending: Option<CorePendingHostAdmissionProjection>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionUnavailableIssuerOperation {
+    CancelToken,
+    RejectGrant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionUnavailableIssuerMismatchProjection {
+    pub(crate) receiver: HostAdmissionUnavailableMismatchProjection,
+    pub(crate) operation: HostAdmissionUnavailableIssuerOperation,
+    pub(crate) expected_issuer: HostAdmissionIssuerProjection,
+    pub(crate) observed_issuer: HostAdmissionIssuerProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionUnavailableFailureEvidence {
+    Receiver(HostAdmissionUnavailableMismatchProjection),
+    Issuer(HostAdmissionUnavailableIssuerMismatchProjection),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionUnavailablePreStagingOwner {
+    Permit(HostAdmissionSourcePermit),
+    Token(SourceBoundHostAdmissionToken),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionUnavailablePreStagingSource<Installation, Evidence> {
+    pub(crate) prepared: PreparedHostAdmissionUnavailableCause<Evidence>,
+    pub(crate) owner: HostAdmissionUnavailablePreStagingOwner,
+    pub(crate) installation: Installation,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionUnavailableGrantedSource<Installation, Evidence> {
+    pub(crate) prepared: PreparedHostAdmissionUnavailableCause<Evidence>,
+    pub(crate) owner: CoreHostConfirmationSource<Installation>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionUnavailablePreStagingOutcome<Installation, Evidence, PhysicalTerminal>
+{
+    Published {
+        terminal: HostAdmissionUnavailableTerminalProjection,
+        physical: PhysicalTerminal,
+    },
+    Mismatch {
+        source: HostAdmissionUnavailablePreStagingSource<Installation, Evidence>,
+        evidence: HostAdmissionUnavailableFailureEvidence,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionUnavailableGrantedOutcome<Installation, Evidence, PhysicalTerminal> {
+    Published {
+        terminal: HostAdmissionUnavailableTerminalProjection,
+        physical: PhysicalTerminal,
+    },
+    Mismatch {
+        source: HostAdmissionUnavailableGrantedSource<Installation, Evidence>,
+        evidence: HostAdmissionUnavailableFailureEvidence,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionUnavailableObservedOutcome<Evidence> {
+    Published(HostAdmissionUnavailableTerminalProjection),
+    Stable {
+        source: HostAdmissionSourceProjection,
+        evidence: Evidence,
+    },
+    Awaiting {
+        source: HostAdmissionSourceProjection,
+        evidence: Evidence,
+    },
+    Mismatch {
+        prepared: PreparedHostAdmissionUnavailableCause<Evidence>,
+        evidence: HostAdmissionUnavailableFailureEvidence,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionSourcePermitOutcome {
+    Issued(HostAdmissionSourcePermit),
+    Ineligible {
+        source: HostAdmissionSourceProjection,
+        evidence: HostAdmissionSourceIneligibleProjection,
+    },
+    Outstanding {
+        source: HostAdmissionSourceProjection,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct AdmissionOwnerError<Owner> {
+    pub(crate) owner: Owner,
+    pub(crate) evidence: HostAdmissionOperationFailureFreezeOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostConfirmationIssuerMismatchProjection {
+    pub(crate) receiver: HostConfirmationReceiverProjection,
+    pub(crate) expected_issuer: HostAdmissionIssuerProjection,
+    pub(crate) observed_issuer: HostAdmissionIssuerProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionConfirmationFailureEvidence {
+    Receiver(HostConfirmationReceiverMismatchProjection),
+    Issuer(HostConfirmationIssuerMismatchProjection),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedHostReadyPublication {
+    pub(crate) projection: HostAdmissionReadyProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedHostUnavailablePublication {
+    terminal: HostAdmissionUnavailableTerminalProjection,
+    source: HostAdmissionSourceProjection,
+    source_open: bool,
+    state: RouterNavigationState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostAdmissionReadyProjection {
+    pub(crate) source: HostAdmissionSourceProjection,
+    pub(crate) host: HostVersion,
+    pub(crate) top_slot: RouteSlotId,
+    pub(crate) availability: RouterAvailability,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct CoreHostConfirmationSource<Installation> {
+    pub(crate) grant: SourceBoundHostGrant,
+    pub(crate) installation: Installation,
+}
+
+impl<Installation> CoreHostConfirmationSource<Installation> {
+    pub(crate) fn receiver_projection(&self) -> HostConfirmationReceiverProjection {
+        RouterEngine::confirmation_receiver_for(&self.grant)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct CorePreparedHostConfirmation<Installation> {
+    pub(crate) grant: SourceBoundHostGrant,
+    pub(crate) installation: Installation,
+    pub(crate) receiver: HostConfirmationReceiverProjection,
+    pub(crate) ready: PreparedHostReadyPublication,
+    expected_issuer: HostAdmissionIssuerProjection,
+    ready_state: RouterNavigationState,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct RejectedHostConfirmationPreparation<Installation> {
+    grant: SourceBoundHostGrant,
+    installation: Installation,
+    evidence: HostConfirmationReceiverMismatchProjection,
+}
+
+impl<Installation> RejectedHostConfirmationPreparation<Installation> {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        SourceBoundHostGrant,
+        Installation,
+        HostConfirmationReceiverMismatchProjection,
+    ) {
+        (self.grant, self.installation, self.evidence)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum HostAdmissionConfirmationCoreOutcome<Installation, Installed> {
+    Ready {
+        projection: HostAdmissionReadyProjection,
+        installed: Installed,
+    },
+    ReceiverMismatch {
+        owner: CorePreparedHostConfirmation<Installation>,
+        evidence: HostConfirmationReceiverMismatchProjection,
+    },
+    IssuerRejected {
+        owner: CorePreparedHostConfirmation<Installation>,
+        evidence: HostConfirmationIssuerMismatchProjection,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum HostConfirmationUnwindOutcome<Installation> {
+    Grant(CoreHostConfirmationSource<Installation>),
+    Mismatch {
+        owner: CorePreparedHostConfirmation<Installation>,
+        evidence: HostConfirmationReceiverMismatchProjection,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum HostConfirmationPreparationOutcome<Installation> {
+    Prepared(CorePreparedHostConfirmation<Installation>),
+    ReceiverMismatch {
+        owner: CoreHostConfirmationSource<Installation>,
+        evidence: HostConfirmationReceiverMismatchProjection,
+    },
+}
+
+pub(crate) fn bind_granted_host_admission_source<Installation>(
+    grant: SourceBoundHostGrant,
+    installation: Installation,
+) -> CoreHostConfirmationSource<Installation> {
+    CoreHostConfirmationSource {
+        grant,
+        installation,
+    }
+}
+
+pub(crate) fn consume_host_confirmation_preparation_mismatch<Installation>(
+    owner: CoreHostConfirmationSource<Installation>,
+    evidence: HostConfirmationReceiverMismatchProjection,
+) -> RejectedHostConfirmationPreparation<Installation> {
+    RejectedHostConfirmationPreparation {
+        grant: owner.grant,
+        installation: owner.installation,
+        evidence,
+    }
+}
+
+pub(crate) fn freeze_host_admission_operation_failure(
+    source: HostAdmissionSourceProjection,
+    operation: HostAdmissionOperation,
+    error: AdmissionError,
+    expected_issuer: HostAdmissionIssuerProjection,
+    observed_issuer: HostAdmissionIssuerProjection,
+    exhaustion: Option<HostAdmissionAllocatorExhaustionEvidence>,
+) -> HostAdmissionOperationFailureFreezeOutcome {
+    let expected_exhaustion = match (operation, error) {
+        (HostAdmissionOperation::Request, AdmissionError::Exhausted) => {
+            HostAdmissionOperationExhaustionExpectation::RequiredOneOf(vec![
+                HostAdmissionAllocatorCounter::RequestSequence,
+            ])
+        }
+        (HostAdmissionOperation::Grant, AdmissionError::Exhausted) => {
+            HostAdmissionOperationExhaustionExpectation::RequiredOneOf(vec![
+                HostAdmissionAllocatorCounter::GrantEpoch,
+                HostAdmissionAllocatorCounter::HostVersion,
+                HostAdmissionAllocatorCounter::TopSlot,
+            ])
+        }
+        _ => HostAdmissionOperationExhaustionExpectation::Forbidden,
+    };
+    let exhaustion_matches = match (&expected_exhaustion, exhaustion) {
+        (HostAdmissionOperationExhaustionExpectation::Forbidden, None) => true,
+        (HostAdmissionOperationExhaustionExpectation::RequiredOneOf(allowed), Some(observed)) => {
+            allowed.contains(&observed.counter)
+        }
+        (HostAdmissionOperationExhaustionExpectation::Forbidden, Some(_))
+        | (HostAdmissionOperationExhaustionExpectation::RequiredOneOf(_), None) => false,
+    };
+    let contradiction = if error == AdmissionError::OutstandingExists {
+        observed_issuer.outstanding.clone().map(|observed| {
+            HostAdmissionOperationFailureContradiction::OutstandingWithoutReturnedOwner { observed }
+        })
+    } else if !exhaustion_matches {
+        Some(HostAdmissionOperationFailureContradiction::ExhaustionPairMismatch)
+    } else {
+        None
+    };
+    if let Some(contradiction) = contradiction {
+        return HostAdmissionOperationFailureFreezeOutcome::Mismatch(
+            HostAdmissionOperationFailureEvidenceMismatch {
+                source,
+                operation,
+                error,
+                expected_issuer,
+                observed_issuer,
+                expected_exhaustion,
+                observed_exhaustion: exhaustion,
+                contradiction,
+            },
+        );
+    }
+    let Some(disposition) = (match error {
+        AdmissionError::AuthorityExists => {
+            Some(HostAdmissionOperationFailureDisposition::PermanentAuthorityConflict)
+        }
+        AdmissionError::ForeignRouter | AdmissionError::Stale => {
+            Some(HostAdmissionOperationFailureDisposition::PermanentForeignOrStale)
+        }
+        AdmissionError::Exhausted => {
+            Some(HostAdmissionOperationFailureDisposition::PermanentIdentityExhausted)
+        }
+        AdmissionError::OutstandingExists => None,
+    }) else {
+        return HostAdmissionOperationFailureFreezeOutcome::Mismatch(
+            HostAdmissionOperationFailureEvidenceMismatch {
+                source,
+                operation,
+                error,
+                expected_issuer,
+                observed_issuer,
+                expected_exhaustion,
+                observed_exhaustion: exhaustion,
+                contradiction: HostAdmissionOperationFailureContradiction::ExhaustionPairMismatch,
+            },
+        );
+    };
+    HostAdmissionOperationFailureFreezeOutcome::Frozen(HostAdmissionOperationFailureEvidence {
+        projection: HostAdmissionOperationFailureProjection {
+            source,
+            operation,
+            error,
+            disposition,
+            expected_issuer,
+            observed_issuer,
+            exhaustion,
+        },
+    })
+}
+
+pub(crate) fn bind_host_admission_unavailable_cause<Evidence>(
+    source: HostAdmissionSourceProjection,
+    projection: &HostAdmissionUnavailableEvidenceProjection,
+    evidence: Evidence,
+) -> HostAdmissionUnavailableCauseBindOutcome<Evidence> {
+    let operation_exact = match &projection.operation_failure {
+        Some(operation) => {
+            projection.kind == HostAdmissionUnavailableEvidenceKind::IssuerOperationFailed
+                && operation.source == source
+                && projection.exhaustion == operation.exhaustion
+        }
+        None => projection.kind != HostAdmissionUnavailableEvidenceKind::IssuerOperationFailed,
+    };
+    if projection.source != source || !operation_exact {
+        return HostAdmissionUnavailableCauseBindOutcome::Mismatch {
+            mismatch: HostAdmissionSourceIneligibleProjection {
+                expected: source.clone(),
+                observed: Some(projection.source.clone()),
+            },
+            source,
+            evidence,
+            projection: projection.clone(),
+        };
+    }
+    let permanent_identity = projection.exhaustion.is_some_and(|exhaustion| {
+        exhaustion.counter == HostAdmissionAllocatorCounter::CandidateRevision
+    });
+    let disposition = match projection.kind {
+        HostAdmissionUnavailableEvidenceKind::NoCandidate
+            if source.kind == HostAdmissionSourceKind::InitialAwaiting =>
+        {
+            HostAdmissionUnavailableDisposition::Awaiting
+        }
+        HostAdmissionUnavailableEvidenceKind::NoCandidate => match source.public_reason.clone() {
+            Some(reason) => HostAdmissionUnavailableDisposition::Unavailable {
+                reason,
+                permanence: if matches!(
+                    source.kind,
+                    HostAdmissionSourceKind::PermanentAuthorityEstablishmentFailed
+                        | HostAdmissionSourceKind::PermanentIdentityExhausted
+                        | HostAdmissionSourceKind::PermanentRegistryInvariantViolation
+                ) {
+                    HostAdmissionPermanence::PermanentForRouter
+                } else {
+                    HostAdmissionPermanence::RetryableAfterCandidateChange
+                },
+            },
+            None => HostAdmissionUnavailableDisposition::Awaiting,
+        },
+        HostAdmissionUnavailableEvidenceKind::Conflict => {
+            HostAdmissionUnavailableDisposition::Unavailable {
+                reason: RouterUnavailableReason::HostConflict,
+                permanence: HostAdmissionPermanence::RetryableAfterCandidateChange,
+            }
+        }
+        HostAdmissionUnavailableEvidenceKind::InvalidTopology => {
+            HostAdmissionUnavailableDisposition::Unavailable {
+                reason: RouterUnavailableReason::InvalidHostUiTopology,
+                permanence: HostAdmissionPermanence::RetryableAfterCandidateChange,
+            }
+        }
+        HostAdmissionUnavailableEvidenceKind::HostLost => {
+            HostAdmissionUnavailableDisposition::Unavailable {
+                reason: RouterUnavailableReason::HostLost,
+                permanence: HostAdmissionPermanence::RetryableAfterCandidateChange,
+            }
+        }
+        HostAdmissionUnavailableEvidenceKind::RegistryInvariantViolation => {
+            HostAdmissionUnavailableDisposition::Unavailable {
+                reason: RouterUnavailableReason::RegistryInvariantViolation,
+                permanence: HostAdmissionPermanence::PermanentForRouter,
+            }
+        }
+        HostAdmissionUnavailableEvidenceKind::AuthorityEstablishmentFailed
+        | HostAdmissionUnavailableEvidenceKind::PostAllocationRejected
+            if !permanent_identity
+                && !matches!(
+                    source.kind,
+                    HostAdmissionSourceKind::PermanentAuthorityEstablishmentFailed
+                        | HostAdmissionSourceKind::PermanentIdentityExhausted
+                        | HostAdmissionSourceKind::PermanentRegistryInvariantViolation
+                ) =>
+        {
+            HostAdmissionUnavailableDisposition::Unavailable {
+                reason: RouterUnavailableReason::AuthorityEstablishmentFailed,
+                permanence: HostAdmissionPermanence::RetryableAfterCandidateChange,
+            }
+        }
+        HostAdmissionUnavailableEvidenceKind::AuthorityEstablishmentFailed
+        | HostAdmissionUnavailableEvidenceKind::IssuerOperationFailed
+        | HostAdmissionUnavailableEvidenceKind::ConfirmationFailed
+        | HostAdmissionUnavailableEvidenceKind::PreallocationRejected
+        | HostAdmissionUnavailableEvidenceKind::PostAllocationRejected => {
+            HostAdmissionUnavailableDisposition::Unavailable {
+                reason: RouterUnavailableReason::AuthorityEstablishmentFailed,
+                permanence: HostAdmissionPermanence::PermanentForRouter,
+            }
+        }
+    };
+    let cause_digest = projection
+        .expected_digest
+        .rotate_left(17)
+        .wrapping_add(projection.observed_digest.rotate_right(9))
+        .wrapping_add(source.availability_incarnation.0)
+        .wrapping_add(projection.candidate_revision.unwrap_or(0))
+        .wrapping_add(1);
+    let cause_digest = if cause_digest == 0 { 1 } else { cause_digest };
+    HostAdmissionUnavailableCauseBindOutcome::Bound(PreparedHostAdmissionUnavailableCause {
+        core: HostAdmissionUnavailableCause {
+            source,
+            evidence: projection.clone(),
+            disposition,
+            cause_digest,
+        },
+        evidence,
+    })
+}
+
 pub(crate) struct RouterEngine {
     matcher: RouteMatcher,
     ids: CoreIdAllocator,
     router: RouterIdentity,
     fallback: RouteViewKey,
     state: RouterNavigationState,
+    host_admission_source: HostAdmissionSourceProjection,
+    host_admission_source_open: bool,
+    pending_host_admission: Option<CorePendingHostAdmission>,
     history: CanonicalHistory,
     history_admission_world: Option<CoreIssuedWorldSealProjection>,
     active_branch: Option<MatchedBranch>,
@@ -4723,12 +5448,23 @@ impl RouterEngine {
         let router = ids
             .allocate_router_identity()
             .map_err(|_| EngineInstallError::IdExhausted)?;
+        let host_admission_source = HostAdmissionSourceProjection {
+            router,
+            availability_incarnation: AvailabilityIncarnation(1),
+            kind: HostAdmissionSourceKind::InitialAwaiting,
+            public_reason: None,
+            host: None,
+            top_slot: None,
+        };
         Ok(Self {
             matcher: RouteMatcher::new(tree),
             ids,
             router,
             fallback,
             state: RouterNavigationState::new(router),
+            host_admission_source,
+            host_admission_source_open: true,
+            pending_host_admission: None,
             history: CanonicalHistory::new(router),
             history_admission_world: None,
             active_branch: None,
@@ -4759,7 +5495,7 @@ impl RouterEngine {
         })
     }
 
-    pub(crate) fn request_host_admission(
+    pub(crate) fn request_legacy_host_admission(
         &mut self,
         issuer: &mut HostAdmissionIssuer,
     ) -> Result<HostAdmissionToken, AdmissionError> {
@@ -4771,7 +5507,7 @@ impl RouterEngine {
         issuer.issue(self.router)
     }
 
-    pub(crate) fn grant_host_admission(
+    pub(crate) fn grant_legacy_host_admission(
         &mut self,
         issuer: &mut HostAdmissionIssuer,
         token: &HostAdmissionToken,
@@ -4785,6 +5521,719 @@ impl RouterEngine {
         confirmation: &HostAdmissionConfirmation,
     ) -> Result<(), crate::presentation::AuthorityConfirmationError> {
         self.state.confirm_host(issuer, confirmation)
+    }
+
+    pub(crate) fn issue_host_admission_source_permit(
+        &mut self,
+    ) -> HostAdmissionSourcePermitOutcome {
+        let source = self.host_admission_source.clone();
+        if self.pending_host_admission.is_some() {
+            return HostAdmissionSourcePermitOutcome::Outstanding { source };
+        }
+        let availability_matches = match source.public_reason.as_ref() {
+            None => self.state.availability() == &RouterAvailability::AwaitingHost,
+            Some(reason) => {
+                self.state.availability() == &RouterAvailability::Unavailable(reason.clone())
+            }
+        };
+        if !self.host_admission_source_open || !availability_matches || self.state.host().is_some()
+        {
+            return HostAdmissionSourcePermitOutcome::Ineligible {
+                evidence: HostAdmissionSourceIneligibleProjection {
+                    expected: source.clone(),
+                    observed: Some(source.clone()),
+                },
+                source,
+            };
+        }
+        let sequence = source.availability_incarnation.0;
+        let key = HostAdmissionSourcePermitKey {
+            router: self.router,
+            availability_incarnation: source.availability_incarnation,
+            sequence,
+            binding: sequence
+                .rotate_left(19)
+                .wrapping_add(source.availability_incarnation.0.rotate_right(7))
+                .wrapping_add(self.router.router().raw()),
+        };
+        let projection = CorePendingHostAdmissionProjection {
+            source: source.clone(),
+            stage: CorePendingHostAdmissionStage::Permit,
+            permit_key: Some(key),
+            host: None,
+            top_slot: None,
+        };
+        self.host_admission_source_open = false;
+        self.pending_host_admission = Some(CorePendingHostAdmission::Permit(projection));
+        HostAdmissionSourcePermitOutcome::Issued(HostAdmissionSourcePermit { source, key })
+    }
+
+    pub(crate) fn request_host_admission(
+        &mut self,
+        issuer: &mut HostAdmissionIssuer,
+        permit: HostAdmissionSourcePermit,
+    ) -> Result<SourceBoundHostAdmissionToken, AdmissionOwnerError<HostAdmissionSourcePermit>> {
+        let expected_pending = CorePendingHostAdmissionProjection {
+            source: permit.source.clone(),
+            stage: CorePendingHostAdmissionStage::Permit,
+            permit_key: Some(permit.key),
+            host: None,
+            top_slot: None,
+        };
+        let expected_issuer = issuer.projection();
+        let receiver_exact = self.host_admission_source == permit.source
+            && self.pending_host_admission.as_ref()
+                == Some(&CorePendingHostAdmission::Permit(expected_pending));
+        if !receiver_exact {
+            let observed_issuer = issuer.projection();
+            return Err(AdmissionOwnerError {
+                evidence: freeze_host_admission_operation_failure(
+                    permit.source.clone(),
+                    HostAdmissionOperation::Request,
+                    AdmissionError::Stale,
+                    expected_issuer,
+                    observed_issuer,
+                    None,
+                ),
+                owner: permit,
+            });
+        }
+        match issuer.issue_with_evidence(self.router) {
+            Ok(token) => {
+                let issuer_projection = issuer.projection();
+                let projection = CorePendingHostAdmissionProjection {
+                    source: permit.source.clone(),
+                    stage: CorePendingHostAdmissionStage::Token,
+                    permit_key: Some(permit.key),
+                    host: None,
+                    top_slot: None,
+                };
+                self.pending_host_admission = Some(CorePendingHostAdmission::Token(projection));
+                Ok(SourceBoundHostAdmissionToken {
+                    permit,
+                    token,
+                    issuer: issuer_projection,
+                })
+            }
+            Err(failure) => {
+                let observed_issuer = issuer.projection();
+                Err(AdmissionOwnerError {
+                    evidence: freeze_host_admission_operation_failure(
+                        permit.source.clone(),
+                        HostAdmissionOperation::Request,
+                        failure.error,
+                        expected_issuer,
+                        observed_issuer,
+                        failure.exhaustion,
+                    ),
+                    owner: permit,
+                })
+            }
+        }
+    }
+
+    pub(crate) fn grant_host_admission(
+        &mut self,
+        issuer: &mut HostAdmissionIssuer,
+        token: SourceBoundHostAdmissionToken,
+    ) -> Result<SourceBoundHostGrant, AdmissionOwnerError<SourceBoundHostAdmissionToken>> {
+        let expected_pending = CorePendingHostAdmissionProjection {
+            source: token.permit.source.clone(),
+            stage: CorePendingHostAdmissionStage::Token,
+            permit_key: Some(token.permit.key),
+            host: None,
+            top_slot: None,
+        };
+        let expected_issuer = issuer.projection();
+        let receiver_exact = self.host_admission_source == token.permit.source
+            && self.pending_host_admission.as_ref()
+                == Some(&CorePendingHostAdmission::Token(expected_pending));
+        if !receiver_exact {
+            let observed_issuer = issuer.projection();
+            return Err(AdmissionOwnerError {
+                evidence: freeze_host_admission_operation_failure(
+                    token.permit.source.clone(),
+                    HostAdmissionOperation::Grant,
+                    AdmissionError::Stale,
+                    expected_issuer,
+                    observed_issuer,
+                    None,
+                ),
+                owner: token,
+            });
+        }
+        match issuer.grant_with_evidence(&token.token, &mut self.ids) {
+            Ok(grant) => {
+                let issuer_projection = issuer.projection();
+                let projection = CorePendingHostAdmissionProjection {
+                    source: token.permit.source.clone(),
+                    stage: CorePendingHostAdmissionStage::Grant,
+                    permit_key: Some(token.permit.key),
+                    host: Some(grant.version().clone()),
+                    top_slot: Some(grant.top_slot()),
+                };
+                self.pending_host_admission = Some(CorePendingHostAdmission::Grant(projection));
+                Ok(SourceBoundHostGrant {
+                    source: token,
+                    grant,
+                    issuer: issuer_projection,
+                })
+            }
+            Err(failure) => {
+                let observed_issuer = issuer.projection();
+                Err(AdmissionOwnerError {
+                    evidence: freeze_host_admission_operation_failure(
+                        token.permit.source.clone(),
+                        HostAdmissionOperation::Grant,
+                        failure.error,
+                        expected_issuer,
+                        observed_issuer,
+                        failure.exhaustion,
+                    ),
+                    owner: token,
+                })
+            }
+        }
+    }
+
+    pub(crate) fn confirmation_receiver_for(
+        grant: &SourceBoundHostGrant,
+    ) -> HostConfirmationReceiverProjection {
+        let grant_projection = grant.projection();
+        HostConfirmationReceiverProjection {
+            source: grant_projection.source.clone(),
+            pending: CorePendingHostAdmissionProjection {
+                source: grant_projection.source.clone(),
+                stage: CorePendingHostAdmissionStage::Confirming,
+                permit_key: Some(grant_projection.permit_key),
+                host: Some(grant_projection.host.clone()),
+                top_slot: Some(grant_projection.top_slot),
+            },
+            grant: grant_projection,
+        }
+    }
+
+    fn grant_pending_for(grant: &SourceBoundHostGrant) -> CorePendingHostAdmissionProjection {
+        let projection = grant.projection();
+        CorePendingHostAdmissionProjection {
+            source: projection.source,
+            stage: CorePendingHostAdmissionStage::Grant,
+            permit_key: Some(projection.permit_key),
+            host: Some(projection.host),
+            top_slot: Some(projection.top_slot),
+        }
+    }
+
+    pub(crate) fn prepare_host_confirmation<Installation>(
+        &mut self,
+        owner: CoreHostConfirmationSource<Installation>,
+    ) -> HostConfirmationPreparationOutcome<Installation> {
+        let receiver = Self::confirmation_receiver_for(&owner.grant);
+        let expected_grant_pending = Self::grant_pending_for(&owner.grant);
+        let exact = self.host_admission_source == receiver.source
+            && self.pending_host_admission.as_ref()
+                == Some(&CorePendingHostAdmission::Grant(expected_grant_pending));
+        let Some(ready_state) = self
+            .state
+            .prepare_host_ready(&receiver.grant.host, receiver.grant.top_slot)
+        else {
+            return HostConfirmationPreparationOutcome::ReceiverMismatch {
+                evidence: HostConfirmationReceiverMismatchProjection {
+                    expected: receiver,
+                    observed: self
+                        .pending_host_admission
+                        .as_ref()
+                        .and_then(CorePendingHostAdmission::confirmation_receiver),
+                },
+                owner,
+            };
+        };
+        if !exact {
+            return HostConfirmationPreparationOutcome::ReceiverMismatch {
+                evidence: HostConfirmationReceiverMismatchProjection {
+                    expected: receiver,
+                    observed: self
+                        .pending_host_admission
+                        .as_ref()
+                        .and_then(CorePendingHostAdmission::confirmation_receiver),
+                },
+                owner,
+            };
+        }
+        let ready = PreparedHostReadyPublication {
+            projection: HostAdmissionReadyProjection {
+                source: receiver.source.clone(),
+                host: receiver.grant.host.clone(),
+                top_slot: receiver.grant.top_slot,
+                availability: RouterAvailability::Ready,
+            },
+        };
+        let expected_issuer = owner.grant.issuer.clone();
+        self.pending_host_admission = Some(CorePendingHostAdmission::Confirming(receiver.clone()));
+        HostConfirmationPreparationOutcome::Prepared(CorePreparedHostConfirmation {
+            grant: owner.grant,
+            installation: owner.installation,
+            receiver,
+            ready,
+            expected_issuer,
+            ready_state,
+        })
+    }
+
+    pub(crate) fn unwind_host_confirmation<Installation>(
+        &mut self,
+        owner: CorePreparedHostConfirmation<Installation>,
+    ) -> HostConfirmationUnwindOutcome<Installation> {
+        let exact = self.pending_host_admission.as_ref()
+            == Some(&CorePendingHostAdmission::Confirming(
+                owner.receiver.clone(),
+            ));
+        if !exact {
+            let evidence = HostConfirmationReceiverMismatchProjection {
+                expected: owner.receiver.clone(),
+                observed: self
+                    .pending_host_admission
+                    .as_ref()
+                    .and_then(CorePendingHostAdmission::confirmation_receiver),
+            };
+            return HostConfirmationUnwindOutcome::Mismatch { owner, evidence };
+        }
+        self.pending_host_admission = Some(CorePendingHostAdmission::Grant(
+            Self::grant_pending_for(&owner.grant),
+        ));
+        HostConfirmationUnwindOutcome::Grant(CoreHostConfirmationSource {
+            grant: owner.grant,
+            installation: owner.installation,
+        })
+    }
+
+    pub(crate) fn confirm_host_admission_with_binding<Installation, Installed, F>(
+        &mut self,
+        issuer: &mut HostAdmissionIssuer,
+        owner: CorePreparedHostConfirmation<Installation>,
+        install_binding: F,
+    ) -> HostAdmissionConfirmationCoreOutcome<Installation, Installed>
+    where
+        F: FnOnce(Installation, HostLease) -> Installed,
+    {
+        let receiver_exact = self.pending_host_admission.as_ref()
+            == Some(&CorePendingHostAdmission::Confirming(
+                owner.receiver.clone(),
+            ));
+        if !receiver_exact {
+            let evidence = HostConfirmationReceiverMismatchProjection {
+                expected: owner.receiver.clone(),
+                observed: self
+                    .pending_host_admission
+                    .as_ref()
+                    .and_then(CorePendingHostAdmission::confirmation_receiver),
+            };
+            return HostAdmissionConfirmationCoreOutcome::ReceiverMismatch { owner, evidence };
+        }
+        let observed_issuer = issuer.projection();
+        if observed_issuer != owner.expected_issuer {
+            let evidence = HostConfirmationIssuerMismatchProjection {
+                receiver: owner.receiver.clone(),
+                expected_issuer: owner.expected_issuer.clone(),
+                observed_issuer,
+            };
+            return HostAdmissionConfirmationCoreOutcome::IssuerRejected { owner, evidence };
+        }
+        let confirmation = match issuer.confirm(&owner.grant.grant) {
+            Ok(confirmation) => confirmation,
+            Err(_) => {
+                let evidence = HostConfirmationIssuerMismatchProjection {
+                    receiver: owner.receiver.clone(),
+                    expected_issuer: owner.expected_issuer.clone(),
+                    observed_issuer: issuer.projection(),
+                };
+                return HostAdmissionConfirmationCoreOutcome::IssuerRejected { owner, evidence };
+            }
+        };
+        let projection = owner.ready.projection;
+        let installed = install_binding(owner.installation, confirmation.into_lease());
+        self.pending_host_admission = None;
+        self.host_admission_source_open = false;
+        self.state = owner.ready_state;
+        HostAdmissionConfirmationCoreOutcome::Ready {
+            projection,
+            installed,
+        }
+    }
+
+    fn unavailable_receiver_mismatch(
+        &self,
+        expected_source: &HostAdmissionSourceProjection,
+    ) -> HostAdmissionUnavailableMismatchProjection {
+        HostAdmissionUnavailableMismatchProjection {
+            expected_source: expected_source.clone(),
+            observed_pending: self
+                .pending_host_admission
+                .as_ref()
+                .map(CorePendingHostAdmission::projection),
+        }
+    }
+
+    fn prepare_host_admission_unavailable_publication(
+        &self,
+        cause: HostAdmissionUnavailableCause,
+        reopen_after_changed_observation: bool,
+    ) -> PreparedHostUnavailablePublication {
+        let HostAdmissionUnavailableDisposition::Unavailable {
+            mut reason,
+            mut permanence,
+        } = cause.disposition
+        else {
+            unreachable!("Awaiting is returned before unavailable publication")
+        };
+        let (next_incarnation, incarnation_exhausted) =
+            match cause.source.availability_incarnation.0.checked_add(1) {
+                Some(next) => (next, false),
+                None => {
+                    reason = RouterUnavailableReason::AuthorityEstablishmentFailed;
+                    permanence = HostAdmissionPermanence::PermanentForRouter;
+                    (cause.source.availability_incarnation.0, true)
+                }
+            };
+        let kind = match (&reason, permanence) {
+            (_, HostAdmissionPermanence::PermanentForRouter)
+                if cause.evidence.exhaustion.is_some()
+                    || incarnation_exhausted
+                    || cause
+                        .evidence
+                        .operation_failure
+                        .as_ref()
+                        .is_some_and(|failure| {
+                            failure.disposition
+                                == HostAdmissionOperationFailureDisposition::PermanentIdentityExhausted
+                        }) => HostAdmissionSourceKind::PermanentIdentityExhausted,
+            (RouterUnavailableReason::RegistryInvariantViolation, _) => {
+                HostAdmissionSourceKind::PermanentRegistryInvariantViolation
+            }
+            (RouterUnavailableReason::HostLost, _) => HostAdmissionSourceKind::RetryableHostLost,
+            (RouterUnavailableReason::HostConflict, _) => {
+                HostAdmissionSourceKind::RetryableHostConflict
+            }
+            (RouterUnavailableReason::InvalidHostUiTopology, _) => {
+                HostAdmissionSourceKind::RetryableInvalidHostUiTopology
+            }
+            (RouterUnavailableReason::AuthorityEstablishmentFailed, _) => {
+                if permanence == HostAdmissionPermanence::PermanentForRouter {
+                    HostAdmissionSourceKind::PermanentAuthorityEstablishmentFailed
+                } else {
+                    HostAdmissionSourceKind::RetryableAuthorityEstablishmentFailed
+                }
+            }
+        };
+        let retained_host = cause.source.host.or_else(|| self.state.host().cloned());
+        let retained_top_slot = cause.source.top_slot.or_else(|| self.state.top_slot());
+        let source = HostAdmissionSourceProjection {
+            router: self.router,
+            availability_incarnation: AvailabilityIncarnation(next_incarnation),
+            kind,
+            public_reason: Some(reason.clone()),
+            host: retained_host,
+            top_slot: retained_top_slot,
+        };
+        let terminal = HostAdmissionUnavailableTerminalProjection {
+            source: source.clone(),
+            cause_digest: cause.cause_digest,
+            reason: reason.clone(),
+            permanence,
+        };
+        let mut state = self.state.clone();
+        state.fail_closed_unavailable(reason);
+        PreparedHostUnavailablePublication {
+            source_open: reopen_after_changed_observation
+                && permanence == HostAdmissionPermanence::RetryableAfterCandidateChange,
+            terminal,
+            source,
+            state,
+        }
+    }
+
+    fn publish_prepared_host_admission_unavailable(
+        &mut self,
+        prepared: PreparedHostUnavailablePublication,
+    ) -> HostAdmissionUnavailableTerminalProjection {
+        self.pending_host_admission = None;
+        self.host_admission_source = prepared.source;
+        self.host_admission_source_open = prepared.source_open;
+        self.state = prepared.state;
+        prepared.terminal
+    }
+
+    fn retain_host_loss_admission_source(&mut self, host: HostVersion, top_slot: RouteSlotId) {
+        let Some(incarnation) = self
+            .host_admission_source
+            .availability_incarnation
+            .0
+            .checked_add(1)
+        else {
+            self.host_admission_source = HostAdmissionSourceProjection {
+                router: self.router,
+                availability_incarnation: self.host_admission_source.availability_incarnation,
+                kind: HostAdmissionSourceKind::PermanentIdentityExhausted,
+                public_reason: Some(RouterUnavailableReason::AuthorityEstablishmentFailed),
+                host: Some(host),
+                top_slot: Some(top_slot),
+            };
+            self.host_admission_source_open = false;
+            self.pending_host_admission = None;
+            self.state
+                .fail_closed_unavailable(RouterUnavailableReason::AuthorityEstablishmentFailed);
+            return;
+        };
+        self.host_admission_source = HostAdmissionSourceProjection {
+            router: self.router,
+            availability_incarnation: AvailabilityIncarnation(incarnation),
+            kind: HostAdmissionSourceKind::RetryableHostLost,
+            public_reason: Some(RouterUnavailableReason::HostLost),
+            host: Some(host),
+            top_slot: Some(top_slot),
+        };
+        self.host_admission_source_open = false;
+        self.pending_host_admission = None;
+    }
+
+    fn retain_awaiting_admission_source(&mut self) {
+        let Some(incarnation) = self
+            .host_admission_source
+            .availability_incarnation
+            .0
+            .checked_add(1)
+        else {
+            self.host_admission_source = HostAdmissionSourceProjection {
+                router: self.router,
+                availability_incarnation: self.host_admission_source.availability_incarnation,
+                kind: HostAdmissionSourceKind::PermanentIdentityExhausted,
+                public_reason: Some(RouterUnavailableReason::AuthorityEstablishmentFailed),
+                host: None,
+                top_slot: None,
+            };
+            self.host_admission_source_open = false;
+            self.pending_host_admission = None;
+            self.state
+                .fail_closed_unavailable(RouterUnavailableReason::AuthorityEstablishmentFailed);
+            return;
+        };
+        self.host_admission_source = HostAdmissionSourceProjection {
+            router: self.router,
+            availability_incarnation: AvailabilityIncarnation(incarnation),
+            kind: HostAdmissionSourceKind::InitialAwaiting,
+            public_reason: None,
+            host: None,
+            top_slot: None,
+        };
+        self.host_admission_source_open = true;
+        self.pending_host_admission = None;
+    }
+
+    pub(crate) fn complete_pre_staging_host_admission_unavailable<
+        Installation,
+        Evidence,
+        PhysicalTerminal,
+        Consume,
+    >(
+        &mut self,
+        issuer: &mut HostAdmissionIssuer,
+        source: HostAdmissionUnavailablePreStagingSource<Installation, Evidence>,
+        consume_installation_and_clear_holder: Consume,
+    ) -> HostAdmissionUnavailablePreStagingOutcome<Installation, Evidence, PhysicalTerminal>
+    where
+        Consume: FnOnce(Installation) -> PhysicalTerminal,
+    {
+        let expected_source = source.prepared.core.source.clone();
+        let expected_pending = match &source.owner {
+            HostAdmissionUnavailablePreStagingOwner::Permit(permit) => {
+                CorePendingHostAdmission::Permit(CorePendingHostAdmissionProjection {
+                    source: permit.source.clone(),
+                    stage: CorePendingHostAdmissionStage::Permit,
+                    permit_key: Some(permit.key),
+                    host: None,
+                    top_slot: None,
+                })
+            }
+            HostAdmissionUnavailablePreStagingOwner::Token(token) => {
+                CorePendingHostAdmission::Token(CorePendingHostAdmissionProjection {
+                    source: token.permit.source.clone(),
+                    stage: CorePendingHostAdmissionStage::Token,
+                    permit_key: Some(token.permit.key),
+                    host: None,
+                    top_slot: None,
+                })
+            }
+        };
+        if self.host_admission_source != expected_source
+            || self.pending_host_admission.as_ref() != Some(&expected_pending)
+        {
+            let evidence = HostAdmissionUnavailableFailureEvidence::Receiver(
+                self.unavailable_receiver_mismatch(&expected_source),
+            );
+            return HostAdmissionUnavailablePreStagingOutcome::Mismatch { source, evidence };
+        }
+        if let HostAdmissionUnavailablePreStagingOwner::Token(token) = &source.owner {
+            let expected_issuer = token.issuer.clone();
+            let observed_issuer = issuer.projection();
+            if observed_issuer != expected_issuer {
+                let evidence = HostAdmissionUnavailableFailureEvidence::Issuer(
+                    HostAdmissionUnavailableIssuerMismatchProjection {
+                        receiver: self.unavailable_receiver_mismatch(&expected_source),
+                        operation: HostAdmissionUnavailableIssuerOperation::CancelToken,
+                        expected_issuer,
+                        observed_issuer,
+                    },
+                );
+                return HostAdmissionUnavailablePreStagingOutcome::Mismatch { source, evidence };
+            }
+        }
+        let HostAdmissionUnavailablePreStagingSource {
+            prepared,
+            owner,
+            installation,
+        } = source;
+        let publication =
+            self.prepare_host_admission_unavailable_publication(prepared.core.clone(), false);
+        if let HostAdmissionUnavailablePreStagingOwner::Token(token) = &owner
+            && issuer.cancel(&token.token).is_err()
+        {
+            let evidence = HostAdmissionUnavailableFailureEvidence::Issuer(
+                HostAdmissionUnavailableIssuerMismatchProjection {
+                    receiver: self.unavailable_receiver_mismatch(&expected_source),
+                    operation: HostAdmissionUnavailableIssuerOperation::CancelToken,
+                    expected_issuer: token.issuer.clone(),
+                    observed_issuer: issuer.projection(),
+                },
+            );
+            return HostAdmissionUnavailablePreStagingOutcome::Mismatch {
+                source: HostAdmissionUnavailablePreStagingSource {
+                    prepared,
+                    owner,
+                    installation,
+                },
+                evidence,
+            };
+        }
+        let physical = consume_installation_and_clear_holder(installation);
+        let terminal = self.publish_prepared_host_admission_unavailable(publication);
+        HostAdmissionUnavailablePreStagingOutcome::Published { terminal, physical }
+    }
+
+    pub(crate) fn complete_granted_host_admission_unavailable<
+        Installation,
+        Evidence,
+        PhysicalTerminal,
+        Consume,
+    >(
+        &mut self,
+        issuer: &mut HostAdmissionIssuer,
+        source: HostAdmissionUnavailableGrantedSource<Installation, Evidence>,
+        consume_physical_terminal: Consume,
+    ) -> HostAdmissionUnavailableGrantedOutcome<Installation, Evidence, PhysicalTerminal>
+    where
+        Consume: FnOnce(Installation) -> PhysicalTerminal,
+    {
+        let expected_source = source.prepared.core.source.clone();
+        let expected_pending =
+            CorePendingHostAdmission::Grant(Self::grant_pending_for(&source.owner.grant));
+        if self.host_admission_source != expected_source
+            || self.pending_host_admission.as_ref() != Some(&expected_pending)
+        {
+            let evidence = HostAdmissionUnavailableFailureEvidence::Receiver(
+                self.unavailable_receiver_mismatch(&expected_source),
+            );
+            return HostAdmissionUnavailableGrantedOutcome::Mismatch { source, evidence };
+        }
+        let expected_issuer = source.owner.grant.issuer.clone();
+        let observed_issuer = issuer.projection();
+        if observed_issuer != expected_issuer {
+            let evidence = HostAdmissionUnavailableFailureEvidence::Issuer(
+                HostAdmissionUnavailableIssuerMismatchProjection {
+                    receiver: self.unavailable_receiver_mismatch(&expected_source),
+                    operation: HostAdmissionUnavailableIssuerOperation::RejectGrant,
+                    expected_issuer,
+                    observed_issuer,
+                },
+            );
+            return HostAdmissionUnavailableGrantedOutcome::Mismatch { source, evidence };
+        }
+        let HostAdmissionUnavailableGrantedSource { prepared, owner } = source;
+        let publication =
+            self.prepare_host_admission_unavailable_publication(prepared.core.clone(), false);
+        if issuer.reject_after_mutation(&owner.grant.grant).is_err() {
+            let evidence = HostAdmissionUnavailableFailureEvidence::Issuer(
+                HostAdmissionUnavailableIssuerMismatchProjection {
+                    receiver: self.unavailable_receiver_mismatch(&expected_source),
+                    operation: HostAdmissionUnavailableIssuerOperation::RejectGrant,
+                    expected_issuer,
+                    observed_issuer: issuer.projection(),
+                },
+            );
+            return HostAdmissionUnavailableGrantedOutcome::Mismatch {
+                source: HostAdmissionUnavailableGrantedSource { prepared, owner },
+                evidence,
+            };
+        }
+        let physical = consume_physical_terminal(owner.installation);
+        let terminal = self.publish_prepared_host_admission_unavailable(publication);
+        HostAdmissionUnavailableGrantedOutcome::Published { terminal, physical }
+    }
+
+    pub(crate) fn complete_observed_host_admission_unavailable<Evidence, Clear>(
+        &mut self,
+        prepared: PreparedHostAdmissionUnavailableCause<Evidence>,
+        clear_holder: Clear,
+    ) -> HostAdmissionUnavailableObservedOutcome<Evidence>
+    where
+        Clear: FnOnce(),
+    {
+        let expected_source = prepared.core.source.clone();
+        if self.host_admission_source != expected_source || self.pending_host_admission.is_some() {
+            let evidence = HostAdmissionUnavailableFailureEvidence::Receiver(
+                self.unavailable_receiver_mismatch(&expected_source),
+            );
+            return HostAdmissionUnavailableObservedOutcome::Mismatch { prepared, evidence };
+        }
+        if prepared.core.disposition == HostAdmissionUnavailableDisposition::Awaiting {
+            return HostAdmissionUnavailableObservedOutcome::Awaiting {
+                source: expected_source,
+                evidence: prepared.evidence,
+            };
+        }
+        if matches!(
+            expected_source.kind,
+            HostAdmissionSourceKind::PermanentAuthorityEstablishmentFailed
+                | HostAdmissionSourceKind::PermanentIdentityExhausted
+                | HostAdmissionSourceKind::PermanentRegistryInvariantViolation
+        ) {
+            self.host_admission_source_open = false;
+            return HostAdmissionUnavailableObservedOutcome::Stable {
+                source: expected_source,
+                evidence: prepared.evidence,
+            };
+        }
+        let changed =
+            prepared.core.evidence.expected_digest != prepared.core.evidence.observed_digest;
+        if !changed
+            && matches!(
+                &prepared.core.disposition,
+                HostAdmissionUnavailableDisposition::Unavailable {
+                    permanence: HostAdmissionPermanence::RetryableAfterCandidateChange,
+                    ..
+                }
+            )
+        {
+            return HostAdmissionUnavailableObservedOutcome::Awaiting {
+                source: expected_source,
+                evidence: prepared.evidence,
+            };
+        }
+        let publication =
+            self.prepare_host_admission_unavailable_publication(prepared.core, changed);
+        clear_holder();
+        HostAdmissionUnavailableObservedOutcome::Published(
+            self.publish_prepared_host_admission_unavailable(publication),
+        )
     }
 
     pub(crate) fn accept_post_commit_authority_transfer(
@@ -6137,6 +7586,9 @@ impl RouterEngine {
             trace_digest,
         };
 
+        let former_host = expected_host.retired_host.version().clone();
+        let former_top_slot = expected_host.retired_host.top_slot();
+
         let physical = clear_physical_holder(expected_host);
         let mut terminal_plan = self
             .pending_post_commit_terminal
@@ -6192,6 +7644,7 @@ impl RouterEngine {
         self.active_child_slots.clear();
         self.action = None;
         self.pending_post_commit_settlement_trace = None;
+        self.retain_host_loss_admission_source(former_host, former_top_slot);
 
         drop(normal_completion);
         drop(authority);
@@ -8518,6 +9971,7 @@ impl RouterEngine {
             self.completed_cleanup = completed_cleanup;
             self.active_branch = None;
             self.active_child_slots.clear();
+            self.retain_awaiting_admission_source();
         }
         BackNoTargetAuthorityCleanupCompletionCoreOutcome::Terminal(terminal)
     }
@@ -8622,6 +10076,7 @@ impl RouterEngine {
         self.completed_cleanup = completed_cleanup;
         self.active_branch = None;
         self.active_child_slots = active_child_slots;
+        self.retain_awaiting_admission_source();
         BackTargetPermanentCleanupCompletionCoreOutcome::Terminal(terminal)
     }
 
@@ -13069,6 +14524,11 @@ impl RouterEngine {
                 self.state.complete_authority_settlement(&version, top_slot)
             };
             assert!(settled);
+            if failure.kind() == NavigationFailureKind::HostLost {
+                self.retain_host_loss_admission_source(version, top_slot);
+            } else {
+                self.retain_awaiting_admission_source();
+            }
             self.active_branch = None;
             self.active_child_slots.clear();
             self.retire_history_authority();
@@ -15492,6 +16952,12 @@ impl RouterEngine {
     fn snapshot(&self) -> EngineSnapshot {
         EngineSnapshot {
             state: self.state.snapshot(),
+            host_admission_source: self.host_admission_source.clone(),
+            host_admission_source_open: self.host_admission_source_open,
+            pending_host_admission: self
+                .pending_host_admission
+                .as_ref()
+                .map(CorePendingHostAdmission::projection),
             ids: self.ids.snapshot(),
             history: self.history.authority_snapshot(),
             history_admission_world: self.history_admission_world,
@@ -16023,6 +17489,61 @@ impl RouterEngine {
         self.mount.snapshot()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_host_admission_source_projection(&self) -> HostAdmissionSourceProjection {
+        self.host_admission_source.clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_pending_host_admission_projection(
+        &self,
+    ) -> Option<CorePendingHostAdmissionProjection> {
+        self.pending_host_admission
+            .as_ref()
+            .map(CorePendingHostAdmission::projection)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_drift_prepared_host_confirmation_receiver_input(&mut self) -> bool {
+        if !matches!(
+            self.pending_host_admission.as_ref(),
+            Some(CorePendingHostAdmission::Confirming(_))
+        ) {
+            return false;
+        }
+        self.pending_host_admission = None;
+        true
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_drift_host_confirmation_preparation_receiver_input(&mut self) -> bool {
+        if !matches!(
+            self.pending_host_admission.as_ref(),
+            Some(CorePendingHostAdmission::Grant(_))
+        ) {
+            return false;
+        }
+        self.pending_host_admission = None;
+        true
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_replace_host_allocator_with_foreign_domain(&mut self) -> bool {
+        let Ok(ids) = CoreIdAllocator::new() else {
+            return false;
+        };
+        self.ids = ids;
+        true
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_cancel_source_bound_token(
+        issuer: &mut HostAdmissionIssuer,
+        token: &SourceBoundHostAdmissionToken,
+    ) -> bool {
+        issuer.cancel(&token.token).is_ok()
+    }
+
     #[cfg(test)]
     pub(crate) fn testing_begin_back_target_host_drift(&mut self) -> bool {
         let Some(host) = self.state.host().cloned() else {
@@ -16042,8 +17563,12 @@ impl RouterEngine {
         let Some(top_slot) = self.state.top_slot() else {
             return false;
         };
-        self.state.begin_authority_recovery(&host, top_slot)
-            && self.state.complete_authority_settlement(&host, top_slot)
+        let settled = self.state.begin_authority_recovery(&host, top_slot)
+            && self.state.complete_authority_settlement(&host, top_slot);
+        if settled {
+            self.retain_awaiting_admission_source();
+        }
+        settled
     }
 
     #[cfg(test)]
@@ -17025,8 +18550,10 @@ fn history_fixture_ready_engine() -> RouterEngine {
     )
     .unwrap();
     let mut issuer = HostAdmissionIssuer::new().unwrap();
-    let token = engine.request_host_admission(&mut issuer).unwrap();
-    let grant = engine.grant_host_admission(&mut issuer, &token).unwrap();
+    let token = engine.request_legacy_host_admission(&mut issuer).unwrap();
+    let grant = engine
+        .grant_legacy_host_admission(&mut issuer, &token)
+        .unwrap();
     let confirmation = issuer.confirm(&grant).unwrap();
     engine.confirm_host(&issuer, &confirmation).unwrap();
     engine
@@ -17208,6 +18735,9 @@ impl From<&EngineAction> for ActionSnapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct EngineSnapshot {
     state: RouterNavigationState,
+    host_admission_source: HostAdmissionSourceProjection,
+    host_admission_source_open: bool,
+    pending_host_admission: Option<CorePendingHostAdmissionProjection>,
     ids: crate::ids::CoreIdAllocatorSnapshot,
     history: HistoryAuthoritySnapshot,
     history_admission_world: Option<CoreIssuedWorldSealProjection>,
@@ -17254,6 +18784,7 @@ impl EngineSnapshot {
 #[cfg(test)]
 mod tests {
     use super::CoreBackTargetPermanentBeginOwner;
+    use super::*;
     use crate::admission::HostLease;
     use std::collections::VecDeque;
 
@@ -17304,7 +18835,9 @@ mod tests {
     use crate::location::RouteLocation;
     use crate::meta::ErrorBoundaryKey;
     use crate::pattern::RoutePattern;
-    use crate::presentation::{ActivePresentation, ActivePresentationKind};
+    use crate::presentation::{
+        ActivePresentation, ActivePresentationKind, RouterAvailability, RouterUnavailableReason,
+    };
     use crate::request::{
         NavigationFailure, NavigationFailureKind, NavigationPhase, RequestRecordError,
         RequestStatus,
@@ -17380,8 +18913,10 @@ mod tests {
         let mut engine =
             RouterEngine::install(tree, RouteViewKey::new("fallback").unwrap()).unwrap();
         let mut issuer = HostAdmissionIssuer::new().unwrap();
-        let token = engine.request_host_admission(&mut issuer).unwrap();
-        let grant = engine.grant_host_admission(&mut issuer, &token).unwrap();
+        let token = engine.request_legacy_host_admission(&mut issuer).unwrap();
+        let grant = engine
+            .grant_legacy_host_admission(&mut issuer, &token)
+            .unwrap();
         let confirmation = issuer.confirm(&grant).unwrap();
         engine.confirm_host(&issuer, &confirmation).unwrap();
         let lease = confirmation.into_lease();
@@ -17622,8 +19157,10 @@ mod tests {
         let mut donor =
             RouterEngine::install(tree(), RouteViewKey::new("fallback").unwrap()).unwrap();
         let mut issuer = HostAdmissionIssuer::new().unwrap();
-        let token = donor.request_host_admission(&mut issuer).unwrap();
-        let grant = donor.grant_host_admission(&mut issuer, &token).unwrap();
+        let token = donor.request_legacy_host_admission(&mut issuer).unwrap();
+        let grant = donor
+            .grant_legacy_host_admission(&mut issuer, &token)
+            .unwrap();
         let confirmation = issuer.confirm(&grant).unwrap();
         donor.confirm_host(&issuer, &confirmation).unwrap();
         let router = donor.router;
@@ -20830,11 +22367,642 @@ mod tests {
         let before = engine.snapshot();
 
         assert_eq!(
-            engine.request_host_admission(&mut issuer),
+            engine.request_legacy_host_admission(&mut issuer),
             Err(crate::admission::AdmissionError::AuthorityExists)
         );
         assert!(!issuer.has_outstanding());
         assert_eq!(engine.snapshot(), before);
+    }
+
+    fn r3_initial_host_admission_permit(engine: &mut RouterEngine) -> HostAdmissionSourcePermit {
+        match engine.issue_host_admission_source_permit() {
+            HostAdmissionSourcePermitOutcome::Issued(permit) => {
+                assert_eq!(permit.source.kind, HostAdmissionSourceKind::InitialAwaiting);
+                assert_eq!(permit.source.public_reason, None);
+                permit
+            }
+            HostAdmissionSourcePermitOutcome::Ineligible { .. } => {
+                panic!("an initial AwaitingHost source must be eligible")
+            }
+            HostAdmissionSourcePermitOutcome::Outstanding { .. } => {
+                panic!("a fresh engine must not have an outstanding admission owner")
+            }
+        }
+    }
+
+    fn r3_bind_candidate_unavailable<Evidence>(
+        source: &HostAdmissionSourceProjection,
+        kind: HostAdmissionUnavailableEvidenceKind,
+        candidate_revision: u64,
+        expected_digest: u64,
+        observed_digest: u64,
+        evidence: Evidence,
+    ) -> PreparedHostAdmissionUnavailableCause<Evidence> {
+        let projection = HostAdmissionUnavailableEvidenceProjection {
+            source: source.clone(),
+            kind,
+            candidate_revision: Some(candidate_revision),
+            expected_digest,
+            observed_digest,
+            exhaustion: None,
+            operation_failure: None,
+        };
+        match bind_host_admission_unavailable_cause(source.clone(), &projection, evidence) {
+            HostAdmissionUnavailableCauseBindOutcome::Bound(prepared) => prepared,
+            HostAdmissionUnavailableCauseBindOutcome::Mismatch { .. } => {
+                panic!("the exact candidate evidence must bind to its source")
+            }
+        }
+    }
+
+    fn r3_source_bound_token(
+        engine: &mut RouterEngine,
+        issuer: &mut HostAdmissionIssuer,
+    ) -> SourceBoundHostAdmissionToken {
+        let permit = r3_initial_host_admission_permit(engine);
+        match engine.request_host_admission(issuer, permit) {
+            Ok(token) => token,
+            Err(_) => panic!("an exact initial permit must issue one source-bound token"),
+        }
+    }
+
+    fn r3_source_bound_grant(
+        engine: &mut RouterEngine,
+        issuer: &mut HostAdmissionIssuer,
+    ) -> SourceBoundHostGrant {
+        let token = r3_source_bound_token(engine, issuer);
+        match engine.grant_host_admission(issuer, token) {
+            Ok(grant) => grant,
+            Err(_) => panic!("an exact source-bound token must issue one source-bound grant"),
+        }
+    }
+
+    fn r3_conflict_pre_staging_source<Installation, Evidence>(
+        engine: &mut RouterEngine,
+        issuer: &mut HostAdmissionIssuer,
+        installation: Installation,
+        evidence: Evidence,
+    ) -> HostAdmissionUnavailablePreStagingSource<Installation, Evidence> {
+        let token = r3_source_bound_token(engine, issuer);
+        let source = token.permit.source.clone();
+        let prepared = r3_bind_candidate_unavailable(
+            &source,
+            HostAdmissionUnavailableEvidenceKind::Conflict,
+            7,
+            0x434f_4e46_4c49_4354,
+            0x434f_4e46_4c49_4354,
+            evidence,
+        );
+        HostAdmissionUnavailablePreStagingSource {
+            prepared,
+            owner: HostAdmissionUnavailablePreStagingOwner::Token(token),
+            installation,
+        }
+    }
+
+    #[test]
+    fn host_admission_source_permit_reopens_only_changed_retryable_unavailable() {
+        let mut engine = RouterEngine::install(
+            tree(),
+            RouteViewKey::new("source-permit-r3-fallback").unwrap(),
+        )
+        .unwrap();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+        let permit = r3_initial_host_admission_permit(&mut engine);
+        let initial_source = permit.source.clone();
+        let prepared = r3_bind_candidate_unavailable(
+            &initial_source,
+            HostAdmissionUnavailableEvidenceKind::Conflict,
+            1,
+            0x1111,
+            0x2222,
+            Box::new(1_u64),
+        );
+        let source = HostAdmissionUnavailablePreStagingSource {
+            prepared,
+            owner: HostAdmissionUnavailablePreStagingOwner::Permit(permit),
+            installation: Box::new(0xA11C_u64),
+        };
+        let published = engine.complete_pre_staging_host_admission_unavailable(
+            &mut issuer,
+            source,
+            |installation| installation,
+        );
+        let first_terminal = match published {
+            HostAdmissionUnavailablePreStagingOutcome::Published { terminal, physical } => {
+                assert_eq!(*physical, 0xA11C_u64);
+                terminal
+            }
+            HostAdmissionUnavailablePreStagingOutcome::Mismatch { .. } => {
+                panic!("an exact permit owner must publish its derived conflict")
+            }
+        };
+        assert_eq!(first_terminal.reason, RouterUnavailableReason::HostConflict);
+        assert_eq!(
+            first_terminal.permanence,
+            HostAdmissionPermanence::RetryableAfterCandidateChange
+        );
+
+        let unavailable_source = match engine.issue_host_admission_source_permit() {
+            HostAdmissionSourcePermitOutcome::Ineligible { source, .. } => source,
+            HostAdmissionSourcePermitOutcome::Issued(_) => {
+                panic!("an unchanged retryable source must not reopen")
+            }
+            HostAdmissionSourcePermitOutcome::Outstanding { .. } => {
+                panic!("the conflict terminal consumed the permit owner")
+            }
+        };
+        let changed = r3_bind_candidate_unavailable(
+            &unavailable_source,
+            HostAdmissionUnavailableEvidenceKind::Conflict,
+            2,
+            0x2222,
+            0x3333,
+            Box::new(2_u64),
+        );
+        let clear_calls = std::cell::Cell::new(0usize);
+        match engine.complete_observed_host_admission_unavailable(changed, || {
+            clear_calls.set(clear_calls.get() + 1);
+        }) {
+            HostAdmissionUnavailableObservedOutcome::Published(terminal) => {
+                assert_eq!(terminal.reason, RouterUnavailableReason::HostConflict);
+            }
+            HostAdmissionUnavailableObservedOutcome::Awaiting { .. }
+            | HostAdmissionUnavailableObservedOutcome::Stable { .. }
+            | HostAdmissionUnavailableObservedOutcome::Mismatch { .. } => {
+                panic!("a changed retryable observation must publish a fresh source")
+            }
+        }
+        assert_eq!(clear_calls.get(), 1);
+        let reopened = match engine.issue_host_admission_source_permit() {
+            HostAdmissionSourcePermitOutcome::Issued(permit) => permit,
+            HostAdmissionSourcePermitOutcome::Ineligible { .. }
+            | HostAdmissionSourcePermitOutcome::Outstanding { .. } => {
+                panic!("only the changed retryable source must reopen")
+            }
+        };
+        assert!(
+            reopened.source.availability_incarnation.0
+                > unavailable_source.availability_incarnation.0
+        );
+
+        let mut permanent_engine = RouterEngine::install(
+            tree(),
+            RouteViewKey::new("source-permit-permanent-r3-fallback").unwrap(),
+        )
+        .unwrap();
+        let mut permanent_issuer = HostAdmissionIssuer::new().unwrap();
+        let permanent_permit = r3_initial_host_admission_permit(&mut permanent_engine);
+        let permanent_source = permanent_permit.source.clone();
+        let permanent_projection = HostAdmissionUnavailableEvidenceProjection {
+            source: permanent_source.clone(),
+            kind: HostAdmissionUnavailableEvidenceKind::AuthorityEstablishmentFailed,
+            candidate_revision: Some(u64::MAX),
+            expected_digest: 0xE7A0,
+            observed_digest: 0xE7A0,
+            exhaustion: Some(HostAdmissionAllocatorExhaustionEvidence {
+                counter: HostAdmissionAllocatorCounter::CandidateRevision,
+                current: u64::MAX,
+                attempted: u64::MAX,
+            }),
+            operation_failure: None,
+        };
+        let permanent_prepared = match bind_host_admission_unavailable_cause(
+            permanent_source,
+            &permanent_projection,
+            Box::new(3_u64),
+        ) {
+            HostAdmissionUnavailableCauseBindOutcome::Bound(prepared) => prepared,
+            HostAdmissionUnavailableCauseBindOutcome::Mismatch { .. } => {
+                panic!("candidate revision exhaustion must bind as a permanent source")
+            }
+        };
+        let permanent_owner = HostAdmissionUnavailablePreStagingSource {
+            prepared: permanent_prepared,
+            owner: HostAdmissionUnavailablePreStagingOwner::Permit(permanent_permit),
+            installation: Box::new(0xE7A0_u64),
+        };
+        let permanent_terminal = match permanent_engine
+            .complete_pre_staging_host_admission_unavailable(
+                &mut permanent_issuer,
+                permanent_owner,
+                |installation| installation,
+            ) {
+            HostAdmissionUnavailablePreStagingOutcome::Published { terminal, .. } => terminal,
+            HostAdmissionUnavailablePreStagingOutcome::Mismatch { .. } => {
+                panic!("the exact permanent permit owner must publish")
+            }
+        };
+        assert_eq!(
+            permanent_terminal.permanence,
+            HostAdmissionPermanence::PermanentForRouter
+        );
+        match permanent_engine.issue_host_admission_source_permit() {
+            HostAdmissionSourcePermitOutcome::Ineligible { source, .. } => {
+                assert_eq!(
+                    source.kind,
+                    HostAdmissionSourceKind::PermanentIdentityExhausted
+                );
+            }
+            HostAdmissionSourcePermitOutcome::Issued(_)
+            | HostAdmissionSourcePermitOutcome::Outstanding { .. } => {
+                panic!("a permanent source must never reopen")
+            }
+        }
+    }
+
+    #[test]
+    fn host_admission_unavailable_cause_is_derived_from_exact_observation() {
+        let mut engine = RouterEngine::install(
+            tree(),
+            RouteViewKey::new("derived-unavailable-r3-fallback").unwrap(),
+        )
+        .unwrap();
+        let permit = r3_initial_host_admission_permit(&mut engine);
+        let source = permit.source.clone();
+        let projection = HostAdmissionUnavailableEvidenceProjection {
+            source: source.clone(),
+            kind: HostAdmissionUnavailableEvidenceKind::Conflict,
+            candidate_revision: Some(11),
+            expected_digest: 0xABCD,
+            observed_digest: 0xDCBA,
+            exhaustion: None,
+            operation_failure: None,
+        };
+        let evidence = Box::new(0xCAFE_u64);
+
+        let prepared =
+            match bind_host_admission_unavailable_cause(source.clone(), &projection, evidence) {
+                HostAdmissionUnavailableCauseBindOutcome::Bound(prepared) => prepared,
+                HostAdmissionUnavailableCauseBindOutcome::Mismatch { .. } => {
+                    panic!("an exact observation must bind")
+                }
+            };
+        assert_eq!(prepared.core.source, source);
+        assert_eq!(prepared.core.evidence, projection);
+        assert_eq!(
+            prepared.core.disposition,
+            HostAdmissionUnavailableDisposition::Unavailable {
+                reason: RouterUnavailableReason::HostConflict,
+                permanence: HostAdmissionPermanence::RetryableAfterCandidateChange,
+            }
+        );
+        assert_ne!(prepared.core.cause_digest, 0);
+        assert_eq!(*prepared.evidence, 0xCAFE_u64);
+    }
+
+    #[test]
+    fn host_unavailable_rejection_clears_issuer_before_publication() {
+        let mut engine = RouterEngine::install(
+            tree(),
+            RouteViewKey::new("unavailable-rejection-r3-fallback").unwrap(),
+        )
+        .unwrap();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+        let source = r3_conflict_pre_staging_source(
+            &mut engine,
+            &mut issuer,
+            Box::new(0x5155_u64),
+            Box::new(0xE11D_u64),
+        );
+        let callback_calls = std::cell::Cell::new(0usize);
+
+        let outcome = engine.complete_pre_staging_host_admission_unavailable(
+            &mut issuer,
+            source,
+            |installation| {
+                callback_calls.set(callback_calls.get() + 1);
+                installation
+            },
+        );
+
+        let HostAdmissionUnavailablePreStagingOutcome::Published { terminal, physical } = outcome
+        else {
+            panic!("the exact token cancellation must publish")
+        };
+        assert_eq!(callback_calls.get(), 1);
+        assert_eq!(*physical, 0x5155_u64);
+        assert!(!issuer.has_outstanding());
+        assert_eq!(terminal.reason, RouterUnavailableReason::HostConflict);
+        assert_eq!(
+            engine.availability(),
+            &RouterAvailability::Unavailable(RouterUnavailableReason::HostConflict)
+        );
+    }
+
+    #[test]
+    fn host_unavailable_issuer_failure_returns_typed_observed_evidence() {
+        let mut engine = RouterEngine::install(
+            tree(),
+            RouteViewKey::new("unavailable-issuer-r3-fallback").unwrap(),
+        )
+        .unwrap();
+        let mut owning_issuer = HostAdmissionIssuer::new().unwrap();
+        let source = r3_conflict_pre_staging_source(
+            &mut engine,
+            &mut owning_issuer,
+            Box::new(0x5156_u64),
+            Box::new(0xE12D_u64),
+        );
+        let expected_issuer = owning_issuer.projection();
+        let mut observed_issuer = HostAdmissionIssuer::new().unwrap();
+        let observed = observed_issuer.projection();
+        let callback_calls = std::cell::Cell::new(0usize);
+
+        let outcome = engine.complete_pre_staging_host_admission_unavailable(
+            &mut observed_issuer,
+            source,
+            |installation| {
+                callback_calls.set(callback_calls.get() + 1);
+                installation
+            },
+        );
+        let HostAdmissionUnavailablePreStagingOutcome::Mismatch { source, evidence } = outcome
+        else {
+            panic!("a foreign issuer must return the prepared source whole")
+        };
+        let HostAdmissionUnavailableFailureEvidence::Issuer(mismatch) = evidence else {
+            panic!("the exact Core receiver must classify only issuer drift")
+        };
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(
+            mismatch.operation,
+            HostAdmissionUnavailableIssuerOperation::CancelToken
+        );
+        assert_eq!(mismatch.expected_issuer, expected_issuer);
+        assert_eq!(mismatch.observed_issuer, observed);
+        assert!(owning_issuer.has_outstanding());
+        assert_eq!(*source.installation, 0x5156_u64);
+        assert_eq!(*source.prepared.evidence, 0xE12D_u64);
+        let HostAdmissionUnavailablePreStagingOwner::Token(token) = source.owner else {
+            panic!("issuer rejection must return the source-bound token")
+        };
+        assert_eq!(token.permit.source, source.prepared.core.source);
+        assert_eq!(engine.availability(), &RouterAvailability::AwaitingHost);
+    }
+
+    #[test]
+    fn host_admission_request_sequence_exhaustion_is_permanent_and_exact() {
+        let mut engine = RouterEngine::install(
+            tree(),
+            RouteViewKey::new("request-exhaustion-r3-fallback").unwrap(),
+        )
+        .unwrap();
+        let permit = r3_initial_host_admission_permit(&mut engine);
+        let expected_source = permit.source.clone();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+        issuer.testing_exhaust_request_sequence_counter();
+        let expected_issuer = issuer.projection();
+        let issuer_before = issuer.snapshot();
+
+        let error = match engine.request_host_admission(&mut issuer, permit) {
+            Err(error) => error,
+            Ok(_) => panic!("request-sequence exhaustion must reject the permit"),
+        };
+        assert_eq!(issuer.snapshot(), issuer_before);
+        assert_eq!(error.owner.source, expected_source);
+        let HostAdmissionOperationFailureFreezeOutcome::Frozen(evidence) = error.evidence else {
+            panic!("an exact request exhaustion pair must freeze")
+        };
+        assert_eq!(
+            evidence.projection.operation,
+            HostAdmissionOperation::Request
+        );
+        assert_eq!(evidence.projection.error, AdmissionError::Exhausted);
+        assert_eq!(
+            evidence.projection.disposition,
+            HostAdmissionOperationFailureDisposition::PermanentIdentityExhausted
+        );
+        assert_eq!(evidence.projection.expected_issuer, expected_issuer);
+        assert_eq!(evidence.projection.observed_issuer, expected_issuer);
+        assert_eq!(
+            evidence.projection.exhaustion,
+            Some(HostAdmissionAllocatorExhaustionEvidence {
+                counter: HostAdmissionAllocatorCounter::RequestSequence,
+                current: u64::MAX,
+                attempted: u64::MAX,
+            })
+        );
+    }
+
+    #[test]
+    fn host_admission_grant_identity_exhaustion_is_permanent_and_exact() {
+        for counter in [
+            HostAdmissionAllocatorCounter::GrantEpoch,
+            HostAdmissionAllocatorCounter::HostVersion,
+            HostAdmissionAllocatorCounter::TopSlot,
+        ] {
+            let mut engine = RouterEngine::install(
+                tree(),
+                RouteViewKey::new("grant-exhaustion-r3-fallback").unwrap(),
+            )
+            .unwrap();
+            let mut issuer = HostAdmissionIssuer::new().unwrap();
+            let token = r3_source_bound_token(&mut engine, &mut issuer);
+            let expected_source = token.permit.source.clone();
+            match counter {
+                HostAdmissionAllocatorCounter::GrantEpoch => {
+                    issuer.testing_exhaust_grant_epoch_counter();
+                }
+                HostAdmissionAllocatorCounter::HostVersion => {
+                    engine.ids.testing_exhaust_host_counter();
+                }
+                HostAdmissionAllocatorCounter::TopSlot => {
+                    engine.ids.testing_exhaust_slot_counter();
+                }
+                HostAdmissionAllocatorCounter::CandidateRevision
+                | HostAdmissionAllocatorCounter::RequestSequence => unreachable!(),
+            }
+            let expected_issuer = issuer.projection();
+            let issuer_before = issuer.snapshot();
+            let ids_before = engine.ids.snapshot();
+
+            let error = match engine.grant_host_admission(&mut issuer, token) {
+                Err(error) => error,
+                Ok(_) => panic!("grant identity exhaustion must return the token owner"),
+            };
+            assert_eq!(issuer.snapshot(), issuer_before, "counter: {counter:?}");
+            assert_eq!(engine.ids.snapshot(), ids_before, "counter: {counter:?}");
+            assert_eq!(error.owner.permit.source, expected_source);
+            let HostAdmissionOperationFailureFreezeOutcome::Frozen(evidence) = error.evidence
+            else {
+                panic!("an exact grant exhaustion pair must freeze: {counter:?}")
+            };
+            assert_eq!(evidence.projection.operation, HostAdmissionOperation::Grant);
+            assert_eq!(evidence.projection.error, AdmissionError::Exhausted);
+            assert_eq!(
+                evidence.projection.disposition,
+                HostAdmissionOperationFailureDisposition::PermanentIdentityExhausted
+            );
+            assert_eq!(evidence.projection.expected_issuer, expected_issuer);
+            assert_eq!(evidence.projection.observed_issuer, expected_issuer);
+            assert_eq!(
+                evidence.projection.exhaustion,
+                Some(HostAdmissionAllocatorExhaustionEvidence {
+                    counter,
+                    current: u64::MAX,
+                    attempted: u64::MAX,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn host_confirmation_receiver_mismatch_returns_whole_owner_and_calls_zero() {
+        let mut source_engine = RouterEngine::install(
+            tree(),
+            RouteViewKey::new("confirmation-source-r3-fallback").unwrap(),
+        )
+        .unwrap();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+        let grant = r3_source_bound_grant(&mut source_engine, &mut issuer);
+        let expected_source = grant.source.permit.source.clone();
+        let expected_version = grant.grant.version().clone();
+        let expected_top_slot = grant.grant.top_slot();
+        let owner = bind_granted_host_admission_source(grant, Box::new(0xC0DE_u64));
+        let mut foreign_engine = RouterEngine::install(
+            tree(),
+            RouteViewKey::new("confirmation-foreign-r3-fallback").unwrap(),
+        )
+        .unwrap();
+        let callback_calls = std::cell::Cell::new(0usize);
+
+        let outcome = foreign_engine.prepare_host_confirmation(owner);
+        let HostConfirmationPreparationOutcome::ReceiverMismatch { owner, evidence } = outcome
+        else {
+            panic!("a foreign Core receiver must reject before Confirming")
+        };
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(evidence.expected.source, expected_source);
+        assert!(evidence.observed.is_none());
+        assert_eq!(owner.grant.grant.version(), &expected_version);
+        assert_eq!(owner.grant.grant.top_slot(), expected_top_slot);
+        assert_eq!(*owner.installation, 0xC0DE_u64);
+        assert!(issuer.is_outstanding_grant(&owner.grant.grant));
+    }
+
+    #[test]
+    fn host_confirmation_issuer_rejection_is_last_fallible_and_returns_whole_owner() {
+        let mut engine = RouterEngine::install(
+            tree(),
+            RouteViewKey::new("confirmation-issuer-r3-fallback").unwrap(),
+        )
+        .unwrap();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+        let grant = r3_source_bound_grant(&mut engine, &mut issuer);
+        let expected_version = grant.grant.version().clone();
+        let expected_top_slot = grant.grant.top_slot();
+        let owner = bind_granted_host_admission_source(grant, Box::new(0x1A57_u64));
+        let prepared = match engine.prepare_host_confirmation(owner) {
+            HostConfirmationPreparationOutcome::Prepared(prepared) => prepared,
+            HostConfirmationPreparationOutcome::ReceiverMismatch { .. } => {
+                panic!("the exact receiver must prepare confirmation")
+            }
+        };
+        let mut foreign_issuer = HostAdmissionIssuer::new().unwrap();
+        let observed_issuer = foreign_issuer.projection();
+        let callback_calls = std::cell::Cell::new(0usize);
+
+        let outcome = engine.confirm_host_admission_with_binding(
+            &mut foreign_issuer,
+            prepared,
+            |installation, _lease| {
+                callback_calls.set(callback_calls.get() + 1);
+                installation
+            },
+        );
+        let HostAdmissionConfirmationCoreOutcome::IssuerRejected { owner, evidence } = outcome
+        else {
+            panic!("foreign issuer drift must return the confirming owner")
+        };
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(evidence.observed_issuer, observed_issuer);
+        assert_eq!(owner.grant.grant.version(), &expected_version);
+        assert_eq!(owner.grant.grant.top_slot(), expected_top_slot);
+        assert_eq!(*owner.installation, 0x1A57_u64);
+        assert_eq!(engine.availability(), &RouterAvailability::AwaitingHost);
+    }
+
+    #[test]
+    fn host_confirmation_unwind_returns_grant_and_installation() {
+        let mut engine = RouterEngine::install(
+            tree(),
+            RouteViewKey::new("confirmation-unwind-r3-fallback").unwrap(),
+        )
+        .unwrap();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+        let grant = r3_source_bound_grant(&mut engine, &mut issuer);
+        let expected_source = grant.source.permit.source.clone();
+        let expected_version = grant.grant.version().clone();
+        let expected_top_slot = grant.grant.top_slot();
+        let owner = bind_granted_host_admission_source(grant, Box::new(0x5154_u64));
+        let prepared = match engine.prepare_host_confirmation(owner) {
+            HostConfirmationPreparationOutcome::Prepared(prepared) => prepared,
+            HostConfirmationPreparationOutcome::ReceiverMismatch { .. } => {
+                panic!("the exact receiver must prepare confirmation")
+            }
+        };
+
+        let outcome = engine.unwind_host_confirmation(prepared);
+        let HostConfirmationUnwindOutcome::Grant(owner) = outcome else {
+            panic!("an unchanged Confirming owner must unwind to Grant")
+        };
+        assert_eq!(owner.grant.source.permit.source, expected_source);
+        assert_eq!(owner.grant.grant.version(), &expected_version);
+        assert_eq!(owner.grant.grant.top_slot(), expected_top_slot);
+        assert_eq!(*owner.installation, 0x5154_u64);
+        assert!(issuer.is_outstanding_grant(&owner.grant.grant));
+    }
+
+    #[test]
+    fn host_confirmation_callback_installs_binding_before_ready_publication() {
+        let mut engine = RouterEngine::install(
+            tree(),
+            RouteViewKey::new("confirmation-ready-r3-fallback").unwrap(),
+        )
+        .unwrap();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+        let grant = r3_source_bound_grant(&mut engine, &mut issuer);
+        let expected_router = grant.grant.version().router_identity();
+        let expected_version = grant.grant.version().clone();
+        let expected_top_slot = grant.grant.top_slot();
+        let owner = bind_granted_host_admission_source(grant, Box::new(0xB1AD_u64));
+        let prepared = match engine.prepare_host_confirmation(owner) {
+            HostConfirmationPreparationOutcome::Prepared(prepared) => prepared,
+            HostConfirmationPreparationOutcome::ReceiverMismatch { .. } => {
+                panic!("the exact receiver must prepare confirmation")
+            }
+        };
+        let callback_calls = std::cell::Cell::new(0usize);
+
+        let outcome = engine.confirm_host_admission_with_binding(
+            &mut issuer,
+            prepared,
+            |installation, lease| {
+                callback_calls.set(callback_calls.get() + 1);
+                (installation, lease)
+            },
+        );
+        let HostAdmissionConfirmationCoreOutcome::Ready {
+            projection,
+            installed,
+        } = outcome
+        else {
+            panic!("the exact final issuer operation must publish Ready")
+        };
+        assert_eq!(callback_calls.get(), 1);
+        assert_eq!(*installed.0, 0xB1AD_u64);
+        assert!(
+            installed
+                .1
+                .matches(expected_router, &expected_version, expected_top_slot)
+        );
+        assert_eq!(projection.host, expected_version);
+        assert_eq!(projection.top_slot, expected_top_slot);
+        assert_eq!(projection.availability, RouterAvailability::Ready);
+        assert_eq!(engine.availability(), &RouterAvailability::Ready);
+        assert_eq!(engine.host(), Some(&expected_version));
+        assert_eq!(engine.top_slot(), Some(expected_top_slot));
     }
 
     #[test]
@@ -24210,8 +26378,10 @@ mod tests {
         )
         .unwrap();
         let mut issuer = HostAdmissionIssuer::new().unwrap();
-        let token = engine.request_host_admission(&mut issuer).unwrap();
-        let grant = engine.grant_host_admission(&mut issuer, &token).unwrap();
+        let token = engine.request_legacy_host_admission(&mut issuer).unwrap();
+        let grant = engine
+            .grant_legacy_host_admission(&mut issuer, &token)
+            .unwrap();
         let confirmation = issuer.confirm(&grant).unwrap();
         engine.confirm_host(&issuer, &confirmation).unwrap();
         let lease = confirmation.into_lease();
@@ -24354,8 +26524,10 @@ mod tests {
         assert!(!engine.testing_history_capability_snapshot().has_owner());
         assert!(engine.testing_history_drift_evidence_snapshot().is_none());
 
-        let token = engine.request_host_admission(&mut issuer).unwrap();
-        let grant = engine.grant_host_admission(&mut issuer, &token).unwrap();
+        let token = engine.request_legacy_host_admission(&mut issuer).unwrap();
+        let grant = engine
+            .grant_legacy_host_admission(&mut issuer, &token)
+            .unwrap();
         let confirmation = issuer.confirm(&grant).unwrap();
         engine.confirm_host(&issuer, &confirmation).unwrap();
 
@@ -24377,8 +26549,10 @@ mod tests {
         )
         .unwrap();
         let mut issuer = HostAdmissionIssuer::new().unwrap();
-        let token = engine.request_host_admission(&mut issuer).unwrap();
-        let grant = engine.grant_host_admission(&mut issuer, &token).unwrap();
+        let token = engine.request_legacy_host_admission(&mut issuer).unwrap();
+        let grant = engine
+            .grant_legacy_host_admission(&mut issuer, &token)
+            .unwrap();
         let confirmation = issuer.confirm(&grant).unwrap();
         engine.confirm_host(&issuer, &confirmation).unwrap();
         let lease = confirmation.into_lease();
@@ -24417,7 +26591,7 @@ mod tests {
         ));
         let ids_before = engine.ids.snapshot();
         assert_eq!(
-            engine.request_host_admission(&mut issuer),
+            engine.request_legacy_host_admission(&mut issuer),
             Err(AdmissionError::AuthorityExists)
         );
         assert_eq!(engine.ids.snapshot(), ids_before);
@@ -24431,8 +26605,10 @@ mod tests {
         )
         .unwrap();
         let mut issuer = HostAdmissionIssuer::new().unwrap();
-        let token = engine.request_host_admission(&mut issuer).unwrap();
-        let grant = engine.grant_host_admission(&mut issuer, &token).unwrap();
+        let token = engine.request_legacy_host_admission(&mut issuer).unwrap();
+        let grant = engine
+            .grant_legacy_host_admission(&mut issuer, &token)
+            .unwrap();
         let confirmation = issuer.confirm(&grant).unwrap();
         engine.confirm_host(&issuer, &confirmation).unwrap();
         let lease = confirmation.into_lease();
@@ -24489,8 +26665,10 @@ mod tests {
         )
         .unwrap();
         let mut issuer = HostAdmissionIssuer::new().unwrap();
-        let token = engine.request_host_admission(&mut issuer).unwrap();
-        let grant = engine.grant_host_admission(&mut issuer, &token).unwrap();
+        let token = engine.request_legacy_host_admission(&mut issuer).unwrap();
+        let grant = engine
+            .grant_legacy_host_admission(&mut issuer, &token)
+            .unwrap();
         let confirmation = issuer.confirm(&grant).unwrap();
         engine.confirm_host(&issuer, &confirmation).unwrap();
         let lease = confirmation.into_lease();
@@ -28049,9 +30227,18 @@ mod tests {
     }
 
     #[test]
-    fn post_commit_host_loss_terminal_keeps_committed_history_and_succeeded_request() {
+    fn host_loss_terminal_publishes_stable_unavailable_host_lost() {
         let (mut engine, mut issuer, request, normal, prepared, authority) =
             prepared_post_commit_authority_fixture();
+        let former_host = engine
+            .state
+            .host()
+            .cloned()
+            .expect("the post-commit HostLost source starts with an exact host");
+        let former_top_slot = engine
+            .state
+            .top_slot()
+            .expect("the post-commit HostLost source starts with an exact top slot");
         let history = engine.history_snapshot();
         let queued = engine
             .push(RouteLocation::new("/items/2"))
@@ -28187,5 +30374,35 @@ mod tests {
             .map(|tombstone| tombstone.token.source_projection())
             .collect::<Vec<_>>();
         assert_eq!(exact_tombstones, expected_tombstones);
+
+        let source = match engine.issue_host_admission_source_permit() {
+            HostAdmissionSourcePermitOutcome::Ineligible { source, evidence } => {
+                assert_eq!(evidence.expected, source);
+                assert_eq!(evidence.observed.as_ref(), Some(&source));
+                source
+            }
+            HostAdmissionSourcePermitOutcome::Issued(_) => {
+                panic!("an unchanged HostLost source must not issue a new permit")
+            }
+            HostAdmissionSourcePermitOutcome::Outstanding { .. } => {
+                panic!("HostLost terminal must not retain an outstanding admission owner")
+            }
+        };
+        assert_eq!(
+            (
+                source.availability_incarnation.0 > 0,
+                source.kind,
+                source.public_reason,
+                source.host.as_ref(),
+                source.top_slot,
+            ),
+            (
+                true,
+                HostAdmissionSourceKind::RetryableHostLost,
+                Some(crate::presentation::RouterUnavailableReason::HostLost),
+                Some(&former_host),
+                Some(former_top_slot),
+            )
+        );
     }
 }

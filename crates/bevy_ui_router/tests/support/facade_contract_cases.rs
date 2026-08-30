@@ -358,7 +358,7 @@ fn validate_recovery_contract_profile(profile: &HistoryContractProfile) {
             (
                 "host re-admission fresh-epoch complete evidence",
                 "R3 Re-admission/stale output",
-                "planned",
+                "active",
                 "Journey G foreground re-admission rows PASS",
             ),
         ],
@@ -382,7 +382,7 @@ fn validate_recovery_contract_profile(profile: &HistoryContractProfile) {
             (
                 "host_reacceptance_detaches_old_top_slot",
                 "R3 Re-admission/stale output",
-                "planned",
+                "active",
                 "",
             ),
         ],
@@ -396,9 +396,10 @@ fn validate_recovery_contract_profile(profile: &HistoryContractProfile) {
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([
             "error_outlet_role_classification_is_preserved",
+            "host_reacceptance_detaches_old_top_slot",
             "post_commit_host_loss_preserves_committed_history",
         ]),
-        "Recovery must activate exactly the completed R1 and R2 authority rows"
+        "Recovery must activate exactly the completed R1–R3 authority rows"
     );
 }
 

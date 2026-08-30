@@ -124,10 +124,17 @@ pub enum RequestLookup<'a> {
     Unknown,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RequestSnapshotEntry {
     router: RouterHandle,
     request: NavigationRequestId,
     snapshot: NavigationRequestSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RouterSnapshotsProjection {
+    routers: Vec<(RouterHandle, RouterSnapshot)>,
+    requests: Vec<RequestSnapshotEntry>,
 }
 
 #[derive(Resource)]
@@ -166,6 +173,13 @@ impl RouterSnapshots {
         {
             MissingRequestClassification::NotRetained => RequestLookup::NotRetained,
             MissingRequestClassification::Unknown => RequestLookup::Unknown,
+        }
+    }
+
+    pub(crate) fn exact_projection(&self) -> RouterSnapshotsProjection {
+        RouterSnapshotsProjection {
+            routers: self.routers.clone(),
+            requests: self.requests.clone(),
         }
     }
 

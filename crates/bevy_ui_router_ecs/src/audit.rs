@@ -829,6 +829,9 @@ impl RouterAuthorityAudits {
                     false,
                     false,
                 );
+                if !owned_states.iter().any(|(id, _)| *id == entity) {
+                    owned_states.push((entity, AuditEntityState::PresentOwned));
+                }
                 slots.push(AuthoritySlotMapping {
                     id: tracked.slot(),
                     entity,

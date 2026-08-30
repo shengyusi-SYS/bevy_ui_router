@@ -1,6 +1,6 @@
 # MVP Acceptance Journeys
 
-> **Recovery activation status:** Journey D 的 R1 Error presentation 与 Journey G 的 R2 pre/post-commit foreground host-loss 合同已通过；R3 host re-admission/fresh epoch 仍为后续 Recovery 验收工作。background old-lease reap 与剩余完整 Journey G rows 仍属于 Authority closure；当前不是 Recovery 或 MVP 整体 PASS 声明。
+> **Recovery activation status:** Journey D 的 R1 Error presentation、Journey G 的 R2 pre/post-commit foreground host-loss，以及 R3 host re-admission/fresh epoch 与 Scenario E stale-output 合同已通过。background old-lease reap 与剩余完整 Journey G rows 仍属于 Authority closure；当前不是 Recovery 或 MVP 整体 PASS 声明。
 
 **文档类型**: 外部行为验收规范
 **状态**: Phase 3B.1 `Plan PASS`

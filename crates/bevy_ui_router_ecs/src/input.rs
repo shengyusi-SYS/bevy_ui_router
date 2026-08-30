@@ -59,6 +59,10 @@ impl RouterInputGate {
     pub fn allows_gamepad(&self, target: Entity) -> bool {
         self.allowed.contains(&target)
     }
+
+    pub(crate) fn allowed_projection(&self) -> &[Entity] {
+        &self.allowed
+    }
 }
 
 #[derive(Clone)]

@@ -1,6 +1,6 @@
 # Recovery 阶段设计
 
-**Activation status**: current active canonical/profile stage; History is completed historical evidence. R1 contract delta and authority row are active; R2/R3 remain planned. This does not claim Recovery PASS, full Journey G, or MVP PASS. Background old-lease reap remains Authority-closure work.
+**Activation status**: current active canonical/profile stage; History is completed historical evidence. R1–R3 contract deltas and authority rows are active. This does not claim Recovery PASS, full Journey G, or MVP PASS. Background old-lease reap remains Authority-closure work.
 
 **用户设计确认**: 用户已将 MVP PASS、阶段顺序与自主规划/调度权写入持续目标；本规范按该授权收敛 Recovery 设计
 
@@ -540,7 +540,7 @@ R1只有在真实 public RED/GREEN、facade consumer、Journey D与review PASS�
 | --- | --- | --- | --- |
 | boundary-bound error presentation complete evidence | R1 Error presentation | active | Journey D public contract PASS |
 | post-commit compound settlement complete evidence | R2 Compound settlement | active | Journey G post-commit foreground rows PASS |
-| host re-admission fresh-epoch complete evidence | R3 Re-admission/stale output | planned | Journey G foreground re-admission rows PASS |
+| host re-admission fresh-epoch complete evidence | R3 Re-admission/stale output | active | Journey G foreground re-admission rows PASS |
 
 completed History的以下active rows必须作为不可删除的历史union输入：
 
@@ -556,7 +556,7 @@ Recovery profile不是替换History rows。全局active delta集合在Recovery�
 | --- | --- | --- |
 | `error_outlet_role_classification_is_preserved` | R1 Error presentation | active |
 | `post_commit_host_loss_preserves_committed_history` | R2 Compound settlement | active |
-| `host_reacceptance_detaches_old_top_slot` | R3 Re-admission/stale output | planned |
+| `host_reacceptance_detaches_old_top_slot` | R3 Re-admission/stale output | active |
 
 激活row与既有 Root 20 + Nested 3 + History 1形成唯一 union；Recovery completion catalogue为27项。source catalogue、direct `#[test]`、binary registration与实际passed集合必须双向相等且无ignored/extra/duplicate。
 

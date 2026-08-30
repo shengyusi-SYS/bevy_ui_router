@@ -1260,3 +1260,9 @@ pub(crate) fn pickable_repair_observer_drift_supersedes_attempt_before_quarantin
             .is_some()
     );
 }
+
+#[test]
+pub(crate) fn host_reacceptance_detaches_old_top_slot() {
+    crate::navigation::tests::same_host_readmission_waits_for_retired_edge_and_old_slot_disposition(
+    );
+}

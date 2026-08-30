@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -10,6 +10,7 @@ use bevy_app::{App, Update};
 use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
     component::{Component, ComponentId},
+    entity::Entity,
     hierarchy::{ChildOf, Children},
     prelude::Resource,
     schedule::IntoScheduleConfigs,
@@ -17,11 +18,14 @@ use bevy_ecs::{
 };
 use bevy_picking::Pickable;
 use bevy_ui::{Node, Val};
+use bevy_ui_router::core::DiagnosticEventKind;
 use bevy_ui_router::ecs::RouterScheduleSet;
 use bevy_ui_router::prelude::*;
 use bevy_ui_router_ecs::test_support::{
-    BackCapacityOrderEvent, BackCapacityOrderInstallError, testing_back_request_inventory,
-    testing_install_back_capacity_order_observer,
+    BackCapacityOrderEvent, BackCapacityOrderInstallError, TestingDelayedDriverReportReplay,
+    testing_arm_next_applied_driver_report_replay, testing_back_request_inventory,
+    testing_install_back_capacity_order_observer, testing_release_applied_driver_report_replay,
+    testing_router_request_inventory,
 };
 
 const ROOT_RECT_WIDTH: u16 = 37;
@@ -33,11 +37,41 @@ struct AuditDriver {
     outlet_view: Option<RouteViewKey>,
 }
 
+struct RecoveryR3ReplayAuditDriver {
+    key: ViewDriverKey,
+    outlet_view: RouteViewKey,
+    effects: Arc<AtomicUsize>,
+}
+
 #[derive(Component, Debug, Eq, PartialEq)]
 struct RecoveryAuditHostSentinel(u64);
 
 #[derive(Component, Debug, Eq, PartialEq)]
 struct RecoveryAuditChildSentinel(u64);
+
+#[derive(Resource)]
+struct RecoveryR3AuditLossInjection {
+    host: Entity,
+    fired: bool,
+}
+
+fn inject_recovery_r3_audit_registration_loss(world: &mut World) {
+    let (host, fired) = {
+        let injection = world.resource::<RecoveryR3AuditLossInjection>();
+        (injection.host, injection.fired)
+    };
+    if fired {
+        return;
+    }
+    assert!(
+        world
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .is_some(),
+        "the audit seam removes only the real registration input fact"
+    );
+    world.resource_mut::<RecoveryR3AuditLossInjection>().fired = true;
+}
 
 struct RecoveryAuditDriver {
     key: ViewDriverKey,
@@ -185,6 +219,45 @@ impl EcsViewDriver for AuditDriver {
     }
 }
 
+impl EcsViewDriver for RecoveryR3ReplayAuditDriver {
+    fn key(&self) -> ViewDriverKey {
+        self.key.clone()
+    }
+
+    fn apply(
+        &mut self,
+        effect: &ViewBuildEffect,
+        content: &mut FrameContentWriter<'_>,
+        report: EcsViewReportSession<'_>,
+    ) -> ViewBuildReport {
+        self.effects.fetch_add(1, Ordering::SeqCst);
+        let root = content.spawn_empty().expect("R3 audit root stages");
+        let rect = content
+            .spawn_solid_rect(
+                SolidRect::new(
+                    if effect.view() == &self.outlet_view {
+                        LAYOUT_RECT_WIDTH
+                    } else {
+                        LEAF_RECT_WIDTH
+                    },
+                    19,
+                    ContentColor::srgba8(11, 23, 47, 255),
+                )
+                .unwrap(),
+            )
+            .expect("R3 audit rectangle stages");
+        content
+            .add_child(root, rect)
+            .expect("R3 audit content edge stages");
+        if effect.view() == &self.outlet_view {
+            content
+                .declare_outlet(root, RouteSlotKey::default())
+                .expect("R3 audit layout outlet stages");
+        }
+        report.applied()
+    }
+}
+
 fn push_and_publish(
     app: &mut App,
     router: RouterHandle,
@@ -245,6 +318,207 @@ fn replace_and_publish(
         }
     }
     panic!("public audit replace did not settle within 16 App::update calls")
+}
+
+fn drive_recovery_r3_audit_availability(
+    app: &mut App,
+    router: RouterHandle,
+    expected: &RouterAvailability,
+) -> RouterSnapshot {
+    for _ in 0..24 {
+        app.update();
+        let snapshot = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .expect("R3 audit router retains a public snapshot")
+            .clone();
+        if snapshot.availability() == expected
+            && snapshot.running_request().is_none()
+            && snapshot.pending_phase().is_none()
+            && !snapshot.cleanup().foreground_pending()
+        {
+            return snapshot;
+        }
+    }
+    panic!(
+        "R3 audit router did not reach stable {expected:?}: {:?}",
+        app.world().resource::<RouterSnapshots>().get(router)
+    )
+}
+
+fn arm_recovery_r3_audit_replay(
+    app: &mut App,
+    router: RouterHandle,
+) -> TestingDelayedDriverReportReplay {
+    testing_arm_next_applied_driver_report_replay(
+        &mut app.world_mut().resource_mut::<RouterNavigation>(),
+        router,
+    )
+    .expect("the R3 audit arms one real applied-report delivery")
+}
+
+fn release_recovery_r3_audit_replay(app: &mut App, control: TestingDelayedDriverReportReplay) {
+    testing_release_applied_driver_report_replay(
+        &mut app.world_mut().resource_mut::<RouterNavigation>(),
+        control,
+    )
+    .expect("the R3 audit releases its real delayed report artifact")
+}
+
+fn recovery_r3_prepared_audit_entities(audit: &RouterAuthorityAuditSnapshot) -> Vec<AuditEntityId> {
+    let prepared_frames = audit
+        .frames()
+        .iter()
+        .filter(|mapping| mapping.lifecycle() == AuthorityFrameLifecycle::PreparedInert)
+        .map(|mapping| mapping.frame().clone())
+        .collect::<Vec<_>>();
+    let mut entities = audit
+        .frames()
+        .iter()
+        .filter(|mapping| mapping.lifecycle() == AuthorityFrameLifecycle::PreparedInert)
+        .flat_map(|mapping| mapping.entities().iter().copied())
+        .collect::<Vec<_>>();
+    entities.extend(audit.slots().iter().filter_map(|slot| {
+        slot.parent_frame()
+            .is_some_and(|parent| prepared_frames.contains(parent))
+            .then_some(slot.entity())
+    }));
+    let mut seen = HashSet::new();
+    entities.retain(|entity| seen.insert(*entity));
+    entities
+}
+
+fn recovery_r3_current_audit_entities(audit: &RouterAuthorityAuditSnapshot) -> Vec<AuditEntityId> {
+    let current_host = audit.host().map(|host| host.version().clone());
+    let active_frames = audit
+        .frames()
+        .iter()
+        .filter(|mapping| mapping.lifecycle() == AuthorityFrameLifecycle::Active)
+        .map(|mapping| mapping.frame().clone())
+        .collect::<Vec<_>>();
+    let mut entities = audit
+        .host()
+        .map(|host| vec![host.top_slot()])
+        .unwrap_or_default();
+    entities.extend(
+        audit
+            .slots()
+            .iter()
+            .filter(|slot| {
+                current_host
+                    .as_ref()
+                    .is_some_and(|host| slot.host() == host)
+            })
+            .map(|slot| slot.entity()),
+    );
+    entities.extend(
+        audit
+            .frames()
+            .iter()
+            .filter(|mapping| mapping.lifecycle() == AuthorityFrameLifecycle::Active)
+            .flat_map(|mapping| mapping.entities().iter().copied()),
+    );
+    entities.extend(
+        audit
+            .outlets()
+            .iter()
+            .filter(|outlet| active_frames.contains(outlet.parent()))
+            .map(|outlet| outlet.anchor()),
+    );
+    entities.extend(
+        audit
+            .content()
+            .iter()
+            .filter(|content| active_frames.contains(content.frame()))
+            .map(|content| content.entity()),
+    );
+    let mut seen = HashSet::new();
+    entities.retain(|entity| seen.insert(*entity));
+    entities
+}
+
+fn assert_recovery_r3_audit_mapping_exact(
+    before: &RouterAuthorityAuditSnapshot,
+    after: &RouterAuthorityAuditSnapshot,
+) {
+    assert_eq!(after.host(), before.host());
+    let current_host = before.host().map(|host| host.version());
+    let current_frames = before
+        .frames()
+        .iter()
+        .filter(|mapping| mapping.lifecycle() == AuthorityFrameLifecycle::Active)
+        .map(|mapping| mapping.frame())
+        .collect::<Vec<_>>();
+    let before_slots = before
+        .slots()
+        .iter()
+        .filter(|slot| current_host.is_some_and(|host| slot.host() == host))
+        .collect::<Vec<_>>();
+    let after_slots = after
+        .slots()
+        .iter()
+        .filter(|slot| current_host.is_some_and(|host| slot.host() == host))
+        .collect::<Vec<_>>();
+    assert_eq!(after_slots, before_slots);
+    assert_eq!(
+        after
+            .frames()
+            .iter()
+            .filter(|mapping| mapping.lifecycle() == AuthorityFrameLifecycle::Active)
+            .collect::<Vec<_>>(),
+        before
+            .frames()
+            .iter()
+            .filter(|mapping| mapping.lifecycle() == AuthorityFrameLifecycle::Active)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        after
+            .outlets()
+            .iter()
+            .filter(|outlet| current_frames.contains(&outlet.parent()))
+            .collect::<Vec<_>>(),
+        before
+            .outlets()
+            .iter()
+            .filter(|outlet| current_frames.contains(&outlet.parent()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        after
+            .content()
+            .iter()
+            .filter(|content| current_frames.contains(&content.frame()))
+            .collect::<Vec<_>>(),
+        before
+            .content()
+            .iter()
+            .filter(|content| current_frames.contains(&content.frame()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        after
+            .orphan_slots()
+            .iter()
+            .all(|slot| !after_slots.iter().any(|mapping| mapping.id() == *slot))
+    );
+}
+
+fn assert_recovery_r3_audit_facade_exact(before: &RouterSnapshot, after: &RouterSnapshot) {
+    assert_eq!(after.requested(), before.requested());
+    assert_eq!(after.matched(), before.matched());
+    assert_eq!(after.active(), before.active());
+    assert_eq!(after.availability(), before.availability());
+    assert_eq!(after.pending_phase(), before.pending_phase());
+    assert_eq!(after.history(), before.history());
+    assert_eq!(after.running_request(), before.running_request());
+    assert_eq!(
+        after.earliest_retained_sequence(),
+        before.earliest_retained_sequence()
+    );
+    assert_eq!(after.cleanup(), before.cleanup());
+    assert_eq!(after.host(), before.host());
 }
 
 fn back_and_publish(app: &mut App, router: RouterHandle) -> NavigationRequestId {
@@ -1710,4 +1984,507 @@ fn recovery_r2_authority_audit_closes_l_a_h_and_preserves_host_order() {
         app_entities_before_admission,
         "terminal audit completeness requires every router-created hidden Entity to be gone"
     );
+}
+
+#[test]
+fn recovery_r3_same_host_and_stale_epoch_authority_audit_is_exact() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let layout = RouteViewKey::new("r3-replay-audit-layout").unwrap();
+    let leaf = RouteViewKey::new("r3-replay-audit-leaf").unwrap();
+    let fallback = RouteViewKey::new("r3-replay-audit-fallback").unwrap();
+    let effects = Arc::new(AtomicUsize::new(0));
+    let driver = app
+        .register_ui_view_driver(RecoveryR3ReplayAuditDriver {
+            key: ViewDriverKey::new("r3-replay-audit-driver").unwrap(),
+            outlet_view: layout.clone(),
+            effects: effects.clone(),
+        })
+        .unwrap();
+    let mut routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::pathless(),
+            RouteNodeOptions::new().with_view(layout.clone()),
+        )
+        .unwrap();
+    let root_route = routes.root_id().unwrap();
+    let section = routes
+        .route_with_options(
+            root_route,
+            RoutePattern::path("section").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(layout.clone())
+                .with_slot(RouteSlotKey::default()),
+        )
+        .unwrap();
+    routes
+        .route_with_options(
+            section,
+            RoutePattern::path("items/:id").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(leaf.clone())
+                .with_slot(RouteSlotKey::default()),
+        )
+        .unwrap();
+    let alternate = routes
+        .route_with_options(
+            root_route,
+            RoutePattern::path("alternate").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(layout.clone())
+                .with_slot(RouteSlotKey::default()),
+        )
+        .unwrap();
+    routes
+        .route_with_options(
+            alternate,
+            RoutePattern::path("items/:id").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(leaf.clone())
+                .with_slot(RouteSlotKey::default()),
+        )
+        .unwrap();
+    let mut views = RouteViewRegistry::new();
+    for view in [layout, leaf, fallback.clone()] {
+        views
+            .insert(view, RouteViewDescriptor::new(driver.clone()))
+            .unwrap();
+    }
+    let router = app
+        .add_ui_router(RouterConfig::new(routes.build().unwrap(), views, fallback))
+        .unwrap();
+    let host = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(613.0),
+                height: Val::Px(353.0),
+                ..Node::default()
+            },
+            RecoveryAuditHostSentinel(0x731),
+            RouterHostRegistration::new(router),
+        ))
+        .id();
+    let first_child = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(23.0),
+                ..Node::default()
+            },
+            RecoveryAuditChildSentinel(0x732),
+            ChildOf(host),
+        ))
+        .id();
+    let second_child = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(29.0),
+                ..Node::default()
+            },
+            RecoveryAuditChildSentinel(0x733),
+            ChildOf(host),
+        ))
+        .id();
+    let host_manifest = audit_component_manifest(&app, host);
+    let first_manifest = audit_component_manifest(&app, first_child);
+    let second_manifest = audit_component_manifest(&app, second_child);
+    app.update();
+
+    let before_loss = app
+        .world()
+        .resource::<RouterSnapshots>()
+        .get(router)
+        .unwrap()
+        .clone();
+    let history_before_loss = before_loss.history().clone();
+    assert!(history_before_loss.current().is_none());
+    let before_loss_audit = app
+        .world()
+        .resource::<RouterAuthorityAudits>()
+        .get(router)
+        .unwrap()
+        .clone();
+    let old_host_mapping = before_loss_audit.host().unwrap().clone();
+    assert!(old_host_mapping.matches_app_entity(host));
+    let old_top_slot = app
+        .world()
+        .get::<Children>(host)
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|child| ![first_child, second_child].contains(child))
+        .expect("initial admission exposes one real top-slot Entity");
+    let effects_before_stale = effects.load(Ordering::SeqCst);
+    let stale_request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/section/items/1"))
+        .expect("the sealed nested audit branch enqueues");
+    app.update();
+    assert!(effects.load(Ordering::SeqCst) > effects_before_stale);
+    let stale_audit_after_first_effect = app
+        .world()
+        .resource::<RouterAuthorityAudits>()
+        .get(router)
+        .unwrap();
+    let prepared_before_capture =
+        recovery_r3_prepared_audit_entities(stale_audit_after_first_effect);
+    assert!(
+        !prepared_before_capture.is_empty(),
+        "one entering output is physically PreparedInert before capture: snapshot={:?}, audit={stale_audit_after_first_effect:?}, effects_before={effects_before_stale}, effects_after={}",
+        app.world().resource::<RouterSnapshots>().get(router),
+        effects.load(Ordering::SeqCst),
+    );
+    let replay = arm_recovery_r3_audit_replay(&mut app, router);
+    let capture_effect = effects.load(Ordering::SeqCst) + 1;
+    for _ in 0..16 {
+        app.update();
+        if effects.load(Ordering::SeqCst) >= capture_effect {
+            break;
+        }
+    }
+    assert_eq!(effects.load(Ordering::SeqCst), capture_effect);
+    let stale_entities = recovery_r3_prepared_audit_entities(
+        app.world()
+            .resource::<RouterAuthorityAudits>()
+            .get(router)
+            .expect("the captured stale artifact retains an authority audit"),
+    );
+    assert!(
+        !stale_entities.is_empty(),
+        "the captured stale artifact must retain a non-empty exact physical target"
+    );
+    let foreign = app
+        .world_mut()
+        .spawn((RecoveryAuditChildSentinel(0x734), ChildOf(old_top_slot)))
+        .id();
+    let foreign_manifest = audit_component_manifest(&app, foreign);
+
+    app.world_mut()
+        .insert_resource(RecoveryR3AuditLossInjection { host, fired: false });
+    app.add_systems(
+        Update,
+        inject_recovery_r3_audit_registration_loss
+            .after(RouterScheduleSet::CollectNavigation)
+            .before(RouterScheduleSet::DriveNavigation),
+    );
+    let unavailable = drive_recovery_r3_audit_availability(
+        &mut app,
+        router,
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost),
+    );
+    assert!(app.world().resource::<RecoveryR3AuditLossInjection>().fired);
+    assert_eq!(unavailable.active().kind(), ActivePresentationKind::None);
+    assert_eq!(unavailable.history(), &history_before_loss);
+    let stale_terminal = app
+        .world()
+        .resource::<RouterSnapshots>()
+        .request(router, stale_request);
+    assert!(matches!(
+        stale_terminal,
+        RequestLookup::Found(snapshot)
+            if matches!(snapshot.status(), RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::HostLost)
+    ));
+    let unavailable_audit = app
+        .world()
+        .resource::<RouterAuthorityAudits>()
+        .get(router)
+        .unwrap();
+    assert!(unavailable_audit.host().is_none());
+    assert!(unavailable_audit.frames().is_empty());
+    assert!(unavailable_audit.slots().is_empty());
+    assert!(unavailable_audit.outlets().is_empty());
+    assert!(unavailable_audit.content().is_empty());
+    assert_eq!(
+        unavailable_audit.owned_entity_state(old_host_mapping.top_slot()),
+        AuditEntityState::Quarantined
+    );
+    assert!(stale_entities.iter().all(|entity| matches!(
+        unavailable_audit.owned_entity_state(*entity),
+        AuditEntityState::PresentOwned | AuditEntityState::Quarantined | AuditEntityState::Removed
+    )));
+    let stale_present_after_loss = stale_entities
+        .iter()
+        .copied()
+        .filter(|entity| unavailable_audit.owned_entity_state(*entity) != AuditEntityState::Removed)
+        .collect::<Vec<_>>();
+    assert!(
+        !stale_present_after_loss.is_empty(),
+        "the stale replay retains a non-empty exact physical cleanup target after HostLost"
+    );
+    assert_eq!(
+        app.world()
+            .get::<Children>(host)
+            .unwrap()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![first_child, second_child]
+    );
+    assert!(app.world().get::<ChildOf>(old_top_slot).is_none());
+    assert_eq!(
+        app.world().get::<ChildOf>(foreign).map(ChildOf::parent),
+        Some(old_top_slot)
+    );
+
+    app.world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(router));
+    let ready = drive_recovery_r3_audit_availability(&mut app, router, &RouterAvailability::Ready);
+    assert_eq!(ready.active().kind(), ActivePresentationKind::None);
+    assert_eq!(ready.history(), &history_before_loss);
+    let ready_audit = app
+        .world()
+        .resource::<RouterAuthorityAudits>()
+        .get(router)
+        .unwrap();
+    let new_host_mapping = ready_audit.host().unwrap();
+    assert!(new_host_mapping.matches_app_entity(host));
+    assert_ne!(new_host_mapping.version(), old_host_mapping.version());
+    assert_ne!(new_host_mapping.top_slot(), old_host_mapping.top_slot());
+    let new_top_slot = app
+        .world()
+        .get::<Children>(host)
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|child| ![first_child, second_child].contains(child))
+        .expect("same-host re-admission exposes one fresh top slot");
+    assert_ne!(new_top_slot, old_top_slot);
+    assert_eq!(
+        app.world()
+            .get::<Children>(host)
+            .unwrap()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![first_child, second_child, new_top_slot]
+    );
+    assert!(app.world().get::<ChildOf>(old_top_slot).is_none());
+    assert_eq!(
+        app.world().get::<ChildOf>(foreign).map(ChildOf::parent),
+        Some(old_top_slot)
+    );
+
+    let restored_location = RouteLocation::new("/section/items/1");
+    let restored = replace_and_publish(&mut app, router, restored_location.clone());
+    let snapshot_before_release = app
+        .world()
+        .resource::<RouterSnapshots>()
+        .get(router)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        snapshot_before_release.active().location(),
+        Some(&restored_location)
+    );
+    assert_eq!(
+        snapshot_before_release.history().current(),
+        Some(&restored_location)
+    );
+    assert_eq!(
+        snapshot_before_release.history().entries(),
+        [restored_location.clone()]
+    );
+    let restored_before_release = match app
+        .world()
+        .resource::<RouterSnapshots>()
+        .request(router, restored)
+    {
+        RequestLookup::Found(snapshot) => snapshot.clone(),
+        _ => panic!("the explicit restore request remains retained"),
+    };
+    let stale_before_release = match app
+        .world()
+        .resource::<RouterSnapshots>()
+        .request(router, stale_request)
+    {
+        RequestLookup::Found(snapshot) => snapshot.clone(),
+        _ => panic!("the stale request remains retained"),
+    };
+    let audit_before_release = app
+        .world()
+        .resource::<RouterAuthorityAudits>()
+        .get(router)
+        .unwrap()
+        .clone();
+    let current_entities = recovery_r3_current_audit_entities(&audit_before_release);
+    assert!(current_entities.iter().all(|entity| {
+        audit_before_release.owned_entity_state(*entity) == AuditEntityState::PresentOwned
+    }));
+    let entities_before_release = app
+        .world()
+        .iter_entities()
+        .map(|entity| entity.id())
+        .collect::<HashSet<_>>();
+    let diagnostics_before = snapshot_before_release.diagnostics().events().to_vec();
+    let effects_before_release = effects.load(Ordering::SeqCst);
+    let inventory_before_release = {
+        let world = app.world();
+        testing_router_request_inventory(
+            world.resource::<RouterNavigation>(),
+            world.resource::<RouterSnapshots>(),
+        )
+    };
+
+    release_recovery_r3_audit_replay(&mut app, replay);
+    for _ in 0..24 {
+        app.update();
+        let audit = app
+            .world()
+            .resource::<RouterAuthorityAudits>()
+            .get(router)
+            .unwrap();
+        if stale_entities
+            .iter()
+            .all(|entity| audit.owned_entity_state(*entity) == AuditEntityState::Removed)
+        {
+            break;
+        }
+    }
+
+    let snapshot_after_release = app
+        .world()
+        .resource::<RouterSnapshots>()
+        .get(router)
+        .unwrap()
+        .clone();
+    assert_recovery_r3_audit_facade_exact(&snapshot_before_release, &snapshot_after_release);
+    assert!(
+        snapshot_after_release
+            .diagnostics()
+            .events()
+            .starts_with(&diagnostics_before)
+    );
+    let diagnostic_delta =
+        &snapshot_after_release.diagnostics().events()[diagnostics_before.len()..];
+    assert!(diagnostic_delta.len() <= 1);
+    assert!(diagnostic_delta.iter().all(|event| {
+        event.kind() == DiagnosticEventKind::ReportDisposition
+            && event.request() == Some(stale_request)
+            && event.report_disposition() == Some(ReportDisposition::StaleDiscarded)
+    }));
+    let audit_after_release = app
+        .world()
+        .resource::<RouterAuthorityAudits>()
+        .get(router)
+        .unwrap();
+    assert_recovery_r3_audit_mapping_exact(&audit_before_release, audit_after_release);
+    assert!(stale_entities.iter().all(|entity| {
+        audit_after_release.owned_entity_state(*entity) == AuditEntityState::Removed
+    }));
+    assert!(current_entities.iter().all(|entity| {
+        audit_after_release.owned_entity_state(*entity) == AuditEntityState::PresentOwned
+    }));
+    assert_eq!(
+        audit_after_release.owned_entity_state(old_host_mapping.top_slot()),
+        AuditEntityState::Quarantined
+    );
+    assert_eq!(
+        match app
+            .world()
+            .resource::<RouterSnapshots>()
+            .request(router, restored)
+        {
+            RequestLookup::Found(snapshot) => snapshot,
+            _ => panic!("the restore request remains retained after replay"),
+        },
+        &restored_before_release
+    );
+    let stale_after_release = match app
+        .world()
+        .resource::<RouterSnapshots>()
+        .request(router, stale_request)
+    {
+        RequestLookup::Found(snapshot) => snapshot,
+        _ => panic!("the stale request remains retained after replay"),
+    };
+    assert_eq!(
+        stale_after_release.requested(),
+        stale_before_release.requested()
+    );
+    assert_eq!(
+        stale_after_release.matched(),
+        stale_before_release.matched()
+    );
+    assert_eq!(stale_after_release.status(), stale_before_release.status());
+    assert_eq!(stale_after_release.trace(), stale_before_release.trace());
+    assert!(
+        stale_after_release
+            .diagnostics()
+            .starts_with(stale_before_release.diagnostics())
+    );
+    let stale_diagnostic_delta =
+        &stale_after_release.diagnostics()[stale_before_release.diagnostics().len()..];
+    assert!(stale_diagnostic_delta.len() <= 1);
+    assert!(stale_diagnostic_delta.iter().all(|event| {
+        event.kind() == DiagnosticEventKind::ReportDisposition
+            && event.request() == Some(stale_request)
+            && event.report_disposition() == Some(ReportDisposition::StaleDiscarded)
+    }));
+    let entities_after_release = app
+        .world()
+        .iter_entities()
+        .map(|entity| entity.id())
+        .collect::<HashSet<_>>();
+    assert!(entities_after_release.is_subset(&entities_before_release));
+    assert_eq!(
+        entities_before_release.len() - entities_after_release.len(),
+        stale_present_after_loss.len(),
+        "every stale old-output Entity still present at release must reach a physical terminal"
+    );
+    assert_eq!(effects.load(Ordering::SeqCst), effects_before_release);
+    {
+        let world = app.world();
+        assert_eq!(
+            testing_router_request_inventory(
+                world.resource::<RouterNavigation>(),
+                world.resource::<RouterSnapshots>(),
+            ),
+            inventory_before_release
+        );
+    }
+    assert_eq!(audit_component_manifest(&app, host), host_manifest);
+    assert_eq!(audit_component_manifest(&app, first_child), first_manifest);
+    assert_eq!(
+        audit_component_manifest(&app, second_child),
+        second_manifest
+    );
+    assert_eq!(audit_component_manifest(&app, foreign), foreign_manifest);
+    assert_eq!(
+        app.world().get::<RecoveryAuditHostSentinel>(host),
+        Some(&RecoveryAuditHostSentinel(0x731))
+    );
+    assert_eq!(
+        app.world().get::<RecoveryAuditChildSentinel>(first_child),
+        Some(&RecoveryAuditChildSentinel(0x732))
+    );
+    assert_eq!(
+        app.world().get::<RecoveryAuditChildSentinel>(second_child),
+        Some(&RecoveryAuditChildSentinel(0x733))
+    );
+    assert_eq!(
+        app.world().get::<RecoveryAuditChildSentinel>(foreign),
+        Some(&RecoveryAuditChildSentinel(0x734))
+    );
+    assert_eq!(
+        app.world()
+            .get::<Children>(host)
+            .unwrap()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![first_child, second_child, new_top_slot]
+    );
+    assert!(app.world().get::<ChildOf>(old_top_slot).is_none());
+    assert_eq!(
+        app.world().get::<ChildOf>(foreign).map(ChildOf::parent),
+        Some(old_top_slot)
+    );
+    assert!(snapshot_after_release.running_request().is_none());
+    assert!(snapshot_after_release.pending_phase().is_none());
+    assert!(!snapshot_after_release.cleanup().foreground_pending());
+    assert_eq!(snapshot_after_release.cleanup().quarantine_count(), 1);
 }

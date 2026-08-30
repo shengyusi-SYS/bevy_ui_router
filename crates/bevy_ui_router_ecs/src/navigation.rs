@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -13,6 +16,7 @@ use bevy_ecs::{
 use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
 use bevy_ui_router_core::{
+    integration as r3_core,
     integration::{
         ApprovedBackNoTargetCandidate, BackNoTargetApprovalOutcome,
         BackNoTargetAuthorityBeginOutcome, BackNoTargetAuthorityBeginOwner,
@@ -82,7 +86,7 @@ use bevy_ui_router_core::{
 use bevy_ui_router_view::{RouteViewRegistry, ViewBuildEffect, integration as view_integration};
 
 use crate::{
-    app_ext::{RouterHandle, RouterHostRegistration, ViewDriverStore},
+    app_ext::{RouterHandle, RouterHostRegistration, ViewDriverStore, ViewDriverStoreProjection},
     branch_transaction::{
         FailedPreparedBranch, PendingCommit, PreparedBranch, PreparedPermanentIsolationClaimRebind,
         RealizedBranch, ReconciliationAuthorityIdentity, ReconciliationProjectionFacts,
@@ -129,11 +133,15 @@ use crate::{
         validate_preserved_branch_local, validate_reconciliation_entering_branch,
     },
     host::{
-        HostCandidateClassification, HostCandidateRevisionLatch, HostCandidateRevisionState,
-        ProvisionalHostSettlement, ValidatedHostCandidate, ValidatedHostCandidateObservation,
-        activate_granted_top_slot, classify_host_candidate, observe_validated_host_candidate,
-        retry_provisional_host_settlement, settle_rejected_granted_top_slot,
-        stage_granted_top_slot, validated_host_candidate_is_current,
+        HostCandidateCapacityEvidence, HostCandidateClassification, HostCandidateObservationSource,
+        HostCandidateRevisionLatch, HostCandidateRevisionState, PreparedEcsHostCandidateSource,
+        PreparedHostCandidateRejection, ProvisionalHostCleanupLedger, ProvisionalHostSettlement,
+        ProvisionalHostSettlementTerminal, ProvisionalStagingFailureEvidence,
+        StagedProvisionalTopSlot, ValidatedHostCandidate, ValidatedHostCandidateObservation,
+        activate_source_bound_granted_top_slot, classify_host_candidate,
+        hide_source_bound_granted_top_slot, observe_validated_host_candidate,
+        retain_staged_top_slot_for_settlement, stage_source_bound_granted_top_slot,
+        validated_host_candidate_is_current,
     },
     input::{
         PreparedInputGateIsolation, RouteFocusState, RouterInputGate, observed_descendant_closure,
@@ -158,9 +166,10 @@ use crate::{
     },
     registry::{
         ComponentManifest, EntityLifecycle, EntityOwner, ExactRegistryClaim,
-        PreparedLifecycleMutation, ProvisionalOwner, RegistryOwner, RouteEntityRegistry,
+        PreparedLifecycleMutation, ProtectedRegistryProjection, ProvisionalOwner,
+        QuarantineLeaseTable, RegistryOwner, RouteEntityRegistry,
     },
-    snapshots::RouterSnapshots,
+    snapshots::{RouterSnapshots, RouterSnapshotsProjection},
 };
 
 fn allocate_navigation_domain(counter: &AtomicU64) -> Option<u64> {
@@ -606,6 +615,287 @@ struct PendingFrameDrive {
     task: RootFrameTask,
     effect: ViewBuildEffect,
     pending: PendingCommit,
+}
+
+#[derive(Clone)]
+struct AppliedDriverReportArtifact {
+    identity: bevy_ui_router_core::integration::ViewReportIdentity,
+    kind: ViewBuildReportKind,
+    message: Option<String>,
+    plan: ContentPlan,
+}
+
+impl AppliedDriverReportArtifact {
+    fn from_report(report: ViewBuildReport, plan: ContentPlan) -> Self {
+        Self {
+            identity: report.identity().clone(),
+            kind: report.kind(),
+            message: report.message().map(str::to_owned),
+            plan,
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct OldOutputSourceIdentity {
+    router: RouterHandle,
+    host_version: bevy_ui_router_core::HostVersion,
+    host: Entity,
+    top_slot: Entity,
+    top_slot_claim: ExactRegistryClaim,
+    frame: RouteFrameVersion,
+    request: NavigationRequestId,
+    sequence: u64,
+    mount: FrameMountTarget,
+    report: ViewReportIdentity,
+}
+
+impl OldOutputSourceIdentity {
+    fn freeze(
+        router: RouterHandle,
+        host: &HostBinding,
+        task: &RootFrameTask,
+        artifact: &AppliedDriverReportArtifact,
+    ) -> Option<Self> {
+        if artifact.identity != task.report_identity()
+            || !r3_core::host_version_matches_frame(&host.version, task.frame())
+        {
+            return None;
+        }
+        Some(Self {
+            router,
+            host_version: host.version.clone(),
+            host: host.host,
+            top_slot: host.top_slot,
+            top_slot_claim: host.top_slot_claim.clone(),
+            frame: task.frame().clone(),
+            request: task.request(),
+            sequence: task.view_request_sequence(),
+            mount: task.mount_target(),
+            report: task.report_identity(),
+        })
+    }
+
+    fn matches(
+        &self,
+        router: RouterHandle,
+        task: &RootFrameTask,
+        artifact: &AppliedDriverReportArtifact,
+    ) -> bool {
+        self.router == router
+            && self.frame == *task.frame()
+            && self.request == task.request()
+            && self.sequence == task.view_request_sequence()
+            && self.mount == task.mount_target()
+            && self.report == task.report_identity()
+            && artifact.identity == self.report
+    }
+}
+
+struct SealedOldOutputSourceOwner {
+    source: OldOutputSourceIdentity,
+    pending: PendingCommit,
+    task: RootFrameTask,
+}
+
+struct SealedOldOutputOwner {
+    source: OldOutputSourceIdentity,
+    physical: FailedPreparedBranch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FrozenStaleOutputOtherHolders {
+    host_settlement: bool,
+    pending_host_admission_failure: bool,
+    pending_commit: bool,
+    pending_frame_drive: bool,
+    pending_mount_frame_task: bool,
+    pending_mount_request: bool,
+    pending_mount_mutation_rejection: bool,
+    pending_failed_branch: bool,
+    failure_cleanup_permanent: bool,
+    projectionless_fail_close: bool,
+    cleanup_ledger: bool,
+    post_commit_compound: bool,
+    settled_retired_host_evidence: bool,
+    failure_cleanup_completion: bool,
+    authority_protocol_residual: bool,
+    back_capacity_enqueue_retire_residual: bool,
+    back_capacity_reservation_count: usize,
+    pending_back_resolution_action: bool,
+    pending_bound_back_resolution: bool,
+    pending_back_target_execution: bool,
+    pending_back_no_target_completion: bool,
+    pending_back_no_target_preparation: bool,
+    pending_back_no_target_authority_cleanup: bool,
+    pending_back_target_permanent_cleanup: bool,
+    history_admission_stamp: bool,
+    back_capacity_issuer: bool,
+}
+
+impl FrozenStaleOutputOtherHolders {
+    fn observe(entry: &RouterEntry) -> Self {
+        Self {
+            host_settlement: entry.host_settlement.is_some(),
+            pending_host_admission_failure: entry.pending_host_admission_failure.is_some(),
+            pending_commit: entry.pending_commit.is_some(),
+            pending_frame_drive: entry.pending_frame_drive.is_some(),
+            pending_mount_frame_task: entry.pending_mount_frame_task.is_some(),
+            pending_mount_request: entry.pending_mount_request.is_some(),
+            pending_mount_mutation_rejection: entry.pending_mount_mutation_rejection.is_some(),
+            pending_failed_branch: entry.pending_failed_branch.is_some(),
+            failure_cleanup_permanent: entry.failure_cleanup_permanent.is_some(),
+            projectionless_fail_close: entry.projectionless_fail_close.is_some(),
+            cleanup_ledger: entry.cleanup_ledger.is_some(),
+            post_commit_compound: entry.post_commit_compound.is_some(),
+            settled_retired_host_evidence: entry.settled_retired_host_evidence.is_some(),
+            failure_cleanup_completion: entry.failure_cleanup_completion.is_some(),
+            authority_protocol_residual: entry.authority_protocol_residual.is_some(),
+            back_capacity_enqueue_retire_residual: entry
+                .back_capacity_enqueue_retire_residual
+                .is_some(),
+            back_capacity_reservation_count: entry.back_capacity_reservations.len(),
+            pending_back_resolution_action: entry.pending_back_resolution_action.is_some(),
+            pending_bound_back_resolution: entry.pending_bound_back_resolution.is_some(),
+            pending_back_target_execution: entry.pending_back_target_execution.is_some(),
+            pending_back_no_target_completion: entry.pending_back_no_target_completion.is_some(),
+            pending_back_no_target_preparation: entry.pending_back_no_target_preparation.is_some(),
+            pending_back_no_target_authority_cleanup: entry
+                .pending_back_no_target_authority_cleanup
+                .is_some(),
+            pending_back_target_permanent_cleanup: entry
+                .pending_back_target_permanent_cleanup
+                .is_some(),
+            history_admission_stamp: entry.history_admission_stamp.is_some(),
+            back_capacity_issuer: entry.back_capacity_issuer.is_some(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Eq, PartialEq)]
+enum FrozenDelayedDriverReportReplayProjection {
+    Armed {
+        control: u64,
+    },
+    Captured {
+        control: u64,
+        identity: ViewReportIdentity,
+        released: bool,
+    },
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct FrozenStaleOutputCurrentEpoch {
+    router: RouterHandle,
+    targets: Vec<Entity>,
+    engine: r3_core::RouterSnapshotProjection,
+    requests: Vec<NavigationRequestId>,
+    physical: FailureCleanupSourceProjection,
+    holders: FrozenStaleOutputOtherHolders,
+    snapshots: Option<RouterSnapshotsProjection>,
+    drivers: Option<ViewDriverStoreProjection>,
+    registry: Option<ProtectedRegistryProjection>,
+    quarantine: Option<QuarantineLeaseTable>,
+    #[cfg(feature = "test-support")]
+    audit: Option<crate::audit::RouterAuthorityAuditSnapshot>,
+    #[cfg(any(test, feature = "test-support"))]
+    delayed_report: Option<FrozenDelayedDriverReportReplayProjection>,
+}
+
+impl FrozenStaleOutputCurrentEpoch {
+    fn observe(world: &World, entry: &RouterEntry, targets: &[Entity]) -> Self {
+        Self {
+            router: entry.handle,
+            targets: targets.to_vec(),
+            engine: entry.engine.snapshot(),
+            requests: entry.requests.clone(),
+            physical: FailureCleanupSourceProjection::observe(
+                entry.host.as_ref(),
+                entry.active.as_ref(),
+            ),
+            holders: FrozenStaleOutputOtherHolders::observe(entry),
+            snapshots: world
+                .get_resource::<RouterSnapshots>()
+                .map(RouterSnapshots::exact_projection),
+            drivers: world
+                .get_resource::<ViewDriverStore>()
+                .map(ViewDriverStore::exact_projection),
+            registry: world
+                .get_resource::<RouteEntityRegistry>()
+                .map(|registry| registry.protected_projection_excluding(targets)),
+            quarantine: world.get_resource::<QuarantineLeaseTable>().cloned(),
+            #[cfg(feature = "test-support")]
+            audit: world
+                .get_resource::<crate::audit::RouterAuthorityAudits>()
+                .and_then(|audits| audits.get(entry.handle))
+                .cloned(),
+            #[cfg(any(test, feature = "test-support"))]
+            delayed_report: entry
+                .delayed_driver_report_replay
+                .as_ref()
+                .map(|state| match state {
+                    TestingDelayedDriverReportReplayState::Armed { control } => {
+                        FrozenDelayedDriverReportReplayProjection::Armed { control: *control }
+                    }
+                    TestingDelayedDriverReportReplayState::Captured {
+                        control,
+                        artifact,
+                        released,
+                    } => FrozenDelayedDriverReportReplayProjection::Captured {
+                        control: *control,
+                        identity: artifact.identity.clone(),
+                        released: *released,
+                    },
+                }),
+        }
+    }
+
+    fn matches(&self, world: &World, entry: &RouterEntry) -> bool {
+        entry.handle == self.router && Self::observe(world, entry, &self.targets) == *self
+    }
+}
+
+enum PendingStaleOutputCleanup {
+    Sealed(SealedOldOutputSourceOwner),
+    Released {
+        owner: SealedOldOutputSourceOwner,
+        artifact: AppliedDriverReportArtifact,
+        stable_inert: bool,
+    },
+    Physical {
+        owner: SealedOldOutputOwner,
+        artifact: AppliedDriverReportArtifact,
+        stable_inert: bool,
+    },
+    Active {
+        source: OldOutputSourceIdentity,
+        current_epoch: FrozenStaleOutputCurrentEpoch,
+        cleanup_source: FailureCleanupSourceProjection,
+        ledger: CleanupLedger,
+        stable_inert: bool,
+    },
+}
+
+#[cfg(any(test, feature = "test-support"))]
+enum TestingDelayedDriverReportReplayState {
+    Armed {
+        control: u64,
+    },
+    Captured {
+        control: u64,
+        artifact: AppliedDriverReportArtifact,
+        released: bool,
+    },
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TestingDelayedDriverReportReplayControlError {
+    UnknownRouter,
+    AlreadyArmed,
+    NothingCaptured,
+    ForeignControl,
 }
 
 enum PendingMountMutationPayload {
@@ -2029,6 +2319,172 @@ struct SettledRetiredHostEvidence {
     retired_host: RetiredHostAuthorityTerminalEvidence,
 }
 
+struct PreparedHostAdmissionOperationFailure {
+    pub(crate) evidence: bevy_ui_router_core::integration::HostAdmissionUnavailableEvidence,
+}
+
+struct HostAdmissionOperationPreStagingSource {
+    pub(crate) prepared: PreparedHostAdmissionOperationFailure,
+    pub(crate) owner: bevy_ui_router_core::integration::HostAdmissionUnavailablePreStagingOwner,
+    pub(crate) installation: PreparedEcsHostCandidateSource,
+}
+
+enum HostAdmissionFailureHolder {
+    TraceCapacityInert {
+        owner: bevy_ui_router_core::integration::HostAdmissionUnavailablePreStagingOwner,
+        candidate: PreparedEcsHostCandidateSource,
+        evidence: bevy_ui_router_core::integration::HostAdmissionTraceCapacityFailureEvidence,
+    },
+    OperationEvidenceInert {
+        owner: bevy_ui_router_core::integration::HostAdmissionUnavailablePreStagingOwner,
+        candidate: PreparedEcsHostCandidateSource,
+        evidence: bevy_ui_router_core::integration::HostAdmissionOperationFailureEvidenceMismatch,
+    },
+    CauseBindObservedInert {
+        source: r3_core::HostAdmissionSourceProjection,
+        evidence: R3HostAdmissionUnavailableEvidence,
+        mismatch: r3_core::HostAdmissionSourceIneligibleProjection,
+    },
+    CauseBindPreStagingInert {
+        owner: r3_core::HostAdmissionUnavailablePreStagingOwner,
+        candidate: HostCandidateObservationSource,
+        evidence: R3HostAdmissionUnavailableEvidence,
+        mismatch: r3_core::HostAdmissionSourceIneligibleProjection,
+    },
+    CauseBindGrantedCandidateInert {
+        grant: r3_core::SourceBoundHostGrant,
+        candidate: PreparedEcsHostCandidateSource,
+        evidence: R3HostAdmissionUnavailableEvidence,
+        mismatch: r3_core::HostAdmissionSourceIneligibleProjection,
+    },
+    PreStaging(HostAdmissionOperationPreStagingSource),
+    GrantedInert {
+        grant: bevy_ui_router_core::integration::SourceBoundHostGrant,
+        candidate: PreparedEcsHostCandidateSource,
+    },
+    Provisional(ProvisionalHostAdmissionFailure),
+    ConfirmingInert(ConfirmingHostAdmissionInert),
+    PublicationInert(HostAdmissionPublicationInert),
+}
+
+enum R3HostAdmissionUnavailableEvidence {
+    NoCandidate(HostCandidateObservationSource),
+    Conflict(HostCandidateObservationSource),
+    InvalidTopology(HostCandidateObservationSource),
+    IdentityExhausted {
+        source: HostCandidateObservationSource,
+        attempted_counter: u64,
+    },
+    HostLost(HostCandidateObservationSource),
+    Preallocation(HostCandidateObservationSource),
+    Confirmation {
+        source: HostCandidateObservationSource,
+        evidence: r3_core::HostAdmissionConfirmationFailureEvidence,
+    },
+    AuthorityEstablishment(HostCandidateObservationSource),
+    PostAllocation {
+        source: HostCandidateObservationSource,
+        evidence: Arc<ProvisionalStagingFailureEvidence>,
+    },
+}
+
+struct PreparedProvisionalHostInstallation {
+    staged: StagedProvisionalTopSlot,
+    candidate: PreparedEcsHostCandidateSource,
+    claim: ExactRegistryClaim,
+    version: bevy_ui_router_core::HostVersion,
+    slot_id: bevy_ui_router_core::ids::RouteSlotId,
+}
+
+struct ProvisionalHostAdmissionFailure {
+    prepared: r3_core::PreparedHostAdmissionUnavailableCause<R3HostAdmissionUnavailableEvidence>,
+    grant: r3_core::SourceBoundHostGrant,
+    candidate: PreparedEcsHostCandidateSource,
+    ledger: ProvisionalHostCleanupLedger,
+    receiver: Option<r3_core::HostConfirmationReceiverMismatchProjection>,
+    stable_inert: bool,
+}
+
+struct ConfirmingHostAdmissionInert {
+    owner: r3_core::CorePreparedHostConfirmation<PreparedProvisionalHostInstallation>,
+    evidence: r3_core::HostAdmissionConfirmationFailureEvidence,
+    candidate: ValidatedHostCandidate,
+    grant_version: bevy_ui_router_core::HostVersion,
+    grant_top_slot: bevy_ui_router_core::ids::RouteSlotId,
+    slot: Entity,
+    claim: ExactRegistryClaim,
+}
+
+enum HostAdmissionPublicationInert {
+    CauseBindGranted {
+        grant: r3_core::SourceBoundHostGrant,
+        candidate: PreparedEcsHostCandidateSource,
+        settlement: ProvisionalHostSettlement,
+        evidence: R3HostAdmissionUnavailableEvidence,
+        mismatch: r3_core::HostAdmissionSourceIneligibleProjection,
+    },
+    PreStaging {
+        source: r3_core::HostAdmissionUnavailablePreStagingSource<
+            HostCandidateObservationSource,
+            R3HostAdmissionUnavailableEvidence,
+        >,
+        evidence: r3_core::HostAdmissionUnavailableFailureEvidence,
+    },
+    Observed {
+        prepared:
+            r3_core::PreparedHostAdmissionUnavailableCause<R3HostAdmissionUnavailableEvidence>,
+        evidence: r3_core::HostAdmissionUnavailableFailureEvidence,
+    },
+    Provisional {
+        source: r3_core::HostAdmissionUnavailableGrantedSource<
+            ProvisionalHostAdmissionTerminal,
+            R3HostAdmissionUnavailableEvidence,
+        >,
+        evidence: r3_core::HostAdmissionUnavailableFailureEvidence,
+    },
+    GrantedCandidate {
+        source: r3_core::HostAdmissionUnavailableGrantedSource<
+            PreparedEcsHostCandidateSource,
+            R3HostAdmissionUnavailableEvidence,
+        >,
+        evidence: r3_core::HostAdmissionUnavailableFailureEvidence,
+    },
+}
+
+struct ProvisionalHostAdmissionTerminal {
+    candidate: PreparedEcsHostCandidateSource,
+    terminal: ProvisionalHostSettlementTerminal,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestingHostConfirmationWholeOwnerStage {
+    Absent,
+    LegacyProvisionalSettlement,
+    OtherAdmissionFailure,
+    ProvisionalWholeOwner,
+    ConfirmingUnwindMismatchInert,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TestingHostConfirmationReceiverEvidenceProjection {
+    expected: r3_core::HostConfirmationReceiverProjection,
+    observed: Option<r3_core::HostConfirmationReceiverProjection>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TestingHostConfirmationWholeOwnerProjection {
+    stage: TestingHostConfirmationWholeOwnerStage,
+    candidate: Option<ValidatedHostCandidate>,
+    grant_version: Option<bevy_ui_router_core::HostVersion>,
+    grant_top_slot: Option<bevy_ui_router_core::ids::RouteSlotId>,
+    slot: Option<Entity>,
+    claim: Option<ExactRegistryClaim>,
+    receiver: Option<TestingHostConfirmationReceiverEvidenceProjection>,
+}
+
 struct RetiredHostPhysicalTerminal {
     host: RetiredHostBinding,
     edge: FrozenRetiredHostEdge,
@@ -2046,8 +2502,12 @@ pub(crate) struct RouterEntry {
     views: RouteViewRegistry,
     pub(crate) host: Option<HostBinding>,
     host_settlement: Option<ProvisionalHostSettlement>,
+    pending_host_admission_failure: Option<HostAdmissionFailureHolder>,
     pending_commit: Option<PendingCommit>,
     pending_frame_drive: Option<PendingFrameDrive>,
+    pending_stale_output_cleanup: Option<PendingStaleOutputCleanup>,
+    #[cfg(any(test, feature = "test-support"))]
+    delayed_driver_report_replay: Option<TestingDelayedDriverReportReplayState>,
     pending_mount_frame_task: Option<RootFrameTask>,
     pending_mount_request: Option<MountRequest>,
     pending_mount_mutation_rejection: Option<PendingMountMutationRejection>,
@@ -2086,6 +2546,11 @@ pub(crate) struct RouterEntry {
     back_target_atomic_applied_dispatch_calls: AtomicUsize,
     #[cfg(test)]
     back_target_permanent_begin_callback_calls: AtomicUsize,
+    host_admission_operation_counts: (usize, usize, usize, usize),
+    #[cfg(test)]
+    host_confirmation_receiver_drift_before_confirm_armed: bool,
+    #[cfg(test)]
+    host_confirmation_preparation_receiver_drift_before_prepare_armed: bool,
     #[cfg(test)]
     back_target_driver_staging_drift_armed: bool,
     #[cfg(test)]
@@ -5393,6 +5858,131 @@ enum AuthorityProtocolResidualKind {
 }
 
 impl RouterEntry {
+    fn captured_delayed_driver_report(
+        &self,
+        task: &RootFrameTask,
+    ) -> Option<&AppliedDriverReportArtifact> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            return match self.delayed_driver_report_replay.as_ref() {
+                Some(TestingDelayedDriverReportReplayState::Captured { artifact, .. })
+                    if artifact.identity == task.report_identity() =>
+                {
+                    Some(artifact)
+                }
+                _ => None,
+            };
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let _ = task;
+            None
+        }
+    }
+
+    fn delayed_driver_report_replay_blocks_drive(&self, task: &RootFrameTask) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            return matches!(
+                self.delayed_driver_report_replay.as_ref(),
+                Some(TestingDelayedDriverReportReplayState::Captured {
+                    artifact,
+                    released: false,
+                    ..
+                }) if artifact.identity == task.report_identity()
+            );
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let _ = task;
+            false
+        }
+    }
+
+    fn capture_delayed_driver_report_replay(
+        &mut self,
+        artifact: &AppliedDriverReportArtifact,
+    ) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let Some(state) = self.delayed_driver_report_replay.take() else {
+                return false;
+            };
+            match state {
+                TestingDelayedDriverReportReplayState::Armed { control } => {
+                    self.delayed_driver_report_replay =
+                        Some(TestingDelayedDriverReportReplayState::Captured {
+                            control,
+                            artifact: artifact.clone(),
+                            released: false,
+                        });
+                    true
+                }
+                state => {
+                    self.delayed_driver_report_replay = Some(state);
+                    false
+                }
+            }
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let _ = artifact;
+            false
+        }
+    }
+
+    fn take_released_driver_report_replay(
+        &mut self,
+        task: &RootFrameTask,
+    ) -> Option<AppliedDriverReportArtifact> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let state = self.delayed_driver_report_replay.take()?;
+            match state {
+                TestingDelayedDriverReportReplayState::Captured {
+                    artifact,
+                    released: true,
+                    ..
+                } if artifact.identity == task.report_identity() => Some(artifact),
+                state => {
+                    self.delayed_driver_report_replay = Some(state);
+                    None
+                }
+            }
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let _ = task;
+            None
+        }
+    }
+
+    fn take_released_sealed_driver_report_replay(
+        &mut self,
+        source: &OldOutputSourceIdentity,
+    ) -> Option<AppliedDriverReportArtifact> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let state = self.delayed_driver_report_replay.take()?;
+            match state {
+                TestingDelayedDriverReportReplayState::Captured {
+                    artifact,
+                    released: true,
+                    ..
+                } if artifact.identity == source.report => Some(artifact),
+                state => {
+                    self.delayed_driver_report_replay = Some(state);
+                    None
+                }
+            }
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let _ = source;
+            None
+        }
+    }
+
     pub(crate) fn install_back_capacity_issuer(
         &mut self,
         domains: &mut BackCapacityDomainIssuer,
@@ -5580,6 +6170,7 @@ impl RouterEntry {
                 || self.failure_cleanup_permanent.is_some()
                 || self.pending_mount_mutation_rejection.is_some()
                 || self.host_settlement.is_some()
+                || self.pending_host_admission_failure.is_some()
                 || self.pending_back_no_target_completion.is_some()
                 || self.pending_back_no_target_preparation.is_some()
                 || self.pending_back_no_target_authority_cleanup.is_some(),
@@ -5872,6 +6463,8 @@ impl RouterEntry {
 pub struct RouterNavigation {
     domain: u64,
     next_router: u64,
+    #[cfg(any(test, feature = "test-support"))]
+    next_delayed_driver_report_replay_control: u64,
     back_capacity_domain_issuer: BackCapacityDomainIssuer,
     pub(crate) entries: Vec<RouterEntry>,
 }
@@ -5901,8 +6494,62 @@ impl RouterNavigation {
         Self {
             domain,
             next_router: 1,
+            #[cfg(any(test, feature = "test-support"))]
+            next_delayed_driver_report_replay_control: 1,
             back_capacity_domain_issuer: BackCapacityDomainIssuer::new(),
             entries: Vec::new(),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_arm_next_applied_driver_report_replay(
+        &mut self,
+        router: RouterHandle,
+    ) -> Result<u64, TestingDelayedDriverReportReplayControlError> {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.handle == router) else {
+            return Err(TestingDelayedDriverReportReplayControlError::UnknownRouter);
+        };
+        if entry.delayed_driver_report_replay.is_some() {
+            return Err(TestingDelayedDriverReportReplayControlError::AlreadyArmed);
+        }
+        let control = self.next_delayed_driver_report_replay_control;
+        self.next_delayed_driver_report_replay_control = self
+            .next_delayed_driver_report_replay_control
+            .checked_add(1)
+            .ok_or(TestingDelayedDriverReportReplayControlError::AlreadyArmed)?;
+        entry.delayed_driver_report_replay =
+            Some(TestingDelayedDriverReportReplayState::Armed { control });
+        Ok(control)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn testing_release_applied_driver_report_replay(
+        &mut self,
+        router: RouterHandle,
+        control: u64,
+    ) -> Result<(), TestingDelayedDriverReportReplayControlError> {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.handle == router) else {
+            return Err(TestingDelayedDriverReportReplayControlError::UnknownRouter);
+        };
+        match entry.delayed_driver_report_replay.as_mut() {
+            Some(TestingDelayedDriverReportReplayState::Armed { control: armed }) => {
+                if *armed == control {
+                    Err(TestingDelayedDriverReportReplayControlError::NothingCaptured)
+                } else {
+                    Err(TestingDelayedDriverReportReplayControlError::ForeignControl)
+                }
+            }
+            Some(TestingDelayedDriverReportReplayState::Captured {
+                control: captured,
+                released,
+                ..
+            }) if *captured == control && !*released => {
+                *released = true;
+                Ok(())
+            }
+            Some(TestingDelayedDriverReportReplayState::Captured { .. }) | None => {
+                Err(TestingDelayedDriverReportReplayControlError::ForeignControl)
+            }
         }
     }
 
@@ -5953,8 +6600,12 @@ impl RouterNavigation {
             views,
             host: None,
             host_settlement: None,
+            pending_host_admission_failure: None,
             pending_commit: None,
             pending_frame_drive: None,
+            pending_stale_output_cleanup: None,
+            #[cfg(any(test, feature = "test-support"))]
+            delayed_driver_report_replay: None,
             pending_mount_frame_task: None,
             pending_mount_request: None,
             pending_mount_mutation_rejection: None,
@@ -5993,6 +6644,11 @@ impl RouterNavigation {
             back_target_atomic_applied_dispatch_calls: AtomicUsize::new(0),
             #[cfg(test)]
             back_target_permanent_begin_callback_calls: AtomicUsize::new(0),
+            host_admission_operation_counts: (0, 0, 0, 0),
+            #[cfg(test)]
+            host_confirmation_receiver_drift_before_confirm_armed: false,
+            #[cfg(test)]
+            host_confirmation_preparation_receiver_drift_before_prepare_armed: false,
             #[cfg(test)]
             back_target_driver_staging_drift_armed: false,
             #[cfg(test)]
@@ -6316,6 +6972,94 @@ fn map_navigation_enqueue_error(error: IntegrationError) -> NavigationEnqueueErr
 }
 
 #[cfg(test)]
+impl RouterEntry {
+    fn testing_host_admission_operation_counts(&self) -> (usize, usize, usize, usize) {
+        self.host_admission_operation_counts
+    }
+
+    fn testing_host_confirmation_whole_owner_projection(
+        &self,
+    ) -> TestingHostConfirmationWholeOwnerProjection {
+        if let Some(HostAdmissionFailureHolder::Provisional(holder)) =
+            &self.pending_host_admission_failure
+        {
+            return TestingHostConfirmationWholeOwnerProjection {
+                stage: TestingHostConfirmationWholeOwnerStage::ProvisionalWholeOwner,
+                candidate: Some(holder.candidate.candidate.clone()),
+                grant_version: Some(holder.grant.version().clone()),
+                grant_top_slot: Some(holder.grant.top_slot()),
+                slot: Some(holder.ledger.slot()),
+                claim: Some(holder.ledger.claim()),
+                receiver: holder.receiver.as_ref().map(|evidence| {
+                    TestingHostConfirmationReceiverEvidenceProjection {
+                        expected: evidence.expected.clone(),
+                        observed: evidence.observed.clone(),
+                    }
+                }),
+            };
+        }
+        if let Some(HostAdmissionFailureHolder::ConfirmingInert(holder)) =
+            &self.pending_host_admission_failure
+        {
+            let receiver = match &holder.evidence {
+                r3_core::HostAdmissionConfirmationFailureEvidence::Receiver(evidence) => {
+                    Some(TestingHostConfirmationReceiverEvidenceProjection {
+                        expected: evidence.expected.clone(),
+                        observed: evidence.observed.clone(),
+                    })
+                }
+                r3_core::HostAdmissionConfirmationFailureEvidence::Issuer(_)
+                | r3_core::HostAdmissionConfirmationFailureEvidence::TopSlotRegistrationOperationRejected(
+                    _,
+                )
+                | r3_core::HostAdmissionConfirmationFailureEvidence::TopSlotRegistrationRejected(
+                    _,
+                )
+                | r3_core::HostAdmissionConfirmationFailureEvidence::ConfirmationPreparationRejected(
+                    _,
+                )
+                | r3_core::HostAdmissionConfirmationFailureEvidence::ConfirmationPublicationRejected(
+                    _,
+                ) => None,
+            };
+            return TestingHostConfirmationWholeOwnerProjection {
+                stage: TestingHostConfirmationWholeOwnerStage::ConfirmingUnwindMismatchInert,
+                candidate: Some(holder.candidate.clone()),
+                grant_version: Some(holder.grant_version.clone()),
+                grant_top_slot: Some(holder.grant_top_slot),
+                slot: Some(holder.slot),
+                claim: Some(holder.claim.clone()),
+                receiver,
+            };
+        }
+        if let Some(settlement) = &self.host_settlement {
+            return TestingHostConfirmationWholeOwnerProjection {
+                stage: TestingHostConfirmationWholeOwnerStage::LegacyProvisionalSettlement,
+                candidate: None,
+                grant_version: None,
+                grant_top_slot: None,
+                slot: Some(settlement.slot()),
+                claim: Some(settlement.claim()),
+                receiver: None,
+            };
+        }
+        TestingHostConfirmationWholeOwnerProjection {
+            stage: if self.pending_host_admission_failure.is_some() {
+                TestingHostConfirmationWholeOwnerStage::OtherAdmissionFailure
+            } else {
+                TestingHostConfirmationWholeOwnerStage::Absent
+            },
+            candidate: None,
+            grant_version: None,
+            grant_top_slot: None,
+            slot: None,
+            claim: None,
+            receiver: None,
+        }
+    }
+}
+
+#[cfg(test)]
 impl RouterNavigation {
     pub(crate) fn pending_shape_for_test(&self) -> Option<(usize, usize, bool)> {
         self.entries
@@ -6397,13 +7141,16 @@ pub(crate) fn observe_authority_system(world: &mut World) {
         world.resource_scope(|world, mut latch: bevy_ecs::change_detection::Mut<HostCandidateRevisionLatch>| {
             world.resource_scope(|world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 for entry in &mut navigation.entries {
-                    if let Some(settlement) = entry.host_settlement.take()
-                        && !retry_provisional_host_settlement(world, &settlement)
-                    {
-                        entry.host_settlement = Some(settlement);
+                    if entry.pending_host_admission_failure.is_some() {
+                        drive_pending_r3_host_admission_failure(world, entry);
+                        continue;
+                    }
+                    if entry.host_settlement.is_some() {
                         continue;
                     }
                     if entry.host.is_some()
+                        || entry.post_commit_compound.is_some()
+                        || entry.authority_protocol_residual.is_some()
                         || entry
                             .cleanup_ledger
                             .as_ref()
@@ -6413,82 +7160,937 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                     {
                         continue;
                     }
-                    let HostCandidateClassification::Unique(candidate) =
-                        classify_host_candidate(world, entry.handle, &mut revisions)
-                    else {
-                        continue;
+                    let previous_candidate_source = match revisions.current_source(entry.handle) {
+                        Ok(source) => source,
+                        Err(_) => continue,
                     };
-                    let revision = candidate.revision();
-                    if !latch.allows(revision) {
-                        continue;
-                    }
-                    let host = candidate.host();
-                    let Ok(token) = entry.engine.request_host_admission() else {
-                        continue;
-                    };
-                    let Ok(grant) = entry.engine.grant_host_admission(&token) else {
-                        let _ = entry.engine.reject_host_admission(token);
-                        continue;
-                    };
-                    let version = grant.version().clone();
-                    let slot_id = grant.top_slot();
-                    match stage_granted_top_slot(world, candidate.clone(), &grant) {
-                        Ok(staged) => {
-                            let top_slot = staged.entity();
-                            if activate_granted_top_slot(world, &candidate, &grant, staged) {
-                                if entry.engine.record_top_slot_registered(&grant).is_err() {
-                                    let _ = settle_rejected_granted_top_slot(
-                                        world,
-                                        &candidate,
-                                        staged,
-                                    );
-                                    let _ = entry.engine.reject_host_after_mutation(grant);
-                                    latch.reject(revision);
-                                    continue;
-                                }
-                                let top_slot_claim = world
-                                    .resource::<RouteEntityRegistry>()
-                                    .record(top_slot)
-                                    .expect("activated top slot remains registered")
-                                    .claim();
-                                let registration_incarnation = world
-                                    .get::<crate::app_ext::RouterHostRegistration>(host)
-                                    .filter(|registration| registration.router() == entry.handle)
-                                    .map(crate::app_ext::RouterHostRegistration::incarnation)
-                                    .expect("the validated host retains its exact registration");
-                                let lease = entry.engine.confirm_host(grant);
-                                entry.host = Some(HostBinding {
-                                    version,
-                                    slot_id,
-                                    host,
-                                    top_slot,
-                                    top_slot_claim,
-                                    candidate,
-                                    registration_incarnation,
-                                    lease,
-                                });
-                            } else {
-                                let _ = settle_rejected_granted_top_slot(
-                                    world,
-                                    &candidate,
-                                    staged,
+                    let classification =
+                        classify_host_candidate(world, entry.handle, &mut revisions);
+                    let candidate = match classification {
+                        HostCandidateClassification::None(source) => {
+                            if entry.engine.snapshot().availability()
+                                != &RouterAvailability::AwaitingHost
+                                && let r3_core::HostAdmissionSourcePermitOutcome::Ineligible {
+                                    source: core_source,
+                                    ..
+                                } = entry.engine.issue_host_admission_source_permit()
+                            {
+                                complete_observed_r3_unavailable(
+                                    entry,
+                                    core_source,
+                                    R3HostAdmissionUnavailableEvidence::NoCandidate(source),
+                                    previous_candidate_source.as_ref().map(|source| source.digest()),
                                 );
-                                let _ = entry.engine.reject_host_after_mutation(grant);
-                                latch.reject(revision);
                             }
+                            continue;
                         }
-                        Err(failure) => {
-                            let settlement = failure.into_settlement();
-                            let _ = entry.engine.reject_host_after_mutation(grant);
-                            latch.reject(revision);
-                            entry.host_settlement = settlement;
+                        HostCandidateClassification::InvalidTopology(candidate) => {
+                            let source = candidate.observation_source();
+                            drive_observed_candidate_rejection(
+                                entry,
+                                source.clone(),
+                                R3HostAdmissionUnavailableEvidence::InvalidTopology(source),
+                                previous_candidate_source.as_ref().map(|source| source.digest()),
+                            );
+                            continue;
                         }
+                        HostCandidateClassification::Conflict(candidate) => {
+                            let source = candidate.observation_source();
+                            drive_observed_candidate_rejection(
+                                entry,
+                                source.clone(),
+                                R3HostAdmissionUnavailableEvidence::Conflict(source),
+                                previous_candidate_source.as_ref().map(|source| source.digest()),
+                            );
+                            continue;
+                        }
+                        HostCandidateClassification::RetryableCapacity(_) => continue,
+                        HostCandidateClassification::IdentityExhausted {
+                            source,
+                            attempted_counter,
+                        } => {
+                            drive_observed_candidate_rejection(
+                                entry,
+                                source.clone(),
+                                R3HostAdmissionUnavailableEvidence::IdentityExhausted {
+                                    source,
+                                    attempted_counter,
+                                },
+                                previous_candidate_source.as_ref().map(|source| source.digest()),
+                            );
+                            continue;
+                        }
+                        HostCandidateClassification::Unique(candidate) => candidate,
+                    };
+                    if !latch.allows(candidate.revision()) {
+                        continue;
                     }
+                    let prepared_rejection = match latch
+                        .prepare_rejection(entry.handle, candidate.revision())
+                    {
+                        Ok(prepared) => prepared,
+                        Err(_) => continue,
+                    };
+                    #[cfg(any(test, feature = "test-support"))]
+                    if let Some(owner) = entry.engine.testing_take_armed_host_admission_owner() {
+                        drive_armed_source_bound_host_admission(
+                            entry,
+                            PreparedEcsHostCandidateSource::prepare(candidate),
+                            owner,
+                        );
+                        continue;
+                    }
+                    let _ = drive_r3_unique_host_candidate(
+                        world,
+                        entry,
+                        PreparedEcsHostCandidateSource::prepare(candidate),
+                        previous_candidate_source.as_ref().map(|source| source.digest()),
+                        &mut latch,
+                        prepared_rejection,
+                    );
                 }
             });
         });
     });
     refresh_authority_audits(world);
+}
+
+fn r3_unavailable_projection(
+    core_source: &r3_core::HostAdmissionSourceProjection,
+    evidence: &R3HostAdmissionUnavailableEvidence,
+    expected_observation_digest: Option<u64>,
+) -> r3_core::HostAdmissionUnavailableEvidenceProjection {
+    match evidence {
+        R3HostAdmissionUnavailableEvidence::NoCandidate(source) => {
+            r3_core::HostAdmissionUnavailableEvidenceProjection::no_candidate(
+                core_source,
+                Some(source.revision().raw()),
+                expected_observation_digest.unwrap_or_else(|| source.digest()),
+                source.digest(),
+                None,
+            )
+        }
+        R3HostAdmissionUnavailableEvidence::Conflict(source) => {
+            r3_core::HostAdmissionUnavailableEvidenceProjection::conflict(
+                core_source,
+                Some(source.revision().raw()),
+                expected_observation_digest.unwrap_or_else(|| source.digest()),
+                source.digest(),
+            )
+        }
+        R3HostAdmissionUnavailableEvidence::InvalidTopology(source) => {
+            r3_core::HostAdmissionUnavailableEvidenceProjection::invalid_topology(
+                core_source,
+                Some(source.revision().raw()),
+                expected_observation_digest.unwrap_or_else(|| source.digest()),
+                source.digest(),
+            )
+        }
+        R3HostAdmissionUnavailableEvidence::IdentityExhausted {
+            source,
+            attempted_counter,
+        } => r3_core::HostAdmissionUnavailableEvidenceProjection::authority_establishment_failed(
+            core_source,
+            Some(source.revision().raw()),
+            expected_observation_digest.unwrap_or_else(|| source.digest()),
+            source.digest(),
+            Some(r3_core::HostAdmissionAllocatorExhaustionEvidence {
+                counter: r3_core::HostAdmissionAllocatorCounter::CandidateRevision,
+                current: *attempted_counter,
+                attempted: *attempted_counter,
+            }),
+        ),
+        R3HostAdmissionUnavailableEvidence::HostLost(source) => {
+            r3_core::HostAdmissionUnavailableEvidenceProjection::host_lost(
+                core_source,
+                Some(source.revision().raw()),
+                expected_observation_digest.unwrap_or_else(|| source.digest()),
+                source.digest(),
+            )
+        }
+        R3HostAdmissionUnavailableEvidence::Preallocation(source) => {
+            r3_core::HostAdmissionUnavailableEvidenceProjection::registry_invariant_violation(
+                core_source,
+                Some(source.revision().raw()),
+                source.digest(),
+                source.digest(),
+            )
+        }
+        R3HostAdmissionUnavailableEvidence::Confirmation { source, evidence } => {
+            r3_core::HostAdmissionUnavailableEvidenceProjection::confirmation_failed(
+                core_source,
+                Some(source.revision().raw()),
+                evidence.expected_digest(),
+                evidence.observed_digest(),
+            )
+        }
+        R3HostAdmissionUnavailableEvidence::AuthorityEstablishment(source) => {
+            r3_core::HostAdmissionUnavailableEvidenceProjection::authority_establishment_failed(
+                core_source,
+                Some(source.revision().raw()),
+                expected_observation_digest.unwrap_or_else(|| source.digest()),
+                source.digest(),
+                None,
+            )
+        }
+        R3HostAdmissionUnavailableEvidence::PostAllocation { source, evidence } => {
+            r3_core::HostAdmissionUnavailableEvidenceProjection::authority_establishment_failed(
+                core_source,
+                Some(source.revision().raw()),
+                evidence.expected_digest(),
+                evidence.observed_digest(),
+                None,
+            )
+        }
+    }
+}
+
+fn complete_observed_r3_unavailable(
+    entry: &mut RouterEntry,
+    source: r3_core::HostAdmissionSourceProjection,
+    evidence: R3HostAdmissionUnavailableEvidence,
+    expected_observation_digest: Option<u64>,
+) -> bool {
+    let projection = r3_unavailable_projection(&source, &evidence, expected_observation_digest);
+    entry.host_admission_operation_counts.0 += 1;
+    match r3_core::bind_host_admission_unavailable_cause(source, &projection, evidence) {
+        r3_core::HostAdmissionUnavailableCauseBindOutcome::Bound(prepared) => {
+            match entry
+                .engine
+                .complete_observed_host_admission_unavailable(prepared, || {})
+            {
+                r3_core::HostAdmissionUnavailableObservedOutcome::Published(_) => {
+                    entry.host_admission_operation_counts.1 += 1;
+                    entry.host_admission_operation_counts.2 += 1;
+                    return true;
+                }
+                r3_core::HostAdmissionUnavailableObservedOutcome::Stable { .. } => {
+                    entry.host_admission_operation_counts.1 += 1;
+                }
+                r3_core::HostAdmissionUnavailableObservedOutcome::Awaiting { .. } => {
+                    entry.host_admission_operation_counts.1 += 1;
+                }
+                r3_core::HostAdmissionUnavailableObservedOutcome::Mismatch {
+                    prepared,
+                    evidence,
+                } => {
+                    entry.pending_host_admission_failure =
+                        Some(HostAdmissionFailureHolder::PublicationInert(
+                            HostAdmissionPublicationInert::Observed { prepared, evidence },
+                        ));
+                }
+            }
+        }
+        r3_core::HostAdmissionUnavailableCauseBindOutcome::Mismatch {
+            source,
+            evidence,
+            mismatch,
+            ..
+        } => {
+            entry.pending_host_admission_failure =
+                Some(HostAdmissionFailureHolder::CauseBindObservedInert {
+                    source,
+                    evidence,
+                    mismatch,
+                });
+        }
+    }
+    false
+}
+
+fn settled_retired_host_allows_candidate(
+    world: &World,
+    evidence: &SettledRetiredHostEvidence,
+    candidate: &PreparedEcsHostCandidateSource,
+) -> bool {
+    if candidate.candidate.host() != evidence.host.host {
+        return true;
+    }
+    let allowed = candidate.registration_incarnation != evidence.host.registration_incarnation
+        && evidence.edge.host == evidence.host.host
+        && evidence.edge.top_slot == evidence.host.top_slot
+        && evidence.edge.top_slot_claim == evidence.host.top_slot_claim
+        && evidence.edge.registration_incarnation == evidence.host.registration_incarnation
+        && matches!(
+            evidence.edge_terminal,
+            RetiredHostEdgePhysicalTerminal::Detached
+                | RetiredHostEdgePhysicalTerminal::HostAbsent
+                | RetiredHostEdgePhysicalTerminal::EdgeAlreadyAbsent
+        )
+        && (world.get_entity(evidence.host.top_slot).is_err()
+            || world
+                .get::<ChildOf>(evidence.host.top_slot)
+                .is_none_or(|parent| parent.parent() != evidence.host.host));
+    allowed
+}
+
+fn complete_pre_staging_r3_unavailable(
+    entry: &mut RouterEntry,
+    owner: r3_core::HostAdmissionUnavailablePreStagingOwner,
+    source_evidence: HostCandidateObservationSource,
+    evidence: R3HostAdmissionUnavailableEvidence,
+) {
+    let core_source = match &owner {
+        r3_core::HostAdmissionUnavailablePreStagingOwner::Permit(permit) => {
+            permit.source_projection()
+        }
+        r3_core::HostAdmissionUnavailablePreStagingOwner::Token(token) => token.source_projection(),
+    };
+    let projection = r3_unavailable_projection(&core_source, &evidence, None);
+    entry.host_admission_operation_counts.0 += 1;
+    let prepared =
+        match r3_core::bind_host_admission_unavailable_cause(core_source, &projection, evidence) {
+            r3_core::HostAdmissionUnavailableCauseBindOutcome::Bound(prepared) => prepared,
+            r3_core::HostAdmissionUnavailableCauseBindOutcome::Mismatch {
+                evidence,
+                mismatch,
+                ..
+            } => {
+                entry.pending_host_admission_failure =
+                    Some(HostAdmissionFailureHolder::CauseBindPreStagingInert {
+                        owner,
+                        candidate: source_evidence,
+                        evidence,
+                        mismatch,
+                    });
+                return;
+            }
+        };
+    let source = r3_core::HostAdmissionUnavailablePreStagingSource {
+        prepared,
+        owner,
+        installation: source_evidence,
+    };
+    match entry
+        .engine
+        .complete_pre_staging_host_admission_unavailable(source, |evidence| evidence)
+    {
+        r3_core::HostAdmissionUnavailablePreStagingOutcome::Published { .. } => {
+            entry.host_admission_operation_counts.1 += 1;
+            entry.host_admission_operation_counts.2 += 1;
+        }
+        r3_core::HostAdmissionUnavailablePreStagingOutcome::Mismatch { source, evidence } => {
+            entry.pending_host_admission_failure =
+                Some(HostAdmissionFailureHolder::PublicationInert(
+                    HostAdmissionPublicationInert::PreStaging { source, evidence },
+                ));
+        }
+    }
+}
+
+fn drive_observed_candidate_rejection(
+    entry: &mut RouterEntry,
+    source_evidence: HostCandidateObservationSource,
+    evidence: R3HostAdmissionUnavailableEvidence,
+    expected_observation_digest: Option<u64>,
+) {
+    match entry.engine.issue_host_admission_source_permit() {
+        r3_core::HostAdmissionSourcePermitOutcome::Issued(permit) => {
+            complete_pre_staging_r3_unavailable(
+                entry,
+                r3_core::HostAdmissionUnavailablePreStagingOwner::Permit(permit),
+                source_evidence,
+                evidence,
+            );
+        }
+        r3_core::HostAdmissionSourcePermitOutcome::Ineligible { source, .. } => {
+            complete_observed_r3_unavailable(entry, source, evidence, expected_observation_digest);
+        }
+        r3_core::HostAdmissionSourcePermitOutcome::Outstanding { .. } => {}
+    }
+}
+
+fn drive_r3_unique_host_candidate(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    mut candidate: PreparedEcsHostCandidateSource,
+    expected_observation_digest: Option<u64>,
+    latch: &mut HostCandidateRevisionLatch,
+    prepared_rejection: PreparedHostCandidateRejection,
+) -> Result<(), HostCandidateCapacityEvidence> {
+    if entry
+        .settled_retired_host_evidence
+        .as_ref()
+        .is_some_and(|evidence| !settled_retired_host_allows_candidate(world, evidence, &candidate))
+    {
+        return Ok(());
+    }
+    if !candidate.prepare_staging_revalidation(world)? {
+        return Ok(());
+    }
+    let permit = match entry.engine.issue_host_admission_source_permit() {
+        r3_core::HostAdmissionSourcePermitOutcome::Issued(permit) => permit,
+        r3_core::HostAdmissionSourcePermitOutcome::Ineligible { source, .. } => {
+            let observation = candidate.observation_source();
+            let evidence = match entry.engine.snapshot().availability() {
+                RouterAvailability::Unavailable(
+                    bevy_ui_router_core::prelude::RouterUnavailableReason::HostConflict,
+                ) => R3HostAdmissionUnavailableEvidence::Conflict(observation),
+                RouterAvailability::Unavailable(
+                    bevy_ui_router_core::prelude::RouterUnavailableReason::InvalidHostUiTopology,
+                ) => R3HostAdmissionUnavailableEvidence::InvalidTopology(observation),
+                RouterAvailability::Unavailable(
+                    bevy_ui_router_core::prelude::RouterUnavailableReason::HostLost,
+                ) => R3HostAdmissionUnavailableEvidence::HostLost(observation),
+                _ => R3HostAdmissionUnavailableEvidence::AuthorityEstablishment(observation),
+            };
+            let _ = complete_observed_r3_unavailable(
+                entry,
+                source,
+                evidence,
+                expected_observation_digest,
+            );
+            return Ok(());
+        }
+        r3_core::HostAdmissionSourcePermitOutcome::Outstanding { .. } => return Ok(()),
+    };
+    let token = match entry.engine.request_source_bound_host_admission(permit) {
+        Ok(token) => token,
+        Err(error) => {
+            retain_host_admission_operation_failure(
+                entry,
+                candidate,
+                r3_core::HostAdmissionUnavailablePreStagingOwner::Permit(error.owner),
+                error.evidence,
+            );
+            latch.commit_rejection(prepared_rejection);
+            return Ok(());
+        }
+    };
+    let grant = match entry.engine.grant_source_bound_host_admission(token) {
+        Ok(grant) => grant,
+        Err(error) => {
+            retain_host_admission_operation_failure(
+                entry,
+                candidate,
+                r3_core::HostAdmissionUnavailablePreStagingOwner::Token(error.owner),
+                error.evidence,
+            );
+            latch.commit_rejection(prepared_rejection);
+            return Ok(());
+        }
+    };
+    if !world.contains_resource::<RouteEntityRegistry>()
+        || !world.contains_resource::<crate::registry::QuarantineLeaseTable>()
+    {
+        let observation = candidate.observation_source();
+        complete_granted_candidate_unavailable(
+            entry,
+            grant,
+            candidate,
+            R3HostAdmissionUnavailableEvidence::Preallocation(observation),
+        );
+        latch.commit_rejection(prepared_rejection);
+        return Ok(());
+    }
+    match stage_source_bound_granted_top_slot(world, &mut candidate, &grant) {
+        Ok(staged) => {
+            drive_r3_staged_host_confirmation(world, entry, grant, candidate, staged);
+            if entry.host.is_none() {
+                latch.commit_rejection(prepared_rejection);
+            }
+        }
+        Err(failure) => {
+            let post_allocation = failure.entity().is_some();
+            if let Some(settlement) = failure.into_settlement() {
+                retain_r3_provisional_failure(entry, grant, candidate, settlement, None, false);
+            } else if post_allocation {
+                entry.pending_host_admission_failure =
+                    Some(HostAdmissionFailureHolder::GrantedInert { grant, candidate });
+            } else {
+                let observation = candidate.observation_source();
+                complete_granted_candidate_unavailable(
+                    entry,
+                    grant,
+                    candidate,
+                    R3HostAdmissionUnavailableEvidence::Preallocation(observation),
+                );
+            }
+            latch.commit_rejection(prepared_rejection);
+        }
+    }
+    Ok(())
+}
+
+fn complete_granted_candidate_unavailable(
+    entry: &mut RouterEntry,
+    grant: r3_core::SourceBoundHostGrant,
+    candidate: PreparedEcsHostCandidateSource,
+    evidence: R3HostAdmissionUnavailableEvidence,
+) {
+    let source = grant.source_projection();
+    let projection = r3_unavailable_projection(&source, &evidence, None);
+    entry.host_admission_operation_counts.0 += 1;
+    let prepared =
+        match r3_core::bind_host_admission_unavailable_cause(source, &projection, evidence) {
+            r3_core::HostAdmissionUnavailableCauseBindOutcome::Bound(prepared) => prepared,
+            r3_core::HostAdmissionUnavailableCauseBindOutcome::Mismatch {
+                evidence,
+                mismatch,
+                ..
+            } => {
+                entry.pending_host_admission_failure =
+                    Some(HostAdmissionFailureHolder::CauseBindGrantedCandidateInert {
+                        grant,
+                        candidate,
+                        evidence,
+                        mismatch,
+                    });
+                return;
+            }
+        };
+    let source = r3_core::HostAdmissionUnavailableGrantedSource {
+        prepared,
+        owner: r3_core::bind_granted_host_admission_source(grant, candidate),
+    };
+    match entry
+        .engine
+        .complete_granted_host_admission_unavailable(source, |candidate| candidate)
+    {
+        r3_core::HostAdmissionUnavailableGrantedOutcome::Published { .. } => {
+            entry.host_admission_operation_counts.1 += 1;
+            entry.host_admission_operation_counts.2 += 1;
+        }
+        r3_core::HostAdmissionUnavailableGrantedOutcome::Mismatch { source, evidence } => {
+            entry.pending_host_admission_failure =
+                Some(HostAdmissionFailureHolder::PublicationInert(
+                    HostAdmissionPublicationInert::GrantedCandidate { source, evidence },
+                ));
+        }
+    }
+}
+
+fn drive_r3_staged_host_confirmation(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    grant: r3_core::SourceBoundHostGrant,
+    mut candidate: PreparedEcsHostCandidateSource,
+    staged: StagedProvisionalTopSlot,
+) {
+    let staged_entity = staged.entity();
+    let claim = world
+        .resource::<RouteEntityRegistry>()
+        .record(staged_entity)
+        .expect("source-bound staging retained its exact claim")
+        .claim();
+    if !activate_source_bound_granted_top_slot(world, &candidate, &grant, &staged) {
+        let settlement = retain_staged_top_slot_for_settlement(world, &candidate.candidate, staged);
+        retain_r3_provisional_failure(entry, grant, candidate, settlement, None, false);
+        return;
+    }
+    if let Err(error) = entry.engine.record_source_bound_top_slot_registered(&grant) {
+        let failure = match error {
+            r3_core::SourceBoundTopSlotRegistrationError::Operation(evidence) => Some(
+                r3_core::HostAdmissionConfirmationFailureEvidence::TopSlotRegistrationOperationRejected(
+                    evidence,
+                ),
+            ),
+            r3_core::SourceBoundTopSlotRegistrationError::TraceCapacity(evidence) => Some(
+                r3_core::HostAdmissionConfirmationFailureEvidence::TopSlotRegistrationRejected(
+                    evidence,
+                ),
+            ),
+        };
+        let stable_inert = !hide_source_bound_granted_top_slot(world, &candidate, &grant, &staged);
+        let settlement = retain_staged_top_slot_for_settlement(world, &candidate.candidate, staged);
+        retain_r3_provisional_failure(entry, grant, candidate, settlement, failure, stable_inert);
+        return;
+    }
+    #[cfg(test)]
+    if std::mem::take(&mut entry.host_confirmation_preparation_receiver_drift_before_prepare_armed)
+    {
+        let _ = entry
+            .engine
+            .testing_drift_host_confirmation_preparation_receiver_input();
+    }
+    let cached_candidate = candidate
+        .take_confirmation_failure_candidate()
+        .expect("confirmation failure projection was prepared before admission");
+    let cached_grant_version = grant.version().clone();
+    let cached_grant_top_slot = grant.top_slot();
+    let installation = PreparedProvisionalHostInstallation {
+        staged,
+        claim: claim.clone(),
+        version: grant.version().clone(),
+        slot_id: grant.top_slot(),
+        candidate,
+    };
+    let owner = r3_core::bind_granted_host_admission_source(grant, installation);
+    let prepared = match entry.engine.prepare_host_confirmation(owner) {
+        r3_core::HostConfirmationPreparationOutcome::Prepared(prepared) => prepared,
+        r3_core::HostConfirmationPreparationOutcome::PublicationPreparationRejected {
+            owner,
+            evidence,
+        } => {
+            let (grant, installation) = owner.into_parts();
+            let PreparedProvisionalHostInstallation {
+                staged, candidate, ..
+            } = installation;
+            let stable_inert =
+                !hide_source_bound_granted_top_slot(world, &candidate, &grant, &staged);
+            let settlement =
+                retain_staged_top_slot_for_settlement(world, &candidate.candidate, staged);
+            retain_r3_provisional_failure(
+                entry,
+                grant,
+                candidate,
+                settlement,
+                Some(
+                    r3_core::HostAdmissionConfirmationFailureEvidence::ConfirmationPreparationRejected(
+                        evidence,
+                    ),
+                ),
+                stable_inert,
+            );
+            return;
+        }
+        r3_core::HostConfirmationPreparationOutcome::ReceiverMismatch { owner, evidence } => {
+            let rejected =
+                r3_core::consume_host_confirmation_preparation_mismatch(owner, evidence.clone());
+            let (grant, installation, _) = rejected.into_parts();
+            let PreparedProvisionalHostInstallation {
+                staged, candidate, ..
+            } = installation;
+            let stable_inert =
+                !hide_source_bound_granted_top_slot(world, &candidate, &grant, &staged);
+            let settlement =
+                retain_staged_top_slot_for_settlement(world, &candidate.candidate, staged);
+            retain_r3_provisional_failure(
+                entry,
+                grant,
+                candidate,
+                settlement,
+                Some(r3_core::HostAdmissionConfirmationFailureEvidence::Receiver(
+                    evidence,
+                )),
+                stable_inert,
+            );
+            return;
+        }
+    };
+    #[cfg(test)]
+    if std::mem::take(&mut entry.host_confirmation_receiver_drift_before_confirm_armed) {
+        let _ = entry
+            .engine
+            .testing_drift_prepared_host_confirmation_receiver_input();
+    }
+    match entry
+        .engine
+        .confirm_host_admission_with_binding(prepared, |installation, lease| HostBinding {
+            version: installation.version,
+            slot_id: installation.slot_id,
+            host: installation.candidate.candidate.host(),
+            top_slot: installation.staged.entity(),
+            top_slot_claim: installation.claim,
+            registration_incarnation: installation.candidate.registration_incarnation,
+            candidate: installation.candidate.candidate,
+            lease,
+        }) {
+        r3_core::HostAdmissionConfirmationCoreOutcome::Ready { installed, .. } => {
+            entry.host = Some(installed);
+            let _ = entry.settled_retired_host_evidence.take();
+        }
+        r3_core::HostAdmissionConfirmationCoreOutcome::ReceiverMismatch { owner, evidence } => {
+            retain_r3_confirmation_failure(
+                world,
+                entry,
+                owner,
+                r3_core::HostAdmissionConfirmationFailureEvidence::Receiver(evidence),
+                cached_candidate,
+                cached_grant_version,
+                cached_grant_top_slot,
+                staged_entity,
+                claim,
+            );
+        }
+        r3_core::HostAdmissionConfirmationCoreOutcome::IssuerRejected { owner, evidence } => {
+            retain_r3_confirmation_failure(
+                world,
+                entry,
+                owner,
+                r3_core::HostAdmissionConfirmationFailureEvidence::Issuer(evidence),
+                cached_candidate,
+                cached_grant_version,
+                cached_grant_top_slot,
+                staged_entity,
+                claim,
+            );
+        }
+        r3_core::HostAdmissionConfirmationCoreOutcome::PublicationPreparationRejected {
+            owner,
+            evidence,
+        } => {
+            retain_r3_confirmation_failure(
+                world,
+                entry,
+                owner,
+                r3_core::HostAdmissionConfirmationFailureEvidence::ConfirmationPublicationRejected(
+                    evidence,
+                ),
+                cached_candidate,
+                cached_grant_version,
+                cached_grant_top_slot,
+                staged_entity,
+                claim,
+            );
+        }
+    }
+}
+
+fn retain_r3_provisional_failure(
+    entry: &mut RouterEntry,
+    grant: r3_core::SourceBoundHostGrant,
+    candidate: PreparedEcsHostCandidateSource,
+    settlement: ProvisionalHostSettlement,
+    failure: Option<r3_core::HostAdmissionConfirmationFailureEvidence>,
+    stable_inert: bool,
+) {
+    let receiver = failure.as_ref().and_then(|failure| match failure {
+        r3_core::HostAdmissionConfirmationFailureEvidence::Receiver(receiver) => {
+            Some(receiver.clone())
+        }
+        r3_core::HostAdmissionConfirmationFailureEvidence::Issuer(_)
+        | r3_core::HostAdmissionConfirmationFailureEvidence::TopSlotRegistrationOperationRejected(
+            _,
+        )
+        | r3_core::HostAdmissionConfirmationFailureEvidence::TopSlotRegistrationRejected(_)
+        | r3_core::HostAdmissionConfirmationFailureEvidence::ConfirmationPreparationRejected(_)
+        | r3_core::HostAdmissionConfirmationFailureEvidence::ConfirmationPublicationRejected(_) => {
+            None
+        }
+    });
+    let source_observation = candidate.observation_source();
+    let evidence = if let Some(failure) = failure {
+        R3HostAdmissionUnavailableEvidence::Confirmation {
+            source: source_observation,
+            evidence: failure,
+        }
+    } else {
+        R3HostAdmissionUnavailableEvidence::PostAllocation {
+            source: source_observation,
+            evidence: settlement.failure_evidence(),
+        }
+    };
+    let source = grant.source_projection();
+    let projection = r3_unavailable_projection(&source, &evidence, None);
+    entry.host_admission_operation_counts.0 += 1;
+    match r3_core::bind_host_admission_unavailable_cause(source, &projection, evidence) {
+        r3_core::HostAdmissionUnavailableCauseBindOutcome::Bound(prepared) => {
+            entry.pending_host_admission_failure = Some(HostAdmissionFailureHolder::Provisional(
+                ProvisionalHostAdmissionFailure {
+                    prepared,
+                    grant,
+                    candidate,
+                    ledger: ProvisionalHostCleanupLedger::new(settlement),
+                    receiver,
+                    stable_inert,
+                },
+            ));
+        }
+        r3_core::HostAdmissionUnavailableCauseBindOutcome::Mismatch {
+            evidence, mismatch, ..
+        } => {
+            entry.pending_host_admission_failure =
+                Some(HostAdmissionFailureHolder::PublicationInert(
+                    HostAdmissionPublicationInert::CauseBindGranted {
+                        grant,
+                        candidate,
+                        settlement,
+                        evidence,
+                        mismatch,
+                    },
+                ));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retain_r3_confirmation_failure(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    owner: r3_core::CorePreparedHostConfirmation<PreparedProvisionalHostInstallation>,
+    failure: r3_core::HostAdmissionConfirmationFailureEvidence,
+    candidate: ValidatedHostCandidate,
+    grant_version: bevy_ui_router_core::HostVersion,
+    grant_top_slot: bevy_ui_router_core::ids::RouteSlotId,
+    slot: Entity,
+    claim: ExactRegistryClaim,
+) {
+    match entry.engine.unwind_host_confirmation(owner) {
+        r3_core::HostConfirmationUnwindOutcome::Grant(source) => {
+            let (grant, installation) = source.into_parts();
+            let PreparedProvisionalHostInstallation {
+                staged, candidate, ..
+            } = installation;
+            let settlement =
+                retain_staged_top_slot_for_settlement(world, &candidate.candidate, staged);
+            retain_r3_provisional_failure(
+                entry,
+                grant,
+                candidate,
+                settlement,
+                Some(failure),
+                false,
+            );
+        }
+        r3_core::HostConfirmationUnwindOutcome::Mismatch { owner, evidence } => {
+            entry.pending_host_admission_failure = Some(
+                HostAdmissionFailureHolder::ConfirmingInert(ConfirmingHostAdmissionInert {
+                    owner,
+                    evidence: r3_core::HostAdmissionConfirmationFailureEvidence::Receiver(evidence),
+                    candidate,
+                    grant_version,
+                    grant_top_slot,
+                    slot,
+                    claim,
+                }),
+            );
+        }
+    }
+}
+
+fn drive_pending_r3_host_admission_failure(world: &mut World, entry: &mut RouterEntry) {
+    let Some(holder) = entry.pending_host_admission_failure.take() else {
+        return;
+    };
+    match holder {
+        HostAdmissionFailureHolder::Provisional(mut holder) if !holder.stable_inert => {
+            entry.host_admission_operation_counts.3 += 1;
+            if !holder.ledger.settle(world) {
+                holder.stable_inert = holder.ledger.is_inert();
+                entry.pending_host_admission_failure =
+                    Some(HostAdmissionFailureHolder::Provisional(holder));
+                return;
+            }
+            let terminal = match holder.ledger.into_terminal() {
+                Ok(terminal) => terminal,
+                Err(ledger) => {
+                    holder.ledger = ledger;
+                    holder.stable_inert = true;
+                    entry.pending_host_admission_failure =
+                        Some(HostAdmissionFailureHolder::Provisional(holder));
+                    return;
+                }
+            };
+            let owner = r3_core::bind_granted_host_admission_source(
+                holder.grant,
+                ProvisionalHostAdmissionTerminal {
+                    candidate: holder.candidate,
+                    terminal,
+                },
+            );
+            let source = r3_core::HostAdmissionUnavailableGrantedSource {
+                prepared: holder.prepared,
+                owner,
+            };
+            match entry
+                .engine
+                .complete_granted_host_admission_unavailable(source, |terminal| terminal)
+            {
+                r3_core::HostAdmissionUnavailableGrantedOutcome::Published { .. } => {
+                    entry.host_admission_operation_counts.1 += 1;
+                    entry.host_admission_operation_counts.2 += 1;
+                }
+                r3_core::HostAdmissionUnavailableGrantedOutcome::Mismatch { source, evidence } => {
+                    entry.pending_host_admission_failure =
+                        Some(HostAdmissionFailureHolder::PublicationInert(
+                            HostAdmissionPublicationInert::Provisional { source, evidence },
+                        ));
+                }
+            }
+        }
+        holder => {
+            entry.pending_host_admission_failure = Some(holder);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn drive_armed_source_bound_host_admission(
+    entry: &mut RouterEntry,
+    candidate: PreparedEcsHostCandidateSource,
+    owner: bevy_ui_router_core::integration::HostAdmissionUnavailablePreStagingOwner,
+) {
+    match owner {
+        bevy_ui_router_core::integration::HostAdmissionUnavailablePreStagingOwner::Permit(
+            permit,
+        ) => match entry.engine.request_source_bound_host_admission(permit) {
+            Ok(token) => drive_armed_source_bound_host_grant(entry, candidate, token),
+            Err(error) => retain_host_admission_operation_failure(
+                entry,
+                candidate,
+                bevy_ui_router_core::integration::HostAdmissionUnavailablePreStagingOwner::Permit(
+                    error.owner,
+                ),
+                error.evidence,
+            ),
+        },
+        bevy_ui_router_core::integration::HostAdmissionUnavailablePreStagingOwner::Token(token) => {
+            drive_armed_source_bound_host_grant(entry, candidate, token);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn drive_armed_source_bound_host_grant(
+    entry: &mut RouterEntry,
+    candidate: PreparedEcsHostCandidateSource,
+    token: bevy_ui_router_core::integration::SourceBoundHostAdmissionToken,
+) {
+    match entry.engine.grant_source_bound_host_admission(token) {
+        Ok(grant) => {
+            entry.pending_host_admission_failure =
+                Some(HostAdmissionFailureHolder::GrantedInert { grant, candidate });
+        }
+        Err(error) => retain_host_admission_operation_failure(
+            entry,
+            candidate,
+            bevy_ui_router_core::integration::HostAdmissionUnavailablePreStagingOwner::Token(
+                error.owner,
+            ),
+            error.evidence,
+        ),
+    }
+}
+
+fn retain_host_admission_operation_failure(
+    entry: &mut RouterEntry,
+    candidate: PreparedEcsHostCandidateSource,
+    owner: bevy_ui_router_core::integration::HostAdmissionUnavailablePreStagingOwner,
+    evidence: bevy_ui_router_core::integration::AdmissionOwnerFailureEvidence,
+) {
+    entry.pending_host_admission_failure = Some(match evidence {
+        bevy_ui_router_core::integration::AdmissionOwnerFailureEvidence::Operation(evidence) => {
+            match evidence {
+                bevy_ui_router_core::integration::HostAdmissionOperationFailureFreezeOutcome::Frozen(
+                    evidence,
+                ) => HostAdmissionFailureHolder::PreStaging(HostAdmissionOperationPreStagingSource {
+                    prepared: PreparedHostAdmissionOperationFailure {
+                        evidence:
+                            bevy_ui_router_core::integration::HostAdmissionUnavailableEvidence::Operation(
+                                evidence,
+                            ),
+                    },
+                    owner,
+                    installation: candidate,
+                }),
+                bevy_ui_router_core::integration::HostAdmissionOperationFailureFreezeOutcome::Mismatch(
+                    evidence,
+                ) => HostAdmissionFailureHolder::OperationEvidenceInert {
+                    owner,
+                    candidate,
+                    evidence,
+                },
+            }
+        }
+        bevy_ui_router_core::integration::AdmissionOwnerFailureEvidence::TraceCapacity(evidence) => {
+            HostAdmissionFailureHolder::TraceCapacityInert {
+                owner,
+                candidate,
+                evidence,
+            }
+        }
+    });
 }
 
 pub(crate) fn collect_navigation_system(world: &mut World) {
@@ -6550,8 +8152,7 @@ fn apply_applied_driver_report(
     top_slot: bevy_ecs::entity::Entity,
     top_slot_claim: crate::registry::ExactRegistryClaim,
     task: &RootFrameTask,
-    report: &ViewBuildReport,
-    plan: ContentPlan,
+    artifact: AppliedDriverReportArtifact,
 ) -> Result<RealizedFrame, DriverReportApplicationError> {
     apply_applied_driver_report_to_branch(
         world,
@@ -6562,8 +8163,7 @@ fn apply_applied_driver_report(
         None,
         None,
         task,
-        report,
-        plan,
+        artifact,
     )
 }
 
@@ -6576,15 +8176,15 @@ fn apply_applied_driver_report_to_branch(
     branch: Option<&PreparedBranch>,
     active: Option<&RealizedBranch>,
     task: &RootFrameTask,
-    report: &ViewBuildReport,
-    plan: ContentPlan,
+    artifact: AppliedDriverReportArtifact,
 ) -> Result<RealizedFrame, DriverReportApplicationError> {
-    if report.kind() != ViewBuildReportKind::Applied
-        || report.identity() != &task.report_identity()
+    if artifact.kind != ViewBuildReportKind::Applied
+        || artifact.identity != task.report_identity()
         || engine.inspect_report_identity(task).is_err()
     {
         return Err(DriverReportApplicationError::Stale);
     }
+    let AppliedDriverReportArtifact { plan, .. } = artifact;
 
     match task.mount_target() {
         FrameMountTarget::TopSlot { .. } if branch.is_none() => realize_frame_deferred(
@@ -7630,6 +9230,315 @@ fn retain_frame_task_after_authority_retry(
     });
 }
 
+fn begin_sealed_old_output_host_loss(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    had_active: bool,
+    active: RealizedBranch,
+    pending: PendingCommit,
+    task: RootFrameTask,
+    retry_effect: Option<ViewBuildEffect>,
+) {
+    let source = entry.host.as_ref().and_then(|host| {
+        entry
+            .captured_delayed_driver_report(&task)
+            .and_then(|artifact| {
+                OldOutputSourceIdentity::freeze(entry.handle, host, &task, artifact)
+            })
+    });
+    let Some(source) = source else {
+        retain_frame_task_after_authority_retry(
+            entry,
+            had_active,
+            active,
+            pending,
+            task,
+            retry_effect,
+        );
+        return;
+    };
+    if entry.pending_stale_output_cleanup.is_some() {
+        retain_frame_task_after_authority_retry(
+            entry,
+            had_active,
+            active,
+            pending,
+            task,
+            retry_effect,
+        );
+        return;
+    }
+    let logical_roots = entry.engine.authority_settlement_logical_roots();
+    match begin_authority_settlement(
+        world,
+        entry,
+        active,
+        PendingCommit::new(),
+        Some(logical_roots),
+    ) {
+        AuthoritySettlementBeginOutcome::Begun => {
+            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Sealed(
+                SealedOldOutputSourceOwner {
+                    source,
+                    pending,
+                    task,
+                },
+            ));
+        }
+        AuthoritySettlementBeginOutcome::RetryablePreparation { active, .. }
+        | AuthoritySettlementBeginOutcome::ProtocolContradiction { active, .. }
+        | AuthoritySettlementBeginOutcome::IsolationContradiction { active, .. }
+        | AuthoritySettlementBeginOutcome::LedgerContradiction { active, .. } => {
+            retain_frame_task_after_authority_retry(
+                entry,
+                had_active,
+                active,
+                pending,
+                task,
+                retry_effect,
+            );
+        }
+    }
+}
+
+fn activate_stale_output_cleanup(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    owner: SealedOldOutputOwner,
+    artifact: AppliedDriverReportArtifact,
+    stable_inert: bool,
+) {
+    if stable_inert {
+        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
+            owner,
+            artifact,
+            stable_inert,
+        });
+        return;
+    }
+    let manifest = {
+        let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
+                owner,
+                artifact,
+                stable_inert: true,
+            });
+            return;
+        };
+        FrozenCleanupManifest::from_failed_prepared_branch(world, registry, &owner.physical)
+    };
+    let manifest = match manifest {
+        Ok(manifest) => manifest,
+        Err(FailedManifestBuildError::RetryableCapacity) => {
+            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
+                owner,
+                artifact,
+                stable_inert: false,
+            });
+            return;
+        }
+        Err(_) => {
+            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
+                owner,
+                artifact,
+                stable_inert: true,
+            });
+            return;
+        }
+    };
+    let bindings = manifest
+        .boundary_drifts()
+        .iter()
+        .map(|drift| {
+            (drift.expected.exact_claim() == &owner.source.top_slot_claim
+                && failed_boundary_source_accepts_owner(drift))
+            .then(|| {
+                exact_failed_source_obligation(drift, &owner.physical).map(|obligation| {
+                    PendingBoundaryBinding {
+                        source: drift.source.clone(),
+                        obligation: obligation.clone(),
+                    }
+                })
+            })
+            .flatten()
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(bindings) = bindings else {
+        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
+            owner,
+            artifact,
+            stable_inert: true,
+        });
+        return;
+    };
+    let manifest = match manifest.finalize_sealed_stale_boundaries(bindings) {
+        Ok(manifest) => manifest,
+        Err((_, _manifest)) => {
+            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
+                owner,
+                artifact,
+                stable_inert: true,
+            });
+            return;
+        }
+    };
+    if manifest.len() == 0 {
+        return;
+    }
+    if !manifest.preflight(world) || !manifest.failure_cleanup_targets_are_isolated(world) {
+        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
+            owner,
+            artifact,
+            stable_inert: true,
+        });
+        return;
+    }
+    let targets = manifest.obligation_entities();
+    let partition = {
+        let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
+                owner,
+                artifact,
+                stable_inert: true,
+            });
+            return;
+        };
+        let Some(host) = entry.host.as_ref() else {
+            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
+                owner,
+                artifact,
+                stable_inert: false,
+            });
+            return;
+        };
+        manifest.freeze_stale_output_cleanup_partition(world, registry, entry.active.as_ref(), host)
+    };
+    let Some(partition) = partition else {
+        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
+            owner,
+            artifact,
+            stable_inert: true,
+        });
+        return;
+    };
+    let current_epoch = FrozenStaleOutputCurrentEpoch::observe(world, entry, &targets);
+    let cleanup_source = current_epoch.physical.clone();
+    let prepared = match CleanupLedger::reserve(manifest) {
+        Ok(prepared) => prepared.bind_failure_cleanup_partition(partition),
+        Err(error) => {
+            let stable_inert = error.kind() != CleanupLedgerReserveErrorKind::RetryableCapacity;
+            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
+                owner,
+                artifact,
+                stable_inert,
+            });
+            return;
+        }
+    };
+    let SealedOldOutputOwner { source, physical } = owner;
+    entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Active {
+        source,
+        current_epoch,
+        cleanup_source,
+        ledger: CleanupLedger::activate_failed(prepared, physical),
+        stable_inert: false,
+    });
+}
+
+fn drive_released_stale_output_report(world: &mut World, entry: &mut RouterEntry) {
+    let Some(state) = entry.pending_stale_output_cleanup.take() else {
+        return;
+    };
+    let (owner, artifact, stable_inert) = match state {
+        PendingStaleOutputCleanup::Sealed(owner) => {
+            let source = owner.source.clone();
+            let Some(artifact) = entry.take_released_sealed_driver_report_replay(&source) else {
+                entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Sealed(owner));
+                return;
+            };
+            (owner, artifact, false)
+        }
+        PendingStaleOutputCleanup::Released {
+            owner,
+            artifact,
+            stable_inert,
+        } => (owner, artifact, stable_inert),
+        PendingStaleOutputCleanup::Physical {
+            owner,
+            artifact,
+            stable_inert,
+        } => {
+            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
+                owner,
+                artifact,
+                stable_inert,
+            });
+            return;
+        }
+        active @ PendingStaleOutputCleanup::Active { .. } => {
+            entry.pending_stale_output_cleanup = Some(active);
+            return;
+        }
+    };
+    let host_is_available = entry.host.is_some();
+    if stable_inert
+        || !owner.source.matches(entry.handle, &owner.task, &artifact)
+        || !host_is_available
+        || entry.engine.inspect_report_identity(&owner.task).is_ok()
+    {
+        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Released {
+            owner,
+            artifact,
+            stable_inert: stable_inert || host_is_available,
+        });
+        return;
+    }
+    let host = entry
+        .host
+        .as_ref()
+        .expect("the stale receiver prevalidates the current host");
+    if !current_host_binding_is_exact(world, host) {
+        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Released {
+            owner,
+            artifact,
+            stable_inert: false,
+        });
+        return;
+    }
+    let application = apply_applied_driver_report_to_branch(
+        world,
+        &mut entry.engine,
+        host.candidate.clone(),
+        host.top_slot,
+        host.top_slot_claim.clone(),
+        None,
+        entry.active.as_ref(),
+        &owner.task,
+        artifact.clone(),
+    );
+    if !matches!(application, Err(DriverReportApplicationError::Stale)) {
+        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Released {
+            owner,
+            artifact,
+            stable_inert: true,
+        });
+        return;
+    }
+    let SealedOldOutputSourceOwner {
+        source,
+        pending,
+        task: _,
+    } = owner;
+    entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
+        owner: SealedOldOutputOwner {
+            source,
+            physical: FailedPreparedBranch::new(pending.branch),
+        },
+        artifact,
+        stable_inert: false,
+    });
+}
+
 fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> Vec<usize> {
     let mut newly_bound_entries = Vec::new();
     world.resource_scope(
@@ -7640,6 +9549,7 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                         if only_entries.is_some_and(|entries| !entries.contains(&entry_index)) {
                             continue;
                         }
+                        drive_released_stale_output_report(world, entry);
                         if let Some(pending_rejection) =
                             entry.pending_mount_mutation_rejection.take()
                         {
@@ -7998,6 +9908,18 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                         .active
                                         .take()
                                         .unwrap_or_else(RealizedBranch::empty);
+                                    if entry.captured_delayed_driver_report(&task).is_some() {
+                                        begin_sealed_old_output_host_loss(
+                                            world,
+                                            entry,
+                                            had_active,
+                                            active,
+                                            pending,
+                                            task,
+                                            retry_effect,
+                                        );
+                                        continue;
+                                    }
                                     let logical_roots =
                                         entry.engine.authority_settlement_logical_roots();
                                     match begin_authority_settlement(
@@ -8142,6 +10064,25 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                     }
                                     continue;
                                 }
+                                let host_candidate = host.candidate.clone();
+                                let top_slot = host.top_slot;
+                                let top_slot_claim = host.top_slot_claim.clone();
+                                if entry.delayed_driver_report_replay_blocks_drive(&task) {
+                                    let Some(effect) = retry_effect else {
+                                        unreachable!(
+                                            "a captured report retains its exact pending frame-drive owner"
+                                        )
+                                    };
+                                    entry.pending_frame_drive = Some(PendingFrameDrive {
+                                        task,
+                                        effect,
+                                        pending,
+                                    });
+                                    continue;
+                                }
+                                let replay_artifact = retry_effect
+                                    .as_ref()
+                                    .and_then(|_| entry.take_released_driver_report_replay(&task));
                                 let Some(driver_key) =
                                     view_integration::driver_key(&entry.views, task.view())
                                         .cloned()
@@ -8242,24 +10183,27 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                         task.view_request_sequence(),
                                     )
                                 });
-                                let mut plan = ContentPlan::new();
-                                let mut writer = FrameContentWriter::new(&mut plan);
-                                let mut seal = ReportSeal::new();
-                                let report_identity = task.report_identity();
-                                let report = driver.apply(
-                                    &effect,
-                                    &mut writer,
-                                    EcsViewReportSession::new(&mut seal, report_identity),
-                                );
-                                if report.identity() != &task.report_identity() {
-                                    entry.pending_frame_drive = Some(PendingFrameDrive {
-                                        task,
-                                        effect,
-                                        pending,
-                                    });
-                                    continue;
-                                }
-                                if report.kind() != ViewBuildReportKind::Applied {
+                                let artifact = if let Some(artifact) = replay_artifact {
+                                    artifact
+                                } else {
+                                    let mut plan = ContentPlan::new();
+                                    let mut writer = FrameContentWriter::new(&mut plan);
+                                    let mut seal = ReportSeal::new();
+                                    let report_identity = task.report_identity();
+                                    let report = driver.apply(
+                                        &effect,
+                                        &mut writer,
+                                        EcsViewReportSession::new(&mut seal, report_identity),
+                                    );
+                                    if report.identity() != &task.report_identity() {
+                                        entry.pending_frame_drive = Some(PendingFrameDrive {
+                                            task,
+                                            effect,
+                                            pending,
+                                        });
+                                        continue;
+                                    }
+                                    if report.kind() != ViewBuildReportKind::Applied {
                                     if entry.engine.inspect_report_identity(&task).is_err() {
                                         match route_back_target_frame_failure(
                                             world,
@@ -8353,19 +10297,28 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                             entry.pending_failed_branch = Some(failed);
                                         }
                                     }
+                                        continue;
+                                    }
+                                    AppliedDriverReportArtifact::from_report(report, plan)
+                                };
+                                if entry.capture_delayed_driver_report_replay(&artifact) {
+                                    entry.pending_frame_drive = Some(PendingFrameDrive {
+                                        task,
+                                        effect,
+                                        pending,
+                                    });
                                     continue;
                                 }
                                 let realized = apply_applied_driver_report_to_branch(
                                     world,
                                     &mut entry.engine,
-                                    host.candidate.clone(),
-                                    host.top_slot,
-                                    host.top_slot_claim.clone(),
+                                    host_candidate,
+                                    top_slot,
+                                    top_slot_claim,
                                     (!realizing_root).then_some(&pending.branch),
                                     entry.active.as_ref(),
                                     &task,
-                                    &report,
-                                    plan,
+                                    artifact,
                                 );
                                 let realized = match realized {
                                     Ok(realized) => realized,
@@ -20625,10 +22578,91 @@ fn drive_post_commit_compound(world: &mut World, entry: &mut RouterEntry) -> boo
     true
 }
 
+fn drive_stale_output_cleanup_settlement(world: &mut World, entry: &mut RouterEntry) -> bool {
+    let Some(state) = entry.pending_stale_output_cleanup.take() else {
+        return false;
+    };
+    let state = match state {
+        PendingStaleOutputCleanup::Physical {
+            owner,
+            artifact,
+            stable_inert,
+        } => {
+            activate_stale_output_cleanup(world, entry, owner, artifact, stable_inert);
+            if matches!(
+                entry.pending_stale_output_cleanup,
+                Some(PendingStaleOutputCleanup::Active { .. })
+            ) {
+                return drive_stale_output_cleanup_settlement(world, entry);
+            }
+            return true;
+        }
+        state => state,
+    };
+    let PendingStaleOutputCleanup::Active {
+        source,
+        current_epoch,
+        cleanup_source,
+        mut ledger,
+        stable_inert,
+    } = state
+    else {
+        entry.pending_stale_output_cleanup = Some(state);
+        return false;
+    };
+    if stable_inert || !current_epoch.matches(world, entry) {
+        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Active {
+            source,
+            current_epoch,
+            cleanup_source,
+            ledger,
+            stable_inert: true,
+        });
+        return true;
+    }
+    let Some(attempt) = ledger.attempt(world) else {
+        if !ledger.is_settled() {
+            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Active {
+                source,
+                current_epoch,
+                cleanup_source,
+                ledger,
+                stable_inert: true,
+            });
+        }
+        return true;
+    };
+    let _ = ledger.settle_failure_cleanup_guarded(world, attempt, &cleanup_source, &|world| {
+        current_epoch.matches(world, entry)
+    });
+    let failure_cleanup_is_inert = ledger.failure_cleanup_is_inert();
+    if !current_epoch.matches(world, entry) {
+        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Active {
+            source,
+            current_epoch,
+            cleanup_source,
+            ledger,
+            stable_inert: true,
+        });
+    } else if !ledger.is_settled() {
+        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Active {
+            source,
+            current_epoch,
+            cleanup_source,
+            ledger,
+            stable_inert: failure_cleanup_is_inert,
+        });
+    }
+    true
+}
+
 pub(crate) fn settle_cleanup_system(world: &mut World) {
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             for entry in &mut navigation.entries {
+                if drive_stale_output_cleanup_settlement(world, entry) {
+                    continue;
+                }
                 if drive_post_commit_compound(world, entry) {
                     continue;
                 }
@@ -21286,7 +23320,11 @@ pub(crate) mod tests {
     use bevy_picking::events::{Over, Pointer};
     use bevy_ui::{ComputedNode, Node, UiGlobalTransform, Val};
     use bevy_ui_router_core::integration::{
-        BackTargetResumeAction, BackTargetStart, TestingReservationCounter, ViewReportIdentity,
+        AdmissionError, BackTargetResumeAction, BackTargetStart, HostAdmissionAllocatorCounter,
+        HostAdmissionAllocatorExhaustionEvidence, HostAdmissionOperation,
+        HostAdmissionOperationExhaustionExpectation, HostAdmissionOperationFailureContradiction,
+        HostAdmissionOperationFailureDisposition, HostAdmissionUnavailableEvidence,
+        HostAdmissionUnavailablePreStagingOwner, TestingReservationCounter, ViewReportIdentity,
     };
     use bevy_ui_router_core::prelude::{
         ActivePresentationKind, DiagnosticEventKind, DiagnosticSeverity, FrameOrigin,
@@ -28171,8 +30209,12 @@ pub(crate) mod tests {
             views: RouteViewRegistry::new(),
             host: None,
             host_settlement: None,
+            pending_host_admission_failure: None,
             pending_commit: None,
             pending_frame_drive: None,
+            pending_stale_output_cleanup: None,
+            #[cfg(any(test, feature = "test-support"))]
+            delayed_driver_report_replay: None,
             pending_mount_frame_task: None,
             pending_mount_request: None,
             pending_mount_mutation_rejection: None,
@@ -28211,6 +30253,11 @@ pub(crate) mod tests {
             back_target_atomic_applied_dispatch_calls: AtomicUsize::new(0),
             #[cfg(test)]
             back_target_permanent_begin_callback_calls: AtomicUsize::new(0),
+            host_admission_operation_counts: (0, 0, 0, 0),
+            #[cfg(test)]
+            host_confirmation_receiver_drift_before_confirm_armed: false,
+            #[cfg(test)]
+            host_confirmation_preparation_receiver_drift_before_prepare_armed: false,
             #[cfg(test)]
             back_target_driver_staging_drift_armed: false,
             #[cfg(test)]
@@ -52325,7 +54372,7 @@ pub(crate) mod tests {
             let mut revisions = HostCandidateRevisionState::default();
             match classify_host_candidate(app.world(), router, &mut revisions) {
                 HostCandidateClassification::Unique(candidate) => candidate.revision(),
-                HostCandidateClassification::None => {
+                HostCandidateClassification::None(_) => {
                     panic!("the real admitted host must remain a candidate")
                 }
                 HostCandidateClassification::InvalidTopology(_) => {
@@ -52333,6 +54380,12 @@ pub(crate) mod tests {
                 }
                 HostCandidateClassification::Conflict(_) => {
                     panic!("the real admitted host must remain unique")
+                }
+                HostCandidateClassification::RetryableCapacity(_) => {
+                    panic!("the local candidate revision storage must remain available")
+                }
+                HostCandidateClassification::IdentityExhausted { .. } => {
+                    panic!("the local candidate revision allocator must remain available")
                 }
             }
         };
@@ -54194,6 +56247,7 @@ pub(crate) mod tests {
             .to_vec();
         let pending = PendingCommit::new();
         let (plan, report) = applied_report_with_identity(task.report_identity());
+        let artifact = AppliedDriverReportArtifact::from_report(report, plan);
         app.world_mut().resource_scope(
             |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 let entry = &mut navigation.entries[0];
@@ -54206,8 +56260,7 @@ pub(crate) mod tests {
                     Some(&pending.branch),
                     None,
                     &task,
-                    &report,
-                    plan,
+                    artifact,
                 );
                 assert!(matches!(result, Err(DriverReportApplicationError::Stale)));
                 entry.pending_failed_branch = Some(stale_driver_report_owner(pending, task));
@@ -54280,6 +56333,7 @@ pub(crate) mod tests {
             .chain(pending.branch.child_slots().iter().map(|slot| slot.slot()))
             .collect::<Vec<_>>();
         let (plan, report) = applied_report_with_identity(task.report_identity());
+        let artifact = AppliedDriverReportArtifact::from_report(report, plan);
         app.world_mut().resource_scope(
             |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 let entry = &mut navigation.entries[0];
@@ -54292,8 +56346,7 @@ pub(crate) mod tests {
                     None,
                     None,
                     &task,
-                    &report,
-                    plan,
+                    artifact,
                 );
                 assert!(matches!(result, Err(DriverReportApplicationError::Stale)));
                 entry.pending_failed_branch = Some(stale_driver_report_owner(pending, task));
@@ -54353,6 +56406,7 @@ pub(crate) mod tests {
             )
         };
         let (plan, report) = applied_report_with_identity(task.report_identity());
+        let artifact = AppliedDriverReportArtifact::from_report(report, plan);
         app.world_mut().resource_scope(
             |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 let entry = &mut navigation.entries[0];
@@ -54365,8 +56419,7 @@ pub(crate) mod tests {
                     None,
                     None,
                     &task,
-                    &report,
-                    plan,
+                    artifact,
                 );
                 assert!(matches!(result, Err(DriverReportApplicationError::Stale)));
                 entry.pending_failed_branch = Some(stale_driver_report_owner(pending, task));
@@ -54407,6 +56460,7 @@ pub(crate) mod tests {
             )
         };
         let (plan, report) = applied_report_with_identity(task.report_identity());
+        let artifact = AppliedDriverReportArtifact::from_report(report, plan);
         app.world_mut().resource_scope(
             |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 let entry = &mut navigation.entries[0];
@@ -54419,8 +56473,7 @@ pub(crate) mod tests {
                     Some(&pending.branch),
                     None,
                     &task,
-                    &report,
-                    plan,
+                    artifact,
                 ) {
                     Ok(realized) => realized,
                     Err(_) => {
@@ -54575,6 +56628,7 @@ pub(crate) mod tests {
             )
         };
         let (plan, report) = applied_report_with_identity(task.report_identity());
+        let artifact = AppliedDriverReportArtifact::from_report(report, plan);
         app.world_mut().resource_scope(
             |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 let entry = &mut navigation.entries[0];
@@ -54587,8 +56641,7 @@ pub(crate) mod tests {
                     None,
                     None,
                     &task,
-                    &report,
-                    plan,
+                    artifact,
                 );
                 assert!(matches!(result, Err(DriverReportApplicationError::Stale)));
                 entry.pending_failed_branch = Some(stale_driver_report_owner(pending, task));
@@ -57458,6 +59511,7 @@ pub(crate) mod tests {
         };
 
         let (plan, report) = applied_report_with_identity(foreign_task.report_identity());
+        let artifact = AppliedDriverReportArtifact::from_report(report, plan);
         let opaque_mismatch = app.world_mut().resource_scope(
             |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 let entry = navigation
@@ -57473,8 +59527,7 @@ pub(crate) mod tests {
                     host.top_slot,
                     host.top_slot_claim.clone(),
                     &current_task,
-                    &report,
-                    plan,
+                    artifact,
                 )
             },
         );
@@ -57494,6 +59547,7 @@ pub(crate) mod tests {
         );
 
         let (plan, report) = applied_report_with_identity(foreign_task.report_identity());
+        let artifact = AppliedDriverReportArtifact::from_report(report, plan);
 
         let result = app.world_mut().resource_scope(
             |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
@@ -57510,8 +59564,7 @@ pub(crate) mod tests {
                     host.top_slot,
                     host.top_slot_claim.clone(),
                     &foreign_task,
-                    &report,
-                    plan,
+                    artifact,
                 )
             },
         );
@@ -58232,7 +60285,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn reconciliation_host_loss_app_despawned_host_settles_stably_unavailable_without_replay() {
+    fn reconciliation_host_loss_app_despawned_host_readmits_fresh_host_without_replay() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
         let router = install_atomic_router(&mut app, "authority-loss-despawned-host");
@@ -58399,10 +60452,14 @@ pub(crate) mod tests {
         }
 
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
-        assert!(entry.host.is_none());
+        let fresh = entry
+            .host
+            .as_ref()
+            .expect("a fresh host candidate reopens HostLost admission");
+        assert_eq!(fresh.host, replacement_host);
         assert_eq!(
             entry.engine.snapshot().availability(),
-            &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+            &RouterAvailability::Ready
         );
         assert_eq!(
             entry.engine.snapshot().active().kind(),
@@ -61900,6 +63957,7 @@ pub(crate) mod tests {
         }
 
         app.update();
+        app.update();
 
         let revision = current_candidate_revision(&mut app, router);
         let residual = app
@@ -61912,14 +63970,11 @@ pub(crate) mod tests {
             .host()
             .trace()
             .to_vec();
-        let rejected = trace_before
-            .iter()
-            .find(|event| {
-                event.kind()
-                    == bevy_ui_router_core::HostTraceEventKind::AdmissionRejectedAfterMutation
+        assert!(
+            trace_before.iter().any(|event| {
+                event.kind() == bevy_ui_router_core::HostTraceEventKind::HostGranted
             })
-            .unwrap()
-            .clone();
+        );
         assert_eq!(
             app.world().get::<ChildOf>(residual).map(ChildOf::parent),
             Some(host)
@@ -61955,11 +64010,12 @@ pub(crate) mod tests {
                 .lifecycle(),
             EntityLifecycle::PreparedInert
         );
-        assert!(
+        assert_eq!(
             app.world().resource::<RouterNavigation>().entries[0]
-                .host_settlement
-                .is_some(),
-            "the exact residual must retain an explicit settlement owner"
+                .testing_host_confirmation_whole_owner_projection()
+                .stage,
+            TestingHostConfirmationWholeOwnerStage::ProvisionalWholeOwner,
+            "the exact residual must remain in the unique R3 provisional holder"
         );
         assert!(
             app.world().resource::<RouterNavigation>().entries[0]
@@ -61979,14 +64035,13 @@ pub(crate) mod tests {
             .enabled = false;
         app.update();
 
+        assert!(app.world().get_entity(residual).is_ok());
         assert!(
-            app.world().get_entity(residual).is_err()
-                || app
-                    .world()
-                    .resource::<QuarantineLeaseTable>()
-                    .record(residual)
-                    .is_some(),
-            "the retained exact settlement must finish after detach reentry stops"
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(residual)
+                .is_some(),
+            "permanent detach drift retains the unique physical owner inert"
         );
         assert_eq!(
             app.world()
@@ -61996,26 +64051,26 @@ pub(crate) mod tests {
             1,
             "the latched candidate must not be admitted again"
         );
-        assert_eq!(
-            app.world().resource::<RouterNavigation>().entries[0]
-                .engine
-                .snapshot()
-                .host()
-                .trace(),
-            trace_before
-        );
+        let inert_trace = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .snapshot()
+            .host()
+            .trace()
+            .to_vec();
+        assert_eq!(inert_trace, trace_before);
         assert!(
             !app.world()
                 .resource::<HostCandidateRevisionLatch>()
                 .allows(revision)
         );
-        assert!(
+        assert_eq!(
             app.world().resource::<RouterNavigation>().entries[0]
-                .host_settlement
-                .is_none()
+                .testing_host_confirmation_whole_owner_projection()
+                .stage,
+            TestingHostConfirmationWholeOwnerStage::ProvisionalWholeOwner
         );
         assert!(
-            !app.world().resource::<RouterNavigation>().entries[0]
+            app.world().resource::<RouterNavigation>().entries[0]
                 .cleanup_summary()
                 .foreground_pending()
         );
@@ -62034,21 +64089,6 @@ pub(crate) mod tests {
                 .map(ChildOf::parent),
             Some(host)
         );
-
-        let registration = app
-            .world_mut()
-            .entity_mut(host)
-            .take::<RouterHostRegistration>()
-            .unwrap();
-        app.world_mut().entity_mut(host).insert(registration);
-        app.update();
-        let snapshot = app.world().resource::<RouterNavigation>().entries[0]
-            .engine
-            .snapshot()
-            .host()
-            .clone();
-        assert_ne!(snapshot.version(), rejected.version());
-        assert_ne!(snapshot.top_slot(), rejected.slot());
     }
 
     #[test]
@@ -65289,15 +67329,11 @@ pub(crate) mod tests {
             vec![
                 bevy_ui_router_core::HostTraceEventKind::AdmissionRequested,
                 bevy_ui_router_core::HostTraceEventKind::HostGranted,
-                bevy_ui_router_core::HostTraceEventKind::AdmissionRejectedAfterMutation,
             ]
         );
         let rejected = first_trace
             .iter()
-            .find(|event| {
-                event.kind()
-                    == bevy_ui_router_core::HostTraceEventKind::AdmissionRejectedAfterMutation
-            })
+            .find(|event| event.kind() == bevy_ui_router_core::HostTraceEventKind::HostGranted)
             .unwrap()
             .clone();
         assert!(rejected.version().is_some());
@@ -65313,11 +67349,36 @@ pub(crate) mod tests {
             .world()
             .resource::<HostGrantObserverDrift>()
             .observed_slots[0];
+        assert!(app.world().get_entity(rejected_slot_entity).is_ok());
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .snapshot()
+                .availability(),
+            &RouterAvailability::AwaitingHost,
+            "publication must wait for the independent physical terminal"
+        );
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(rejected_slot_entity)
+                .is_some()
+        );
+
+        observe_authority_system(app.world_mut());
+
         assert!(app.world().get_entity(rejected_slot_entity).is_err());
         assert!(
             app.world().resource::<RouterNavigation>().entries[0]
                 .host
                 .is_none()
+        );
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .snapshot()
+                .availability(),
+            &RouterAvailability::Unavailable(RouterUnavailableReason::AuthorityEstablishmentFailed)
         );
         assert!(
             app.world()
@@ -65325,6 +67386,12 @@ pub(crate) mod tests {
                 .records()
                 .is_empty()
         );
+        let settled_trace = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .snapshot()
+            .host()
+            .trace()
+            .to_vec();
         assert_eq!(
             app.world()
                 .get::<bevy_ecs::hierarchy::Children>(host)
@@ -65354,7 +67421,7 @@ pub(crate) mod tests {
                 .snapshot()
                 .host()
                 .trace(),
-            first_trace
+            settled_trace
         );
 
         app.world_mut()
@@ -65366,9 +67433,17 @@ pub(crate) mod tests {
             .take::<RouterHostRegistration>()
             .unwrap();
         app.world_mut().entity_mut(host).insert(registration);
+        for _ in 0..4 {
+            observe_authority_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .host
+                .is_some()
+            {
+                break;
+            }
+        }
         let fresh_revision = current_candidate_revision(&mut app, router);
         assert_ne!(fresh_revision, rejected_revision);
-        observe_authority_system(app.world_mut());
 
         let navigation = app.world().resource::<RouterNavigation>();
         let entry = &navigation.entries[0];
@@ -65407,6 +67482,7 @@ pub(crate) mod tests {
             .unwrap_or_default();
 
         observe_authority_system(app.world_mut());
+        observe_authority_system(app.world_mut());
         let first_revision = current_candidate_revision(&mut app, router);
         let live_entities_after_first = app.world().iter_entities().count();
         for _ in 0..3 {
@@ -65435,9 +67511,21 @@ pub(crate) mod tests {
             .take::<RouterHostRegistration>()
             .unwrap();
         app.world_mut().entity_mut(host).insert(registration);
+        for _ in 0..4 {
+            observe_authority_system(app.world_mut());
+            if app
+                .world()
+                .resource::<HostGrantObserverDrift>()
+                .observed_slots
+                .len()
+                == 2
+            {
+                break;
+            }
+        }
+        observe_authority_system(app.world_mut());
         let second_revision = current_candidate_revision(&mut app, router);
         assert_ne!(second_revision, first_revision);
-        observe_authority_system(app.world_mut());
         let live_entities_after_second = app.world().iter_entities().count();
         for _ in 0..3 {
             observe_authority_system(app.world_mut());
@@ -65485,10 +67573,7 @@ pub(crate) mod tests {
             .to_vec();
         let rejected = trace
             .iter()
-            .filter(|event| {
-                event.kind()
-                    == bevy_ui_router_core::HostTraceEventKind::AdmissionRejectedAfterMutation
-            })
+            .filter(|event| event.kind() == bevy_ui_router_core::HostTraceEventKind::HostGranted)
             .collect::<Vec<_>>();
         assert_eq!(rejected.len(), 2);
         assert_ne!(rejected[0].version(), rejected[1].version());
@@ -67049,5 +69134,971 @@ pub(crate) mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn host_admission_request_and_grant_errors_retain_candidate_owner() {
+        #[derive(Clone, Copy)]
+        enum InputMutation {
+            OutstandingRequest,
+            AuthorityBeforeRequest,
+            ForeignRouterBeforeGrant,
+            StaleTokenBeforeGrant,
+            ExhaustRequestSequence,
+            ExhaustRequestWithGrantEpochEvidence,
+            AuthorityWithRequestSequenceEvidence,
+        }
+
+        #[derive(Clone, Copy)]
+        enum ExpectedContradiction {
+            OutstandingWithoutReturnedOwner,
+            ExhaustionPairMismatch,
+        }
+
+        struct Row {
+            label: &'static str,
+            input: InputMutation,
+            operation: HostAdmissionOperation,
+            error: AdmissionError,
+            disposition: Option<HostAdmissionOperationFailureDisposition>,
+            exhaustion: Option<HostAdmissionAllocatorExhaustionEvidence>,
+            contradiction: Option<ExpectedContradiction>,
+        }
+
+        let rows = [
+            Row {
+                label: "outstanding-request-ownerless",
+                input: InputMutation::OutstandingRequest,
+                operation: HostAdmissionOperation::Request,
+                error: AdmissionError::OutstandingExists,
+                disposition: None,
+                exhaustion: None,
+                contradiction: Some(ExpectedContradiction::OutstandingWithoutReturnedOwner),
+            },
+            Row {
+                label: "authority-before-request",
+                input: InputMutation::AuthorityBeforeRequest,
+                operation: HostAdmissionOperation::Request,
+                error: AdmissionError::AuthorityExists,
+                disposition: Some(
+                    HostAdmissionOperationFailureDisposition::PermanentAuthorityConflict,
+                ),
+                exhaustion: None,
+                contradiction: None,
+            },
+            Row {
+                label: "foreign-router-before-grant",
+                input: InputMutation::ForeignRouterBeforeGrant,
+                operation: HostAdmissionOperation::Grant,
+                error: AdmissionError::ForeignRouter,
+                disposition: Some(
+                    HostAdmissionOperationFailureDisposition::PermanentForeignOrStale,
+                ),
+                exhaustion: None,
+                contradiction: None,
+            },
+            Row {
+                label: "stale-token-before-grant",
+                input: InputMutation::StaleTokenBeforeGrant,
+                operation: HostAdmissionOperation::Grant,
+                error: AdmissionError::Stale,
+                disposition: Some(
+                    HostAdmissionOperationFailureDisposition::PermanentForeignOrStale,
+                ),
+                exhaustion: None,
+                contradiction: None,
+            },
+            Row {
+                label: "request-sequence-exhausted",
+                input: InputMutation::ExhaustRequestSequence,
+                operation: HostAdmissionOperation::Request,
+                error: AdmissionError::Exhausted,
+                disposition: Some(
+                    HostAdmissionOperationFailureDisposition::PermanentIdentityExhausted,
+                ),
+                exhaustion: Some(HostAdmissionAllocatorExhaustionEvidence {
+                    counter: HostAdmissionAllocatorCounter::RequestSequence,
+                    current: u64::MAX,
+                    attempted: u64::MAX,
+                }),
+                contradiction: None,
+            },
+            Row {
+                label: "request-exhausted-with-grant-epoch-evidence",
+                input: InputMutation::ExhaustRequestWithGrantEpochEvidence,
+                operation: HostAdmissionOperation::Request,
+                error: AdmissionError::Exhausted,
+                disposition: None,
+                exhaustion: Some(HostAdmissionAllocatorExhaustionEvidence {
+                    counter: HostAdmissionAllocatorCounter::GrantEpoch,
+                    current: u64::MAX,
+                    attempted: u64::MAX,
+                }),
+                contradiction: Some(ExpectedContradiction::ExhaustionPairMismatch),
+            },
+            Row {
+                label: "authority-with-forbidden-request-counter",
+                input: InputMutation::AuthorityWithRequestSequenceEvidence,
+                operation: HostAdmissionOperation::Request,
+                error: AdmissionError::AuthorityExists,
+                disposition: None,
+                exhaustion: Some(HostAdmissionAllocatorExhaustionEvidence {
+                    counter: HostAdmissionAllocatorCounter::RequestSequence,
+                    current: u64::MAX,
+                    attempted: u64::MAX,
+                }),
+                contradiction: Some(ExpectedContradiction::ExhaustionPairMismatch),
+            },
+        ];
+
+        for row in rows {
+            let mut app = App::new();
+            app.add_plugins(BevyUiRouterPlugin::default());
+            let router =
+                install_atomic_router(&mut app, &format!("r3-admission-operation-{}", row.label));
+            let host = registered_host(&mut app, router);
+            let host_manifest = ComponentManifest::from_world(app.world(), host).unwrap();
+            let registration_incarnation = app
+                .world()
+                .get::<RouterHostRegistration>(host)
+                .unwrap()
+                .incarnation();
+            let (candidate_revision, candidate_observation) = app.world_mut().resource_scope(
+                |world,
+                 mut revisions: bevy_ecs::change_detection::Mut<HostCandidateRevisionState>| {
+                    let HostCandidateClassification::Unique(candidate) =
+                        classify_host_candidate(world, router, &mut revisions)
+                    else {
+                        panic!("{}: fixture must expose one real candidate", row.label)
+                    };
+                    (
+                        candidate.revision(),
+                        observe_validated_host_candidate(world, &candidate),
+                    )
+                },
+            );
+            let input = {
+                let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+                let entry = &mut navigation.entries[0];
+                match row.input {
+                    InputMutation::OutstandingRequest => entry
+                        .engine
+                        .testing_arm_host_admission_outstanding_request_input(),
+                    InputMutation::AuthorityBeforeRequest => entry
+                        .engine
+                        .testing_arm_host_admission_authority_exists_request_input(),
+                    InputMutation::ForeignRouterBeforeGrant => entry
+                        .engine
+                        .testing_arm_host_admission_foreign_router_grant_input(),
+                    InputMutation::StaleTokenBeforeGrant => entry
+                        .engine
+                        .testing_arm_host_admission_stale_token_grant_input(),
+                    InputMutation::ExhaustRequestSequence => entry
+                        .engine
+                        .testing_arm_host_admission_request_sequence_exhaustion_input(),
+                    InputMutation::ExhaustRequestWithGrantEpochEvidence => entry
+                        .engine
+                        .testing_arm_host_admission_request_exhaustion_with_allocator_counter_input(
+                            HostAdmissionAllocatorCounter::GrantEpoch,
+                        ),
+                    InputMutation::AuthorityWithRequestSequenceEvidence => entry
+                        .engine
+                        .testing_arm_host_admission_authority_and_allocator_counter_input(
+                            HostAdmissionAllocatorCounter::RequestSequence,
+                        ),
+                }
+            };
+            let stable_before = app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .snapshot();
+
+            observe_authority_system(app.world_mut());
+
+            let assert_candidate = |candidate: &PreparedEcsHostCandidateSource| {
+                assert_eq!(candidate.candidate.host(), host, "{}", row.label);
+                assert_eq!(
+                    candidate.registration_incarnation, registration_incarnation,
+                    "{}",
+                    row.label
+                );
+                assert_eq!(candidate.revision, candidate_revision, "{}", row.label);
+                assert_eq!(
+                    observe_validated_host_candidate(app.world(), &candidate.candidate),
+                    candidate_observation,
+                    "{}",
+                    row.label
+                );
+                assert_eq!(
+                    ComponentManifest::from_world(app.world(), host),
+                    Some(host_manifest.clone()),
+                    "{}",
+                    row.label
+                );
+            };
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let holder = entry
+                .pending_host_admission_failure
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}: failure must retain one owner holder", row.label));
+            match (holder, row.disposition, row.contradiction) {
+                (HostAdmissionFailureHolder::PreStaging(source), Some(disposition), None) => {
+                    let HostAdmissionUnavailableEvidence::Operation(evidence) =
+                        &source.prepared.evidence;
+                    let projection = evidence.projection();
+                    assert_eq!(projection.operation(), row.operation, "{}", row.label);
+                    assert_eq!(projection.error(), row.error, "{}", row.label);
+                    assert_eq!(projection.disposition(), disposition, "{}", row.label);
+                    assert_eq!(
+                        projection.expected_issuer(),
+                        &input.expected_issuer,
+                        "{}",
+                        row.label
+                    );
+                    assert_eq!(
+                        projection.observed_issuer(),
+                        &input.observed_issuer,
+                        "{}",
+                        row.label
+                    );
+                    assert_eq!(projection.exhaustion(), row.exhaustion, "{}", row.label);
+                    match (&source.owner, row.operation) {
+                        (
+                            HostAdmissionUnavailablePreStagingOwner::Permit(_),
+                            HostAdmissionOperation::Request,
+                        )
+                        | (
+                            HostAdmissionUnavailablePreStagingOwner::Token(_),
+                            HostAdmissionOperation::Grant,
+                        ) => {}
+                        _ => panic!("{}: operation returned the wrong linear owner", row.label),
+                    }
+                    assert_candidate(&source.installation);
+                }
+                (
+                    HostAdmissionFailureHolder::OperationEvidenceInert {
+                        owner,
+                        candidate,
+                        evidence,
+                    },
+                    None,
+                    Some(contradiction),
+                ) => {
+                    assert_eq!(evidence.source, input.source, "{}", row.label);
+                    assert_eq!(evidence.operation, row.operation, "{}", row.label);
+                    assert_eq!(evidence.error, row.error, "{}", row.label);
+                    assert_eq!(
+                        evidence.expected_issuer, input.expected_issuer,
+                        "{}",
+                        row.label
+                    );
+                    assert_eq!(
+                        evidence.observed_issuer, input.observed_issuer,
+                        "{}",
+                        row.label
+                    );
+                    assert_eq!(
+                        evidence.observed_exhaustion, row.exhaustion,
+                        "{}",
+                        row.label
+                    );
+                    match contradiction {
+                        ExpectedContradiction::OutstandingWithoutReturnedOwner => {
+                            let HostAdmissionOperationFailureContradiction::OutstandingWithoutReturnedOwner {
+                                observed,
+                            } = &evidence.contradiction
+                            else {
+                                panic!("{}: outstanding owner loss must remain distinct", row.label)
+                            };
+                            assert_eq!(observed, &input.outstanding, "{}", row.label);
+                        }
+                        ExpectedContradiction::ExhaustionPairMismatch => {
+                            assert_eq!(
+                                evidence.contradiction,
+                                HostAdmissionOperationFailureContradiction::ExhaustionPairMismatch
+                            );
+                            assert_eq!(
+                                evidence.expected_exhaustion,
+                                if row.error == AdmissionError::Exhausted {
+                                    HostAdmissionOperationExhaustionExpectation::RequiredOneOf(
+                                        vec![HostAdmissionAllocatorCounter::RequestSequence],
+                                    )
+                                } else {
+                                    HostAdmissionOperationExhaustionExpectation::Forbidden
+                                },
+                                "{}",
+                                row.label
+                            );
+                        }
+                    }
+                    match (owner, row.operation) {
+                        (
+                            HostAdmissionUnavailablePreStagingOwner::Permit(_),
+                            HostAdmissionOperation::Request,
+                        )
+                        | (
+                            HostAdmissionUnavailablePreStagingOwner::Token(_),
+                            HostAdmissionOperation::Grant,
+                        ) => {}
+                        _ => panic!("{}: inert failure returned the wrong owner", row.label),
+                    }
+                    assert_candidate(candidate);
+                    assert_eq!(entry.engine.snapshot(), stable_before, "{}", row.label);
+                    assert_eq!(
+                        entry.engine.testing_pending_host_admission_projection(),
+                        input.pending,
+                        "{}",
+                        row.label
+                    );
+                    assert_eq!(
+                        entry.engine.testing_host_admission_issuer_projection(),
+                        input.observed_issuer,
+                        "{}",
+                        row.label
+                    );
+                    assert_eq!(
+                        entry.testing_host_admission_operation_counts(),
+                        (0, 0, 0, 0),
+                        "{}: cause-bind/callback/publication/redrive must remain zero",
+                        row.label
+                    );
+                }
+                _ => panic!("{}: wrong operation failure disposition", row.label),
+            }
+
+            if row.contradiction.is_some() {
+                let world_before = authority_world_fingerprint(app.world());
+                let trace_before = app.world().resource::<RouterNavigation>().entries[0]
+                    .engine
+                    .snapshot()
+                    .host()
+                    .trace()
+                    .to_vec();
+                observe_authority_system(app.world_mut());
+                let entry = &app.world().resource::<RouterNavigation>().entries[0];
+                assert_eq!(
+                    authority_world_fingerprint(app.world()),
+                    world_before,
+                    "{}",
+                    row.label
+                );
+                assert_eq!(
+                    entry.engine.snapshot().host().trace(),
+                    trace_before,
+                    "{}",
+                    row.label
+                );
+                assert_eq!(
+                    entry.testing_host_admission_operation_counts(),
+                    (0, 0, 0, 0),
+                    "{}: inert evidence must not redrive",
+                    row.label
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preallocation_grant_rejection_consumes_candidate_before_unavailable() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "r3-preallocation-rejection");
+        let host = registered_host(&mut app, router);
+        let host_manifest = ComponentManifest::from_world(app.world(), host).unwrap();
+        app.world_mut().remove_resource::<RouteEntityRegistry>();
+        let entity_count_before = app.world().iter_entities().count();
+
+        observe_authority_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::Unavailable(RouterUnavailableReason::RegistryInvariantViolation)
+        );
+        assert!(entry.host.is_none());
+        assert!(entry.host_settlement.is_none());
+        assert_eq!(app.world().iter_entities().count(), entity_count_before);
+        assert_eq!(
+            ComponentManifest::from_world(app.world(), host),
+            Some(host_manifest)
+        );
+    }
+
+    #[test]
+    fn host_confirmation_preparation_mismatch_enters_provisional_settlement() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "r3-confirmation-preparation");
+        let expected_candidate = app.world_mut().resource_scope(
+            |world, mut revisions: bevy_ecs::change_detection::Mut<HostCandidateRevisionState>| {
+                let HostCandidateClassification::Unique(candidate) =
+                    classify_host_candidate(world, router, &mut revisions)
+                else {
+                    panic!("the real registered host must produce one exact candidate")
+                };
+                candidate
+            },
+        );
+        let expected_candidate_observation =
+            observe_validated_host_candidate(app.world(), &expected_candidate);
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+            .host_confirmation_preparation_receiver_drift_before_prepare_armed = true;
+
+        observe_authority_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let retained = entry.testing_host_confirmation_whole_owner_projection();
+        assert_eq!(
+            retained.stage,
+            TestingHostConfirmationWholeOwnerStage::ProvisionalWholeOwner,
+            "the real preparation receiver mismatch must retain grant+candidate+physical in the independent provisional holder"
+        );
+        assert_eq!(retained.candidate.as_ref(), Some(&expected_candidate));
+        assert_eq!(
+            retained
+                .candidate
+                .as_ref()
+                .map(|candidate| observe_validated_host_candidate(app.world(), candidate)),
+            Some(expected_candidate_observation)
+        );
+        let grant_version = retained
+            .grant_version
+            .as_ref()
+            .expect("the provisional holder must retain the exact Core grant version");
+        let grant_top_slot = retained
+            .grant_top_slot
+            .expect("the provisional holder must retain the exact Core top-slot identity");
+        let slot = retained
+            .slot
+            .expect("the provisional holder must retain the physical top-slot Entity");
+        let claim = retained
+            .claim
+            .as_ref()
+            .expect("the provisional holder must retain the exact registry claim");
+        let record = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(slot)
+            .expect("the provisional top slot must remain exactly registered");
+        assert_eq!(record.claim(), *claim);
+        assert!(matches!(
+            record.owner(),
+            RegistryOwner::Committed(EntityOwner::HostTopSlot {
+                host,
+                slot: registered_slot,
+            }) if host == grant_version && *registered_slot == grant_top_slot
+        ));
+        let receiver = retained
+            .receiver
+            .as_ref()
+            .expect("the provisional holder must retain exact preparation receiver evidence");
+        assert_eq!(receiver.observed, None);
+        assert!(entry.host.is_none());
+        assert!(entry.host_settlement.is_none());
+        assert!(app.world().get_entity(slot).is_ok());
+        assert_eq!(
+            app.world().get::<Visibility>(slot),
+            Some(&Visibility::Hidden)
+        );
+        assert!(
+            app.world()
+                .get::<RouterInputBarrier>(slot)
+                .is_some_and(RouterInputBarrier::denies_all)
+        );
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::AwaitingHost
+        );
+    }
+
+    #[test]
+    fn host_confirmation_unwind_mismatch_retains_whole_owner_inert() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "r3-confirmation-unwind");
+        let host = registered_host(&mut app, router);
+
+        let expected_candidate = app.world_mut().resource_scope(
+            |world, mut revisions: bevy_ecs::change_detection::Mut<HostCandidateRevisionState>| {
+                let HostCandidateClassification::Unique(candidate) =
+                    classify_host_candidate(world, router, &mut revisions)
+                else {
+                    panic!("the real registered host must produce one exact candidate")
+                };
+                candidate
+            },
+        );
+        let expected_candidate_observation =
+            observe_validated_host_candidate(app.world(), &expected_candidate);
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+            .host_confirmation_receiver_drift_before_confirm_armed = true;
+
+        observe_authority_system(app.world_mut());
+        let first = app.world().resource::<RouterNavigation>().entries[0]
+            .testing_host_confirmation_whole_owner_projection();
+        assert_eq!(
+            first.stage,
+            TestingHostConfirmationWholeOwnerStage::ConfirmingUnwindMismatchInert,
+            "the real before-confirm receiver drift must retain the complete confirming owner after exact unwind mismatch"
+        );
+        let slot = first
+            .slot
+            .expect("the confirming whole owner must retain its physical provisional slot");
+        let claim_before = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(slot)
+            .unwrap()
+            .claim();
+        assert_eq!(first.candidate.as_ref(), Some(&expected_candidate));
+        assert_eq!(
+            first
+                .candidate
+                .as_ref()
+                .map(|candidate| observe_validated_host_candidate(app.world(), candidate)),
+            Some(expected_candidate_observation.clone())
+        );
+        let expected_grant_version = first
+            .grant_version
+            .clone()
+            .expect("the provisional whole owner must retain the exact Core grant version");
+        let expected_grant_top_slot = first
+            .grant_top_slot
+            .expect("the provisional whole owner must retain the exact Core top-slot identity");
+        assert_eq!(first.slot, Some(slot));
+        assert_eq!(first.claim.as_ref(), Some(&claim_before));
+        let receiver = first
+            .receiver
+            .as_ref()
+            .expect("the inert whole owner must retain exact confirmation receiver evidence");
+        let expected_receiver = receiver.expected.clone();
+        assert_eq!(
+            receiver.observed, None,
+            "the real Core receiver-input drift must remove the confirming receiver"
+        );
+
+        let world_before = authority_world_fingerprint(app.world());
+        let snapshot_before = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .snapshot();
+        let trace_before = snapshot_before.host().trace().to_vec();
+        let counts_before = app.world().resource::<RouterNavigation>().entries[0]
+            .testing_host_admission_operation_counts();
+
+        observe_authority_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let second = entry.testing_host_confirmation_whole_owner_projection();
+        assert_eq!(
+            second.stage,
+            TestingHostConfirmationWholeOwnerStage::ConfirmingUnwindMismatchInert,
+            "the real reentry drift must retain the complete confirming owner plus receiver mismatch evidence"
+        );
+        assert_eq!(second.candidate.as_ref(), Some(&expected_candidate));
+        assert_eq!(second.grant_version.as_ref(), Some(&expected_grant_version));
+        assert_eq!(second.grant_top_slot, Some(expected_grant_top_slot));
+        assert_eq!(second.slot, Some(slot));
+        assert_eq!(second.claim.as_ref(), Some(&claim_before));
+        let receiver = second
+            .receiver
+            .as_ref()
+            .expect("the inert whole owner must retain exact confirmation receiver evidence");
+        assert_eq!(receiver.expected, expected_receiver);
+        assert_eq!(
+            receiver.observed, None,
+            "this exact unwind mismatch observes no matching confirming receiver"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(slot)
+                .unwrap()
+                .claim(),
+            claim_before
+        );
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        assert_eq!(entry.engine.snapshot(), snapshot_before);
+        assert_eq!(entry.engine.snapshot().host().trace(), trace_before);
+        assert_eq!(
+            entry.testing_host_admission_operation_counts(),
+            counts_before,
+            "an inert whole owner must not cause-bind, callback, publish, or redrive"
+        );
+        assert_eq!(
+            app.world().get::<ChildOf>(slot).map(ChildOf::parent),
+            Some(host)
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(slot),
+            Some(&Visibility::Visible),
+            "an unwind mismatch retains the whole owner without a compensating World write"
+        );
+    }
+
+    #[test]
+    fn provisional_top_slot_settlement_terminal_precedes_unavailable_publication() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        install_host_grant_observer_drift(&mut app);
+        install_provisional_detach_reentry(&mut app);
+        let router = install_atomic_router(&mut app, "r3-provisional-terminal-order");
+        let host = registered_host(&mut app, router);
+        {
+            let mut reentry = app.world_mut().resource_mut::<ProvisionalDetachReentry>();
+            reentry.enabled = true;
+            reentry.host = Some(host);
+        }
+
+        observe_authority_system(app.world_mut());
+        let slot = app
+            .world()
+            .resource::<HostGrantObserverDrift>()
+            .observed_slots[0];
+        assert!(app.world().get_entity(slot).is_ok());
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .snapshot()
+                .availability(),
+            &RouterAvailability::AwaitingHost
+        );
+
+        app.world_mut()
+            .resource_mut::<ProvisionalDetachReentry>()
+            .enabled = false;
+        app.world_mut()
+            .resource_mut::<HostGrantObserverDrift>()
+            .enabled = false;
+        observe_authority_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.host_settlement.is_none());
+        assert!(app.world().get_entity(slot).is_err());
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::Unavailable(RouterUnavailableReason::AuthorityEstablishmentFailed)
+        );
+    }
+
+    #[test]
+    fn invalid_host_topology_publishes_unavailable_without_staging() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "r3-invalid-host-topology");
+        let host = registered_host(&mut app, router);
+        app.world_mut().entity_mut(host).remove::<Node>();
+
+        observe_authority_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::Unavailable(RouterUnavailableReason::InvalidHostUiTopology)
+        );
+        assert!(entry.host.is_none());
+        assert!(entry.host_settlement.is_none());
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .records()
+                .is_empty()
+        );
+        assert!(app.world().get::<Children>(host).is_none());
+    }
+
+    fn capture_real_applied_report(
+        app: &mut App,
+        router: RouterHandle,
+        after_first_realization: bool,
+    ) -> (u64, Vec<Entity>) {
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        if after_first_realization {
+            drive_navigation_system(app.world_mut());
+        }
+        let control = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .testing_arm_next_applied_driver_report_replay(router)
+            .unwrap();
+        for _ in 0..8 {
+            drive_navigation_system(app.world_mut());
+            if matches!(
+                app.world().resource::<RouterNavigation>().entries[0].delayed_driver_report_replay,
+                Some(TestingDelayedDriverReportReplayState::Captured { .. })
+            ) {
+                break;
+            }
+        }
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(matches!(
+            entry.delayed_driver_report_replay,
+            Some(TestingDelayedDriverReportReplayState::Captured {
+                released: false,
+                ..
+            })
+        ));
+        let physical = entry
+            .pending_frame_drive
+            .as_ref()
+            .unwrap()
+            .pending
+            .branch
+            .as_realized()
+            .claims()
+            .map(|claim| claim.entity())
+            .collect::<Vec<_>>();
+        if after_first_realization {
+            assert!(!physical.is_empty());
+        } else {
+            assert!(physical.is_empty());
+        }
+        (control, physical)
+    }
+
+    fn settle_captured_report_host_loss_and_readmit(app: &mut App, router: RouterHandle) {
+        let (host, old_top_slot) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let binding = entry.host.as_ref().unwrap();
+            (binding.host, binding.top_slot)
+        };
+        assert!(
+            app.world_mut()
+                .entity_mut(host)
+                .take::<RouterHostRegistration>()
+                .is_some()
+        );
+        drive_navigation_system(app.world_mut());
+        for _ in 0..32 {
+            settle_cleanup_system(app.world_mut());
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            if entry.host.is_none() && entry.cleanup_ledger.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .snapshot()
+                .availability(),
+            &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+        );
+        app.world_mut()
+            .entity_mut(host)
+            .insert(RouterHostRegistration::new(router));
+        for _ in 0..8 {
+            observe_authority_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .host
+                .is_some()
+            {
+                break;
+            }
+        }
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let fresh = entry
+            .host
+            .as_ref()
+            .expect("fresh exact registration must reopen admission after retired-edge terminal");
+        assert_eq!(fresh.host, host);
+        assert_ne!(fresh.top_slot, old_top_slot);
+        assert!(entry.active.is_none());
+    }
+
+    #[test]
+    pub(crate) fn same_host_readmission_waits_for_retired_edge_and_old_slot_disposition() {
+        let (mut app, router, _request, host, _history) =
+            post_commit_nested_host_loss_fixture("r3-same-host-readmission");
+        let old_top_slot = app.world().resource::<RouterNavigation>().entries[0]
+            .host
+            .as_ref()
+            .unwrap()
+            .top_slot;
+        remove_post_commit_registration(&mut app, host);
+        app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                assert!(begin_post_commit_compound(
+                    world,
+                    &mut navigation.entries[0],
+                    PostCommitAuthorityCause::HostRegistrationLost,
+                ));
+            },
+        );
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .post_commit_compound
+                .is_some()
+        );
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .host
+                .is_none()
+        );
+        for _ in 0..64 {
+            settle_cleanup_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .settled_retired_host_evidence
+                .is_some()
+            {
+                break;
+            }
+        }
+        assert!(app.world().get_entity(old_top_slot).is_err());
+        app.world_mut()
+            .entity_mut(host)
+            .insert(RouterHostRegistration::new(router));
+        for _ in 0..4 {
+            observe_authority_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .host
+                .is_some()
+            {
+                break;
+            }
+        }
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let fresh = entry.host.as_ref().expect(
+            "same-host admission must wait for and then consume retired-host terminal evidence",
+        );
+        assert_eq!(fresh.host, host);
+        assert_ne!(fresh.top_slot, old_top_slot);
+        assert!(entry.active.is_none());
+    }
+
+    fn commit_fresh_nested_epoch(app: &mut App, router: RouterHandle, fragment: &str) {
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/items/1").with_fragment(fragment),
+            )
+            .unwrap();
+        for _ in 0..16 {
+            collect_navigation_system(app.world_mut());
+            drive_navigation_system(app.world_mut());
+            commit_presentation_system(app.world_mut());
+            settle_cleanup_system(app.world_mut());
+        }
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .active
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn sealed_stale_output_cleanup_is_disjoint_from_new_epoch() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        observe_authority_system(app.world_mut());
+        let (control, old_physical) = capture_real_applied_report(&mut app, router, true);
+        settle_captured_report_host_loss_and_readmit(&mut app, router);
+        commit_fresh_nested_epoch(&mut app, router, "fresh-sealed-epoch");
+        let history_before = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .history()
+            .clone();
+        let active_before = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .active()
+            .clone();
+
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .testing_release_applied_driver_report_replay(router, control)
+            .unwrap();
+        for _ in 0..16 {
+            drive_navigation_system(app.world_mut());
+            settle_cleanup_system(app.world_mut());
+        }
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.delayed_driver_report_replay.is_none());
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(entry.engine.active(), &active_before);
+        assert!(
+            old_physical
+                .iter()
+                .all(|entity| app.world().get_entity(*entity).is_err())
+        );
+    }
+
+    #[test]
+    fn ownerless_old_report_after_readmission_is_zero_write() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        observe_authority_system(app.world_mut());
+        let (control, old_physical) = capture_real_applied_report(&mut app, router, false);
+        assert!(old_physical.is_empty());
+        settle_captured_report_host_loss_and_readmit(&mut app, router);
+        commit_fresh_nested_epoch(&mut app, router, "fresh-ownerless-epoch");
+        let before = authority_world_fingerprint(app.world());
+        let snapshot_before = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .snapshot();
+
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .testing_release_applied_driver_report_replay(router, control)
+            .unwrap();
+        drive_navigation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.delayed_driver_report_replay.is_none());
+        assert_eq!(entry.engine.snapshot(), snapshot_before);
+        assert_eq!(authority_world_fingerprint(app.world()), before);
+    }
+
+    #[test]
+    fn stale_output_despawn_hook_protected_drift_stops_before_receipt() {
+        let mut app = App::new();
+        install_cleanup_despawn_drift_hook(&mut app);
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        observe_authority_system(app.world_mut());
+        let (control, old_physical) = capture_real_applied_report(&mut app, router, true);
+        assert!(old_physical.len() >= 2);
+        let first = *old_physical
+            .last()
+            .expect("the cleanup target order starts at the leaf obligation");
+        let later = old_physical[old_physical.len() - 2];
+        let protected = app.world_mut().spawn_empty().id();
+        settle_captured_report_host_loss_and_readmit(&mut app, router);
+        commit_fresh_nested_epoch(&mut app, router, "fresh-protected-epoch");
+        app.world_mut().insert_resource(CleanupDespawnDrift {
+            target: first,
+            action: CleanupDespawnDriftAction::ProtectedMarker(protected),
+        });
+
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .testing_release_applied_driver_report_replay(router, control)
+            .unwrap();
+        drive_navigation_system(app.world_mut());
+        settle_cleanup_system(app.world_mut());
+
+        assert!(app.world().get_entity(first).is_err());
+        assert!(app.world().get::<CleanupDriftMarker>(protected).is_some());
+        assert!(app.world().get_entity(later).is_ok());
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.delayed_driver_report_replay.is_none());
+        let Some(PendingStaleOutputCleanup::Active {
+            ledger,
+            stable_inert: true,
+            ..
+        }) = entry.pending_stale_output_cleanup.as_ref()
+        else {
+            panic!("protected drift must retain the unique stale cleanup owner inert");
+        };
+        assert_eq!(ledger.receipt_count(), 0);
     }
 }

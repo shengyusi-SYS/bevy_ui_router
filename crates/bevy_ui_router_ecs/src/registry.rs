@@ -323,11 +323,54 @@ impl ComponentManifest {
         Self { component_ids }
     }
 
+    pub(crate) fn try_new(ids: impl IntoIterator<Item = ComponentId>) -> Result<Self, ()> {
+        note_component_manifest_materialization();
+        let iterator = ids.into_iter();
+        let (minimum, maximum) = iterator.size_hint();
+        let mut component_ids = Vec::new();
+        component_ids
+            .try_reserve_exact(maximum.unwrap_or(minimum))
+            .map_err(|_| ())?;
+        for component in iterator {
+            if component_ids.len() == component_ids.capacity() {
+                component_ids.try_reserve(1).map_err(|_| ())?;
+            }
+            component_ids.push(component);
+        }
+        component_ids.sort_unstable();
+        component_ids.dedup();
+        Ok(Self { component_ids })
+    }
+
     pub(crate) fn from_world(world: &World, entity: Entity) -> Option<Self> {
         world
             .get_entity(entity)
             .ok()
             .map(|entity| Self::new(entity.archetype().components().iter().copied()))
+    }
+
+    pub(crate) fn try_from_world(world: &World, entity: Entity) -> Result<Option<Self>, ()> {
+        let Ok(entity) = world.get_entity(entity) else {
+            return Ok(None);
+        };
+        let components = entity.archetype().components();
+        let mut component_ids = Vec::new();
+        component_ids
+            .try_reserve_exact(components.len())
+            .map_err(|_| ())?;
+        component_ids.extend(components.iter().copied());
+        component_ids.sort_unstable();
+        component_ids.dedup();
+        Ok(Some(Self { component_ids }))
+    }
+
+    pub(crate) fn try_clone(&self) -> Result<Self, ()> {
+        let mut component_ids = Vec::new();
+        component_ids
+            .try_reserve_exact(self.component_ids.len())
+            .map_err(|_| ())?;
+        component_ids.extend_from_slice(&self.component_ids);
+        Ok(Self { component_ids })
     }
 
     pub(crate) fn component_ids(&self) -> &[ComponentId] {
@@ -379,6 +422,13 @@ impl RouteEntityRecord {
             seal: self.seal,
             lifecycle: self.lifecycle,
         }
+    }
+
+    pub(crate) fn matches_claim(&self, claim: &ExactRegistryClaim) -> bool {
+        self.entity == claim.entity
+            && self.owner == claim.owner
+            && self.seal == claim.seal
+            && self.lifecycle == claim.lifecycle
     }
 }
 
@@ -466,18 +516,119 @@ impl ExactRegistryClaim {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RegistryWriteError {
+    CapacityExhausted,
     ForeignOrUnissuedSeal,
     DuplicateEntity,
     DuplicateOwner,
     DuplicateSeal,
 }
 
-#[derive(Resource)]
+#[derive(Clone, Debug, Eq, PartialEq, Resource)]
 pub(crate) struct RouteEntityRegistry {
     seal_domain: u64,
     next_seal_sequence: u64,
     consumed_seal_sequences: Vec<u64>,
     records: Vec<RouteEntityRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProtectedRegistryProjection {
+    seal_domain: u64,
+    next_seal_sequence: u64,
+    consumed_seal_sequences: Vec<u64>,
+    records: Vec<RouteEntityRecord>,
+}
+
+impl ProtectedRegistryProjection {
+    pub(crate) fn bind_single_registration(&mut self, seal: OwnershipSeal) -> bool {
+        if seal.domain != self.seal_domain
+            || seal.sequence != self.next_seal_sequence.saturating_add(1)
+            || self.consumed_seal_sequences.len() == self.consumed_seal_sequences.capacity()
+        {
+            return false;
+        }
+        self.next_seal_sequence = seal.sequence;
+        self.consumed_seal_sequences.push(seal.sequence);
+        true
+    }
+}
+
+fn try_clone_route_slot_key(source: &RouteSlotKey) -> Result<RouteSlotKey, ()> {
+    if source.is_default() {
+        return Ok(RouteSlotKey::default());
+    }
+    let mut value = String::new();
+    value
+        .try_reserve_exact(source.as_str().len())
+        .map_err(|_| ())?;
+    value.push_str(source.as_str());
+    RouteSlotKey::named(value).map_err(|_| ())
+}
+
+fn try_clone_registry_owner(source: &RegistryOwner) -> Result<RegistryOwner, ()> {
+    Ok(match source {
+        RegistryOwner::Committed(EntityOwner::HostTopSlot { host, slot }) => {
+            RegistryOwner::Committed(EntityOwner::HostTopSlot {
+                host: host.clone(),
+                slot: *slot,
+            })
+        }
+        RegistryOwner::Committed(EntityOwner::ChildSlot {
+            parent,
+            outlet,
+            slot,
+        }) => RegistryOwner::Committed(EntityOwner::ChildSlot {
+            parent: parent.clone(),
+            outlet: try_clone_route_slot_key(outlet)?,
+            slot: *slot,
+        }),
+        RegistryOwner::Committed(EntityOwner::FrameShell(frame)) => {
+            RegistryOwner::Committed(EntityOwner::FrameShell(frame.clone()))
+        }
+        RegistryOwner::Committed(EntityOwner::FrameContentTarget(frame)) => {
+            RegistryOwner::Committed(EntityOwner::FrameContentTarget(frame.clone()))
+        }
+        RegistryOwner::Committed(EntityOwner::FrameOutput {
+            frame,
+            output,
+            local_index,
+        }) => RegistryOwner::Committed(EntityOwner::FrameOutput {
+            frame: frame.clone(),
+            output: *output,
+            local_index: *local_index,
+        }),
+        RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(owner)) => {
+            RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(owner.clone()))
+        }
+        RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
+            parent,
+            outlet,
+            slot,
+        }) => RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
+            parent: parent.clone(),
+            outlet: try_clone_route_slot_key(outlet)?,
+            slot: *slot,
+        }),
+    })
+}
+
+fn try_clone_route_entity_record(source: &RouteEntityRecord) -> Result<RouteEntityRecord, ()> {
+    Ok(RouteEntityRecord {
+        entity: source.entity,
+        owner: try_clone_registry_owner(&source.owner)?,
+        seal: source.seal,
+        manifest: source.manifest.try_clone()?,
+        lifecycle: source.lifecycle,
+    })
+}
+
+fn try_clone_exact_registry_claim(source: &ExactRegistryClaim) -> Result<ExactRegistryClaim, ()> {
+    Ok(ExactRegistryClaim {
+        entity: source.entity,
+        owner: try_clone_registry_owner(&source.owner)?,
+        seal: source.seal,
+        lifecycle: source.lifecycle,
+    })
 }
 
 impl RouteEntityRegistry {
@@ -491,6 +642,77 @@ impl RouteEntityRegistry {
         }
     }
 
+    pub(crate) fn protected_projection(
+        &self,
+        excluded_target: Entity,
+    ) -> ProtectedRegistryProjection {
+        self.protected_projection_excluding(&[excluded_target])
+    }
+
+    pub(crate) fn protected_projection_excluding(
+        &self,
+        excluded_targets: &[Entity],
+    ) -> ProtectedRegistryProjection {
+        ProtectedRegistryProjection {
+            seal_domain: self.seal_domain,
+            next_seal_sequence: self.next_seal_sequence,
+            consumed_seal_sequences: self.consumed_seal_sequences.clone(),
+            records: self
+                .records
+                .iter()
+                .filter(|record| !excluded_targets.contains(&record.entity))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    pub(crate) fn try_protected_projection_excluding(
+        &self,
+        excluded_targets: &[Entity],
+    ) -> Result<ProtectedRegistryProjection, ()> {
+        let mut consumed_seal_sequences = Vec::new();
+        consumed_seal_sequences
+            .try_reserve_exact(self.consumed_seal_sequences.len().saturating_add(1))
+            .map_err(|_| ())?;
+        consumed_seal_sequences.extend_from_slice(&self.consumed_seal_sequences);
+
+        let record_count = self
+            .records
+            .iter()
+            .filter(|record| !excluded_targets.contains(&record.entity))
+            .count();
+        let mut records = Vec::new();
+        records.try_reserve_exact(record_count).map_err(|_| ())?;
+        for record in self
+            .records
+            .iter()
+            .filter(|record| !excluded_targets.contains(&record.entity))
+        {
+            records.push(try_clone_route_entity_record(record)?);
+        }
+        Ok(ProtectedRegistryProjection {
+            seal_domain: self.seal_domain,
+            next_seal_sequence: self.next_seal_sequence,
+            consumed_seal_sequences,
+            records,
+        })
+    }
+
+    pub(crate) fn matches_protected_projection_excluding(
+        &self,
+        expected: &ProtectedRegistryProjection,
+        excluded_targets: &[Entity],
+    ) -> bool {
+        self.seal_domain == expected.seal_domain
+            && self.next_seal_sequence == expected.next_seal_sequence
+            && self.consumed_seal_sequences == expected.consumed_seal_sequences
+            && self
+                .records
+                .iter()
+                .filter(|record| !excluded_targets.contains(&record.entity))
+                .eq(expected.records.iter())
+    }
+
     pub(crate) fn issue_seal(&mut self) -> OwnershipSeal {
         self.next_seal_sequence = self
             .next_seal_sequence
@@ -500,6 +722,25 @@ impl RouteEntityRegistry {
             domain: self.seal_domain,
             sequence: self.next_seal_sequence,
         }
+    }
+
+    pub(crate) fn try_reserve_registration(
+        &mut self,
+        owner: &RegistryOwner,
+    ) -> Result<(), RegistryWriteError> {
+        if self
+            .records
+            .iter()
+            .any(|record| record.owner.conflicts_with(owner))
+        {
+            return Err(RegistryWriteError::DuplicateOwner);
+        }
+        self.consumed_seal_sequences
+            .try_reserve(1)
+            .map_err(|_| RegistryWriteError::CapacityExhausted)?;
+        self.records
+            .try_reserve(1)
+            .map_err(|_| RegistryWriteError::CapacityExhausted)
     }
 
     #[cfg(test)]
@@ -616,9 +857,40 @@ impl RouteEntityRegistry {
         let record = self
             .records
             .iter_mut()
-            .find(|record| record.claim() == *claim)?;
+            .find(|record| record.matches_claim(claim))?;
         record.owner = owner;
         Some(record.claim())
+    }
+
+    pub(crate) fn compare_exchange_host_top_slot_owner(
+        &mut self,
+        claim: &ExactRegistryClaim,
+        host: HostVersion,
+        slot: RouteSlotId,
+    ) -> Option<ExactRegistryClaim> {
+        let owner = RegistryOwner::Committed(EntityOwner::HostTopSlot {
+            host: host.clone(),
+            slot,
+        });
+        if !claim.owner.allows_exact_owner_transition(&owner)
+            || self
+                .records
+                .iter()
+                .any(|record| record.entity != claim.entity && record.owner.conflicts_with(&owner))
+        {
+            return None;
+        }
+        let record = self
+            .records
+            .iter_mut()
+            .find(|record| record.matches_claim(claim))?;
+        record.owner = owner;
+        Some(ExactRegistryClaim {
+            entity: record.entity,
+            owner: RegistryOwner::Committed(EntityOwner::HostTopSlot { host, slot }),
+            seal: record.seal,
+            lifecycle: record.lifecycle,
+        })
     }
 
     pub(crate) fn compare_exchange_manifest(
@@ -1205,7 +1477,7 @@ impl PreparedAuthorityPublicationCapacity {
     }
 }
 
-#[derive(Resource)]
+#[derive(Clone, Debug, Eq, PartialEq, Resource)]
 pub(crate) struct QuarantineLeaseTable {
     domain: u64,
     next_sequence: u64,
@@ -1219,6 +1491,88 @@ pub(crate) struct QuarantineLeaseTable {
     authority_lost: Vec<AuthorityLostResidual>,
 }
 
+fn try_clone_copy_slice<T: Copy>(source: &[T]) -> Result<Vec<T>, ()> {
+    let mut cloned = Vec::new();
+    cloned.try_reserve_exact(source.len()).map_err(|_| ())?;
+    cloned.extend_from_slice(source);
+    Ok(cloned)
+}
+
+fn try_clone_quarantine_facts(source: &QuarantineFacts) -> Result<QuarantineFacts, ()> {
+    Ok(QuarantineFacts {
+        former_app_host: source.former_app_host,
+        protected_parent: source.protected_parent,
+        foreign_descendants: try_clone_copy_slice(&source.foreign_descendants)?,
+        foreign_components: try_clone_copy_slice(&source.foreign_components)?,
+        missing_components: try_clone_copy_slice(&source.missing_components)?,
+    })
+}
+
+fn try_clone_registry_records(source: &[RouteEntityRecord]) -> Result<Vec<RouteEntityRecord>, ()> {
+    let mut records = Vec::new();
+    records.try_reserve_exact(source.len()).map_err(|_| ())?;
+    for record in source {
+        records.push(try_clone_route_entity_record(record)?);
+    }
+    Ok(records)
+}
+
+fn try_clone_actual_manifests(
+    source: &[(Entity, ComponentManifest)],
+) -> Result<Vec<(Entity, ComponentManifest)>, ()> {
+    let mut manifests = Vec::new();
+    manifests.try_reserve_exact(source.len()).map_err(|_| ())?;
+    for (entity, manifest) in source {
+        manifests.push((*entity, manifest.try_clone()?));
+    }
+    Ok(manifests)
+}
+
+fn try_clone_quarantine_lease(source: &QuarantineLease) -> Result<QuarantineLease, ()> {
+    Ok(QuarantineLease {
+        id: source.id,
+        generation: source.generation,
+        operation_sequence: source.operation_sequence,
+        records: try_clone_registry_records(&source.records)?,
+        facts: try_clone_quarantine_facts(&source.facts)?,
+    })
+}
+
+fn try_clone_unresolved_residual(source: &UnresolvedResidual) -> Result<UnresolvedResidual, ()> {
+    Ok(UnresolvedResidual {
+        sequence: source.sequence,
+        records: try_clone_registry_records(&source.records)?,
+        actual_manifests: try_clone_actual_manifests(&source.actual_manifests)?,
+        facts: try_clone_quarantine_facts(&source.facts)?,
+    })
+}
+
+fn try_clone_authority_lost_residual(
+    source: &AuthorityLostResidual,
+) -> Result<AuthorityLostResidual, ()> {
+    Ok(AuthorityLostResidual {
+        id: source.id,
+        generation: source.generation,
+        operation_sequence: source.operation_sequence,
+        provenance: source.provenance.clone(),
+        retired_claim: try_clone_exact_registry_claim(&source.retired_claim)?,
+        frozen_expected_manifest: source.frozen_expected_manifest.try_clone()?,
+        observed_manifest: source
+            .observed_manifest
+            .as_ref()
+            .map(ComponentManifest::try_clone)
+            .transpose()?,
+        entity_present_at_receipt: source.entity_present_at_receipt,
+        observed_registry_claim: source
+            .observed_registry_claim
+            .as_ref()
+            .map(try_clone_exact_registry_claim)
+            .transpose()?,
+        actual_parent_at_receipt: source.actual_parent_at_receipt,
+        facts: try_clone_quarantine_facts(&source.facts)?,
+    })
+}
+
 impl QuarantineLeaseTable {
     pub(crate) fn new() -> Self {
         Self {
@@ -1230,6 +1584,41 @@ impl QuarantineLeaseTable {
             unresolved: Vec::new(),
             authority_lost: Vec::new(),
         }
+    }
+
+    pub(crate) fn try_clone_projection(&self) -> Result<Self, ()> {
+        let mut leases = Vec::new();
+        leases
+            .try_reserve_exact(self.leases.len())
+            .map_err(|_| ())?;
+        for lease in &self.leases {
+            leases.push(try_clone_quarantine_lease(lease)?);
+        }
+
+        let mut unresolved = Vec::new();
+        unresolved
+            .try_reserve_exact(self.unresolved.len())
+            .map_err(|_| ())?;
+        for residual in &self.unresolved {
+            unresolved.push(try_clone_unresolved_residual(residual)?);
+        }
+
+        let mut authority_lost = Vec::new();
+        authority_lost
+            .try_reserve_exact(self.authority_lost.len())
+            .map_err(|_| ())?;
+        for residual in &self.authority_lost {
+            authority_lost.push(try_clone_authority_lost_residual(residual)?);
+        }
+
+        Ok(Self {
+            domain: self.domain,
+            next_sequence: self.next_sequence,
+            next_residual_sequence: self.next_residual_sequence,
+            leases,
+            unresolved,
+            authority_lost,
+        })
     }
 
     fn prepare_verified(
