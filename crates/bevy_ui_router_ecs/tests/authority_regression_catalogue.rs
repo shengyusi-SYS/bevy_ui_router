@@ -1429,7 +1429,7 @@ fn back_no_target_authority_callbacks_only_publish_prepared_state() {
     let navigation = include_str!("../src/navigation.rs");
     let core_integration = include_str!("../../bevy_ui_router_core/src/integration.rs");
     let tests_start = navigation
-        .find("pub(crate) mod tests {")
+        .find("#[path = \"navigation_tests.rs\"]\npub(crate) mod tests;")
         .expect("navigation source retains its crate-private test module");
     let production_navigation = &navigation[..tests_start];
 
@@ -1821,7 +1821,7 @@ fn back_no_target_completion_callback_tail_is_infallible_and_query_free() {
     let helper_marker = "fn drive_back_no_target_zero_completion(";
     let receiver = ".complete_back_no_target_cleanup(";
     let tests_start = navigation
-        .find("pub(crate) mod tests {")
+        .find("#[path = \"navigation_tests.rs\"]\npub(crate) mod tests;")
         .expect("navigation source retains its crate-private test module");
     let production_navigation = &navigation[..tests_start];
 
@@ -2049,7 +2049,7 @@ fn back_target_permanent_completion_callback_tail_is_infallible_and_publication_
     let navigation = include_str!("../src/navigation.rs");
     let core_engine = include_str!("../../bevy_ui_router_core/src/engine.rs");
     let tests_start = navigation
-        .find("pub(crate) mod tests {")
+        .find("#[path = \"navigation_tests.rs\"]\npub(crate) mod tests;")
         .expect("navigation source retains its crate-private test module");
     let production_navigation = &navigation[..tests_start];
     let receiver = ".complete_back_target_permanent_cleanup(";
@@ -2202,7 +2202,7 @@ fn back_target_permanent_completion_callback_tail_is_infallible_and_publication_
 fn back_target_dispatch_owners_are_linear_and_exact() {
     let navigation = include_str!("../src/navigation.rs");
     let tests_start = navigation
-        .find("pub(crate) mod tests {")
+        .find("#[path = \"navigation_tests.rs\"]\npub(crate) mod tests;")
         .expect("navigation source retains its crate-private test module");
     let production_navigation = &navigation[..tests_start];
     let integration = include_str!("../../bevy_ui_router_core/src/integration.rs");
@@ -2380,7 +2380,7 @@ fn back_target_zero_entering_commit_reuses_the_single_target_publisher() {
     let integration = include_str!("../../bevy_ui_router_core/src/integration.rs");
     let navigation = include_str!("../src/navigation.rs");
     let tests_start = navigation
-        .find("pub(crate) mod tests {")
+        .find("#[path = \"navigation_tests.rs\"]\npub(crate) mod tests;")
         .expect("navigation source retains its crate-private test module");
     let production_navigation = &navigation[..tests_start];
 
@@ -2600,7 +2600,7 @@ fn back_target_zero_entering_commit_reuses_the_single_target_publisher() {
 fn back_target_frame_task_failures_preserve_one_typed_execution_owner() {
     let navigation = include_str!("../src/navigation.rs");
     let tests_start = navigation
-        .find("pub(crate) mod tests {")
+        .find("#[path = \"navigation_tests.rs\"]\npub(crate) mod tests;")
         .expect("navigation source retains its crate-private test module");
     let production_navigation = &navigation[..tests_start];
     let drive = body_after_marker(production_navigation, "fn drive_navigation_pass(");
