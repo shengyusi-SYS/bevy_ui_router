@@ -1,12 +1,14 @@
 # Authority Transition Matrix
 
-> **Recovery activation invariant:** never merge or infer ledgers after mutation. A post-commit host-loss transition prepares one `L + A + H` owner: old cleanup `L`, disjoint authority `A` including `A0`, and retired-host edge `H`. All fallible bindings, including final-fallible `retire_current`, finish before the callback installs the ECS compound; confirmation/publication are last. Admission is source-bound, confirmation-last, and exhausted identities are permanent. No Recovery PASS, full Journey G, or old-lease reap completion is claimed.
+> **Recovery closure invariant:** never merge or infer ledgers after mutation. A post-commit host-loss transition prepares one `L + A + H` owner: old cleanup `L`, disjoint authority `A` including `A0`, and retired-host edge `H`. All fallible bindings, including final-fallible `retire_current`, finish before the callback installs the ECS compound; confirmation/publication are last. Admission is source-bound, confirmation-last, and exhausted identities are permanent. Recovery PASS does not claim full Journey G or old-lease reap completion.
 
 **文档类型**: Phase 3B.1 生命周期规范附录
-**状态**: Recovery 为当前阶段合同；History 是已完成的历史证据；runtime Recovery 仍计划中，未宣称 Recovery PASS、full Journey G 或 MVP PASS
+**状态**: Recovery PASS；History 与 Recovery 均为已完成历史证据；full Journey G、Authority closure 与 MVP PASS 未完成
 **架构上位规范**: [Target Architecture](target-architecture.md)
 
-**History checkpoint**：implementation `be25dbe` 至 `e001345`，contract activation `f0fcc2e`。History 的 pre-commit authority precedence、late-bound Back、failure/no-target cleanup 与 terminal owner closure 已通过 completion gate；post-commit compound settlement、host re-admission 与完整 Recovery 仍待完成。
+**History checkpoint**：implementation `be25dbe` 至 `e001345`，contract activation `f0fcc2e`。History 的 pre-commit authority precedence、late-bound Back、failure/no-target cleanup 与 terminal owner closure 已通过 completion gate。
+
+**Recovery checkpoint**：R2–R4 `d889942..494ae6b`。Post-commit compound settlement、stable unavailable、fresh-epoch host re-admission、Journey D、Scenario E 与 Journey G Recovery-owned foreground/readmission rows 已通过 completion gate；actual old-lease reap 与完整 Journey G 仍属 Authority closure。
 
 Target Architecture 拥有架构边界与不变量；本文拥有 token、closure、cleanup、quarantine 与 request terminal 的详细转换语义。本文不得改变 Target 的 ownership/依赖边界；若两者在生命周期细节上冲突，以本文为准。
 
@@ -240,7 +242,7 @@ terminal evidence 还必须证明该 request/settlement scope 不再持有 outst
 
 ### 9.1 History request and cleanup boundary
 
-以下 History contract 已由 implementation `be25dbe` 至 `e001345` 与 completion gate 闭合。pre-commit 的 host、current、preserved 或 leaving authority loss 优先于 resolved target、pending rejection、route failure 与 no-target；它取消或消费原 history owner、history 保持旧值，并进入既有 scoped authority settlement。`CommitPublished` 后 capability 已消费，History 只冻结不回滚边界；ordinary drift 保持原 immutable ledger，authority loss 或不能按 receipt/quarantine 收敛的异常仍属于下一阶段 Recovery 的 compound settlement，本文中的 Recovery 行不是当前完成事实。
+以下 History contract 已由 implementation `be25dbe` 至 `e001345` 与 completion gate 闭合。pre-commit 的 host、current、preserved 或 leaving authority loss 优先于 resolved target、pending rejection、route failure 与 no-target；它取消或消费原 history owner、history 保持旧值，并进入既有 scoped authority settlement。`CommitPublished` 后 capability 已消费，History 只冻结不回滚边界；ordinary drift 保持原 immutable ledger，authority loss 或不能按 receipt/quarantine 收敛的异常由已完成的 Recovery compound settlement 闭合。Actual old-lease reap 与跨多 Router 的完整 Authority closure 仍不是当前完成事实。
 
 | Case | Cleanup scope | Continuation | requested / terminal |
 | --- | --- | --- | --- |

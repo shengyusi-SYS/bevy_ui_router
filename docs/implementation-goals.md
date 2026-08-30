@@ -1,10 +1,10 @@
 # 整体实施目标规划
 
-**状态**：实施总纲 `Plan PASS`；当前阶段 `History PASS`，Now = Recovery
+**状态**：实施总纲 `Plan PASS`；当前阶段 `Recovery PASS`，Now = 结构治理
 
 **前置条件**：Phase 3B.1 `Plan PASS`
 
-**更新日期**：2026-08-11
+**更新日期**：2026-08-31
 
 ## 总体目标
 
@@ -17,10 +17,11 @@
 3. **Reconciliation**：实现 common-prefix 保留和 leaf 替换，验证离场输入/focus 隔离、精确清理及稳定 identity。
 4. **History**：完成 `replace`、`back` 与执行期重检，确保 presentation 成功提交后才更新 history。
 5. **Recovery**：分别闭合三类终态：route-level match/view/mount 失败可提交 error presentation 或保留旧 active UI；host/authority loss 不渲染 fallback，并在安全 settlement 后清空失效 active；stale result 只丢弃或清理旧输出，不改变当前 request、presentation 与 history。
-6. **Authority closure**：补齐多 router、quarantine、后台 reaper、真实 input probe 和攻击性回归，关闭绕过 facade 或伪造生命周期身份的路径。
-7. **MVP gate**：统一运行 facade journeys、authority audit、ECS 私有回归、feature/consumer compile gates 与 workspace 验证，并进行最终事实性审查。
+6. **结构治理**：在不改变行为与公共 API 的前提下拆分巨型测试和稳定协议模块，降低 Authority 扩张前的审查与状态聚合风险。
+7. **Authority closure**：补齐多 router、quarantine、后台 reaper、真实 input probe 和攻击性回归，关闭绕过 facade 或伪造生命周期身份的路径。
+8. **MVP gate**：统一运行 facade journeys、authority audit、ECS 私有回归、feature/consumer compile gates 与 workspace 验证，并进行最终事实性审查。
 
-当前事实：Root push、Nested push、Reconciliation 与 History 已完成；History implementation 为 `be25dbe` 至 `e001345`，最终 contract activation 为 `f0fcc2e`，authority catalogue 为 24，workspace completion gate 为 1108/1108。下一阶段只推进 Recovery；Authority closure、`RouterInputProbes` 与 MVP gate 仍未完成，因此当前结论不是 MVP PASS。
+当前事实：Root push、Nested push、Reconciliation、History 与 Recovery 已完成。Recovery verified implementation candidate 为 `494ae6b`，全局 active deltas 为 6，authority 为 27/27/27，workspace completion gate 为 1222/1222。下一阶段先做行为与公共 API 不变的结构治理，再独立设计 Authority closure；`RouterInputProbes`、actual old-lease reap、完整 Journey G 与 MVP gate 仍未完成，因此当前结论不是 MVP PASS。
 
 ## 执行与质量门槛
 

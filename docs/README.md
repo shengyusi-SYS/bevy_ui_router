@@ -1,12 +1,12 @@
 # Bevy UI Router 文档索引
 
-## Recovery current-stage activation
+## Recovery completion
 
-The current active spec/plan pair is [Recovery 阶段设计](superpowers/specs/2026-08-12-recovery-design.md) and [Recovery 实施计划](superpowers/plans/2026-08-12-recovery-implementation-plan.md). History is completed historical evidence. The active profile has eight current exclusions, preserves History's three active deltas, activates the R1 Recovery delta while keeping R2/R3 planned, exposes one active Recovery authority row, and keeps the runtime catalogue at 25. This is not a Recovery PASS, full Journey G, or MVP PASS claim; background old-lease reap remains Authority-closure work.
+Recovery is complete at verified implementation candidate `494ae6b`. [Recovery 阶段设计](superpowers/specs/2026-08-12-recovery-design.md) and [Recovery 实施计划](superpowers/plans/2026-08-12-recovery-implementation-plan.md) are completed historical evidence. The final profile has eight Authority-owned exclusions, preserves History's three active deltas, activates all three Recovery deltas and authority rows, and fixes the runtime catalogue at 27. Journey D and Scenario E are complete; only Journey G's Recovery-owned foreground/readmission rows are complete. Background old-lease reap, full Journey G, Authority closure, and MVP PASS remain open.
 
-**状态**: Phase 3B.1 `Recovery` current stage; History is completed historical evidence
-**基准提交**: History implementation `be25dbe` 至 `e001345`，contract activation `f0fcc2e`
-**更新时间**: 2026-08-12
+**状态**: Phase 3B.1 `Recovery PASS`; Now = structural governance
+**基准提交**: Recovery R2–R4 `d889942..494ae6b`
+**更新时间**: 2026-08-31
 
 ## 权威顺序
 
@@ -23,7 +23,7 @@ The current active spec/plan pair is [Recovery 阶段设计](superpowers/specs/2
 9. [Roadmap](roadmap.md) 的执行顺序。
 10. 历史计划、研究资料和审查记录仅作为证据，不定义当前目标。
 
-History completion gate 已通过，[History 阶段设计](superpowers/specs/2026-07-20-history-design.md) 的机器表 `10.1–10.3` 现作为已完成阶段的历史证据，记录三个 active contract delta 与 Root 20 + Nested 3 + History 1 = 24 的 authority catalogue。当前 canonical/profile pair 是 [Recovery 阶段设计](superpowers/specs/2026-08-12-recovery-design.md) 与 [Recovery 实施计划](superpowers/plans/2026-08-12-recovery-implementation-plan.md)：它保留 History active 3，激活 Recovery R1 delta/authority row，R2/R3 仍 planned；当前 exclusions 为 8，runtime catalogue 为 25。该 activation 不声明 Recovery PASS、完整 Journey G 或 MVP PASS；old-lease reap 仍属 Authority closure。
+History 与 Recovery completion gates 已通过。[History 阶段设计](superpowers/specs/2026-07-20-history-design.md) 与 [Recovery 阶段设计](superpowers/specs/2026-08-12-recovery-design.md) 的机器表均为 completed historical evidence。最终 union 是 History active 3 + Recovery active 3 = 6，authority catalogue 为 Root 20 + Nested 3 + History 1 + Recovery 3 = 27。当前执行顺序是结构治理 → Authority closure → MVP gate；old-lease reap 与完整 Journey G 仍属 Authority closure。
 
 ## 当前文档
 
@@ -42,6 +42,8 @@ History completion gate 已通过，[History 阶段设计](superpowers/specs/202
 | [Nested Push 阶段合同 Profile](nested-push-contract-profile.md) | 收窄首次嵌套 push、sealed child mount、逐层 apply 与阶段 exclusions |
 | [History 阶段设计](superpowers/specs/2026-07-20-history-design.md) | 已完成 History 的规范与最终机器 profile 历史证据；机器表位于 `10.1–10.3` |
 | [History 实施计划](superpowers/plans/2026-07-20-history-implementation-plan.md) | 已完成 History 的任务顺序、实现范围、复审与 completion gate 证据 |
+| [Recovery 阶段设计](superpowers/specs/2026-08-12-recovery-design.md) | 已完成 Recovery 的规范、最终机器 profile 与 completion record 历史证据 |
+| [Recovery 实施计划](superpowers/plans/2026-08-12-recovery-implementation-plan.md) | 已完成 Recovery R1–R4 的任务顺序、复审、门禁与 factual close 证据 |
 | [Root Push 实施计划](superpowers/plans/2026-07-11-root-push-implementation-plan.md) | Root push 的任务顺序、TDD 门禁、文件范围与提交边界 |
 | [Root Push 计划审查记录](superpowers/plans/2026-07-11-root-push-plan-review-log.md) | 记录多角度审查的共同根因、修订、复审与无需重写结论 |
 | [Phase 3B.1 Review Log](phase-3b1-architecture-review-log.md) | 记录审查共同根因、负责人处置和复审结论 |

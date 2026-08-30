@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `subagent-driven-development` to implement this plan task-by-task. Use `test-driven-development` before each behavior change, `systematic-debugging` for unexpected failures, `receiving-code-review` before applying review feedback, and `verification-before-completion` before every PASS or commit claim.
 
-**Status:** Independently reviewed; ready for Task 1 canonical/profile activation. Runtime implementation has not started.
+**Status:** Complete; Recovery PASS at verified implementation candidate `494ae6b`. This plan is completed historical evidence.
 
 **Review:** PASS — Core/ECS/Public Critical 0, Important 0, Minor 0 on semantic snapshot `F5BEC9529B412A4038BC2F5AF5FDDD96427F6FA8FA1A70F694FD4A5E63E43916`.
 
@@ -2229,7 +2229,7 @@ Expected: tracking exits `0`; `rg` has no matches.
 
 - [ ] Update facts only in `docs/current-architecture.md`, `docs/roadmap.md`, `docs/README.md`, `docs/authority-transition-matrix.md`, `docs/implementation-goals.md`, `docs/superpowers/README.md`, `.superpowers/sdd/progress.md`, Recovery spec, and this plan. Record actual commit range/run identities, six active deltas, and `27/27/27`.
 
-Claims are limited to Journey D complete, Scenario E complete, and Journey G’s Recovery-owned foreground/readmission rows complete. Keep actual old-lease reap, full Journey G, Authority closure, and MVP PASS explicitly incomplete; set `Now` to Authority closure.
+Claims are limited to Journey D complete, Scenario E complete, and Journey G’s Recovery-owned foreground/readmission rows complete. Keep actual old-lease reap, full Journey G, Authority closure, and MVP PASS explicitly incomplete. The plan originally directed `Now` to Authority closure; the newer overall goal inserts behavior/API-preserving structural governance first and controls the factual roadmap.
 
 - [ ] Re-run exact facts/profile gates, then stage and commit the facts-only set.
 
@@ -2254,4 +2254,15 @@ Expected staged inventory is exactly the nine facts files; verifier remains `27/
 
 ## Execution handoff
 
-Execute Tasks 1–5 in order. Each semantic task uses one writer, a real RED before production code, focused GREEN before affected/public gates, three-way review before commit, and a clean tracked candidate before the next task. Do not start Authority closure in this plan.
+Tasks 1–5 are complete. Each semantic task used one writer, focused/affected/public verification, independent review, and a clean tracked candidate before factual close. Do not start structural governance or Authority closure in this completed Recovery plan.
+
+## Completion record — 2026-08-31
+
+- Recovery implementation: R1 on `main` at `fbadf43`; R2–R4 implementation/review fixes `d889942..494ae6b`; final verified implementation candidate `494ae6b`.
+- Final profile: eight Authority-owned exclusions；History active 3 + Recovery active 3 = six global active deltas；three active Recovery authority rows；catalogue 27。
+- Public gates: facade allowlist 61/61；facade compile-fail 47/47；public journeys 29/29；public authority audit 10/10；authority catalogue integration 18/18。
+- Authority semantic verifier: 27/27/27 using a Linux reproduction of the PowerShell script's catalogue parser, exact registration/passed-set comparisons, and result-summary checks; PowerShell itself was unavailable on this host.
+- Workspace gates: nextest run `5462ad56-859f-4bbe-89a2-7ad7f1b3eae2`, 1222/1222 passed, 0 skipped；Core doctest 28/28；workspace all-target/all-feature check、format、diff、tracking 与 trailing-whitespace checks passed。
+- Final reviews: Core、ECS、public/facade Critical 0 / Important 0。One retained Minor concerns mismatch projection detail for two owner slots that the authorization predicate requires to be empty; it does not broaden the allowed state.
+- Claims: Journey D complete；Scenario E complete；Journey G Recovery-owned foreground/readmission rows complete。Actual old-lease reap、full Journey G、Authority closure 与 MVP PASS remain incomplete。
+- Next stage ruling: the newer overall objective requires structural governance before Authority closure; this supersedes the older direct-to-Authority sequencing in this plan without changing Recovery semantics.

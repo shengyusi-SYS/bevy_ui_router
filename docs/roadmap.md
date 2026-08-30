@@ -1,10 +1,10 @@
 # Roadmap
 
-> **Current-stage activation:** Recovery is the active spec/plan pair. Its profile keeps eight exclusions, History active delta 3, Recovery R1 active with R2/R3 planned, one active Recovery authority row, and catalogue 25. Journey D's R1 contract is active while Journey G remains planned; background old-lease reap and full Journey G remain Authority-closure work. This is not Recovery PASS or MVP PASS.
+> **Current-stage status:** Recovery PASS at verified implementation candidate `494ae6b`. The completed profile keeps eight Authority-owned exclusions, six global active deltas, three Recovery authority rows, and catalogue 27. Journey D and Scenario E are complete; only Journey G's Recovery-owned foreground/readmission rows are complete. Background old-lease reap, full Journey G, Authority closure, and MVP PASS remain open.
 
-**状态**: Phase 3B.1 `Recovery` current stage; History completed
+**状态**: Phase 3B.1 `Recovery PASS`; Now = structural governance
 
-**更新时间**: 2026-08-12
+**更新时间**: 2026-08-31
 
 ## 已完成
 
@@ -32,12 +32,17 @@
   - C1–C3 成功/失败/queued Back 公开旅程，pre-commit authority settlement、ABA/cross-incarnation/stale replay 与 exact cleanup owner closure
   - implementation `be25dbe` 至 `e001345`，contract activation `f0fcc2e`，authority catalogue 24，workspace nextest 1108/1108
 
+- [x] **Recovery**
+  - boundary-bound error presentation、post-commit `L + A + H` compound settlement、stable unavailable、fresh-epoch re-admission 与 sealed stale-output cleanup
+  - Journey D、Scenario E 与 Journey G Recovery-owned foreground/readmission rows；无 binding nested Push 保持 cleanup → `RouterFallback`
+  - R2–R4 range `d889942..494ae6b`，six active deltas，authority 27/27/27，workspace nextest 1222/1222
+
 ## Now
 
-1. **Recovery**
-   - 先形成并独立复审 Recovery spec/plan 与完整 role/topology/physical-drift/terminal matrix
-   - 闭合 view/mount failure、error presentation、post-commit host/registration loss、stale result cleanup 与新 epoch re-admission
-   - History PASS 不授权从已提交 presentation/history 回滚，也不允许绕过 exact settlement owner
+1. **结构治理**
+   - 为 `engine`、`navigation`、`cleanup` 建立按稳定协议划分的模块图，优先机械迁移巨型内联测试
+   - 保持行为、公共 API、测试名、feature 与过滤入口不变；机械移动与任何语义修改分开审查和提交
+   - Authority 新能力后续进入独立 quarantine、reaper、audit、input-probe 模块，不继续堆入 `navigation.rs`
 
 ## Next
 
@@ -46,7 +51,7 @@
 2. **MVP gate**
    - facade journeys、authority regressions、feature matrix、workspace tests 与独立 factual review
 
-Recovery、Authority closure、`RouterInputProbes` 与 MVP 仍未完成；History PASS 不等于 Recovery PASS 或 MVP PASS。
+结构治理、Authority closure、`RouterInputProbes`、完整 Journey G 与 MVP gate 仍未完成；Recovery PASS 不等于完整 Journey G 或 MVP PASS。
 
 ## MVP 后
 

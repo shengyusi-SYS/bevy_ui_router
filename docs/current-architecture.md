@@ -2,9 +2,9 @@
 
 **文档类型**: 当前事实
 
-**状态**: History PASS
+**状态**: Recovery PASS
 
-**as_of**: History implementation `be25dbe` through `e001345` inclusive，final contract activation `f0fcc2e`
+**as_of**: Recovery verified implementation candidate `494ae6b`
 
 **事实来源**: workspace manifest、实现、固定测试、公开旅程、已执行门禁与最终独立复审
 
@@ -12,7 +12,7 @@
 
 ## 1 当前定位
 
-Root Push、Nested Push、Reconciliation 与 History 已闭合；当前下一阶段是 Recovery
+Root Push、Nested Push、Reconciliation、History 与 Recovery 已闭合；当前下一阶段是保持行为与公共 API 不变的结构治理，随后才进入 Authority closure
 
 Reconciliation 的当前事实必须按四个层次分别读取
 
@@ -24,6 +24,8 @@ Reconciliation 的当前事实必须按四个层次分别读取
 Task 8 focused/full workspace 门禁已在精确干净 `5806c59` 树上通过，四路独立复审均通过，阶段结论为 Reconciliation PASS
 
 History 在唯一 Core history publisher 下接通了 facade `replace` 与 late-bound relative `back`。Back 只在成为 running 后从 live canonical history 解析一次 target；成功 publication 同步提交 presentation/history，no-target、route failure、pre-commit authority loss、stale/ABA replay 与 cleanup completion 都保留 exact typed owner/evidence 并有界终结。公共 C1–C3、authority audit、ECS 私有回归、facade consumer/compile-fail 与 workspace completion gate 已闭合，阶段结论为 History PASS。
+
+Recovery 已闭合 boundary-bound error presentation、post-commit `L + A + H` compound settlement、stable unavailable、source-bound re-admission、fresh epoch 与 sealed stale-output cleanup。Journey D 和 Scenario E 完成；Journey G 只完成 Recovery-owned foreground/readmission rows。无 error binding 的 nested Push 保持 cleanup 后进入 `RouterFallback`。Actual old-lease reap、完整 Journey G、Authority closure 与 MVP PASS 仍未完成。
 
 ## 2 Authority 与 owner 边界
 
@@ -83,7 +85,7 @@ Update: ObserveAuthority
 - locked Bevy layout、visibility、native picking 与 target event delivery
 - parent outlet 登记后 root-to-leaf apply，完整 branch 一次 preflight 与一次 Core publication
 - frame-local traversal、input/focus barrier、leaf-to-root exact cleanup 与 opaque outlet/content audit
-- Authority catalogue 为 Root 20 + Nested 3 + History 1 = 24
+- Authority catalogue 为 Root 20 + Nested 3 + History 1 + Recovery 3 = 27
 
 ## 5 Reconciliation checkpoints
 
@@ -138,14 +140,27 @@ Update: ObserveAuthority
 
 以上只证明 History PASS；post-commit compound settlement、host re-admission/new epoch rebuild、background reaper、完整 Recovery journey 与最终 MVP gate 不在该结论内。
 
-## 9 后续边界
+## 9 Recovery completion checkpoint
+
+- R2–R4 implementation/review-fix range：`d889942..494ae6b`
+- final verified implementation candidate：`494ae6b`
+- global active contract deltas：History 3 + Recovery 3 = 6
+- Recovery authority rows：3；catalogue source/registration/runtime：27/27/27
+- facade allowlist：61/61；facade compile-fail：47/47
+- public navigation journeys：29/29；public authority audit：10/10；authority catalogue integration：18/18
+- workspace nextest：1222/1222，0 skipped，run ID `5462ad56-859f-4bbe-89a2-7ad7f1b3eae2`
+- workspace doctest：Core 28/28，其余 crates 0；workspace all-target/all-feature check、format、diff、tracking 与 trailing-whitespace gates通过
+- Core、ECS、public/facade 三类最终复审无剩余 Critical/Important；一项非阻塞 Minor 仅涉及两个必须为空的 mismatch owner 槽投影粒度，不放宽授权
+- PowerShell host 不可用；在 Linux 上按脚本相同 parser、set equality、registration、passed set 与 summary 规则执行语义等价 verifier，并得到 27/27/27
+
+## 10 后续边界
 
 尚未完成
 
-- error presentation、mount recovery、post-commit host/registration loss 与 stale replay 的完整 Recovery
+- 巨型 `engine`、`navigation`、`cleanup` 文件的行为不变、公共 API 不变结构治理
 - multi-router stress、完整 opaque audit、lease authority、background reaper 与 cleanup replay 的 Authority closure
 - `RouterInputProbes` 与对应公开 input journey
 - 最终 MVP gate
 - MVP 之后的 BSN adapter 与嵌套示例
 
-History factual close 已完成。Recovery runtime implementation 只能在其 spec/plan 与完整 role/topology/physical-drift/terminal matrix 分别通过独立复审后开始；后续切片继续复用唯一 authority、exact claim、registry-first、post-write validation 与 app-owned host zero-write 约束。
+Recovery factual close 已完成。结构治理不得改变运行时语义或公共 API；Authority closure 必须另建并独立复审 spec/plan 与完整矩阵。后续切片继续复用唯一 authority、exact claim、registry-first、post-write validation 与 app-owned host zero-write 约束。

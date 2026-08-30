@@ -1,6 +1,6 @@
 # Recovery 阶段设计
 
-**Activation status**: current active canonical/profile stage; History is completed historical evidence. R1–R3 contract deltas and authority rows are active. This does not claim Recovery PASS, full Journey G, or MVP PASS. Background old-lease reap remains Authority-closure work.
+**Activation status**: completed historical evidence; Recovery PASS at verified implementation candidate `494ae6b`. R1–R3 contract deltas and authority rows are active. This does not claim full Journey G, Authority closure, or MVP PASS. Background old-lease reap remains Authority-closure work.
 
 **用户设计确认**: 用户已将 MVP PASS、阶段顺序与自主规划/调度权写入持续目标；本规范按该授权收敛 Recovery 设计
 
@@ -8,11 +8,11 @@
 
 **Plan independent review**: PASS
 
-**阶段状态**: current active canonical/profile stage；History is completed historical evidence；不得据此声明 Recovery PASS、完整 Journey G 或 MVP PASS
+**阶段状态**: Recovery PASS；本文与 History spec 均转为 completed historical evidence；不得据此声明完整 Journey G、Authority closure 或 MVP PASS
 
 **事实基线**: `fe8532c`（History closure verified）；编写本规范时 tracked tree/index clean，用户未跟踪 `review-history-*` 材料不在本阶段范围
 
-**阶段顺序**: History PASS → Recovery（current）→ Authority closure → MVP gate
+**阶段顺序**: History PASS → Recovery PASS → 结构治理（current）→ Authority closure → MVP gate
 
 **权威顺序**: 明确用户目标与 `AGENTS.md` → `docs/target-architecture.md` → `docs/authority-transition-matrix.md` → Facade Fixture/Allowlist/Golden → `docs/mvp-acceptance-journeys.md` → Current Architecture/Roadmap → 本规范 → implementation plan → runtime/tests。本文在 canonical activation commit 前只能提出 amendment，不能覆盖上游合同
 
@@ -653,4 +653,14 @@ Recovery PASS仅在同一 verified committed tree同时满足：
 - current architecture、roadmap、README、Authority Matrix与SDD progress只同步已验证事实；
 - tracked tree/index clean，用户WIP保持未触碰。
 
-完成后本文转为 completed historical evidence，roadmap进入 Authority closure；不得写 `MVP PASS`或完整Journey G PASS。Authority closure必须另建并独立复审spec/plan与完整矩阵，完成old-lease reap/new-epoch隔离等剩余rows后才能声明Journey G完整；最终MVP gate只能在Recovery与Authority都完成的同一verified tree上执行。
+本文现已转为 completed historical evidence。较新的整体目标在 Authority closure 前插入行为与公共 API 不变的结构治理，该顺序覆盖本规范早期“直接进入 Authority”的计划文字。不得写 `MVP PASS` 或完整 Journey G PASS；Authority closure 必须另建并独立复审 spec/plan 与完整矩阵，完成 old-lease reap/new-epoch 隔离等剩余 rows 后才能声明 Journey G 完整；最终 MVP gate 只能在 Recovery、必要结构治理与 Authority 都完成的同一 verified tree 上执行。
+
+## 16 Recovery completion record
+
+- R2–R4 implementation/review-fix range：`d889942..494ae6b`；final verified candidate：`494ae6b`。
+- Machine profile：eight Authority-owned exclusions；History active 3 + Recovery active 3 = six global active deltas；three active Recovery authority rows。
+- Public evidence：Journey D complete、Scenario E complete、Journey G Recovery-owned foreground/readmission rows complete；actual old-lease reap 与 full Journey G 未完成。
+- Gates：facade allowlist 61/61、compile-fail 47/47、public journeys 29/29、public authority audit 10/10、authority catalogue integration 18/18、authority source/registration/runtime 27/27/27。
+- Workspace：nextest run `5462ad56-859f-4bbe-89a2-7ad7f1b3eae2` 为 1222/1222、0 skipped；Core doctest 28/28；workspace all-target/all-feature check、format、diff、tracking 与 trailing-whitespace gates通过。
+- Reviews：Core、ECS、public/facade 无剩余 Critical/Important。保留的一项 Minor 只涉及 observed-unavailable mismatch 中两个必须为空槽位的 projection 粒度，不改变 authorization predicate。
+- Host note：本机无 PowerShell；按 `scripts/verify-authority-regressions.ps1` 相同 catalogue parser、exact-set、compiled registration、actual passed set 与 result-summary 规则执行 Linux 语义等价 verifier，结果为 27/27/27。
