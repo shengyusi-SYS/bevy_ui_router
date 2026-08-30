@@ -4,7 +4,7 @@
 
 [Recovery 阶段设计](specs/2026-08-12-recovery-design.md) and [Recovery 实施计划](plans/2026-08-12-recovery-implementation-plan.md) are completed historical evidence. Recovery PASS preserves History active delta 3, activates all three Recovery deltas and authority rows, keeps eight Authority-owned exclusions, and fixes the runtime catalogue at 27. Journey D and Scenario E are complete; only Journey G's Recovery-owned foreground/readmission rows are complete. Old-lease reap, full Journey G, Authority closure, and MVP PASS remain open.
 
-No spec/plan in this directory is currently an active runtime implementation exception. The next active work is structural governance under the newer overall goal; Authority closure must receive its own independently reviewed spec/plan before runtime implementation.
+No spec/plan in this directory is currently an active runtime implementation exception. Structural governance is complete at `2f2cb42`; Authority closure now executes directly from the canonical Target, Matrix, Fixture, Allowlist/Golden and Journeys without adding a new phase spec/plan.
 
 **状态**: frozen historical evidence；History 与 Recovery profiles 已完成
 **冻结日期**: 2026-08-31

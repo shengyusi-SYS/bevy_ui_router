@@ -4,7 +4,7 @@
 
 Recovery is complete at verified implementation candidate `494ae6b`. [Recovery 阶段设计](superpowers/specs/2026-08-12-recovery-design.md) and [Recovery 实施计划](superpowers/plans/2026-08-12-recovery-implementation-plan.md) are completed historical evidence. The final profile has eight Authority-owned exclusions, preserves History's three active deltas, activates all three Recovery deltas and authority rows, and fixes the runtime catalogue at 27. Journey D and Scenario E are complete; only Journey G's Recovery-owned foreground/readmission rows are complete. Background old-lease reap, full Journey G, Authority closure, and MVP PASS remain open.
 
-**状态**: Phase 3B.1 `Recovery PASS`; Now = structural governance
+**状态**: Phase 3B.1 `Recovery PASS` + structural governance complete；Now = Authority closure
 **基准提交**: Recovery R2–R4 `d889942..494ae6b`
 **更新时间**: 2026-08-31
 
@@ -23,7 +23,7 @@ Recovery is complete at verified implementation candidate `494ae6b`. [Recovery �
 9. [Roadmap](roadmap.md) 的执行顺序。
 10. 历史计划、研究资料和审查记录仅作为证据，不定义当前目标。
 
-History 与 Recovery completion gates 已通过。[History 阶段设计](superpowers/specs/2026-07-20-history-design.md) 与 [Recovery 阶段设计](superpowers/specs/2026-08-12-recovery-design.md) 的机器表均为 completed historical evidence。最终 union 是 History active 3 + Recovery active 3 = 6，authority catalogue 为 Root 20 + Nested 3 + History 1 + Recovery 3 = 27。当前执行顺序是结构治理 → Authority closure → MVP gate；old-lease reap 与完整 Journey G 仍属 Authority closure。
+History 与 Recovery completion gates 已通过。[History 阶段设计](superpowers/specs/2026-07-20-history-design.md) 与 [Recovery 阶段设计](superpowers/specs/2026-08-12-recovery-design.md) 的机器表均为 completed historical evidence。最终 union 是 History active 3 + Recovery active 3 = 6，authority catalogue 为 Root 20 + Nested 3 + History 1 + Recovery 3 = 27。结构治理 `211874a..2f2cb42` 已闭合；当前执行顺序是 Authority closure → MVP gate，old-lease reap 与完整 Journey G 仍属 Authority closure。
 
 ## 当前文档
 

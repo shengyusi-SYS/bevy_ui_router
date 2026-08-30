@@ -2,9 +2,9 @@
 
 **文档类型**: 当前事实
 
-**状态**: Recovery PASS
+**状态**: Recovery PASS；结构治理已完成；Authority closure 进行中
 
-**as_of**: Recovery verified implementation candidate `494ae6b`
+**as_of**: structural-governance candidate `2f2cb42`
 
 **事实来源**: workspace manifest、实现、固定测试、公开旅程、已执行门禁与最终独立复审
 
@@ -12,7 +12,7 @@
 
 ## 1 当前定位
 
-Root Push、Nested Push、Reconciliation、History 与 Recovery 已闭合；当前下一阶段是保持行为与公共 API 不变的结构治理，随后才进入 Authority closure
+Root Push、Nested Push、Reconciliation、History、Recovery 与行为/API 不变的结构治理已闭合；当前阶段是 Authority closure
 
 Reconciliation 的当前事实必须按四个层次分别读取
 
@@ -157,10 +157,9 @@ Update: ObserveAuthority
 
 尚未完成
 
-- 巨型 `engine`、`navigation`、`cleanup` 文件的行为不变、公共 API 不变结构治理
 - multi-router stress、完整 opaque audit、lease authority、background reaper 与 cleanup replay 的 Authority closure
 - `RouterInputProbes` 与对应公开 input journey
 - 最终 MVP gate
 - MVP 之后的 BSN adapter 与嵌套示例
 
-Recovery factual close 已完成。结构治理不得改变运行时语义或公共 API；Authority closure 必须另建并独立复审 spec/plan 与完整矩阵。后续切片继续复用唯一 authority、exact claim、registry-first、post-write validation 与 app-owned host zero-write 约束。
+结构治理提交范围 `211874a..2f2cb42` 已通过 facade closed-world、authority 27/27/27、workspace nextest 1222/1222、doctest 28/28、全目标检查与最终独立复审，未改变运行时语义或公共 API。Authority closure 直接依据既有 Target、Matrix、Fixture 与 Journeys 推进，不新增阶段 spec/plan；后续切片继续复用唯一 authority、exact claim、registry-first、post-write validation 与 app-owned host zero-write 约束。

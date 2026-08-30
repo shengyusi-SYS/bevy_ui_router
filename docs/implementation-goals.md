@@ -1,6 +1,6 @@
 # 整体实施目标规划
 
-**状态**：实施总纲 `Plan PASS`；当前阶段 `Recovery PASS`，Now = 结构治理
+**状态**：实施总纲 `Plan PASS`；结构治理已完成，Now = Authority closure
 
 **前置条件**：Phase 3B.1 `Plan PASS`
 
@@ -21,13 +21,12 @@
 7. **Authority closure**：补齐多 router、quarantine、后台 reaper、真实 input probe 和攻击性回归，关闭绕过 facade 或伪造生命周期身份的路径。
 8. **MVP gate**：统一运行 facade journeys、authority audit、ECS 私有回归、feature/consumer compile gates 与 workspace 验证，并进行最终事实性审查。
 
-当前事实：Root push、Nested push、Reconciliation、History 与 Recovery 已完成。Recovery verified implementation candidate 为 `494ae6b`，全局 active deltas 为 6，authority 为 27/27/27，workspace completion gate 为 1222/1222。下一阶段先做行为与公共 API 不变的结构治理，再独立设计 Authority closure；`RouterInputProbes`、actual old-lease reap、完整 Journey G 与 MVP gate 仍未完成，因此当前结论不是 MVP PASS。
+当前事实：Root push、Nested push、Reconciliation、History、Recovery 与结构治理已完成。结构治理范围 `211874a..2f2cb42` 保持行为与公共 API 不变，并通过 workspace 1222/1222、doctest 28/28、authority 27/27/27 与独立复审。当前直接执行 Authority closure；`RouterInputProbes`、actual old-lease reap、完整 Journey G 与 MVP gate 仍未完成，因此当前结论不是 MVP PASS。
 
 ## 执行与质量门槛
 
-- 每个阶段先形成可审查的详细实施计划，再按 TDD 小步实现；阶段产物必须独立可测试、可提交、可回退。
-- 每份阶段计划必须映射其权威规范、覆盖的 facade journey/authority regression/feature gate，并预先定义能够证明完成的测试输出、审查结论与提交范围。
-- History、Recovery 与 Authority closure 的阶段 spec/plan 必须先列出角色、拓扑、物理漂移与终态矩阵，每个格明确 exact owner、允许写集、receipt/terminal 与 retry 条件
+- Authority closure 直接依据 Target、Authority Matrix、Facade Fixture、Allowlist/Golden 与 MVP Journeys 执行；除非用户明确要求，不新建阶段 spec/plan，也不把测试编写顺序当作流程目标。
+- 变更按可审查 checkpoint 推进；每个 checkpoint 映射其权威 owner、允许写集、receipt/terminal、retry 条件和最高层 public/consumer gate，并保持可独立验证、提交与回退。
 - 失败矩阵必须分列 cleanup target/obligation 与 cleanup 后 continuation，后者由原始 failure/authority classification 与 attempt/branch role 预先封存，不能从 active 状态、obligation 数量或物理 disposition 反推
 - lifecycle/authority 终态至少由一条真实 producer 经正式 system schedule 到 settler 的旅程证明，并覆盖多轮收敛与额外一轮 no-replay
 - 注入 fact、直接 finalizer 与私有分类测试只能补充该证据

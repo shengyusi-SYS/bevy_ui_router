@@ -2,7 +2,7 @@
 
 > **Current-stage status:** Recovery PASS at verified implementation candidate `494ae6b`. The completed profile keeps eight Authority-owned exclusions, six global active deltas, three Recovery authority rows, and catalogue 27. Journey D and Scenario E are complete; only Journey G's Recovery-owned foreground/readmission rows are complete. Background old-lease reap, full Journey G, Authority closure, and MVP PASS remain open.
 
-**状态**: Phase 3B.1 `Recovery PASS`; Now = structural governance
+**状态**: Phase 3B.1 `Recovery PASS` + structural governance complete；Now = Authority closure
 
 **更新时间**: 2026-08-31
 
@@ -37,21 +37,24 @@
   - Journey D、Scenario E 与 Journey G Recovery-owned foreground/readmission rows；无 binding nested Push 保持 cleanup → `RouterFallback`
   - R2–R4 range `d889942..494ae6b`，six active deltas，authority 27/27/27，workspace nextest 1222/1222
 
+- [x] **结构治理**
+  - Core `engine::post_commit`、ECS `cleanup::capacity` 与 `navigation::authority_isolation` 已形成稳定协议 child module；巨型内联测试已机械迁移
+  - 提交范围 `211874a..2f2cb42`；行为、公共 API、测试名、feature 与过滤入口不变
+  - facade closed-world、authority 27/27/27、workspace nextest 1222/1222、doctest 28/28、全目标检查和最终独立复审通过
+
 ## Now
-
-1. **结构治理**
-   - 为 `engine`、`navigation`、`cleanup` 建立按稳定协议划分的模块图，优先机械迁移巨型内联测试
-   - 保持行为、公共 API、测试名、feature 与过滤入口不变；机械移动与任何语义修改分开审查和提交
-   - Authority 新能力后续进入独立 quarantine、reaper、audit、input-probe 模块，不继续堆入 `navigation.rs`
-
-## Next
 
 1. **Authority closure**
    - multi-router stress、完整 opaque audit、lease authority、background reaper 与 cleanup replay
-2. **MVP gate**
+   - `RouterInputProbes`、真实 input isolation journey 与 old-epoch quarantine 安全收敛
+   - 新能力进入独立 quarantine、reaper、audit、input-probe 模块，不继续堆入 `navigation.rs`
+
+## Next
+
+1. **MVP gate**
    - facade journeys、authority regressions、feature matrix、workspace tests 与独立 factual review
 
-结构治理、Authority closure、`RouterInputProbes`、完整 Journey G 与 MVP gate 仍未完成；Recovery PASS 不等于完整 Journey G 或 MVP PASS。
+Authority closure、`RouterInputProbes`、完整 Journey G 与 MVP gate 仍未完成；结构治理完成不等于完整 Journey G 或 MVP PASS。
 
 ## MVP 后
 
