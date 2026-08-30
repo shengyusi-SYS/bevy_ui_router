@@ -4968,6 +4968,8 @@ pub(crate) struct HostAdmissionUnavailableCause {
     pub(crate) evidence: HostAdmissionUnavailableEvidenceProjection,
     pub(crate) disposition: HostAdmissionUnavailableDisposition,
     pub(crate) cause_digest: u64,
+    pub(crate) expected_issuer: Box<HostAdmissionIssuerProjection>,
+    expected_owner_inventory: Box<HostAdmissionUnavailableOwnerInventoryProjection>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -5015,8 +5017,100 @@ pub(crate) struct HostAdmissionUnavailableObservedMismatchProjection {
     observed_current_identity: Option<FrameTaskIdentity>,
     observed_current_stage: Option<WorkStageProjection>,
     observed_action_present: bool,
-    observed_internal_owner_count: usize,
+    expected_owner_inventory: HostAdmissionUnavailableOwnerInventoryProjection,
+    observed_owner_inventory: HostAdmissionUnavailableOwnerInventoryProjection,
+    expected_issuer: HostAdmissionIssuerProjection,
     observed_issuer: HostAdmissionIssuerProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HostAdmissionUnavailableCurrentOwnerProjection {
+    identity: FrameTaskIdentity,
+    stage: WorkStageProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HostAdmissionUnavailableActionOwnerProjection {
+    FrameTask(FrameTaskIdentity),
+    MountRequest {
+        request: NavigationRequestId,
+        parent: RouteFrameVersion,
+        outlet: RouteSlotKey,
+    },
+    FailureCleanup(NavigationRequestId),
+    Commit(FrameTaskIdentity),
+    BackResolution,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostAdmissionUnavailableHistoryPreparationOwnerProjection {
+    Source,
+    Binding,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HostAdmissionUnavailablePublicationOwnerProjection {
+    Ready {
+        identity: FrameTaskIdentity,
+        evidence: SealedCommitEvidence,
+    },
+    Rejected {
+        identity: FrameTaskIdentity,
+        evidence: SealedCommitEvidence,
+        error: CommitError,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HostAdmissionUnavailableBackNoTargetAuthorityOwnerProjection {
+    Accepted {
+        receiver: BackResolutionEvidence,
+        source: CoreFrozenHistorySourceProjection,
+        host: HostVersion,
+        top_slot: RouteSlotId,
+        logical_roots: Vec<RouteFrameVersion>,
+    },
+    Cleanup(CoreBackNoTargetAuthorityCleanupProjection),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HostAdmissionUnavailableOwnerInventoryProjection {
+    pending_host_admission: Option<CorePendingHostAdmissionProjection>,
+    history_admission_world: Option<CoreIssuedWorldSealProjection>,
+    queued_requests: Vec<NavigationRequestId>,
+    current: Option<HostAdmissionUnavailableCurrentOwnerProjection>,
+    action: Option<HostAdmissionUnavailableActionOwnerProjection>,
+    pending_no_target_back: Option<NavigationRequestId>,
+    current_history_capability: Option<HistoryExecutionBindingProjection>,
+    pending_history_preparation_error:
+        Option<HostAdmissionUnavailableHistoryPreparationOwnerProjection>,
+    prepared_publication_authority: Option<HostAdmissionUnavailablePublicationOwnerProjection>,
+    pending_back_no_target_authority:
+        Option<HostAdmissionUnavailableBackNoTargetAuthorityOwnerProjection>,
+    pending_back_target_permanent_cleanup: Option<CoreBackTargetPermanentCleanupProjection>,
+    pending_post_commit_terminal: Option<CorePreparedPostCommitTerminalSourceProjection>,
+    pending_post_commit_settlement_trace: Option<CorePostCommitSettlementTraceProjection>,
+    live_failed_authority_trigger_revision: Option<u64>,
+    mount_issuer: MountIssuerRequestProjection,
+}
+
+impl HostAdmissionUnavailableOwnerInventoryProjection {
+    fn is_observed_unavailable_idle(&self) -> bool {
+        self.pending_host_admission.is_none()
+            && self.queued_requests.is_empty()
+            && self.current.is_none()
+            && self.action.is_none()
+            && self.pending_no_target_back.is_none()
+            && self.current_history_capability.is_none()
+            && self.pending_history_preparation_error.is_none()
+            && self.prepared_publication_authority.is_none()
+            && self.pending_back_no_target_authority.is_none()
+            && self.pending_back_target_permanent_cleanup.is_none()
+            && self.pending_post_commit_terminal.is_none()
+            && self.pending_post_commit_settlement_trace.is_none()
+            && self.live_failed_authority_trigger_revision.is_none()
+            && !self.mount_issuer.has_outstanding()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5341,9 +5435,11 @@ pub(crate) fn freeze_host_admission_operation_failure(
     })
 }
 
-pub(crate) fn bind_host_admission_unavailable_cause<Evidence>(
+fn bind_host_admission_unavailable_cause_with_issuer<Evidence>(
     source: HostAdmissionSourceProjection,
     projection: &HostAdmissionUnavailableEvidenceProjection,
+    expected_issuer: HostAdmissionIssuerProjection,
+    expected_owner_inventory: HostAdmissionUnavailableOwnerInventoryProjection,
     evidence: Evidence,
 ) -> HostAdmissionUnavailableCauseBindOutcome<Evidence> {
     let operation_exact = match &projection.operation_failure {
@@ -5458,6 +5554,8 @@ pub(crate) fn bind_host_admission_unavailable_cause<Evidence>(
             evidence: projection.clone(),
             disposition,
             cause_digest,
+            expected_issuer: Box::new(expected_issuer),
+            expected_owner_inventory: Box::new(expected_owner_inventory),
         },
         evidence,
     })
@@ -5555,6 +5653,22 @@ impl RouterEngine {
             #[cfg(test)]
             testing_back_target_source_drift_before_freeze_once: false,
         })
+    }
+
+    pub(crate) fn bind_host_admission_unavailable_cause<Evidence>(
+        &self,
+        issuer: &HostAdmissionIssuer,
+        source: HostAdmissionSourceProjection,
+        projection: &HostAdmissionUnavailableEvidenceProjection,
+        evidence: Evidence,
+    ) -> HostAdmissionUnavailableCauseBindOutcome<Evidence> {
+        bind_host_admission_unavailable_cause_with_issuer(
+            source,
+            projection,
+            issuer.projection(),
+            self.observed_unavailable_owner_inventory(),
+            evidence,
+        )
     }
 
     pub(crate) fn request_legacy_host_admission(
@@ -5936,24 +6050,123 @@ impl RouterEngine {
         }
     }
 
-    fn observed_unavailable_internal_owner_count(&self) -> usize {
-        usize::from(self.current_history_capability.is_some())
-            + usize::from(self.pending_history_preparation_error.is_some())
-            + usize::from(self.prepared_publication_authority.is_some())
-            + usize::from(self.pending_no_target_back.is_some())
-            + usize::from(self.pending_back_no_target_authority.is_some())
-            + usize::from(self.pending_back_target_permanent_cleanup.is_some())
-            + usize::from(self.pending_post_commit_terminal.is_some())
-            + usize::from(self.pending_post_commit_settlement_trace.is_some())
-            + usize::from(self.live_failed_authority_trigger_revision.is_some())
-            + self.queue.len()
+    fn observed_unavailable_owner_inventory(
+        &self,
+    ) -> HostAdmissionUnavailableOwnerInventoryProjection {
+        let action = self.action.as_ref().map(|action| match action {
+            EngineAction::FrameTask(task) => {
+                HostAdmissionUnavailableActionOwnerProjection::FrameTask(task.identity.clone())
+            }
+            EngineAction::MountRequest(request) => {
+                HostAdmissionUnavailableActionOwnerProjection::MountRequest {
+                    request: request.request,
+                    parent: request.parent.clone(),
+                    outlet: request.outlet.clone(),
+                }
+            }
+            EngineAction::FailureCleanup(request) => {
+                HostAdmissionUnavailableActionOwnerProjection::FailureCleanup(request.request())
+            }
+            EngineAction::Commit(ticket) => {
+                HostAdmissionUnavailableActionOwnerProjection::Commit(ticket.identity.clone())
+            }
+            EngineAction::BackResolution(_) => {
+                HostAdmissionUnavailableActionOwnerProjection::BackResolution
+            }
+        });
+        let pending_history_preparation_error = self
+            .pending_history_preparation_error
+            .as_ref()
+            .map(|error| match error {
+                HistoryPreparationError::Source(_) => {
+                    HostAdmissionUnavailableHistoryPreparationOwnerProjection::Source
+                }
+                HistoryPreparationError::Binding(_) => {
+                    HostAdmissionUnavailableHistoryPreparationOwnerProjection::Binding
+                }
+            });
+        let prepared_publication_authority =
+            self.prepared_publication_authority
+                .as_ref()
+                .map(|authority| match authority {
+                    PreparedPublicationAuthority::Ready(owner) => {
+                        HostAdmissionUnavailablePublicationOwnerProjection::Ready {
+                            identity: owner.identity.clone(),
+                            evidence: owner.evidence.clone(),
+                        }
+                    }
+                    PreparedPublicationAuthority::Rejected(rejection) => {
+                        HostAdmissionUnavailablePublicationOwnerProjection::Rejected {
+                            identity: rejection.owner.identity.clone(),
+                            evidence: rejection.owner.evidence.clone(),
+                            error: rejection.error,
+                        }
+                    }
+                });
+        let pending_back_no_target_authority =
+            self.pending_back_no_target_authority
+                .as_ref()
+                .map(|pending| match pending {
+                    CorePendingBackNoTargetAuthority::Accepted(accepted) => {
+                        HostAdmissionUnavailableBackNoTargetAuthorityOwnerProjection::Accepted {
+                            receiver: accepted.receiver.clone(),
+                            source: accepted.source.clone(),
+                            host: accepted.host.clone(),
+                            top_slot: accepted.top_slot,
+                            logical_roots: accepted.logical_roots.clone(),
+                        }
+                    }
+                    CorePendingBackNoTargetAuthority::Cleanup(cleanup) => {
+                        HostAdmissionUnavailableBackNoTargetAuthorityOwnerProjection::Cleanup(
+                            cleanup.receiver.clone(),
+                        )
+                    }
+                });
+        HostAdmissionUnavailableOwnerInventoryProjection {
+            pending_host_admission: self
+                .pending_host_admission
+                .as_ref()
+                .map(CorePendingHostAdmission::projection),
+            history_admission_world: self.history_admission_world,
+            queued_requests: self.queue.iter().map(|queued| queued.request).collect(),
+            current: self.current.as_ref().map(|current| {
+                HostAdmissionUnavailableCurrentOwnerProjection {
+                    identity: current.identity.clone(),
+                    stage: current.stage.projection(),
+                }
+            }),
+            action,
+            pending_no_target_back: self
+                .pending_no_target_back
+                .as_ref()
+                .map(|pending| pending.request),
+            current_history_capability: self
+                .current_history_capability
+                .as_ref()
+                .map(HistoryCommitCapability::execution_projection),
+            pending_history_preparation_error,
+            prepared_publication_authority,
+            pending_back_no_target_authority,
+            pending_back_target_permanent_cleanup: self
+                .pending_back_target_permanent_cleanup
+                .as_ref()
+                .map(|cleanup| cleanup.receiver.clone()),
+            pending_post_commit_terminal: self
+                .pending_post_commit_terminal
+                .as_ref()
+                .map(CorePreparedPostCommitTerminalSourceProjection::from),
+            pending_post_commit_settlement_trace: self.pending_post_commit_settlement_trace.clone(),
+            live_failed_authority_trigger_revision: self.live_failed_authority_trigger_revision,
+            mount_issuer: self.mount.projection(),
+        }
     }
 
     fn observed_unavailable_receiver_mismatch(
         &self,
         issuer: &HostAdmissionIssuer,
-        expected_source: &HostAdmissionSourceProjection,
+        cause: &HostAdmissionUnavailableCause,
     ) -> HostAdmissionUnavailableObservedMismatchProjection {
+        let expected_source = &cause.source;
         HostAdmissionUnavailableObservedMismatchProjection {
             expected_source: expected_source.clone(),
             observed_source: self.host_admission_source.clone(),
@@ -5976,7 +6189,9 @@ impl RouterEngine {
                 .as_ref()
                 .map(|current| current.stage.projection()),
             observed_action_present: self.action.is_some(),
-            observed_internal_owner_count: self.observed_unavailable_internal_owner_count(),
+            expected_owner_inventory: cause.expected_owner_inventory.as_ref().clone(),
+            observed_owner_inventory: self.observed_unavailable_owner_inventory(),
+            expected_issuer: cause.expected_issuer.as_ref().clone(),
             observed_issuer: issuer.projection(),
         }
     }
@@ -5984,8 +6199,9 @@ impl RouterEngine {
     fn observed_unavailable_receiver_is_exact(
         &self,
         issuer: &HostAdmissionIssuer,
-        expected_source: &HostAdmissionSourceProjection,
+        cause: &HostAdmissionUnavailableCause,
     ) -> bool {
+        let expected_source = &cause.source;
         let expected_availability = match expected_source.kind {
             HostAdmissionSourceKind::InitialAwaiting => RouterAvailability::AwaitingHost,
             _ => {
@@ -5996,7 +6212,6 @@ impl RouterEngine {
             }
         };
         let expected_source_open = expected_source.kind == HostAdmissionSourceKind::InitialAwaiting;
-        let issuer = issuer.projection();
         self.host_admission_source == *expected_source
             && self.host_admission_source_open == expected_source_open
             && self.pending_host_admission.is_none()
@@ -6005,11 +6220,12 @@ impl RouterEngine {
             && self.state.top_slot().is_none()
             && self.state.active() == &ActivePresentation::none()
             && self.state.current_request().is_none()
-            && self.current.is_none()
-            && self.action.is_none()
-            && self.observed_unavailable_internal_owner_count() == 0
-            && issuer.outstanding.is_none()
-            && issuer.current.is_none()
+            && cause
+                .expected_owner_inventory
+                .is_observed_unavailable_idle()
+            && &self.observed_unavailable_owner_inventory()
+                == cause.expected_owner_inventory.as_ref()
+            && &issuer.projection() == cause.expected_issuer.as_ref()
     }
 
     fn prepare_host_admission_unavailable_publication(
@@ -6327,9 +6543,9 @@ impl RouterEngine {
         Clear: FnOnce(),
     {
         let expected_source = prepared.core.source.clone();
-        if !self.observed_unavailable_receiver_is_exact(issuer, &expected_source) {
+        if !self.observed_unavailable_receiver_is_exact(issuer, &prepared.core) {
             let evidence = HostAdmissionUnavailableFailureEvidence::ObservedReceiver(Box::new(
-                self.observed_unavailable_receiver_mismatch(issuer, &expected_source),
+                self.observed_unavailable_receiver_mismatch(issuer, &prepared.core),
             ));
             return HostAdmissionUnavailableObservedOutcome::Mismatch { prepared, evidence };
         }
@@ -11453,11 +11669,16 @@ impl RouterEngine {
                             "child mount request issuer rejected internal identity"
                         }
                     };
+                    let (failure, failure_continuation) = self
+                        .reserve_frozen_failure_recovery_attempt(
+                            NavigationFailure::new(NavigationFailureKind::Mount, message),
+                            failure_continuation,
+                        );
                     let failure = FailureCleanupRequest::new(
                         current.identity.clone(),
                         PendingFailureKind::MountIssue,
                         current.applied_frames.iter().rev().cloned().collect(),
-                        NavigationFailure::new(NavigationFailureKind::Mount, message),
+                        failure,
                         failure_continuation,
                     );
                     current.pending_mount = None;
@@ -15494,10 +15715,16 @@ impl RouterEngine {
             };
             self.frozen_failure_recovery_continuation_for(current, failure_branch_index)
         };
+        self.reserve_frozen_failure_recovery_attempt(failure, continuation)
+    }
+
+    fn reserve_frozen_failure_recovery_attempt(
+        &mut self,
+        failure: NavigationFailure,
+        continuation: FailureCleanupContinuationOwner,
+    ) -> (NavigationFailure, FailureCleanupContinuationOwner) {
         match continuation {
-            FailureCleanupContinuationOwner::BeginBoundError(mut recovery)
-                if !recovery.prepared_prefix.is_empty() =>
-            {
+            FailureCleanupContinuationOwner::BeginBoundError(mut recovery) => {
                 let reserved = match self.ids.reserve_attempt_with_evidence() {
                     Ok(reserved) => reserved,
                     Err(exhaustion) => {
@@ -16160,23 +16387,21 @@ impl RouterEngine {
                 NavigationTraceEventKind::HistoryIntentRejected,
             ))
             .expect("running trace is open");
-        let reserved = match recovery.reserved_attempt.take() {
-            Some(reserved) => reserved,
-            None => match self.ids.reserve_attempt() {
-                Ok(reserved) => reserved,
-                Err(_) => {
-                    self.fail_bound_error_before_issue(
-                        request,
-                        &prepared_prefix,
-                        None,
-                        NavigationFailure::new(
-                            NavigationFailureKind::RecoveryFailed,
-                            "bound error recovery identity reservation exhausted",
-                        ),
-                    );
-                    return BoundErrorBeginDisposition::Cleanup;
-                }
-            },
+        let Some(reserved) = recovery.reserved_attempt.take() else {
+            debug_assert!(
+                false,
+                "a frozen bound-error continuation must own a pre-reserved attempt"
+            );
+            self.fail_bound_error_before_issue(
+                request,
+                &prepared_prefix,
+                None,
+                NavigationFailure::new(
+                    NavigationFailureKind::RecoveryFailed,
+                    "bound error recovery lost its reserved attempt",
+                ),
+            );
+            return BoundErrorBeginDisposition::Cleanup;
         };
         let host = self
             .state
@@ -22554,6 +22779,8 @@ mod tests {
     }
 
     fn r3_bind_candidate_unavailable<Evidence>(
+        engine: &RouterEngine,
+        issuer: &HostAdmissionIssuer,
         source: &HostAdmissionSourceProjection,
         kind: HostAdmissionUnavailableEvidenceKind,
         candidate_revision: u64,
@@ -22570,7 +22797,12 @@ mod tests {
             exhaustion: None,
             operation_failure: None,
         };
-        match bind_host_admission_unavailable_cause(source.clone(), &projection, evidence) {
+        match engine.bind_host_admission_unavailable_cause(
+            issuer,
+            source.clone(),
+            &projection,
+            evidence,
+        ) {
             HostAdmissionUnavailableCauseBindOutcome::Bound(prepared) => prepared,
             HostAdmissionUnavailableCauseBindOutcome::Mismatch { .. } => {
                 panic!("the exact candidate evidence must bind to its source")
@@ -22609,6 +22841,8 @@ mod tests {
         let token = r3_source_bound_token(engine, issuer);
         let source = token.permit.source.clone();
         let prepared = r3_bind_candidate_unavailable(
+            engine,
+            issuer,
             &source,
             HostAdmissionUnavailableEvidenceKind::Conflict,
             7,
@@ -22634,6 +22868,8 @@ mod tests {
         let permit = r3_initial_host_admission_permit(&mut engine);
         let initial_source = permit.source.clone();
         let prepared = r3_bind_candidate_unavailable(
+            &engine,
+            &issuer,
             &initial_source,
             HostAdmissionUnavailableEvidenceKind::Conflict,
             1,
@@ -22676,6 +22912,8 @@ mod tests {
             }
         };
         let changed = r3_bind_candidate_unavailable(
+            &engine,
+            &issuer,
             &unavailable_source,
             HostAdmissionUnavailableEvidenceKind::Conflict,
             2,
@@ -22730,7 +22968,8 @@ mod tests {
             }),
             operation_failure: None,
         };
-        let permanent_prepared = match bind_host_admission_unavailable_cause(
+        let permanent_prepared = match permanent_engine.bind_host_admission_unavailable_cause(
+            &permanent_issuer,
             permanent_source,
             &permanent_projection,
             Box::new(3_u64),
@@ -22775,6 +23014,55 @@ mod tests {
     }
 
     #[test]
+    fn observed_host_unavailable_refreeze_rejects_idle_issuer_counter_drift() {
+        let mut engine = RouterEngine::install(
+            tree(),
+            RouteViewKey::new("observed-unavailable-issuer-drift-fallback").unwrap(),
+        )
+        .unwrap();
+        let source = engine.testing_host_admission_source_projection();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
+        let prepared = r3_bind_candidate_unavailable(
+            &engine,
+            &issuer,
+            &source,
+            HostAdmissionUnavailableEvidenceKind::Conflict,
+            2,
+            0x1111,
+            0x2222,
+            Box::new(0x1D1E_u64),
+        );
+        let expected_issuer = issuer.projection();
+        let token = issuer.issue(engine.router).unwrap();
+        issuer.cancel(&token).unwrap();
+        let observed_issuer = issuer.projection();
+        assert!(observed_issuer.outstanding.is_none());
+        assert!(observed_issuer.current.is_none());
+        assert_ne!(observed_issuer, expected_issuer);
+
+        let clear_calls = std::cell::Cell::new(0usize);
+        let outcome =
+            engine.complete_observed_host_admission_unavailable(&issuer, prepared, || {
+                clear_calls.set(clear_calls.get() + 1)
+            });
+        let HostAdmissionUnavailableObservedOutcome::Mismatch { prepared, evidence } = outcome
+        else {
+            panic!("idle issuer counter drift must reject final unavailable publication")
+        };
+        let HostAdmissionUnavailableFailureEvidence::ObservedReceiver(mismatch) = evidence else {
+            panic!("issuer drift must retain the full observed mismatch")
+        };
+        assert_eq!(mismatch.expected_issuer, expected_issuer);
+        assert_eq!(mismatch.observed_issuer, observed_issuer);
+        assert_eq!(
+            mismatch.expected_owner_inventory,
+            mismatch.observed_owner_inventory
+        );
+        assert_eq!(*prepared.evidence, 0x1D1E_u64);
+        assert_eq!(clear_calls.get(), 0);
+    }
+
+    #[test]
     fn observed_host_unavailable_final_refreeze_rejects_ready_active_running_authority() {
         let mut engine = RouterEngine::install(
             tree(),
@@ -22782,7 +23070,10 @@ mod tests {
         )
         .unwrap();
         let initial_source = engine.testing_host_admission_source_projection();
+        let mut issuer = HostAdmissionIssuer::new().unwrap();
         let stale_prepared = r3_bind_candidate_unavailable(
+            &engine,
+            &issuer,
             &initial_source,
             HostAdmissionUnavailableEvidenceKind::Conflict,
             2,
@@ -22791,7 +23082,6 @@ mod tests {
             Box::new(0xC0DE_u64),
         );
 
-        let mut issuer = HostAdmissionIssuer::new().unwrap();
         let grant = r3_source_bound_grant(&mut engine, &mut issuer);
         let owner = bind_granted_host_admission_source(grant, ());
         let prepared = match engine.prepare_host_confirmation(owner) {
@@ -22839,8 +23129,16 @@ mod tests {
         assert!(mismatch.observed_current_identity.is_some());
         assert!(mismatch.observed_current_stage.is_some());
         assert!(mismatch.observed_action_present);
-        assert!(mismatch.observed_internal_owner_count > 0);
+        assert_ne!(
+            mismatch.observed_owner_inventory,
+            mismatch.expected_owner_inventory
+        );
+        assert_eq!(
+            &mismatch.expected_issuer,
+            prepared.core.expected_issuer.as_ref()
+        );
         assert!(mismatch.observed_issuer.current.is_some());
+        assert_ne!(mismatch.observed_issuer, mismatch.expected_issuer);
         assert_eq!(clear_calls.get(), 0);
         assert_eq!(engine.snapshot(), engine_before);
         assert_eq!(issuer.projection(), issuer_before);
@@ -22866,14 +23164,19 @@ mod tests {
             operation_failure: None,
         };
         let evidence = Box::new(0xCAFE_u64);
+        let issuer = HostAdmissionIssuer::new().unwrap();
 
-        let prepared =
-            match bind_host_admission_unavailable_cause(source.clone(), &projection, evidence) {
-                HostAdmissionUnavailableCauseBindOutcome::Bound(prepared) => prepared,
-                HostAdmissionUnavailableCauseBindOutcome::Mismatch { .. } => {
-                    panic!("an exact observation must bind")
-                }
-            };
+        let prepared = match engine.bind_host_admission_unavailable_cause(
+            &issuer,
+            source.clone(),
+            &projection,
+            evidence,
+        ) {
+            HostAdmissionUnavailableCauseBindOutcome::Bound(prepared) => prepared,
+            HostAdmissionUnavailableCauseBindOutcome::Mismatch { .. } => {
+                panic!("an exact observation must bind")
+            }
+        };
         assert_eq!(prepared.core.source, source);
         assert_eq!(prepared.core.evidence, projection);
         assert_eq!(
@@ -22884,6 +23187,7 @@ mod tests {
             }
         );
         assert_ne!(prepared.core.cause_digest, 0);
+        assert_eq!(prepared.core.expected_issuer.as_ref(), &issuer.projection());
         assert_eq!(*prepared.evidence, 0xCAFE_u64);
     }
 
@@ -28334,6 +28638,71 @@ mod tests {
             engine.request(request).unwrap().status(),
             RequestStatus::Failed(failure)
                 if failure.kind() == NavigationFailureKind::Apply
+        ));
+    }
+
+    #[test]
+    fn empty_prefix_bound_error_attempt_identity_exhaustion_retains_terminal_evidence() {
+        let counter = ReservationCounter::Transaction;
+        let boundary = ErrorBoundaryKey::named("root-boundary").unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/items/:id").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(RouteViewKey::new("root-view").unwrap())
+                    .with_error_view(boundary, RouteViewKey::new("root-error-view").unwrap()),
+            )
+            .unwrap();
+        let mut engine = ready_engine_with_tree(routes.build().unwrap());
+        let request = engine.push(RouteLocation::new("/items/1")).unwrap();
+        let next = engine.enqueue_push(RouteLocation::new("/items/2")).unwrap();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("the matched root route must issue one frame task")
+        };
+        engine.testing_exhaust_reservation_counter(counter);
+        let failure = engine
+            .begin_view_report(task.identity())
+            .unwrap()
+            .failed(NavigationFailure::new(
+                NavigationFailureKind::Apply,
+                "root output failed before bound-error recovery",
+            ))
+            .expect("the failed root output enters canonical cleanup");
+
+        let FailureCleanupRecoveryTargetProjection::BoundErrorIdentityExhausted(projection) =
+            &failure.receiver.recovery
+        else {
+            panic!("empty-prefix recovery must retain typed identity exhaustion evidence")
+        };
+        assert!(projection.prepared_prefix.is_empty());
+        assert_eq!(
+            projection.original_failure.kind(),
+            NavigationFailureKind::Apply
+        );
+        assert_eq!(
+            projection.terminal_failure.kind(),
+            NavigationFailureKind::RecoveryFailed
+        );
+        assert_eq!(projection.exhaustion.counter, counter);
+        assert_eq!(projection.exhaustion.current, u64::MAX);
+        assert_eq!(projection.exhaustion.attempted, u64::MAX);
+        assert_eq!(
+            engine.request(next).unwrap().status(),
+            &RequestStatus::Queued
+        );
+
+        let obligation_count = failure.logical_roots().len();
+        let cleanup = prepare_failure_cleanup(&mut engine, failure, 0xa29, obligation_count);
+        engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::RecoveryFailed
+        ));
+        assert!(matches!(
+            engine.request(next).unwrap().status(),
+            RequestStatus::Running(_)
         ));
     }
 

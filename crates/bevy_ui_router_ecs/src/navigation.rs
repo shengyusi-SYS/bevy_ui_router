@@ -7368,7 +7368,10 @@ fn complete_observed_r3_unavailable(
 ) -> bool {
     let projection = r3_unavailable_projection(&source, &evidence, expected_observation_digest);
     entry.host_admission_operation_counts.0 += 1;
-    match r3_core::bind_host_admission_unavailable_cause(source, &projection, evidence) {
+    match entry
+        .engine
+        .bind_host_admission_unavailable_cause(source, &projection, evidence)
+    {
         r3_core::HostAdmissionUnavailableCauseBindOutcome::Bound(prepared) => {
             match entry
                 .engine
@@ -7454,7 +7457,10 @@ fn complete_pre_staging_r3_unavailable(
     let projection = r3_unavailable_projection(&core_source, &evidence, None);
     entry.host_admission_operation_counts.0 += 1;
     let prepared =
-        match r3_core::bind_host_admission_unavailable_cause(core_source, &projection, evidence) {
+        match entry
+            .engine
+            .bind_host_admission_unavailable_cause(core_source, &projection, evidence)
+        {
             r3_core::HostAdmissionUnavailableCauseBindOutcome::Bound(prepared) => prepared,
             r3_core::HostAdmissionUnavailableCauseBindOutcome::Mismatch {
                 evidence,
@@ -7637,7 +7643,10 @@ fn complete_granted_candidate_unavailable(
     let projection = r3_unavailable_projection(&source, &evidence, None);
     entry.host_admission_operation_counts.0 += 1;
     let prepared =
-        match r3_core::bind_host_admission_unavailable_cause(source, &projection, evidence) {
+        match entry
+            .engine
+            .bind_host_admission_unavailable_cause(source, &projection, evidence)
+        {
             r3_core::HostAdmissionUnavailableCauseBindOutcome::Bound(prepared) => prepared,
             r3_core::HostAdmissionUnavailableCauseBindOutcome::Mismatch {
                 evidence,
@@ -7896,7 +7905,10 @@ fn retain_r3_provisional_failure(
     let source = grant.source_projection();
     let projection = r3_unavailable_projection(&source, &evidence, None);
     entry.host_admission_operation_counts.0 += 1;
-    match r3_core::bind_host_admission_unavailable_cause(source, &projection, evidence) {
+    match entry
+        .engine
+        .bind_host_admission_unavailable_cause(source, &projection, evidence)
+    {
         r3_core::HostAdmissionUnavailableCauseBindOutcome::Bound(prepared) => {
             entry.pending_host_admission_failure = Some(HostAdmissionFailureHolder::Provisional(
                 ProvisionalHostAdmissionFailure {

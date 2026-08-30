@@ -136,6 +136,12 @@ pub(crate) struct MountIssuerRequestProjection {
     outstanding: Option<OutstandingMount>,
 }
 
+impl MountIssuerRequestProjection {
+    pub(crate) fn has_outstanding(&self) -> bool {
+        self.outstanding.is_some()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MountIssuerContextDisposition {
     Matched,
@@ -209,6 +215,13 @@ impl MountIssuer {
         Self {
             router,
             outstanding: None,
+        }
+    }
+
+    pub(crate) fn projection(&self) -> MountIssuerRequestProjection {
+        MountIssuerRequestProjection {
+            router: self.router,
+            outstanding: self.outstanding.clone(),
         }
     }
 
@@ -407,10 +420,7 @@ impl MountIssuer {
         token: &MountRequestToken,
     ) -> MountRequestReceiverInspection {
         let expected = token.receiver_projection();
-        let observed = MountIssuerRequestProjection {
-            router: self.router,
-            outstanding: self.outstanding.clone(),
-        };
+        let observed = self.projection();
         let disposition = if expected.supplied_binding != expected.canonical_binding
             || !identity_is_coherent(&expected.identity)
         {

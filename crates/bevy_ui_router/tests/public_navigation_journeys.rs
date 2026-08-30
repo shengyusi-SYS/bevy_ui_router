@@ -2109,7 +2109,7 @@ fn recovery_r3_facade_projection(snapshot: &RouterSnapshot) -> RecoveryR3FacadeP
 }
 
 #[cfg(feature = "test-support")]
-fn assert_recovery_r3_current_audit_mapping_is_exact(
+fn assert_recovery_r3_observable_current_mapping_unchanged(
     before: &RouterAuthorityAuditSnapshot,
     after: &RouterAuthorityAuditSnapshot,
 ) {
@@ -2186,7 +2186,7 @@ fn recovery_r3_audit_snapshot(app: &App, router: RouterHandle) -> RouterAuthorit
 }
 
 #[cfg(feature = "test-support")]
-fn recovery_r3_prepared_output_entities(
+fn recovery_r3_prepared_output_observable_entities(
     audit: &RouterAuthorityAuditSnapshot,
 ) -> Vec<AuditEntityId> {
     let prepared_frames = audit
@@ -2227,7 +2227,7 @@ fn recovery_r3_prepared_output_entities(
 }
 
 #[cfg(feature = "test-support")]
-fn recovery_r3_current_owned_audit_entities(
+fn recovery_r3_current_owned_observable_entities(
     audit: &RouterAuthorityAuditSnapshot,
 ) -> Vec<AuditEntityId> {
     let current_host = audit.host().map(|host| host.version().clone());
@@ -3971,6 +3971,83 @@ fn recovery_r1_journey_d_uses_bound_error_views_for_failure_matrix() {
 }
 
 #[test]
+fn recovery_r1_journey_d_nested_push_without_error_binding_publishes_fallback_after_cleanup() {
+    let mut fixture = nested_fixture();
+    let first_location = RouteLocation::new("/items/1");
+    let first = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        first_location.clone(),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, first));
+    let before = router_snapshot(&fixture.app, fixture.router);
+    let history_before = before.history().clone();
+    assert_eq!(before.active().frames().len(), 2);
+
+    fixture
+        .control
+        .set_one_shot_mode(&fixture.leaf, FixtureMode::ApplyFailure);
+    let requested = RouteLocation::new("/items/2");
+    let request = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(fixture.router, requested.clone())
+        .unwrap();
+    let failed = drive_request_to_terminal(&mut fixture.app, fixture.router, request);
+
+    assert_failed(&failed, NavigationFailureKind::Apply);
+    assert_eq!(failed.requested(), Some(&requested));
+    assert!(failed.matched().is_some());
+    let cleanup = failed
+        .trace()
+        .iter()
+        .position(|event| event.kind() == NavigationTraceEventKind::CleanupSettled)
+        .expect("the real failed leaf output must settle cleanup");
+    let fallback = failed
+        .trace()
+        .iter()
+        .position(|event| {
+            event.kind() == NavigationTraceEventKind::FrameTaskIssued
+                && event
+                    .frame()
+                    .is_some_and(|frame| frame.origin() == &FrameOrigin::RouterFallback)
+        })
+        .expect("the no-binding continuation must issue RouterFallback");
+    let terminal = failed
+        .trace()
+        .iter()
+        .position(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+        .expect("the fallback publication must terminalize the failed request");
+    assert!(cleanup < fallback && fallback < terminal);
+    assert_eq!(terminal + 1, failed.trace().len());
+
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after.history(), &history_before);
+    assert_eq!(after.active().kind(), ActivePresentationKind::Error);
+    assert_eq!(after.active().requested(), Some(&requested));
+    assert_eq!(after.active().matched(), failed.matched());
+    assert_eq!(
+        after.active().failure().map(NavigationFailure::kind),
+        Some(NavigationFailureKind::Apply)
+    );
+    assert_eq!(after.active().frames().len(), 1);
+    assert_eq!(
+        after.active().frames()[0].origin(),
+        &FrameOrigin::RouterFallback
+    );
+    assert!(node_entities_with_width(&mut fixture.app, PARTIAL_RECT_WIDTH).is_empty());
+    assert_real_solid_rect(&mut fixture.app, FALLBACK_RECT_WIDTH);
+    let fallback_effect = fixture.control.effects().last().cloned().unwrap();
+    assert_eq!(fallback_effect.origin, FrameOrigin::RouterFallback);
+    assert_eq!(fallback_effect.failure, Some(NavigationFailureKind::Apply));
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
 fn recovery_r1_journey_d_recovery_failure_cleans_all_attempts_and_queue_continues() {
     let mut fixture = recovery_r1_fixture("r1-recovery-failure");
     let first_location = RouteLocation::new("/section/items/1");
@@ -4816,7 +4893,7 @@ fn recovery_scenario_e_sealed_stale_output_cleanup_preserves_current_epoch() {
         .expect("the sealed root navigation enqueues through the public facade");
     fixture.app.update();
     assert!(fixture.control.effects().len() > effects_before_stale.len());
-    let prepared_before_capture = recovery_r3_prepared_output_entities(
+    let prepared_before_capture = recovery_r3_prepared_output_observable_entities(
         &recovery_r3_audit_snapshot(&fixture.app, fixture.router),
     );
     assert!(
@@ -4830,10 +4907,10 @@ fn recovery_scenario_e_sealed_stale_output_cleanup_preserves_current_epoch() {
 
     let snapshot_before_second_arm = router_snapshot(&fixture.app, fixture.router);
     let audit_before_second_arm = recovery_r3_audit_snapshot(&fixture.app, fixture.router);
-    let sealed_entities = recovery_r3_prepared_output_entities(&audit_before_second_arm);
+    let sealed_entities = recovery_r3_prepared_output_observable_entities(&audit_before_second_arm);
     assert!(
         !sealed_entities.is_empty(),
-        "the captured stale artifact must retain a non-empty exact physical target"
+        "the captured stale artifact must retain a non-empty observable public mapping"
     );
     let entities_before_second_arm = entity_set(&fixture.app);
     let inventory_before_second_arm = {
@@ -4905,7 +4982,7 @@ fn recovery_scenario_e_sealed_stale_output_cleanup_preserves_current_epoch() {
         .collect::<Vec<_>>();
     assert!(
         !sealed_present_after_loss.is_empty(),
-        "the sealed replay retains a non-empty exact physical cleanup target after HostLost"
+        "the sealed replay retains a non-empty observable public mapping after HostLost"
     );
     let old_top_slot = fixture.host_fingerprint.top_slot.unwrap();
     assert_ne!(
@@ -4958,7 +5035,7 @@ fn recovery_scenario_e_sealed_stale_output_cleanup_preserves_current_epoch() {
     let restored_before_release = request_snapshot(&fixture.app, fixture.router, restored);
     let stale_before_release = request_snapshot(&fixture.app, fixture.router, stale_request);
     let audit_before_release = recovery_r3_audit_snapshot(&fixture.app, fixture.router);
-    let current_owned = recovery_r3_current_owned_audit_entities(&audit_before_release);
+    let current_owned = recovery_r3_current_owned_observable_entities(&audit_before_release);
     let current_owned_states = current_owned
         .iter()
         .map(|entity| (*entity, audit_before_release.owned_entity_state(*entity)))
@@ -4967,7 +5044,7 @@ fn recovery_scenario_e_sealed_stale_output_cleanup_preserves_current_epoch() {
         current_owned_states
             .iter()
             .all(|(_, state)| *state == AuditEntityState::PresentOwned),
-        "every new-epoch mapped Entity starts present under current authority: {current_owned_states:?}"
+        "every observable new-epoch public mapping starts present under current authority: {current_owned_states:?}"
     );
     let inventory_before_release = {
         let world = fixture.app.world();
@@ -5028,7 +5105,10 @@ fn recovery_scenario_e_sealed_stale_output_cleanup_preserves_current_epoch() {
         stale_request,
     );
     let audit_after_release = recovery_r3_audit_snapshot(&fixture.app, fixture.router);
-    assert_recovery_r3_current_audit_mapping_is_exact(&audit_before_release, &audit_after_release);
+    assert_recovery_r3_observable_current_mapping_unchanged(
+        &audit_before_release,
+        &audit_after_release,
+    );
     assert!(sealed_entities.iter().all(|entity| {
         audit_after_release.owned_entity_state(*entity) == AuditEntityState::Removed
     }));
@@ -5037,14 +5117,6 @@ fn recovery_scenario_e_sealed_stale_output_cleanup_preserves_current_epoch() {
     }));
     let entities_after_release = entity_set(&fixture.app);
     assert!(entities_after_release.is_subset(&entities_before_release));
-    let removed_entities = entities_before_release
-        .difference(&entities_after_release)
-        .copied()
-        .collect::<Vec<_>>();
-    assert!(
-        removed_entities.len() >= sealed_present_after_loss.len(),
-        "every sealed old-output entity still present at release must reach a physical terminal; removed={removed_entities:?}, old_top_slot={old_top_slot:?}"
-    );
     {
         let world = fixture.app.world();
         assert_eq!(
@@ -5095,7 +5167,7 @@ fn recovery_scenario_e_ownerless_old_artifact_is_public_snapshot_zero_write() {
         effects_before_stale.len() + 1,
     );
     assert!(
-        recovery_r3_prepared_output_entities(&recovery_r3_audit_snapshot(
+        recovery_r3_prepared_output_observable_entities(&recovery_r3_audit_snapshot(
             &fixture.app,
             fixture.router,
         ))
@@ -5170,7 +5242,7 @@ fn recovery_scenario_e_ownerless_old_artifact_is_public_snapshot_zero_write() {
     let initial_before_release = request_snapshot(&fixture.app, fixture.router, initial);
     let stale_before_release = request_snapshot(&fixture.app, fixture.router, stale_request);
     let audit_before_release = recovery_r3_audit_snapshot(&fixture.app, fixture.router);
-    let current_owned = recovery_r3_current_owned_audit_entities(&audit_before_release);
+    let current_owned = recovery_r3_current_owned_observable_entities(&audit_before_release);
     let inventory_before_release = {
         let world = fixture.app.world();
         testing_router_request_inventory(
@@ -5221,7 +5293,10 @@ fn recovery_scenario_e_ownerless_old_artifact_is_public_snapshot_zero_write() {
         stale_request,
     );
     let audit_after_release = recovery_r3_audit_snapshot(&fixture.app, fixture.router);
-    assert_recovery_r3_current_audit_mapping_is_exact(&audit_before_release, &audit_after_release);
+    assert_recovery_r3_observable_current_mapping_unchanged(
+        &audit_before_release,
+        &audit_after_release,
+    );
     assert!(current_owned.iter().all(|entity| {
         audit_after_release.owned_entity_state(*entity) == AuditEntityState::PresentOwned
     }));

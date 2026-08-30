@@ -1283,33 +1283,6 @@ pub enum HostAdmissionUnavailableCauseBindOutcome<Evidence> {
     },
 }
 
-pub fn bind_host_admission_unavailable_cause<Evidence>(
-    source: HostAdmissionSourceProjection,
-    projection: &HostAdmissionUnavailableEvidenceProjection,
-    evidence: Evidence,
-) -> HostAdmissionUnavailableCauseBindOutcome<Evidence> {
-    match crate::engine::bind_host_admission_unavailable_cause(
-        source.inner,
-        &projection.inner,
-        evidence,
-    ) {
-        CoreHostAdmissionUnavailableCauseBindOutcome::Bound(prepared) => {
-            HostAdmissionUnavailableCauseBindOutcome::Bound(prepared.into())
-        }
-        CoreHostAdmissionUnavailableCauseBindOutcome::Mismatch {
-            source,
-            evidence,
-            projection,
-            mismatch,
-        } => HostAdmissionUnavailableCauseBindOutcome::Mismatch {
-            source: HostAdmissionSourceProjection { inner: source },
-            evidence,
-            projection: HostAdmissionUnavailableEvidenceProjection { inner: projection },
-            mismatch: HostAdmissionSourceIneligibleProjection { inner: mismatch },
-        },
-    }
-}
-
 pub struct HostAdmissionUnavailablePreStagingSource<Installation, Evidence> {
     pub prepared: PreparedHostAdmissionUnavailableCause<Evidence>,
     pub owner: HostAdmissionUnavailablePreStagingOwner,
@@ -5783,6 +5756,36 @@ impl RouterEngine {
             #[cfg(feature = "test-support")]
             back_capacity_core_producer: None,
         })
+    }
+
+    #[doc(hidden)]
+    pub fn bind_host_admission_unavailable_cause<Evidence>(
+        &self,
+        source: HostAdmissionSourceProjection,
+        projection: &HostAdmissionUnavailableEvidenceProjection,
+        evidence: Evidence,
+    ) -> HostAdmissionUnavailableCauseBindOutcome<Evidence> {
+        match self.inner.bind_host_admission_unavailable_cause(
+            &self.admission,
+            source.inner,
+            &projection.inner,
+            evidence,
+        ) {
+            CoreHostAdmissionUnavailableCauseBindOutcome::Bound(prepared) => {
+                HostAdmissionUnavailableCauseBindOutcome::Bound(prepared.into())
+            }
+            CoreHostAdmissionUnavailableCauseBindOutcome::Mismatch {
+                source,
+                evidence,
+                projection,
+                mismatch,
+            } => HostAdmissionUnavailableCauseBindOutcome::Mismatch {
+                source: HostAdmissionSourceProjection { inner: source },
+                evidence,
+                projection: HostAdmissionUnavailableEvidenceProjection { inner: projection },
+                mismatch: HostAdmissionSourceIneligibleProjection { inner: mismatch },
+            },
+        }
     }
 
     #[doc(hidden)]
@@ -14897,7 +14900,24 @@ mod tests {
         let request = failure.request();
         assert!(failure.logical_roots().is_empty());
         assert_eq!(failure.failure().kind(), NavigationFailureKind::Mount);
-        assert_eq!(engine.inner.testing_id_allocator_snapshot(), ids_before);
+        let ids_after = engine.inner.testing_id_allocator_snapshot();
+        assert_eq!(
+            ids_after.next_transaction(),
+            ids_before.next_transaction() + 1
+        );
+        assert_eq!(
+            ids_after.next_frame_task(),
+            ids_before.next_frame_task() + 1
+        );
+        assert_eq!(ids_after.next_frame(), ids_before.next_frame() + 1);
+        assert_eq!(
+            ids_after.next_cleanup_batch(),
+            ids_before.next_cleanup_batch() + 1
+        );
+        assert_eq!(
+            ids_after.next_mount_sequence(),
+            ids_before.next_mount_sequence()
+        );
         assert_eq!(engine.inner.testing_mount_issuer_snapshot(), mount_before);
         assert_eq!(engine.active(), &active_before);
         assert_eq!(engine.snapshot().history(), &history_before);
