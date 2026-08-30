@@ -173,91 +173,12 @@ fn back_capacity_reclaimed_cell_advances_generation_and_rejects_aba() {
     assert_eq!(issuer.semantic_snapshot_for_test().outstanding_count(), 0);
 }
 
-fn prepared_installed_back_zero_completion(
-    initial_generation: u64,
-) -> (
-    BackCapacityIssuer,
-    PreparedBackNoTargetZeroCompletion,
-    (u64, usize, u64, u64),
-) {
-    let mut domains = BackCapacityDomainIssuer::new();
-    let mut issuer = domains.issue().unwrap();
-    issuer.set_next_new_cell_initial_generation_for_test(initial_generation);
-    let capacity = issuer.reserve().unwrap();
-    let identity = capacity.ordinal_identity_for_test();
-    let EcsCleanupCapacityReservation {
-        domain,
-        cell,
-        owner,
-        generation,
-        vacant_ledger,
-    } = capacity;
-    issuer
-        .live
-        .get_mut(&owner)
-        .expect("the reserved owner remains live")
-        .state = BackCapacityLiveState::Leased;
-    issuer.cells[cell.0].state = BackCapacityCellState::Leased { owner };
-    let removed = issuer
-        .live
-        .remove(&owner)
-        .expect("canonical-zero installation consumes the live entry");
-    assert_eq!(removed.domain, domain);
-    assert_eq!(removed.cell, cell);
-    assert_eq!(removed.owner, owner);
-    assert_eq!(removed.generation, generation);
-
-    let ManifestNeutralLedgerStorage {
-        obligations,
-        mount_parents,
-        receipts,
-        ledger_domain,
-    } = vacant_ledger;
-    let ledger = CleanupLedger {
-        batch: None,
-        back_no_target_batch: None,
-        back_no_target_capacity: Some(InstalledBackCapacityLease {
-            domain,
-            cell,
-            owner,
-            generation,
-        }),
-        owner: None,
-        obligations,
-        mount_parents,
-        manifest_digest: canonical_zero_manifest_digest(),
-        receipts,
-        ledger_domain,
-        next_attempt: 1,
-        issued_attempt: None,
-        completion_digest: Some(canonical_empty_completion_digest()),
-        quarantine_event_observed: false,
-        post_settlement_focus: Vec::new(),
-        authority_host_children: None,
-        back_no_target_authority_partition: None,
-        failure_cleanup_partition: None,
-        failure_cleanup_inert: None,
-    };
-    let source = ledger.back_no_target_zero_completion_source_identity();
-    let prepared = PreparedBackNoTargetZeroCompletion {
-        ledger,
-        facts: BackNoTargetZeroCompletionFacts {
-            manifest_digest: canonical_zero_manifest_digest(),
-            obligation_count: 0,
-            completion_digest: canonical_empty_completion_digest(),
-            settled_count: 0,
-        },
-        source,
-    };
-    (issuer, prepared, identity)
-}
-
 #[test]
 fn back_no_target_zero_completion_reclaim_rejection_is_zero_write() {
     let (issuer, prepared, identity) = prepared_installed_back_zero_completion(1);
     let mut domains = BackCapacityDomainIssuer::new();
     let mut foreign = domains.issue().unwrap();
-    foreign.domain = PreparationCapacityDomain(
+    foreign.set_domain_for_test(
         identity
             .0
             .checked_add(1)

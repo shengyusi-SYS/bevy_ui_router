@@ -1237,7 +1237,7 @@ fn compact_static_source(source: &str) -> String {
 #[test]
 fn back_target_callback_tail_is_infallible_and_query_free() {
     let navigation = include_str!("../src/navigation.rs");
-    let cleanup = include_str!("../src/cleanup.rs");
+    let capacity = include_str!("../src/cleanup/capacity.rs");
     let helper_marker = "pub(crate) fn resume_bound_back_target(";
     let receiver = ".resume_back_target_with_retirement(";
 
@@ -1319,11 +1319,11 @@ fn back_target_callback_tail_is_infallible_and_query_free() {
 
     let commit_marker = "pub(crate) fn commit(self)";
     assert_eq!(
-        cleanup.match_indices(commit_marker).count(),
+        capacity.match_indices(commit_marker).count(),
         1,
         "the exact capacity guard must expose one audited commit implementation"
     );
-    let commit = body_after_marker(cleanup, commit_marker);
+    let commit = body_after_marker(capacity, commit_marker);
     assert!(
         commit.contains("match self.transition"),
         "guard commit must only dispatch its already-prepared operation-specific transition"
@@ -1596,9 +1596,10 @@ fn back_no_target_authority_callbacks_only_publish_prepared_state() {
 #[test]
 fn cleanup_ledger_fault_seams_only_change_real_predicate_inputs() {
     let cleanup = include_str!("../src/cleanup.rs");
-    let back_capacity_impl = cleanup
+    let capacity = include_str!("../src/cleanup/capacity.rs");
+    let back_capacity_impl = capacity
         .split_once("impl BackCapacityIssuer {")
-        .expect("cleanup source retains the BackCapacityIssuer implementation")
+        .expect("capacity source retains the BackCapacityIssuer implementation")
         .1;
     let capacity_reserve = body_after_marker(back_capacity_impl, "pub(crate) fn reserve(");
     let cleanup_ledger_impl = cleanup
@@ -1816,7 +1817,7 @@ fn cleanup_ledger_fault_seams_only_change_real_predicate_inputs() {
 #[test]
 fn back_no_target_completion_callback_tail_is_infallible_and_query_free() {
     let navigation = include_str!("../src/navigation.rs");
-    let cleanup = include_str!("../src/cleanup.rs");
+    let capacity = include_str!("../src/cleanup/capacity.rs");
     let core_engine = include_str!("../../bevy_ui_router_core/src/engine.rs");
     let helper_marker = "fn drive_back_no_target_zero_completion(";
     let receiver = ".complete_back_no_target_cleanup(";
@@ -2004,7 +2005,7 @@ fn back_no_target_completion_callback_tail_is_infallible_and_query_free() {
         );
     }
 
-    let commit = body_after_marker(cleanup, "pub(crate) fn commit(self)");
+    let commit = body_after_marker(capacity, "pub(crate) fn commit(self)");
     let reclaim = match_arm_body_after_marker(
         commit,
         "BackCapacityCommitTransition::InstalledLeaseReclaim",
