@@ -352,7 +352,7 @@ fn validate_recovery_contract_profile(profile: &HistoryContractProfile) {
             (
                 "post-commit compound settlement complete evidence",
                 "R2 Compound settlement",
-                "planned",
+                "active",
                 "Journey G post-commit foreground rows PASS",
             ),
             (
@@ -376,7 +376,7 @@ fn validate_recovery_contract_profile(profile: &HistoryContractProfile) {
             (
                 "post_commit_host_loss_preserves_committed_history",
                 "R2 Compound settlement",
-                "planned",
+                "active",
                 "",
             ),
             (
@@ -394,8 +394,11 @@ fn validate_recovery_contract_profile(profile: &HistoryContractProfile) {
             .filter(|row| row.state == "active")
             .map(|row| row.item.as_str())
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["error_outlet_role_classification_is_preserved"]),
-        "Recovery must activate exactly the completed R1 authority row"
+        BTreeSet::from([
+            "error_outlet_role_classification_is_preserved",
+            "post_commit_host_loss_preserves_committed_history",
+        ]),
+        "Recovery must activate exactly the completed R1 and R2 authority rows"
     );
 }
 
@@ -3646,9 +3649,11 @@ fn inspect_api_risk_meta(
         }
         return;
     }
-    let safe_builtin = ["allow", "cfg", "derive", "doc", "must_use", "path", "test"]
-        .iter()
-        .any(|name| meta.path().is_ident(name));
+    let safe_builtin = [
+        "allow", "cfg", "derive", "doc", "inline", "must_use", "path", "test",
+    ]
+    .iter()
+    .any(|name| meta.path().is_ident(name));
     let safe_helper = meta
         .path()
         .get_ident()

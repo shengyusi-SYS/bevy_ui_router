@@ -64,3 +64,19 @@ pub fn testing_router_request_inventory(
         snapshot_requests,
     }
 }
+
+#[doc(hidden)]
+pub fn testing_remove_host_registration_after_next_commit_seal(
+    navigation: &mut RouterNavigation,
+    router: RouterHandle,
+) -> bool {
+    navigation.testing_remove_host_registration_after_next_commit_seal(router)
+}
+
+#[doc(hidden)]
+pub fn testing_commit_sealed_registration_removal_fired(
+    navigation: &RouterNavigation,
+    router: RouterHandle,
+) -> bool {
+    navigation.testing_commit_sealed_registration_removal_fired(router)
+}

@@ -855,6 +855,11 @@ fn post_commit_cleanup_drift_supersedes_attempt() {
 }
 
 #[test]
+fn post_commit_host_loss_preserves_committed_history() {
+    crate::navigation::tests::post_commit_host_loss_enters_single_compound_without_rolling_back_history();
+}
+
+#[test]
 fn exact_owned_cleanup_cycle_quarantines_exact_set_and_releases_focus() {
     crate::navigation::tests::failed_branch_relationship_cycle_quarantines_exact_set_and_releases_focus();
 }

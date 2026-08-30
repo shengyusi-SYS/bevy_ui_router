@@ -474,6 +474,10 @@ impl CoreIdAllocator {
         Ok(reserved)
     }
 
+    pub(crate) fn reserve_cleanup_batch(&mut self) -> Result<CleanupBatchId, IdExhaustion> {
+        checked_take(&mut self.next_cleanup_batch).map(CleanupBatchId)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn owns_request(
         &self,

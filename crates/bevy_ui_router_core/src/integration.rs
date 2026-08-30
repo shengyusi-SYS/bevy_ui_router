@@ -4,8 +4,8 @@ use crate::admission::{
     HostLease as CoreHostLease,
 };
 use crate::cleanup::{
-    CleanupBatchToken, CleanupCompletion as CoreCleanupCompletion, CleanupCompletionDigest,
-    CleanupManifestDigest, CleanupManifestSeal, CleanupSummary,
+    CleanupBatchSourceProjection, CleanupBatchToken, CleanupCompletion as CoreCleanupCompletion,
+    CleanupCompletionDigest, CleanupManifestDigest, CleanupManifestSeal, CleanupSummary,
 };
 #[cfg(feature = "test-support")]
 use crate::engine::BackAllocatorBoundary;
@@ -28,7 +28,8 @@ use crate::engine::{
     BackTargetResumeAction as CoreBackTargetResumeAction,
     BackTargetResumeOutcome as CoreBackTargetResumeOutcome,
     BeginAuthoritySettlementErrorKind as CoreBeginAuthoritySettlementErrorKind,
-    CommitError as CoreCommitError, CommitTicket as CoreCommitTicket,
+    CleanupBatchProjection as CoreCleanupBatchProjection, CommitError as CoreCommitError,
+    CommitTicket as CoreCommitTicket, CoreAuthorityCleanupCompletionFacts,
     CoreBackNoTargetAuthorityBeginOwner, CoreBackNoTargetAuthorityBeginPermanentEvidence,
     CoreBackNoTargetAuthorityBeginRetryEvidence, CoreBackNoTargetAuthorityCleanupBatch,
     CoreBackNoTargetAuthorityCleanupCompletionOwner,
@@ -55,9 +56,26 @@ use crate::engine::{
     CoreBackTargetPermanentTerminalFailureProjection,
     CoreBackTargetPermanentTerminalObservedProjection, CoreBackTargetPermanentTerminalOperation,
     CoreBackTargetPermanentTerminalSourceProjection, CoreBackTargetPhysicalReceiverRef,
-    CorePreparationReceiverMismatchProjection, CoreProvenEmptyApprovalProjection,
-    CoreRejectedBackContinuationOwner, EngineAction as CoreEngineAction,
-    EngineInstallError as CoreEngineInstallError,
+    CoreBoundPostCommitSettlementPlan, CoreNormalCleanupCompletionFacts,
+    CorePostCommitAuthorityBeginPermanentEvidence, CorePostCommitAuthorityBeginRetryEvidence,
+    CorePostCommitAuthorityPreparationSource, CorePostCommitAuthorityTransferOwner,
+    CorePostCommitCleanupObservedProjection, CorePostCommitCleanupReceiverProjection,
+    CorePostCommitCompoundBatchOwner, CorePostCommitCompoundCompletionOwner,
+    CorePostCommitCompoundMismatchEvidence, CorePostCommitCompoundProjection,
+    CorePostCommitPlannedCleanupProjection, CorePostCommitPlannedHostEdgeProjection,
+    CorePostCommitReceiverMismatchProjection, CorePostCommitSettledOriginalProjection,
+    CorePostCommitSettlementExpectedProjection, CorePostCommitSettlementKeyProjection,
+    CorePostCommitSettlementPermitOutcome, CorePostCommitSettlementPlanBuilder,
+    CorePostCommitSettlementPlanDescriptor, CorePostCommitSettlementPlanMismatchEvidence,
+    CorePostCommitSettlementPlanMismatchKind, CorePostCommitSettlementRecordOutcome,
+    CorePostCommitSettlementRole, CorePostCommitSettlementTraceMismatchEvidence,
+    CorePostCommitSettlementTraceMismatchKind, CorePostCommitSettlementTraceProgress,
+    CorePostCommitSettlementTraceProjection, CorePostCommitTerminalProjection,
+    CorePreparationReceiverMismatchProjection, CorePreparedPostCommitAuthorityTransfer,
+    CorePreparedPostCommitSettlement, CoreProvenEmptyApprovalProjection,
+    CoreRejectedBackContinuationOwner, CoreRetiredHostAuthorityExpectedProjection,
+    CoreRetiredHostAuthorityTerminalEvidence, CoreRetiredHostEdgeCompletionFacts,
+    EngineAction as CoreEngineAction, EngineInstallError as CoreEngineInstallError,
     FailedAuthoritySettlementTrigger as CoreFailedAuthoritySettlementTrigger,
     FailedAuthorityTriggerError as CoreFailedAuthorityTriggerError,
     FailureCleanupCompletionCommitError as CoreFailureCleanupCompletionCommitError,
@@ -81,6 +99,14 @@ use crate::engine::{
     FailureCleanupZeroTerminalOwner as CoreFailureCleanupZeroTerminalOwner,
     FrameMountRequest as CoreFrameMountRequest, FrameMountTarget as CoreFrameMountTarget,
     FrameTask as CoreFrameTask, MountMutationArtifact as CoreMountMutationArtifact,
+    PostCommitAuthorityAcceptanceOutcome as CorePostCommitAuthorityAcceptanceOutcome,
+    PostCommitAuthorityBeginCoreOutcome as CorePostCommitAuthorityBeginOutcome,
+    PostCommitAuthorityCause as CorePostCommitAuthorityCause,
+    PostCommitAuthorityPreparationOutcome as CorePostCommitAuthorityPreparationOutcome,
+    PostCommitCompoundCompletionCoreOutcome as CorePostCommitCompoundCompletionOutcome,
+    PostCommitCompoundCompletionInputs as CorePostCommitCompoundCompletionInputs,
+    PostCommitCompoundCompletionPreparationOutcome as CorePostCommitCompoundCompletionPreparationOutcome,
+    PreCommitAuthorityCause as CorePreCommitAuthorityCause,
     PreparedFailureCleanupZeroPhysical as CorePreparedFailureCleanupZeroPhysical,
     PreparedPublication, PrivateRequestLookup, PushError as CorePushError,
     ReportError as CoreReportError, ResolveMountOwner as CoreResolveMountOwner,
@@ -130,7 +156,10 @@ use crate::view_input::RouteViewInput;
 use crate::view_key::RouteViewKey;
 use crate::{
     HostSnapshot, HostTraceEvent, HostTraceEventKind, HostVersion,
-    diagnostics::{DiagnosticEvent, DiagnosticSnapshot},
+    diagnostics::{
+        DiagnosticEvent, DiagnosticSnapshot,
+        PostCommitCleanupAnomalyCause as CorePostCommitCleanupAnomalyCause,
+    },
     fingerprint::RouteBranchFingerprint,
 };
 
@@ -205,6 +234,22 @@ pub enum BeginAuthoritySettlementErrorKind {
     WrongPhase,
     InvalidManifest,
     RetryablePreparation,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreCommitAuthorityCause {
+    AuthorityLost,
+    HostLost,
+}
+
+impl PreCommitAuthorityCause {
+    const fn inner(self) -> CorePreCommitAuthorityCause {
+        match self {
+            Self::AuthorityLost => CorePreCommitAuthorityCause::AuthorityLost,
+            Self::HostLost => CorePreCommitAuthorityCause::HostLost,
+        }
+    }
 }
 
 #[must_use = "failed authority settlement begin returns the exact host lease"]
@@ -1254,6 +1299,9 @@ impl CleanupBatch {
                 CleanupCompletionDigest::canonical_empty(),
                 0,
             ),
+            manifest_digest: self.manifest_digest,
+            completion_digest: 0,
+            settled_count: 0,
         }
     }
 
@@ -1264,12 +1312,1039 @@ impl CleanupBatch {
                 CleanupCompletionDigest::from_opaque(completion_digest),
                 settled_count,
             ),
+            manifest_digest: self.manifest_digest,
+            completion_digest,
+            settled_count,
         }
     }
 }
 
 pub struct CleanupCompletion {
     inner: CoreCleanupCompletion,
+    manifest_digest: u64,
+    completion_digest: u64,
+    settled_count: usize,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitCleanupBatchView {
+    inner: CoreCleanupBatchProjection,
+    manifest_digest: u64,
+    obligation_count: usize,
+}
+
+impl PostCommitCleanupBatchView {
+    pub fn manifest_digest(&self) -> u64 {
+        self.manifest_digest
+    }
+
+    pub fn obligation_count(&self) -> usize {
+        self.obligation_count
+    }
+
+    pub fn is_exact_core_projection(&self) -> bool {
+        self.inner.manifest_digest_matches(self.manifest_digest)
+            && self.inner.obligation_count() == self.obligation_count
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitCleanupReceiverView {
+    inner: CorePostCommitCleanupReceiverProjection,
+}
+
+impl PostCommitCleanupReceiverView {
+    pub fn request(&self) -> NavigationRequestId {
+        self.inner.request()
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitCleanupObservedView {
+    inner: CorePostCommitCleanupObservedProjection,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitReceiverMismatchView {
+    inner: CorePostCommitReceiverMismatchProjection,
+}
+
+impl PostCommitReceiverMismatchView {
+    pub fn expected(&self) -> PostCommitCleanupReceiverView {
+        PostCommitCleanupReceiverView {
+            inner: self.inner.expected().clone(),
+        }
+    }
+
+    pub fn observed(&self) -> PostCommitCleanupObservedView {
+        PostCommitCleanupObservedView {
+            inner: self.inner.observed().clone(),
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostCommitAuthorityCause {
+    HostRegistrationLost,
+    HostEntityMissing,
+    RequiredResourcesLost,
+}
+
+impl From<PostCommitAuthorityCause> for CorePostCommitAuthorityCause {
+    fn from(cause: PostCommitAuthorityCause) -> Self {
+        match cause {
+            PostCommitAuthorityCause::HostRegistrationLost => Self::HostRegistrationLost,
+            PostCommitAuthorityCause::HostEntityMissing => Self::HostEntityMissing,
+            PostCommitAuthorityCause::RequiredResourcesLost => Self::RequiredResourcesLost,
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostCommitAuthorityCauseKind {
+    HostRegistrationLost,
+    HostEntityMissing,
+    RequiredResourcesLost,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PostCommitAuthorityCauseView {
+    inner: CorePostCommitAuthorityCause,
+}
+
+impl PostCommitAuthorityCauseView {
+    fn from_core(inner: CorePostCommitAuthorityCause) -> Self {
+        Self { inner }
+    }
+
+    pub fn from_diagnostic(diagnostic: &DiagnosticEvent) -> Option<Self> {
+        diagnostic
+            .post_commit_cleanup_anomaly_cause()
+            .map(|cause| match cause {
+                CorePostCommitCleanupAnomalyCause::HostRegistrationLost => {
+                    CorePostCommitAuthorityCause::HostRegistrationLost
+                }
+                CorePostCommitCleanupAnomalyCause::HostEntityMissing => {
+                    CorePostCommitAuthorityCause::HostEntityMissing
+                }
+                CorePostCommitCleanupAnomalyCause::RequiredResourcesLost => {
+                    CorePostCommitAuthorityCause::RequiredResourcesLost
+                }
+            })
+            .map(Self::from_core)
+    }
+
+    pub fn kind(self) -> PostCommitAuthorityCauseKind {
+        match self.inner {
+            CorePostCommitAuthorityCause::HostRegistrationLost => {
+                PostCommitAuthorityCauseKind::HostRegistrationLost
+            }
+            CorePostCommitAuthorityCause::HostEntityMissing => {
+                PostCommitAuthorityCauseKind::HostEntityMissing
+            }
+            CorePostCommitAuthorityCause::RequiredResourcesLost => {
+                PostCommitAuthorityCauseKind::RequiredResourcesLost
+            }
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct PostCommitAuthorityTransferOwner {
+    inner: CorePostCommitAuthorityTransferOwner,
+    normal_manifest_digest: u64,
+    normal_obligation_count: usize,
+}
+
+impl PostCommitAuthorityTransferOwner {
+    pub fn receiver(&self) -> PostCommitCleanupReceiverView {
+        PostCommitCleanupReceiverView {
+            inner: self.inner.receiver().clone(),
+        }
+    }
+
+    pub fn cause(&self) -> PostCommitAuthorityCauseView {
+        PostCommitAuthorityCauseView::from_core(self.inner.cause())
+    }
+}
+
+#[doc(hidden)]
+pub enum PostCommitAuthorityAcceptanceOutcome {
+    Accepted(PostCommitAuthorityTransferOwner),
+    Mismatch {
+        expected: PostCommitCleanupReceiverView,
+        observed: PostCommitCleanupObservedView,
+    },
+}
+
+#[doc(hidden)]
+pub struct PostCommitAuthorityPreparationSource {
+    inner: CorePostCommitAuthorityPreparationSource,
+    normal_manifest_digest: u64,
+    normal_obligation_count: usize,
+}
+
+impl PostCommitAuthorityPreparationSource {
+    pub fn new(transfer: PostCommitAuthorityTransferOwner, host: HostLease) -> Self {
+        Self {
+            inner: CorePostCommitAuthorityPreparationSource::new(transfer.inner, host.inner),
+            normal_manifest_digest: transfer.normal_manifest_digest,
+            normal_obligation_count: transfer.normal_obligation_count,
+        }
+    }
+
+    pub fn into_parts(self) -> (PostCommitAuthorityTransferOwner, HostLease) {
+        let (transfer, host) = self.inner.into_parts();
+        (
+            PostCommitAuthorityTransferOwner {
+                inner: transfer,
+                normal_manifest_digest: self.normal_manifest_digest,
+                normal_obligation_count: self.normal_obligation_count,
+            },
+            HostLease { inner: host },
+        )
+    }
+
+    pub fn cause(&self) -> PostCommitAuthorityCauseView {
+        PostCommitAuthorityCauseView::from_core(self.inner.cause())
+    }
+}
+
+#[doc(hidden)]
+pub struct PreparedPostCommitAuthorityTransfer {
+    inner: CorePreparedPostCommitAuthorityTransfer,
+    normal_manifest_digest: u64,
+    normal_obligation_count: usize,
+    authority_manifest_digest: u64,
+    authority_obligation_count: usize,
+}
+
+impl PreparedPostCommitAuthorityTransfer {
+    pub fn authority_batch(&self) -> PostCommitCleanupBatchView {
+        PostCommitCleanupBatchView {
+            inner: self.inner.batch_projection(),
+            manifest_digest: self.authority_manifest_digest,
+            obligation_count: self.authority_obligation_count,
+        }
+    }
+
+    pub fn into_source(self) -> PostCommitAuthorityPreparationSource {
+        PostCommitAuthorityPreparationSource {
+            inner: self.inner.into_source(),
+            normal_manifest_digest: self.normal_manifest_digest,
+            normal_obligation_count: self.normal_obligation_count,
+        }
+    }
+
+    pub fn cause(&self) -> PostCommitAuthorityCauseView {
+        PostCommitAuthorityCauseView::from_core(self.inner.cause())
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostCommitCapacityKind {
+    PreparedTrace,
+    PreparedTerminal,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostCommitAuthorityContradiction {
+    ForeignReceiver,
+    CompetingSameSourceOwner,
+    RetiredHostMismatch,
+    HistoryOrActiveMismatch,
+    IdentityExhausted,
+    RequestOrQueueMismatch,
+    TraceMismatch,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitAuthorityBeginRetryEvidence {
+    inner: CorePostCommitAuthorityBeginRetryEvidence,
+}
+
+impl PostCommitAuthorityBeginRetryEvidence {
+    pub fn missing_capacity(&self) -> PostCommitCapacityKind {
+        match self.inner.missing_capacity() {
+            crate::engine::CorePostCommitCapacityKind::PreparedTrace => {
+                PostCommitCapacityKind::PreparedTrace
+            }
+            crate::engine::CorePostCommitCapacityKind::PreparedTerminal => {
+                PostCommitCapacityKind::PreparedTerminal
+            }
+        }
+    }
+
+    pub fn cause(&self) -> PostCommitAuthorityCauseView {
+        PostCommitAuthorityCauseView::from_core(self.inner.cause())
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitAuthorityBeginPermanentEvidence {
+    inner: CorePostCommitAuthorityBeginPermanentEvidence,
+}
+
+impl PostCommitAuthorityBeginPermanentEvidence {
+    pub fn contradiction(&self) -> PostCommitAuthorityContradiction {
+        match self.inner.contradiction() {
+            crate::engine::CorePostCommitAuthorityContradiction::ForeignReceiver => {
+                PostCommitAuthorityContradiction::ForeignReceiver
+            }
+            crate::engine::CorePostCommitAuthorityContradiction::CompetingSameSourceOwner => {
+                PostCommitAuthorityContradiction::CompetingSameSourceOwner
+            }
+            crate::engine::CorePostCommitAuthorityContradiction::RetiredHostMismatch => {
+                PostCommitAuthorityContradiction::RetiredHostMismatch
+            }
+            crate::engine::CorePostCommitAuthorityContradiction::HistoryOrActiveMismatch => {
+                PostCommitAuthorityContradiction::HistoryOrActiveMismatch
+            }
+            crate::engine::CorePostCommitAuthorityContradiction::IdentityExhausted => {
+                PostCommitAuthorityContradiction::IdentityExhausted
+            }
+            crate::engine::CorePostCommitAuthorityContradiction::RequestOrQueueMismatch => {
+                PostCommitAuthorityContradiction::RequestOrQueueMismatch
+            }
+            crate::engine::CorePostCommitAuthorityContradiction::TraceMismatch => {
+                PostCommitAuthorityContradiction::TraceMismatch
+            }
+        }
+    }
+
+    pub fn cause(&self) -> PostCommitAuthorityCauseView {
+        PostCommitAuthorityCauseView::from_core(self.inner.cause())
+    }
+}
+
+#[doc(hidden)]
+pub enum PostCommitAuthorityPreparationOutcome {
+    Prepared {
+        owner: PreparedPostCommitAuthorityTransfer,
+        batch: PostCommitCleanupBatchView,
+    },
+    Mismatch {
+        source: PostCommitAuthorityPreparationSource,
+        evidence: PostCommitReceiverMismatchView,
+    },
+    Retryable {
+        source: PostCommitAuthorityPreparationSource,
+        evidence: PostCommitAuthorityBeginRetryEvidence,
+    },
+    Permanent {
+        source: PostCommitAuthorityPreparationSource,
+        evidence: PostCommitAuthorityBeginPermanentEvidence,
+    },
+}
+
+#[doc(hidden)]
+pub enum PostCommitAuthorityBeginOutcome<Unbound, Bound, BindError> {
+    Begun,
+    BindingMismatch {
+        owner: PreparedPostCommitAuthorityTransfer,
+        unbound: Unbound,
+        evidence: BindError,
+    },
+    ReceiverMismatch {
+        owner: PreparedPostCommitAuthorityTransfer,
+        bound: Bound,
+        evidence: PostCommitReceiverMismatchView,
+    },
+    Retryable {
+        owner: PreparedPostCommitAuthorityTransfer,
+        bound: Bound,
+        evidence: PostCommitAuthorityBeginRetryEvidence,
+    },
+    Permanent {
+        owner: PreparedPostCommitAuthorityTransfer,
+        bound: Bound,
+        evidence: PostCommitAuthorityBeginPermanentEvidence,
+    },
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitCompoundView {
+    inner: CorePostCommitCompoundProjection,
+}
+
+impl PostCommitCompoundView {
+    pub fn receiver(&self) -> PostCommitCleanupReceiverView {
+        PostCommitCleanupReceiverView {
+            inner: self.inner.receiver().clone(),
+        }
+    }
+
+    pub fn cause(&self) -> PostCommitAuthorityCauseView {
+        PostCommitAuthorityCauseView::from_core(self.inner.cause())
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetiredHostAuthorityExpectedView {
+    inner: CoreRetiredHostAuthorityExpectedProjection,
+}
+
+impl RetiredHostAuthorityExpectedView {
+    pub fn cause(&self) -> PostCommitAuthorityCauseView {
+        PostCommitAuthorityCauseView::from_core(self.inner.cause())
+    }
+}
+
+#[doc(hidden)]
+pub struct PostCommitCompoundBatchOwner {
+    inner: CorePostCommitCompoundBatchOwner,
+    normal_manifest_digest: u64,
+    normal_obligation_count: usize,
+    authority_manifest_digest: u64,
+    authority_obligation_count: usize,
+}
+
+impl PostCommitCompoundBatchOwner {
+    pub fn projection(&self) -> PostCommitCompoundView {
+        PostCommitCompoundView {
+            inner: self.inner.projection(),
+        }
+    }
+
+    pub fn normal_batch(&self) -> PostCommitCleanupBatchView {
+        PostCommitCleanupBatchView {
+            inner: self.inner.projection().receiver().normal_batch().clone(),
+            manifest_digest: self.normal_manifest_digest,
+            obligation_count: self.normal_obligation_count,
+        }
+    }
+
+    pub fn authority_batch(&self) -> PostCommitCleanupBatchView {
+        PostCommitCleanupBatchView {
+            inner: self.inner.authority_batch_projection(),
+            manifest_digest: self.authority_manifest_digest,
+            obligation_count: self.authority_obligation_count,
+        }
+    }
+
+    pub fn retired_host_expected(&self) -> RetiredHostAuthorityExpectedView {
+        RetiredHostAuthorityExpectedView {
+            inner: self.inner.host_expected_projection(),
+        }
+    }
+
+    pub fn expected_host_physical_digest(&self) -> u64 {
+        self.inner.expected_host_physical_digest()
+    }
+
+    pub fn cause(&self) -> PostCommitAuthorityCauseView {
+        PostCommitAuthorityCauseView::from_core(self.inner.cause())
+    }
+
+    pub fn settlement(&self) -> PostCommitSettlementTraceView {
+        PostCommitSettlementTraceView {
+            inner: self.inner.settlement_projection(),
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostCommitSettlementTraceProgress {
+    OriginalResidual,
+    AuthorityNonTop,
+    RetiredHostEdge,
+    AuthorityTop,
+    Complete,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitSettlementTraceView {
+    inner: CorePostCommitSettlementTraceProjection,
+}
+
+impl PostCommitSettlementTraceView {
+    pub fn cause(&self) -> PostCommitAuthorityCauseView {
+        PostCommitAuthorityCauseView::from_core(self.inner.cause())
+    }
+
+    pub fn progress(&self) -> PostCommitSettlementTraceProgress {
+        match self.inner.progress() {
+            CorePostCommitSettlementTraceProgress::OriginalResidual => {
+                PostCommitSettlementTraceProgress::OriginalResidual
+            }
+            CorePostCommitSettlementTraceProgress::AuthorityNonTop => {
+                PostCommitSettlementTraceProgress::AuthorityNonTop
+            }
+            CorePostCommitSettlementTraceProgress::RetiredHostEdge => {
+                PostCommitSettlementTraceProgress::RetiredHostEdge
+            }
+            CorePostCommitSettlementTraceProgress::AuthorityTop => {
+                PostCommitSettlementTraceProgress::AuthorityTop
+            }
+            CorePostCommitSettlementTraceProgress::Complete => {
+                PostCommitSettlementTraceProgress::Complete
+            }
+        }
+    }
+
+    pub fn digest(&self) -> u64 {
+        self.inner.digest()
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostCommitSettlementTraceMismatchKind {
+    Receiver,
+    WrongOwner,
+    Replay,
+    TraceUnavailable,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitSettlementTraceMismatchEvidence {
+    inner: CorePostCommitSettlementTraceMismatchEvidence,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitCleanupSourceView {
+    inner: CleanupBatchSourceProjection,
+}
+
+impl PostCommitSettlementTraceMismatchEvidence {
+    pub fn kind(&self) -> PostCommitSettlementTraceMismatchKind {
+        match self.inner.kind() {
+            CorePostCommitSettlementTraceMismatchKind::Receiver => {
+                PostCommitSettlementTraceMismatchKind::Receiver
+            }
+            CorePostCommitSettlementTraceMismatchKind::WrongOwner => {
+                PostCommitSettlementTraceMismatchKind::WrongOwner
+            }
+            CorePostCommitSettlementTraceMismatchKind::Replay => {
+                PostCommitSettlementTraceMismatchKind::Replay
+            }
+            CorePostCommitSettlementTraceMismatchKind::TraceUnavailable => {
+                PostCommitSettlementTraceMismatchKind::TraceUnavailable
+            }
+        }
+    }
+
+    pub fn cause(&self) -> PostCommitAuthorityCauseView {
+        PostCommitAuthorityCauseView::from_core(self.inner.cause())
+    }
+
+    pub fn submitted_normal(&self) -> PostCommitCleanupSourceView {
+        PostCommitCleanupSourceView {
+            inner: self.inner.submitted_normal().clone(),
+        }
+    }
+
+    pub fn expected_next(&self) -> Option<PostCommitSettlementExpectedView> {
+        self.inner
+            .expected_next()
+            .cloned()
+            .map(|inner| PostCommitSettlementExpectedView { inner })
+    }
+
+    pub fn submitted_trace(&self) -> PostCommitSettlementTraceView {
+        PostCommitSettlementTraceView {
+            inner: self.inner.submitted_trace().clone(),
+        }
+    }
+
+    pub fn submitted_next(&self) -> Option<PostCommitSettlementExpectedView> {
+        self.inner
+            .submitted_next()
+            .cloned()
+            .map(|inner| PostCommitSettlementExpectedView { inner })
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitSettlementKeyProjection {
+    inner: CorePostCommitSettlementKeyProjection,
+}
+
+impl PostCommitSettlementKeyProjection {
+    /// Trusted ECS integration SPI. The identity must come from an independently
+    /// frozen physical obligation, never from a Core expected projection.
+    pub fn from_trusted_ecs_freeze(namespace: u64, identity: Vec<u64>) -> Self {
+        Self {
+            inner: CorePostCommitSettlementKeyProjection::new(namespace, identity),
+        }
+    }
+
+    pub fn namespace(&self) -> u64 {
+        self.inner.namespace()
+    }
+
+    pub fn identity(&self) -> &[u64] {
+        self.inner.identity()
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostCommitSettlementRole {
+    OriginalResidual,
+    AuthorityNonTop,
+    RetiredHostEdge,
+    AuthorityTop,
+}
+
+impl PostCommitSettlementRole {
+    fn from_core(role: CorePostCommitSettlementRole) -> Self {
+        match role {
+            CorePostCommitSettlementRole::OriginalResidual => Self::OriginalResidual,
+            CorePostCommitSettlementRole::AuthorityNonTop => Self::AuthorityNonTop,
+            CorePostCommitSettlementRole::RetiredHostEdge => Self::RetiredHostEdge,
+            CorePostCommitSettlementRole::AuthorityTop => Self::AuthorityTop,
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitPlannedCleanupProjection {
+    inner: CorePostCommitPlannedCleanupProjection,
+}
+
+impl PostCommitPlannedCleanupProjection {
+    /// Trusted ECS integration SPI.
+    pub fn from_trusted_ecs_freeze(
+        obligation: PostCommitSettlementKeyProjection,
+        physical_source: PostCommitSettlementKeyProjection,
+        disposition: CleanupDisposition,
+    ) -> Self {
+        Self {
+            inner: CorePostCommitPlannedCleanupProjection::new(
+                obligation.inner,
+                physical_source.inner,
+                disposition,
+            ),
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitSettledOriginalProjection {
+    inner: CorePostCommitSettledOriginalProjection,
+}
+
+impl PostCommitSettledOriginalProjection {
+    /// Trusted ECS integration SPI.
+    pub fn from_trusted_ecs_freeze(
+        obligation: PostCommitSettlementKeyProjection,
+        receipt: PostCommitSettlementKeyProjection,
+        disposition: CleanupDisposition,
+    ) -> Self {
+        Self {
+            inner: CorePostCommitSettledOriginalProjection::new(
+                obligation.inner,
+                receipt.inner,
+                disposition,
+            ),
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitPlannedHostEdgeProjection {
+    inner: CorePostCommitPlannedHostEdgeProjection,
+}
+
+impl PostCommitPlannedHostEdgeProjection {
+    /// Trusted ECS integration SPI.
+    pub fn from_trusted_ecs_freeze(
+        obligation: PostCommitSettlementKeyProjection,
+        physical_source: PostCommitSettlementKeyProjection,
+    ) -> Self {
+        Self {
+            inner: CorePostCommitPlannedHostEdgeProjection::new(
+                obligation.inner,
+                physical_source.inner,
+            ),
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct PostCommitSettlementPlanDescriptor {
+    inner: CorePostCommitSettlementPlanDescriptor,
+}
+
+impl PostCommitSettlementPlanDescriptor {
+    #[allow(clippy::too_many_arguments)]
+    /// Trusted ECS integration SPI. Core still validates exact coverage,
+    /// role separation, the prior L receipt suffix, and the H/top dependency.
+    pub fn from_trusted_ecs_freeze(
+        prior_trace_start: usize,
+        settled_original: Vec<PostCommitSettledOriginalProjection>,
+        residual_original: Vec<PostCommitPlannedCleanupProjection>,
+        authority_non_top: Vec<PostCommitPlannedCleanupProjection>,
+        authority_top: PostCommitPlannedCleanupProjection,
+        authority_top_dependency: PostCommitSettlementKeyProjection,
+        host_edge: PostCommitPlannedHostEdgeProjection,
+    ) -> Self {
+        Self {
+            inner: CorePostCommitSettlementPlanDescriptor::new(
+                prior_trace_start,
+                settled_original
+                    .into_iter()
+                    .map(|entry| entry.inner)
+                    .collect(),
+                residual_original
+                    .into_iter()
+                    .map(|entry| entry.inner)
+                    .collect(),
+                authority_non_top
+                    .into_iter()
+                    .map(|entry| entry.inner)
+                    .collect(),
+                authority_top.inner,
+                authority_top_dependency.inner,
+                host_edge.inner,
+            ),
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostCommitSettlementPlanMismatchKind {
+    OriginalCoverage,
+    AuthorityCoverage,
+    DuplicateKey,
+    EmptyKey,
+    PriorTrace,
+    WrongSource,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitSettlementPlanMismatchEvidence {
+    inner: CorePostCommitSettlementPlanMismatchEvidence,
+}
+
+impl PostCommitSettlementPlanMismatchEvidence {
+    pub fn kind(&self) -> PostCommitSettlementPlanMismatchKind {
+        match self.inner.kind() {
+            CorePostCommitSettlementPlanMismatchKind::OriginalCoverage => {
+                PostCommitSettlementPlanMismatchKind::OriginalCoverage
+            }
+            CorePostCommitSettlementPlanMismatchKind::AuthorityCoverage => {
+                PostCommitSettlementPlanMismatchKind::AuthorityCoverage
+            }
+            CorePostCommitSettlementPlanMismatchKind::DuplicateKey => {
+                PostCommitSettlementPlanMismatchKind::DuplicateKey
+            }
+            CorePostCommitSettlementPlanMismatchKind::EmptyKey => {
+                PostCommitSettlementPlanMismatchKind::EmptyKey
+            }
+            CorePostCommitSettlementPlanMismatchKind::PriorTrace => {
+                PostCommitSettlementPlanMismatchKind::PriorTrace
+            }
+            CorePostCommitSettlementPlanMismatchKind::WrongSource => {
+                PostCommitSettlementPlanMismatchKind::WrongSource
+            }
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct PostCommitSettlementPlanBuilder {
+    inner: CorePostCommitSettlementPlanBuilder,
+}
+
+#[doc(hidden)]
+pub struct PostCommitSettlementPlan {
+    inner: CoreBoundPostCommitSettlementPlan,
+}
+
+impl PostCommitSettlementPlanBuilder {
+    /// Length of the already-published request trace frozen by Core for
+    /// binding an exact settled-L suffix. No settlement expectation is
+    /// exposed by this projection.
+    pub fn prior_trace_len(&self) -> usize {
+        self.inner.current_trace_len()
+    }
+
+    /// Trusted ECS integration SPI. The descriptor must be built from the
+    /// physical freeze retained by the sole ECS compound owner.
+    pub fn bind_trusted_ecs(
+        self,
+        descriptor: PostCommitSettlementPlanDescriptor,
+    ) -> Result<PostCommitSettlementPlan, PostCommitSettlementPlanMismatchEvidence> {
+        self.inner
+            .bind(descriptor.inner)
+            .map(|inner| PostCommitSettlementPlan { inner })
+            .map_err(|inner| PostCommitSettlementPlanMismatchEvidence { inner })
+    }
+}
+
+/// Opaque linear Core settlement attempt. It contains the only permit for the
+/// next frozen L/A/H plan entry and deliberately exposes no expected facts.
+#[doc(hidden)]
+pub struct TrustedPostCommitSettlementAttempt {
+    inner: CorePreparedPostCommitSettlement,
+    normal_manifest_digest: u64,
+    normal_obligation_count: usize,
+    authority_manifest_digest: u64,
+    authority_obligation_count: usize,
+}
+
+/// Result of moving the compound owner into the next exact settlement permit.
+#[doc(hidden)]
+pub enum TrustedPostCommitSettlementPermitOutcome {
+    Prepared(TrustedPostCommitSettlementAttempt),
+    Mismatch {
+        owner: PostCommitCompoundBatchOwner,
+        evidence: PostCommitSettlementTraceMismatchEvidence,
+    },
+}
+
+/// Result of the trusted ECS physical-attestation bridge. The bridge accepts
+/// no submitted role, key, disposition, or expected projection; Core records
+/// only the fact already frozen into its private permit.
+#[doc(hidden)]
+pub enum TrustedPostCommitSettlementRecordOutcome<Physical> {
+    Recorded {
+        owner: PostCommitCompoundBatchOwner,
+        trace: PostCommitSettlementTraceView,
+    },
+    Mismatch {
+        attempt: TrustedPostCommitSettlementAttempt,
+        physical: Physical,
+        evidence: PostCommitSettlementTraceMismatchEvidence,
+    },
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitSettlementExpectedView {
+    inner: CorePostCommitSettlementExpectedProjection,
+}
+
+impl PostCommitSettlementExpectedView {
+    pub fn role(&self) -> PostCommitSettlementRole {
+        PostCommitSettlementRole::from_core(self.inner.role())
+    }
+
+    pub fn obligation(&self) -> PostCommitSettlementKeyProjection {
+        PostCommitSettlementKeyProjection {
+            inner: self.inner.obligation().clone(),
+        }
+    }
+
+    pub fn physical_source(&self) -> PostCommitSettlementKeyProjection {
+        PostCommitSettlementKeyProjection {
+            inner: self.inner.physical_source().clone(),
+        }
+    }
+
+    pub fn disposition(&self) -> Option<CleanupDisposition> {
+        self.inner.disposition()
+    }
+}
+
+#[doc(hidden)]
+pub struct AuthorityCleanupCompletionFacts {
+    inner: CoreAuthorityCleanupCompletionFacts,
+}
+
+impl AuthorityCleanupCompletionFacts {
+    pub(crate) fn new(
+        batch: PostCommitCleanupBatchView,
+        completion_digest: u64,
+        settled_count: usize,
+    ) -> Self {
+        Self {
+            inner: CoreAuthorityCleanupCompletionFacts::new(
+                batch.inner,
+                CleanupCompletionDigest::from_opaque(completion_digest),
+                settled_count,
+            ),
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct RetiredHostEdgeCompletionFacts {
+    inner: CoreRetiredHostEdgeCompletionFacts,
+}
+
+impl RetiredHostEdgeCompletionFacts {
+    pub(crate) fn new(expected: RetiredHostAuthorityExpectedView, physical_digest: u64) -> Self {
+        Self {
+            inner: CoreRetiredHostEdgeCompletionFacts::new(expected.inner, physical_digest),
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct PostCommitCompoundCompletionInputs {
+    inner: CorePostCommitCompoundCompletionInputs,
+}
+
+impl PostCommitCompoundCompletionInputs {
+    pub(crate) fn new(
+        normal: CleanupCompletion,
+        normal_batch: PostCommitCleanupBatchView,
+        authority_expected: AuthorityCleanupCompletionFacts,
+        authority: AuthorityCleanupCompletionFacts,
+        host_edge: RetiredHostEdgeCompletionFacts,
+        settlement: PostCommitSettlementTraceView,
+    ) -> Self {
+        let normal_facts = CoreNormalCleanupCompletionFacts::new(
+            normal_batch.inner,
+            CleanupManifestDigest::from_opaque(normal.manifest_digest),
+            CleanupCompletionDigest::from_opaque(normal.completion_digest),
+            normal.settled_count,
+        );
+        Self {
+            inner: CorePostCommitCompoundCompletionInputs::new(
+                normal.inner,
+                normal_facts,
+                authority_expected.inner,
+                authority.inner,
+                host_edge.inner,
+                settlement.inner,
+            ),
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitCompoundMismatchEvidence {
+    inner: CorePostCommitCompoundMismatchEvidence,
+}
+
+impl PostCommitCompoundMismatchEvidence {
+    pub fn is_completion_facts(&self) -> bool {
+        self.inner.is_completion_facts()
+    }
+
+    pub fn is_source(&self) -> bool {
+        self.inner.is_source()
+    }
+
+    pub fn is_settlement_trace(&self) -> bool {
+        self.inner.is_settlement_trace()
+    }
+
+    pub fn cause(&self) -> Option<PostCommitAuthorityCauseView> {
+        self.inner
+            .cause()
+            .map(PostCommitAuthorityCauseView::from_core)
+    }
+}
+
+#[doc(hidden)]
+pub struct PostCommitCompoundCompletionOwner {
+    inner: CorePostCommitCompoundCompletionOwner,
+}
+
+#[doc(hidden)]
+pub enum PostCommitCompoundCompletionPreparationOutcome {
+    Prepared(PostCommitCompoundCompletionOwner),
+    Mismatch {
+        batch: PostCommitCompoundBatchOwner,
+        inputs: PostCommitCompoundCompletionInputs,
+        evidence: PostCommitCompoundMismatchEvidence,
+    },
+}
+
+/// Trusted ECS completion bridge result. `Physical` is the whole private ECS
+/// compound owner, so a Core mismatch returns it unchanged beside the exact
+/// Core batch and opaque derived inputs.
+#[doc(hidden)]
+pub enum TrustedPostCommitCompoundCompletionPreparationOutcome<Physical> {
+    Prepared {
+        owner: PostCommitCompoundCompletionOwner,
+        physical: Physical,
+    },
+    Mismatch {
+        batch: PostCommitCompoundBatchOwner,
+        physical: Physical,
+        inputs: PostCommitCompoundCompletionInputs,
+        evidence: PostCommitCompoundMismatchEvidence,
+    },
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitTerminalEvidence {
+    inner: CorePostCommitTerminalProjection,
+}
+
+impl PostCommitTerminalEvidence {
+    pub fn request(&self) -> NavigationRequestId {
+        self.inner.request()
+    }
+
+    pub fn cause(&self) -> PostCommitAuthorityCauseView {
+        PostCommitAuthorityCauseView::from_core(self.inner.cause())
+    }
+
+    pub fn trace_digest(&self) -> u64 {
+        self.inner.trace_digest()
+    }
+}
+
+#[doc(hidden)]
+pub struct RetiredHostAuthorityTerminalEvidence {
+    inner: CoreRetiredHostAuthorityTerminalEvidence,
+}
+
+impl RetiredHostAuthorityTerminalEvidence {
+    pub fn cause(&self) -> PostCommitAuthorityCauseView {
+        PostCommitAuthorityCauseView::from_core(self.inner.cause())
+    }
+}
+
+#[doc(hidden)]
+pub enum PostCommitCompoundCompletionOutcome<PhysicalTerminal> {
+    Terminal {
+        terminal: PostCommitTerminalEvidence,
+        physical: PhysicalTerminal,
+        retired_host: RetiredHostAuthorityTerminalEvidence,
+    },
+    Mismatch {
+        owner: PostCommitCompoundCompletionOwner,
+        evidence: PostCommitCompoundMismatchEvidence,
+    },
+}
+
+/// Completion result for the trusted ECS compound. A receiver mismatch keeps
+/// the complete private physical owner beside the linear Core owner.
+#[doc(hidden)]
+pub enum TrustedPostCommitCompoundCompletionOutcome<Physical, PhysicalTerminal> {
+    Terminal {
+        terminal: PostCommitTerminalEvidence,
+        physical: PhysicalTerminal,
+        retired_host: RetiredHostAuthorityTerminalEvidence,
+    },
+    Mismatch {
+        owner: PostCommitCompoundCompletionOwner,
+        physical: Physical,
+        evidence: PostCommitCompoundMismatchEvidence,
+    },
 }
 
 pub struct PreparedCommit {
@@ -3034,6 +4109,431 @@ impl RouterEngine {
         })
     }
 
+    #[doc(hidden)]
+    pub fn accept_post_commit_authority_transfer(
+        &mut self,
+        normal: &CleanupBatch,
+        cause: PostCommitAuthorityCause,
+    ) -> PostCommitAuthorityAcceptanceOutcome {
+        match self
+            .inner
+            .accept_post_commit_authority_transfer(&normal.inner, cause.into())
+        {
+            CorePostCommitAuthorityAcceptanceOutcome::Accepted(inner) => {
+                PostCommitAuthorityAcceptanceOutcome::Accepted(PostCommitAuthorityTransferOwner {
+                    inner,
+                    normal_manifest_digest: normal.manifest_digest,
+                    normal_obligation_count: normal.obligation_count,
+                })
+            }
+            CorePostCommitAuthorityAcceptanceOutcome::Mismatch { expected, observed } => {
+                PostCommitAuthorityAcceptanceOutcome::Mismatch {
+                    expected: PostCommitCleanupReceiverView { inner: expected },
+                    observed: PostCommitCleanupObservedView { inner: observed },
+                }
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_post_commit_authority_transfer(
+        &mut self,
+        source: PostCommitAuthorityPreparationSource,
+        manifest: CleanupManifest,
+    ) -> PostCommitAuthorityPreparationOutcome {
+        let PostCommitAuthorityPreparationSource {
+            inner: source,
+            normal_manifest_digest,
+            normal_obligation_count,
+        } = source;
+        let authority_manifest_digest = manifest.manifest_digest;
+        let authority_obligation_count = manifest.obligation_count;
+        let seal = CleanupManifestSeal::new(
+            manifest.logical_roots,
+            CleanupManifestDigest::from_opaque(authority_manifest_digest),
+            authority_obligation_count,
+        );
+        match self
+            .inner
+            .prepare_post_commit_authority_transfer(source, seal)
+        {
+            CorePostCommitAuthorityPreparationOutcome::Prepared { owner, batch } => {
+                PostCommitAuthorityPreparationOutcome::Prepared {
+                    owner: PreparedPostCommitAuthorityTransfer {
+                        inner: owner,
+                        normal_manifest_digest,
+                        normal_obligation_count,
+                        authority_manifest_digest,
+                        authority_obligation_count,
+                    },
+                    batch: PostCommitCleanupBatchView {
+                        inner: batch,
+                        manifest_digest: authority_manifest_digest,
+                        obligation_count: authority_obligation_count,
+                    },
+                }
+            }
+            CorePostCommitAuthorityPreparationOutcome::Mismatch { source, evidence } => {
+                PostCommitAuthorityPreparationOutcome::Mismatch {
+                    source: PostCommitAuthorityPreparationSource {
+                        inner: source,
+                        normal_manifest_digest,
+                        normal_obligation_count,
+                    },
+                    evidence: PostCommitReceiverMismatchView { inner: evidence },
+                }
+            }
+            CorePostCommitAuthorityPreparationOutcome::Retryable { source, evidence } => {
+                PostCommitAuthorityPreparationOutcome::Retryable {
+                    source: PostCommitAuthorityPreparationSource {
+                        inner: source,
+                        normal_manifest_digest,
+                        normal_obligation_count,
+                    },
+                    evidence: PostCommitAuthorityBeginRetryEvidence { inner: evidence },
+                }
+            }
+            CorePostCommitAuthorityPreparationOutcome::Permanent { source, evidence } => {
+                PostCommitAuthorityPreparationOutcome::Permanent {
+                    source: PostCommitAuthorityPreparationSource {
+                        inner: source,
+                        normal_manifest_digest,
+                        normal_obligation_count,
+                    },
+                    evidence: PostCommitAuthorityBeginPermanentEvidence { inner: evidence },
+                }
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn begin_post_commit_authority_transfer<Unbound, Bound, BindError, Bind, Install>(
+        &mut self,
+        owner: PreparedPostCommitAuthorityTransfer,
+        unbound: Unbound,
+        bind: Bind,
+        install: Install,
+    ) -> PostCommitAuthorityBeginOutcome<Unbound, Bound, BindError>
+    where
+        Bind: FnOnce(
+            Unbound,
+            &PostCommitCleanupBatchView,
+            PostCommitSettlementPlanBuilder,
+        ) -> Result<(Bound, PostCommitSettlementPlan), (Unbound, BindError)>,
+        Install: FnOnce(Bound, PostCommitCompoundBatchOwner),
+    {
+        let PreparedPostCommitAuthorityTransfer {
+            inner: owner,
+            normal_manifest_digest,
+            normal_obligation_count,
+            authority_manifest_digest,
+            authority_obligation_count,
+        } = owner;
+        let outcome = self.inner.begin_post_commit_authority_transfer(
+            &mut self.admission,
+            owner,
+            unbound,
+            |unbound, batch, plan| {
+                bind(
+                    unbound,
+                    &PostCommitCleanupBatchView {
+                        inner: batch.clone(),
+                        manifest_digest: authority_manifest_digest,
+                        obligation_count: authority_obligation_count,
+                    },
+                    PostCommitSettlementPlanBuilder { inner: plan },
+                )
+                .map(|(bound, plan)| (bound, plan.inner))
+            },
+            |bound, batch| {
+                install(
+                    bound,
+                    PostCommitCompoundBatchOwner {
+                        inner: batch,
+                        normal_manifest_digest,
+                        normal_obligation_count,
+                        authority_manifest_digest,
+                        authority_obligation_count,
+                    },
+                );
+            },
+        );
+        let wrap_owner = |inner| PreparedPostCommitAuthorityTransfer {
+            inner,
+            normal_manifest_digest,
+            normal_obligation_count,
+            authority_manifest_digest,
+            authority_obligation_count,
+        };
+        match outcome {
+            CorePostCommitAuthorityBeginOutcome::Begun => PostCommitAuthorityBeginOutcome::Begun,
+            CorePostCommitAuthorityBeginOutcome::BindingMismatch {
+                owner,
+                unbound,
+                evidence,
+            } => PostCommitAuthorityBeginOutcome::BindingMismatch {
+                owner: wrap_owner(owner),
+                unbound,
+                evidence,
+            },
+            CorePostCommitAuthorityBeginOutcome::ReceiverMismatch {
+                owner,
+                bound,
+                evidence,
+            } => PostCommitAuthorityBeginOutcome::ReceiverMismatch {
+                owner: wrap_owner(owner),
+                bound,
+                evidence: PostCommitReceiverMismatchView { inner: evidence },
+            },
+            CorePostCommitAuthorityBeginOutcome::Retryable {
+                owner,
+                bound,
+                evidence,
+            } => PostCommitAuthorityBeginOutcome::Retryable {
+                owner: wrap_owner(owner),
+                bound,
+                evidence: PostCommitAuthorityBeginRetryEvidence { inner: evidence },
+            },
+            CorePostCommitAuthorityBeginOutcome::Permanent {
+                owner,
+                bound,
+                evidence,
+            } => PostCommitAuthorityBeginOutcome::Permanent {
+                owner: wrap_owner(owner),
+                bound,
+                evidence: PostCommitAuthorityBeginPermanentEvidence { inner: evidence },
+            },
+        }
+    }
+
+    /// Trusted ECS integration SPI. This moves the sole compound owner into an
+    /// opaque permit whose expected role/key/disposition cannot be inspected.
+    #[doc(hidden)]
+    pub fn prepare_next_post_commit_settlement_trusted(
+        &mut self,
+        owner: PostCommitCompoundBatchOwner,
+    ) -> TrustedPostCommitSettlementPermitOutcome {
+        let PostCommitCompoundBatchOwner {
+            inner,
+            normal_manifest_digest,
+            normal_obligation_count,
+            authority_manifest_digest,
+            authority_obligation_count,
+        } = owner;
+        match self.inner.prepare_next_post_commit_settlement(inner) {
+            CorePostCommitSettlementPermitOutcome::Prepared(inner) => {
+                TrustedPostCommitSettlementPermitOutcome::Prepared(
+                    TrustedPostCommitSettlementAttempt {
+                        inner,
+                        normal_manifest_digest,
+                        normal_obligation_count,
+                        authority_manifest_digest,
+                        authority_obligation_count,
+                    },
+                )
+            }
+            CorePostCommitSettlementPermitOutcome::Mismatch { owner, evidence } => {
+                TrustedPostCommitSettlementPermitOutcome::Mismatch {
+                    owner: PostCommitCompoundBatchOwner {
+                        inner: owner,
+                        normal_manifest_digest,
+                        normal_obligation_count,
+                        authority_manifest_digest,
+                        authority_obligation_count,
+                    },
+                    evidence: PostCommitSettlementTraceMismatchEvidence { inner: evidence },
+                }
+            }
+        }
+    }
+
+    /// Trusted ECS integration SPI. `physical` must be the private non-Clone
+    /// proof emitted by the real ECS post-write/refreeze/registry predicate.
+    /// The API accepts no raw observed facts and records only Core's private
+    /// permit fact.
+    #[doc(hidden)]
+    pub fn record_next_post_commit_settlement_trusted<Physical>(
+        &mut self,
+        attempt: TrustedPostCommitSettlementAttempt,
+        physical: Physical,
+    ) -> TrustedPostCommitSettlementRecordOutcome<Physical> {
+        let TrustedPostCommitSettlementAttempt {
+            inner: attempt,
+            normal_manifest_digest,
+            normal_obligation_count,
+            authority_manifest_digest,
+            authority_obligation_count,
+        } = attempt;
+        match self.inner.record_next_post_commit_settlement(
+            attempt,
+            physical,
+            |physical, permit| {
+                Ok::<_, (Physical, std::convert::Infallible)>(
+                    crate::engine::CorePostCommitSettlementAttestation::from_trusted_physical(
+                        physical, permit,
+                    ),
+                )
+            },
+        ) {
+            CorePostCommitSettlementRecordOutcome::Recorded { owner, trace } => {
+                TrustedPostCommitSettlementRecordOutcome::Recorded {
+                    owner: PostCommitCompoundBatchOwner {
+                        inner: owner,
+                        normal_manifest_digest,
+                        normal_obligation_count,
+                        authority_manifest_digest,
+                        authority_obligation_count,
+                    },
+                    trace: PostCommitSettlementTraceView { inner: trace },
+                }
+            }
+            CorePostCommitSettlementRecordOutcome::Mismatch {
+                attempt,
+                physical,
+                evidence,
+            } => TrustedPostCommitSettlementRecordOutcome::Mismatch {
+                attempt: TrustedPostCommitSettlementAttempt {
+                    inner: attempt,
+                    normal_manifest_digest,
+                    normal_obligation_count,
+                    authority_manifest_digest,
+                    authority_obligation_count,
+                },
+                physical,
+                evidence: PostCommitSettlementTraceMismatchEvidence { inner: evidence },
+            },
+            CorePostCommitSettlementRecordOutcome::BindingMismatch {
+                attempt,
+                physical,
+                bind_error,
+            } => match bind_error {},
+            CorePostCommitSettlementRecordOutcome::AttestationMismatch { .. } => {
+                unreachable!("the trusted wrapper binds only the private Core permit")
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn prepare_post_commit_compound_completion(
+        &mut self,
+        batch: PostCommitCompoundBatchOwner,
+        inputs: PostCommitCompoundCompletionInputs,
+    ) -> PostCommitCompoundCompletionPreparationOutcome {
+        let PostCommitCompoundBatchOwner {
+            inner: batch,
+            normal_manifest_digest,
+            normal_obligation_count,
+            authority_manifest_digest,
+            authority_obligation_count,
+        } = batch;
+        match self
+            .inner
+            .prepare_post_commit_compound_completion(batch, inputs.inner)
+        {
+            CorePostCommitCompoundCompletionPreparationOutcome::Prepared(inner) => {
+                PostCommitCompoundCompletionPreparationOutcome::Prepared(
+                    PostCommitCompoundCompletionOwner { inner },
+                )
+            }
+            CorePostCommitCompoundCompletionPreparationOutcome::Mismatch {
+                batch,
+                inputs,
+                evidence,
+            } => PostCommitCompoundCompletionPreparationOutcome::Mismatch {
+                batch: PostCommitCompoundBatchOwner {
+                    inner: batch,
+                    normal_manifest_digest,
+                    normal_obligation_count,
+                    authority_manifest_digest,
+                    authority_obligation_count,
+                },
+                inputs: PostCommitCompoundCompletionInputs { inner: inputs },
+                evidence: PostCommitCompoundMismatchEvidence { inner: evidence },
+            },
+        }
+    }
+
+    /// Trusted ECS integration SPI. The whole physical compound is accepted
+    /// only after ECS has produced its private terminal proof. Authority/H
+    /// completion facts are derived inside Core from the exact consumed plan;
+    /// no raw expected/observed constructor is exposed here.
+    #[doc(hidden)]
+    pub fn prepare_post_commit_compound_completion_trusted<Physical>(
+        &mut self,
+        batch: PostCommitCompoundBatchOwner,
+        normal: CleanupCompletion,
+        physical: Physical,
+    ) -> TrustedPostCommitCompoundCompletionPreparationOutcome<Physical> {
+        let PostCommitCompoundBatchOwner {
+            inner: batch,
+            normal_manifest_digest,
+            normal_obligation_count,
+            authority_manifest_digest,
+            authority_obligation_count,
+        } = batch;
+        match self
+            .inner
+            .prepare_post_commit_compound_completion_from_trusted_physical(batch, normal.inner)
+        {
+            CorePostCommitCompoundCompletionPreparationOutcome::Prepared(inner) => {
+                TrustedPostCommitCompoundCompletionPreparationOutcome::Prepared {
+                    owner: PostCommitCompoundCompletionOwner { inner },
+                    physical,
+                }
+            }
+            CorePostCommitCompoundCompletionPreparationOutcome::Mismatch {
+                batch,
+                inputs,
+                evidence,
+            } => TrustedPostCommitCompoundCompletionPreparationOutcome::Mismatch {
+                batch: PostCommitCompoundBatchOwner {
+                    inner: batch,
+                    normal_manifest_digest,
+                    normal_obligation_count,
+                    authority_manifest_digest,
+                    authority_obligation_count,
+                },
+                physical,
+                inputs: PostCommitCompoundCompletionInputs { inner: inputs },
+                evidence: PostCommitCompoundMismatchEvidence { inner: evidence },
+            },
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn complete_post_commit_authority_compound<PhysicalTerminal, F>(
+        &mut self,
+        owner: PostCommitCompoundCompletionOwner,
+        clear_physical_holder: F,
+    ) -> PostCommitCompoundCompletionOutcome<PhysicalTerminal>
+    where
+        F: FnOnce(RetiredHostAuthorityExpectedView) -> PhysicalTerminal,
+    {
+        match self
+            .inner
+            .complete_post_commit_authority_compound(owner.inner, |expected| {
+                clear_physical_holder(RetiredHostAuthorityExpectedView { inner: expected })
+            }) {
+            CorePostCommitCompoundCompletionOutcome::Terminal {
+                terminal,
+                physical,
+                retired_host,
+            } => PostCommitCompoundCompletionOutcome::Terminal {
+                terminal: PostCommitTerminalEvidence { inner: terminal },
+                physical,
+                retired_host: RetiredHostAuthorityTerminalEvidence {
+                    inner: retired_host,
+                },
+            },
+            CorePostCommitCompoundCompletionOutcome::Mismatch { owner, evidence } => {
+                PostCommitCompoundCompletionOutcome::Mismatch {
+                    owner: PostCommitCompoundCompletionOwner { inner: owner },
+                    evidence: PostCommitCompoundMismatchEvidence { inner: evidence },
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn prepare_back_capacity_core_producer_slot(
@@ -3201,7 +4701,37 @@ impl RouterEngine {
     where
         F: FnOnce(CleanupBatch),
     {
-        self.begin_authority_settlement_with_trigger(lease, None, manifest, authority_mutation)
+        self.begin_authority_settlement_for_cause_retaining(
+            lease,
+            PreCommitAuthorityCause::AuthorityLost,
+            manifest,
+            authority_mutation,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn authority_settlement_logical_roots(&self) -> Vec<RouteFrameVersion> {
+        self.inner.authority_settlement_logical_roots()
+    }
+
+    #[doc(hidden)]
+    pub fn begin_authority_settlement_for_cause_retaining<F>(
+        &mut self,
+        lease: HostLease,
+        cause: PreCommitAuthorityCause,
+        manifest: CleanupManifest,
+        authority_mutation: F,
+    ) -> Result<CleanupBatch, BeginAuthoritySettlementError>
+    where
+        F: FnOnce(CleanupBatch),
+    {
+        self.begin_authority_settlement_with_trigger(
+            lease,
+            None,
+            cause,
+            manifest,
+            authority_mutation,
+        )
     }
 
     #[doc(hidden)]
@@ -3215,9 +4745,31 @@ impl RouterEngine {
     where
         F: FnOnce(CleanupBatch),
     {
+        self.begin_failed_authority_settlement_for_cause_retaining(
+            lease,
+            trigger,
+            PreCommitAuthorityCause::AuthorityLost,
+            manifest,
+            authority_mutation,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn begin_failed_authority_settlement_for_cause_retaining<F>(
+        &mut self,
+        lease: HostLease,
+        trigger: FailedAuthoritySettlementTrigger,
+        cause: PreCommitAuthorityCause,
+        manifest: CleanupManifest,
+        authority_mutation: F,
+    ) -> Result<CleanupBatch, BeginAuthoritySettlementError>
+    where
+        F: FnOnce(CleanupBatch),
+    {
         self.begin_authority_settlement_with_trigger(
             lease,
             Some(trigger),
+            cause,
             manifest,
             authority_mutation,
         )
@@ -3227,6 +4779,7 @@ impl RouterEngine {
         &mut self,
         lease: HostLease,
         trigger: Option<FailedAuthoritySettlementTrigger>,
+        cause: PreCommitAuthorityCause,
         manifest: CleanupManifest,
         authority_mutation: F,
     ) -> Result<CleanupBatch, BeginAuthoritySettlementError>
@@ -3264,16 +4817,18 @@ impl RouterEngine {
             ));
         };
         let result = match trigger {
-            Some(trigger) => inner_engine.begin_failed_authority_settlement_retaining(
+            Some(trigger) => inner_engine.begin_failed_authority_settlement_for_cause_retaining(
                 admission,
                 lease.inner,
                 trigger.inner,
+                cause.inner(),
                 seal,
                 publication,
             ),
-            None => inner_engine.begin_authority_settlement_retaining(
+            None => inner_engine.begin_authority_settlement_for_cause_retaining(
                 admission,
                 lease.inner,
+                cause.inner(),
                 seal,
                 publication,
             ),
@@ -5051,6 +6606,30 @@ impl RouterEngine {
         })
     }
 
+    #[doc(hidden)]
+    pub fn cancel_prepared_commit_for_authority_settlement(
+        &mut self,
+        prepared: PreparedCommit,
+    ) -> Result<(), (PreparedCommit, IntegrationError)> {
+        let PreparedCommit {
+            publication,
+            cleanup,
+        } = prepared;
+        match self
+            .inner
+            .cancel_prepared_publication_for_authority_settlement(publication)
+        {
+            Ok(()) => Ok(()),
+            Err((publication, error)) => Err((
+                PreparedCommit {
+                    publication,
+                    cleanup,
+                },
+                map_commit_error(error),
+            )),
+        }
+    }
+
     pub fn complete_cleanup(
         &mut self,
         completion: CleanupCompletion,
@@ -5243,6 +6822,52 @@ impl RouterEngine {
             }
             PrivateRequestLookup::Evicted => RequestLookup::NotRetained,
             PrivateRequestLookup::Unknown => RequestLookup::Unknown,
+        }
+    }
+
+    /// Trusted ECS completion bridge retaining the whole private physical
+    /// owner when Core's final receiver refreeze rejects completion.
+    #[doc(hidden)]
+    pub fn complete_post_commit_authority_compound_trusted<Physical, PhysicalTerminal, F>(
+        &mut self,
+        owner: PostCommitCompoundCompletionOwner,
+        physical: Physical,
+        clear_physical_holder: F,
+    ) -> TrustedPostCommitCompoundCompletionOutcome<Physical, PhysicalTerminal>
+    where
+        F: FnOnce(Physical, RetiredHostAuthorityExpectedView) -> PhysicalTerminal,
+    {
+        let mut physical = Some(physical);
+        match self
+            .inner
+            .complete_post_commit_authority_compound(owner.inner, |expected| {
+                clear_physical_holder(
+                    physical
+                        .take()
+                        .expect("the trusted completion callback consumes physical once"),
+                    RetiredHostAuthorityExpectedView { inner: expected },
+                )
+            }) {
+            CorePostCommitCompoundCompletionOutcome::Terminal {
+                terminal,
+                physical,
+                retired_host,
+            } => TrustedPostCommitCompoundCompletionOutcome::Terminal {
+                terminal: PostCommitTerminalEvidence { inner: terminal },
+                physical,
+                retired_host: RetiredHostAuthorityTerminalEvidence {
+                    inner: retired_host,
+                },
+            },
+            CorePostCommitCompoundCompletionOutcome::Mismatch { owner, evidence } => {
+                TrustedPostCommitCompoundCompletionOutcome::Mismatch {
+                    owner: PostCommitCompoundCompletionOwner { inner: owner },
+                    physical: physical
+                        .take()
+                        .expect("a rejected trusted completion returns physical whole"),
+                    evidence: PostCommitCompoundMismatchEvidence { inner: evidence },
+                }
+            }
         }
     }
 }

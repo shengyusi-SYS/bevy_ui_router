@@ -51,10 +51,25 @@ use bevy_ui_router_core::{
         FailureCleanupZeroTerminalOutcome, FailureCleanupZeroTerminalOwner, FrameMountTarget,
         HistoryAdmissionStamp, HistoryAdmissionWorldSeal, HistoryExecutionBindingView, HostLease,
         IntegrationError, LifecycleContinuationCapacity, MountMutationArtifact, MountReceiptProof,
-        MountRegistrationBeginError, MountRequest, PreparationBoundaryScopeView,
-        PreparationReceiverMismatchView, PrepareBackAdmissionErrorKind,
-        PreparedFailureCleanupZeroPhysical, PreparedPostCommitContinuationOwner, ResolveMountOwner,
+        MountRegistrationBeginError, MountRequest, PostCommitAuthorityAcceptanceOutcome,
+        PostCommitAuthorityBeginOutcome, PostCommitAuthorityBeginPermanentEvidence,
+        PostCommitAuthorityBeginRetryEvidence, PostCommitAuthorityCause,
+        PostCommitAuthorityPreparationOutcome, PostCommitAuthorityPreparationSource,
+        PostCommitCleanupObservedView, PostCommitCleanupReceiverView, PostCommitCompoundBatchOwner,
+        PostCommitCompoundCompletionInputs, PostCommitCompoundCompletionOwner,
+        PostCommitCompoundMismatchEvidence, PostCommitPlannedCleanupProjection,
+        PostCommitPlannedHostEdgeProjection, PostCommitReceiverMismatchView,
+        PostCommitSettledOriginalProjection, PostCommitSettlementKeyProjection,
+        PostCommitSettlementPlanDescriptor, PostCommitSettlementPlanMismatchEvidence,
+        PostCommitSettlementTraceMismatchEvidence, PostCommitSettlementTraceProgress,
+        PreCommitAuthorityCause, PreparationBoundaryScopeView, PreparationReceiverMismatchView,
+        PrepareBackAdmissionErrorKind, PreparedFailureCleanupZeroPhysical,
+        PreparedPostCommitAuthorityTransfer, PreparedPostCommitContinuationOwner,
+        ResolveMountOwner, RetiredHostAuthorityExpectedView, RetiredHostAuthorityTerminalEvidence,
         RootFrameTask, RouteFailureContinuationOwner, RouterEngine, TargetAuthoritySettlementOwner,
+        TrustedPostCommitCompoundCompletionOutcome,
+        TrustedPostCommitCompoundCompletionPreparationOutcome,
+        TrustedPostCommitSettlementPermitOutcome, TrustedPostCommitSettlementRecordOutcome,
         VerifiedBackNoTargetCandidate, VerifiedBackResolutionContradiction,
         VerifiedBackResolutionOwnerHandoff, VerifiedBackTargetExecutionOwner, ViewFailureKind,
         ViewReportIdentity,
@@ -67,7 +82,7 @@ use bevy_ui_router_core::{
 use bevy_ui_router_view::{RouteViewRegistry, ViewBuildEffect, integration as view_integration};
 
 use crate::{
-    app_ext::{RouterHandle, ViewDriverStore},
+    app_ext::{RouterHandle, RouterHostRegistration, ViewDriverStore},
     branch_transaction::{
         FailedPreparedBranch, PendingCommit, PreparedBranch, PreparedPermanentIsolationClaimRebind,
         RealizedBranch, ReconciliationAuthorityIdentity, ReconciliationProjectionFacts,
@@ -83,9 +98,14 @@ use crate::{
         CleanupLedgerReserveError, CleanupLedgerReserveErrorKind, EnqueueRejected,
         FailedAuthorityBoundaryBinding, FailedBoundaryDrift, FailedBoundarySource,
         FailedManifestBuildError, FailedPreparedTopologyError, FailureCleanupSourceProjection,
-        FrozenBackNoTargetAuthorityPartition, FrozenCleanupManifest, ManifestNeutralLedgerSlot,
-        NoTargetCapacityPermit, PendingBoundaryBinding, PreparedBackNoTargetAuthorityCleanupLedger,
-        PreparedBackNoTargetZeroCompletion, PreparedCleanupLedger, PreparedCleanupLedgerProjection,
+        FrozenBackNoTargetAuthorityPartition, FrozenCleanupManifest,
+        FrozenOriginalCleanupLedgerTransfer, FrozenPostCommitAuthorityPartition,
+        ManifestNeutralLedgerSlot, NoTargetCapacityPermit, PendingBoundaryBinding,
+        PostCommitAuthorityFreezeFailure, PostCommitAuthorityFreezePermanentEvidence,
+        PostCommitAuthoritySettlementFailure, PostCommitOriginalFreezeFailure,
+        PostCommitOriginalFreezePermanentEvidence, PostCommitPhysicalSettlementProof,
+        PreparedBackNoTargetAuthorityCleanupLedger, PreparedBackNoTargetZeroCompletion,
+        PreparedCleanupLedger, PreparedCleanupLedgerProjection, PreparedPostCommitAuthorityLedger,
         RouterCleanupObservation, TargetPreparationPermanentCompletionDomain,
         TargetPreparationPermanentCompletionFacts,
         TargetPreparationPermanentCompletionPreparationEvidence,
@@ -158,6 +178,7 @@ pub(crate) struct HostBinding {
     pub(crate) top_slot: bevy_ecs::entity::Entity,
     pub(crate) top_slot_claim: crate::registry::ExactRegistryClaim,
     pub(crate) candidate: ValidatedHostCandidate,
+    pub(crate) registration_incarnation: u64,
     lease: HostLease,
 }
 
@@ -168,6 +189,7 @@ pub(crate) struct RetiredHostBinding {
     pub(crate) top_slot: bevy_ecs::entity::Entity,
     pub(crate) top_slot_claim: crate::registry::ExactRegistryClaim,
     pub(crate) candidate: ValidatedHostCandidate,
+    pub(crate) registration_incarnation: u64,
 }
 
 impl HostBinding {
@@ -179,6 +201,7 @@ impl HostBinding {
             top_slot,
             top_slot_claim,
             candidate,
+            registration_incarnation,
             lease,
         } = self;
         (
@@ -189,6 +212,7 @@ impl HostBinding {
                 top_slot,
                 top_slot_claim,
                 candidate,
+                registration_incarnation,
             },
             lease,
         )
@@ -204,6 +228,7 @@ impl RetiredHostBinding {
             top_slot,
             top_slot_claim,
             candidate,
+            registration_incarnation,
         } = self;
         HostBinding {
             version,
@@ -212,6 +237,7 @@ impl RetiredHostBinding {
             top_slot,
             top_slot_claim,
             candidate,
+            registration_incarnation,
             lease,
         }
     }
@@ -1739,6 +1765,276 @@ struct FailureCleanupCompletionInertOwner {
     mismatch: FailureCleanupCompletionMismatchView,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FrozenRetiredHostEdge {
+    host: Entity,
+    top_slot: Entity,
+    top_slot_claim: ExactRegistryClaim,
+    registration_incarnation: u64,
+    host_present: bool,
+    host_non_children_manifest: Option<ComponentManifest>,
+    host_parent: Option<Entity>,
+    host_ancestry: Vec<Entity>,
+    children_before: Vec<Entity>,
+    children_after: Vec<Entity>,
+    top_parent_before: Option<Entity>,
+    obligation_binding: u64,
+    physical_source_binding: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetiredHostEdgePhysicalTerminal {
+    Detached,
+    HostAbsent,
+    EdgeAlreadyAbsent,
+}
+
+struct RetiredHostEdgePhysicalProof {
+    terminal: RetiredHostEdgePhysicalTerminal,
+    binding: u64,
+}
+
+enum PostCommitAnyPhysicalProof {
+    Cleanup(PostCommitPhysicalSettlementProof),
+    HostEdge(RetiredHostEdgePhysicalProof),
+}
+
+struct PreparedPostCommitPhysicalOwner {
+    original: CleanupLedger,
+    original_freeze: FrozenOriginalCleanupLedgerTransfer,
+    authority: PreparedPostCommitAuthorityLedger,
+    active: RealizedBranch,
+    host: RetiredHostBinding,
+    edge: FrozenRetiredHostEdge,
+    input_isolation: Option<PreparedPostCommitInputIsolation>,
+}
+
+struct PreparedPostCommitInputIsolation {
+    mutation: PreparedAuthorityIsolation,
+    frozen: FrozenPostCommitInputIsolation,
+    contradiction: Option<AuthorityIsolationContradiction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FrozenPostCommitInputIsolation {
+    focus: Vec<Entity>,
+    gate_targets: Vec<Entity>,
+    gate_required: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PostCommitInputIsolationFailure {
+    RetryableCapacity,
+    Permanent(AuthorityIsolationContradiction),
+    RefreezeRejected,
+}
+
+struct PostCommitCompoundPhysicalOwner {
+    original: CleanupLedger,
+    original_freeze: FrozenOriginalCleanupLedgerTransfer,
+    authority: CleanupLedger,
+    partition: FrozenPostCommitAuthorityPartition,
+    active: RealizedBranch,
+    host: RetiredHostBinding,
+    edge: FrozenRetiredHostEdge,
+    input_isolation: FrozenPostCommitInputIsolation,
+    original_cursor: usize,
+    authority_non_top_cursor: usize,
+    settled_authority: Vec<Entity>,
+    edge_terminal: Option<RetiredHostEdgePhysicalTerminal>,
+    top_settled: bool,
+}
+
+struct ActivePostCommitCompoundOwner {
+    core: PostCommitCompoundBatchOwner,
+    physical: PostCommitCompoundPhysicalOwner,
+}
+
+struct PostCommitSettlementRecordInert {
+    attempt: bevy_ui_router_core::integration::TrustedPostCommitSettlementAttempt,
+    proof: PostCommitAnyPhysicalProof,
+    physical: PostCommitCompoundPhysicalOwner,
+    evidence: PostCommitSettlementTraceMismatchEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RetiredHostEdgeFreezePermanentEvidence {
+    InvalidBinding,
+    InvalidRelationship,
+    RelationshipCycle,
+}
+
+enum PostCommitPreAcceptInertEvidence {
+    ReceiptObservationMismatch,
+    Original(PostCommitOriginalFreezePermanentEvidence),
+    EntryOwnerMissing,
+    RetiredHostEdge(RetiredHostEdgeFreezePermanentEvidence),
+    Authority(PostCommitAuthorityFreezePermanentEvidence),
+    MissingNormalBatch,
+    CoreReceiver {
+        expected: PostCommitCleanupReceiverView,
+        observed: PostCommitCleanupObservedView,
+    },
+}
+
+struct PostCommitPreAcceptPhysicalOwner {
+    original: CleanupLedger,
+    original_freeze: Option<FrozenOriginalCleanupLedgerTransfer>,
+    authority: Option<PreparedPostCommitAuthorityLedger>,
+    edge: Option<FrozenRetiredHostEdge>,
+}
+
+enum PostCommitCompoundHolder {
+    PreAcceptInert {
+        physical: PostCommitPreAcceptPhysicalOwner,
+        evidence: PostCommitPreAcceptInertEvidence,
+    },
+    AcceptedInert {
+        source: PostCommitAuthorityPreparationSource,
+        physical: Box<PreparedPostCommitPhysicalOwner>,
+        evidence: Box<PostCommitAcceptedInertEvidence>,
+    },
+    PreparedInert {
+        owner: PreparedPostCommitAuthorityTransfer,
+        physical: PreparedPostCommitPhysicalOwner,
+        evidence: PostCommitPlanBindFailure,
+    },
+    BoundInert {
+        owner: PreparedPostCommitAuthorityTransfer,
+        physical: Box<PostCommitCompoundPhysicalOwner>,
+        evidence: Box<PostCommitBoundInertEvidence>,
+    },
+    Active(ActivePostCommitCompoundOwner),
+    PermitMismatchInert {
+        core: PostCommitCompoundBatchOwner,
+        physical: PostCommitCompoundPhysicalOwner,
+        evidence: PostCommitSettlementTraceMismatchEvidence,
+    },
+    PermitInert {
+        attempt: bevy_ui_router_core::integration::TrustedPostCommitSettlementAttempt,
+        physical: PostCommitCompoundPhysicalOwner,
+        failure: PostCommitAuthoritySettlementFailure,
+    },
+    SettlementInert(PostCommitSettlementRecordInert),
+    CompletionPreparationInert {
+        core: PostCommitCompoundBatchOwner,
+        physical: PostCommitCompoundPhysicalOwner,
+        inputs: PostCommitCompoundCompletionInputs,
+        evidence: PostCommitCompoundMismatchEvidence,
+    },
+    CompletionInert {
+        owner: PostCommitCompoundCompletionOwner,
+        physical: PostCommitCompoundPhysicalOwner,
+        evidence: PostCommitCompoundMismatchEvidence,
+    },
+    Inert(ActivePostCommitCompoundOwner),
+}
+
+impl PostCommitCompoundHolder {
+    #[cfg(feature = "test-support")]
+    fn leaving_frames(&self) -> Vec<&RealizedFrame> {
+        match self {
+            Self::PreAcceptInert { physical, .. } => {
+                physical.original.leaving_frames().iter().collect()
+            }
+            Self::AcceptedInert { physical, .. } => physical
+                .original
+                .leaving_frames()
+                .iter()
+                .chain(physical.active.frames())
+                .collect(),
+            Self::PreparedInert { physical, .. } => physical
+                .original
+                .leaving_frames()
+                .iter()
+                .chain(physical.active.frames())
+                .collect(),
+            Self::BoundInert { physical, .. } => physical
+                .original
+                .leaving_frames()
+                .iter()
+                .chain(physical.active.frames())
+                .collect(),
+            Self::PermitMismatchInert { physical, .. }
+            | Self::PermitInert { physical, .. }
+            | Self::CompletionPreparationInert { physical, .. }
+            | Self::CompletionInert { physical, .. } => physical
+                .original
+                .leaving_frames()
+                .iter()
+                .chain(physical.active.frames())
+                .collect(),
+            Self::Active(active) | Self::Inert(active) => active
+                .physical
+                .original
+                .leaving_frames()
+                .iter()
+                .chain(active.physical.active.frames())
+                .collect(),
+            Self::SettlementInert(inert) => inert
+                .physical
+                .original
+                .leaving_frames()
+                .iter()
+                .chain(inert.physical.active.frames())
+                .collect(),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn append_tracked_child_slots(
+        &self,
+        slots: &mut Vec<crate::branch_transaction::TrackedChildSlot>,
+    ) {
+        match self {
+            Self::PreAcceptInert { physical, .. } => {
+                slots.extend(physical.original.tracked_child_slots());
+            }
+            Self::AcceptedInert { physical, .. } => {
+                slots.extend(physical.original.tracked_child_slots());
+                slots.extend(physical.active.tracked_child_slots());
+            }
+            Self::PreparedInert { physical, .. } => {
+                slots.extend(physical.original.tracked_child_slots());
+                slots.extend(physical.active.tracked_child_slots());
+            }
+            Self::BoundInert { physical, .. } => {
+                slots.extend(physical.original.tracked_child_slots());
+                slots.extend(physical.active.tracked_child_slots());
+            }
+            Self::PermitMismatchInert { physical, .. }
+            | Self::PermitInert { physical, .. }
+            | Self::CompletionPreparationInert { physical, .. }
+            | Self::CompletionInert { physical, .. } => {
+                slots.extend(physical.original.tracked_child_slots());
+                slots.extend(physical.active.tracked_child_slots());
+            }
+            Self::Active(active) | Self::Inert(active) => {
+                slots.extend(active.physical.original.tracked_child_slots());
+                slots.extend(active.physical.active.tracked_child_slots());
+            }
+            Self::SettlementInert(inert) => {
+                slots.extend(inert.physical.original.tracked_child_slots());
+                slots.extend(inert.physical.active.tracked_child_slots());
+            }
+        }
+    }
+}
+
+struct SettledRetiredHostEvidence {
+    host: RetiredHostBinding,
+    edge: FrozenRetiredHostEdge,
+    edge_terminal: RetiredHostEdgePhysicalTerminal,
+    terminal: bevy_ui_router_core::integration::PostCommitTerminalEvidence,
+    retired_host: RetiredHostAuthorityTerminalEvidence,
+}
+
+struct RetiredHostPhysicalTerminal {
+    host: RetiredHostBinding,
+    edge: FrozenRetiredHostEdge,
+    edge_terminal: RetiredHostEdgePhysicalTerminal,
+}
+
 enum FailureCleanupCompletionMismatchView {
     Preparation(FailureCleanupCompletionPreparationMismatchView),
     Completion(FailureCleanupCompletionReceiverMismatchView),
@@ -1760,6 +2056,12 @@ pub(crate) struct RouterEntry {
     projectionless_fail_close: Option<ProjectionlessFailCloseContinuation>,
     pub(crate) active: Option<RealizedBranch>,
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
+    post_commit_compound: Option<Box<PostCommitCompoundHolder>>,
+    settled_retired_host_evidence: Option<SettledRetiredHostEvidence>,
+    #[cfg(feature = "test-support")]
+    commit_sealed_registration_removal_armed: bool,
+    #[cfg(feature = "test-support")]
+    commit_sealed_registration_removal_fired: bool,
     failure_cleanup_completion: Option<FailureCleanupCompletionInertOwner>,
     cleanup_observation: RouterCleanupObservation,
     pub(crate) authority_protocol_residual: Option<AuthorityProtocolResidualOwner>,
@@ -5273,6 +5575,7 @@ impl RouterEntry {
     pub(crate) fn cleanup_summary(&self) -> bevy_ui_router_core::CleanupSummary {
         self.cleanup_observation.summary(
             self.cleanup_ledger.is_some()
+                || self.post_commit_compound.is_some()
                 || self.pending_failed_branch.is_some()
                 || self.failure_cleanup_permanent.is_some()
                 || self.pending_mount_mutation_rejection.is_some()
@@ -5348,32 +5651,37 @@ impl RouterEntry {
     }
 
     #[cfg(feature = "test-support")]
-    pub(crate) fn leaving_cleanup_frames(&self) -> &[RealizedFrame] {
-        self.pending_back_no_target_authority_cleanup
+    pub(crate) fn leaving_cleanup_frames(&self) -> Vec<&RealizedFrame> {
+        self.post_commit_compound
             .as_ref()
-            .and_then(|pending| match pending {
-                PendingBackNoTargetAuthorityCleanup::Installed(installed) => {
-                    Some(installed.ledger.leaving_frames())
-                }
-                PendingBackNoTargetAuthorityCleanup::Completing(completing) => {
-                    Some(completing.ledger.leaving_frames())
-                }
-                PendingBackNoTargetAuthorityCleanup::Settled(settled) => {
-                    Some(settled.prepared.ledger.leaving_frames())
-                }
-                PendingBackNoTargetAuthorityCleanup::AuthorityBeginInert(inert) => {
-                    Some(inert.leaving_frames())
-                }
-                PendingBackNoTargetAuthorityCleanup::CompletionInert(inert) => {
-                    Some(inert.leaving_frames())
-                }
+            .map(|compound| compound.leaving_frames())
+            .or_else(|| {
+                self.pending_back_no_target_authority_cleanup
+                    .as_ref()
+                    .and_then(|pending| match pending {
+                        PendingBackNoTargetAuthorityCleanup::Installed(installed) => {
+                            Some(installed.ledger.leaving_frames().iter().collect())
+                        }
+                        PendingBackNoTargetAuthorityCleanup::Completing(completing) => {
+                            Some(completing.ledger.leaving_frames().iter().collect())
+                        }
+                        PendingBackNoTargetAuthorityCleanup::Settled(settled) => {
+                            Some(settled.prepared.ledger.leaving_frames().iter().collect())
+                        }
+                        PendingBackNoTargetAuthorityCleanup::AuthorityBeginInert(inert) => {
+                            Some(inert.leaving_frames().iter().collect())
+                        }
+                        PendingBackNoTargetAuthorityCleanup::CompletionInert(inert) => {
+                            Some(inert.leaving_frames().iter().collect())
+                        }
+                    })
             })
             .or_else(|| {
                 self.cleanup_ledger
                     .as_ref()
-                    .map(CleanupLedger::leaving_frames)
+                    .map(|ledger| ledger.leaving_frames().iter().collect())
             })
-            .unwrap_or(&[])
+            .unwrap_or_default()
     }
 
     #[cfg(feature = "test-support")]
@@ -5506,6 +5814,9 @@ impl RouterEntry {
     #[cfg(feature = "test-support")]
     pub(crate) fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
         let mut slots = Vec::new();
+        if let Some(compound) = &self.post_commit_compound {
+            compound.append_tracked_child_slots(&mut slots);
+        }
         if let Some(pending) = &self.pending_commit {
             slots.extend(pending.branch.tracked_child_slots());
         }
@@ -5595,6 +5906,34 @@ impl RouterNavigation {
         }
     }
 
+    /// Arms the test-only timing seam that removes the next committed host's real
+    /// registration after Core has sealed the commit and before ECS publication.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn testing_remove_host_registration_after_next_commit_seal(
+        &mut self,
+        router: RouterHandle,
+    ) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.handle == router) else {
+            return false;
+        };
+        entry.commit_sealed_registration_removal_armed = true;
+        entry.commit_sealed_registration_removal_fired = false;
+        true
+    }
+
+    /// Reports whether the test-only post-seal/pre-publication seam removed the
+    /// real host registration for this router.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn testing_commit_sealed_registration_removal_fired(
+        &self,
+        router: RouterHandle,
+    ) -> bool {
+        self.entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .is_some_and(|entry| entry.commit_sealed_registration_removal_fired)
+    }
+
     pub(crate) fn install(
         &mut self,
         routes: bevy_ui_router_core::prelude::RouteTree,
@@ -5624,6 +5963,12 @@ impl RouterNavigation {
             projectionless_fail_close: None,
             active: None,
             cleanup_ledger: None,
+            post_commit_compound: None,
+            settled_retired_host_evidence: None,
+            #[cfg(feature = "test-support")]
+            commit_sealed_registration_removal_armed: false,
+            #[cfg(feature = "test-support")]
+            commit_sealed_registration_removal_fired: false,
             failure_cleanup_completion: None,
             cleanup_observation: RouterCleanupObservation::default(),
             authority_protocol_residual: None,
@@ -6106,6 +6451,11 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                                     .record(top_slot)
                                     .expect("activated top slot remains registered")
                                     .claim();
+                                let registration_incarnation = world
+                                    .get::<crate::app_ext::RouterHostRegistration>(host)
+                                    .filter(|registration| registration.router() == entry.handle)
+                                    .map(crate::app_ext::RouterHostRegistration::incarnation)
+                                    .expect("the validated host retains its exact registration");
                                 let lease = entry.engine.confirm_host(grant);
                                 entry.host = Some(HostBinding {
                                     version,
@@ -6114,6 +6464,7 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                                     top_slot,
                                     top_slot_claim,
                                     candidate,
+                                    registration_incarnation,
                                     lease,
                                 });
                             } else {
@@ -7256,6 +7607,29 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
     refresh_authority_audits(world);
 }
 
+fn retain_frame_task_after_authority_retry(
+    entry: &mut RouterEntry,
+    had_active: bool,
+    active: RealizedBranch,
+    pending: PendingCommit,
+    mut task: RootFrameTask,
+    retry_effect: Option<ViewBuildEffect>,
+) {
+    let effect = retry_effect.unwrap_or_else(|| {
+        view_integration::build_effect(
+            task.view().clone(),
+            task.take_input(),
+            task.view_request_sequence(),
+        )
+    });
+    entry.active = had_active.then_some(active);
+    entry.pending_frame_drive = Some(PendingFrameDrive {
+        task,
+        effect,
+        pending,
+    });
+}
+
 fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> Vec<usize> {
     let mut newly_bound_entries = Vec::new();
     world.resource_scope(
@@ -7615,6 +7989,114 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                     }
                                     continue;
                                 };
+                                let host_cause = precommit_authority_cause(world, host);
+                                if host_cause == PreCommitAuthorityCause::HostLost
+                                    && !current_host_binding_is_exact(world, host)
+                                {
+                                    let had_active = entry.active.is_some();
+                                    let active = entry
+                                        .active
+                                        .take()
+                                        .unwrap_or_else(RealizedBranch::empty);
+                                    let logical_roots =
+                                        entry.engine.authority_settlement_logical_roots();
+                                    match begin_authority_settlement(
+                                        world,
+                                        entry,
+                                        active,
+                                        pending,
+                                        Some(logical_roots),
+                                    ) {
+                                        AuthoritySettlementBeginOutcome::Begun => {}
+                                        AuthoritySettlementBeginOutcome::RetryablePreparation {
+                                            active,
+                                            pending,
+                                        } => retain_frame_task_after_authority_retry(
+                                            entry,
+                                            had_active,
+                                            active,
+                                            pending,
+                                            task,
+                                            retry_effect,
+                                        ),
+                                        AuthoritySettlementBeginOutcome::ProtocolContradiction {
+                                            active,
+                                            pending,
+                                            kind,
+                                        } => {
+                                            if let Err((active, pending)) =
+                                                fail_closed_normal_authority_protocol(
+                                                    world, entry, active, pending, kind,
+                                                )
+                                            {
+                                                retain_frame_task_after_authority_retry(
+                                                    entry,
+                                                    had_active,
+                                                    active,
+                                                    pending,
+                                                    task,
+                                                    retry_effect,
+                                                );
+                                            }
+                                        }
+                                        AuthoritySettlementBeginOutcome::IsolationContradiction {
+                                            active,
+                                            pending,
+                                            contradiction,
+                                            isolation,
+                                        } => {
+                                            if let Err((active, pending)) =
+                                                fail_closed_normal_authority_protocol_prepared(
+                                                    world,
+                                                    entry,
+                                                    active,
+                                                    pending,
+                                                    AuthorityProtocolResidualKind::AuthorityIsolation(
+                                                        contradiction.clone(),
+                                                    ),
+                                                    isolation,
+                                                    Some(contradiction),
+                                                )
+                                            {
+                                                retain_frame_task_after_authority_retry(
+                                                    entry,
+                                                    had_active,
+                                                    active,
+                                                    pending,
+                                                    task,
+                                                    retry_effect,
+                                                );
+                                            }
+                                        }
+                                        AuthoritySettlementBeginOutcome::LedgerContradiction {
+                                            active,
+                                            pending,
+                                            kind,
+                                        } => {
+                                            if let Err((active, pending)) =
+                                                fail_closed_normal_owner_protocol(
+                                                    world,
+                                                    entry,
+                                                    active,
+                                                    pending,
+                                                    AuthorityProtocolResidualKind::CleanupLedger(
+                                                        kind,
+                                                    ),
+                                                )
+                                            {
+                                                retain_frame_task_after_authority_retry(
+                                                    entry,
+                                                    had_active,
+                                                    active,
+                                                    pending,
+                                                    task,
+                                                    retry_effect,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
                                 if !validated_host_candidate_is_current(world, &host.candidate) {
                                     let (pending, task) =
                                         match route_back_target_frame_failure(
@@ -8580,39 +9062,59 @@ pub(crate) enum ReconciliationPreparationOutcome {
 }
 
 fn current_host_binding_is_exact(world: &World, host: &HostBinding) -> bool {
+    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+        return false;
+    };
+    current_host_binding_is_exact_with_registry(world, registry, host)
+}
+
+fn precommit_authority_cause(world: &World, host: &HostBinding) -> PreCommitAuthorityCause {
+    if world.get_entity(host.host).is_err()
+        || world
+            .get::<crate::app_ext::RouterHostRegistration>(host.host)
+            .is_none()
+    {
+        PreCommitAuthorityCause::HostLost
+    } else {
+        PreCommitAuthorityCause::AuthorityLost
+    }
+}
+
+fn current_host_binding_is_exact_with_registry(
+    world: &World,
+    registry: &RouteEntityRegistry,
+    host: &HostBinding,
+) -> bool {
     let claim_owner_is_exact = matches!(
         host.top_slot_claim.owner(),
         crate::registry::RegistryOwner::Committed(
             crate::registry::EntityOwner::HostTopSlot { host: version, slot }
         ) if version == &host.version && *slot == host.slot_id
     );
-    let record_is_exact = world
-        .get_resource::<RouteEntityRegistry>()
-        .and_then(|registry| registry.record(host.top_slot))
-        .is_some_and(|record| {
-            record.claim() == host.top_slot_claim
-                && crate::registry::ComponentManifest::from_world(world, host.top_slot).is_some_and(
-                    |actual| {
-                        let child_of = world
-                            .components()
-                            .component_id::<bevy_ecs::hierarchy::ChildOf>();
-                        let children = world
-                            .components()
-                            .component_id::<bevy_ecs::hierarchy::Children>();
-                        let normalized = |manifest: &crate::registry::ComponentManifest| {
-                            crate::registry::ComponentManifest::new(
-                                manifest
-                                    .component_ids()
-                                    .iter()
-                                    .copied()
-                                    .filter(|component| Some(*component) != child_of)
-                                    .filter(|component| Some(*component) != children),
-                            )
-                        };
-                        normalized(&actual) == normalized(record.manifest())
-                    },
-                )
-        });
+    let record_is_exact = registry.record(host.top_slot).is_some_and(|record| {
+        record.claim() == host.top_slot_claim
+            && crate::registry::ComponentManifest::from_world(world, host.top_slot).is_some_and(
+                |actual| {
+                    let child_of = world
+                        .components()
+                        .component_id::<bevy_ecs::hierarchy::ChildOf>();
+                    let children = world
+                        .components()
+                        .component_id::<bevy_ecs::hierarchy::Children>();
+                    let normalized = |manifest: &crate::registry::ComponentManifest| {
+                        crate::registry::ComponentManifest::new(
+                            manifest
+                                .component_ids()
+                                .iter()
+                                .copied()
+                                .filter(|component| Some(*component) != child_of)
+                                .filter(|component| Some(*component) != children),
+                        )
+                    };
+                    normalized(&actual) == normalized(record.manifest())
+                },
+            )
+    });
     let parent_is_exact = world
         .get::<bevy_ecs::hierarchy::ChildOf>(host.top_slot)
         .map(bevy_ecs::hierarchy::ChildOf::parent)
@@ -8629,11 +9131,44 @@ fn current_host_binding_is_exact(world: &World, host: &HostBinding) -> bool {
     claim_owner_is_exact
         && host.candidate.host() == host.host
         && world.get_entity(host.host).is_ok()
+        && world
+            .get::<crate::app_ext::RouterHostRegistration>(host.host)
+            .is_some_and(|registration| registration.incarnation() == host.registration_incarnation)
         && validated_host_candidate_is_current(world, &host.candidate)
         && record_is_exact
         && cleanup_claim_has_exact_authority(world, &host.top_slot_claim)
         && parent_is_exact
         && membership_is_exact
+}
+
+#[cfg(feature = "test-support")]
+fn inject_commit_sealed_registration_removal(world: &mut World, entry: &mut RouterEntry) {
+    if !std::mem::take(&mut entry.commit_sealed_registration_removal_armed) {
+        return;
+    }
+    let Some(host) = entry.host.as_ref().map(|binding| binding.host) else {
+        return;
+    };
+    if let Ok(mut host) = world.get_entity_mut(host)
+        && host
+            .take::<crate::app_ext::RouterHostRegistration>()
+            .is_some()
+    {
+        entry.commit_sealed_registration_removal_fired = true;
+    }
+}
+
+#[cfg(not(feature = "test-support"))]
+fn inject_commit_sealed_registration_removal(_world: &mut World, _entry: &mut RouterEntry) {}
+
+#[cfg(feature = "test-support")]
+fn commit_sealed_registration_removal_is_armed(entry: &RouterEntry) -> bool {
+    entry.commit_sealed_registration_removal_armed
+}
+
+#[cfg(not(feature = "test-support"))]
+fn commit_sealed_registration_removal_is_armed(_entry: &RouterEntry) -> bool {
+    false
 }
 
 fn reconciliation_preflight(
@@ -11754,7 +12289,76 @@ fn store_back_target_applied_commit_permanent(
     ));
 }
 
-fn drive_back_target_applied_commit(world: &mut World, entry: &mut RouterEntry) -> bool {
+#[inline(never)]
+fn drive_back_target_applied_classification(world: &mut World, entry: &mut RouterEntry) {
+    if !matches!(
+        entry.pending_back_target_execution.as_ref(),
+        Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::Active(_)
+        ))
+    ) {
+        return;
+    }
+    let Some(PendingBackTargetExecution::Classifying(PendingBackTargetClassification::Active(
+        owner,
+    ))) = entry.pending_back_target_execution.take()
+    else {
+        unreachable!("the observed active classification owner remains whole");
+    };
+    match classify_back_target(world, entry, owner) {
+        ReconciliationPreparationOutcome::Matched(ReconciliationPreparationDecision::Ready(
+            owner,
+        )) => {
+            let Some(pending) = entry.pending_commit.take() else {
+                entry.pending_back_target_execution =
+                    Some(PendingBackTargetExecution::Classifying(
+                        PendingBackTargetClassification::ReadyAwaitingAcceptance(owner),
+                    ));
+                return;
+            };
+            publish_ready_back_target(world, entry, pending, owner);
+        }
+        ReconciliationPreparationOutcome::Matched(
+            ReconciliationPreparationDecision::PendingRejected { owner, evidence },
+        ) => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::PendingRejectedUnaccepted { owner, evidence },
+            ));
+        }
+        ReconciliationPreparationOutcome::Matched(
+            ReconciliationPreparationDecision::AuthorityLost { owner, evidence },
+        ) => {
+            let classification =
+                if evidence.is_missing_resource() || evidence.is_host_binding_authority_loss() {
+                    PendingBackTargetClassification::AuthorityLostUnaccepted { owner, evidence }
+                } else {
+                    accept_classified_back_target_authority_lost(world, entry, owner, evidence)
+                };
+            entry.pending_back_target_execution =
+                Some(PendingBackTargetExecution::Classifying(classification));
+        }
+        ReconciliationPreparationOutcome::Matched(
+            ReconciliationPreparationDecision::Permanent(owner),
+        ) => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::Permanent(owner),
+            ));
+        }
+        ReconciliationPreparationOutcome::PairingMismatch { owner, mismatch } => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::PairingMismatch { owner, mismatch },
+            ));
+        }
+        ReconciliationPreparationOutcome::EntryMismatch { owner, evidence } => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::EntryMismatch { owner, evidence },
+            ));
+        }
+    }
+}
+
+#[inline(never)]
+fn advance_back_target_applied_commit(_world: &mut World, entry: &mut RouterEntry) -> bool {
     if !matches!(
         entry.pending_back_target_execution.as_ref(),
         Some(PendingBackTargetExecution::ResumeBlocked(
@@ -11892,63 +12496,16 @@ fn drive_back_target_applied_commit(world: &mut World, entry: &mut RouterEntry) 
             continuation,
         }),
     ));
-    let Some(PendingBackTargetExecution::Classifying(PendingBackTargetClassification::Active(
-        owner,
-    ))) = entry.pending_back_target_execution.take()
-    else {
-        return true;
-    };
-    match classify_back_target(world, entry, owner) {
-        ReconciliationPreparationOutcome::Matched(ReconciliationPreparationDecision::Ready(
-            owner,
-        )) => {
-            let Some(pending) = entry.pending_commit.take() else {
-                entry.pending_back_target_execution =
-                    Some(PendingBackTargetExecution::Classifying(
-                        PendingBackTargetClassification::ReadyAwaitingAcceptance(owner),
-                    ));
-                return true;
-            };
-            publish_ready_back_target(world, entry, pending, owner);
-        }
-        ReconciliationPreparationOutcome::Matched(
-            ReconciliationPreparationDecision::PendingRejected { owner, evidence },
-        ) => {
-            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
-                PendingBackTargetClassification::PendingRejectedUnaccepted { owner, evidence },
-            ));
-        }
-        ReconciliationPreparationOutcome::Matched(
-            ReconciliationPreparationDecision::AuthorityLost { owner, evidence },
-        ) => {
-            let classification =
-                if evidence.is_missing_resource() || evidence.is_host_binding_authority_loss() {
-                    PendingBackTargetClassification::AuthorityLostUnaccepted { owner, evidence }
-                } else {
-                    accept_classified_back_target_authority_lost(world, entry, owner, evidence)
-                };
-            entry.pending_back_target_execution =
-                Some(PendingBackTargetExecution::Classifying(classification));
-        }
-        ReconciliationPreparationOutcome::Matched(
-            ReconciliationPreparationDecision::Permanent(owner),
-        ) => {
-            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
-                PendingBackTargetClassification::Permanent(owner),
-            ));
-        }
-        ReconciliationPreparationOutcome::PairingMismatch { owner, mismatch } => {
-            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
-                PendingBackTargetClassification::PairingMismatch { owner, mismatch },
-            ));
-        }
-        ReconciliationPreparationOutcome::EntryMismatch { owner, evidence } => {
-            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
-                PendingBackTargetClassification::EntryMismatch { owner, evidence },
-            ));
-        }
-    }
     true
+}
+
+#[cfg(test)]
+fn drive_back_target_applied_commit(world: &mut World, entry: &mut RouterEntry) -> bool {
+    let handled = advance_back_target_applied_commit(world, entry);
+    if handled {
+        drive_back_target_applied_classification(world, entry);
+    }
+    handled
 }
 
 fn drive_accepted_back_target_authority_lost(world: &World, entry: &mut RouterEntry) -> bool {
@@ -12243,7 +12800,7 @@ fn drive_back_target_authority_protocol(world: &mut World, entry: &mut RouterEnt
         return true;
     }
 
-    match begin_authority_settlement(world, entry, active, pending) {
+    match begin_authority_settlement(world, entry, active, pending, None) {
         AuthoritySettlementBeginOutcome::Begun => {
             drop(history);
             drop(continuation);
@@ -12485,7 +13042,8 @@ fn drive_back_target_pending_rejected(entry: &mut RouterEntry) -> bool {
 }
 
 fn drive_back_target_root_commit(world: &mut World, entry: &mut RouterEntry) -> bool {
-    if drive_back_target_applied_commit(world, entry) {
+    if advance_back_target_applied_commit(world, entry) {
+        drive_back_target_applied_classification(world, entry);
         let _ = drive_back_target_authority_protocol(world, entry);
         let _ = drive_accepted_back_target_authority_lost(world, entry);
         return true;
@@ -12526,7 +13084,8 @@ fn drive_back_target_root_commit(world: &mut World, entry: &mut RouterEntry) -> 
                 pending,
             }),
         ));
-        let _ = drive_back_target_applied_commit(world, entry);
+        let _ = advance_back_target_applied_commit(world, entry);
+        drive_back_target_applied_classification(world, entry);
         return true;
     }
     let Some(task) = pending.final_task.take() else {
@@ -12541,7 +13100,8 @@ fn drive_back_target_root_commit(world: &mut World, entry: &mut RouterEntry) -> 
         BackTargetAppliedReport::LegacyLeaf,
     ) {
         RouteBackTargetAppliedOutcome::Handled => {
-            let _ = drive_back_target_applied_commit(world, entry);
+            let _ = advance_back_target_applied_commit(world, entry);
+            drive_back_target_applied_classification(world, entry);
             true
         }
         RouteBackTargetAppliedOutcome::NonTarget {
@@ -13110,6 +13670,7 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                             entry,
                             active,
                             pending,
+                            None,
                         ) {
                             AuthoritySettlementBeginOutcome::Begun => {}
                             AuthoritySettlementBeginOutcome::RetryablePreparation {
@@ -13255,11 +13816,6 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                                                 };
                                                 let manifest_digest = frozen_manifest.digest();
                                                 let obligation_count = frozen_manifest.len();
-                                                let manifest = CleanupManifest::new(
-                                                    logical_roots.clone(),
-                                                    manifest_digest,
-                                                    obligation_count,
-                                                );
                                                 let reserved_ledger =
                                                     match CleanupLedger::reserve(frozen_manifest) {
                                                         Ok(reserved) => reserved,
@@ -13290,9 +13846,6 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                                                 let claim_rebind = splice_owner
                                                     .as_ref()?
                                                     .prepare_claim_rebind(&resulting_claims)?;
-                                                let presentation_plan =
-                                                    prepare_presentation_mutation(world, &targets)?
-                                                        .seal_commit(isolate_count)?;
                                                 if pending.ticket.is_none() {
                                                     let task = pending.final_task.take().expect(
                                                         "fully preflighted legacy leaf task remains owned",
@@ -13304,30 +13857,101 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                                                     );
                                                 }
                                                 let ticket = pending.ticket.as_ref()?;
-                                                let prepared = match entry
-                                                    .engine
-                                                    .prepare_commit(ticket, manifest)
-                                                {
-                                                    Ok(prepared) => prepared,
-                                                    Err(error) => {
-                                                        commit_authority_contradiction = Some(
-                                                            match error {
-                                                                IntegrationError::InvalidManifest => {
-                                                                    BeginAuthoritySettlementErrorKind::InvalidManifest
-                                                                }
-                                                                IntegrationError::Exhausted
-                                                                | IntegrationError::AwaitingHost
-                                                                | IntegrationError::OutstandingAdmission
-                                                                | IntegrationError::AuthorityExists
-                                                                | IntegrationError::ForeignRouter
-                                                                | IntegrationError::Duplicate
-                                                                | IntegrationError::Stale
-                                                                | IntegrationError::Invalid => {
-                                                                    BeginAuthoritySettlementErrorKind::Stale
-                                                                }
-                                                            },
-                                                        );
+                                                let mut timing_seam_prepared = None;
+                                                if commit_sealed_registration_removal_is_armed(
+                                                    entry,
+                                                ) {
+                                                    let manifest = CleanupManifest::new(
+                                                        logical_roots.clone(),
+                                                        manifest_digest,
+                                                        obligation_count,
+                                                    );
+                                                    let prepared = match entry
+                                                        .engine
+                                                        .prepare_commit(ticket, manifest)
+                                                    {
+                                                        Ok(prepared) => prepared,
+                                                        Err(error) => {
+                                                            commit_authority_contradiction = Some(
+                                                                match error {
+                                                                    IntegrationError::InvalidManifest => {
+                                                                        BeginAuthoritySettlementErrorKind::InvalidManifest
+                                                                    }
+                                                                    IntegrationError::Exhausted
+                                                                    | IntegrationError::AwaitingHost
+                                                                    | IntegrationError::OutstandingAdmission
+                                                                    | IntegrationError::AuthorityExists
+                                                                    | IntegrationError::ForeignRouter
+                                                                    | IntegrationError::Duplicate
+                                                                    | IntegrationError::Stale
+                                                                    | IntegrationError::Invalid => {
+                                                                        BeginAuthoritySettlementErrorKind::Stale
+                                                                    }
+                                                                },
+                                                            );
+                                                            return None;
+                                                        }
+                                                    };
+                                                    inject_commit_sealed_registration_removal(
+                                                        world, entry,
+                                                    );
+                                                    if !entry.host.as_ref().is_some_and(|host| {
+                                                        current_host_binding_is_exact_with_registry(
+                                                            world, &registry, host,
+                                                        )
+                                                    }) {
+                                                        if entry
+                                                            .engine
+                                                            .cancel_prepared_commit_for_authority_settlement(
+                                                                prepared,
+                                                            )
+                                                            .is_err()
+                                                        {
+                                                            commit_authority_contradiction = Some(
+                                                                BeginAuthoritySettlementErrorKind::Stale,
+                                                            );
+                                                        }
                                                         return None;
+                                                    }
+                                                    timing_seam_prepared = Some(prepared);
+                                                }
+                                                let presentation_plan =
+                                                    prepare_presentation_mutation(world, &targets)?
+                                                        .seal_commit(isolate_count)?;
+                                                let prepared = match timing_seam_prepared {
+                                                    Some(prepared) => prepared,
+                                                    None => {
+                                                        let manifest = CleanupManifest::new(
+                                                            logical_roots.clone(),
+                                                            manifest_digest,
+                                                            obligation_count,
+                                                        );
+                                                        match entry
+                                                            .engine
+                                                            .prepare_commit(ticket, manifest)
+                                                        {
+                                                            Ok(prepared) => prepared,
+                                                            Err(error) => {
+                                                                commit_authority_contradiction = Some(
+                                                                    match error {
+                                                                        IntegrationError::InvalidManifest => {
+                                                                            BeginAuthoritySettlementErrorKind::InvalidManifest
+                                                                        }
+                                                                        IntegrationError::Exhausted
+                                                                        | IntegrationError::AwaitingHost
+                                                                        | IntegrationError::OutstandingAdmission
+                                                                        | IntegrationError::AuthorityExists
+                                                                        | IntegrationError::ForeignRouter
+                                                                        | IntegrationError::Duplicate
+                                                                        | IntegrationError::Stale
+                                                                        | IntegrationError::Invalid => {
+                                                                            BeginAuthoritySettlementErrorKind::Stale
+                                                                        }
+                                                                    },
+                                                                );
+                                                                return None;
+                                                            }
+                                                        }
                                                     }
                                                 };
                                                 let engine = match entry
@@ -13473,6 +14097,7 @@ fn begin_authority_settlement(
     entry: &mut RouterEntry,
     active: RealizedBranch,
     pending: PendingCommit,
+    logical_roots_override: Option<Vec<RouteFrameVersion>>,
 ) -> AuthoritySettlementBeginOutcome {
     let Some(host) = entry.host.as_ref() else {
         return AuthoritySettlementBeginOutcome::ProtocolContradiction {
@@ -13481,6 +14106,7 @@ fn begin_authority_settlement(
             kind: BeginAuthoritySettlementErrorKind::Stale,
         };
     };
+    let cause = precommit_authority_cause(world, host);
     let frozen = {
         let registry = world.resource::<RouteEntityRegistry>();
         match FrozenCleanupManifest::from_authority_settlement(
@@ -13573,12 +14199,14 @@ fn begin_authority_settlement(
         top_slot,
         top_slot_claim,
         candidate,
+        registration_incarnation,
         lease,
     } = entry
         .host
         .take()
         .expect("authority settlement retains its exact host binding");
-    let logical_roots = authority_settlement_logical_roots(&pending.branch, &active);
+    let logical_roots = logical_roots_override
+        .unwrap_or_else(|| authority_settlement_logical_roots(&pending.branch, &active));
     let retired_host = RetiredHostBinding {
         version: version.clone(),
         slot_id,
@@ -13586,12 +14214,14 @@ fn begin_authority_settlement(
         top_slot,
         top_slot_claim: top_slot_claim.clone(),
         candidate: candidate.clone(),
+        registration_incarnation,
     };
     let mut settlement_owner = Some((reserved, active, pending, retired_host));
     let engine = &mut entry.engine;
     let cleanup_ledger = &mut entry.cleanup_ledger;
-    match engine.begin_authority_settlement_retaining(
+    match engine.begin_authority_settlement_for_cause_retaining(
         lease,
+        cause,
         CleanupManifest::new(logical_roots, manifest_digest, obligation_count),
         |batch| {
             isolation.apply(world);
@@ -13617,6 +14247,7 @@ fn begin_authority_settlement(
                 top_slot,
                 top_slot_claim,
                 candidate,
+                registration_incarnation,
                 lease: error.into_owner(),
             });
             let (_, active, pending, _) = settlement_owner
@@ -13724,6 +14355,104 @@ impl PreparedAuthorityIsolation {
                     crate::components::RouterInputBarrier::deny_all();
             }
         }
+    }
+
+    fn apply_guarded(self, world: &mut World, guard: &impl Fn(&World) -> bool) -> bool {
+        if let Some(gate) = self.gate
+            && let Some(mut current) = world.get_resource_mut::<RouterInputGate>()
+        {
+            gate.apply(&mut current);
+        }
+        if world
+            .get_resource::<InputFocus>()
+            .and_then(InputFocus::get)
+            .is_some_and(|focused| self.focus.contains(&focused))
+            && let Some(mut focus) = world.get_resource_mut::<InputFocus>()
+        {
+            *focus = InputFocus::default();
+        }
+        if world
+            .get_resource::<RouteFocusState>()
+            .and_then(RouteFocusState::focused)
+            .is_some_and(|focused| self.focus.contains(&focused))
+            && let Some(mut focus) = world.get_resource_mut::<RouteFocusState>()
+        {
+            focus.set_focused(None);
+        }
+        if !guard(world) {
+            return false;
+        }
+        for entity in self.entities {
+            if entity.visibility {
+                *world
+                    .get_mut::<Visibility>(entity.entity)
+                    .expect("prepared post-commit isolation retains Visibility") =
+                    Visibility::Hidden;
+                world.flush();
+                if !guard(world) {
+                    return false;
+                }
+            }
+            if entity.pickable {
+                *world
+                    .get_mut::<Pickable>(entity.entity)
+                    .expect("prepared post-commit isolation retains Pickable") = Pickable::IGNORE;
+                world.flush();
+                if !guard(world) {
+                    return false;
+                }
+            }
+            if entity.barrier {
+                *world
+                    .get_mut::<RouterInputBarrier>(entity.entity)
+                    .expect("prepared post-commit isolation retains input barrier") =
+                    RouterInputBarrier::deny_all();
+                world.flush();
+                if !guard(world) {
+                    return false;
+                }
+            }
+        }
+        guard(world)
+    }
+}
+
+impl FrozenPostCommitInputIsolation {
+    fn is_current(&self, world: &World) -> bool {
+        (!self.gate_required
+            || world.get_resource::<RouterInputGate>().is_some_and(|gate| {
+                self.gate_targets.iter().all(|entity| {
+                    !gate.allows_pointer(*entity)
+                        && !gate.allows_keyboard(*entity)
+                        && !gate.allows_gamepad(*entity)
+                })
+            }))
+            && world
+                .get_resource::<InputFocus>()
+                .and_then(InputFocus::get)
+                .is_none_or(|focused| !self.focus.contains(&focused))
+            && world
+                .get_resource::<RouteFocusState>()
+                .and_then(RouteFocusState::focused)
+                .is_none_or(|focused| !self.focus.contains(&focused))
+    }
+}
+
+impl PreparedPostCommitInputIsolation {
+    fn apply_guarded(
+        self,
+        world: &mut World,
+        guard: &impl Fn(&World) -> bool,
+    ) -> Result<FrozenPostCommitInputIsolation, PostCommitInputIsolationFailure> {
+        let frozen = self.frozen;
+        let combined_guard = |world: &World| frozen.is_current(world) && guard(world);
+        if !self.mutation.apply_guarded(world, &combined_guard) || !combined_guard(world) {
+            return Err(PostCommitInputIsolationFailure::RefreezeRejected);
+        }
+        if let Some(contradiction) = self.contradiction {
+            return Err(PostCommitInputIsolationFailure::Permanent(contradiction));
+        }
+        Ok(frozen)
     }
 }
 
@@ -13880,6 +14609,64 @@ fn prepare_authority_isolation_targets<'a>(
             fail_closed: prepared,
         }
     }
+}
+
+fn prepare_post_commit_input_isolation(
+    world: &World,
+    active: &RealizedBranch,
+    original: &FrozenOriginalCleanupLedgerTransfer,
+    authority: &PreparedPostCommitAuthorityLedger,
+) -> Result<PreparedPostCommitInputIsolation, PostCommitInputIsolationFailure> {
+    let mut gate_targets = active.interactive_entities();
+    gate_targets.extend(original.partition_entities().iter().copied());
+    gate_targets.sort_by_key(|entity| entity.to_bits());
+    gate_targets.dedup();
+    let gate_required = world.get_resource::<RouterInputGate>().is_some();
+    let preparation = prepare_authority_isolation_targets(
+        world,
+        authority
+            .partition()
+            .targets()
+            .iter()
+            .map(|target| target.claim()),
+        gate_targets.iter().copied(),
+        authority.partition().targets().len(),
+    );
+    let (mut mutation, contradiction) = match preparation {
+        AuthorityIsolationPreparation::Ready(prepared) => (prepared, None),
+        AuthorityIsolationPreparation::RetryableCapacity => {
+            return Err(PostCommitInputIsolationFailure::RetryableCapacity);
+        }
+        AuthorityIsolationPreparation::PermanentContradiction {
+            contradiction,
+            fail_closed,
+        } => (fail_closed, Some(contradiction)),
+    };
+    let original_focus = observed_descendant_closure(
+        world,
+        original
+            .immutable_entities()
+            .iter()
+            .copied()
+            .filter(|entity| world.get_entity(*entity).is_ok()),
+    );
+    mutation
+        .focus
+        .try_reserve(original_focus.len())
+        .map_err(|_| PostCommitInputIsolationFailure::RetryableCapacity)?;
+    mutation.focus.extend(original_focus);
+    mutation.focus.sort_by_key(|entity| entity.to_bits());
+    mutation.focus.dedup();
+    let frozen = FrozenPostCommitInputIsolation {
+        focus: mutation.focus.clone(),
+        gate_targets,
+        gate_required,
+    };
+    Ok(PreparedPostCommitInputIsolation {
+        mutation,
+        frozen,
+        contradiction,
+    })
 }
 
 fn target_authority_missing_pickable_repair_is_exact(
@@ -15997,6 +16784,7 @@ fn begin_failed_authority_settlement(
             kind: BeginAuthoritySettlementErrorKind::Stale,
         };
     };
+    let cause = precommit_authority_cause(world, host);
     let frozen = {
         let registry = world.resource::<RouteEntityRegistry>();
         match manifest.finalize_failed_authority_settlement(
@@ -16094,9 +16882,10 @@ fn begin_failed_authority_settlement(
     let mut settlement_owner = Some((reserved, active, failed, retired_host));
     let engine = &mut entry.engine;
     let cleanup_ledger = &mut entry.cleanup_ledger;
-    match engine.begin_failed_authority_settlement_retaining(
+    match engine.begin_failed_authority_settlement_for_cause_retaining(
         lease,
         trigger,
+        cause,
         CleanupManifest::new(logical_roots, manifest_digest, obligation_count),
         |batch| {
             isolation.apply(world);
@@ -18183,10 +18972,1666 @@ fn drive_target_preparation_permanent_cleanup(world: &mut World, entry: &mut Rou
     true
 }
 
+const POST_COMMIT_L_OBLIGATION_KEY: u64 = 0x5232_4c4f_424c;
+const POST_COMMIT_L_RECEIPT_KEY: u64 = 0x5232_4c52_4350;
+const POST_COMMIT_L_SOURCE_KEY: u64 = 0x5232_4c53_5243;
+const POST_COMMIT_A_OBLIGATION_KEY: u64 = 0x5232_414f_424c;
+const POST_COMMIT_A_SOURCE_KEY: u64 = 0x5232_4153_5243;
+const POST_COMMIT_H_OBLIGATION_KEY: u64 = 0x5232_484f_424c;
+const POST_COMMIT_H_SOURCE_KEY: u64 = 0x5232_4853_5243;
+
+impl FrozenRetiredHostEdge {
+    fn freeze(
+        world: &World,
+        host: &HostBinding,
+    ) -> Result<Self, RetiredHostEdgeFreezePermanentEvidence> {
+        if host.top_slot_claim.entity() != host.top_slot
+            || host.candidate.host() != host.host
+            || !matches!(
+                host.top_slot_claim.owner(),
+                RegistryOwner::Committed(EntityOwner::HostTopSlot { host: version, slot })
+                    if version == &host.version && *slot == host.slot_id
+            )
+        {
+            return Err(RetiredHostEdgeFreezePermanentEvidence::InvalidBinding);
+        }
+        let host_present = world.get_entity(host.host).is_ok();
+        let children_component = world.components().component_id::<Children>();
+        let host_non_children_manifest =
+            ComponentManifest::from_world(world, host.host).map(|manifest| {
+                ComponentManifest::new(
+                    manifest
+                        .component_ids()
+                        .iter()
+                        .copied()
+                        .filter(|component| Some(*component) != children_component),
+                )
+            });
+        let children_before = world
+            .get::<Children>(host.host)
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let top_parent_before = world.get::<ChildOf>(host.top_slot).map(ChildOf::parent);
+        let membership = children_before
+            .iter()
+            .filter(|child| **child == host.top_slot)
+            .count();
+        if host_present
+            && ((top_parent_before == Some(host.host) && membership != 1)
+                || (top_parent_before != Some(host.host) && membership != 0))
+        {
+            return Err(RetiredHostEdgeFreezePermanentEvidence::InvalidRelationship);
+        }
+        let mut children_after = children_before.clone();
+        children_after.retain(|child| *child != host.top_slot);
+        let host_parent = world.get::<ChildOf>(host.host).map(ChildOf::parent);
+        let mut host_ancestry = Vec::new();
+        let mut cursor = host_parent;
+        while let Some(entity) = cursor {
+            if entity == host.host || host_ancestry.contains(&entity) {
+                return Err(RetiredHostEdgeFreezePermanentEvidence::RelationshipCycle);
+            }
+            host_ancestry.push(entity);
+            cursor = world.get::<ChildOf>(entity).map(ChildOf::parent);
+        }
+        let obligation_binding = host.host.to_bits().rotate_left(11)
+            ^ host.top_slot.to_bits().rotate_left(29)
+            ^ host.registration_incarnation;
+        let physical_source_binding = obligation_binding
+            ^ (children_before.len() as u64).rotate_left(17)
+            ^ top_parent_before.map_or(0, |entity| entity.to_bits());
+        Ok(Self {
+            host: host.host,
+            top_slot: host.top_slot,
+            top_slot_claim: host.top_slot_claim.clone(),
+            registration_incarnation: host.registration_incarnation,
+            host_present,
+            host_non_children_manifest,
+            host_parent,
+            host_ancestry,
+            children_before,
+            children_after,
+            top_parent_before,
+            obligation_binding,
+            physical_source_binding,
+        })
+    }
+
+    fn host_projection_is_current(&self, world: &World, detached: bool) -> bool {
+        if !self.host_present {
+            return world.get_entity(self.host).is_err();
+        }
+        if world.get_entity(self.host).is_err()
+            || world.get::<ChildOf>(self.host).map(ChildOf::parent) != self.host_parent
+        {
+            return false;
+        }
+        let children_component = world.components().component_id::<Children>();
+        let observed_host_manifest =
+            ComponentManifest::from_world(world, self.host).map(|manifest| {
+                ComponentManifest::new(
+                    manifest
+                        .component_ids()
+                        .iter()
+                        .copied()
+                        .filter(|component| Some(*component) != children_component),
+                )
+            });
+        if observed_host_manifest != self.host_non_children_manifest {
+            return false;
+        }
+        let mut ancestry = Vec::new();
+        let mut cursor = self.host_parent;
+        while let Some(entity) = cursor {
+            if entity == self.host || ancestry.contains(&entity) {
+                return false;
+            }
+            ancestry.push(entity);
+            cursor = world.get::<ChildOf>(entity).map(ChildOf::parent);
+        }
+        if ancestry != self.host_ancestry {
+            return false;
+        }
+        let expected_children = if detached {
+            &self.children_after
+        } else {
+            &self.children_before
+        };
+        let observed_children = world
+            .get::<Children>(self.host)
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let observed_parent = world.get::<ChildOf>(self.top_slot).map(ChildOf::parent);
+        observed_children == *expected_children
+            && if detached {
+                observed_parent != Some(self.host)
+            } else {
+                observed_parent == self.top_parent_before
+            }
+    }
+}
+
+fn post_commit_cleanup_plan_entry(
+    target: &crate::cleanup::FrozenPostCommitAuthorityTarget,
+) -> PostCommitPlannedCleanupProjection {
+    PostCommitPlannedCleanupProjection::from_trusted_ecs_freeze(
+        PostCommitSettlementKeyProjection::from_trusted_ecs_freeze(
+            POST_COMMIT_A_OBLIGATION_KEY,
+            vec![
+                target.index() as u64,
+                target.entity().to_bits(),
+                target.obligation_binding(),
+            ],
+        ),
+        PostCommitSettlementKeyProjection::from_trusted_ecs_freeze(
+            POST_COMMIT_A_SOURCE_KEY,
+            vec![
+                target.index() as u64,
+                target.entity().to_bits(),
+                target.physical_source_binding(),
+            ],
+        ),
+        target.disposition().public(),
+    )
+}
+
+fn bind_post_commit_settlement_plan(
+    original: &FrozenOriginalCleanupLedgerTransfer,
+    authority: &FrozenPostCommitAuthorityPartition,
+    edge: &FrozenRetiredHostEdge,
+    builder: bevy_ui_router_core::integration::PostCommitSettlementPlanBuilder,
+) -> Result<
+    bevy_ui_router_core::integration::PostCommitSettlementPlan,
+    PostCommitSettlementPlanMismatchEvidence,
+> {
+    let settled_original = original
+        .indices()
+        .iter()
+        .filter_map(|entry| {
+            let receipt = entry.settled_receipt()?;
+            Some(
+                PostCommitSettledOriginalProjection::from_trusted_ecs_freeze(
+                    PostCommitSettlementKeyProjection::from_trusted_ecs_freeze(
+                        POST_COMMIT_L_OBLIGATION_KEY,
+                        vec![
+                            original.ledger_domain(),
+                            entry.index() as u64,
+                            entry.obligation_binding(),
+                        ],
+                    ),
+                    PostCommitSettlementKeyProjection::from_trusted_ecs_freeze(
+                        POST_COMMIT_L_RECEIPT_KEY,
+                        vec![
+                            original.ledger_domain(),
+                            receipt.obligation() as u64,
+                            receipt.attempt_revision(),
+                            receipt.binding(),
+                        ],
+                    ),
+                    receipt.disposition().public(),
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let residual_original = original
+        .indices()
+        .iter()
+        .filter(|entry| entry.settled_receipt().is_none())
+        .map(|entry| {
+            PostCommitPlannedCleanupProjection::from_trusted_ecs_freeze(
+                PostCommitSettlementKeyProjection::from_trusted_ecs_freeze(
+                    POST_COMMIT_L_OBLIGATION_KEY,
+                    vec![
+                        original.ledger_domain(),
+                        entry.index() as u64,
+                        entry.obligation_binding(),
+                    ],
+                ),
+                PostCommitSettlementKeyProjection::from_trusted_ecs_freeze(
+                    POST_COMMIT_L_SOURCE_KEY,
+                    vec![
+                        original.ledger_domain(),
+                        entry.index() as u64,
+                        entry.physical_source_binding(),
+                    ],
+                ),
+                entry.disposition().public(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let authority_non_top = authority
+        .non_top_targets()
+        .map(post_commit_cleanup_plan_entry)
+        .collect::<Vec<_>>();
+    let authority_top_target = authority
+        .top_target()
+        .expect("the frozen authority partition owns exactly one top slot");
+    let authority_top = post_commit_cleanup_plan_entry(authority_top_target);
+    let host_obligation = PostCommitSettlementKeyProjection::from_trusted_ecs_freeze(
+        POST_COMMIT_H_OBLIGATION_KEY,
+        vec![
+            edge.host.to_bits(),
+            edge.top_slot.to_bits(),
+            edge.registration_incarnation,
+            edge.obligation_binding,
+        ],
+    );
+    let host_edge = PostCommitPlannedHostEdgeProjection::from_trusted_ecs_freeze(
+        host_obligation.clone(),
+        PostCommitSettlementKeyProjection::from_trusted_ecs_freeze(
+            POST_COMMIT_H_SOURCE_KEY,
+            vec![
+                edge.host.to_bits(),
+                edge.top_slot.to_bits(),
+                edge.physical_source_binding,
+            ],
+        ),
+    );
+    let prior_trace_start = builder
+        .prior_trace_len()
+        .checked_sub(settled_original.len())
+        .unwrap_or(usize::MAX);
+    builder.bind_trusted_ecs(PostCommitSettlementPlanDescriptor::from_trusted_ecs_freeze(
+        prior_trace_start,
+        settled_original,
+        residual_original,
+        authority_non_top,
+        authority_top,
+        host_obligation,
+        host_edge,
+    ))
+}
+
+enum PostCommitPlanBindFailure {
+    Plan(PostCommitSettlementPlanMismatchEvidence),
+    Authority(crate::cleanup::PreparedAuthorityLedgerBindingMismatch),
+    Isolation(PostCommitInputIsolationFailure),
+}
+
+enum PostCommitAcceptedInertEvidence {
+    Receiver(PostCommitReceiverMismatchView),
+    Retryable(PostCommitAuthorityBeginRetryEvidence),
+    Permanent(PostCommitAuthorityBeginPermanentEvidence),
+}
+
+impl PostCommitAcceptedInertEvidence {
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::Retryable(_))
+    }
+}
+
+enum PostCommitBoundInertEvidence {
+    Binding(PostCommitPlanBindFailure),
+    Receiver(PostCommitReceiverMismatchView),
+    Retryable(PostCommitAuthorityBeginRetryEvidence),
+    Permanent(PostCommitAuthorityBeginPermanentEvidence),
+}
+
+impl PostCommitBoundInertEvidence {
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::Retryable(_))
+    }
+}
+
+fn post_commit_authority_loss_cause(
+    world: &World,
+    host: &HostBinding,
+) -> Option<PostCommitAuthorityCause> {
+    if current_host_binding_is_exact(world, host) {
+        return None;
+    }
+    Some(if world.get_resource::<RouteEntityRegistry>().is_none() {
+        PostCommitAuthorityCause::RequiredResourcesLost
+    } else if world.get_entity(host.host).is_err() {
+        PostCommitAuthorityCause::HostEntityMissing
+    } else if world
+        .get::<RouterHostRegistration>(host.host)
+        .is_none_or(|registration| registration.incarnation() != host.registration_incarnation)
+    {
+        PostCommitAuthorityCause::HostRegistrationLost
+    } else {
+        return None;
+    })
+}
+
+fn begin_post_commit_compound(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    cause: PostCommitAuthorityCause,
+) -> bool {
+    if entry.post_commit_compound.is_some() {
+        return true;
+    }
+    let Some(mut original) = entry.cleanup_ledger.take() else {
+        return false;
+    };
+    if matches!(
+        original.preflight_post_commit_transfer_source_kind(),
+        Err(PostCommitOriginalFreezeFailure::IneligibleSource)
+    ) {
+        entry.cleanup_ledger = Some(original);
+        return false;
+    }
+    if original.post_commit_transfer_requires_ordinary_settlement(world) {
+        let Some(attempt) = original.attempt(world) else {
+            entry.cleanup_ledger = Some(original);
+            return true;
+        };
+        if !original.settle(world, attempt) {
+            entry.cleanup_ledger = Some(original);
+            return true;
+        }
+    }
+    if !entry.observe_cleanup_receipts(&mut original) {
+        entry.post_commit_compound = Some(
+            PostCommitCompoundHolder::PreAcceptInert {
+                physical: PostCommitPreAcceptPhysicalOwner {
+                    original,
+                    original_freeze: None,
+                    authority: None,
+                    edge: None,
+                },
+                evidence: PostCommitPreAcceptInertEvidence::ReceiptObservationMismatch,
+            }
+            .into(),
+        );
+        return true;
+    }
+    let original_freeze = match original.freeze_for_post_commit_transfer(world) {
+        Ok(freeze) => freeze,
+        Err(PostCommitOriginalFreezeFailure::IneligibleSource) => {
+            entry.cleanup_ledger = Some(original);
+            return false;
+        }
+        Err(PostCommitOriginalFreezeFailure::OrdinarySettlementRequired) => {
+            entry.cleanup_ledger = Some(original);
+            return true;
+        }
+        Err(PostCommitOriginalFreezeFailure::RetryableCapacity) => {
+            entry.cleanup_ledger = Some(original);
+            return true;
+        }
+        Err(PostCommitOriginalFreezeFailure::Permanent(evidence)) => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::PreAcceptInert {
+                    physical: PostCommitPreAcceptPhysicalOwner {
+                        original,
+                        original_freeze: None,
+                        authority: None,
+                        edge: None,
+                    },
+                    evidence: PostCommitPreAcceptInertEvidence::Original(evidence),
+                }
+                .into(),
+            );
+            return true;
+        }
+    };
+    let (Some(active), Some(host)) = (entry.active.as_ref(), entry.host.as_ref()) else {
+        entry.post_commit_compound = Some(
+            PostCommitCompoundHolder::PreAcceptInert {
+                physical: PostCommitPreAcceptPhysicalOwner {
+                    original,
+                    original_freeze: Some(original_freeze),
+                    authority: None,
+                    edge: None,
+                },
+                evidence: PostCommitPreAcceptInertEvidence::EntryOwnerMissing,
+            }
+            .into(),
+        );
+        return true;
+    };
+    let edge = match FrozenRetiredHostEdge::freeze(world, host) {
+        Ok(edge) => edge,
+        Err(evidence) => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::PreAcceptInert {
+                    physical: PostCommitPreAcceptPhysicalOwner {
+                        original,
+                        original_freeze: Some(original_freeze),
+                        authority: None,
+                        edge: None,
+                    },
+                    evidence: PostCommitPreAcceptInertEvidence::RetiredHostEdge(evidence),
+                }
+                .into(),
+            );
+            return true;
+        }
+    };
+    let authority = match PreparedPostCommitAuthorityLedger::freeze_and_reserve(
+        world,
+        active,
+        host,
+        &original_freeze,
+    ) {
+        Ok(authority) => authority,
+        Err(PostCommitAuthorityFreezeFailure::RetryableCapacity) => {
+            entry.cleanup_ledger = Some(original);
+            return true;
+        }
+        Err(PostCommitAuthorityFreezeFailure::Permanent(evidence)) => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::PreAcceptInert {
+                    physical: PostCommitPreAcceptPhysicalOwner {
+                        original,
+                        original_freeze: Some(original_freeze),
+                        authority: None,
+                        edge: Some(edge),
+                    },
+                    evidence: PostCommitPreAcceptInertEvidence::Authority(evidence),
+                }
+                .into(),
+            );
+            return true;
+        }
+    };
+    let Some(normal_batch) = original.batch() else {
+        entry.post_commit_compound = Some(
+            PostCommitCompoundHolder::PreAcceptInert {
+                physical: PostCommitPreAcceptPhysicalOwner {
+                    original,
+                    original_freeze: Some(original_freeze),
+                    authority: Some(authority),
+                    edge: Some(edge),
+                },
+                evidence: PostCommitPreAcceptInertEvidence::MissingNormalBatch,
+            }
+            .into(),
+        );
+        return true;
+    };
+    let transfer = match entry
+        .engine
+        .accept_post_commit_authority_transfer(normal_batch, cause)
+    {
+        PostCommitAuthorityAcceptanceOutcome::Accepted(transfer) => transfer,
+        PostCommitAuthorityAcceptanceOutcome::Mismatch { expected, observed } => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::PreAcceptInert {
+                    physical: PostCommitPreAcceptPhysicalOwner {
+                        original,
+                        original_freeze: Some(original_freeze),
+                        authority: Some(authority),
+                        edge: Some(edge),
+                    },
+                    evidence: PostCommitPreAcceptInertEvidence::CoreReceiver { expected, observed },
+                }
+                .into(),
+            );
+            return true;
+        }
+    };
+
+    let active = entry
+        .active
+        .take()
+        .expect("the accepted post-commit receiver retains active physical ownership");
+    let (host, lease) = entry
+        .host
+        .take()
+        .expect("the accepted post-commit receiver retains host ownership")
+        .into_retired();
+    let logical_roots = active
+        .frames()
+        .iter()
+        .rev()
+        .map(|frame| frame.frame().clone())
+        .collect::<Vec<_>>();
+    let physical = PreparedPostCommitPhysicalOwner {
+        original,
+        original_freeze,
+        authority,
+        active,
+        host,
+        edge,
+        input_isolation: None,
+    };
+    let source = PostCommitAuthorityPreparationSource::new(transfer, lease);
+    let (prepared, _authority_batch) = match entry.engine.prepare_post_commit_authority_transfer(
+        source,
+        CleanupManifest::new(
+            logical_roots,
+            physical.authority.manifest_digest(),
+            physical.authority.obligation_count(),
+        ),
+    ) {
+        PostCommitAuthorityPreparationOutcome::Prepared { owner, batch } => (owner, batch),
+        PostCommitAuthorityPreparationOutcome::Mismatch { source, evidence } => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::AcceptedInert {
+                    source,
+                    physical: Box::new(physical),
+                    evidence: Box::new(PostCommitAcceptedInertEvidence::Receiver(evidence)),
+                }
+                .into(),
+            );
+            return true;
+        }
+        PostCommitAuthorityPreparationOutcome::Retryable { source, evidence } => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::AcceptedInert {
+                    source,
+                    physical: Box::new(physical),
+                    evidence: Box::new(PostCommitAcceptedInertEvidence::Retryable(evidence)),
+                }
+                .into(),
+            );
+            return true;
+        }
+        PostCommitAuthorityPreparationOutcome::Permanent { source, evidence } => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::AcceptedInert {
+                    source,
+                    physical: Box::new(physical),
+                    evidence: Box::new(PostCommitAcceptedInertEvidence::Permanent(evidence)),
+                }
+                .into(),
+            );
+            return true;
+        }
+    };
+    let mut physical = physical;
+    physical.input_isolation = match prepare_post_commit_input_isolation(
+        world,
+        &physical.active,
+        &physical.original_freeze,
+        &physical.authority,
+    ) {
+        Ok(isolation) => Some(isolation),
+        Err(evidence) => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::PreparedInert {
+                    owner: prepared,
+                    physical,
+                    evidence: PostCommitPlanBindFailure::Isolation(evidence),
+                }
+                .into(),
+            );
+            return true;
+        }
+    };
+
+    let mut installed = None;
+    let outcome = entry.engine.begin_post_commit_authority_transfer(
+        prepared,
+        Box::new(physical),
+        |mut physical, observed_batch, builder| {
+            let plan = match bind_post_commit_settlement_plan(
+                &physical.original_freeze,
+                physical.authority.partition(),
+                &physical.edge,
+                builder,
+            ) {
+                Ok(plan) => plan,
+                Err(evidence) => {
+                    return Err((physical, PostCommitPlanBindFailure::Plan(evidence)));
+                }
+            };
+            if !physical.authority.batch_matches(observed_batch) {
+                return Err((
+                    physical,
+                    PostCommitPlanBindFailure::Authority(
+                        crate::cleanup::PreparedAuthorityLedgerBindingMismatch::WrongBatch,
+                    ),
+                ));
+            }
+            let Some(isolation) = physical.input_isolation.take() else {
+                return Err((
+                    physical,
+                    PostCommitPlanBindFailure::Isolation(
+                        PostCommitInputIsolationFailure::RefreezeRejected,
+                    ),
+                ));
+            };
+            let Some(original_removed) = physical
+                .original_freeze
+                .removed_entities_for_authority_refreeze(world, &physical.original, None)
+            else {
+                return Err((
+                    physical,
+                    PostCommitPlanBindFailure::Isolation(
+                        PostCommitInputIsolationFailure::RefreezeRejected,
+                    ),
+                ));
+            };
+            let input_isolation = match isolation.apply_guarded(world, &|world| {
+                physical
+                    .original_freeze
+                    .refreeze(world, &physical.original, None)
+                    && physical
+                        .authority
+                        .partition()
+                        .refreeze_allowing_input_isolation(world, &original_removed)
+                    && physical.edge.host_projection_is_current(world, false)
+            }) {
+                Ok(isolation) => isolation,
+                Err(evidence) => {
+                    return Err((physical, PostCommitPlanBindFailure::Isolation(evidence)));
+                }
+            };
+            if !physical.authority.commit_input_isolation(
+                world,
+                &physical.original_freeze,
+                &physical.original,
+            ) {
+                return Err((
+                    physical,
+                    PostCommitPlanBindFailure::Isolation(
+                        PostCommitInputIsolationFailure::RefreezeRejected,
+                    ),
+                ));
+            }
+            let PreparedPostCommitPhysicalOwner {
+                original,
+                original_freeze,
+                authority,
+                active,
+                host,
+                edge,
+                input_isolation: _,
+            } = *physical;
+            let authority = authority.bind_verified_batch(observed_batch.clone());
+            let (authority, partition) = authority.into_parts();
+            Ok((
+                Box::new(PostCommitCompoundPhysicalOwner {
+                    original,
+                    original_freeze,
+                    authority,
+                    partition,
+                    active,
+                    host,
+                    edge,
+                    input_isolation,
+                    original_cursor: 0,
+                    authority_non_top_cursor: 0,
+                    settled_authority: Vec::new(),
+                    edge_terminal: None,
+                    top_settled: false,
+                }),
+                plan,
+            ))
+        },
+        |physical, core| installed = Some((physical, core)),
+    );
+    match outcome {
+        PostCommitAuthorityBeginOutcome::Begun => {
+            let (physical, core) =
+                installed.expect("the infallible install callback publishes the compound owner");
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::Active(ActivePostCommitCompoundOwner {
+                    core,
+                    physical: *physical,
+                })
+                .into(),
+            );
+        }
+        PostCommitAuthorityBeginOutcome::BindingMismatch {
+            owner,
+            unbound,
+            evidence,
+        } => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::PreparedInert {
+                    owner,
+                    physical: *unbound,
+                    evidence,
+                }
+                .into(),
+            );
+        }
+        PostCommitAuthorityBeginOutcome::ReceiverMismatch {
+            owner,
+            bound,
+            evidence,
+        } => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::BoundInert {
+                    owner,
+                    physical: bound,
+                    evidence: Box::new(PostCommitBoundInertEvidence::Receiver(evidence)),
+                }
+                .into(),
+            );
+        }
+        PostCommitAuthorityBeginOutcome::Retryable {
+            owner,
+            bound,
+            evidence,
+        } => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::BoundInert {
+                    owner,
+                    physical: bound,
+                    evidence: Box::new(PostCommitBoundInertEvidence::Retryable(evidence)),
+                }
+                .into(),
+            );
+        }
+        PostCommitAuthorityBeginOutcome::Permanent {
+            owner,
+            bound,
+            evidence,
+        } => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::BoundInert {
+                    owner,
+                    physical: bound,
+                    evidence: Box::new(PostCommitBoundInertEvidence::Permanent(evidence)),
+                }
+                .into(),
+            );
+        }
+    }
+    true
+}
+
+fn resume_accepted_post_commit_compound(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    source: PostCommitAuthorityPreparationSource,
+    physical: PreparedPostCommitPhysicalOwner,
+) -> Box<PostCommitCompoundHolder> {
+    let logical_roots = physical
+        .active
+        .frames()
+        .iter()
+        .rev()
+        .map(|frame| frame.frame().clone())
+        .collect::<Vec<_>>();
+    match entry.engine.prepare_post_commit_authority_transfer(
+        source,
+        CleanupManifest::new(
+            logical_roots,
+            physical.authority.manifest_digest(),
+            physical.authority.obligation_count(),
+        ),
+    ) {
+        PostCommitAuthorityPreparationOutcome::Prepared { owner, .. } => {
+            resume_prepared_post_commit_compound(world, entry, owner, physical)
+        }
+        PostCommitAuthorityPreparationOutcome::Mismatch { source, evidence } => {
+            Box::new(PostCommitCompoundHolder::AcceptedInert {
+                source,
+                physical: Box::new(physical),
+                evidence: Box::new(PostCommitAcceptedInertEvidence::Receiver(evidence)),
+            })
+        }
+        PostCommitAuthorityPreparationOutcome::Retryable { source, evidence } => {
+            Box::new(PostCommitCompoundHolder::AcceptedInert {
+                source,
+                physical: Box::new(physical),
+                evidence: Box::new(PostCommitAcceptedInertEvidence::Retryable(evidence)),
+            })
+        }
+        PostCommitAuthorityPreparationOutcome::Permanent { source, evidence } => {
+            Box::new(PostCommitCompoundHolder::AcceptedInert {
+                source,
+                physical: Box::new(physical),
+                evidence: Box::new(PostCommitAcceptedInertEvidence::Permanent(evidence)),
+            })
+        }
+    }
+}
+
+fn resume_prepared_post_commit_compound(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    owner: PreparedPostCommitAuthorityTransfer,
+    mut physical: PreparedPostCommitPhysicalOwner,
+) -> Box<PostCommitCompoundHolder> {
+    if physical.input_isolation.is_none() {
+        physical.input_isolation = match prepare_post_commit_input_isolation(
+            world,
+            &physical.active,
+            &physical.original_freeze,
+            &physical.authority,
+        ) {
+            Ok(isolation) => Some(isolation),
+            Err(evidence) => {
+                return Box::new(PostCommitCompoundHolder::PreparedInert {
+                    owner,
+                    physical,
+                    evidence: PostCommitPlanBindFailure::Isolation(evidence),
+                });
+            }
+        };
+    }
+
+    let mut installed = None;
+    let outcome = entry.engine.begin_post_commit_authority_transfer(
+        owner,
+        Box::new(physical),
+        |mut physical, observed_batch, builder| {
+            let plan = match bind_post_commit_settlement_plan(
+                &physical.original_freeze,
+                physical.authority.partition(),
+                &physical.edge,
+                builder,
+            ) {
+                Ok(plan) => plan,
+                Err(evidence) => {
+                    return Err((physical, PostCommitPlanBindFailure::Plan(evidence)));
+                }
+            };
+            if !physical.authority.batch_matches(observed_batch) {
+                return Err((
+                    physical,
+                    PostCommitPlanBindFailure::Authority(
+                        crate::cleanup::PreparedAuthorityLedgerBindingMismatch::WrongBatch,
+                    ),
+                ));
+            }
+            let Some(isolation) = physical.input_isolation.take() else {
+                return Err((
+                    physical,
+                    PostCommitPlanBindFailure::Isolation(
+                        PostCommitInputIsolationFailure::RefreezeRejected,
+                    ),
+                ));
+            };
+            let Some(original_removed) = physical
+                .original_freeze
+                .removed_entities_for_authority_refreeze(world, &physical.original, None)
+            else {
+                return Err((
+                    physical,
+                    PostCommitPlanBindFailure::Isolation(
+                        PostCommitInputIsolationFailure::RefreezeRejected,
+                    ),
+                ));
+            };
+            let input_isolation = match isolation.apply_guarded(world, &|world| {
+                physical
+                    .original_freeze
+                    .refreeze(world, &physical.original, None)
+                    && physical
+                        .authority
+                        .partition()
+                        .refreeze_allowing_input_isolation(world, &original_removed)
+                    && physical.edge.host_projection_is_current(world, false)
+            }) {
+                Ok(isolation) => isolation,
+                Err(evidence) => {
+                    return Err((physical, PostCommitPlanBindFailure::Isolation(evidence)));
+                }
+            };
+            if !physical.authority.commit_input_isolation(
+                world,
+                &physical.original_freeze,
+                &physical.original,
+            ) {
+                return Err((
+                    physical,
+                    PostCommitPlanBindFailure::Isolation(
+                        PostCommitInputIsolationFailure::RefreezeRejected,
+                    ),
+                ));
+            }
+            let PreparedPostCommitPhysicalOwner {
+                original,
+                original_freeze,
+                authority,
+                active,
+                host,
+                edge,
+                input_isolation: _,
+            } = *physical;
+            let authority = authority.bind_verified_batch(observed_batch.clone());
+            let (authority, partition) = authority.into_parts();
+            Ok((
+                Box::new(PostCommitCompoundPhysicalOwner {
+                    original,
+                    original_freeze,
+                    authority,
+                    partition,
+                    active,
+                    host,
+                    edge,
+                    input_isolation,
+                    original_cursor: 0,
+                    authority_non_top_cursor: 0,
+                    settled_authority: Vec::new(),
+                    edge_terminal: None,
+                    top_settled: false,
+                }),
+                plan,
+            ))
+        },
+        |physical, core| installed = Some((physical, core)),
+    );
+    post_commit_begin_outcome_holder(outcome, installed)
+}
+
+fn resume_bound_post_commit_compound(
+    entry: &mut RouterEntry,
+    owner: PreparedPostCommitAuthorityTransfer,
+    physical: PostCommitCompoundPhysicalOwner,
+) -> Box<PostCommitCompoundHolder> {
+    let mut installed = None;
+    let outcome = entry.engine.begin_post_commit_authority_transfer(
+        owner,
+        Box::new(physical),
+        |physical, observed_batch, builder| {
+            let plan = match bind_post_commit_settlement_plan(
+                &physical.original_freeze,
+                &physical.partition,
+                &physical.edge,
+                builder,
+            ) {
+                Ok(plan) => plan,
+                Err(evidence) => {
+                    return Err((physical, PostCommitPlanBindFailure::Plan(evidence)));
+                }
+            };
+            if !physical.authority.post_commit_batch_matches(observed_batch) {
+                return Err((
+                    physical,
+                    PostCommitPlanBindFailure::Authority(
+                        crate::cleanup::PreparedAuthorityLedgerBindingMismatch::WrongBatch,
+                    ),
+                ));
+            }
+            Ok((physical, plan))
+        },
+        |physical, core| installed = Some((physical, core)),
+    );
+    post_commit_bound_retry_outcome_holder(outcome, installed)
+}
+
+fn post_commit_begin_outcome_holder(
+    outcome: PostCommitAuthorityBeginOutcome<
+        Box<PreparedPostCommitPhysicalOwner>,
+        Box<PostCommitCompoundPhysicalOwner>,
+        PostCommitPlanBindFailure,
+    >,
+    installed: Option<(
+        Box<PostCommitCompoundPhysicalOwner>,
+        PostCommitCompoundBatchOwner,
+    )>,
+) -> Box<PostCommitCompoundHolder> {
+    match outcome {
+        PostCommitAuthorityBeginOutcome::Begun => {
+            let (physical, core) =
+                installed.expect("the infallible install callback publishes the compound owner");
+            Box::new(PostCommitCompoundHolder::Active(
+                ActivePostCommitCompoundOwner {
+                    core,
+                    physical: *physical,
+                },
+            ))
+        }
+        PostCommitAuthorityBeginOutcome::BindingMismatch {
+            owner,
+            unbound,
+            evidence,
+        } => Box::new(PostCommitCompoundHolder::PreparedInert {
+            owner,
+            physical: *unbound,
+            evidence,
+        }),
+        PostCommitAuthorityBeginOutcome::ReceiverMismatch {
+            owner,
+            bound,
+            evidence,
+        } => Box::new(PostCommitCompoundHolder::BoundInert {
+            owner,
+            physical: bound,
+            evidence: Box::new(PostCommitBoundInertEvidence::Receiver(evidence)),
+        }),
+        PostCommitAuthorityBeginOutcome::Retryable {
+            owner,
+            bound,
+            evidence,
+        } => Box::new(PostCommitCompoundHolder::BoundInert {
+            owner,
+            physical: bound,
+            evidence: Box::new(PostCommitBoundInertEvidence::Retryable(evidence)),
+        }),
+        PostCommitAuthorityBeginOutcome::Permanent {
+            owner,
+            bound,
+            evidence,
+        } => Box::new(PostCommitCompoundHolder::BoundInert {
+            owner,
+            physical: bound,
+            evidence: Box::new(PostCommitBoundInertEvidence::Permanent(evidence)),
+        }),
+    }
+}
+
+fn post_commit_bound_retry_outcome_holder(
+    outcome: PostCommitAuthorityBeginOutcome<
+        Box<PostCommitCompoundPhysicalOwner>,
+        Box<PostCommitCompoundPhysicalOwner>,
+        PostCommitPlanBindFailure,
+    >,
+    installed: Option<(
+        Box<PostCommitCompoundPhysicalOwner>,
+        PostCommitCompoundBatchOwner,
+    )>,
+) -> Box<PostCommitCompoundHolder> {
+    match outcome {
+        PostCommitAuthorityBeginOutcome::Begun => {
+            let (physical, core) =
+                installed.expect("the infallible install callback publishes the compound owner");
+            Box::new(PostCommitCompoundHolder::Active(
+                ActivePostCommitCompoundOwner {
+                    core,
+                    physical: *physical,
+                },
+            ))
+        }
+        PostCommitAuthorityBeginOutcome::BindingMismatch {
+            owner,
+            unbound,
+            evidence,
+        } => Box::new(PostCommitCompoundHolder::BoundInert {
+            owner,
+            physical: unbound,
+            evidence: Box::new(PostCommitBoundInertEvidence::Binding(evidence)),
+        }),
+        PostCommitAuthorityBeginOutcome::ReceiverMismatch {
+            owner,
+            bound,
+            evidence,
+        } => Box::new(PostCommitCompoundHolder::BoundInert {
+            owner,
+            physical: bound,
+            evidence: Box::new(PostCommitBoundInertEvidence::Receiver(evidence)),
+        }),
+        PostCommitAuthorityBeginOutcome::Retryable {
+            owner,
+            bound,
+            evidence,
+        } => Box::new(PostCommitCompoundHolder::BoundInert {
+            owner,
+            physical: bound,
+            evidence: Box::new(PostCommitBoundInertEvidence::Retryable(evidence)),
+        }),
+        PostCommitAuthorityBeginOutcome::Permanent {
+            owner,
+            bound,
+            evidence,
+        } => Box::new(PostCommitCompoundHolder::BoundInert {
+            owner,
+            physical: bound,
+            evidence: Box::new(PostCommitBoundInertEvidence::Permanent(evidence)),
+        }),
+    }
+}
+
+fn resume_retryable_post_commit_holder(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    holder: Box<PostCommitCompoundHolder>,
+) -> Box<PostCommitCompoundHolder> {
+    let retryable = match holder.as_ref() {
+        PostCommitCompoundHolder::AcceptedInert { evidence, .. } => evidence.is_retryable(),
+        PostCommitCompoundHolder::PreparedInert {
+            evidence:
+                PostCommitPlanBindFailure::Isolation(PostCommitInputIsolationFailure::RetryableCapacity),
+            ..
+        } => true,
+        PostCommitCompoundHolder::BoundInert { evidence, .. } => evidence.is_retryable(),
+        _ => false,
+    };
+    if !retryable {
+        return holder;
+    }
+    match *holder {
+        PostCommitCompoundHolder::AcceptedInert {
+            source, physical, ..
+        } => resume_accepted_post_commit_compound(world, entry, source, *physical),
+        PostCommitCompoundHolder::PreparedInert {
+            owner, physical, ..
+        } => resume_prepared_post_commit_compound(world, entry, owner, physical),
+        PostCommitCompoundHolder::BoundInert {
+            owner, physical, ..
+        } => resume_bound_post_commit_compound(entry, owner, *physical),
+        _ => unreachable!("only a retryable post-accept holder is resumed"),
+    }
+}
+
+fn settle_post_commit_retired_host_edge(
+    world: &mut World,
+    physical: &PostCommitCompoundPhysicalOwner,
+) -> Result<RetiredHostEdgePhysicalProof, PostCommitAuthoritySettlementFailure> {
+    let edge = &physical.edge;
+    let original_removed = physical
+        .original_freeze
+        .removed_entities_for_authority_refreeze(world, &physical.original, None)
+        .ok_or(PostCommitAuthoritySettlementFailure::PrewriteDrift)?;
+    if physical.edge_terminal.is_some()
+        || !physical.input_isolation.is_current(world)
+        || !physical
+            .original_freeze
+            .terminals_are_current(world, &physical.original)
+        || physical
+            .partition
+            .top_target()
+            .is_none_or(|top| top.entity() != edge.top_slot || top.claim() != &edge.top_slot_claim)
+        || !physical.partition.refreeze(
+            world,
+            &physical.settled_authority,
+            None,
+            false,
+            &original_removed,
+        )
+    {
+        return Err(PostCommitAuthoritySettlementFailure::PrewriteDrift);
+    }
+    let terminal = if !edge.host_present {
+        if !edge.host_projection_is_current(world, false) {
+            return Err(PostCommitAuthoritySettlementFailure::PrewriteDrift);
+        }
+        RetiredHostEdgePhysicalTerminal::HostAbsent
+    } else if edge.top_parent_before != Some(edge.host) {
+        if edge.children_before != edge.children_after
+            || !edge.host_projection_is_current(world, false)
+        {
+            return Err(PostCommitAuthoritySettlementFailure::PrewriteDrift);
+        }
+        RetiredHostEdgePhysicalTerminal::EdgeAlreadyAbsent
+    } else {
+        if !edge.host_projection_is_current(world, false)
+            || world.get_entity(edge.top_slot).is_err()
+        {
+            return Err(PostCommitAuthoritySettlementFailure::PrewriteDrift);
+        }
+        world.entity_mut(edge.top_slot).remove::<ChildOf>();
+        world.flush();
+        if !edge.host_projection_is_current(world, true)
+            || !physical.input_isolation.is_current(world)
+            || !physical
+                .original_freeze
+                .terminals_are_current(world, &physical.original)
+            || !physical.partition.refreeze(
+                world,
+                &physical.settled_authority,
+                None,
+                true,
+                &original_removed,
+            )
+        {
+            return Err(PostCommitAuthoritySettlementFailure::PostwriteDrift);
+        }
+        RetiredHostEdgePhysicalTerminal::Detached
+    };
+    let host_edge_detached = terminal == RetiredHostEdgePhysicalTerminal::Detached;
+    if !physical
+        .original_freeze
+        .terminals_are_current(world, &physical.original)
+        || !physical.input_isolation.is_current(world)
+        || !physical.partition.refreeze(
+            world,
+            &physical.settled_authority,
+            None,
+            host_edge_detached,
+            &original_removed,
+        )
+    {
+        return Err(PostCommitAuthoritySettlementFailure::PostwriteDrift);
+    }
+    Ok(RetiredHostEdgePhysicalProof {
+        terminal,
+        binding: edge.physical_source_binding
+            ^ match terminal {
+                RetiredHostEdgePhysicalTerminal::Detached => 1,
+                RetiredHostEdgePhysicalTerminal::HostAbsent => 2,
+                RetiredHostEdgePhysicalTerminal::EdgeAlreadyAbsent => 3,
+            },
+    })
+}
+
+#[inline(never)]
+fn drive_post_commit_original_residual(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    mut active: ActivePostCommitCompoundOwner,
+) {
+    if !active.physical.input_isolation.is_current(world) {
+        entry.post_commit_compound = Some(PostCommitCompoundHolder::Inert(active).into());
+        return;
+    }
+    while active.physical.original_cursor < active.physical.original_freeze.indices().len()
+        && active.physical.original_freeze.indices()[active.physical.original_cursor]
+            .settled_receipt()
+            .is_some()
+    {
+        active.physical.original_cursor += 1;
+    }
+    let Some(frozen) = active
+        .physical
+        .original_freeze
+        .indices()
+        .get(active.physical.original_cursor)
+    else {
+        entry.post_commit_compound = Some(PostCommitCompoundHolder::Inert(active).into());
+        return;
+    };
+    let obligation = frozen.index();
+    let attempt = match entry
+        .engine
+        .prepare_next_post_commit_settlement_trusted(active.core)
+    {
+        TrustedPostCommitSettlementPermitOutcome::Prepared(attempt) => attempt,
+        TrustedPostCommitSettlementPermitOutcome::Mismatch { owner, evidence } => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::PermitMismatchInert {
+                    core: owner,
+                    physical: active.physical,
+                    evidence,
+                }
+                .into(),
+            );
+            return;
+        }
+    };
+    let proof = match active.physical.original.post_commit_original_receipt_proof(
+        world,
+        &active.physical.original_freeze,
+        obligation,
+    ) {
+        Some(proof) => proof,
+        None => match active.physical.original.settle_post_commit_original_target(
+            world,
+            &active.physical.original_freeze,
+            obligation,
+            &active.physical.partition,
+            &active.physical.settled_authority,
+            &|world| active.physical.input_isolation.is_current(world),
+        ) {
+            Ok(proof) => proof,
+            Err(failure) => {
+                entry.post_commit_compound = Some(
+                    PostCommitCompoundHolder::PermitInert {
+                        attempt,
+                        physical: active.physical,
+                        failure,
+                    }
+                    .into(),
+                );
+                return;
+            }
+        },
+    };
+    match entry
+        .engine
+        .record_next_post_commit_settlement_trusted(attempt, proof)
+    {
+        TrustedPostCommitSettlementRecordOutcome::Recorded { owner, .. } => {
+            active.core = owner;
+            active.physical.original_cursor += 1;
+            entry.post_commit_compound = Some(PostCommitCompoundHolder::Active(active).into());
+        }
+        TrustedPostCommitSettlementRecordOutcome::Mismatch {
+            attempt,
+            physical: proof,
+            evidence,
+        } => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::SettlementInert(PostCommitSettlementRecordInert {
+                    attempt,
+                    proof: PostCommitAnyPhysicalProof::Cleanup(proof),
+                    physical: active.physical,
+                    evidence,
+                })
+                .into(),
+            );
+        }
+    }
+}
+
+#[inline(never)]
+fn drive_post_commit_authority_target(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    mut active: ActivePostCommitCompoundOwner,
+    top: bool,
+) {
+    if !active
+        .physical
+        .original_freeze
+        .terminals_are_current(world, &active.physical.original)
+        || !active.physical.input_isolation.is_current(world)
+    {
+        entry.post_commit_compound = Some(PostCommitCompoundHolder::Inert(active).into());
+        return;
+    }
+    let target = if top {
+        active.physical.partition.top_target()
+    } else {
+        active
+            .physical
+            .partition
+            .non_top_targets()
+            .nth(active.physical.authority_non_top_cursor)
+    };
+    let Some(target) = target else {
+        entry.post_commit_compound = Some(PostCommitCompoundHolder::Inert(active).into());
+        return;
+    };
+    let target_index = target.index();
+    let target_entity = target.entity();
+    let host_edge_detached = matches!(
+        active.physical.edge_terminal,
+        Some(RetiredHostEdgePhysicalTerminal::Detached)
+    );
+    let attempt = match entry
+        .engine
+        .prepare_next_post_commit_settlement_trusted(active.core)
+    {
+        TrustedPostCommitSettlementPermitOutcome::Prepared(attempt) => attempt,
+        TrustedPostCommitSettlementPermitOutcome::Mismatch { owner, evidence } => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::PermitMismatchInert {
+                    core: owner,
+                    physical: active.physical,
+                    evidence,
+                }
+                .into(),
+            );
+            return;
+        }
+    };
+    let proof = active
+        .physical
+        .authority
+        .settle_post_commit_authority_target(
+            world,
+            &mut active.physical.partition,
+            &active.physical.original,
+            &active.physical.original_freeze,
+            target_index,
+            &active.physical.settled_authority,
+            host_edge_detached,
+            &|world| active.physical.input_isolation.is_current(world),
+        );
+    let proof = match proof {
+        Ok(proof) => proof,
+        Err(failure) => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::PermitInert {
+                    attempt,
+                    physical: active.physical,
+                    failure,
+                }
+                .into(),
+            );
+            return;
+        }
+    };
+    match entry
+        .engine
+        .record_next_post_commit_settlement_trusted(attempt, proof)
+    {
+        TrustedPostCommitSettlementRecordOutcome::Recorded { owner, .. } => {
+            active.core = owner;
+            if top {
+                active.physical.top_settled = true;
+            } else {
+                active.physical.authority_non_top_cursor += 1;
+            }
+            active.physical.settled_authority.push(target_entity);
+            entry.post_commit_compound = Some(PostCommitCompoundHolder::Active(active).into());
+        }
+        TrustedPostCommitSettlementRecordOutcome::Mismatch {
+            attempt,
+            physical: proof,
+            evidence,
+        } => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::SettlementInert(PostCommitSettlementRecordInert {
+                    attempt,
+                    proof: PostCommitAnyPhysicalProof::Cleanup(proof),
+                    physical: active.physical,
+                    evidence,
+                })
+                .into(),
+            );
+        }
+    }
+}
+
+#[inline(never)]
+fn drive_post_commit_retired_host_edge(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    mut active: ActivePostCommitCompoundOwner,
+) {
+    if !active
+        .physical
+        .original_freeze
+        .terminals_are_current(world, &active.physical.original)
+        || !active.physical.input_isolation.is_current(world)
+    {
+        entry.post_commit_compound = Some(PostCommitCompoundHolder::Inert(active).into());
+        return;
+    }
+    let attempt = match entry
+        .engine
+        .prepare_next_post_commit_settlement_trusted(active.core)
+    {
+        TrustedPostCommitSettlementPermitOutcome::Prepared(attempt) => attempt,
+        TrustedPostCommitSettlementPermitOutcome::Mismatch { owner, evidence } => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::PermitMismatchInert {
+                    core: owner,
+                    physical: active.physical,
+                    evidence,
+                }
+                .into(),
+            );
+            return;
+        }
+    };
+    let proof = match settle_post_commit_retired_host_edge(world, &active.physical) {
+        Ok(proof) => proof,
+        Err(failure) => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::PermitInert {
+                    attempt,
+                    physical: active.physical,
+                    failure,
+                }
+                .into(),
+            );
+            return;
+        }
+    };
+    active.physical.edge_terminal = Some(proof.terminal);
+    match entry
+        .engine
+        .record_next_post_commit_settlement_trusted(attempt, proof)
+    {
+        TrustedPostCommitSettlementRecordOutcome::Recorded { owner, .. } => {
+            active.core = owner;
+            entry.post_commit_compound = Some(PostCommitCompoundHolder::Active(active).into());
+        }
+        TrustedPostCommitSettlementRecordOutcome::Mismatch {
+            attempt,
+            physical: proof,
+            evidence,
+        } => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::SettlementInert(PostCommitSettlementRecordInert {
+                    attempt,
+                    proof: PostCommitAnyPhysicalProof::HostEdge(proof),
+                    physical: active.physical,
+                    evidence,
+                })
+                .into(),
+            );
+        }
+    }
+}
+
+#[inline(never)]
+fn drive_post_commit_completion(
+    world: &World,
+    entry: &mut RouterEntry,
+    active: ActivePostCommitCompoundOwner,
+) {
+    if !active.physical.original.is_settled()
+        || !active
+            .physical
+            .original_freeze
+            .terminals_are_current(world, &active.physical.original)
+        || !active.physical.input_isolation.is_current(world)
+        || !active.physical.authority.authority_completion_is_exact()
+        || !active.physical.top_settled
+        || active.physical.edge_terminal.is_none()
+    {
+        entry.post_commit_compound = Some(PostCommitCompoundHolder::Inert(active).into());
+        return;
+    }
+    let completion = active
+        .physical
+        .original
+        .pending_completion()
+        .expect("the exact original ledger retains its Core completion");
+    match entry
+        .engine
+        .prepare_post_commit_compound_completion_trusted(active.core, completion, active.physical)
+    {
+        TrustedPostCommitCompoundCompletionPreparationOutcome::Prepared { owner, physical } => {
+            match entry
+                .engine
+                .complete_post_commit_authority_compound_trusted(
+                    owner,
+                    physical,
+                    |physical, _expected: RetiredHostAuthorityExpectedView| {
+                        let PostCommitCompoundPhysicalOwner {
+                            original,
+                            authority,
+                            active,
+                            host,
+                            edge,
+                            edge_terminal,
+                            ..
+                        } = physical;
+                        drop((original, authority, active));
+                        RetiredHostPhysicalTerminal {
+                            host,
+                            edge,
+                            edge_terminal: edge_terminal
+                                .expect("joint completion consumes the exact H terminal fact"),
+                        }
+                    },
+                ) {
+                TrustedPostCommitCompoundCompletionOutcome::Terminal {
+                    terminal,
+                    physical,
+                    retired_host,
+                } => {
+                    entry.settled_retired_host_evidence = Some(SettledRetiredHostEvidence {
+                        host: physical.host,
+                        edge: physical.edge,
+                        edge_terminal: physical.edge_terminal,
+                        terminal,
+                        retired_host,
+                    });
+                    entry.post_commit_compound = None;
+                }
+                TrustedPostCommitCompoundCompletionOutcome::Mismatch {
+                    owner,
+                    physical,
+                    evidence,
+                } => {
+                    entry.post_commit_compound = Some(
+                        PostCommitCompoundHolder::CompletionInert {
+                            owner,
+                            physical,
+                            evidence,
+                        }
+                        .into(),
+                    );
+                }
+            }
+        }
+        TrustedPostCommitCompoundCompletionPreparationOutcome::Mismatch {
+            batch,
+            physical,
+            inputs,
+            evidence,
+        } => {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::CompletionPreparationInert {
+                    core: batch,
+                    physical,
+                    inputs,
+                    evidence,
+                }
+                .into(),
+            );
+        }
+    }
+}
+
+fn drive_post_commit_compound(world: &mut World, entry: &mut RouterEntry) -> bool {
+    if entry.post_commit_compound.is_none() {
+        let Some(host) = entry.host.as_ref() else {
+            return false;
+        };
+        let Some(cause) = post_commit_authority_loss_cause(world, host) else {
+            return false;
+        };
+        if !begin_post_commit_compound(world, entry, cause) {
+            return false;
+        }
+    }
+
+    let budget = entry
+        .post_commit_compound
+        .as_ref()
+        .and_then(|holder| match holder.as_ref() {
+            PostCommitCompoundHolder::Active(active) => Some(
+                active.physical.original_freeze.indices().len()
+                    + active.physical.partition.targets().len()
+                    + 4,
+            ),
+            _ => None,
+        })
+        .unwrap_or(1);
+    for _ in 0..budget {
+        let Some(holder) = entry.post_commit_compound.take() else {
+            return true;
+        };
+        let holder = resume_retryable_post_commit_holder(world, entry, holder);
+        let PostCommitCompoundHolder::Active(active) = *holder else {
+            entry.post_commit_compound = Some(holder);
+            return true;
+        };
+        match active.core.settlement().progress() {
+            PostCommitSettlementTraceProgress::OriginalResidual => {
+                drive_post_commit_original_residual(world, entry, active);
+            }
+            PostCommitSettlementTraceProgress::AuthorityNonTop => {
+                drive_post_commit_authority_target(world, entry, active, false);
+            }
+            PostCommitSettlementTraceProgress::RetiredHostEdge => {
+                drive_post_commit_retired_host_edge(world, entry, active);
+            }
+            PostCommitSettlementTraceProgress::AuthorityTop => {
+                drive_post_commit_authority_target(world, entry, active, true);
+            }
+            PostCommitSettlementTraceProgress::Complete => {
+                drive_post_commit_completion(world, entry, active);
+            }
+        }
+    }
+    true
+}
+
 pub(crate) fn settle_cleanup_system(world: &mut World) {
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             for entry in &mut navigation.entries {
+                if drive_post_commit_compound(world, entry) {
+                    continue;
+                }
                 if drive_target_preparation_permanent_cleanup(world, entry) {
                     continue;
                 }
@@ -18845,9 +21290,9 @@ pub(crate) mod tests {
     };
     use bevy_ui_router_core::prelude::{
         ActivePresentationKind, DiagnosticEventKind, DiagnosticSeverity, FrameOrigin,
-        NavigationFailureKind, NavigationPhase, NavigationTraceEventKind, ReportDisposition,
-        RequestStatus, RouteNodeOptions, RoutePattern, RouteTree, RouteViewKey, RouterAvailability,
-        RouterUnavailableReason,
+        MemoryHistory, NavigationFailureKind, NavigationPhase, NavigationTraceEventKind,
+        ReportDisposition, RequestStatus, RouteNodeOptions, RoutePattern, RouteTree, RouteViewKey,
+        RouterAvailability, RouterUnavailableReason,
     };
     use bevy_ui_router_view::{
         RouteViewDescriptor, RouteViewRegistry, ViewBuildEffect, ViewDriverKey,
@@ -25736,6 +28181,12 @@ pub(crate) mod tests {
             projectionless_fail_close: None,
             active: None,
             cleanup_ledger: None,
+            post_commit_compound: None,
+            settled_retired_host_evidence: None,
+            #[cfg(feature = "test-support")]
+            commit_sealed_registration_removal_armed: false,
+            #[cfg(feature = "test-support")]
+            commit_sealed_registration_removal_fired: false,
             failure_cleanup_completion: None,
             cleanup_observation: RouterCleanupObservation::default(),
             authority_protocol_residual: None,
@@ -41285,6 +43736,9 @@ pub(crate) mod tests {
             .1
             .split_once("pub(crate) fn settle_cleanup_system(")
             .expect("the target driver must precede settle_cleanup_system")
+            .0
+            .split_once("\n}\n\nconst POST_COMMIT_L_OBLIGATION_KEY")
+            .expect("the Current cleanup driver must end before post-commit helpers")
             .0;
         let compact = driver
             .chars()
@@ -55778,7 +58232,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn reconciliation_authority_loss_app_despawned_host_settles_and_readmits_without_replay() {
+    fn reconciliation_host_loss_app_despawned_host_settles_stably_unavailable_without_replay() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
         let router = install_atomic_router(&mut app, "authority-loss-despawned-host");
@@ -55875,7 +58329,7 @@ pub(crate) mod tests {
             assert!(matches!(
                 entry.engine.request(request).unwrap().status(),
                 RequestStatus::Failed(failure)
-                    if failure.kind() == NavigationFailureKind::AuthorityLost
+                    if failure.kind() == NavigationFailureKind::HostLost
             ));
             assert!(entry.active.is_none());
             assert!(entry.host.is_none());
@@ -55945,13 +58399,10 @@ pub(crate) mod tests {
         }
 
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
-        assert_eq!(
-            entry.host.as_ref().map(|binding| binding.host),
-            Some(replacement_host)
-        );
+        assert!(entry.host.is_none());
         assert_eq!(
             entry.engine.snapshot().availability(),
-            &RouterAvailability::Ready
+            &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
         );
         assert_eq!(
             entry.engine.snapshot().active().kind(),
@@ -57814,7 +60265,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn reconciliation_authority_loss_detaches_old_top_when_registration_is_absent() {
+    fn reconciliation_host_loss_detaches_old_top_when_registration_is_absent() {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
         let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -57856,7 +60307,7 @@ pub(crate) mod tests {
         assert!(matches!(
             entry.engine.request(request).unwrap().status(),
             RequestStatus::Failed(failure)
-                if failure.kind() == NavigationFailureKind::AuthorityLost
+                if failure.kind() == NavigationFailureKind::HostLost
         ));
         assert!(entry.cleanup_ledger.is_none());
         assert!(app.world().get_entity(top_slot).is_err());
@@ -59043,20 +61494,6 @@ pub(crate) mod tests {
             RequestStatus::Running(NavigationPhase::PostCommitCleanup)
         ));
 
-        app.update();
-        let ledger = app.world().resource::<RouterNavigation>().entries[0]
-            .cleanup_ledger
-            .as_ref()
-            .unwrap();
-        assert_eq!(ledger.receipt_count(), obligation_count);
-        assert_eq!(
-            app.world()
-                .resource::<QuarantineLeaseTable>()
-                .leases()
-                .len(),
-            lease_count
-        );
-
         let stale_root_seal = app
             .world_mut()
             .resource_mut::<RouteEntityRegistry>()
@@ -59072,8 +61509,8 @@ pub(crate) mod tests {
         app.world_mut()
             .entity_mut(top_slot)
             .insert(RouteOwnershipSeal::new(top_slot_seal));
-        app.update();
-        app.update();
+        settle_cleanup_system(app.world_mut());
+        crate::input::refresh_input_gate_system(app.world_mut());
 
         assert!(matches!(
             app.world().resource::<RouterNavigation>().entries[0]
@@ -63819,5 +66256,798 @@ pub(crate) mod tests {
             app.world(),
             entry.active.as_ref().unwrap().first_frame().unwrap()
         ));
+    }
+
+    fn post_commit_nested_host_loss_fixture(
+        label: &str,
+    ) -> (
+        App,
+        RouterHandle,
+        NavigationRequestId,
+        Entity,
+        MemoryHistory,
+    ) {
+        post_commit_nested_host_loss_fixture_with_hook(label, false)
+    }
+
+    fn post_commit_nested_host_loss_fixture_with_hook(
+        label: &str,
+        install_despawn_hook: bool,
+    ) -> (
+        App,
+        RouterHandle,
+        NavigationRequestId,
+        Entity,
+        MemoryHistory,
+    ) {
+        let mut app = App::new();
+        if install_despawn_hook {
+            install_cleanup_despawn_drift_hook(&mut app);
+        }
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        commit_initial_nested_branch(&mut app, router);
+        let request = prepare_nested_branch_for_commit(
+            &mut app,
+            router,
+            RouteLocation::new("/items/2").with_fragment(label),
+        );
+        commit_presentation_system(app.world_mut());
+        let (host, committed_history) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let entry = &navigation.entries[0];
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+            ));
+            (
+                entry.host.as_ref().unwrap().host,
+                entry.engine.history().clone(),
+            )
+        };
+        (app, router, request, host, committed_history)
+    }
+
+    fn remove_post_commit_registration(app: &mut App, host: Entity) {
+        assert!(
+            app.world_mut()
+                .entity_mut(host)
+                .take::<RouterHostRegistration>()
+                .is_some(),
+            "the real post-commit fixture removes exactly its current registration"
+        );
+    }
+
+    fn assert_post_commit_host_loss_retains_committed_result(
+        app: &App,
+        request: NavigationRequestId,
+        committed_history: &MemoryHistory,
+    ) {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(entry.engine.history(), committed_history);
+        let request = entry.engine.request(request).unwrap();
+        let status = request.status();
+        assert!(
+            match status {
+                RequestStatus::Running(NavigationPhase::Recovering) | RequestStatus::Succeeded =>
+                    true,
+                RequestStatus::Queued | RequestStatus::Running(_) => false,
+                RequestStatus::Failed(_) => false,
+            },
+            "unexpected post-commit host-loss status: {status:?}"
+        );
+    }
+
+    #[test]
+    pub(crate) fn post_commit_host_loss_enters_single_compound_without_rolling_back_history() {
+        let (mut app, _router, request, host, committed_history) =
+            post_commit_nested_host_loss_fixture("r2-single-compound");
+        let history_len = committed_history.len();
+        remove_post_commit_registration(&mut app, host);
+
+        settle_cleanup_system(app.world_mut());
+
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .history()
+                .len(),
+            history_len
+        );
+        assert_post_commit_host_loss_retains_committed_result(&app, request, &committed_history);
+    }
+
+    #[test]
+    fn post_commit_host_loss_canonical_zero_l_transfers_disjoint_a_and_h() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "r2-zero-l");
+        app.update();
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+        let (host, top_slot, active_entities, active_interactive, history) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let ledger = entry.cleanup_ledger.as_ref().unwrap();
+            assert_eq!(ledger.projection().obligation_count(), 0);
+            let host = entry.host.as_ref().unwrap();
+            let active_entities = entry
+                .active
+                .as_ref()
+                .unwrap()
+                .claims()
+                .map(|claim| claim.entity())
+                .collect::<Vec<_>>();
+            assert!(!active_entities.contains(&host.top_slot));
+            (
+                host.host,
+                host.top_slot,
+                active_entities,
+                entry.active.as_ref().unwrap().interactive_entities(),
+                entry.engine.history().clone(),
+            )
+        };
+        let focused = active_interactive[0];
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(focused);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(focused));
+        remove_post_commit_registration(&mut app, host);
+
+        settle_cleanup_system(app.world_mut());
+
+        assert_post_commit_host_loss_retains_committed_result(&app, request, &history);
+        assert!(
+            active_entities
+                .iter()
+                .all(|entity| app.world().get_entity(*entity).is_err())
+        );
+        assert!(app.world().get_entity(top_slot).is_err());
+        assert!(app.world().get_entity(host).is_ok());
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        let gate = app.world().resource::<RouterInputGate>();
+        assert!(active_interactive.iter().all(|entity| {
+            !gate.allows_pointer(*entity)
+                && !gate.allows_keyboard(*entity)
+                && !gate.allows_gamepad(*entity)
+        }));
+    }
+
+    #[test]
+    fn post_commit_topology_drift_with_exact_registration_is_not_host_loss() {
+        let (mut app, _router, request, _host, committed_history) =
+            post_commit_nested_host_loss_fixture("r2-topology-drift-is-authority-loss");
+        let top_slot = app.world().resource::<RouterNavigation>().entries[0]
+            .host
+            .as_ref()
+            .unwrap()
+            .top_slot;
+        app.world_mut().entity_mut(top_slot).remove::<ChildOf>();
+        app.world_mut().flush();
+
+        settle_cleanup_system(app.world_mut());
+
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(entry.engine.history(), &committed_history);
+        assert!(entry.post_commit_compound.is_none());
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::PostCommitCleanup) | RequestStatus::Succeeded
+        ));
+        assert!(
+            entry
+                .engine
+                .request(request)
+                .unwrap()
+                .diagnostics()
+                .iter()
+                .all(
+                    |diagnostic| diagnostic.kind() != DiagnosticEventKind::PostCommitCleanupAnomaly
+                )
+        );
+    }
+
+    #[test]
+    fn post_commit_authority_bulk_quarantine_preserves_already_absent_target() {
+        let (mut app, _router, request, host, history) =
+            post_commit_nested_host_loss_fixture("r2-mixed-authority-disposition");
+        let (leaving, top_slot, absent) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let active = entry.active.as_ref().unwrap();
+            let absent = active
+                .claims()
+                .map(|claim| claim.entity())
+                .find(|entity| {
+                    *entity != entry.host.as_ref().unwrap().top_slot
+                        && app.world().get::<Children>(*entity).is_none()
+                })
+                .expect("the active fixture retains a leaf authority target");
+            (
+                entry
+                    .cleanup_ledger
+                    .as_ref()
+                    .unwrap()
+                    .leaving_frames()
+                    .iter()
+                    .flat_map(RealizedFrame::interactive_entities)
+                    .next()
+                    .expect("the committed transition retains an L target"),
+                entry.host.as_ref().unwrap().top_slot,
+                absent,
+            )
+        };
+        app.world_mut()
+            .entity_mut(leaving)
+            .insert(ChildOf(top_slot));
+        assert!(app.world_mut().despawn(absent));
+        app.world_mut().flush();
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .as_ref()
+                .unwrap()
+                .post_commit_transfer_requires_ordinary_settlement(app.world())
+        );
+        remove_post_commit_registration(&mut app, host);
+
+        for _ in 0..8 {
+            settle_cleanup_system(app.world_mut());
+            if matches!(
+                app.world().resource::<RouterNavigation>().entries[0]
+                    .engine
+                    .request(request)
+                    .unwrap()
+                    .status(),
+                RequestStatus::Succeeded
+            ) {
+                break;
+            }
+        }
+
+        assert_post_commit_host_loss_retains_committed_result(&app, request, &history);
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.post_commit_compound.is_none());
+        let dispositions = entry
+            .engine
+            .request(request)
+            .unwrap()
+            .trace()
+            .iter()
+            .filter_map(|event| event.cleanup_disposition())
+            .collect::<Vec<_>>();
+        assert!(
+            dispositions.contains(&bevy_ui_router_core::prelude::CleanupDisposition::AlreadyAbsent)
+        );
+        assert!(dispositions.contains(
+            &bevy_ui_router_core::prelude::CleanupDisposition::QuarantinedForeignDescendant
+        ));
+        assert!(app.world().get_entity(absent).is_err());
+        assert!(app.world().get_entity(top_slot).is_ok());
+        assert!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .record(top_slot)
+                .is_some()
+        );
+        assert!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .record(absent)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn post_commit_host_loss_quarantined_original_l_keeps_independent_lease_and_closes_compound() {
+        let (mut app, _router, request, host, committed_history) =
+            post_commit_nested_host_loss_fixture("r2-original-quarantine");
+        let leaving = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            entry
+                .cleanup_ledger
+                .as_ref()
+                .unwrap()
+                .leaving_frames()
+                .iter()
+                .flat_map(RealizedFrame::interactive_entities)
+                .next()
+                .unwrap()
+        };
+        app.world_mut()
+            .entity_mut(leaving)
+            .insert(FinalPreflightForeignComponent);
+        let foreign = app.world_mut().spawn(ChildOf(leaving)).id();
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .as_ref()
+                .unwrap()
+                .post_commit_transfer_requires_ordinary_settlement(app.world())
+        );
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(leaving);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(leaving));
+        remove_post_commit_registration(&mut app, host);
+
+        for _ in 0..8 {
+            settle_cleanup_system(app.world_mut());
+            if !matches!(
+                app.world().resource::<RouterNavigation>().entries[0]
+                    .engine
+                    .request(request)
+                    .unwrap()
+                    .status(),
+                RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+            ) {
+                break;
+            }
+        }
+
+        assert_post_commit_host_loss_retains_committed_result(&app, request, &committed_history);
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.post_commit_compound.is_none());
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Succeeded
+        ));
+        assert!(app.world().get_entity(leaving).is_ok());
+        assert!(
+            app.world()
+                .get::<FinalPreflightForeignComponent>(leaving)
+                .is_some()
+        );
+        assert_eq!(
+            app.world().get::<ChildOf>(foreign).map(ChildOf::parent),
+            Some(leaving)
+        );
+        assert!(
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .record(leaving)
+                .is_some()
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(leaving),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(
+            app.world().get::<Pickable>(leaving),
+            Some(&Pickable::IGNORE)
+        );
+        assert!(
+            app.world()
+                .get::<RouterInputBarrier>(leaving)
+                .is_some_and(RouterInputBarrier::denies_all)
+        );
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        let gate = app.world().resource::<RouterInputGate>();
+        assert!(!gate.allows_pointer(leaving));
+        assert!(!gate.allows_keyboard(leaving));
+        assert!(!gate.allows_gamepad(leaving));
+        assert!(app.world().get_entity(host).is_ok());
+    }
+
+    #[test]
+    fn post_commit_host_loss_bulk_quarantine_with_preexisting_missing_host_edge_closes_compound() {
+        let (mut app, _router, request, host, committed_history) =
+            post_commit_nested_host_loss_fixture("r2-quarantine-edge-already-absent");
+        let (leaving, top_slot) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            (
+                entry
+                    .cleanup_ledger
+                    .as_ref()
+                    .unwrap()
+                    .leaving_frames()
+                    .iter()
+                    .flat_map(RealizedFrame::interactive_entities)
+                    .next()
+                    .unwrap(),
+                entry.host.as_ref().unwrap().top_slot,
+            )
+        };
+        app.world_mut()
+            .entity_mut(leaving)
+            .insert(FinalPreflightForeignComponent);
+        let foreign = app.world_mut().spawn(ChildOf(leaving)).id();
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .as_ref()
+                .unwrap()
+                .post_commit_transfer_requires_ordinary_settlement(app.world())
+        );
+        app.world_mut().entity_mut(top_slot).remove::<ChildOf>();
+        app.world_mut().flush();
+        assert!(app.world().get::<ChildOf>(top_slot).is_none());
+        remove_post_commit_registration(&mut app, host);
+
+        for _ in 0..8 {
+            settle_cleanup_system(app.world_mut());
+            if matches!(
+                app.world().resource::<RouterNavigation>().entries[0]
+                    .engine
+                    .request(request)
+                    .unwrap()
+                    .status(),
+                RequestStatus::Succeeded
+            ) {
+                break;
+            }
+        }
+
+        assert_post_commit_host_loss_retains_committed_result(&app, request, &committed_history);
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.post_commit_compound.is_none());
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Succeeded
+        ));
+        let leases = app.world().resource::<QuarantineLeaseTable>();
+        assert!(leases.record(leaving).is_some());
+        assert!(leases.record(top_slot).is_some());
+        assert_eq!(
+            app.world().get::<ChildOf>(foreign).map(ChildOf::parent),
+            Some(leaving)
+        );
+        assert!(app.world().get::<ChildOf>(top_slot).is_none());
+        assert!(app.world().get_entity(host).is_ok());
+    }
+
+    #[test]
+    fn post_commit_host_loss_unattempted_original_ledger_preserves_batch_and_owner() {
+        let (mut app, _router, request, host, committed_history) =
+            post_commit_nested_host_loss_fixture("r2-unattempted-ledger");
+        let (projection, batch_facts, leaving, leaving_entities) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let ledger = entry.cleanup_ledger.as_ref().unwrap();
+            assert!(!ledger.issued_attempt_present_for_test());
+            let batch = ledger.batch().unwrap();
+            (
+                ledger.projection(),
+                (batch.manifest_digest(), batch.obligation_count()),
+                ledger
+                    .leaving_frames()
+                    .iter()
+                    .map(|frame| frame.frame().clone())
+                    .collect::<Vec<_>>(),
+                ledger.obligation_entities_for_test(),
+            )
+        };
+        assert!(!leaving.is_empty());
+        assert_eq!(projection.receipt_count(), 0);
+        remove_post_commit_registration(&mut app, host);
+
+        settle_cleanup_system(app.world_mut());
+
+        assert_post_commit_host_loss_retains_committed_result(&app, request, &committed_history);
+        assert_eq!(batch_facts.1, projection.obligation_count());
+        assert!(
+            leaving_entities
+                .iter()
+                .all(|entity| app.world().get_entity(*entity).is_err())
+        );
+    }
+
+    #[test]
+    fn post_commit_host_loss_partial_live_attempt_preserves_receipts_and_reclassifies_only_residual()
+     {
+        let (mut app, _router, request, host, committed_history) =
+            post_commit_nested_host_loss_fixture_with_hook("r2-partial-live-attempt", true);
+        let mut ledger = app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+            .cleanup_ledger
+            .take()
+            .unwrap();
+        let mut entities = ledger.obligation_entities_for_test();
+        entities.sort_by_key(|entity| {
+            let mut depth = 0usize;
+            let mut current = *entity;
+            let mut visited = std::collections::HashSet::new();
+            while visited.insert(current) {
+                let Some(parent) = app.world().get::<ChildOf>(current).map(ChildOf::parent) else {
+                    break;
+                };
+                depth = depth.saturating_add(1);
+                current = parent;
+            }
+            (std::cmp::Reverse(depth), entity.to_bits())
+        });
+        assert!(entities.len() >= 2);
+        let later_claim = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .record(entities[1])
+            .unwrap()
+            .claim();
+        app.world_mut().insert_resource(CleanupDespawnDrift {
+            target: entities[0],
+            action: CleanupDespawnDriftAction::TargetRegistryClaim(later_claim),
+        });
+        let attempt = ledger.attempt(app.world()).unwrap();
+        assert!(!ledger.settle(app.world_mut(), attempt));
+        assert!(
+            app.world().get_entity(entities[1]).is_ok(),
+            "the injected later target must survive the partial ordinary attempt"
+        );
+        let receipts_before = ledger.receipt_count();
+        let projection_before = ledger.projection();
+        assert!(receipts_before > 0);
+        assert!(receipts_before < entities.len());
+        assert!(!ledger.issued_attempt_present_for_test());
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0].cleanup_ledger = Some(ledger);
+        remove_post_commit_registration(&mut app, host);
+
+        settle_cleanup_system(app.world_mut());
+
+        assert_post_commit_host_loss_retains_committed_result(&app, request, &committed_history);
+        assert_eq!(projection_before.receipt_count(), receipts_before);
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .filter(|event| event.cleanup_disposition().is_some())
+                .count()
+                >= receipts_before
+        );
+        assert!(app.world().get_entity(entities[1]).is_ok());
+    }
+
+    #[test]
+    fn post_commit_host_loss_physical_settled_core_pending_retains_leaving_owner() {
+        let (mut app, _router, request, host, committed_history) =
+            post_commit_nested_host_loss_fixture("r2-physical-settled");
+        let mut ledger = app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+            .cleanup_ledger
+            .take()
+            .unwrap();
+        let leaving = ledger
+            .leaving_frames()
+            .iter()
+            .map(|frame| frame.frame().clone())
+            .collect::<Vec<_>>();
+        let leaving_entities = ledger.obligation_entities_for_test();
+        let attempt = ledger.attempt(app.world()).unwrap();
+        assert!(ledger.settle(app.world_mut(), attempt));
+        assert!(ledger.is_settled());
+        assert!(!leaving.is_empty());
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0].cleanup_ledger = Some(ledger);
+        remove_post_commit_registration(&mut app, host);
+
+        settle_cleanup_system(app.world_mut());
+
+        assert_post_commit_host_loss_retains_committed_result(&app, request, &committed_history);
+        assert!(
+            leaving_entities
+                .iter()
+                .all(|entity| app.world().get_entity(*entity).is_err())
+        );
+    }
+
+    #[test]
+    fn post_commit_host_loss_wrong_authority_batch_is_zero_write_and_returns_whole_compound() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router_a = install_atomic_router(&mut app, "r2-wrong-batch-a");
+        let router_b = install_atomic_router(&mut app, "r2-wrong-batch-b");
+        app.update();
+        for (router, fragment) in [(router_a, "a0"), (router_b, "b0")] {
+            let first = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new("/").with_fragment(fragment))
+                .unwrap();
+            run_updates_until_succeeded(&mut app, first);
+        }
+        let mut requests = Vec::new();
+        for (router, fragment) in [(router_a, "a1"), (router_b, "b1")] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new("/").with_fragment(fragment))
+                .unwrap();
+            requests.push(request);
+        }
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+        let (index_a, index_b, host_a, host_b) = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            let index_a = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == router_a)
+                .unwrap();
+            let index_b = navigation
+                .entries
+                .iter()
+                .position(|entry| entry.handle == router_b)
+                .unwrap();
+            (
+                index_a,
+                index_b,
+                navigation.entries[index_a].host.as_ref().unwrap().host,
+                navigation.entries[index_b].host.as_ref().unwrap().host,
+            )
+        };
+        {
+            let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+            let split = index_a.max(index_b);
+            let (left, right) = navigation.entries.split_at_mut(split);
+            let (a, b) = if index_a < index_b {
+                (&mut left[index_a], &mut right[0])
+            } else {
+                (&mut right[0], &mut left[index_b])
+            };
+            std::mem::swap(&mut a.cleanup_ledger, &mut b.cleanup_ledger);
+        }
+        remove_post_commit_registration(&mut app, host_a);
+        remove_post_commit_registration(&mut app, host_b);
+        let world_before = authority_world_fingerprint(app.world());
+
+        settle_cleanup_system(app.world_mut());
+
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        let trace_lengths_before = {
+            let navigation = app.world().resource::<RouterNavigation>();
+            for (index, request) in [(index_a, requests[0]), (index_b, requests[1])] {
+                let entry = &navigation.entries[index];
+                assert!(entry.cleanup_ledger.is_none());
+                assert!(entry.post_commit_compound.is_some());
+                assert!(matches!(
+                    entry.engine.request(request).unwrap().status(),
+                    RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+                ));
+            }
+            [
+                navigation.entries[index_a]
+                    .engine
+                    .request(requests[0])
+                    .unwrap()
+                    .trace()
+                    .len(),
+                navigation.entries[index_b]
+                    .engine
+                    .request(requests[1])
+                    .unwrap()
+                    .trace()
+                    .len(),
+            ]
+        };
+
+        settle_cleanup_system(app.world_mut());
+
+        assert_eq!(authority_world_fingerprint(app.world()), world_before);
+        let navigation = app.world().resource::<RouterNavigation>();
+        for ((index, request), trace_length_before) in
+            [(index_a, requests[0]), (index_b, requests[1])]
+                .into_iter()
+                .zip(trace_lengths_before)
+        {
+            let entry = &navigation.entries[index];
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(entry.post_commit_compound.is_some());
+            let request = entry.engine.request(request).unwrap();
+            assert!(matches!(
+                request.status(),
+                RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+            ));
+            assert_eq!(request.trace().len(), trace_length_before);
+        }
+    }
+
+    #[test]
+    fn post_commit_host_loss_first_authority_write_hook_drift_stops_before_receipt_and_later_writes()
+     {
+        let mut app = App::new();
+        install_cleanup_despawn_drift_hook(&mut app);
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "r2-first-authority-write");
+        app.update();
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+        let (host, first, later, focused, history) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert_eq!(
+                entry
+                    .cleanup_ledger
+                    .as_ref()
+                    .unwrap()
+                    .projection()
+                    .obligation_count(),
+                0
+            );
+            let mut entities = entry
+                .active
+                .as_ref()
+                .unwrap()
+                .claims()
+                .map(|claim| claim.entity())
+                .collect::<Vec<_>>();
+            entities.sort_by_key(|entity| {
+                let mut depth = 0usize;
+                let mut current = *entity;
+                let mut visited = std::collections::HashSet::new();
+                while visited.insert(current) {
+                    let Some(parent) = app.world().get::<ChildOf>(current).map(ChildOf::parent)
+                    else {
+                        break;
+                    };
+                    depth = depth.saturating_add(1);
+                    current = parent;
+                }
+                (std::cmp::Reverse(depth), entity.to_bits())
+            });
+            assert!(entities.len() >= 2);
+            (
+                entry.host.as_ref().unwrap().host,
+                entities[0],
+                entities[1],
+                entry.active.as_ref().unwrap().interactive_entities()[0],
+                entry.engine.history().clone(),
+            )
+        };
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(focused);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(focused));
+        app.world_mut().insert_resource(CleanupDespawnDrift {
+            target: first,
+            action: CleanupDespawnDriftAction::ProtectedMarker(later),
+        });
+        remove_post_commit_registration(&mut app, host);
+
+        settle_cleanup_system(app.world_mut());
+
+        assert_post_commit_host_loss_retains_committed_result(&app, request, &history);
+        assert!(app.world().get_entity(first).is_err());
+        assert!(app.world().get_entity(later).is_ok());
+        assert!(app.world().get::<CleanupDriftMarker>(later).is_some());
+        assert_eq!(
+            app.world().get::<Visibility>(later),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(app.world().get::<Pickable>(later), Some(&Pickable::IGNORE));
+        assert!(
+            app.world()
+                .get::<RouterInputBarrier>(later)
+                .is_some_and(RouterInputBarrier::denies_all)
+        );
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        let gate = app.world().resource::<RouterInputGate>();
+        assert!(!gate.allows_pointer(focused));
+        assert!(!gate.allows_keyboard(focused));
+        assert!(!gate.allows_gamepad(focused));
+        let request = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .request(request)
+            .unwrap();
+        assert_eq!(
+            request
+                .trace()
+                .iter()
+                .filter(|event| event.cleanup_disposition().is_some())
+                .count(),
+            0
+        );
     }
 }

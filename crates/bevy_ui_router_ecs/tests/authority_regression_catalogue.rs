@@ -32,6 +32,7 @@ pub const AUTHORITY_REGRESSION_CATALOGUE: &[&str] = &[
     "slot_lifecycle_has_no_orphans",
     "active_cycle_enters_authority_settlement",
     "error_outlet_role_classification_is_preserved",
+    "post_commit_host_loss_preserves_committed_history",
 ];
 
 fn package_root() -> PathBuf {
@@ -718,7 +719,7 @@ fn recovery_authority_parser_rejects_invalid_rows() {
     let _control = parse_recovery_authority_rows(&source);
     let rows = [
         source.replacen(
-            "| `post_commit_host_loss_preserves_committed_history` | R2 Compound settlement | planned |",
+            "| `post_commit_host_loss_preserves_committed_history` | R2 Compound settlement | active |",
             "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | active |",
             1,
         ),
@@ -750,15 +751,18 @@ fn recovery_authority_parser_rejects_invalid_rows() {
         );
     }
     let active = source.clone();
-    let direct = syn::parse_file("#[test] fn error_outlet_role_classification_is_preserved() {}")
-        .expect("synthetic authority source must parse");
+    let direct = syn::parse_file(
+        "#[test] fn error_outlet_role_classification_is_preserved() {} \
+         #[test] fn post_commit_host_loss_preserves_committed_history() {}",
+    )
+    .expect("synthetic authority source must parse");
     parse_recovery_authority_rows_with_source(&active, &direct);
     for source in [
         "",
-        "#[test] fn error_outlet_role_classification_is_preserved() {} #[test] fn error_outlet_role_classification_is_preserved() {}",
-        "#[test] #[ignore] fn error_outlet_role_classification_is_preserved() {}",
-        "#[cfg(test)] #[test] fn error_outlet_role_classification_is_preserved() {}",
-        "#[cfg_attr(test, ignore)] #[test] fn error_outlet_role_classification_is_preserved() {}",
+        "#[test] fn error_outlet_role_classification_is_preserved() {} #[test] fn error_outlet_role_classification_is_preserved() {} #[test] fn post_commit_host_loss_preserves_committed_history() {}",
+        "#[test] #[ignore] fn error_outlet_role_classification_is_preserved() {} #[test] fn post_commit_host_loss_preserves_committed_history() {}",
+        "#[cfg(test)] #[test] fn error_outlet_role_classification_is_preserved() {} #[test] fn post_commit_host_loss_preserves_committed_history() {}",
+        "#[cfg_attr(test, ignore)] #[test] fn error_outlet_role_classification_is_preserved() {} #[test] fn post_commit_host_loss_preserves_committed_history() {}",
     ] {
         let source = syn::parse_file(source).expect("synthetic authority source must parse");
         assert!(
@@ -779,12 +783,12 @@ fn recovery_planned_rows_do_not_enter_the_runtime_catalogue() {
         .filter(|row| row.state == "planned")
         .map(|row| row.test_function)
         .collect::<BTreeSet<_>>();
-    assert_eq!(planned.len(), 2, "Recovery must retain two planned rows");
+    assert_eq!(planned.len(), 1, "Recovery must retain the R3 planned row");
     let catalogue = catalogue_set();
     assert_eq!(
         catalogue.len(),
-        25,
-        "runtime catalogue must contain the completed R1 row"
+        26,
+        "runtime catalogue must contain the completed R1 and R2 rows"
     );
     let overlap = planned
         .intersection(&catalogue)
@@ -896,14 +900,14 @@ fn catalogue_matches_root_nested_and_active_history_recovery_profiles_and_final_
     let expected_set = expected.into_iter().collect::<BTreeSet<_>>();
     assert_eq!(
         expected_set.len(),
-        25,
-        "active History plus Recovery R1 cumulative catalogue must be 25"
+        26,
+        "active History plus Recovery R1/R2 cumulative catalogue must be 26"
     );
     let catalogue = catalogue_set();
     assert_eq!(
         catalogue.len(),
-        25,
-        "Rust catalogue must include the active Recovery R1 row"
+        26,
+        "Rust catalogue must include the active Recovery R1 and R2 rows"
     );
     assert_eq!(
         catalogue, expected_set,
@@ -2475,14 +2479,14 @@ fn back_target_zero_entering_commit_reuses_the_single_target_publisher() {
 
     let root_commit = body_after_marker(production_navigation, "fn drive_back_target_root_commit(");
     for required in [
-        "if drive_back_target_applied_commit(world, entry)",
+        "if advance_back_target_applied_commit(world, entry)",
         "Some(PendingBackTargetExecution::Driving(_))",
         "let Some(mut pending) = entry.pending_commit.take()",
         "if pending.ticket.is_some()",
         "let Some(PendingBackTargetExecution::Driving(driving))",
         "let ticket = pending\n            .ticket\n            .take()",
         "PendingBackTargetResumeBlocked::AppliedCommitPending(PendingBackTargetAppliedCommit {",
-        "let _ = drive_back_target_applied_commit(world, entry);",
+        "let _ = advance_back_target_applied_commit(world, entry);",
     ] {
         assert!(
             root_commit.contains(required),
@@ -2502,7 +2506,7 @@ fn back_target_zero_entering_commit_reuses_the_single_target_publisher() {
         .expect("the zero-entering Commit path must precede the legacy frame-task path");
     assert_eq!(
         zero_entering_root_commit
-            .match_indices("drive_back_target_applied_commit(world, entry)")
+            .match_indices("advance_back_target_applied_commit(world, entry)")
             .count(),
         2,
         "root Commit must first resume an existing applied owner and then drive its newly installed owner"
@@ -2520,7 +2524,7 @@ fn back_target_zero_entering_commit_reuses_the_single_target_publisher() {
 
     let applied_commit = body_after_marker(
         production_navigation,
-        "fn drive_back_target_applied_commit(",
+        "fn advance_back_target_applied_commit(",
     );
     for required in [
         "PendingBackTargetResumeBlocked::AppliedCommitPending(_)",
@@ -2528,23 +2532,34 @@ fn back_target_zero_entering_commit_reuses_the_single_target_publisher() {
         "BackTargetPhysicalOwnerRef::CommitTicket(&owner.ticket)",
         "pending.ticket = Some(ticket);",
         "PendingBackTargetClassification::Active(TargetPreparationOwner {",
+    ] {
+        assert!(
+            applied_commit.contains(required),
+            "the applied Commit advance must preserve exact pairing and reconciliation ownership: {required}"
+        );
+    }
+    let applied_classification = body_after_marker(
+        production_navigation,
+        "fn drive_back_target_applied_classification(",
+    );
+    for required in [
         "match classify_back_target(world, entry, owner)",
         "ReconciliationPreparationDecision::Ready(",
         "publish_ready_back_target(world, entry, pending, owner);",
     ] {
         assert!(
-            applied_commit.contains(required),
-            "the applied Commit driver must preserve the exact pairing, reconciliation and Ready handoff: {required}"
+            applied_classification.contains(required),
+            "the applied Commit classifier must preserve the exact Ready handoff: {required}"
         );
     }
-    let classify = applied_commit
+    let classify = applied_classification
         .find("match classify_back_target(world, entry, owner)")
         .expect("the applied Commit classifier was required");
-    let ready = applied_commit[classify..]
+    let ready = applied_classification[classify..]
         .find("ReconciliationPreparationDecision::Ready(")
         .map(|offset| classify + offset)
         .expect("classification must produce the typed Ready arm");
-    let target_publisher = applied_commit[ready..]
+    let target_publisher = applied_classification[ready..]
         .find("publish_ready_back_target(world, entry, pending, owner);")
         .map(|offset| ready + offset)
         .expect("Ready must enter the shared target publisher");
@@ -2553,7 +2568,7 @@ fn back_target_zero_entering_commit_reuses_the_single_target_publisher() {
         "applied Commit classification must precede the sole target publisher"
     );
     assert_eq!(
-        applied_commit
+        applied_classification
             .match_indices("publish_ready_back_target(")
             .count(),
         1,

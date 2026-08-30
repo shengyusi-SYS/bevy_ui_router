@@ -41,7 +41,7 @@ fn recovery_profile_has_exact_activation_machine_state() {
             (
                 "post-commit compound settlement complete evidence",
                 "R2 Compound settlement",
-                "planned",
+                "active",
             ),
             (
                 "host re-admission fresh-epoch complete evidence",
@@ -69,7 +69,7 @@ fn recovery_profile_has_exact_activation_machine_state() {
             (
                 "post_commit_host_loss_preserves_committed_history",
                 "R2 Compound settlement",
-                "planned",
+                "active",
             ),
             (
                 "host_reacceptance_detaches_old_top_slot",
@@ -85,8 +85,11 @@ fn recovery_profile_has_exact_activation_machine_state() {
             .filter(|row| row.state == "active")
             .map(|row| row.item.as_str())
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["error_outlet_role_classification_is_preserved"]),
-        "Recovery must activate exactly the completed R1 authority row"
+        BTreeSet::from([
+            "error_outlet_role_classification_is_preserved",
+            "post_commit_host_loss_preserves_committed_history",
+        ]),
+        "Recovery must activate exactly the completed R1 and R2 authority rows"
     );
 }
 
@@ -95,15 +98,15 @@ fn active_stage_profile_preserves_history_union_at_recovery_activation() {
     let profile = stage_contract_profile();
     assert_eq!(profile.exclusions.len(), 8);
     assert_eq!(profile.contract_deltas.len(), 6);
-    assert_eq!(profile.authority_additions.len(), 2);
+    assert_eq!(profile.authority_additions.len(), 3);
     assert_eq!(
         profile
             .authority_additions
             .iter()
             .filter(|row| row.state == "active")
             .count(),
-        2,
-        "the completed History and Recovery R1 authority rows are active"
+        3,
+        "the completed History and Recovery R1/R2 authority rows are active"
     );
     assert_eq!(
         profile
@@ -117,6 +120,7 @@ fn active_stage_profile_preserves_history_union_at_recovery_activation() {
             "NavigationEnqueueErrorKind::IdentityExhausted",
             "boundary-bound error presentation complete evidence",
             "late-bound back complete evidence",
+            "post-commit compound settlement complete evidence",
         ])
     );
     assert_eq!(
@@ -126,10 +130,7 @@ fn active_stage_profile_preserves_history_union_at_recovery_activation() {
             .filter(|row| row.state == "planned")
             .map(|row| row.item.as_str())
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from([
-            "post-commit compound settlement complete evidence",
-            "host re-admission fresh-epoch complete evidence",
-        ])
+        BTreeSet::from(["host re-admission fresh-epoch complete evidence"])
     );
 }
 
@@ -184,7 +185,7 @@ fn recovery_profile_rejects_invalid_10_2_rows() {
     let _control = parse_recovery_contract_profile(&source);
     let rows = [
         source.replacen(
-            "| post-commit compound settlement complete evidence | R2 Compound settlement | planned | Journey G post-commit foreground rows PASS |",
+            "| post-commit compound settlement complete evidence | R2 Compound settlement | active | Journey G post-commit foreground rows PASS |",
             "| boundary-bound error presentation complete evidence | R1 Error presentation | active | Journey D public contract PASS |",
             1,
         ),
@@ -223,7 +224,7 @@ fn recovery_profile_rejects_invalid_10_3_rows() {
     let _control = parse_recovery_contract_profile(&source);
     let rows = [
         source.replacen(
-            "| `post_commit_host_loss_preserves_committed_history` | R2 Compound settlement | planned |",
+            "| `post_commit_host_loss_preserves_committed_history` | R2 Compound settlement | active |",
             "| `error_outlet_role_classification_is_preserved` | R1 Error presentation | active |",
             1,
         ),

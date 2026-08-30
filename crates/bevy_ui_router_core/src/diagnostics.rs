@@ -133,6 +133,13 @@ pub enum DiagnosticSeverity {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PostCommitCleanupAnomalyCause {
+    HostRegistrationLost,
+    HostEntityMissing,
+    RequiredResourcesLost,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReportDisposition {
     Accepted,
     StaleDiscarded,
@@ -225,6 +232,7 @@ pub struct DiagnosticEvent {
     branch_planning: Option<BranchPlanningDiagnostic>,
     frame_lifecycle: Option<FrameLifecycleDiagnostic>,
     report_disposition: Option<ReportDisposition>,
+    post_commit_cleanup_anomaly_cause: Option<PostCommitCleanupAnomalyCause>,
     redacted_message: String,
 }
 
@@ -243,6 +251,7 @@ impl DiagnosticEvent {
             branch_planning: None,
             frame_lifecycle: None,
             report_disposition: None,
+            post_commit_cleanup_anomaly_cause: None,
             redacted_message: redacted_message.into(),
         }
     }
@@ -258,6 +267,7 @@ impl DiagnosticEvent {
             branch_planning: None,
             frame_lifecycle: None,
             report_disposition: None,
+            post_commit_cleanup_anomaly_cause: None,
             redacted_message: redacted_message.into(),
         }
     }
@@ -273,6 +283,7 @@ impl DiagnosticEvent {
             branch_planning: None,
             frame_lifecycle: None,
             report_disposition: None,
+            post_commit_cleanup_anomaly_cause: None,
             redacted_message: redacted_message.into(),
         }
     }
@@ -288,6 +299,7 @@ impl DiagnosticEvent {
             branch_planning: None,
             frame_lifecycle: None,
             report_disposition: None,
+            post_commit_cleanup_anomaly_cause: None,
             redacted_message: redacted_message.into(),
         }
     }
@@ -303,6 +315,7 @@ impl DiagnosticEvent {
             branch_planning: Some(branch_planning),
             frame_lifecycle: None,
             report_disposition: None,
+            post_commit_cleanup_anomaly_cause: None,
             redacted_message: "branch planned".to_owned(),
         }
     }
@@ -326,6 +339,7 @@ impl DiagnosticEvent {
             branch_planning: None,
             frame_lifecycle: Some(frame_lifecycle),
             report_disposition: None,
+            post_commit_cleanup_anomaly_cause: None,
             redacted_message: "frame lifecycle changed".to_owned(),
         }
     }
@@ -345,6 +359,26 @@ impl DiagnosticEvent {
             branch_planning: None,
             frame_lifecycle: None,
             report_disposition: Some(disposition),
+            post_commit_cleanup_anomaly_cause: None,
+            redacted_message: redacted_message.into(),
+        }
+    }
+
+    pub(crate) fn post_commit_cleanup_anomaly(
+        request: NavigationRequestId,
+        cause: PostCommitCleanupAnomalyCause,
+        redacted_message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: DiagnosticEventKind::PostCommitCleanupAnomaly,
+            severity: DiagnosticSeverity::Severe,
+            request: Some(request),
+            frame: None,
+            identity: None,
+            branch_planning: None,
+            frame_lifecycle: None,
+            report_disposition: None,
+            post_commit_cleanup_anomaly_cause: Some(cause),
             redacted_message: redacted_message.into(),
         }
     }
@@ -382,6 +416,12 @@ impl DiagnosticEvent {
 
     pub fn report_disposition(&self) -> Option<ReportDisposition> {
         self.report_disposition
+    }
+
+    pub(crate) const fn post_commit_cleanup_anomaly_cause(
+        &self,
+    ) -> Option<PostCommitCleanupAnomalyCause> {
+        self.post_commit_cleanup_anomaly_cause
     }
 
     pub fn redacted_message(&self) -> &str {

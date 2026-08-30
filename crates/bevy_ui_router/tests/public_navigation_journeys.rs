@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use bevy_app::App;
+use bevy_app::{App, Update};
 use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
     change_detection::Tick,
@@ -17,16 +17,21 @@ use bevy_ecs::{
     hierarchy::{ChildOf, Children},
     lifecycle::Insert,
     observer::On,
-    prelude::Component,
+    prelude::{Component, Resource},
+    schedule::IntoScheduleConfigs,
+    world::World,
 };
 use bevy_picking::Pickable;
 use bevy_ui::{BackgroundColor, Node, Val};
+use bevy_ui_router::core::DiagnosticEventKind;
+use bevy_ui_router::ecs::RouterScheduleSet;
 #[cfg(feature = "test-support")]
 use bevy_ui_router::ecs::{AuthorityFrameLifecycle, RouterAuthorityAudits};
 use bevy_ui_router::prelude::*;
 #[cfg(feature = "test-support")]
 use bevy_ui_router_ecs::test_support::{
-    testing_back_request_inventory, testing_router_request_inventory,
+    testing_back_request_inventory, testing_commit_sealed_registration_removal_fired,
+    testing_remove_host_registration_after_next_commit_seal, testing_router_request_inventory,
 };
 
 const NORMAL_RECT_WIDTH: u16 = 31;
@@ -412,6 +417,112 @@ struct RecoveryR1Fixture {
     root_route: RouteId,
     boundary_route: RouteId,
     host_fingerprint: HostBoundaryFingerprint,
+    admission_entities: HashSet<Entity>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryR2LossKind {
+    RegistrationRemoval,
+    HostDespawn,
+}
+
+#[derive(Resource)]
+struct RecoveryR2LossInjection {
+    host: Entity,
+    kind: RecoveryR2LossKind,
+    armed: bool,
+    fired: bool,
+}
+
+fn inject_recovery_r2_host_loss(world: &mut World) {
+    let (host, kind, armed, fired) = {
+        let injection = world.resource::<RecoveryR2LossInjection>();
+        (
+            injection.host,
+            injection.kind,
+            injection.armed,
+            injection.fired,
+        )
+    };
+    if !armed || fired {
+        return;
+    }
+    match kind {
+        RecoveryR2LossKind::RegistrationRemoval => {
+            assert!(
+                world
+                    .entity_mut(host)
+                    .take::<RouterHostRegistration>()
+                    .is_some(),
+                "the R2 seam removes only the real host-registration input fact"
+            );
+        }
+        RecoveryR2LossKind::HostDespawn => {
+            assert!(
+                world.despawn(host),
+                "the R2 seam despawns only the real app-host input fact"
+            );
+        }
+    }
+    world.resource_mut::<RecoveryR2LossInjection>().fired = true;
+}
+
+fn install_recovery_r2_precommit_loss(
+    fixture: &mut RecoveryR1Fixture,
+    kind: RecoveryR2LossKind,
+    after_drive: bool,
+) {
+    fixture
+        .app
+        .world_mut()
+        .insert_resource(RecoveryR2LossInjection {
+            host: fixture.host_fingerprint.host,
+            kind,
+            armed: true,
+            fired: false,
+        });
+    if after_drive {
+        fixture.app.add_systems(
+            Update,
+            inject_recovery_r2_host_loss
+                .after(RouterScheduleSet::DriveNavigation)
+                .before(RouterScheduleSet::CommitPresentation),
+        );
+    } else {
+        fixture.app.add_systems(
+            Update,
+            inject_recovery_r2_host_loss
+                .after(RouterScheduleSet::CollectNavigation)
+                .before(RouterScheduleSet::DriveNavigation),
+        );
+    }
+}
+
+fn install_recovery_r2_postcommit_loss(fixture: &mut RecoveryR1Fixture, kind: RecoveryR2LossKind) {
+    fixture
+        .app
+        .world_mut()
+        .insert_resource(RecoveryR2LossInjection {
+            host: fixture.host_fingerprint.host,
+            kind,
+            armed: false,
+            fired: false,
+        });
+    fixture.app.add_systems(
+        Update,
+        inject_recovery_r2_host_loss
+            .after(RouterScheduleSet::CommitPresentation)
+            .before(RouterScheduleSet::SettleCleanup),
+    );
+}
+
+fn arm_recovery_r2_loss(fixture: &mut RecoveryR1Fixture) {
+    let mut injection = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RecoveryR2LossInjection>();
+    injection.armed = true;
+    injection.fired = false;
 }
 
 fn recovery_r1_fixture(label: &str) -> RecoveryR1Fixture {
@@ -535,6 +646,7 @@ fn recovery_r1_fixture(label: &str) -> RecoveryR1Fixture {
         .iter()
         .copied()
         .find(|child| !existing_children.contains(child));
+    let admission_entities = entity_set(&app);
 
     RecoveryR1Fixture {
         app,
@@ -547,6 +659,7 @@ fn recovery_r1_fixture(label: &str) -> RecoveryR1Fixture {
         root_route,
         boundary_route,
         host_fingerprint,
+        admission_entities,
     }
 }
 
@@ -1138,6 +1251,13 @@ fn assert_terminal_owner_closure(app: &App, router: RouterHandle) {
             assert_eq!(mapping.frame(), active);
             assert_eq!(mapping.lifecycle(), AuthorityFrameLifecycle::Active);
         }
+        if snapshot.active().kind() == ActivePresentationKind::None {
+            assert!(audit.host().is_none());
+            assert!(audit.frames().is_empty());
+            assert!(audit.slots().is_empty());
+            assert!(audit.content().is_empty());
+            assert!(audit.outlets().is_empty());
+        }
         assert!(audit.orphan_slots().is_empty());
     }
 }
@@ -1474,6 +1594,81 @@ fn assert_host_intact(app: &App, fingerprint: &HostBoundaryFingerprint) {
     assert_eq!(sibling_node.height, Val::Px(29.0));
 }
 
+fn assert_host_after_registration_loss(app: &App, fingerprint: &HostBoundaryFingerprint) {
+    let host = fingerprint.host;
+    let existing_child = fingerprint.existing_children[0];
+    let existing_sibling = fingerprint.existing_children[1];
+    assert_eq!(
+        app.world().get::<HostSentinel>(host),
+        Some(&HostSentinel(7))
+    );
+    assert_eq!(
+        app.world().get::<HostMetadata>(host),
+        Some(&HostMetadata(73))
+    );
+    assert!(app.world().get::<RouterHostRegistration>(host).is_none());
+    assert_eq!(
+        app.world().get::<ExistingChild>(existing_child),
+        Some(&ExistingChild(11))
+    );
+    assert_eq!(
+        app.world().get::<ExistingSibling>(existing_sibling),
+        Some(&ExistingSibling(17))
+    );
+    assert_eq!(
+        app.world()
+            .get::<ChildOf>(existing_child)
+            .map(ChildOf::parent),
+        Some(host)
+    );
+    assert_eq!(
+        app.world()
+            .get::<ChildOf>(existing_sibling)
+            .map(ChildOf::parent),
+        Some(host)
+    );
+    assert_eq!(
+        app.world()
+            .get::<Children>(host)
+            .unwrap()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        fingerprint.existing_children
+    );
+    if let Some(top_slot) = fingerprint.top_slot {
+        assert!(app.world().get_entity(top_slot).is_err());
+    }
+    let children_component = app.world().component_id::<Children>().unwrap();
+    let registration_component = app
+        .world()
+        .component_id::<RouterHostRegistration>()
+        .unwrap();
+    let current_host_components = component_manifest(app, host)
+        .into_iter()
+        .filter(|component| *component != children_component)
+        .collect::<Vec<_>>();
+    let expected_host_components = fingerprint
+        .host_non_children_components
+        .iter()
+        .copied()
+        .filter(|component| *component != registration_component)
+        .collect::<Vec<_>>();
+    assert_eq!(current_host_components, expected_host_components);
+    for (child, expected_components) in &fingerprint.existing_child_components {
+        assert_eq!(component_manifest(app, *child), *expected_components);
+    }
+    let host_node = app.world().get::<Node>(host).unwrap();
+    assert_eq!(host_node.width, Val::Px(640.0));
+    assert_eq!(host_node.height, Val::Px(360.0));
+    let child_node = app.world().get::<Node>(existing_child).unwrap();
+    assert_eq!(child_node.width, Val::Px(13.0));
+    assert_eq!(child_node.height, Val::Px(17.0));
+    let sibling_node = app.world().get::<Node>(existing_sibling).unwrap();
+    assert_eq!(sibling_node.width, Val::Px(19.0));
+    assert_eq!(sibling_node.height, Val::Px(29.0));
+}
+
 fn observe_app_owned_inserts<T: Component>(
     app: &mut App,
     entities: &[Entity],
@@ -1505,6 +1700,22 @@ fn entity_set(app: &App) -> HashSet<Entity> {
         .iter_entities()
         .map(|entity| entity.id())
         .collect()
+}
+
+fn entity_descendant_closure(app: &App, root: Entity) -> HashSet<Entity> {
+    let mut closure = HashSet::from([root]);
+    let mut pending = vec![root];
+    while let Some(entity) = pending.pop() {
+        let Some(children) = app.world().get::<Children>(entity) else {
+            continue;
+        };
+        for child in children.iter().copied() {
+            if closure.insert(child) {
+                pending.push(child);
+            }
+        }
+    }
+    closure
 }
 
 fn node_entities_with_width(app: &mut App, width: u16) -> Vec<Entity> {
@@ -3298,4 +3509,273 @@ fn recovery_r1_journey_d_recovery_failure_cleans_all_attempts_and_queue_continue
     );
     assert_terminal_owner_closure(&fixture.app, fixture.router);
     assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
+fn recovery_r2_characterization_precommit_host_loss_closes_foreground_owners() {
+    #[derive(Clone, Copy)]
+    enum Row {
+        ApplyFirstNavigation,
+        ReadyToCommitWithActive,
+        CommitSealedRegistrationRemoval,
+    }
+
+    for (label, row) in [
+        ("apply", Row::ApplyFirstNavigation),
+        ("ready-to-commit", Row::ReadyToCommitWithActive),
+        ("commit-sealed", Row::CommitSealedRegistrationRemoval),
+    ] {
+        let mut fixture = recovery_r1_fixture(&format!("r2-precommit-{label}"));
+        let existing_location = RouteLocation::new("/section/items/1");
+        if !matches!(row, Row::ApplyFirstNavigation) {
+            let existing = push_and_settle(
+                &mut fixture.app,
+                fixture.router,
+                existing_location.clone(),
+                None,
+                None,
+            );
+            assert_succeeded(&request_snapshot(&fixture.app, fixture.router, existing));
+        }
+        let before = router_snapshot(&fixture.app, fixture.router);
+        let history_before = before.history().clone();
+        let host_remains = matches!(row, Row::CommitSealedRegistrationRemoval);
+        if matches!(row, Row::CommitSealedRegistrationRemoval) {
+            assert!(
+                testing_remove_host_registration_after_next_commit_seal(
+                    &mut fixture.app.world_mut().resource_mut::<RouterNavigation>(),
+                    fixture.router,
+                ),
+                "the commit-sealed row must arm the real post-seal/pre-publication seam"
+            );
+        } else {
+            install_recovery_r2_precommit_loss(
+                &mut fixture,
+                RecoveryR2LossKind::HostDespawn,
+                matches!(row, Row::ReadyToCommitWithActive),
+            );
+        }
+        let terminal_entity_baseline = entity_set(&fixture.app);
+        let despawned_host_subtree = (!host_remains)
+            .then(|| entity_descendant_closure(&fixture.app, fixture.host_fingerprint.host));
+        let requested = match row {
+            Row::ApplyFirstNavigation => RouteLocation::new("/section/items/1"),
+            Row::ReadyToCommitWithActive => RouteLocation::new("/section/items/2"),
+            Row::CommitSealedRegistrationRemoval => RouteLocation::new("/section/items/3"),
+        };
+        let request = fixture
+            .app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(fixture.router, requested.clone())
+            .unwrap();
+        let terminal = drive_request_to_terminal(&mut fixture.app, fixture.router, request);
+
+        let seam_fired = if matches!(row, Row::CommitSealedRegistrationRemoval) {
+            testing_commit_sealed_registration_removal_fired(
+                fixture.app.world().resource::<RouterNavigation>(),
+                fixture.router,
+            )
+        } else {
+            fixture
+                .app
+                .world()
+                .resource::<RecoveryR2LossInjection>()
+                .fired
+        };
+        assert!(
+            seam_fired,
+            "row {label} must alter the real authority fact at its exact boundary"
+        );
+        assert_failed(&terminal, NavigationFailureKind::HostLost);
+        assert_eq!(terminal.requested(), Some(&requested));
+        assert!(
+            terminal
+                .trace()
+                .iter()
+                .all(|event| event.kind() != NavigationTraceEventKind::CommitPublished),
+            "row {label} must not publish a pre-commit request"
+        );
+        let after = router_snapshot(&fixture.app, fixture.router);
+        assert_eq!(after.history(), &history_before, "row {label}");
+        assert_eq!(
+            after.active().kind(),
+            ActivePresentationKind::None,
+            "row {label}"
+        );
+        assert_eq!(
+            after.availability(),
+            &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost),
+            "row {label}"
+        );
+        assert_terminal_owner_closure(&fixture.app, fixture.router);
+        if host_remains {
+            assert_host_after_registration_loss(&fixture.app, &fixture.host_fingerprint);
+            let mut expected_entities = fixture.admission_entities.clone();
+            expected_entities.remove(
+                &fixture
+                    .host_fingerprint
+                    .top_slot
+                    .expect("admission creates the router-owned top slot"),
+            );
+            assert_eq!(entity_set(&fixture.app), expected_entities);
+        } else {
+            let expected_entities = terminal_entity_baseline
+                .difference(
+                    despawned_host_subtree
+                        .as_ref()
+                        .expect("host-despawn rows freeze the exact app-host subtree"),
+                )
+                .copied()
+                .collect::<HashSet<_>>();
+            assert_eq!(entity_set(&fixture.app), expected_entities, "row {label}");
+        }
+    }
+}
+
+fn run_recovery_r2_postcommit_row(label: &str, kind: RecoveryR2LossKind) {
+    let mut fixture = recovery_r1_fixture(label);
+    install_recovery_r2_postcommit_loss(&mut fixture, kind);
+    let terminal_entity_baseline = entity_set(&fixture.app);
+    let despawned_host_subtree = (kind == RecoveryR2LossKind::HostDespawn)
+        .then(|| entity_descendant_closure(&fixture.app, fixture.host_fingerprint.host));
+    let first_location = RouteLocation::new("/section/items/1");
+    let first = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        first_location.clone(),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, first));
+    let committed_location = RouteLocation::new("/section/items/2");
+    let queued_location = RouteLocation::new("/section/items/3");
+    let committed = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(fixture.router, committed_location.clone())
+        .unwrap();
+    let queued = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(fixture.router, queued_location.clone())
+        .unwrap();
+    arm_recovery_r2_loss(&mut fixture);
+
+    let committed_snapshot = drive_request_to_terminal(&mut fixture.app, fixture.router, committed);
+    assert_succeeded(&committed_snapshot);
+    let commit = committed_snapshot
+        .trace()
+        .iter()
+        .position(|event| event.kind() == NavigationTraceEventKind::CommitPublished)
+        .expect("the post-commit row publishes before authority loss is settled");
+    let terminal = committed_snapshot
+        .trace()
+        .iter()
+        .position(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+        .unwrap();
+    let post_commit_cleanup = committed_snapshot
+        .trace()
+        .iter()
+        .position(|event| {
+            event.kind() == NavigationTraceEventKind::RequestPhaseChanged
+                && event.phase() == Some(&NavigationPhase::PostCommitCleanup)
+        })
+        .expect("the committed request enters post-commit cleanup");
+    let recovering = committed_snapshot
+        .trace()
+        .iter()
+        .position(|event| {
+            event.kind() == NavigationTraceEventKind::RequestPhaseChanged
+                && event.phase() == Some(&NavigationPhase::Recovering)
+        })
+        .expect("post-commit host loss enters explicit recovery before terminal");
+    assert!(
+        commit < post_commit_cleanup && post_commit_cleanup < recovering && recovering < terminal
+    );
+    let request_anomalies = committed_snapshot
+        .diagnostics()
+        .iter()
+        .filter(|event| event.kind() == DiagnosticEventKind::PostCommitCleanupAnomaly)
+        .collect::<Vec<_>>();
+    assert_eq!(request_anomalies.len(), 1);
+    assert_eq!(request_anomalies[0].severity(), DiagnosticSeverity::Severe);
+    assert_eq!(request_anomalies[0].request(), Some(committed));
+    let queued_snapshot = drive_request_to_terminal(&mut fixture.app, fixture.router, queued);
+    assert_failed(&queued_snapshot, NavigationFailureKind::HostLost);
+    assert!(
+        queued_snapshot
+            .trace()
+            .iter()
+            .all(|event| event.kind() != NavigationTraceEventKind::CommitPublished)
+    );
+
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after.requested(), None);
+    assert_eq!(
+        after.history().entries(),
+        [first_location, committed_location.clone()]
+    );
+    assert_eq!(after.history().current(), Some(&committed_location));
+    assert_eq!(after.history().cursor(), Some(1));
+    assert_eq!(after.active().kind(), ActivePresentationKind::None);
+    assert_eq!(
+        after.availability(),
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+    );
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    let router_anomalies = after
+        .diagnostics()
+        .events()
+        .iter()
+        .filter(|event| event.kind() == DiagnosticEventKind::PostCommitCleanupAnomaly)
+        .collect::<Vec<_>>();
+    assert_eq!(router_anomalies.len(), 1);
+    assert_eq!(router_anomalies[0], request_anomalies[0]);
+    assert!(
+        fixture
+            .app
+            .world()
+            .resource::<RecoveryR2LossInjection>()
+            .fired
+    );
+    if kind == RecoveryR2LossKind::RegistrationRemoval {
+        assert_host_after_registration_loss(&fixture.app, &fixture.host_fingerprint);
+        let mut expected_entities = terminal_entity_baseline;
+        expected_entities.remove(
+            &fixture
+                .host_fingerprint
+                .top_slot
+                .expect("admission creates the router-owned top slot"),
+        );
+        assert_eq!(entity_set(&fixture.app), expected_entities);
+    } else {
+        let expected_entities = terminal_entity_baseline
+            .difference(
+                despawned_host_subtree
+                    .as_ref()
+                    .expect("host-despawn row freezes the exact app-host subtree"),
+            )
+            .copied()
+            .collect::<HashSet<_>>();
+        assert_eq!(entity_set(&fixture.app), expected_entities);
+    }
+}
+
+#[test]
+fn recovery_r2_journey_g_post_commit_registration_removal_preserves_committed_history() {
+    run_recovery_r2_postcommit_row(
+        "r2-postcommit-registration-removal",
+        RecoveryR2LossKind::RegistrationRemoval,
+    );
+}
+
+#[test]
+fn recovery_r2_journey_g_post_commit_host_despawn_preserves_committed_history() {
+    run_recovery_r2_postcommit_row(
+        "r2-postcommit-host-despawn",
+        RecoveryR2LossKind::HostDespawn,
+    );
 }

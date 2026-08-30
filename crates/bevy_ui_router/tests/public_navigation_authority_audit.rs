@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use bevy_app::{App, Update};
@@ -8,6 +11,7 @@ use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
     component::{Component, ComponentId},
     hierarchy::{ChildOf, Children},
+    prelude::Resource,
     schedule::IntoScheduleConfigs,
     world::World,
 };
@@ -40,6 +44,71 @@ struct RecoveryAuditDriver {
     failed_view: Option<RouteViewKey>,
     error_view: RouteViewKey,
     fallback_view: RouteViewKey,
+}
+
+#[derive(Resource)]
+struct RecoveryR2AuditLoss {
+    router: RouterHandle,
+    host: bevy_ecs::entity::Entity,
+    armed: bool,
+    fired: bool,
+}
+
+#[derive(Resource, Default)]
+struct RecoveryR2AuditCommitBoundary {
+    leaving: Vec<AuditEntityId>,
+    authority_non_top: Vec<AuditEntityId>,
+    top_slot: Option<AuditEntityId>,
+}
+
+fn capture_recovery_r2_audit_commit_boundary(world: &mut World) {
+    let (router, armed, fired) = {
+        let loss = world.resource::<RecoveryR2AuditLoss>();
+        (loss.router, loss.armed, loss.fired)
+    };
+    if !armed || fired {
+        return;
+    }
+    let audit = world
+        .resource::<RouterAuthorityAudits>()
+        .get(router)
+        .expect("the commit boundary publishes one exact authority audit");
+    let mut leaving = Vec::new();
+    let mut authority_non_top = Vec::new();
+    for frame in audit.frames() {
+        let role = match frame.lifecycle() {
+            AuthorityFrameLifecycle::LeavingInert => &mut leaving,
+            AuthorityFrameLifecycle::Active => &mut authority_non_top,
+            AuthorityFrameLifecycle::PreparedInert | AuthorityFrameLifecycle::Quarantined => {
+                panic!("the post-publication boundary contains only L and active A frames")
+            }
+        };
+        role.extend(frame.entities().iter().copied());
+    }
+    let top_slot = audit.host().map(|host| host.top_slot());
+    *world.resource_mut::<RecoveryR2AuditCommitBoundary>() = RecoveryR2AuditCommitBoundary {
+        leaving,
+        authority_non_top,
+        top_slot,
+    };
+}
+
+fn inject_recovery_r2_audit_registration_loss(world: &mut World) {
+    let (host, armed, fired) = {
+        let loss = world.resource::<RecoveryR2AuditLoss>();
+        (loss.host, loss.armed, loss.fired)
+    };
+    if !armed || fired {
+        return;
+    }
+    assert!(
+        world
+            .entity_mut(host)
+            .take::<RouterHostRegistration>()
+            .is_some(),
+        "the authority audit seam removes only the real registration fact"
+    );
+    world.resource_mut::<RecoveryR2AuditLoss>().fired = true;
 }
 
 impl EcsViewDriver for RecoveryAuditDriver {
@@ -1314,4 +1383,331 @@ fn recovery_r1_error_presentation_authority_maps_exact_frame() {
         assert_eq!(app.world().get::<Node>(host).unwrap().width, Val::Px(503.0));
         assert_eq!(app.world().get::<Node>(child).unwrap().width, Val::Px(13.0));
     }
+}
+
+#[test]
+fn recovery_r2_authority_audit_closes_l_a_h_and_preserves_host_order() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let driver = app
+        .register_ui_view_driver(AuditDriver {
+            key: ViewDriverKey::new("r2-authority-audit-driver").unwrap(),
+            outlet_view: None,
+        })
+        .unwrap();
+    let view = RouteViewKey::new("r2-authority-audit-view").unwrap();
+    let routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("/items/:id").unwrap(),
+            RouteNodeOptions::new().with_view(view.clone()),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut views = RouteViewRegistry::new();
+    views
+        .insert(view.clone(), RouteViewDescriptor::new(driver))
+        .unwrap();
+    let router = app
+        .add_ui_router(RouterConfig::new(routes, views, view))
+        .unwrap();
+    let host = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(607.0),
+                height: Val::Px(347.0),
+                ..Node::default()
+            },
+            RecoveryAuditHostSentinel(0x621),
+            RouterHostRegistration::new(router),
+        ))
+        .id();
+    let first_child = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(17.0),
+                ..Node::default()
+            },
+            RecoveryAuditChildSentinel(0x622),
+            ChildOf(host),
+        ))
+        .id();
+    let second_child = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(19.0),
+                ..Node::default()
+            },
+            RecoveryAuditChildSentinel(0x623),
+            ChildOf(host),
+        ))
+        .id();
+    let host_manifest_before = audit_component_manifest(&app, host);
+    let first_manifest_before = audit_component_manifest(&app, first_child);
+    let second_manifest_before = audit_component_manifest(&app, second_child);
+    app.world_mut().insert_resource(RecoveryR2AuditLoss {
+        router,
+        host,
+        armed: false,
+        fired: false,
+    });
+    app.world_mut()
+        .init_resource::<RecoveryR2AuditCommitBoundary>();
+    app.add_systems(
+        Update,
+        capture_recovery_r2_audit_commit_boundary
+            .after(RouterScheduleSet::CommitPresentation)
+            .before(inject_recovery_r2_audit_registration_loss),
+    );
+    app.add_systems(
+        Update,
+        inject_recovery_r2_audit_registration_loss
+            .after(RouterScheduleSet::CommitPresentation)
+            .before(RouterScheduleSet::SettleCleanup),
+    );
+    let app_entities_before_admission = app
+        .world()
+        .iter_entities()
+        .map(|entity| entity.id())
+        .collect::<HashSet<_>>();
+    app.update();
+    let first = push_and_publish(&mut app, router, RouteLocation::new("/items/1"));
+    assert!(matches!(
+        app.world().resource::<RouterSnapshots>().request(router, first),
+        RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded
+    ));
+    let old_owned = {
+        let audit = app
+            .world()
+            .resource::<RouterAuthorityAudits>()
+            .get(router)
+            .unwrap();
+        audit
+            .frames()
+            .iter()
+            .flat_map(|mapping| mapping.entities().iter().copied())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        old_owned.iter().copied().collect::<HashSet<_>>().len(),
+        old_owned.len(),
+        "the baseline audit must not alias frame roots and content"
+    );
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/items/2"))
+        .unwrap();
+    {
+        let mut loss = app.world_mut().resource_mut::<RecoveryR2AuditLoss>();
+        loss.armed = true;
+        loss.fired = false;
+    }
+    for _ in 0..16 {
+        app.update();
+        if matches!(
+            app.world().resource::<RouterSnapshots>().request(router, request),
+            RequestLookup::Found(snapshot) if matches!(snapshot.status(), RequestStatus::Succeeded | RequestStatus::Failed(_))
+        ) {
+            break;
+        }
+    }
+
+    let snapshots = app.world().resource::<RouterSnapshots>();
+    let RequestLookup::Found(request_snapshot) = snapshots.request(router, request) else {
+        panic!("the R2 audit request remains retained")
+    };
+    assert_eq!(request_snapshot.status(), &RequestStatus::Succeeded);
+    let router_snapshot = snapshots.get(router).unwrap();
+    assert_eq!(
+        router_snapshot.availability(),
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+    );
+    assert_eq!(
+        router_snapshot.active().kind(),
+        ActivePresentationKind::None
+    );
+    assert_eq!(
+        router_snapshot.history().entries(),
+        [
+            RouteLocation::new("/items/1"),
+            RouteLocation::new("/items/2")
+        ]
+    );
+    assert!(router_snapshot.running_request().is_none());
+    assert!(router_snapshot.pending_phase().is_none());
+    assert!(!router_snapshot.cleanup().foreground_pending());
+
+    let boundary = app.world().resource::<RecoveryR2AuditCommitBoundary>();
+    let leaving = boundary.leaving.clone();
+    let authority_non_top = boundary.authority_non_top.clone();
+    let top_slot = boundary
+        .top_slot
+        .expect("the commit boundary freezes the exact A-top slot");
+    assert!(!leaving.is_empty());
+    assert!(!authority_non_top.is_empty());
+    assert_eq!(leaving, old_owned);
+    assert_eq!(
+        leaving.iter().copied().collect::<HashSet<_>>().len(),
+        leaving.len()
+    );
+    assert_eq!(
+        authority_non_top
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>()
+            .len(),
+        authority_non_top.len()
+    );
+    let leaving_set = leaving.iter().copied().collect::<HashSet<_>>();
+    let authority_set = authority_non_top.iter().copied().collect::<HashSet<_>>();
+    assert!(leaving_set.is_disjoint(&authority_set));
+    assert!(!leaving_set.contains(&top_slot));
+    assert!(!authority_set.contains(&top_slot));
+
+    let trace = request_snapshot.trace();
+    let commit = trace
+        .iter()
+        .position(|event| event.kind() == NavigationTraceEventKind::CommitPublished)
+        .unwrap();
+    let tail = &trace[commit..];
+    assert_eq!(tail.len(), leaving.len() + authority_non_top.len() + 7);
+    assert_eq!(tail[0].kind(), NavigationTraceEventKind::CommitPublished);
+    assert_eq!(
+        tail[1].kind(),
+        NavigationTraceEventKind::RequestPhaseChanged
+    );
+    assert_eq!(tail[1].phase(), Some(&NavigationPhase::PostCommitCleanup));
+    assert_eq!(
+        tail[2].kind(),
+        NavigationTraceEventKind::RequestPhaseChanged
+    );
+    assert_eq!(tail[2].phase(), Some(&NavigationPhase::Recovering));
+    let leaving_end = 3 + leaving.len();
+    assert!(tail[3..leaving_end].iter().all(|event| {
+        event.kind() == NavigationTraceEventKind::CleanupSettled
+            && event.cleanup_disposition().is_some()
+    }));
+    let authority_end = leaving_end + authority_non_top.len();
+    assert!(tail[leaving_end..authority_end].iter().all(|event| {
+        event.kind() == NavigationTraceEventKind::CleanupSettled
+            && event.cleanup_disposition().is_some()
+    }));
+    assert_eq!(
+        tail[authority_end].kind(),
+        NavigationTraceEventKind::CleanupSettled
+    );
+    assert_eq!(tail[authority_end].cleanup_disposition(), None);
+    assert_eq!(
+        tail[authority_end + 1].kind(),
+        NavigationTraceEventKind::CleanupSettled
+    );
+    assert!(tail[authority_end + 1].cleanup_disposition().is_some());
+    assert_eq!(
+        tail[authority_end + 2].kind(),
+        NavigationTraceEventKind::CleanupSettled
+    );
+    assert_eq!(tail[authority_end + 2].cleanup_disposition(), None);
+    assert_eq!(
+        tail[authority_end + 3].kind(),
+        NavigationTraceEventKind::RequestTerminal
+    );
+
+    let audit = app
+        .world()
+        .resource::<RouterAuthorityAudits>()
+        .get(router)
+        .expect("stable unavailable retains the terminal authority audit");
+    assert!(audit.frames().is_empty());
+    assert!(audit.slots().is_empty());
+    assert!(audit.content().is_empty());
+    assert!(audit.outlets().is_empty());
+    assert!(audit.host().is_none());
+    assert!(audit.orphan_slots().is_empty());
+    assert!(
+        leaving
+            .iter()
+            .chain(&authority_non_top)
+            .chain(std::iter::once(&top_slot))
+            .all(|entity| audit.owned_entity_state(*entity) == AuditEntityState::Removed)
+    );
+
+    assert_eq!(
+        app.world().get::<RecoveryAuditHostSentinel>(host),
+        Some(&RecoveryAuditHostSentinel(0x621))
+    );
+    let host_node = app.world().get::<Node>(host).unwrap();
+    assert_eq!(host_node.width, Val::Px(607.0));
+    assert_eq!(host_node.height, Val::Px(347.0));
+    assert_eq!(
+        app.world().get::<RecoveryAuditChildSentinel>(first_child),
+        Some(&RecoveryAuditChildSentinel(0x622))
+    );
+    assert_eq!(
+        app.world().get::<RecoveryAuditChildSentinel>(second_child),
+        Some(&RecoveryAuditChildSentinel(0x623))
+    );
+    assert_eq!(
+        app.world().get::<ChildOf>(first_child).map(ChildOf::parent),
+        Some(host)
+    );
+    assert_eq!(
+        app.world()
+            .get::<ChildOf>(second_child)
+            .map(ChildOf::parent),
+        Some(host)
+    );
+    assert_eq!(
+        app.world().get::<Node>(first_child).unwrap().width,
+        Val::Px(17.0)
+    );
+    assert_eq!(
+        app.world().get::<Node>(second_child).unwrap().width,
+        Val::Px(19.0)
+    );
+    assert_eq!(
+        audit_component_manifest(&app, first_child),
+        first_manifest_before
+    );
+    assert_eq!(
+        audit_component_manifest(&app, second_child),
+        second_manifest_before
+    );
+    assert_eq!(
+        app.world()
+            .get::<Children>(host)
+            .unwrap()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![first_child, second_child]
+    );
+    let registration_component = app
+        .world()
+        .component_id::<RouterHostRegistration>()
+        .unwrap();
+    let host_manifest_after = audit_component_manifest(&app, host);
+    assert_eq!(
+        host_manifest_after
+            .iter()
+            .filter(|component| **component != registration_component)
+            .copied()
+            .collect::<Vec<_>>(),
+        host_manifest_before
+            .iter()
+            .filter(|component| **component != registration_component)
+            .copied()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        app.world()
+            .iter_entities()
+            .map(|entity| entity.id())
+            .collect::<HashSet<_>>(),
+        app_entities_before_admission,
+        "terminal audit completeness requires every router-created hidden Entity to be gone"
+    );
 }

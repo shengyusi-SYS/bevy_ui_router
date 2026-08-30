@@ -239,6 +239,31 @@ impl RouterNavigationState {
         version: &HostVersion,
         top_slot: crate::ids::RouteSlotId,
     ) -> bool {
+        self.complete_authority_settlement_with_availability(
+            version,
+            top_slot,
+            RouterAvailability::AwaitingHost,
+        )
+    }
+
+    pub(crate) fn complete_host_loss_settlement(
+        &mut self,
+        version: &HostVersion,
+        top_slot: crate::ids::RouteSlotId,
+    ) -> bool {
+        self.complete_authority_settlement_with_availability(
+            version,
+            top_slot,
+            RouterAvailability::Unavailable(RouterUnavailableReason::HostLost),
+        )
+    }
+
+    fn complete_authority_settlement_with_availability(
+        &mut self,
+        version: &HostVersion,
+        top_slot: crate::ids::RouteSlotId,
+        availability: RouterAvailability,
+    ) -> bool {
         let exact = self.availability == RouterAvailability::RecoveringAuthority
             && self.authority.as_ref().is_some_and(|authority| {
                 &authority.version == version && authority.top_slot == top_slot
@@ -246,7 +271,7 @@ impl RouterNavigationState {
         if exact {
             self.active = ActivePresentation::none();
             self.authority = None;
-            self.availability = RouterAvailability::AwaitingHost;
+            self.availability = availability;
         }
         exact
     }
@@ -256,6 +281,13 @@ impl RouterNavigationState {
         self.authority = None;
         self.current_request = None;
         self.availability = RouterAvailability::Unavailable(reason);
+    }
+
+    pub(crate) fn terminalize_post_commit_host_loss(&mut self) {
+        self.active = ActivePresentation::none();
+        self.authority = None;
+        self.current_request = None;
+        self.availability = RouterAvailability::Unavailable(RouterUnavailableReason::HostLost);
     }
 
     #[cfg(test)]

@@ -1,6 +1,6 @@
 # MVP Acceptance Journeys
 
-> **Recovery activation status:** Journey D 的 R1 Error presentation 合同已通过；Journey G 仍为后续 Recovery 验收工作。background old-lease reap 与剩余完整 Journey G rows 仍属于 Authority closure；当前不是 Recovery 或 MVP 整体 PASS 声明。
+> **Recovery activation status:** Journey D 的 R1 Error presentation 与 Journey G 的 R2 pre/post-commit foreground host-loss 合同已通过；R3 host re-admission/fresh epoch 仍为后续 Recovery 验收工作。background old-lease reap 与剩余完整 Journey G rows 仍属于 Authority closure；当前不是 Recovery 或 MVP 整体 PASS 声明。
 
 **文档类型**: 外部行为验收规范
 **状态**: Phase 3B.1 `Plan PASS`
@@ -122,6 +122,8 @@ match failure时对应`NavigationRequestSnapshot::matched()`与 committed error 
 - 新 app-owned host 注册后状态为 `ReadyNoActive`，显式 replace 可以恢复 history current，并使用全新的 host/slot/frame identity。
 - 注册无 `Node` 的host、或把host放到non-Node/cyclic ancestry下，必须得到 `Unavailable(InvalidHostUiTopology)`；Router不补写host/ancestor。应用修复同一registration的UI topology后才可重新完成admission。
 - 当 old top slot 因 foreign descendant 被 quarantine 后重新接纳同一个 app host Entity，必须先由旧 HostLease detach 并复验 old top-slot edge，再确认 settlement；新 epoch 创建不同 top slot。随后 old lease reap 不改变新 host relationship/slot mapping。
+
+`post-commit compound settlement complete evidence` — ACTIVE（R2 Compound settlement；`Journey G post-commit foreground rows PASS`；同时覆盖三个 pre-commit authority-loss rows，只声明本 slice 的 `L + A + H` settlement 与 public owner closure，不声明 R3、Recovery 或 MVP 整体 PASS）
 
 另由 crate 私有回归删除、清空 marker 或 reparent active root/slot/outlet，证明 registry 的 exact Entity generation/ownership seal 足以先将漂移 subtree 的 visibility、pointer、keyboard、gamepad 和 focus 全部隔离，再安全清理；随后 core/ECS active 清空、history 保留，并在合法 host 下重建到 `ReadyNoActive`。向 router-owned subtree 挂入未登记 app-owned child 时，该 child Entity/组件必须保持不变，owned ancestor 被 quarantine 且完全 inert。
 

@@ -8,9 +8,10 @@ use crate::admission::{
 };
 use crate::branch::{FrozenErrorViewBinding, MatchedBranch, MatchedRoute, RouteParams};
 use crate::cleanup::{
-    CleanupBatchToken, CleanupCompletion, CleanupManifestDigest, CleanupManifestSeal,
+    CleanupBatchSourceProjection, CleanupBatchToken, CleanupCompletion, CleanupCompletionDigest,
+    CleanupManifestDigest, CleanupManifestSeal,
 };
-use crate::diagnostics::{DiagnosticEvent, ReportDisposition};
+use crate::diagnostics::{DiagnosticEvent, PostCommitCleanupAnomalyCause, ReportDisposition};
 use crate::fingerprint::{RouteBranchFingerprint, RouteBranchProvenance, RouteSearchFingerprint};
 use crate::frame::{
     FrameOrigin, LogicalChildSlotBinding, ProjectedChildSlotRoleKind, ProjectedEnteringSlot,
@@ -505,6 +506,40 @@ pub(crate) enum BeginAuthoritySettlementErrorKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreCommitAuthorityCause {
+    AuthorityLost,
+    HostLost,
+}
+
+impl PreCommitAuthorityCause {
+    fn running_failure(self) -> NavigationFailure {
+        match self {
+            Self::AuthorityLost => NavigationFailure::new(
+                NavigationFailureKind::AuthorityLost,
+                "physical reconciliation authority was lost",
+            ),
+            Self::HostLost => NavigationFailure::new(
+                NavigationFailureKind::HostLost,
+                "router host was lost before presentation commit",
+            ),
+        }
+    }
+
+    fn queued_failure(self) -> NavigationFailure {
+        match self {
+            Self::AuthorityLost => NavigationFailure::new(
+                NavigationFailureKind::AuthorityLost,
+                "router authority was lost before request start",
+            ),
+            Self::HostLost => NavigationFailure::new(
+                NavigationFailureKind::HostLost,
+                "router host was lost before request start",
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FailedAuthorityTriggerError {
     Foreign,
     Stale,
@@ -849,6 +884,18 @@ struct FailureCleanupZeroTerminalBranchProjection {
     provenance: RouteBranchProvenance,
     search_fingerprint: RouteSearchFingerprint,
     branch_fingerprint: RouteBranchFingerprint,
+}
+
+impl std::fmt::Debug for FailureCleanupZeroTerminalBranchProjection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FailureCleanupZeroTerminalBranchProjection")
+            .field("routes", &self.routes)
+            .field("provenance", &"<opaque>")
+            .field("search_fingerprint", &self.search_fingerprint)
+            .field("branch_fingerprint", &self.branch_fingerprint)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2602,6 +2649,14 @@ enum WorkStage {
     PostCommitCleanup {
         outstanding: CleanupBatchToken,
     },
+    PostCommitAuthorityAccepted {
+        normal: CleanupBatchToken,
+        expected: CorePostCommitCleanupReceiverProjection,
+    },
+    PostCommitAuthorityCleanup {
+        normal: CleanupBatchToken,
+        expected: CorePostCommitCompoundProjection,
+    },
     FailureCleanupManifestPending {
         expected: FailureCleanupReceiverProjection,
     },
@@ -2627,6 +2682,14 @@ enum WorkStageProjection {
     ReadyToCommit,
     CommitSealed(CleanupBatchToken),
     PostCommitCleanup(CleanupBatchToken),
+    PostCommitAuthorityAccepted {
+        normal: CleanupBatchToken,
+        expected: CorePostCommitCleanupReceiverProjection,
+    },
+    PostCommitAuthorityCleanup {
+        normal: CleanupBatchToken,
+        expected: CorePostCommitCompoundProjection,
+    },
     FailureCleanupManifestPending(FailureCleanupReceiverProjection),
     FailureCleanupPrepared {
         outstanding: CleanupBatchToken,
@@ -2647,6 +2710,18 @@ impl WorkStage {
             Self::CommitSealed { token } => WorkStageProjection::CommitSealed(token.clone()),
             Self::PostCommitCleanup { outstanding } => {
                 WorkStageProjection::PostCommitCleanup(outstanding.clone())
+            }
+            Self::PostCommitAuthorityAccepted { normal, expected } => {
+                WorkStageProjection::PostCommitAuthorityAccepted {
+                    normal: normal.clone(),
+                    expected: expected.clone(),
+                }
+            }
+            Self::PostCommitAuthorityCleanup { normal, expected } => {
+                WorkStageProjection::PostCommitAuthorityCleanup {
+                    normal: normal.clone(),
+                    expected: expected.clone(),
+                }
             }
             Self::FailureCleanupManifestPending { expected } => {
                 WorkStageProjection::FailureCleanupManifestPending(expected.clone())
@@ -2681,7 +2756,9 @@ impl WorkStage {
             Self::PostCommitCleanup { outstanding } => Some(Self::PostCommitCleanup {
                 outstanding: outstanding.clone(),
             }),
-            Self::FailureCleanupManifestPending { .. }
+            Self::PostCommitAuthorityAccepted { .. }
+            | Self::PostCommitAuthorityCleanup { .. }
+            | Self::FailureCleanupManifestPending { .. }
             | Self::FailureCleanupPrepared { .. }
             | Self::FailureCleanupZeroTerminalPending { .. }
             | Self::FailureCleanupCompleting { .. } => None,
@@ -2820,6 +2897,1390 @@ impl<Physical> std::fmt::Debug for FailureCleanupCompletionCommitError<Physical>
             .debug_struct("FailureCleanupCompletionCommitError")
             .field("kind", &self.kind)
             .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CleanupBatchProjection {
+    identity: RootTaskIdentity,
+    batch: CleanupBatchId,
+    manifest_digest: CleanupManifestDigest,
+    obligation_count: usize,
+}
+
+impl CleanupBatchProjection {
+    pub(crate) fn from_token(token: &CleanupBatchToken) -> Self {
+        Self {
+            identity: token.identity().clone(),
+            batch: token.batch(),
+            manifest_digest: token.manifest_digest(),
+            obligation_count: token.obligation_count(),
+        }
+    }
+
+    fn matches(&self, token: &CleanupBatchToken) -> bool {
+        self == &Self::from_token(token)
+    }
+
+    pub(crate) fn manifest_digest_matches(&self, value: u64) -> bool {
+        self.manifest_digest == CleanupManifestDigest::from_opaque(value)
+    }
+
+    pub(crate) const fn obligation_count(&self) -> usize {
+        self.obligation_count
+    }
+}
+
+impl CleanupBatchToken {
+    pub(crate) fn projection(&self) -> CleanupBatchProjection {
+        CleanupBatchProjection::from_token(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CorePostCommitCleanupStageProjection {
+    PostCommitCleanup,
+    AuthorityAccepted,
+    AuthorityCleanup,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FrozenCommittedHistoryProjection {
+    entries: Vec<RouteLocation>,
+    cursor: Option<usize>,
+    digest: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FrozenActiveBranchProjection {
+    identity: RootTaskIdentity,
+    presentation: ActivePresentation,
+    frames: Vec<RouteFrameVersion>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitCleanupReceiverProjection {
+    router: RouterIdentity,
+    request: NavigationRequestId,
+    identity: RootTaskIdentity,
+    normal_batch: CleanupBatchProjection,
+    current_host: HostVersion,
+    current_top_slot: RouteSlotId,
+    committed_history: FrozenCommittedHistoryProjection,
+    active: FrozenActiveBranchProjection,
+    stage: CorePostCommitCleanupStageProjection,
+}
+
+impl CorePostCommitCleanupReceiverProjection {
+    pub(crate) const fn request(&self) -> NavigationRequestId {
+        self.request
+    }
+
+    pub(crate) const fn normal_batch(&self) -> &CleanupBatchProjection {
+        &self.normal_batch
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoreCompetingCleanupOwnerStage {
+    Prepared,
+    Active,
+    Completing,
+    Inert,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreCompetingCleanupOwnerProjection {
+    identity: RootTaskIdentity,
+    batch: CleanupBatchProjection,
+    stage: CoreCompetingCleanupOwnerStage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitCleanupObservedProjection {
+    receiver: Option<CorePostCommitCleanupReceiverProjection>,
+    retired_host: Option<RetiredHostAuthorityProjection>,
+    competing_cleanup: Option<CoreCompetingCleanupOwnerProjection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitCompoundProjection {
+    receiver: CorePostCommitCleanupReceiverProjection,
+    authority_batch: CleanupBatchProjection,
+    retired_host: RetiredHostAuthorityProjection,
+    cause: PostCommitAuthorityCause,
+}
+
+impl CorePostCommitCompoundProjection {
+    pub(crate) const fn receiver(&self) -> &CorePostCommitCleanupReceiverProjection {
+        &self.receiver
+    }
+
+    pub(crate) const fn authority_batch(&self) -> &CleanupBatchProjection {
+        &self.authority_batch
+    }
+
+    pub(crate) const fn cause(&self) -> PostCommitAuthorityCause {
+        self.cause
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitReceiverMismatchProjection {
+    expected: CorePostCommitCleanupReceiverProjection,
+    observed: CorePostCommitCleanupObservedProjection,
+}
+
+impl CorePostCommitReceiverMismatchProjection {
+    pub(crate) const fn expected(&self) -> &CorePostCommitCleanupReceiverProjection {
+        &self.expected
+    }
+
+    pub(crate) const fn observed(&self) -> &CorePostCommitCleanupObservedProjection {
+        &self.observed
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PostCommitAuthorityCause {
+    HostRegistrationLost,
+    HostEntityMissing,
+    RequiredResourcesLost,
+}
+
+impl From<PostCommitAuthorityCause> for PostCommitCleanupAnomalyCause {
+    fn from(cause: PostCommitAuthorityCause) -> Self {
+        match cause {
+            PostCommitAuthorityCause::HostRegistrationLost => Self::HostRegistrationLost,
+            PostCommitAuthorityCause::HostEntityMissing => Self::HostEntityMissing,
+            PostCommitAuthorityCause::RequiredResourcesLost => Self::RequiredResourcesLost,
+        }
+    }
+}
+
+impl From<PostCommitCleanupAnomalyCause> for PostCommitAuthorityCause {
+    fn from(cause: PostCommitCleanupAnomalyCause) -> Self {
+        match cause {
+            PostCommitCleanupAnomalyCause::HostRegistrationLost => Self::HostRegistrationLost,
+            PostCommitCleanupAnomalyCause::HostEntityMissing => Self::HostEntityMissing,
+            PostCommitCleanupAnomalyCause::RequiredResourcesLost => Self::RequiredResourcesLost,
+        }
+    }
+}
+
+pub(crate) struct CorePostCommitAuthorityTransferOwner {
+    receiver: CorePostCommitCleanupReceiverProjection,
+    normal_source: CleanupBatchSourceProjection,
+    cause: PostCommitAuthorityCause,
+}
+
+impl CorePostCommitAuthorityTransferOwner {
+    pub(crate) const fn receiver(&self) -> &CorePostCommitCleanupReceiverProjection {
+        &self.receiver
+    }
+
+    pub(crate) const fn cause(&self) -> PostCommitAuthorityCause {
+        self.cause
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreRetiredHostAuthorityExpectedProjection {
+    receiver: CorePostCommitCleanupReceiverProjection,
+    retired_host: RetiredHostAuthorityProjection,
+    cause: PostCommitAuthorityCause,
+}
+
+impl CoreRetiredHostAuthorityExpectedProjection {
+    pub(crate) const fn cause(&self) -> PostCommitAuthorityCause {
+        self.cause
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CoreRetiredHostAuthorityTerminalEvidence {
+    expected: CoreRetiredHostAuthorityExpectedProjection,
+    consumed: RetiredHostAuthorityProjection,
+}
+
+impl CoreRetiredHostAuthorityTerminalEvidence {
+    pub(crate) const fn cause(&self) -> PostCommitAuthorityCause {
+        self.expected.cause
+    }
+}
+
+pub(crate) struct CoreRetiredHostEdgeSettlementOwner {
+    authority: RetiredHostAuthority,
+    expected: CoreRetiredHostAuthorityExpectedProjection,
+    expected_physical_digest: u64,
+}
+
+pub(crate) struct CorePostCommitAuthorityPreparationSource {
+    transfer: CorePostCommitAuthorityTransferOwner,
+    host: HostLease,
+}
+
+impl CorePostCommitAuthorityPreparationSource {
+    pub(crate) const fn new(
+        transfer: CorePostCommitAuthorityTransferOwner,
+        host: HostLease,
+    ) -> Self {
+        Self { transfer, host }
+    }
+
+    pub(crate) fn into_parts(self) -> (CorePostCommitAuthorityTransferOwner, HostLease) {
+        (self.transfer, self.host)
+    }
+
+    pub(crate) const fn cause(&self) -> PostCommitAuthorityCause {
+        self.transfer.cause
+    }
+}
+
+pub(crate) struct CorePreparedPostCommitAuthorityTransfer {
+    transfer: CorePostCommitAuthorityTransferOwner,
+    host: HostLease,
+    authority_batch: CleanupBatchToken,
+    authority_manifest: CleanupManifestSeal,
+}
+
+impl CorePreparedPostCommitAuthorityTransfer {
+    pub(crate) fn batch_projection(&self) -> CleanupBatchProjection {
+        self.authority_batch.projection()
+    }
+
+    pub(crate) fn into_source(self) -> CorePostCommitAuthorityPreparationSource {
+        CorePostCommitAuthorityPreparationSource {
+            transfer: self.transfer,
+            host: self.host,
+        }
+    }
+
+    pub(crate) const fn cause(&self) -> PostCommitAuthorityCause {
+        self.transfer.cause
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CorePostCommitCapacityKind {
+    PreparedTrace,
+    PreparedTerminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CorePostCommitAuthorityContradiction {
+    ForeignReceiver,
+    CompetingSameSourceOwner,
+    RetiredHostMismatch,
+    HistoryOrActiveMismatch,
+    IdentityExhausted,
+    RequestOrQueueMismatch,
+    TraceMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CorePostCommitTerminalPreparationFailure {
+    Retryable(CorePostCommitCapacityKind),
+    Permanent(CorePostCommitAuthorityContradiction),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitAuthorityBeginRetryEvidence {
+    expected: CorePostCommitCleanupReceiverProjection,
+    observed: CorePostCommitCleanupObservedProjection,
+    cause: PostCommitAuthorityCause,
+    missing_capacity: CorePostCommitCapacityKind,
+}
+
+impl CorePostCommitAuthorityBeginRetryEvidence {
+    pub(crate) const fn missing_capacity(&self) -> CorePostCommitCapacityKind {
+        self.missing_capacity
+    }
+
+    pub(crate) const fn cause(&self) -> PostCommitAuthorityCause {
+        self.cause
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitAuthorityBeginPermanentEvidence {
+    expected: CorePostCommitCleanupReceiverProjection,
+    observed: CorePostCommitCleanupObservedProjection,
+    cause: PostCommitAuthorityCause,
+    contradiction: CorePostCommitAuthorityContradiction,
+}
+
+impl CorePostCommitAuthorityBeginPermanentEvidence {
+    pub(crate) const fn contradiction(&self) -> CorePostCommitAuthorityContradiction {
+        self.contradiction
+    }
+
+    pub(crate) const fn cause(&self) -> PostCommitAuthorityCause {
+        self.cause
+    }
+}
+
+pub(crate) enum PostCommitAuthorityAcceptanceOutcome {
+    Accepted(CorePostCommitAuthorityTransferOwner),
+    Mismatch {
+        expected: CorePostCommitCleanupReceiverProjection,
+        observed: CorePostCommitCleanupObservedProjection,
+    },
+}
+
+pub(crate) enum PostCommitAuthorityPreparationOutcome {
+    Prepared {
+        owner: CorePreparedPostCommitAuthorityTransfer,
+        batch: CleanupBatchProjection,
+    },
+    Mismatch {
+        source: CorePostCommitAuthorityPreparationSource,
+        evidence: CorePostCommitReceiverMismatchProjection,
+    },
+    Retryable {
+        source: CorePostCommitAuthorityPreparationSource,
+        evidence: CorePostCommitAuthorityBeginRetryEvidence,
+    },
+    Permanent {
+        source: CorePostCommitAuthorityPreparationSource,
+        evidence: CorePostCommitAuthorityBeginPermanentEvidence,
+    },
+}
+
+pub(crate) enum PostCommitAuthorityBeginCoreOutcome<Unbound, Bound, BindError> {
+    Begun,
+    BindingMismatch {
+        owner: CorePreparedPostCommitAuthorityTransfer,
+        unbound: Unbound,
+        evidence: BindError,
+    },
+    ReceiverMismatch {
+        owner: CorePreparedPostCommitAuthorityTransfer,
+        bound: Bound,
+        evidence: CorePostCommitReceiverMismatchProjection,
+    },
+    Retryable {
+        owner: CorePreparedPostCommitAuthorityTransfer,
+        bound: Bound,
+        evidence: CorePostCommitAuthorityBeginRetryEvidence,
+    },
+    Permanent {
+        owner: CorePreparedPostCommitAuthorityTransfer,
+        bound: Bound,
+        evidence: CorePostCommitAuthorityBeginPermanentEvidence,
+    },
+}
+
+pub(crate) struct CorePostCommitCompoundBatchOwner {
+    receiver: CorePostCommitCompoundProjection,
+    authority_batch: CleanupBatchToken,
+    host_edge: CoreRetiredHostEdgeSettlementOwner,
+    settlement: Option<CorePostCommitSettlementCapability>,
+}
+
+impl CorePostCommitCompoundBatchOwner {
+    pub(crate) fn projection(&self) -> CorePostCommitCompoundProjection {
+        self.receiver.clone()
+    }
+
+    pub(crate) fn authority_batch_projection(&self) -> CleanupBatchProjection {
+        self.authority_batch.projection()
+    }
+
+    pub(crate) fn host_expected_projection(&self) -> CoreRetiredHostAuthorityExpectedProjection {
+        self.host_edge.expected.clone()
+    }
+
+    pub(crate) const fn expected_host_physical_digest(&self) -> u64 {
+        self.host_edge.expected_physical_digest
+    }
+
+    pub(crate) const fn cause(&self) -> PostCommitAuthorityCause {
+        self.receiver.cause
+    }
+
+    pub(crate) fn settlement_projection(&self) -> CorePostCommitSettlementTraceProjection {
+        self.settlement
+            .as_ref()
+            .expect("the compound owner is not externally visible while its permit is issued")
+            .projection
+            .clone()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreNormalCleanupCompletionFacts {
+    batch: CleanupBatchProjection,
+    manifest_digest: CleanupManifestDigest,
+    completion_digest: CleanupCompletionDigest,
+    settled_count: usize,
+}
+
+impl CoreNormalCleanupCompletionFacts {
+    pub(crate) const fn new(
+        batch: CleanupBatchProjection,
+        manifest_digest: CleanupManifestDigest,
+        completion_digest: CleanupCompletionDigest,
+        settled_count: usize,
+    ) -> Self {
+        Self {
+            batch,
+            manifest_digest,
+            completion_digest,
+            settled_count,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreAuthorityCleanupCompletionFacts {
+    batch: CleanupBatchProjection,
+    completion_digest: CleanupCompletionDigest,
+    settled_count: usize,
+}
+
+impl CoreAuthorityCleanupCompletionFacts {
+    pub(crate) const fn new(
+        batch: CleanupBatchProjection,
+        completion_digest: CleanupCompletionDigest,
+        settled_count: usize,
+    ) -> Self {
+        Self {
+            batch,
+            completion_digest,
+            settled_count,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoreRetiredHostEdgeCompletionFacts {
+    expected: CoreRetiredHostAuthorityExpectedProjection,
+    physical_digest: u64,
+}
+
+impl CoreRetiredHostEdgeCompletionFacts {
+    pub(crate) const fn new(
+        expected: CoreRetiredHostAuthorityExpectedProjection,
+        physical_digest: u64,
+    ) -> Self {
+        Self {
+            expected,
+            physical_digest,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitCompoundCompletionFactsProjection {
+    cause: PostCommitAuthorityCause,
+    normal: CoreNormalCleanupCompletionFacts,
+    authority: CoreAuthorityCleanupCompletionFacts,
+    host_edge: CoreRetiredHostEdgeCompletionFacts,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitSettlementKeyProjection {
+    namespace: u64,
+    identity: Vec<u64>,
+}
+
+impl CorePostCommitSettlementKeyProjection {
+    pub(crate) fn new(namespace: u64, identity: Vec<u64>) -> Self {
+        Self {
+            namespace,
+            identity,
+        }
+    }
+
+    pub(crate) const fn namespace(&self) -> u64 {
+        self.namespace
+    }
+
+    pub(crate) fn identity(&self) -> &[u64] {
+        &self.identity
+    }
+
+    fn is_empty(&self) -> bool {
+        self.identity.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CorePostCommitSettlementRole {
+    OriginalResidual,
+    AuthorityNonTop,
+    RetiredHostEdge,
+    AuthorityTop,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitPlannedCleanupProjection {
+    obligation: CorePostCommitSettlementKeyProjection,
+    physical_source: CorePostCommitSettlementKeyProjection,
+    disposition: crate::trace::CleanupDisposition,
+}
+
+impl CorePostCommitPlannedCleanupProjection {
+    pub(crate) fn new(
+        obligation: CorePostCommitSettlementKeyProjection,
+        physical_source: CorePostCommitSettlementKeyProjection,
+        disposition: crate::trace::CleanupDisposition,
+    ) -> Self {
+        Self {
+            obligation,
+            physical_source,
+            disposition,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitSettledOriginalProjection {
+    obligation: CorePostCommitSettlementKeyProjection,
+    receipt: CorePostCommitSettlementKeyProjection,
+    disposition: crate::trace::CleanupDisposition,
+}
+
+impl CorePostCommitSettledOriginalProjection {
+    pub(crate) fn new(
+        obligation: CorePostCommitSettlementKeyProjection,
+        receipt: CorePostCommitSettlementKeyProjection,
+        disposition: crate::trace::CleanupDisposition,
+    ) -> Self {
+        Self {
+            obligation,
+            receipt,
+            disposition,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitPlannedHostEdgeProjection {
+    obligation: CorePostCommitSettlementKeyProjection,
+    physical_source: CorePostCommitSettlementKeyProjection,
+}
+
+impl CorePostCommitPlannedHostEdgeProjection {
+    pub(crate) fn new(
+        obligation: CorePostCommitSettlementKeyProjection,
+        physical_source: CorePostCommitSettlementKeyProjection,
+    ) -> Self {
+        Self {
+            obligation,
+            physical_source,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitSettlementPlanDescriptor {
+    prior_trace_start: usize,
+    settled_original: Vec<CorePostCommitSettledOriginalProjection>,
+    residual_original: Vec<CorePostCommitPlannedCleanupProjection>,
+    authority_non_top: Vec<CorePostCommitPlannedCleanupProjection>,
+    authority_top: CorePostCommitPlannedCleanupProjection,
+    authority_top_dependency: CorePostCommitSettlementKeyProjection,
+    host_edge: CorePostCommitPlannedHostEdgeProjection,
+}
+
+impl CorePostCommitSettlementPlanDescriptor {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        prior_trace_start: usize,
+        settled_original: Vec<CorePostCommitSettledOriginalProjection>,
+        residual_original: Vec<CorePostCommitPlannedCleanupProjection>,
+        authority_non_top: Vec<CorePostCommitPlannedCleanupProjection>,
+        authority_top: CorePostCommitPlannedCleanupProjection,
+        authority_top_dependency: CorePostCommitSettlementKeyProjection,
+        host_edge: CorePostCommitPlannedHostEdgeProjection,
+    ) -> Self {
+        Self {
+            prior_trace_start,
+            settled_original,
+            residual_original,
+            authority_non_top,
+            authority_top,
+            authority_top_dependency,
+            host_edge,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CorePostCommitSettlementPlanMismatchKind {
+    OriginalCoverage,
+    AuthorityCoverage,
+    DuplicateKey,
+    EmptyKey,
+    PriorTrace,
+    WrongSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitSettlementPlanMismatchEvidence {
+    kind: CorePostCommitSettlementPlanMismatchKind,
+    descriptor: CorePostCommitSettlementPlanDescriptor,
+}
+
+impl CorePostCommitSettlementPlanMismatchEvidence {
+    pub(crate) const fn kind(&self) -> CorePostCommitSettlementPlanMismatchKind {
+        self.kind
+    }
+}
+
+pub(crate) struct CorePostCommitSettlementPlanBuilder {
+    compound: CorePostCommitCompoundProjection,
+    normal_batch: CleanupBatchSourceProjection,
+    authority_batch: CleanupBatchSourceProjection,
+    normal_obligation_count: usize,
+    authority_obligation_count: usize,
+    current_trace: Vec<NavigationTraceEvent>,
+}
+
+pub(crate) struct CoreBoundPostCommitSettlementPlan {
+    compound: CorePostCommitCompoundProjection,
+    normal_batch: CleanupBatchSourceProjection,
+    authority_batch: CleanupBatchSourceProjection,
+    descriptor: CorePostCommitSettlementPlanDescriptor,
+    prior_trace_prefix_digest: u64,
+    prior_trace_digest: u64,
+}
+
+impl CorePostCommitSettlementPlanBuilder {
+    pub(crate) fn current_trace_len(&self) -> usize {
+        self.current_trace.len()
+    }
+
+    pub(crate) fn bind(
+        self,
+        descriptor: CorePostCommitSettlementPlanDescriptor,
+    ) -> Result<CoreBoundPostCommitSettlementPlan, CorePostCommitSettlementPlanMismatchEvidence>
+    {
+        let original_coverage = descriptor.settled_original.len()
+            + descriptor.residual_original.len()
+            == self.normal_obligation_count;
+        let authority_coverage =
+            descriptor.authority_non_top.len() + 1 == self.authority_obligation_count;
+        let all_keys = descriptor
+            .settled_original
+            .iter()
+            .flat_map(|entry| [&entry.obligation, &entry.receipt])
+            .chain(
+                descriptor
+                    .residual_original
+                    .iter()
+                    .flat_map(|entry| [&entry.obligation, &entry.physical_source]),
+            )
+            .chain(
+                descriptor
+                    .authority_non_top
+                    .iter()
+                    .flat_map(|entry| [&entry.obligation, &entry.physical_source]),
+            )
+            .chain([
+                &descriptor.authority_top.obligation,
+                &descriptor.authority_top.physical_source,
+                &descriptor.authority_top_dependency,
+                &descriptor.host_edge.obligation,
+                &descriptor.host_edge.physical_source,
+            ])
+            .collect::<Vec<_>>();
+        let empty_key = all_keys.iter().any(|key| key.is_empty());
+        let exact_role_keys = descriptor
+            .settled_original
+            .iter()
+            .flat_map(|entry| [&entry.obligation, &entry.receipt])
+            .chain(
+                descriptor
+                    .residual_original
+                    .iter()
+                    .flat_map(|entry| [&entry.obligation, &entry.physical_source]),
+            )
+            .chain(
+                descriptor
+                    .authority_non_top
+                    .iter()
+                    .flat_map(|entry| [&entry.obligation, &entry.physical_source]),
+            )
+            .chain([
+                &descriptor.authority_top.obligation,
+                &descriptor.authority_top.physical_source,
+                &descriptor.host_edge.obligation,
+                &descriptor.host_edge.physical_source,
+            ])
+            .collect::<Vec<_>>();
+        let duplicate_role_key = exact_role_keys.iter().enumerate().any(|(index, key)| {
+            exact_role_keys
+                .iter()
+                .skip(index + 1)
+                .any(|other| other == key)
+        });
+        let duplicate_original_obligation = descriptor
+            .settled_original
+            .iter()
+            .map(|entry| &entry.obligation)
+            .chain(
+                descriptor
+                    .residual_original
+                    .iter()
+                    .map(|entry| &entry.obligation),
+            )
+            .enumerate()
+            .any(|(index, key)| {
+                descriptor
+                    .settled_original
+                    .iter()
+                    .map(|entry| &entry.obligation)
+                    .chain(
+                        descriptor
+                            .residual_original
+                            .iter()
+                            .map(|entry| &entry.obligation),
+                    )
+                    .skip(index + 1)
+                    .any(|other| other == key)
+            });
+        let duplicate_settled_receipt = descriptor
+            .settled_original
+            .iter()
+            .map(|entry| &entry.receipt)
+            .enumerate()
+            .any(|(index, key)| {
+                descriptor
+                    .settled_original
+                    .iter()
+                    .map(|entry| &entry.receipt)
+                    .skip(index + 1)
+                    .any(|other| other == key)
+            });
+        let duplicate_residual_source = descriptor
+            .residual_original
+            .iter()
+            .map(|entry| &entry.physical_source)
+            .enumerate()
+            .any(|(index, key)| {
+                descriptor
+                    .residual_original
+                    .iter()
+                    .map(|entry| &entry.physical_source)
+                    .skip(index + 1)
+                    .any(|other| other == key)
+            });
+        let duplicate_authority_obligation = descriptor
+            .authority_non_top
+            .iter()
+            .map(|entry| &entry.obligation)
+            .chain([&descriptor.authority_top.obligation])
+            .enumerate()
+            .any(|(index, key)| {
+                descriptor
+                    .authority_non_top
+                    .iter()
+                    .map(|entry| &entry.obligation)
+                    .chain([&descriptor.authority_top.obligation])
+                    .skip(index + 1)
+                    .any(|other| other == key)
+            });
+        let duplicate_authority_source = descriptor
+            .authority_non_top
+            .iter()
+            .map(|entry| &entry.physical_source)
+            .chain([&descriptor.authority_top.physical_source])
+            .enumerate()
+            .any(|(index, key)| {
+                descriptor
+                    .authority_non_top
+                    .iter()
+                    .map(|entry| &entry.physical_source)
+                    .chain([&descriptor.authority_top.physical_source])
+                    .skip(index + 1)
+                    .any(|other| other == key)
+            });
+        let prior_trace = self
+            .current_trace
+            .get(descriptor.prior_trace_start..)
+            .filter(|events| events.len() == descriptor.settled_original.len())
+            .is_some_and(|events| {
+                events
+                    .iter()
+                    .zip(&descriptor.settled_original)
+                    .all(|(event, settled)| {
+                        event == &NavigationTraceEvent::cleanup_settled(Some(settled.disposition))
+                    })
+            });
+        let mismatch = if !original_coverage {
+            Some(CorePostCommitSettlementPlanMismatchKind::OriginalCoverage)
+        } else if !authority_coverage {
+            Some(CorePostCommitSettlementPlanMismatchKind::AuthorityCoverage)
+        } else if empty_key {
+            Some(CorePostCommitSettlementPlanMismatchKind::EmptyKey)
+        } else if duplicate_role_key
+            || duplicate_original_obligation
+            || duplicate_settled_receipt
+            || duplicate_residual_source
+            || duplicate_authority_obligation
+            || duplicate_authority_source
+        {
+            Some(CorePostCommitSettlementPlanMismatchKind::DuplicateKey)
+        } else if descriptor.authority_top_dependency != descriptor.host_edge.obligation {
+            Some(CorePostCommitSettlementPlanMismatchKind::WrongSource)
+        } else if !prior_trace {
+            Some(CorePostCommitSettlementPlanMismatchKind::PriorTrace)
+        } else {
+            None
+        };
+        if let Some(kind) = mismatch {
+            return Err(CorePostCommitSettlementPlanMismatchEvidence { kind, descriptor });
+        }
+        Ok(CoreBoundPostCommitSettlementPlan {
+            compound: self.compound,
+            normal_batch: self.normal_batch,
+            authority_batch: self.authority_batch,
+            prior_trace_prefix_digest: navigation_trace_digest(
+                &self.current_trace[..descriptor.prior_trace_start],
+            ),
+            prior_trace_digest: navigation_trace_digest(&self.current_trace),
+            descriptor,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CorePostCommitSettlementPlanBindingProjection {
+    compound: CorePostCommitCompoundProjection,
+    normal_batch: CleanupBatchSourceProjection,
+    authority_batch: CleanupBatchSourceProjection,
+    prior_trace_start: usize,
+    prior_trace_prefix_digest: u64,
+    prior_trace_digest: u64,
+    settled_original: Vec<CorePostCommitSettledOriginalProjection>,
+    authority_top_dependency: CorePostCommitSettlementKeyProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitSettlementExpectedProjection {
+    ordinal: usize,
+    role: CorePostCommitSettlementRole,
+    obligation: CorePostCommitSettlementKeyProjection,
+    physical_source: CorePostCommitSettlementKeyProjection,
+    disposition: Option<crate::trace::CleanupDisposition>,
+}
+
+impl CorePostCommitSettlementExpectedProjection {
+    pub(crate) const fn role(&self) -> CorePostCommitSettlementRole {
+        self.role
+    }
+
+    pub(crate) const fn obligation(&self) -> &CorePostCommitSettlementKeyProjection {
+        &self.obligation
+    }
+
+    pub(crate) const fn physical_source(&self) -> &CorePostCommitSettlementKeyProjection {
+        &self.physical_source
+    }
+
+    pub(crate) const fn disposition(&self) -> Option<crate::trace::CleanupDisposition> {
+        self.disposition
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CorePostCommitSettlementTraceProgress {
+    OriginalResidual,
+    AuthorityNonTop,
+    RetiredHostEdge,
+    AuthorityTop,
+    Complete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitSettlementTraceProjection {
+    binding: CorePostCommitSettlementPlanBindingProjection,
+    expected: Vec<CorePostCommitSettlementExpectedProjection>,
+    cursor: usize,
+    recorded: Vec<CorePostCommitSettlementExpectedProjection>,
+    settlement_event_start: usize,
+    digest: u64,
+}
+
+impl CorePostCommitSettlementTraceProjection {
+    pub(crate) const fn cause(&self) -> PostCommitAuthorityCause {
+        self.binding.compound.cause
+    }
+
+    pub(crate) fn progress(&self) -> CorePostCommitSettlementTraceProgress {
+        self.expected.get(self.cursor).map_or(
+            CorePostCommitSettlementTraceProgress::Complete,
+            |expected| match expected.role {
+                CorePostCommitSettlementRole::OriginalResidual => {
+                    CorePostCommitSettlementTraceProgress::OriginalResidual
+                }
+                CorePostCommitSettlementRole::AuthorityNonTop => {
+                    CorePostCommitSettlementTraceProgress::AuthorityNonTop
+                }
+                CorePostCommitSettlementRole::RetiredHostEdge => {
+                    CorePostCommitSettlementTraceProgress::RetiredHostEdge
+                }
+                CorePostCommitSettlementRole::AuthorityTop => {
+                    CorePostCommitSettlementTraceProgress::AuthorityTop
+                }
+            },
+        )
+    }
+
+    pub(crate) const fn digest(&self) -> u64 {
+        self.digest
+    }
+
+    fn is_complete(&self) -> bool {
+        self.cursor == self.expected.len() && self.recorded == self.expected
+    }
+}
+
+struct CorePostCommitSettlementCapability {
+    projection: CorePostCommitSettlementTraceProjection,
+}
+
+impl CorePostCommitSettlementCapability {
+    fn from_plan(plan: CoreBoundPostCommitSettlementPlan, settlement_event_start: usize) -> Self {
+        let mut expected = Vec::new();
+        for cleanup in &plan.descriptor.residual_original {
+            expected.push(CorePostCommitSettlementExpectedProjection {
+                ordinal: expected.len(),
+                role: CorePostCommitSettlementRole::OriginalResidual,
+                obligation: cleanup.obligation.clone(),
+                physical_source: cleanup.physical_source.clone(),
+                disposition: Some(cleanup.disposition),
+            });
+        }
+        for cleanup in &plan.descriptor.authority_non_top {
+            expected.push(CorePostCommitSettlementExpectedProjection {
+                ordinal: expected.len(),
+                role: CorePostCommitSettlementRole::AuthorityNonTop,
+                obligation: cleanup.obligation.clone(),
+                physical_source: cleanup.physical_source.clone(),
+                disposition: Some(cleanup.disposition),
+            });
+        }
+        expected.push(CorePostCommitSettlementExpectedProjection {
+            ordinal: expected.len(),
+            role: CorePostCommitSettlementRole::RetiredHostEdge,
+            obligation: plan.descriptor.host_edge.obligation.clone(),
+            physical_source: plan.descriptor.host_edge.physical_source.clone(),
+            disposition: None,
+        });
+        expected.push(CorePostCommitSettlementExpectedProjection {
+            ordinal: expected.len(),
+            role: CorePostCommitSettlementRole::AuthorityTop,
+            obligation: plan.descriptor.authority_top.obligation.clone(),
+            physical_source: plan.descriptor.authority_top.physical_source.clone(),
+            disposition: Some(plan.descriptor.authority_top.disposition),
+        });
+        let binding = CorePostCommitSettlementPlanBindingProjection {
+            compound: plan.compound,
+            normal_batch: plan.normal_batch,
+            authority_batch: plan.authority_batch,
+            prior_trace_start: plan.descriptor.prior_trace_start,
+            prior_trace_prefix_digest: plan.prior_trace_prefix_digest,
+            prior_trace_digest: plan.prior_trace_digest,
+            settled_original: plan.descriptor.settled_original,
+            authority_top_dependency: plan.descriptor.authority_top_dependency,
+        };
+        let mut projection = CorePostCommitSettlementTraceProjection {
+            binding,
+            expected,
+            cursor: 0,
+            recorded: Vec::new(),
+            settlement_event_start,
+            digest: 0,
+        };
+        projection.digest = post_commit_settlement_trace_digest(&projection);
+        Self { projection }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CorePostCommitSettlementTraceMismatchKind {
+    Receiver,
+    WrongOwner,
+    Replay,
+    TraceUnavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitSettlementTraceMismatchEvidence {
+    expected: Option<CorePostCommitSettlementTraceProjection>,
+    observed_receiver: Option<CorePostCommitCompoundProjection>,
+    submitted: CorePostCommitCompoundProjection,
+    submitted_normal: CleanupBatchSourceProjection,
+    submitted_trace: CorePostCommitSettlementTraceProjection,
+    expected_next: Option<CorePostCommitSettlementExpectedProjection>,
+    submitted_next: Option<CorePostCommitSettlementExpectedProjection>,
+    kind: CorePostCommitSettlementTraceMismatchKind,
+}
+
+impl CorePostCommitSettlementTraceMismatchEvidence {
+    pub(crate) const fn kind(&self) -> CorePostCommitSettlementTraceMismatchKind {
+        self.kind
+    }
+
+    pub(crate) fn cause(&self) -> PostCommitAuthorityCause {
+        self.expected.as_ref().map_or(
+            self.submitted.cause,
+            CorePostCommitSettlementTraceProjection::cause,
+        )
+    }
+
+    pub(crate) const fn submitted_normal(&self) -> &CleanupBatchSourceProjection {
+        &self.submitted_normal
+    }
+
+    pub(crate) const fn expected_next(
+        &self,
+    ) -> Option<&CorePostCommitSettlementExpectedProjection> {
+        self.expected_next.as_ref()
+    }
+
+    pub(crate) const fn submitted_trace(&self) -> &CorePostCommitSettlementTraceProjection {
+        &self.submitted_trace
+    }
+
+    pub(crate) const fn submitted_next(
+        &self,
+    ) -> Option<&CorePostCommitSettlementExpectedProjection> {
+        self.submitted_next.as_ref()
+    }
+}
+
+pub(crate) struct CorePostCommitSettlementPermit {
+    capability: CorePostCommitSettlementCapability,
+    expected: CorePostCommitSettlementExpectedProjection,
+    binding: u64,
+}
+
+impl CorePostCommitSettlementPermit {
+    pub(crate) const fn expected(&self) -> &CorePostCommitSettlementExpectedProjection {
+        &self.expected
+    }
+}
+
+pub(crate) struct CorePreparedPostCommitSettlement {
+    owner: CorePostCommitCompoundBatchOwner,
+    permit: CorePostCommitSettlementPermit,
+}
+
+pub(crate) enum CorePostCommitSettlementPermitOutcome {
+    Prepared(CorePreparedPostCommitSettlement),
+    Mismatch {
+        owner: CorePostCommitCompoundBatchOwner,
+        evidence: CorePostCommitSettlementTraceMismatchEvidence,
+    },
+}
+
+pub(crate) struct CorePostCommitSettlementAttestation<Physical> {
+    physical: Physical,
+    permit_binding: u64,
+}
+
+impl<Physical> CorePostCommitSettlementAttestation<Physical> {
+    pub(crate) fn from_trusted_physical(
+        physical: Physical,
+        permit: &CorePostCommitSettlementPermit,
+    ) -> Self {
+        Self {
+            physical,
+            permit_binding: permit.binding,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitSettlementAttestationMismatchEvidence {
+    expected_permit_binding: u64,
+    observed_permit_binding: u64,
+}
+
+pub(crate) enum CorePostCommitSettlementRecordOutcome<Physical, BindError> {
+    Recorded {
+        owner: CorePostCommitCompoundBatchOwner,
+        trace: CorePostCommitSettlementTraceProjection,
+    },
+    Mismatch {
+        attempt: CorePreparedPostCommitSettlement,
+        physical: Physical,
+        evidence: CorePostCommitSettlementTraceMismatchEvidence,
+    },
+    BindingMismatch {
+        attempt: CorePreparedPostCommitSettlement,
+        physical: Physical,
+        bind_error: BindError,
+    },
+    AttestationMismatch {
+        attempt: CorePreparedPostCommitSettlement,
+        physical: Physical,
+        evidence: CorePostCommitSettlementAttestationMismatchEvidence,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitSettlementTraceCompletionExpectedProjection {
+    compound: CorePostCommitCompoundProjection,
+    cause: PostCommitAuthorityCause,
+    plan: CorePostCommitSettlementTraceProjection,
+    required_progress: CorePostCommitSettlementTraceProgress,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CorePostCommitCurrentSourceProjection {
+    identity: FrameTaskIdentity,
+    branch: Option<FailureCleanupZeroTerminalBranchProjection>,
+    location: RouteLocation,
+    reservation: Vec<ReservedFrameAttempt>,
+    target_frames: Vec<RouteFrameVersion>,
+    applied_frames: Vec<RouteFrameVersion>,
+    current_target: FrameMountTarget,
+    pending_mount: Option<FailureCleanupZeroTerminalPendingMountProjection>,
+    authority_cleanup: Option<CorePostCommitAuthorityCleanupSourceProjection>,
+    cleanup_batch: CleanupBatchId,
+    cleanup_roots: Vec<RouteFrameVersion>,
+    attempt: FailureCleanupZeroTerminalAttemptProjection,
+    reconciliation: Option<RouteReconciliationProjection>,
+    retired_host: Option<RetiredHostAuthorityProjection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CorePostCommitAuthorityCleanupSourceProjection {
+    normal: CleanupBatchSourceProjection,
+    expected: CorePostCommitCompoundProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoreCompletedCleanupSourceProjection {
+    request: NavigationRequestId,
+    token: CleanupBatchSourceProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CorePreparedPostCommitTerminalSourceProjection {
+    cause: PostCommitAuthorityCause,
+    history_before: FrozenCommittedHistoryProjection,
+    recovering_record: NavigationTraceEvent,
+    aggregate_cleanup: NavigationTraceEvent,
+    diagnostic: DiagnosticEvent,
+    request_terminal: NavigationTraceEvent,
+    queued_terminals: Vec<NavigationTraceEvent>,
+    final_state: crate::presentation::RouterAvailability,
+    recovering_state: RouterNavigationState,
+    recovering_records: VecDeque<NavigationRequestRecord>,
+    final_navigation_state: RouterNavigationState,
+    final_records: VecDeque<NavigationRequestRecord>,
+    final_evicted_through: Option<u64>,
+    final_issued_view_tasks: Vec<FrameTaskIdentity>,
+    final_report_dispositions: Vec<ReportDispositionRecord>,
+    final_completed_cleanup: Vec<CoreCompletedCleanupSourceProjection>,
+    final_router_diagnostics: Vec<DiagnosticEvent>,
+    retain_completed_current: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitCompletionSourceProjection {
+    receiver: Option<CorePostCommitCompoundProjection>,
+    history: FrozenCommittedHistoryProjection,
+    state: RouterNavigationState,
+    records: VecDeque<NavigationRequestRecord>,
+    evicted_through: Option<u64>,
+    issued_view_tasks: Vec<FrameTaskIdentity>,
+    report_dispositions: Vec<ReportDispositionRecord>,
+    completed_cleanup: Vec<CoreCompletedCleanupSourceProjection>,
+    router_diagnostics: Vec<DiagnosticEvent>,
+    active_branch: Option<FailureCleanupZeroTerminalBranchProjection>,
+    active_child_slots: Vec<LogicalChildSlotBinding>,
+    current: Option<CorePostCommitCurrentSourceProjection>,
+    action_present: bool,
+    terminal_plan: Option<CorePreparedPostCommitTerminalSourceProjection>,
+    settlement_trace: Option<CorePostCommitSettlementTraceProjection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CorePostCommitCompoundMismatchEvidence {
+    Receiver {
+        expected: CorePostCommitCompoundProjection,
+        observed: Option<CorePostCommitCompoundProjection>,
+    },
+    CompletionFacts {
+        expected: CorePostCommitCompoundCompletionFactsProjection,
+        observed: CorePostCommitCompoundCompletionFactsProjection,
+    },
+    SettlementTrace {
+        expected: CorePostCommitSettlementTraceCompletionExpectedProjection,
+        observed: Option<CorePostCommitSettlementTraceProjection>,
+    },
+    Source {
+        expected: CorePostCommitCompletionSourceProjection,
+        observed: CorePostCommitCompletionSourceProjection,
+    },
+}
+
+impl CorePostCommitCompoundMismatchEvidence {
+    pub(crate) const fn is_completion_facts(&self) -> bool {
+        matches!(self, Self::CompletionFacts { .. })
+    }
+
+    pub(crate) const fn is_source(&self) -> bool {
+        matches!(self, Self::Source { .. })
+    }
+
+    pub(crate) const fn is_settlement_trace(&self) -> bool {
+        matches!(self, Self::SettlementTrace { .. })
+    }
+
+    pub(crate) fn cause(&self) -> Option<PostCommitAuthorityCause> {
+        match self {
+            Self::Receiver { expected, .. } => Some(expected.cause),
+            Self::CompletionFacts { expected, .. } => Some(expected.cause),
+            Self::SettlementTrace { expected, .. } => Some(expected.cause),
+            Self::Source { expected, .. } => {
+                expected.receiver.as_ref().map(|receiver| receiver.cause)
+            }
+        }
+    }
+}
+
+pub(crate) struct PostCommitCompoundCompletionInputs {
+    normal: CleanupCompletion,
+    normal_facts: CoreNormalCleanupCompletionFacts,
+    authority_expected: CoreAuthorityCleanupCompletionFacts,
+    authority: CoreAuthorityCleanupCompletionFacts,
+    host_edge: CoreRetiredHostEdgeCompletionFacts,
+    settlement: CorePostCommitSettlementTraceProjection,
+}
+
+impl PostCommitCompoundCompletionInputs {
+    pub(crate) const fn new(
+        normal: CleanupCompletion,
+        normal_facts: CoreNormalCleanupCompletionFacts,
+        authority_expected: CoreAuthorityCleanupCompletionFacts,
+        authority: CoreAuthorityCleanupCompletionFacts,
+        host_edge: CoreRetiredHostEdgeCompletionFacts,
+        settlement: CorePostCommitSettlementTraceProjection,
+    ) -> Self {
+        Self {
+            normal,
+            normal_facts,
+            authority_expected,
+            authority,
+            host_edge,
+            settlement,
+        }
+    }
+}
+
+pub(crate) struct CorePostCommitCompoundCompletionOwner {
+    batch: CorePostCommitCompoundBatchOwner,
+    normal: CleanupCompletion,
+    authority: CoreAuthorityCleanupCompletionFacts,
+    host_edge: CoreRetiredHostEdgeCompletionFacts,
+    source: CorePostCommitCompletionSourceProjection,
+}
+
+pub(crate) enum PostCommitCompoundCompletionPreparationOutcome {
+    Prepared(CorePostCommitCompoundCompletionOwner),
+    Mismatch {
+        batch: CorePostCommitCompoundBatchOwner,
+        inputs: PostCommitCompoundCompletionInputs,
+        evidence: CorePostCommitCompoundMismatchEvidence,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorePostCommitTerminalProjection {
+    router: RouterIdentity,
+    request: NavigationRequestId,
+    cause: PostCommitAuthorityCause,
+    history: FrozenCommittedHistoryProjection,
+    availability: crate::presentation::RouterAvailability,
+    trace_digest: u64,
+}
+
+impl CorePostCommitTerminalProjection {
+    pub(crate) const fn request(&self) -> NavigationRequestId {
+        self.request
+    }
+
+    pub(crate) const fn cause(&self) -> PostCommitAuthorityCause {
+        self.cause
+    }
+
+    pub(crate) const fn trace_digest(&self) -> u64 {
+        self.trace_digest
+    }
+}
+
+pub(crate) enum PostCommitCompoundCompletionCoreOutcome<PhysicalTerminal> {
+    Terminal {
+        terminal: CorePostCommitTerminalProjection,
+        physical: PhysicalTerminal,
+        retired_host: CoreRetiredHostAuthorityTerminalEvidence,
+    },
+    Mismatch {
+        owner: CorePostCommitCompoundCompletionOwner,
+        evidence: CorePostCommitCompoundMismatchEvidence,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedPostCommitTerminalPlan {
+    cause: PostCommitAuthorityCause,
+    history_before: FrozenCommittedHistoryProjection,
+    recovering_record: NavigationTraceEvent,
+    aggregate_cleanup: NavigationTraceEvent,
+    diagnostic: DiagnosticEvent,
+    request_terminal: NavigationTraceEvent,
+    queued_terminals: Vec<NavigationTraceEvent>,
+    final_state: crate::presentation::RouterAvailability,
+    recovering_state: RouterNavigationState,
+    recovering_records: VecDeque<NavigationRequestRecord>,
+    final_navigation_state: RouterNavigationState,
+    final_records: VecDeque<NavigationRequestRecord>,
+    final_evicted_through: Option<u64>,
+    final_issued_view_tasks: Vec<FrameTaskIdentity>,
+    final_report_dispositions: Vec<ReportDispositionRecord>,
+    final_completed_cleanup: Vec<CompletedCleanupTombstone>,
+    final_router_diagnostics: Vec<DiagnosticEvent>,
+    retain_completed_current: bool,
+}
+
+impl From<&PreparedPostCommitTerminalPlan> for CorePreparedPostCommitTerminalSourceProjection {
+    fn from(terminal: &PreparedPostCommitTerminalPlan) -> Self {
+        Self {
+            cause: terminal.cause,
+            history_before: terminal.history_before.clone(),
+            recovering_record: terminal.recovering_record.clone(),
+            aggregate_cleanup: terminal.aggregate_cleanup.clone(),
+            diagnostic: terminal.diagnostic.clone(),
+            request_terminal: terminal.request_terminal.clone(),
+            queued_terminals: terminal.queued_terminals.clone(),
+            final_state: terminal.final_state.clone(),
+            recovering_state: terminal.recovering_state.clone(),
+            recovering_records: terminal.recovering_records.clone(),
+            final_navigation_state: terminal.final_navigation_state.clone(),
+            final_records: terminal.final_records.clone(),
+            final_evicted_through: terminal.final_evicted_through,
+            final_issued_view_tasks: terminal.final_issued_view_tasks.clone(),
+            final_report_dispositions: terminal.final_report_dispositions.clone(),
+            final_completed_cleanup: terminal
+                .final_completed_cleanup
+                .iter()
+                .map(|tombstone| CoreCompletedCleanupSourceProjection {
+                    request: tombstone.request,
+                    token: tombstone.token.source_projection(),
+                })
+                .collect(),
+            final_router_diagnostics: terminal.final_router_diagnostics.clone(),
+            retain_completed_current: terminal.retain_completed_current,
+        }
     }
 }
 
@@ -2963,6 +4424,41 @@ impl From<&CurrentWork> for FailureCleanupZeroTerminalCurrentProjection {
             current_target: current.current_target.clone(),
             pending_mount: current.pending_mount.as_ref().map(Into::into),
             stage: current.stage.projection(),
+            cleanup_batch: current.cleanup_batch,
+            cleanup_roots: current.cleanup_roots.clone(),
+            attempt: (&current.attempt).into(),
+            reconciliation: current.reconciliation.clone(),
+            retired_host: current
+                .retired_host
+                .as_ref()
+                .map(RetiredHostAuthority::projection),
+        }
+    }
+}
+
+impl From<&CurrentWork> for CorePostCommitCurrentSourceProjection {
+    fn from(current: &CurrentWork) -> Self {
+        Self {
+            identity: current.identity.clone(),
+            branch: current
+                .branch
+                .as_ref()
+                .map(failure_cleanup_zero_terminal_branch_projection),
+            location: current.location.clone(),
+            reservation: current.reservation.clone(),
+            target_frames: current.target_frames.clone(),
+            applied_frames: current.applied_frames.clone(),
+            current_target: current.current_target.clone(),
+            pending_mount: current.pending_mount.as_ref().map(Into::into),
+            authority_cleanup: match &current.stage {
+                WorkStage::PostCommitAuthorityCleanup { normal, expected } => {
+                    Some(CorePostCommitAuthorityCleanupSourceProjection {
+                        normal: normal.source_projection(),
+                        expected: expected.clone(),
+                    })
+                }
+                _ => None,
+            },
             cleanup_batch: current.cleanup_batch,
             cleanup_roots: current.cleanup_roots.clone(),
             attempt: (&current.attempt).into(),
@@ -3212,6 +4708,8 @@ pub(crate) struct RouterEngine {
     live_failed_authority_trigger_revision: Option<u64>,
     pending_back_no_target_authority: Option<CorePendingBackNoTargetAuthority>,
     pending_back_target_permanent_cleanup: Option<CoreBackTargetPermanentCleanupState>,
+    pending_post_commit_terminal: Option<PreparedPostCommitTerminalPlan>,
+    pending_post_commit_settlement_trace: Option<CorePostCommitSettlementTraceProjection>,
     #[cfg(test)]
     testing_back_target_source_drift_before_freeze_once: bool,
 }
@@ -3254,6 +4752,8 @@ impl RouterEngine {
             live_failed_authority_trigger_revision: None,
             pending_back_no_target_authority: None,
             pending_back_target_permanent_cleanup: None,
+            pending_post_commit_terminal: None,
+            pending_post_commit_settlement_trace: None,
             #[cfg(test)]
             testing_back_target_source_drift_before_freeze_once: false,
         })
@@ -3287,6 +4787,1424 @@ impl RouterEngine {
         self.state.confirm_host(issuer, confirmation)
     }
 
+    pub(crate) fn accept_post_commit_authority_transfer(
+        &mut self,
+        normal: &CleanupBatchToken,
+        cause: PostCommitAuthorityCause,
+    ) -> PostCommitAuthorityAcceptanceOutcome {
+        let expected = self
+            .post_commit_receiver_projection(
+                normal,
+                CorePostCommitCleanupStageProjection::PostCommitCleanup,
+            )
+            .expect("a post-commit cleanup token retains its frozen Core receiver");
+        let observed = self.observe_post_commit_cleanup();
+        let exact = observed.receiver.as_ref() == Some(&expected)
+            && self.pending_post_commit_terminal.is_none()
+            && self.pending_post_commit_settlement_trace.is_none()
+            && self.action.is_none()
+            && self.current_history_capability.is_none()
+            && self.pending_history_preparation_error.is_none()
+            && self.prepared_publication_authority.is_none();
+        if !exact {
+            return PostCommitAuthorityAcceptanceOutcome::Mismatch { expected, observed };
+        }
+
+        let mut accepted = expected;
+        accepted.stage = CorePostCommitCleanupStageProjection::AuthorityAccepted;
+        let current = self
+            .current
+            .as_mut()
+            .expect("the exact post-commit receiver remains current");
+        let stage = std::mem::replace(&mut current.stage, WorkStage::Applying);
+        let WorkStage::PostCommitCleanup { outstanding } = stage else {
+            unreachable!("acceptance consumes only the exact post-commit stage")
+        };
+        let normal_source = outstanding.source_projection();
+        current.stage = WorkStage::PostCommitAuthorityAccepted {
+            normal: outstanding,
+            expected: accepted.clone(),
+        };
+        PostCommitAuthorityAcceptanceOutcome::Accepted(CorePostCommitAuthorityTransferOwner {
+            receiver: accepted,
+            normal_source,
+            cause,
+        })
+    }
+
+    pub(crate) fn prepare_post_commit_authority_transfer(
+        &mut self,
+        source: CorePostCommitAuthorityPreparationSource,
+        manifest: CleanupManifestSeal,
+    ) -> PostCommitAuthorityPreparationOutcome {
+        let cause = source.transfer.cause;
+        let observed = self.observe_post_commit_cleanup();
+        let expected = source.transfer.receiver.clone();
+        if observed.receiver.as_ref() != Some(&expected) {
+            return PostCommitAuthorityPreparationOutcome::Mismatch {
+                source,
+                evidence: CorePostCommitReceiverMismatchProjection { expected, observed },
+            };
+        }
+        if !source.host.matches(
+            self.router,
+            &source.transfer.receiver.current_host,
+            source.transfer.receiver.current_top_slot,
+        ) {
+            return PostCommitAuthorityPreparationOutcome::Permanent {
+                source,
+                evidence: CorePostCommitAuthorityBeginPermanentEvidence {
+                    expected,
+                    observed,
+                    cause,
+                    contradiction: CorePostCommitAuthorityContradiction::ForeignReceiver,
+                },
+            };
+        }
+        let Some(current) = self.current.as_ref() else {
+            return PostCommitAuthorityPreparationOutcome::Mismatch {
+                source,
+                evidence: CorePostCommitReceiverMismatchProjection { expected, observed },
+            };
+        };
+        if manifest.logical_roots()
+            != current
+                .target_frames
+                .iter()
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+        {
+            return PostCommitAuthorityPreparationOutcome::Permanent {
+                source,
+                evidence: CorePostCommitAuthorityBeginPermanentEvidence {
+                    expected,
+                    observed,
+                    cause,
+                    contradiction: CorePostCommitAuthorityContradiction::HistoryOrActiveMismatch,
+                },
+            };
+        }
+        let batch_id = match self.ids.reserve_cleanup_batch() {
+            Ok(batch) => batch,
+            Err(_) => {
+                return PostCommitAuthorityPreparationOutcome::Permanent {
+                    source,
+                    evidence: CorePostCommitAuthorityBeginPermanentEvidence {
+                        expected,
+                        observed,
+                        cause,
+                        contradiction: CorePostCommitAuthorityContradiction::IdentityExhausted,
+                    },
+                };
+            }
+        };
+        let authority_batch = CleanupBatchToken::sealed(
+            source.transfer.receiver.identity.clone(),
+            batch_id,
+            manifest.logical_roots(),
+            manifest.manifest_digest(),
+            manifest.obligation_count(),
+        );
+        let batch = authority_batch.projection();
+        PostCommitAuthorityPreparationOutcome::Prepared {
+            owner: CorePreparedPostCommitAuthorityTransfer {
+                transfer: source.transfer,
+                host: source.host,
+                authority_batch,
+                authority_manifest: manifest,
+            },
+            batch,
+        }
+    }
+
+    pub(crate) fn begin_post_commit_authority_transfer<Unbound, Bound, BindError, Bind, Install>(
+        &mut self,
+        issuer: &mut HostAdmissionIssuer,
+        owner: CorePreparedPostCommitAuthorityTransfer,
+        unbound: Unbound,
+        bind: Bind,
+        install_compound: Install,
+    ) -> PostCommitAuthorityBeginCoreOutcome<Unbound, Bound, BindError>
+    where
+        Bind: FnOnce(
+            Unbound,
+            &CleanupBatchProjection,
+            CorePostCommitSettlementPlanBuilder,
+        )
+            -> Result<(Bound, CoreBoundPostCommitSettlementPlan), (Unbound, BindError)>,
+        Install: FnOnce(Bound, CorePostCommitCompoundBatchOwner),
+    {
+        let cause = owner.transfer.cause;
+        let batch_projection = owner.authority_batch.projection();
+        let expected = owner.transfer.receiver.clone();
+        let mut cleanup_receiver = owner.transfer.receiver.clone();
+        cleanup_receiver.stage = CorePostCommitCleanupStageProjection::AuthorityCleanup;
+        let retired_projection = owner.host.retirement_projection();
+        let compound_projection = CorePostCommitCompoundProjection {
+            receiver: cleanup_receiver.clone(),
+            authority_batch: owner.authority_batch.projection(),
+            retired_host: retired_projection.clone(),
+            cause,
+        };
+        let current_trace = self
+            .request(expected.request)
+            .map_or_else(Vec::new, |record| record.trace().to_vec());
+        let plan_builder = CorePostCommitSettlementPlanBuilder {
+            compound: compound_projection.clone(),
+            normal_batch: owner.transfer.normal_source.clone(),
+            authority_batch: owner.authority_batch.source_projection(),
+            normal_obligation_count: expected.normal_batch.obligation_count,
+            authority_obligation_count: owner.authority_batch.obligation_count(),
+            current_trace,
+        };
+        let (bound, settlement_plan) = match bind(unbound, &batch_projection, plan_builder) {
+            Ok(bound) => bound,
+            Err((unbound, evidence)) => {
+                return PostCommitAuthorityBeginCoreOutcome::BindingMismatch {
+                    owner,
+                    unbound,
+                    evidence,
+                };
+            }
+        };
+
+        let observed = self.observe_post_commit_cleanup();
+        if observed.receiver.as_ref() != Some(&expected) {
+            return PostCommitAuthorityBeginCoreOutcome::ReceiverMismatch {
+                owner,
+                bound,
+                evidence: CorePostCommitReceiverMismatchProjection { expected, observed },
+            };
+        }
+        if observed.competing_cleanup.is_some() {
+            return PostCommitAuthorityBeginCoreOutcome::Permanent {
+                owner,
+                bound,
+                evidence: CorePostCommitAuthorityBeginPermanentEvidence {
+                    expected,
+                    observed,
+                    cause,
+                    contradiction: CorePostCommitAuthorityContradiction::CompetingSameSourceOwner,
+                },
+            };
+        }
+        let authority_state_is_ready = self.state.availability()
+            == &crate::presentation::RouterAvailability::Ready
+            && self.state.host() == Some(&owner.transfer.receiver.current_host)
+            && self.state.top_slot() == Some(owner.transfer.receiver.current_top_slot);
+        if !authority_state_is_ready {
+            return PostCommitAuthorityBeginCoreOutcome::Permanent {
+                owner,
+                bound,
+                evidence: CorePostCommitAuthorityBeginPermanentEvidence {
+                    expected,
+                    observed,
+                    cause,
+                    contradiction: CorePostCommitAuthorityContradiction::RetiredHostMismatch,
+                },
+            };
+        }
+
+        let normal = match self.current.as_ref().map(|current| &current.stage) {
+            Some(WorkStage::PostCommitAuthorityAccepted { normal, .. }) => normal.clone(),
+            _ => {
+                return PostCommitAuthorityBeginCoreOutcome::ReceiverMismatch {
+                    owner,
+                    bound,
+                    evidence: CorePostCommitReceiverMismatchProjection { expected, observed },
+                };
+            }
+        };
+        let live_trace = self
+            .request(expected.request)
+            .map(|record| record.trace())
+            .unwrap_or_default();
+        let exact_plan_source = settlement_plan.compound == compound_projection
+            && settlement_plan.normal_batch == normal.source_projection()
+            && settlement_plan.authority_batch == owner.authority_batch.source_projection()
+            && settlement_plan.prior_trace_digest == navigation_trace_digest(live_trace);
+        if !exact_plan_source {
+            return PostCommitAuthorityBeginCoreOutcome::Permanent {
+                owner,
+                bound,
+                evidence: CorePostCommitAuthorityBeginPermanentEvidence {
+                    expected,
+                    observed,
+                    cause,
+                    contradiction: CorePostCommitAuthorityContradiction::HistoryOrActiveMismatch,
+                },
+            };
+        }
+        let terminal = match self.prepare_post_commit_terminal_plan(
+            &normal,
+            &owner.authority_batch,
+            cause,
+            &owner.transfer.receiver.current_host,
+            owner.transfer.receiver.current_top_slot,
+        ) {
+            Ok(terminal) => terminal,
+            Err(CorePostCommitTerminalPreparationFailure::Retryable(missing_capacity)) => {
+                return PostCommitAuthorityBeginCoreOutcome::Retryable {
+                    owner,
+                    bound,
+                    evidence: CorePostCommitAuthorityBeginRetryEvidence {
+                        expected,
+                        observed,
+                        cause,
+                        missing_capacity,
+                    },
+                };
+            }
+            Err(CorePostCommitTerminalPreparationFailure::Permanent(contradiction)) => {
+                return PostCommitAuthorityBeginCoreOutcome::Permanent {
+                    owner,
+                    bound,
+                    evidence: CorePostCommitAuthorityBeginPermanentEvidence {
+                        expected,
+                        observed,
+                        cause,
+                        contradiction,
+                    },
+                };
+            }
+        };
+
+        let installed_projection = compound_projection.clone();
+        let host_expected = CoreRetiredHostAuthorityExpectedProjection {
+            receiver: cleanup_receiver,
+            retired_host: retired_projection.clone(),
+            cause,
+        };
+        let expected_physical_digest = post_commit_host_physical_digest(&host_expected.receiver);
+        let recovering_state = terminal.recovering_state.clone();
+        let recovering_records = terminal.recovering_records.clone();
+        let settlement_event_start = recovering_records
+            .iter()
+            .find(|record| record.id() == normal.identity().request())
+            .map_or(0, |record| record.trace().len());
+        let settlement =
+            CorePostCommitSettlementCapability::from_plan(settlement_plan, settlement_event_start);
+        let settlement_trace = settlement.projection.clone();
+
+        let retired_host = match issuer.retire_current(owner.host) {
+            Ok(retired) => retired,
+            Err(error) => {
+                return PostCommitAuthorityBeginCoreOutcome::Permanent {
+                    owner: CorePreparedPostCommitAuthorityTransfer {
+                        transfer: owner.transfer,
+                        host: error.into_owner(),
+                        authority_batch: owner.authority_batch,
+                        authority_manifest: owner.authority_manifest,
+                    },
+                    bound,
+                    evidence: CorePostCommitAuthorityBeginPermanentEvidence {
+                        expected,
+                        observed,
+                        cause,
+                        contradiction: CorePostCommitAuthorityContradiction::RetiredHostMismatch,
+                    },
+                };
+            }
+        };
+        let compound = CorePostCommitCompoundBatchOwner {
+            receiver: compound_projection,
+            authority_batch: owner.authority_batch,
+            host_edge: CoreRetiredHostEdgeSettlementOwner {
+                authority: retired_host,
+                expected: host_expected,
+                expected_physical_digest,
+            },
+            settlement: Some(settlement),
+        };
+
+        install_compound(bound, compound);
+
+        let current = self
+            .current
+            .as_mut()
+            .expect("the post-bind receiver was exact before host retirement");
+        let stage = std::mem::replace(&mut current.stage, WorkStage::Applying);
+        let WorkStage::PostCommitAuthorityAccepted { normal, .. } = stage else {
+            unreachable!("no fallible work occurs after host retirement")
+        };
+        current.stage = WorkStage::PostCommitAuthorityCleanup {
+            normal,
+            expected: installed_projection,
+        };
+        self.state = recovering_state;
+        self.records = recovering_records;
+        self.queue.clear();
+        self.pending_post_commit_terminal = Some(terminal);
+        self.pending_post_commit_settlement_trace = Some(settlement_trace);
+        PostCommitAuthorityBeginCoreOutcome::Begun
+    }
+
+    fn freeze_committed_history(&self) -> FrozenCommittedHistoryProjection {
+        let snapshot = self.history.snapshot();
+        FrozenCommittedHistoryProjection {
+            entries: snapshot.entries().to_vec(),
+            cursor: snapshot.cursor(),
+            digest: committed_history_digest(snapshot.entries(), snapshot.cursor()),
+        }
+    }
+
+    fn post_commit_receiver_projection(
+        &self,
+        normal: &CleanupBatchToken,
+        stage: CorePostCommitCleanupStageProjection,
+    ) -> Option<CorePostCommitCleanupReceiverProjection> {
+        let current = self.current.as_ref()?;
+        let current_host = self.state.host()?.clone();
+        let current_top_slot = self.state.top_slot()?;
+        Some(CorePostCommitCleanupReceiverProjection {
+            router: self.router,
+            request: current.identity.request,
+            identity: current.identity.clone(),
+            normal_batch: normal.projection(),
+            current_host,
+            current_top_slot,
+            committed_history: self.freeze_committed_history(),
+            active: FrozenActiveBranchProjection {
+                identity: current.identity.clone(),
+                presentation: self.state.active().clone(),
+                frames: self.state.active().frames().to_vec(),
+            },
+            stage,
+        })
+    }
+
+    fn observe_post_commit_cleanup(&self) -> CorePostCommitCleanupObservedProjection {
+        let (receiver, retired_host) = match self.current.as_ref().map(|current| &current.stage) {
+            Some(WorkStage::PostCommitCleanup { outstanding }) => (
+                self.post_commit_receiver_projection(
+                    outstanding,
+                    CorePostCommitCleanupStageProjection::PostCommitCleanup,
+                ),
+                None,
+            ),
+            Some(WorkStage::PostCommitAuthorityAccepted { normal, .. }) => (
+                self.post_commit_receiver_projection(
+                    normal,
+                    CorePostCommitCleanupStageProjection::AuthorityAccepted,
+                ),
+                None,
+            ),
+            Some(WorkStage::PostCommitAuthorityCleanup { normal, expected }) => (
+                self.post_commit_receiver_projection(
+                    normal,
+                    CorePostCommitCleanupStageProjection::AuthorityCleanup,
+                ),
+                Some(expected.retired_host.clone()),
+            ),
+            _ => (None, None),
+        };
+        CorePostCommitCleanupObservedProjection {
+            receiver,
+            retired_host,
+            competing_cleanup: None,
+        }
+    }
+
+    fn observe_post_commit_compound(&self) -> Option<CorePostCommitCompoundProjection> {
+        let current = self.current.as_ref()?;
+        let WorkStage::PostCommitAuthorityCleanup { normal, expected } = &current.stage else {
+            return None;
+        };
+        let receiver = self.post_commit_receiver_projection(
+            normal,
+            CorePostCommitCleanupStageProjection::AuthorityCleanup,
+        )?;
+        Some(CorePostCommitCompoundProjection {
+            receiver,
+            authority_batch: expected.authority_batch.clone(),
+            retired_host: expected.retired_host.clone(),
+            cause: expected.cause,
+        })
+    }
+
+    fn post_commit_settlement_trace_mismatch(
+        &self,
+        batch: &CorePostCommitCompoundBatchOwner,
+        kind: CorePostCommitSettlementTraceMismatchKind,
+    ) -> CorePostCommitSettlementTraceMismatchEvidence {
+        let submitted_trace = batch.settlement_projection();
+        self.post_commit_settlement_trace_mismatch_from(batch, submitted_trace, kind)
+    }
+
+    fn post_commit_settlement_trace_mismatch_from(
+        &self,
+        batch: &CorePostCommitCompoundBatchOwner,
+        submitted_trace: CorePostCommitSettlementTraceProjection,
+        kind: CorePostCommitSettlementTraceMismatchKind,
+    ) -> CorePostCommitSettlementTraceMismatchEvidence {
+        let expected_next = self
+            .pending_post_commit_settlement_trace
+            .as_ref()
+            .and_then(|trace| trace.expected.get(trace.cursor))
+            .cloned();
+        let submitted_next = submitted_trace
+            .expected
+            .get(submitted_trace.cursor)
+            .cloned();
+        CorePostCommitSettlementTraceMismatchEvidence {
+            expected: self.pending_post_commit_settlement_trace.clone(),
+            observed_receiver: self.observe_post_commit_compound(),
+            submitted: batch.projection(),
+            submitted_normal: submitted_trace.binding.normal_batch.clone(),
+            submitted_trace,
+            expected_next,
+            submitted_next,
+            kind,
+        }
+    }
+
+    pub(crate) fn prepare_next_post_commit_settlement(
+        &mut self,
+        mut batch: CorePostCommitCompoundBatchOwner,
+    ) -> CorePostCommitSettlementPermitOutcome {
+        let submitted_trace = batch.settlement_projection();
+        let Some(expected_trace) = self.pending_post_commit_settlement_trace.as_ref() else {
+            let evidence = self.post_commit_settlement_trace_mismatch(
+                &batch,
+                CorePostCommitSettlementTraceMismatchKind::TraceUnavailable,
+            );
+            return CorePostCommitSettlementPermitOutcome::Mismatch {
+                owner: batch,
+                evidence,
+            };
+        };
+        let exact_owner = expected_trace == &submitted_trace
+            && submitted_trace.binding.compound == batch.projection()
+            && submitted_trace.binding.authority_batch == batch.authority_batch.source_projection()
+            && submitted_trace.binding.compound.retired_host
+                == batch.host_edge.authority.projection();
+        if !exact_owner {
+            let evidence = self.post_commit_settlement_trace_mismatch(
+                &batch,
+                CorePostCommitSettlementTraceMismatchKind::WrongOwner,
+            );
+            return CorePostCommitSettlementPermitOutcome::Mismatch {
+                owner: batch,
+                evidence,
+            };
+        }
+        let observed_receiver = self.observe_post_commit_compound();
+        let live_normal_is_exact = matches!(
+            self.current.as_ref().map(|current| &current.stage),
+            Some(WorkStage::PostCommitAuthorityCleanup { normal, .. })
+                if normal.source_projection() == submitted_trace.binding.normal_batch
+        );
+        if observed_receiver.as_ref() != Some(&submitted_trace.binding.compound)
+            || !live_normal_is_exact
+        {
+            let evidence = self.post_commit_settlement_trace_mismatch(
+                &batch,
+                CorePostCommitSettlementTraceMismatchKind::Receiver,
+            );
+            return CorePostCommitSettlementPermitOutcome::Mismatch {
+                owner: batch,
+                evidence,
+            };
+        }
+        let Some(expected_next) = submitted_trace
+            .expected
+            .get(submitted_trace.cursor)
+            .cloned()
+        else {
+            let evidence = self.post_commit_settlement_trace_mismatch(
+                &batch,
+                CorePostCommitSettlementTraceMismatchKind::Replay,
+            );
+            return CorePostCommitSettlementPermitOutcome::Mismatch {
+                owner: batch,
+                evidence,
+            };
+        };
+        let capability = batch
+            .settlement
+            .take()
+            .expect("the submitted projection came from the sole linear capability");
+        let binding = post_commit_settlement_permit_digest(&submitted_trace, &expected_next);
+        CorePostCommitSettlementPermitOutcome::Prepared(CorePreparedPostCommitSettlement {
+            owner: batch,
+            permit: CorePostCommitSettlementPermit {
+                capability,
+                expected: expected_next,
+                binding,
+            },
+        })
+    }
+
+    pub(crate) fn record_next_post_commit_settlement<Physical, BindError, Bind>(
+        &mut self,
+        mut attempt: CorePreparedPostCommitSettlement,
+        physical: Physical,
+        bind: Bind,
+    ) -> CorePostCommitSettlementRecordOutcome<Physical, BindError>
+    where
+        Bind:
+            FnOnce(
+                Physical,
+                &CorePostCommitSettlementPermit,
+            )
+                -> Result<CorePostCommitSettlementAttestation<Physical>, (Physical, BindError)>,
+    {
+        let submitted_trace = attempt.permit.capability.projection.clone();
+        let expected_next = attempt.permit.expected.clone();
+        let expected_trace_is_exact = self
+            .pending_post_commit_settlement_trace
+            .as_ref()
+            .is_some_and(|expected| expected == &submitted_trace);
+        let observed_receiver = self.observe_post_commit_compound();
+        let live_normal_is_exact = matches!(
+            self.current.as_ref().map(|current| &current.stage),
+            Some(WorkStage::PostCommitAuthorityCleanup { normal, .. })
+                if normal.source_projection() == submitted_trace.binding.normal_batch
+        );
+        let exact_owner = submitted_trace.binding.compound == attempt.owner.projection()
+            && submitted_trace.binding.authority_batch
+                == attempt.owner.authority_batch.source_projection()
+            && submitted_trace.binding.compound.retired_host
+                == attempt.owner.host_edge.authority.projection();
+        if !expected_trace_is_exact
+            || !exact_owner
+            || observed_receiver.as_ref() != Some(&submitted_trace.binding.compound)
+            || !live_normal_is_exact
+        {
+            let kind = if !expected_trace_is_exact || !exact_owner {
+                CorePostCommitSettlementTraceMismatchKind::WrongOwner
+            } else {
+                CorePostCommitSettlementTraceMismatchKind::Receiver
+            };
+            let evidence = self.post_commit_settlement_trace_mismatch_from(
+                &attempt.owner,
+                submitted_trace,
+                kind,
+            );
+            return CorePostCommitSettlementRecordOutcome::Mismatch {
+                attempt,
+                physical,
+                evidence,
+            };
+        }
+        let request = submitted_trace.binding.compound.receiver.request;
+        let public_tail_is_exact = self
+            .records
+            .iter()
+            .find(|record| record.id() == request)
+            .and_then(|record| record.trace().get(submitted_trace.settlement_event_start..))
+            .is_some_and(|events| {
+                events.len() == submitted_trace.recorded.len()
+                    && events
+                        .iter()
+                        .zip(&submitted_trace.recorded)
+                        .all(|(event, recorded)| {
+                            event == &NavigationTraceEvent::cleanup_settled(recorded.disposition)
+                        })
+            });
+        if !public_tail_is_exact {
+            let evidence = self.post_commit_settlement_trace_mismatch_from(
+                &attempt.owner,
+                submitted_trace,
+                CorePostCommitSettlementTraceMismatchKind::TraceUnavailable,
+            );
+            return CorePostCommitSettlementRecordOutcome::Mismatch {
+                attempt,
+                physical,
+                evidence,
+            };
+        }
+
+        let attestation = match bind(physical, &attempt.permit) {
+            Ok(attestation) => attestation,
+            Err((physical, bind_error)) => {
+                return CorePostCommitSettlementRecordOutcome::BindingMismatch {
+                    attempt,
+                    physical,
+                    bind_error,
+                };
+            }
+        };
+        if attestation.permit_binding != attempt.permit.binding {
+            let CorePostCommitSettlementAttestation {
+                physical,
+                permit_binding,
+            } = attestation;
+            return CorePostCommitSettlementRecordOutcome::AttestationMismatch {
+                evidence: CorePostCommitSettlementAttestationMismatchEvidence {
+                    expected_permit_binding: attempt.permit.binding,
+                    observed_permit_binding: permit_binding,
+                },
+                attempt,
+                physical,
+            };
+        }
+
+        let mut next_trace = submitted_trace;
+        next_trace.cursor += 1;
+        next_trace.recorded.push(expected_next.clone());
+        next_trace.digest = post_commit_settlement_trace_digest(&next_trace);
+        let mut next_records = self.records.clone();
+        if Self::append_cleanup_settlement_trace_record(
+            &mut next_records,
+            request,
+            expected_next.disposition,
+        )
+        .is_err()
+        {
+            let CorePostCommitSettlementAttestation { physical, .. } = attestation;
+            let evidence = self.post_commit_settlement_trace_mismatch_from(
+                &attempt.owner,
+                attempt.permit.capability.projection.clone(),
+                CorePostCommitSettlementTraceMismatchKind::TraceUnavailable,
+            );
+            return CorePostCommitSettlementRecordOutcome::Mismatch {
+                attempt,
+                physical,
+                evidence,
+            };
+        }
+        attempt.permit.capability.projection = next_trace.clone();
+        attempt.owner.settlement = Some(attempt.permit.capability);
+        self.records = next_records;
+        self.pending_post_commit_settlement_trace = Some(next_trace.clone());
+        let CorePostCommitSettlementAttestation { physical, .. } = attestation;
+        drop(physical);
+        CorePostCommitSettlementRecordOutcome::Recorded {
+            owner: attempt.owner,
+            trace: next_trace,
+        }
+    }
+
+    fn prepare_post_commit_terminal_plan(
+        &self,
+        normal: &CleanupBatchToken,
+        _authority: &CleanupBatchToken,
+        cause: PostCommitAuthorityCause,
+        current_host: &HostVersion,
+        current_top_slot: RouteSlotId,
+    ) -> Result<PreparedPostCommitTerminalPlan, CorePostCommitTerminalPreparationFailure> {
+        let request = normal.identity().request();
+        let history_before = self.freeze_committed_history();
+        let recovering_record =
+            NavigationTraceEvent::request_phase_changed(NavigationPhase::Recovering);
+        let aggregate_cleanup = NavigationTraceEvent::cleanup_settled(None);
+        let diagnostic = DiagnosticEvent::post_commit_cleanup_anomaly(
+            request,
+            cause.into(),
+            "post-commit host authority was lost during cleanup",
+        );
+        let request_terminal = NavigationTraceEvent::request_terminal();
+
+        let mut recovering_state = self.state.clone();
+        assert!(
+            recovering_state.begin_authority_recovery(current_host, current_top_slot),
+            "the terminal plan is built only after exact Ready host authority preflight"
+        );
+        recovering_state.set_request(Some(RequestStatus::Running(NavigationPhase::Recovering)));
+        let mut recovering_records = self.records.clone();
+        let Some(record) = recovering_records
+            .iter_mut()
+            .find(|record| record.id() == request)
+        else {
+            return Err(CorePostCommitTerminalPreparationFailure::Permanent(
+                CorePostCommitAuthorityContradiction::RequestOrQueueMismatch,
+            ));
+        };
+        if record
+            .transition(RequestStatus::Running(NavigationPhase::Recovering))
+            .is_err()
+        {
+            return Err(CorePostCommitTerminalPreparationFailure::Permanent(
+                CorePostCommitAuthorityContradiction::RequestOrQueueMismatch,
+            ));
+        }
+        if record.append_trace(recovering_record.clone()).is_err() {
+            return Err(CorePostCommitTerminalPreparationFailure::Permanent(
+                CorePostCommitAuthorityContradiction::TraceMismatch,
+            ));
+        }
+
+        let mut queued_terminals = Vec::new();
+        if queued_terminals
+            .try_reserve_exact(self.queue.len())
+            .is_err()
+        {
+            return Err(CorePostCommitTerminalPreparationFailure::Retryable(
+                CorePostCommitCapacityKind::PreparedTrace,
+            ));
+        }
+        for queued in &self.queue {
+            let Some(record) = recovering_records
+                .iter_mut()
+                .find(|record| record.id() == queued.request)
+            else {
+                return Err(CorePostCommitTerminalPreparationFailure::Permanent(
+                    CorePostCommitAuthorityContradiction::RequestOrQueueMismatch,
+                ));
+            };
+            if record
+                .transition(RequestStatus::Failed(NavigationFailure::new(
+                    NavigationFailureKind::HostLost,
+                    "host was lost after another request committed",
+                )))
+                .is_err()
+            {
+                return Err(CorePostCommitTerminalPreparationFailure::Permanent(
+                    CorePostCommitAuthorityContradiction::RequestOrQueueMismatch,
+                ));
+            }
+            let terminal = NavigationTraceEvent::request_terminal();
+            if record.append_trace(terminal.clone()).is_err() {
+                return Err(CorePostCommitTerminalPreparationFailure::Permanent(
+                    CorePostCommitAuthorityContradiction::TraceMismatch,
+                ));
+            }
+            queued_terminals.push(terminal);
+        }
+
+        let mut final_navigation_state = recovering_state.clone();
+        final_navigation_state.terminalize_post_commit_host_loss();
+        let mut final_records = recovering_records.clone();
+        let Some(record) = final_records
+            .iter_mut()
+            .find(|record| record.id() == request)
+        else {
+            return Err(CorePostCommitTerminalPreparationFailure::Permanent(
+                CorePostCommitAuthorityContradiction::RequestOrQueueMismatch,
+            ));
+        };
+        if record.append_trace(aggregate_cleanup.clone()).is_err() {
+            return Err(CorePostCommitTerminalPreparationFailure::Permanent(
+                CorePostCommitAuthorityContradiction::TraceMismatch,
+            ));
+        }
+        if record.transition(RequestStatus::Succeeded).is_err() {
+            return Err(CorePostCommitTerminalPreparationFailure::Permanent(
+                CorePostCommitAuthorityContradiction::RequestOrQueueMismatch,
+            ));
+        }
+        if record.push_diagnostic(diagnostic.clone()).is_err()
+            || record.append_trace(request_terminal.clone()).is_err()
+        {
+            return Err(CorePostCommitTerminalPreparationFailure::Permanent(
+                CorePostCommitAuthorityContradiction::TraceMismatch,
+            ));
+        }
+
+        let mut final_completed_cleanup = self.completed_cleanup.clone();
+        if final_completed_cleanup.try_reserve(2).is_err() {
+            return Err(CorePostCommitTerminalPreparationFailure::Retryable(
+                CorePostCommitCapacityKind::PreparedTerminal,
+            ));
+        }
+
+        let mut final_router_diagnostics = self.router_diagnostics.clone();
+        if final_router_diagnostics.try_reserve(1).is_err() {
+            return Err(CorePostCommitTerminalPreparationFailure::Retryable(
+                CorePostCommitCapacityKind::PreparedTerminal,
+            ));
+        }
+        if final_router_diagnostics.len() == ROUTER_DIAGNOSTIC_RETENTION {
+            final_router_diagnostics.remove(0);
+        }
+        final_router_diagnostics.push(diagnostic.clone());
+
+        let mut final_issued_view_tasks = self.issued_view_tasks.clone();
+        let mut final_report_dispositions = self.report_dispositions.clone();
+        let mut final_evicted_through = self.evicted_through;
+        while final_records
+            .iter()
+            .filter(|record| is_terminal(record.status()))
+            .count()
+            > TERMINAL_RETENTION
+        {
+            let Some(index) = final_records
+                .iter()
+                .position(|record| is_terminal(record.status()))
+            else {
+                return Err(CorePostCommitTerminalPreparationFailure::Permanent(
+                    CorePostCommitAuthorityContradiction::RequestOrQueueMismatch,
+                ));
+            };
+            let Some(evicted) = final_records.remove(index) else {
+                return Err(CorePostCommitTerminalPreparationFailure::Permanent(
+                    CorePostCommitAuthorityContradiction::RequestOrQueueMismatch,
+                ));
+            };
+            let evicted_request = evicted.id();
+            final_issued_view_tasks.retain(|identity| identity.request != evicted_request);
+            final_report_dispositions
+                .retain(|record| record.target != DiagnosticTarget::Request(evicted_request));
+            final_completed_cleanup.retain(|tombstone| tombstone.request != evicted_request);
+            let sequence = evicted_request.sequence();
+            final_evicted_through =
+                Some(final_evicted_through.map_or(sequence, |current| current.max(sequence)));
+        }
+
+        let retain_completed_current = final_records.iter().any(|record| record.id() == request);
+        Ok(PreparedPostCommitTerminalPlan {
+            cause,
+            history_before,
+            recovering_record,
+            aggregate_cleanup,
+            diagnostic,
+            request_terminal,
+            queued_terminals,
+            final_state: crate::presentation::RouterAvailability::Unavailable(
+                crate::presentation::RouterUnavailableReason::HostLost,
+            ),
+            recovering_state,
+            recovering_records,
+            final_navigation_state,
+            final_records,
+            final_evicted_through,
+            final_issued_view_tasks,
+            final_report_dispositions,
+            final_completed_cleanup,
+            final_router_diagnostics,
+            retain_completed_current,
+        })
+    }
+
+    fn refresh_post_commit_terminal_plan(&mut self) {
+        let (
+            aggregate_cleanup,
+            diagnostic,
+            request_terminal,
+            mut final_completed_cleanup,
+            mut final_router_diagnostics,
+        ) = {
+            let terminal = self
+                .pending_post_commit_terminal
+                .as_mut()
+                .expect("compound completion retains its terminal plan");
+            (
+                terminal.aggregate_cleanup.clone(),
+                terminal.diagnostic.clone(),
+                terminal.request_terminal.clone(),
+                std::mem::take(&mut terminal.final_completed_cleanup),
+                std::mem::take(&mut terminal.final_router_diagnostics),
+            )
+        };
+        let request = self
+            .current
+            .as_ref()
+            .expect("compound completion retains current work")
+            .identity
+            .request;
+        let mut final_navigation_state = self.state.clone();
+        final_navigation_state.terminalize_post_commit_host_loss();
+        let mut final_records = self.records.clone();
+        let record = final_records
+            .iter_mut()
+            .find(|record| record.id() == request)
+            .expect("the exact recovering request remains retained");
+        record
+            .append_trace(aggregate_cleanup)
+            .expect("the exact recovering trace remains open");
+        record
+            .transition(RequestStatus::Succeeded)
+            .expect("the committed request remains nonterminal until compound settlement");
+        record
+            .push_diagnostic(diagnostic.clone())
+            .expect("diagnostic projection accepts its frozen event");
+        record
+            .append_trace(request_terminal)
+            .expect("terminal status precedes the frozen terminal event");
+
+        final_completed_cleanup.clear();
+        final_completed_cleanup.extend(self.completed_cleanup.iter().cloned());
+        final_router_diagnostics.clear();
+        final_router_diagnostics.extend(self.router_diagnostics.iter().cloned());
+        if final_router_diagnostics.len() == ROUTER_DIAGNOSTIC_RETENTION {
+            final_router_diagnostics.remove(0);
+        }
+        final_router_diagnostics.push(diagnostic);
+
+        let mut final_issued_view_tasks = self.issued_view_tasks.clone();
+        let mut final_report_dispositions = self.report_dispositions.clone();
+        let mut final_evicted_through = self.evicted_through;
+        while final_records
+            .iter()
+            .filter(|record| is_terminal(record.status()))
+            .count()
+            > TERMINAL_RETENTION
+        {
+            let index = final_records
+                .iter()
+                .position(|record| is_terminal(record.status()))
+                .expect("terminal retention count has an exact terminal member");
+            let evicted = final_records
+                .remove(index)
+                .expect("the located terminal remains removable");
+            let evicted_request = evicted.id();
+            final_issued_view_tasks.retain(|identity| identity.request != evicted_request);
+            final_report_dispositions
+                .retain(|record| record.target != DiagnosticTarget::Request(evicted_request));
+            final_completed_cleanup.retain(|tombstone| tombstone.request != evicted_request);
+            let sequence = evicted_request.sequence();
+            final_evicted_through =
+                Some(final_evicted_through.map_or(sequence, |current| current.max(sequence)));
+        }
+        let retain_completed_current = final_records.iter().any(|record| record.id() == request);
+
+        let terminal = self
+            .pending_post_commit_terminal
+            .as_mut()
+            .expect("the exact terminal plan remains installed");
+        terminal.final_navigation_state = final_navigation_state;
+        terminal.final_records = final_records;
+        terminal.final_evicted_through = final_evicted_through;
+        terminal.final_issued_view_tasks = final_issued_view_tasks;
+        terminal.final_report_dispositions = final_report_dispositions;
+        terminal.final_completed_cleanup = final_completed_cleanup;
+        terminal.final_router_diagnostics = final_router_diagnostics;
+        terminal.retain_completed_current = retain_completed_current;
+    }
+
+    fn freeze_post_commit_completion_source(&self) -> CorePostCommitCompletionSourceProjection {
+        CorePostCommitCompletionSourceProjection {
+            receiver: self.observe_post_commit_compound(),
+            history: self.freeze_committed_history(),
+            state: self.state.clone(),
+            records: self.records.clone(),
+            evicted_through: self.evicted_through,
+            issued_view_tasks: self.issued_view_tasks.clone(),
+            report_dispositions: self.report_dispositions.clone(),
+            completed_cleanup: self
+                .completed_cleanup
+                .iter()
+                .map(|tombstone| CoreCompletedCleanupSourceProjection {
+                    request: tombstone.request,
+                    token: tombstone.token.source_projection(),
+                })
+                .collect(),
+            router_diagnostics: self.router_diagnostics.clone(),
+            active_branch: self
+                .active_branch
+                .as_ref()
+                .map(failure_cleanup_zero_terminal_branch_projection),
+            active_child_slots: self.active_child_slots.clone(),
+            current: self
+                .current
+                .as_ref()
+                .map(CorePostCommitCurrentSourceProjection::from),
+            action_present: self.action.is_some(),
+            terminal_plan: self
+                .pending_post_commit_terminal
+                .as_ref()
+                .map(CorePreparedPostCommitTerminalSourceProjection::from),
+            settlement_trace: self.pending_post_commit_settlement_trace.clone(),
+        }
+    }
+
+    pub(crate) fn prepare_post_commit_compound_completion(
+        &mut self,
+        batch: CorePostCommitCompoundBatchOwner,
+        inputs: PostCommitCompoundCompletionInputs,
+    ) -> PostCommitCompoundCompletionPreparationOutcome {
+        let expected_receiver = batch.receiver.clone();
+        let observed_receiver = self.observe_post_commit_compound();
+        if observed_receiver.as_ref() != Some(&expected_receiver) {
+            return PostCommitCompoundCompletionPreparationOutcome::Mismatch {
+                batch,
+                inputs,
+                evidence: CorePostCommitCompoundMismatchEvidence::Receiver {
+                    expected: expected_receiver,
+                    observed: observed_receiver,
+                },
+            };
+        }
+        let normal_token = match self.current.as_ref().map(|current| &current.stage) {
+            Some(WorkStage::PostCommitAuthorityCleanup { normal, .. }) => normal,
+            _ => unreachable!("the exact compound receiver retains its normal cleanup owner"),
+        };
+        let expected = CorePostCommitCompoundCompletionFactsProjection {
+            cause: batch.cause(),
+            normal: CoreNormalCleanupCompletionFacts {
+                batch: normal_token.projection(),
+                manifest_digest: normal_token.manifest_digest(),
+                completion_digest: inputs.normal.completion_digest(),
+                settled_count: inputs.normal.settled_count(),
+            },
+            authority: CoreAuthorityCleanupCompletionFacts {
+                batch: batch.authority_batch.projection(),
+                completion_digest: inputs.authority_expected.completion_digest,
+                settled_count: batch.authority_batch.obligation_count(),
+            },
+            host_edge: CoreRetiredHostEdgeCompletionFacts {
+                expected: batch.host_edge.expected.clone(),
+                physical_digest: batch.host_edge.expected_physical_digest,
+            },
+        };
+        let observed = CorePostCommitCompoundCompletionFactsProjection {
+            cause: batch.cause(),
+            normal: inputs.normal_facts.clone(),
+            authority: inputs.authority.clone(),
+            host_edge: inputs.host_edge.clone(),
+        };
+        let authority_expected_is_bound = inputs.authority_expected.batch
+            == batch.authority_batch.projection()
+            && inputs.authority_expected.settled_count == batch.authority_batch.obligation_count();
+        if expected != observed
+            || !authority_expected_is_bound
+            || !inputs.normal.matches(normal_token)
+        {
+            return PostCommitCompoundCompletionPreparationOutcome::Mismatch {
+                batch,
+                inputs,
+                evidence: CorePostCommitCompoundMismatchEvidence::CompletionFacts {
+                    expected,
+                    observed,
+                },
+            };
+        }
+
+        let trace_expected = CorePostCommitSettlementTraceCompletionExpectedProjection {
+            compound: batch.projection(),
+            cause: batch.cause(),
+            plan: batch.settlement_projection(),
+            required_progress: CorePostCommitSettlementTraceProgress::Complete,
+        };
+        let trace_observed = self.pending_post_commit_settlement_trace.clone();
+        let trace_is_exact = self
+            .pending_post_commit_settlement_trace
+            .as_ref()
+            .is_some_and(|trace| {
+                let binding = &trace.binding;
+                let original_residual_count = trace
+                    .expected
+                    .iter()
+                    .filter(|entry| entry.role == CorePostCommitSettlementRole::OriginalResidual)
+                    .count();
+                let authority_non_top_count = trace
+                    .expected
+                    .iter()
+                    .filter(|entry| entry.role == CorePostCommitSettlementRole::AuthorityNonTop)
+                    .count();
+                let retired_host_count = trace
+                    .expected
+                    .iter()
+                    .filter(|entry| entry.role == CorePostCommitSettlementRole::RetiredHostEdge)
+                    .count();
+                let authority_top_count = trace
+                    .expected
+                    .iter()
+                    .filter(|entry| entry.role == CorePostCommitSettlementRole::AuthorityTop)
+                    .count();
+                let ordinals_are_exact = trace
+                    .expected
+                    .iter()
+                    .enumerate()
+                    .all(|(ordinal, entry)| entry.ordinal == ordinal);
+                let recorded_are_exact = trace.recorded == trace.expected;
+                let public_trace_is_exact = self
+                    .records
+                    .iter()
+                    .find(|record| record.id() == batch.receiver.receiver.request)
+                    .is_some_and(|record| {
+                        record
+                            .trace()
+                            .get(trace.settlement_event_start..)
+                            .is_some_and(|events| {
+                                events.len() == trace.recorded.len()
+                                    && events.iter().zip(&trace.recorded).all(|(event, entry)| {
+                                        event
+                                            == &NavigationTraceEvent::cleanup_settled(
+                                                entry.disposition,
+                                            )
+                                    })
+                            })
+                    });
+
+                binding.compound == batch.projection()
+                    && binding.normal_batch == normal_token.source_projection()
+                    && binding.authority_batch == batch.authority_batch.source_projection()
+                    && binding.compound.retired_host == batch.host_edge.authority.projection()
+                    && binding.compound.cause == batch.cause()
+                    && binding.settled_original.len() + original_residual_count
+                        == inputs.normal.settled_count()
+                    && authority_non_top_count + authority_top_count
+                        == inputs.authority.settled_count
+                    && retired_host_count == 1
+                    && authority_top_count == 1
+                    && trace.is_complete()
+                    && ordinals_are_exact
+                    && recorded_are_exact
+                    && public_trace_is_exact
+                    && trace == &inputs.settlement
+                    && batch
+                        .settlement
+                        .as_ref()
+                        .is_some_and(|capability| trace == &capability.projection)
+            });
+        if !trace_is_exact {
+            return PostCommitCompoundCompletionPreparationOutcome::Mismatch {
+                batch,
+                inputs,
+                evidence: CorePostCommitCompoundMismatchEvidence::SettlementTrace {
+                    expected: trace_expected,
+                    observed: trace_observed,
+                },
+            };
+        }
+
+        self.refresh_post_commit_terminal_plan();
+        let source = self.freeze_post_commit_completion_source();
+
+        PostCommitCompoundCompletionPreparationOutcome::Prepared(
+            CorePostCommitCompoundCompletionOwner {
+                batch,
+                normal: inputs.normal,
+                authority: inputs.authority,
+                host_edge: inputs.host_edge,
+                source,
+            },
+        )
+    }
+
+    /// Trusted integration bridge used only after ECS has consumed its private
+    /// non-Clone physical L/A/H completion proof. No caller-supplied authority
+    /// or host expected/observed facts cross this boundary: they are derived
+    /// from the exact bound Core plan and retired-host owner.
+    pub(crate) fn prepare_post_commit_compound_completion_from_trusted_physical(
+        &mut self,
+        batch: CorePostCommitCompoundBatchOwner,
+        normal: CleanupCompletion,
+    ) -> PostCommitCompoundCompletionPreparationOutcome {
+        let settlement = batch.settlement_projection();
+        let authority_expected_count = settlement
+            .expected
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.role,
+                    CorePostCommitSettlementRole::AuthorityNonTop
+                        | CorePostCommitSettlementRole::AuthorityTop
+                )
+            })
+            .count();
+        let authority_settled_count = settlement
+            .recorded
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.role,
+                    CorePostCommitSettlementRole::AuthorityNonTop
+                        | CorePostCommitSettlementRole::AuthorityTop
+                )
+            })
+            .count();
+        let authority_expected_completion_digest =
+            post_commit_authority_expected_completion_digest(&settlement);
+        let authority_completion_digest = post_commit_authority_completion_digest(&settlement);
+        let normal_facts = CoreNormalCleanupCompletionFacts {
+            batch: normal.token().projection(),
+            manifest_digest: normal.token().manifest_digest(),
+            completion_digest: normal.completion_digest(),
+            settled_count: normal.settled_count(),
+        };
+        let authority_expected = CoreAuthorityCleanupCompletionFacts {
+            batch: batch.authority_batch.projection(),
+            completion_digest: CleanupCompletionDigest::from_opaque(
+                authority_expected_completion_digest,
+            ),
+            settled_count: authority_expected_count,
+        };
+        let authority = CoreAuthorityCleanupCompletionFacts {
+            batch: batch.authority_batch.projection(),
+            completion_digest: CleanupCompletionDigest::from_opaque(authority_completion_digest),
+            settled_count: authority_settled_count,
+        };
+        let host_edge = CoreRetiredHostEdgeCompletionFacts {
+            expected: batch.host_edge.expected.clone(),
+            physical_digest: batch.host_edge.expected_physical_digest,
+        };
+        let inputs = PostCommitCompoundCompletionInputs {
+            normal,
+            normal_facts,
+            authority_expected,
+            authority,
+            host_edge,
+            settlement,
+        };
+        self.prepare_post_commit_compound_completion(batch, inputs)
+    }
+
+    pub(crate) fn complete_post_commit_authority_compound<PhysicalTerminal, F>(
+        &mut self,
+        owner: CorePostCommitCompoundCompletionOwner,
+        clear_physical_holder: F,
+    ) -> PostCommitCompoundCompletionCoreOutcome<PhysicalTerminal>
+    where
+        F: FnOnce(CoreRetiredHostAuthorityExpectedProjection) -> PhysicalTerminal,
+    {
+        let expected_receiver = owner.batch.receiver.clone();
+        let observed_receiver = self.observe_post_commit_compound();
+        if observed_receiver.as_ref() != Some(&expected_receiver) {
+            return PostCommitCompoundCompletionCoreOutcome::Mismatch {
+                owner,
+                evidence: CorePostCommitCompoundMismatchEvidence::Receiver {
+                    expected: expected_receiver,
+                    observed: observed_receiver,
+                },
+            };
+        }
+
+        let observed_source = self.freeze_post_commit_completion_source();
+        if observed_source != owner.source {
+            let expected_source = owner.source.clone();
+            return PostCommitCompoundCompletionCoreOutcome::Mismatch {
+                owner,
+                evidence: CorePostCommitCompoundMismatchEvidence::Source {
+                    expected: expected_source,
+                    observed: observed_source,
+                },
+            };
+        }
+
+        let normal_token = match self.current.as_ref().map(|current| &current.stage) {
+            Some(WorkStage::PostCommitAuthorityCleanup { normal, .. }) => normal,
+            _ => unreachable!("the exact compound receiver retains its normal cleanup owner"),
+        };
+        let expected_facts = CorePostCommitCompoundCompletionFactsProjection {
+            cause: owner.batch.cause(),
+            normal: CoreNormalCleanupCompletionFacts {
+                batch: normal_token.projection(),
+                manifest_digest: normal_token.manifest_digest(),
+                completion_digest: owner.normal.completion_digest(),
+                settled_count: owner.normal.settled_count(),
+            },
+            authority: CoreAuthorityCleanupCompletionFacts {
+                batch: owner.batch.authority_batch.projection(),
+                completion_digest: owner.authority.completion_digest,
+                settled_count: owner.batch.authority_batch.obligation_count(),
+            },
+            host_edge: CoreRetiredHostEdgeCompletionFacts {
+                expected: owner.batch.host_edge.expected.clone(),
+                physical_digest: owner.batch.host_edge.expected_physical_digest,
+            },
+        };
+        let observed_facts = CorePostCommitCompoundCompletionFactsProjection {
+            cause: owner.batch.cause(),
+            normal: CoreNormalCleanupCompletionFacts {
+                batch: owner.normal.token().projection(),
+                manifest_digest: owner.normal.token().manifest_digest(),
+                completion_digest: owner.normal.completion_digest(),
+                settled_count: owner.normal.settled_count(),
+            },
+            authority: owner.authority.clone(),
+            host_edge: owner.host_edge.clone(),
+        };
+        let owner_facts_are_exact = expected_facts == observed_facts
+            && owner.normal.matches(normal_token)
+            && owner.batch.host_edge.authority.projection()
+                == owner.batch.host_edge.expected.retired_host;
+        if !owner_facts_are_exact {
+            return PostCommitCompoundCompletionCoreOutcome::Mismatch {
+                owner,
+                evidence: CorePostCommitCompoundMismatchEvidence::CompletionFacts {
+                    expected: expected_facts,
+                    observed: observed_facts,
+                },
+            };
+        }
+
+        let expected_host = owner.batch.host_edge.expected.clone();
+        let consumed = owner.batch.host_edge.authority.projection();
+        let retired_host = CoreRetiredHostAuthorityTerminalEvidence {
+            expected: expected_host.clone(),
+            consumed,
+        };
+        let request = owner.batch.receiver.receiver.request;
+        let terminal_plan = self
+            .pending_post_commit_terminal
+            .as_ref()
+            .expect("the exact completion owner retains its prepared terminal plan");
+        let trace_digest = terminal_plan
+            .final_records
+            .iter()
+            .find(|record| record.id() == request)
+            .map_or(0, |record| navigation_trace_digest(record.trace()));
+        let terminal = CorePostCommitTerminalProjection {
+            router: self.router,
+            request,
+            cause: terminal_plan.cause,
+            history: terminal_plan.history_before.clone(),
+            availability: terminal_plan.final_state.clone(),
+            trace_digest,
+        };
+
+        let physical = clear_physical_holder(expected_host);
+        let mut terminal_plan = self
+            .pending_post_commit_terminal
+            .take()
+            .expect("the prevalidated terminal plan remains installed");
+
+        let current = self
+            .current
+            .take()
+            .expect("the prevalidated compound receiver remains current");
+        let WorkStage::PostCommitAuthorityCleanup { normal, .. } = current.stage else {
+            unreachable!("the completion callback follows exact stage validation")
+        };
+        let CorePostCommitCompoundCompletionOwner {
+            batch,
+            normal: normal_completion,
+            authority,
+            host_edge,
+            source: _,
+        } = owner;
+        let CorePostCommitCompoundBatchOwner {
+            receiver: _,
+            authority_batch,
+            host_edge: host_settlement,
+            settlement,
+        } = batch;
+        if terminal_plan.retain_completed_current {
+            terminal_plan
+                .final_completed_cleanup
+                .push(CompletedCleanupTombstone {
+                    request,
+                    token: normal,
+                });
+            terminal_plan
+                .final_completed_cleanup
+                .push(CompletedCleanupTombstone {
+                    request,
+                    token: authority_batch,
+                });
+        } else {
+            drop(normal);
+            drop(authority_batch);
+        }
+
+        self.state = terminal_plan.final_navigation_state;
+        self.records = terminal_plan.final_records;
+        self.evicted_through = terminal_plan.final_evicted_through;
+        self.issued_view_tasks = terminal_plan.final_issued_view_tasks;
+        self.report_dispositions = terminal_plan.final_report_dispositions;
+        self.completed_cleanup = terminal_plan.final_completed_cleanup;
+        self.router_diagnostics = terminal_plan.final_router_diagnostics;
+        self.active_branch = None;
+        self.active_child_slots.clear();
+        self.action = None;
+        self.pending_post_commit_settlement_trace = None;
+
+        drop(normal_completion);
+        drop(authority);
+        drop(host_edge);
+        drop(host_settlement);
+        drop(settlement);
+        PostCommitCompoundCompletionCoreOutcome::Terminal {
+            terminal,
+            physical,
+            retired_host,
+        }
+    }
+
     pub(crate) fn begin_authority_settlement_retaining<F>(
         &mut self,
         issuer: &mut HostAdmissionIssuer,
@@ -3297,7 +6215,34 @@ impl RouterEngine {
     where
         F: FnOnce(&Self, CleanupBatchToken),
     {
-        self.begin_authority_settlement_publication(issuer, lease, seal, None, authority_mutation)
+        self.begin_authority_settlement_for_cause_retaining(
+            issuer,
+            lease,
+            PreCommitAuthorityCause::AuthorityLost,
+            seal,
+            authority_mutation,
+        )
+    }
+
+    pub(crate) fn begin_authority_settlement_for_cause_retaining<F>(
+        &mut self,
+        issuer: &mut HostAdmissionIssuer,
+        lease: HostLease,
+        cause: PreCommitAuthorityCause,
+        seal: CleanupManifestSeal,
+        authority_mutation: F,
+    ) -> Result<CleanupBatchToken, BeginAuthoritySettlementError>
+    where
+        F: FnOnce(&Self, CleanupBatchToken),
+    {
+        self.begin_authority_settlement_publication(
+            issuer,
+            lease,
+            cause,
+            seal,
+            None,
+            authority_mutation,
+        )
     }
 
     pub(crate) fn failed_authority_trigger_for_task(
@@ -3453,6 +6398,28 @@ impl RouterEngine {
     where
         F: FnOnce(&Self, CleanupBatchToken),
     {
+        self.begin_failed_authority_settlement_for_cause_retaining(
+            issuer,
+            lease,
+            trigger,
+            PreCommitAuthorityCause::AuthorityLost,
+            seal,
+            authority_mutation,
+        )
+    }
+
+    pub(crate) fn begin_failed_authority_settlement_for_cause_retaining<F>(
+        &mut self,
+        issuer: &mut HostAdmissionIssuer,
+        lease: HostLease,
+        trigger: FailedAuthoritySettlementTrigger,
+        cause: PreCommitAuthorityCause,
+        seal: CleanupManifestSeal,
+        authority_mutation: F,
+    ) -> Result<CleanupBatchToken, BeginAuthoritySettlementError>
+    where
+        F: FnOnce(&Self, CleanupBatchToken),
+    {
         let source = match self.consume_failed_authority_trigger(trigger) {
             Ok(source) => source,
             Err(kind) => return Err(BeginAuthoritySettlementError::new(kind, lease)),
@@ -3460,6 +6427,7 @@ impl RouterEngine {
         self.begin_authority_settlement_publication(
             issuer,
             lease,
+            cause,
             seal,
             Some(source),
             authority_mutation,
@@ -3538,6 +6506,7 @@ impl RouterEngine {
         &mut self,
         issuer: &mut HostAdmissionIssuer,
         lease: HostLease,
+        cause: PreCommitAuthorityCause,
         seal: CleanupManifestSeal,
         failed: Option<FailedAuthoritySettlementSource>,
         authority_mutation: F,
@@ -3606,10 +6575,7 @@ impl RouterEngine {
                 (identity, self.authority_settlement_logical_roots())
             }
         };
-        let failure = NavigationFailure::new(
-            NavigationFailureKind::AuthorityLost,
-            "physical reconciliation authority was lost",
-        );
+        let failure = cause.running_failure();
         let request = FailureCleanupRequest::new(
             current_identity,
             PendingFailureKind::AuthorityLost,
@@ -3658,10 +6624,7 @@ impl RouterEngine {
                 .expect("queued authority-loss request remains retained")
                 .clone();
             record
-                .transition(RequestStatus::Failed(NavigationFailure::new(
-                    NavigationFailureKind::AuthorityLost,
-                    "router authority was lost before request start",
-                )))
+                .transition(RequestStatus::Failed(cause.queued_failure()))
                 .expect("queued request is not terminal");
             record
                 .append_trace(NavigationTraceEvent::request_terminal())
@@ -7897,6 +10860,8 @@ impl RouterEngine {
                 | WorkStage::ReadyToCommit
                 | WorkStage::CommitSealed { .. }
                 | WorkStage::PostCommitCleanup { .. }
+                | WorkStage::PostCommitAuthorityAccepted { .. }
+                | WorkStage::PostCommitAuthorityCleanup { .. }
                 | WorkStage::FailureCleanupPrepared { .. }
                 | WorkStage::FailureCleanupZeroTerminalPending { .. }
                 | WorkStage::FailureCleanupCompleting { .. } => None,
@@ -8328,6 +11293,10 @@ impl RouterEngine {
             Some(WorkStage::PostCommitCleanup { .. }) => {
                 CoreBackTargetReceiverStageProjection::PostCommitCleanup
             }
+            Some(
+                WorkStage::PostCommitAuthorityAccepted { .. }
+                | WorkStage::PostCommitAuthorityCleanup { .. },
+            ) => CoreBackTargetReceiverStageProjection::PostCommitCleanup,
             Some(WorkStage::FailureCleanupManifestPending { expected }) => {
                 CoreBackTargetReceiverStageProjection::FailureCleanupManifestPending(
                     expected.clone(),
@@ -9534,6 +12503,33 @@ impl RouterEngine {
         })
     }
 
+    pub(crate) fn cancel_prepared_publication_for_authority_settlement(
+        &mut self,
+        prepared: PreparedPublication,
+    ) -> Result<(), (PreparedPublication, CommitError)> {
+        let validation = match self.prepared_publication_authority.as_ref() {
+            Some(PreparedPublicationAuthority::Ready(owner))
+                if owner.evidence == prepared.evidence =>
+            {
+                self.validate_prepared_publication_owner(owner)
+            }
+            Some(
+                PreparedPublicationAuthority::Ready(_) | PreparedPublicationAuthority::Rejected(_),
+            )
+            | None => Err(CommitError::Stale),
+        };
+        if let Err(error) = validation {
+            return Err((prepared, error));
+        }
+        let Some(PreparedPublicationAuthority::Ready(owner)) =
+            self.prepared_publication_authority.take()
+        else {
+            unreachable!("validated cancellation retains the exact ready publication owner")
+        };
+        drop((prepared, owner));
+        Ok(())
+    }
+
     fn validate_publication_owner(
         &mut self,
         prepared: PreparedPublication,
@@ -10000,6 +12996,8 @@ impl RouterEngine {
                 | WorkStage::ConfirmingMount
                 | WorkStage::ReadyToCommit
                 | WorkStage::CommitSealed { .. }
+                | WorkStage::PostCommitAuthorityAccepted { .. }
+                | WorkStage::PostCommitAuthorityCleanup { .. }
                 | WorkStage::FailureCleanupManifestPending { .. }
                 | WorkStage::FailureCleanupPrepared { .. }
                 | WorkStage::FailureCleanupZeroTerminalPending { .. }
@@ -10065,7 +13063,12 @@ impl RouterEngine {
                 request,
                 token: completed_token,
             });
-            assert!(self.state.complete_authority_settlement(&version, top_slot));
+            let settled = if failure.kind() == NavigationFailureKind::HostLost {
+                self.state.complete_host_loss_settlement(&version, top_slot)
+            } else {
+                self.state.complete_authority_settlement(&version, top_slot)
+            };
+            assert!(settled);
             self.active_branch = None;
             self.active_child_slots.clear();
             self.retire_history_authority();
@@ -10144,16 +13147,31 @@ impl RouterEngine {
                 | WorkStage::ReadyToCommit
                 | WorkStage::CommitSealed { .. }
                 | WorkStage::PostCommitCleanup { .. }
+                | WorkStage::PostCommitAuthorityAccepted { .. }
+                | WorkStage::PostCommitAuthorityCleanup { .. }
                 | WorkStage::FailureCleanupManifestPending { .. }
                 | WorkStage::FailureCleanupPrepared { .. }
                 | WorkStage::FailureCleanupZeroTerminalPending { .. }
                 | WorkStage::FailureCleanupCompleting { .. } => None,
             })
             .ok_or(CleanupError::Stale)?;
-        self.record_mut(request)
-            .expect("current cleanup request is retained")
-            .append_trace(NavigationTraceEvent::cleanup_settled(Some(disposition)))
-            .expect("current cleanup trace is open");
+        Self::append_cleanup_settlement_trace_record(&mut self.records, request, Some(disposition))
+            .map_err(|()| CleanupError::Invalid)?;
+        Ok(())
+    }
+
+    fn append_cleanup_settlement_trace_record(
+        records: &mut VecDeque<NavigationRequestRecord>,
+        request: NavigationRequestId,
+        disposition: Option<crate::trace::CleanupDisposition>,
+    ) -> Result<(), ()> {
+        let record = records
+            .iter_mut()
+            .find(|record| record.id() == request)
+            .ok_or(())?;
+        record
+            .append_trace(NavigationTraceEvent::cleanup_settled(disposition))
+            .map_err(|_| ())?;
         Ok(())
     }
 
@@ -11282,7 +14300,7 @@ impl RouterEngine {
         self.prepared_publication_authority = None;
     }
 
-    fn authority_settlement_logical_roots(&self) -> Vec<RouteFrameVersion> {
+    pub(crate) fn authority_settlement_logical_roots(&self) -> Vec<RouteFrameVersion> {
         let current = self
             .current
             .as_ref()
@@ -12517,6 +15535,11 @@ impl RouterEngine {
                 .pending_back_target_permanent_cleanup
                 .as_ref()
                 .map(|_| "cleanup"),
+            pending_post_commit_terminal: self
+                .pending_post_commit_terminal
+                .as_ref()
+                .map(|_| "prepared"),
+            pending_post_commit_settlement_trace: self.pending_post_commit_settlement_trace.clone(),
             action: self.action.as_ref().map(ActionSnapshot::from),
             issued_view_tasks: self.issued_view_tasks.clone(),
             mount: self.mount.snapshot(),
@@ -13129,6 +16152,366 @@ fn mount_failure(rejection: MountRejectionKind) -> (PendingFailureKind, Navigati
             ),
         ),
     }
+}
+
+fn committed_history_digest(entries: &[RouteLocation], cursor: Option<usize>) -> u64 {
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    digest = digest_u64(digest, entries.len() as u64);
+    digest = digest_u64(digest, cursor.map_or(u64::MAX, |cursor| cursor as u64));
+    for entry in entries {
+        digest = digest_bytes(digest, entry.path().as_bytes());
+        digest = digest_bytes(digest, entry.search().unwrap_or("").as_bytes());
+        digest = digest_bytes(digest, entry.fragment().unwrap_or("").as_bytes());
+    }
+    digest
+}
+
+fn post_commit_host_physical_digest(receiver: &CorePostCommitCleanupReceiverProjection) -> u64 {
+    let (domain, router) = receiver.router.provenance();
+    let mut digest = 0x484f_5354_4544_4745_u64;
+    for value in [
+        domain,
+        router,
+        receiver.request.sequence(),
+        receiver.identity.host().raw(),
+        receiver.identity.host_epoch(),
+        receiver.current_top_slot.raw(),
+        receiver.committed_history.digest,
+    ] {
+        digest = digest_u64(digest, value);
+    }
+    digest
+}
+
+fn post_commit_settlement_trace_digest(trace: &CorePostCommitSettlementTraceProjection) -> u64 {
+    let mut digest = 0x5345_5454_4c45_5253_u64;
+    digest = digest_u64(
+        digest,
+        post_commit_compound_binding_digest(&trace.binding.compound),
+    );
+    digest = digest_u64(digest, trace.binding.normal_batch.binding_digest());
+    digest = digest_u64(digest, trace.binding.authority_batch.binding_digest());
+    digest = digest_u64(
+        digest,
+        match trace.cause() {
+            PostCommitAuthorityCause::HostRegistrationLost => 1,
+            PostCommitAuthorityCause::HostEntityMissing => 2,
+            PostCommitAuthorityCause::RequiredResourcesLost => 3,
+        },
+    );
+    digest = digest_u64(digest, trace.binding.prior_trace_start as u64);
+    digest = digest_u64(digest, trace.binding.prior_trace_prefix_digest);
+    digest = digest_u64(digest, trace.binding.prior_trace_digest);
+    digest = digest_u64(digest, trace.binding.settled_original.len() as u64);
+    for settled in &trace.binding.settled_original {
+        digest = post_commit_settlement_key_digest(digest, &settled.obligation);
+        digest = post_commit_settlement_key_digest(digest, &settled.receipt);
+        digest = digest_u64(digest, cleanup_disposition_digest_tag(settled.disposition));
+    }
+    digest = post_commit_settlement_key_digest(digest, &trace.binding.authority_top_dependency);
+    digest = digest_u64(digest, trace.settlement_event_start as u64);
+    digest = digest_u64(digest, trace.cursor as u64);
+    digest = digest_u64(digest, trace.expected.len() as u64);
+    for entry in &trace.expected {
+        digest = digest_u64(digest, entry.ordinal as u64);
+        digest = digest_u64(
+            digest,
+            match entry.role {
+                CorePostCommitSettlementRole::OriginalResidual => 1,
+                CorePostCommitSettlementRole::AuthorityNonTop => 2,
+                CorePostCommitSettlementRole::RetiredHostEdge => 3,
+                CorePostCommitSettlementRole::AuthorityTop => 4,
+            },
+        );
+        digest = post_commit_settlement_key_digest(digest, &entry.obligation);
+        digest = post_commit_settlement_key_digest(digest, &entry.physical_source);
+        match entry.disposition {
+            Some(disposition) => {
+                digest = digest_u64(digest, 1);
+                digest = digest_u64(digest, cleanup_disposition_digest_tag(disposition));
+            }
+            None => {
+                digest = digest_u64(digest, 0);
+            }
+        }
+    }
+    digest = digest_u64(digest, trace.recorded.len() as u64);
+    for recorded in &trace.recorded {
+        digest = post_commit_settlement_key_digest(digest, &recorded.obligation);
+        digest = post_commit_settlement_key_digest(digest, &recorded.physical_source);
+        match recorded.disposition {
+            Some(disposition) => {
+                digest = digest_u64(digest, 1);
+                digest = digest_u64(digest, cleanup_disposition_digest_tag(disposition));
+            }
+            None => digest = digest_u64(digest, 0),
+        }
+    }
+    digest
+}
+
+fn post_commit_authority_completion_digest(trace: &CorePostCommitSettlementTraceProjection) -> u64 {
+    let mut digest = 0x4155_5448_434f_4d50_u64;
+    let authority = trace.recorded.iter().filter(|entry| {
+        matches!(
+            entry.role,
+            CorePostCommitSettlementRole::AuthorityNonTop
+                | CorePostCommitSettlementRole::AuthorityTop
+        )
+    });
+    for entry in authority {
+        digest = post_commit_settlement_key_digest(digest, &entry.obligation);
+        digest = post_commit_settlement_key_digest(digest, &entry.physical_source);
+        digest = digest_u64(
+            digest,
+            entry.disposition.map_or(0, |disposition| {
+                1 + cleanup_disposition_digest_tag(disposition)
+            }),
+        );
+    }
+    digest
+}
+
+fn post_commit_authority_expected_completion_digest(
+    trace: &CorePostCommitSettlementTraceProjection,
+) -> u64 {
+    let mut digest = 0x4155_5448_434f_4d50_u64;
+    let authority = trace.expected.iter().filter(|entry| {
+        matches!(
+            entry.role,
+            CorePostCommitSettlementRole::AuthorityNonTop
+                | CorePostCommitSettlementRole::AuthorityTop
+        )
+    });
+    for entry in authority {
+        digest = post_commit_settlement_key_digest(digest, &entry.obligation);
+        digest = post_commit_settlement_key_digest(digest, &entry.physical_source);
+        digest = digest_u64(
+            digest,
+            entry.disposition.map_or(0, |disposition| {
+                1 + cleanup_disposition_digest_tag(disposition)
+            }),
+        );
+    }
+    digest
+}
+
+fn post_commit_compound_binding_digest(compound: &CorePostCommitCompoundProjection) -> u64 {
+    let mut digest = post_commit_host_physical_digest(&compound.receiver);
+    digest = digest_u64(
+        digest,
+        match compound.receiver.stage {
+            CorePostCommitCleanupStageProjection::PostCommitCleanup => 1,
+            CorePostCommitCleanupStageProjection::AuthorityAccepted => 2,
+            CorePostCommitCleanupStageProjection::AuthorityCleanup => 3,
+        },
+    );
+    digest = digest_u64(
+        digest,
+        compound.receiver.normal_batch.obligation_count as u64,
+    );
+    digest = digest_u64(digest, compound.authority_batch.obligation_count as u64);
+    digest = digest_u64(
+        digest,
+        match compound.cause {
+            PostCommitAuthorityCause::HostRegistrationLost => 1,
+            PostCommitAuthorityCause::HostEntityMissing => 2,
+            PostCommitAuthorityCause::RequiredResourcesLost => 3,
+        },
+    );
+    digest
+}
+
+fn post_commit_settlement_permit_digest(
+    trace: &CorePostCommitSettlementTraceProjection,
+    expected: &CorePostCommitSettlementExpectedProjection,
+) -> u64 {
+    let mut digest = digest_u64(0x5045_524d_4954_5252_u64, trace.digest);
+    digest = digest_u64(digest, expected.ordinal as u64);
+    digest = digest_u64(
+        digest,
+        match expected.role {
+            CorePostCommitSettlementRole::OriginalResidual => 1,
+            CorePostCommitSettlementRole::AuthorityNonTop => 2,
+            CorePostCommitSettlementRole::RetiredHostEdge => 3,
+            CorePostCommitSettlementRole::AuthorityTop => 4,
+        },
+    );
+    digest = post_commit_settlement_key_digest(digest, &expected.obligation);
+    digest = post_commit_settlement_key_digest(digest, &expected.physical_source);
+    digest = digest_u64(
+        digest,
+        expected.disposition.map_or(0, |disposition| {
+            1 + cleanup_disposition_digest_tag(disposition)
+        }),
+    );
+    digest
+}
+
+fn post_commit_settlement_key_digest(
+    mut digest: u64,
+    key: &CorePostCommitSettlementKeyProjection,
+) -> u64 {
+    digest = digest_u64(digest, key.namespace);
+    digest = digest_u64(digest, key.identity.len() as u64);
+    for value in &key.identity {
+        digest = digest_u64(digest, *value);
+    }
+    digest
+}
+
+fn navigation_trace_digest(events: &[NavigationTraceEvent]) -> u64 {
+    let mut digest = 0x4e41_5654_5241_4345_u64;
+    digest = digest_u64(digest, events.len() as u64);
+    for event in events {
+        digest = digest_u64(digest, navigation_trace_kind_digest_tag(event.kind()));
+        match event.frame() {
+            Some(frame) => {
+                digest = digest_u64(digest, 1);
+                let (domain, router) = frame.router_identity().provenance();
+                digest = digest_u64(digest, domain);
+                digest = digest_u64(digest, router);
+                digest = digest_u64(digest, frame.host().raw());
+                digest = digest_u64(digest, frame.slot().raw());
+                match frame.origin() {
+                    FrameOrigin::MatchedRoute(route) => {
+                        digest = digest_u64(digest, 1);
+                        digest = digest_u64(digest, route.raw());
+                    }
+                    FrameOrigin::RouteError(route) => {
+                        digest = digest_u64(digest, 2);
+                        digest = digest_u64(digest, route.raw());
+                    }
+                    FrameOrigin::RouterFallback => {
+                        digest = digest_u64(digest, 3);
+                    }
+                }
+                digest = digest_u64(digest, frame.frame().raw());
+                digest = digest_u64(digest, frame.generation().raw());
+            }
+            None => {
+                digest = digest_u64(digest, 0);
+            }
+        }
+        match event.outlet() {
+            Some(outlet) => {
+                digest = digest_u64(digest, 1);
+                digest = digest_u64(digest, outlet.as_str().len() as u64);
+                digest = digest_bytes(digest, outlet.as_str().as_bytes());
+            }
+            None => {
+                digest = digest_u64(digest, 0);
+            }
+        }
+        match event.slot() {
+            Some(slot) => {
+                digest = digest_u64(digest, 1);
+                digest = digest_u64(digest, slot.raw());
+            }
+            None => {
+                digest = digest_u64(digest, 0);
+            }
+        }
+        match event.phase() {
+            Some(phase) => {
+                digest = digest_u64(digest, 1);
+                let (tag, index) = navigation_phase_digest_parts(phase);
+                digest = digest_u64(digest, tag);
+                digest = digest_u64(digest, index);
+            }
+            None => {
+                digest = digest_u64(digest, 0);
+            }
+        }
+        match event.mount_rejection() {
+            Some(rejection) => {
+                digest = digest_u64(digest, 1);
+                digest = digest_u64(digest, mount_rejection_digest_tag(rejection));
+            }
+            None => {
+                digest = digest_u64(digest, 0);
+            }
+        }
+        match event.cleanup_disposition() {
+            Some(disposition) => {
+                digest = digest_u64(digest, 1);
+                digest = digest_u64(digest, cleanup_disposition_digest_tag(disposition));
+            }
+            None => {
+                digest = digest_u64(digest, 0);
+            }
+        }
+    }
+    digest
+}
+
+fn navigation_trace_kind_digest_tag(kind: NavigationTraceEventKind) -> u64 {
+    match kind {
+        NavigationTraceEventKind::FrameTaskIssued => 1,
+        NavigationTraceEventKind::RequestPhaseChanged => 2,
+        NavigationTraceEventKind::HistoryIntentRejected => 3,
+        NavigationTraceEventKind::MountRequested => 4,
+        NavigationTraceEventKind::MountResolved => 5,
+        NavigationTraceEventKind::MountGranted => 6,
+        NavigationTraceEventKind::MountRejected => 7,
+        NavigationTraceEventKind::MountRejectedAfterMutation => 8,
+        NavigationTraceEventKind::ShellPrepared => 9,
+        NavigationTraceEventKind::ViewApplied => 10,
+        NavigationTraceEventKind::OutletRegistered => 11,
+        NavigationTraceEventKind::FrameIsolated => 12,
+        NavigationTraceEventKind::FrameActivated => 13,
+        NavigationTraceEventKind::CommitPublished => 14,
+        NavigationTraceEventKind::CleanupSettled => 15,
+        NavigationTraceEventKind::RequestTerminal => 16,
+    }
+}
+
+fn navigation_phase_digest_parts(phase: &NavigationPhase) -> (u64, u64) {
+    match phase {
+        NavigationPhase::Matching => (1, 0),
+        NavigationPhase::Planning => (2, 0),
+        NavigationPhase::ResolvingMount => (3, 0),
+        NavigationPhase::PreparingFrame(index) => (4, *index as u64),
+        NavigationPhase::ApplyingFrame(index) => (5, *index as u64),
+        NavigationPhase::RegisteringOutlets(index) => (6, *index as u64),
+        NavigationPhase::ReadyToSwitch => (7, 0),
+        NavigationPhase::Recovering => (8, 0),
+        NavigationPhase::CleanupPending => (9, 0),
+        NavigationPhase::PostCommitCleanup => (10, 0),
+    }
+}
+
+fn mount_rejection_digest_tag(rejection: MountRejectionKind) -> u64 {
+    match rejection {
+        MountRejectionKind::MissingOutlet => 1,
+        MountRejectionKind::InvalidOutlet => 2,
+        MountRejectionKind::ParentAuthorityLost => 3,
+        MountRejectionKind::RejectedAfterMutation => 4,
+    }
+}
+
+fn cleanup_disposition_digest_tag(disposition: crate::trace::CleanupDisposition) -> u64 {
+    match disposition {
+        crate::trace::CleanupDisposition::Removed => 1,
+        crate::trace::CleanupDisposition::RemovedDetached => 2,
+        crate::trace::CleanupDisposition::AlreadyAbsent => 3,
+        crate::trace::CleanupDisposition::RejectedProtected => 4,
+        crate::trace::CleanupDisposition::QuarantinedForeignDescendant => 5,
+        crate::trace::CleanupDisposition::QuarantinedProtectedParent => 6,
+        crate::trace::CleanupDisposition::QuarantinedForeignComponent => 7,
+    }
+}
+
+fn digest_u64(digest: u64, value: u64) -> u64 {
+    digest_bytes(digest, &value.to_le_bytes())
+}
+
+fn digest_bytes(mut digest: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        digest ^= u64::from(*byte);
+        digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    digest
 }
 
 fn is_terminal(status: &RequestStatus) -> bool {
@@ -13841,6 +17224,8 @@ pub(crate) struct EngineSnapshot {
     prepared_publication_authority: Option<PreparedPublicationAuthoritySnapshot>,
     pending_back_no_target_authority: Option<&'static str>,
     pending_back_target_permanent_cleanup: Option<&'static str>,
+    pending_post_commit_terminal: Option<&'static str>,
+    pending_post_commit_settlement_trace: Option<CorePostCommitSettlementTraceProjection>,
     action: Option<ActionSnapshot>,
     issued_view_tasks: Vec<FrameTaskIdentity>,
     mount: crate::mount::MountIssuerSnapshot,
@@ -13875,13 +17260,28 @@ mod tests {
     use super::{
         ActionSnapshot, BackNoTargetSourceDriftSettlementOutcome,
         BackNoTargetSourceRefreezeOutcome, BackTargetPermanentSettlementOutcome,
-        BackTargetResumeAction, BackTargetResumeOutcome, BackTargetStart, CleanupError,
-        CommitError, CoreBackNoTargetPublicationPreparationFailureProjection,
-        CoreBackNoTargetReadyMismatchProjection, CorePreparationReceiverMismatchProjection,
-        EngineAction, FailureCleanupCompletionDisposition, FrameMountTarget, MountError,
-        NavigationCommand, PrivateRequestLookup, PushError, QueuedNavigation, QueuedReservation,
+        BackTargetResumeAction, BackTargetResumeOutcome, BackTargetStart, CleanupBatchProjection,
+        CleanupError, CommitError, CoreAuthorityCleanupCompletionFacts,
+        CoreBackNoTargetPublicationPreparationFailureProjection,
+        CoreBackNoTargetReadyMismatchProjection, CoreNormalCleanupCompletionFacts,
+        CorePostCommitAuthorityBeginPermanentEvidence, CorePostCommitAuthorityContradiction,
+        CorePostCommitAuthorityPreparationSource, CorePostCommitCleanupStageProjection,
+        CorePostCommitCompoundBatchOwner, CorePostCommitCompoundMismatchEvidence,
+        CorePostCommitPlannedCleanupProjection, CorePostCommitPlannedHostEdgeProjection,
+        CorePostCommitSettlementAttestation, CorePostCommitSettlementKeyProjection,
+        CorePostCommitSettlementPermitOutcome, CorePostCommitSettlementPlanBuilder,
+        CorePostCommitSettlementPlanDescriptor, CorePostCommitSettlementRecordOutcome,
+        CorePostCommitSettlementRole, CorePostCommitSettlementTraceMismatchKind,
+        CorePostCommitSettlementTraceProgress, CorePostCommitSettlementTraceProjection,
+        CorePreparationReceiverMismatchProjection, CorePreparedPostCommitAuthorityTransfer,
+        CoreRetiredHostEdgeCompletionFacts, EngineAction, FailureCleanupCompletionDisposition,
+        FrameMountTarget, MountError, NavigationCommand, PostCommitAuthorityAcceptanceOutcome,
+        PostCommitAuthorityBeginCoreOutcome, PostCommitAuthorityCause,
+        PostCommitAuthorityPreparationOutcome, PostCommitCompoundCompletionCoreOutcome,
+        PostCommitCompoundCompletionInputs, PostCommitCompoundCompletionPreparationOutcome,
+        PrivateRequestLookup, PushError, QueuedNavigation, QueuedReservation,
         ROUTER_DIAGNOSTIC_RETENTION, ReportError, RootTaskIdentity, RouterEngine,
-        TERMINAL_RETENTION, WorkStage, occupied_child_slots,
+        TERMINAL_RETENTION, WorkStage, navigation_trace_digest, occupied_child_slots,
     };
     use crate::admission::{AdmissionError, HostAdmissionIssuer};
     use crate::cleanup::{
@@ -13898,7 +17298,8 @@ mod tests {
         BackTargetPermanentCauseSnapshot, VerifiedBackResolutionOwnerHandoff,
     };
     use crate::ids::{
-        CleanupBatchId, ReservationCounter, RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId,
+        CleanupBatchId, NavigationRequestId, ReservationCounter, RouteFrameId, RouteGeneration,
+        RouteHostId, RouteSlotId,
     };
     use crate::location::RouteLocation;
     use crate::meta::ErrorBoundaryKey;
@@ -14698,16 +18099,35 @@ mod tests {
                     .contains("retired_host:Option<RetiredHostAuthorityProjection>"),
             "permanent begin must retain the admission projection, not a parallel Core identity type"
         );
-        let compact_engine = compact(engine);
-        let named_borrow_count = compact_engine
-            .matches("current.retired_host.as_ref().map(RetiredHostAuthority::projection)")
-            .count();
-        let closure_borrow_count = compact_engine
-            .matches("current.retired_host.as_ref().map(|authority|authority.projection())")
-            .count();
+        let current_builder = compact(braced_item(
+            engine,
+            "fn back_target_permanent_current_state_projection",
+        ));
+        let canonical_builder = compact(braced_item(
+            engine,
+            "fn back_target_permanent_canonical_relation_projections",
+        ));
+        let named_borrow_count = [&current_builder, &canonical_builder]
+            .into_iter()
+            .map(|builder| {
+                builder
+                    .matches("current.retired_host.as_ref().map(RetiredHostAuthority::projection)")
+                    .count()
+            })
+            .sum::<usize>();
+        let closure_borrow_count = [&current_builder, &canonical_builder]
+            .into_iter()
+            .map(|builder| {
+                builder
+                    .matches("current.retired_host.as_ref().map(|authority|authority.projection())")
+                    .count()
+            })
+            .sum::<usize>();
         assert!(
             named_borrow_count + closure_borrow_count >= 2
-                && !compact_engine.contains("retired_host.clone()"),
+                && [&current_builder, &canonical_builder]
+                    .into_iter()
+                    .all(|builder| !builder.contains("retired_host.clone()")),
             "both permanent projection builders must borrow retired-host authority without cloning"
         );
 
@@ -14715,10 +18135,28 @@ mod tests {
         let integration = &integration_and_tests[..integration_and_tests
             .find("mod tests {")
             .unwrap_or(integration_and_tests.len())];
-        assert!(
-            !compact(integration).contains("RetiredHostAuthority"),
-            "integration evidence must not acquire or clone retired-host authority"
-        );
+        for guarded_item in [
+            braced_item(
+                integration,
+                "enum BackTargetPermanentCleanupMismatchEvidence",
+            ),
+            braced_item(
+                integration,
+                "struct BackTargetPermanentCleanupTerminalEvidence",
+            ),
+            braced_item(integration, "enum BackTargetPermanentBeginOutcome"),
+            braced_item(
+                integration,
+                "enum BackTargetPermanentBeginPermanentEvidence",
+            ),
+            braced_item(integration, "fn begin_back_target_permanent_cleanup"),
+            braced_item(integration, "fn complete_back_target_permanent_cleanup"),
+        ] {
+            assert!(
+                !compact(guarded_item).contains("RetiredHostAuthority"),
+                "back-target permanent integration evidence must not acquire or clone retired-host authority"
+            );
+        }
     }
 
     #[test]
@@ -23104,5 +26542,1650 @@ mod tests {
             !receiver.contains("EngineAction::"),
             "the target atomic applied receiver must not infer its typed outcome by matching EngineAction"
         );
+    }
+
+    fn prepared_post_commit_authority_fixture_for_cause(
+        cause: PostCommitAuthorityCause,
+    ) -> (
+        RouterEngine,
+        HostAdmissionIssuer,
+        NavigationRequestId,
+        CleanupBatchToken,
+        CorePreparedPostCommitAuthorityTransfer,
+        CleanupBatchProjection,
+    ) {
+        let (mut engine, issuer, lease) = ready_engine_with_tree_and_authority(tree());
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let request = engine.push(RouteLocation::new("/")).unwrap();
+        let normal = publish_current(&mut engine);
+        assert!(normal.obligation_count() > 0);
+        let accepted = match engine.accept_post_commit_authority_transfer(&normal, cause) {
+            PostCommitAuthorityAcceptanceOutcome::Accepted(owner) => owner,
+            PostCommitAuthorityAcceptanceOutcome::Mismatch { .. } => {
+                panic!("the real post-commit receiver must be accepted")
+            }
+        };
+        let source = CorePostCommitAuthorityPreparationSource::new(accepted, lease);
+        let prepared = match engine.prepare_post_commit_authority_transfer(
+            source,
+            CleanupManifestSeal::new(
+                engine.active().frames().iter().rev().cloned().collect(),
+                manifest_digest(0xa0),
+                engine.active().frames().len(),
+            ),
+        ) {
+            PostCommitAuthorityPreparationOutcome::Prepared { owner, batch } => (owner, batch),
+            PostCommitAuthorityPreparationOutcome::Mismatch { .. }
+            | PostCommitAuthorityPreparationOutcome::Retryable { .. }
+            | PostCommitAuthorityPreparationOutcome::Permanent { .. } => {
+                panic!("the exact accepted source must prepare")
+            }
+        };
+        (engine, issuer, request, normal, prepared.0, prepared.1)
+    }
+
+    fn prepared_post_commit_authority_fixture() -> (
+        RouterEngine,
+        HostAdmissionIssuer,
+        NavigationRequestId,
+        CleanupBatchToken,
+        CorePreparedPostCommitAuthorityTransfer,
+        CleanupBatchProjection,
+    ) {
+        prepared_post_commit_authority_fixture_for_cause(
+            PostCommitAuthorityCause::HostEntityMissing,
+        )
+    }
+
+    fn settlement_key(namespace: u64, identity: u64) -> CorePostCommitSettlementKeyProjection {
+        CorePostCommitSettlementKeyProjection::new(namespace, vec![identity])
+    }
+
+    fn bind_exact_test_settlement_plan(
+        builder: CorePostCommitSettlementPlanBuilder,
+    ) -> super::CoreBoundPostCommitSettlementPlan {
+        let prior_trace_start = builder.current_trace.len();
+        bind_test_settlement_plan(builder, prior_trace_start, Vec::new())
+    }
+
+    fn bind_test_settlement_plan(
+        builder: CorePostCommitSettlementPlanBuilder,
+        prior_trace_start: usize,
+        settled_original: Vec<super::CorePostCommitSettledOriginalProjection>,
+    ) -> super::CoreBoundPostCommitSettlementPlan {
+        let descriptor =
+            test_settlement_plan_descriptor(&builder, prior_trace_start, settled_original);
+        builder
+            .bind(descriptor)
+            .expect("the explicit test settlement plan must bind its exact source")
+    }
+
+    fn bind_test_settlement_plan_with_authority(
+        builder: CorePostCommitSettlementPlanBuilder,
+        prior_trace_start: usize,
+        settled_original: Vec<super::CorePostCommitSettledOriginalProjection>,
+    ) -> (
+        super::CoreBoundPostCommitSettlementPlan,
+        TestPostCommitPhysicalAuthority,
+    ) {
+        let descriptor =
+            test_settlement_plan_descriptor(&builder, prior_trace_start, settled_original);
+        let physical_authority = TestPostCommitPhysicalAuthority::from_descriptor(&descriptor);
+        let plan = builder
+            .bind(descriptor)
+            .expect("the independently frozen physical source must bind the exact Core plan");
+        (plan, physical_authority)
+    }
+
+    fn test_settlement_plan_descriptor(
+        builder: &CorePostCommitSettlementPlanBuilder,
+        prior_trace_start: usize,
+        settled_original: Vec<super::CorePostCommitSettledOriginalProjection>,
+    ) -> CorePostCommitSettlementPlanDescriptor {
+        let residual_original = (settled_original.len()..builder.normal_obligation_count)
+            .map(|ordinal| {
+                CorePostCommitPlannedCleanupProjection::new(
+                    settlement_key(1, 100 + ordinal as u64),
+                    settlement_key(11, 1_000 + ordinal as u64),
+                    crate::trace::CleanupDisposition::Removed,
+                )
+            })
+            .collect();
+        let authority_non_top = (0..builder.authority_obligation_count.saturating_sub(1))
+            .map(|ordinal| {
+                CorePostCommitPlannedCleanupProjection::new(
+                    settlement_key(2, 900 - ordinal as u64),
+                    settlement_key(12, 2_000 + ordinal as u64),
+                    crate::trace::CleanupDisposition::AlreadyAbsent,
+                )
+            })
+            .collect();
+        CorePostCommitSettlementPlanDescriptor::new(
+            prior_trace_start,
+            settled_original,
+            residual_original,
+            authority_non_top,
+            CorePostCommitPlannedCleanupProjection::new(
+                settlement_key(2, 7),
+                settlement_key(12, 77),
+                crate::trace::CleanupDisposition::RemovedDetached,
+            ),
+            settlement_key(3, 41),
+            CorePostCommitPlannedHostEdgeProjection::new(
+                settlement_key(3, 41),
+                settlement_key(13, 42),
+            ),
+        )
+    }
+
+    fn active_post_commit_compound_fixture() -> (
+        RouterEngine,
+        NavigationRequestId,
+        CleanupBatchToken,
+        CleanupBatchProjection,
+        CorePostCommitCompoundBatchOwner,
+        TestPostCommitPhysicalAuthority,
+    ) {
+        let (mut engine, mut issuer, request, normal, prepared, authority_batch) =
+            prepared_post_commit_authority_fixture();
+        let installed = std::cell::RefCell::new(None);
+        let outcome = engine.begin_post_commit_authority_transfer(
+            &mut issuer,
+            prepared,
+            0xfeed_u64,
+            |physical, _, plan| {
+                let prior_trace_start = plan.current_trace.len();
+                let (plan, physical_authority) =
+                    bind_test_settlement_plan_with_authority(plan, prior_trace_start, Vec::new());
+                Ok::<_, (u64, &'static str)>(((physical, physical_authority), plan))
+            },
+            |(physical, physical_authority), batch| {
+                assert_eq!(physical, 0xfeed);
+                *installed.borrow_mut() = Some((batch, physical_authority));
+            },
+        );
+        assert!(matches!(
+            outcome,
+            PostCommitAuthorityBeginCoreOutcome::Begun
+        ));
+        let (batch, physical_authority) = installed
+            .into_inner()
+            .expect("the sole install callback receives the compound owner");
+        (
+            engine,
+            request,
+            normal,
+            authority_batch,
+            batch,
+            physical_authority,
+        )
+    }
+
+    fn exact_post_commit_completion_inputs(
+        normal: &CleanupBatchToken,
+        authority: &CleanupBatchProjection,
+        batch: &CorePostCommitCompoundBatchOwner,
+    ) -> PostCommitCompoundCompletionInputs {
+        let normal_digest = if normal.obligation_count() == 0 {
+            CleanupCompletionDigest::canonical_empty()
+        } else {
+            CleanupCompletionDigest::from_opaque(0x4c)
+        };
+        PostCommitCompoundCompletionInputs::new(
+            CleanupCompletion::attest(normal.clone(), normal_digest, normal.obligation_count()),
+            CoreNormalCleanupCompletionFacts::new(
+                CleanupBatchProjection::from_token(normal),
+                normal.manifest_digest(),
+                normal_digest,
+                normal.obligation_count(),
+            ),
+            CoreAuthorityCleanupCompletionFacts::new(
+                authority.clone(),
+                CleanupCompletionDigest::from_opaque(0xa11),
+                authority.obligation_count,
+            ),
+            CoreAuthorityCleanupCompletionFacts::new(
+                authority.clone(),
+                CleanupCompletionDigest::from_opaque(0xa11),
+                authority.obligation_count,
+            ),
+            CoreRetiredHostEdgeCompletionFacts::new(
+                batch.host_edge.expected.clone(),
+                batch.host_edge.expected_physical_digest,
+            ),
+            batch.settlement_projection(),
+        )
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct TestPostCommitPhysicalFact {
+        role: CorePostCommitSettlementRole,
+        obligation: CorePostCommitSettlementKeyProjection,
+        physical_source: CorePostCommitSettlementKeyProjection,
+        disposition: Option<crate::trace::CleanupDisposition>,
+    }
+
+    impl TestPostCommitPhysicalFact {
+        fn cleanup(
+            role: CorePostCommitSettlementRole,
+            cleanup: &CorePostCommitPlannedCleanupProjection,
+        ) -> Self {
+            Self {
+                role,
+                obligation: cleanup.obligation.clone(),
+                physical_source: cleanup.physical_source.clone(),
+                disposition: Some(cleanup.disposition),
+            }
+        }
+    }
+
+    struct TestPostCommitPhysicalAuthority {
+        source: std::rc::Rc<()>,
+        planned: Vec<TestPostCommitPhysicalFact>,
+    }
+
+    impl TestPostCommitPhysicalAuthority {
+        fn from_descriptor(descriptor: &CorePostCommitSettlementPlanDescriptor) -> Self {
+            let mut planned = descriptor
+                .residual_original
+                .iter()
+                .map(|cleanup| {
+                    TestPostCommitPhysicalFact::cleanup(
+                        CorePostCommitSettlementRole::OriginalResidual,
+                        cleanup,
+                    )
+                })
+                .chain(descriptor.authority_non_top.iter().map(|cleanup| {
+                    TestPostCommitPhysicalFact::cleanup(
+                        CorePostCommitSettlementRole::AuthorityNonTop,
+                        cleanup,
+                    )
+                }))
+                .collect::<Vec<_>>();
+            planned.push(TestPostCommitPhysicalFact {
+                role: CorePostCommitSettlementRole::RetiredHostEdge,
+                obligation: descriptor.host_edge.obligation.clone(),
+                physical_source: descriptor.host_edge.physical_source.clone(),
+                disposition: None,
+            });
+            planned.push(TestPostCommitPhysicalFact::cleanup(
+                CorePostCommitSettlementRole::AuthorityTop,
+                &descriptor.authority_top,
+            ));
+            Self {
+                source: std::rc::Rc::new(()),
+                planned,
+            }
+        }
+
+        fn issue(
+            &self,
+            ordinal: usize,
+            dropped: std::rc::Rc<std::cell::Cell<usize>>,
+        ) -> FakePostCommitPhysicalProof {
+            FakePostCommitPhysicalProof {
+                source: self.source.clone(),
+                fact: self.planned[ordinal].clone(),
+                dropped,
+            }
+        }
+
+        fn issue_fact(
+            &self,
+            fact: TestPostCommitPhysicalFact,
+            dropped: std::rc::Rc<std::cell::Cell<usize>>,
+        ) -> FakePostCommitPhysicalProof {
+            FakePostCommitPhysicalProof {
+                source: self.source.clone(),
+                fact,
+                dropped,
+            }
+        }
+
+        fn foreign_equivalent(&self) -> Self {
+            Self {
+                source: std::rc::Rc::new(()),
+                planned: self.planned.clone(),
+            }
+        }
+
+        fn attest(
+            &self,
+            physical: FakePostCommitPhysicalProof,
+            permit: &super::CorePostCommitSettlementPermit,
+        ) -> Result<
+            CorePostCommitSettlementAttestation<FakePostCommitPhysicalProof>,
+            (FakePostCommitPhysicalProof, TestPostCommitPhysicalBindError),
+        > {
+            if !std::rc::Rc::ptr_eq(&self.source, &physical.source) {
+                return Err((physical, TestPostCommitPhysicalBindError::WrongSource));
+            }
+            let expected = permit.expected();
+            let exact = physical.fact.role == expected.role
+                && physical.fact.obligation == expected.obligation
+                && physical.fact.physical_source == expected.physical_source
+                && physical.fact.disposition == expected.disposition;
+            if !exact {
+                return Err((physical, TestPostCommitPhysicalBindError::WrongFact));
+            }
+            Ok(CorePostCommitSettlementAttestation::from_trusted_physical(
+                physical, permit,
+            ))
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TestPostCommitPhysicalBindError {
+        WrongSource,
+        WrongFact,
+    }
+
+    struct FakePostCommitPhysicalProof {
+        source: std::rc::Rc<()>,
+        fact: TestPostCommitPhysicalFact,
+        dropped: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Drop for FakePostCommitPhysicalProof {
+        fn drop(&mut self) {
+            self.dropped.set(self.dropped.get() + 1);
+        }
+    }
+
+    fn record_exact_post_commit_settlement_trace(
+        engine: &mut RouterEngine,
+        mut batch: CorePostCommitCompoundBatchOwner,
+        physical_authority: &TestPostCommitPhysicalAuthority,
+    ) -> (
+        CorePostCommitCompoundBatchOwner,
+        CorePostCommitSettlementTraceProjection,
+    ) {
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(0));
+        let initial_cursor = batch.settlement_projection().cursor;
+        let mut recorded = 0usize;
+        loop {
+            let trace = batch.settlement_projection();
+            let Some(expected) = trace.expected.get(trace.cursor).cloned() else {
+                assert_eq!(
+                    trace.progress(),
+                    CorePostCommitSettlementTraceProgress::Complete
+                );
+                assert_eq!(dropped.get(), recorded);
+                return (batch, trace);
+            };
+            let attempt = match engine.prepare_next_post_commit_settlement(batch) {
+                CorePostCommitSettlementPermitOutcome::Prepared(attempt) => attempt,
+                CorePostCommitSettlementPermitOutcome::Mismatch { .. } => {
+                    panic!("the exact linear owner must issue its next private permit")
+                }
+            };
+            let proof = physical_authority.issue(expected.ordinal, dropped.clone());
+            batch = match engine.record_next_post_commit_settlement(
+                attempt,
+                proof,
+                |proof, permit| physical_authority.attest(proof, permit),
+            ) {
+                CorePostCommitSettlementRecordOutcome::Recorded { owner, trace } => {
+                    recorded += 1;
+                    assert_eq!(trace.cursor, initial_cursor + recorded);
+                    owner
+                }
+                CorePostCommitSettlementRecordOutcome::Mismatch { .. }
+                | CorePostCommitSettlementRecordOutcome::BindingMismatch { .. }
+                | CorePostCommitSettlementRecordOutcome::AttestationMismatch { .. } => {
+                    panic!(
+                        "each independently source-bound non-Clone proof must attest the Core permit"
+                    )
+                }
+            };
+        }
+    }
+
+    #[test]
+    fn post_commit_authority_transfer_receiver_mismatch_returns_whole_owner_and_calls_zero() {
+        let (mut engine, mut issuer, _request, _normal, owner, batch) =
+            prepared_post_commit_authority_fixture();
+        let lease = owner.host.retirement_projection();
+        let owner_batch = owner.authority_batch.projection();
+        engine
+            .current
+            .as_mut()
+            .expect("the accepted receiver remains current")
+            .identity
+            .branch_index += 1;
+        let bind_calls = std::cell::Cell::new(0usize);
+        let install_calls = std::cell::Cell::new(0usize);
+
+        let outcome = engine.begin_post_commit_authority_transfer(
+            &mut issuer,
+            owner,
+            7_u64,
+            |physical, observed_batch, plan| {
+                bind_calls.set(bind_calls.get() + 1);
+                assert_eq!(observed_batch, &batch);
+                Ok::<_, (u64, ())>((physical + 1, bind_exact_test_settlement_plan(plan)))
+            },
+            |_, _| install_calls.set(install_calls.get() + 1),
+        );
+
+        let PostCommitAuthorityBeginCoreOutcome::ReceiverMismatch {
+            owner,
+            bound,
+            evidence: _,
+        } = outcome
+        else {
+            panic!("post-bind receiver drift must return the whole prepared owner and Bound")
+        };
+        assert_eq!(bound, 8);
+        assert_eq!(owner.host.retirement_projection(), lease);
+        assert_eq!(owner.authority_batch.projection(), owner_batch);
+        assert_eq!(bind_calls.get(), 1);
+        assert_eq!(install_calls.get(), 0);
+    }
+
+    #[test]
+    fn post_commit_cleanup_batch_identity_exhaustion_is_permanent_and_zero_change() {
+        let (mut engine, _issuer, lease) = ready_engine_with_tree_and_authority(tree());
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        engine.push(RouteLocation::new("/")).unwrap();
+        let normal = publish_current(&mut engine);
+        let transfer = match engine.accept_post_commit_authority_transfer(
+            &normal,
+            PostCommitAuthorityCause::HostEntityMissing,
+        ) {
+            PostCommitAuthorityAcceptanceOutcome::Accepted(owner) => owner,
+            PostCommitAuthorityAcceptanceOutcome::Mismatch { .. } => {
+                panic!("the real post-commit receiver must be accepted")
+            }
+        };
+        let source = CorePostCommitAuthorityPreparationSource::new(transfer, lease);
+        let manifest = CleanupManifestSeal::new(
+            engine.active().frames().iter().rev().cloned().collect(),
+            manifest_digest(0xa1),
+            engine.active().frames().len(),
+        );
+        engine.testing_exhaust_reservation_counter(ReservationCounter::CleanupBatch);
+        let before = engine.snapshot();
+
+        let PostCommitAuthorityPreparationOutcome::Permanent { source, evidence } =
+            engine.prepare_post_commit_authority_transfer(source, manifest)
+        else {
+            panic!("monotonic cleanup-batch identity exhaustion must fail permanently")
+        };
+        assert_eq!(source.cause(), PostCommitAuthorityCause::HostEntityMissing);
+        assert_eq!(
+            evidence.contradiction(),
+            CorePostCommitAuthorityContradiction::IdentityExhausted
+        );
+        assert_eq!(engine.snapshot(), before);
+    }
+
+    #[test]
+    fn post_commit_closed_trace_is_permanent_and_calls_zero() {
+        let (mut engine, mut issuer, request, _normal, owner, _batch) =
+            prepared_post_commit_authority_fixture();
+        engine
+            .records
+            .iter_mut()
+            .find(|record| record.id() == request)
+            .expect("the current request remains retained")
+            .testing_close_trace();
+        let before = engine.snapshot();
+        let install_calls = std::cell::Cell::new(0usize);
+
+        let PostCommitAuthorityBeginCoreOutcome::Permanent {
+            owner,
+            bound,
+            evidence,
+        } = engine.begin_post_commit_authority_transfer(
+            &mut issuer,
+            owner,
+            7_u64,
+            |physical, _, plan| {
+                Ok::<_, (u64, ())>((physical + 1, bind_exact_test_settlement_plan(plan)))
+            },
+            |_, _| install_calls.set(install_calls.get() + 1),
+        )
+        else {
+            panic!("a closed trace is a permanent post-commit terminal contradiction")
+        };
+        assert_eq!(bound, 8);
+        assert_eq!(owner.cause(), PostCommitAuthorityCause::HostEntityMissing);
+        assert_eq!(
+            evidence.contradiction(),
+            CorePostCommitAuthorityContradiction::TraceMismatch
+        );
+        assert_eq!(install_calls.get(), 0);
+        assert_eq!(engine.snapshot(), before);
+    }
+
+    #[test]
+    fn post_commit_host_retirement_is_last_fallible_before_callback() {
+        let (mut engine, _issuer, _request, _normal, owner, batch) =
+            prepared_post_commit_authority_fixture();
+        let mut foreign_issuer = HostAdmissionIssuer::new().unwrap();
+        let order = std::cell::RefCell::new(Vec::new());
+
+        let outcome = engine.begin_post_commit_authority_transfer(
+            &mut foreign_issuer,
+            owner,
+            "unbound",
+            |physical, observed_batch, plan| {
+                order.borrow_mut().push("bind");
+                assert_eq!(observed_batch, &batch);
+                Ok::<_, (&'static str, ())>((physical, bind_exact_test_settlement_plan(plan)))
+            },
+            |_, _| order.borrow_mut().push("install"),
+        );
+
+        assert!(matches!(
+            outcome,
+            PostCommitAuthorityBeginCoreOutcome::Permanent {
+                bound: "unbound",
+                evidence: CorePostCommitAuthorityBeginPermanentEvidence {
+                    contradiction: CorePostCommitAuthorityContradiction::RetiredHostMismatch,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(&*order.borrow(), &["bind"]);
+
+        let (mut engine, mut issuer, _request, _normal, owner, _) =
+            prepared_post_commit_authority_fixture();
+        let order = std::cell::RefCell::new(Vec::new());
+        let outcome = engine.begin_post_commit_authority_transfer(
+            &mut issuer,
+            owner,
+            (),
+            |(), _, plan| {
+                order.borrow_mut().push("bind");
+                Ok::<_, ((), ())>(((), bind_exact_test_settlement_plan(plan)))
+            },
+            |(), _| order.borrow_mut().push("install"),
+        );
+        assert!(matches!(
+            outcome,
+            PostCommitAuthorityBeginCoreOutcome::Begun
+        ));
+        assert_eq!(&*order.borrow(), &["bind", "install"]);
+    }
+
+    #[test]
+    fn post_commit_plan_rejects_cross_role_alias_and_wrong_h_top_dependency() {
+        #[derive(Clone, Copy)]
+        enum PlanDrift {
+            CrossRoleAlias,
+            WrongHostTopDependency,
+        }
+
+        for drift in [PlanDrift::CrossRoleAlias, PlanDrift::WrongHostTopDependency] {
+            let (mut engine, mut issuer, _request, _normal, owner, _) =
+                prepared_post_commit_authority_fixture();
+            let outcome = engine.begin_post_commit_authority_transfer(
+                &mut issuer,
+                owner,
+                (),
+                |unbound, _, plan| {
+                    let mut descriptor = test_settlement_plan_descriptor(
+                        &plan,
+                        plan.current_trace.len(),
+                        Vec::new(),
+                    );
+                    match drift {
+                        PlanDrift::CrossRoleAlias => {
+                            descriptor.authority_top.obligation =
+                                descriptor.residual_original[0].obligation.clone();
+                        }
+                        PlanDrift::WrongHostTopDependency => {
+                            descriptor.authority_top_dependency = settlement_key(30, 999);
+                        }
+                    }
+                    let evidence = match plan.bind(descriptor) {
+                        Err(evidence) => evidence,
+                        Ok(_) => panic!("the drifted explicit partition must fail closed"),
+                    };
+                    Err::<((), super::CoreBoundPostCommitSettlementPlan), _>((
+                        unbound,
+                        evidence.kind(),
+                    ))
+                },
+                |(), _| unreachable!("a rejected plan cannot install a compound owner"),
+            );
+            let PostCommitAuthorityBeginCoreOutcome::BindingMismatch { evidence, .. } = outcome
+            else {
+                panic!("a plan-partition contradiction must remain a bind mismatch")
+            };
+            assert_eq!(
+                evidence,
+                match drift {
+                    PlanDrift::CrossRoleAlias => {
+                        super::CorePostCommitSettlementPlanMismatchKind::DuplicateKey
+                    }
+                    PlanDrift::WrongHostTopDependency => {
+                        super::CorePostCommitSettlementPlanMismatchKind::WrongSource
+                    }
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn post_commit_plan_binds_only_exact_prior_l_tail_and_receipt_identities() {
+        let (mut engine, mut issuer, lease) = ready_engine_with_tree_and_authority(tree());
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let request = engine.push(RouteLocation::new("/")).unwrap();
+        let normal = publish_current(&mut engine);
+        assert!(normal.obligation_count() > 0);
+        RouterEngine::append_cleanup_settlement_trace_record(
+            &mut engine.records,
+            request,
+            Some(crate::trace::CleanupDisposition::AlreadyAbsent),
+        )
+        .expect("the retained request accepts an unrelated earlier cleanup event");
+        let prior_trace_start = engine.request(request).unwrap().trace().len();
+        engine
+            .observe_cleanup_receipt(&normal, crate::trace::CleanupDisposition::Removed)
+            .expect("the pre-handoff real L receiver accepts its exact receipt");
+
+        let accepted = match engine.accept_post_commit_authority_transfer(
+            &normal,
+            PostCommitAuthorityCause::HostEntityMissing,
+        ) {
+            PostCommitAuthorityAcceptanceOutcome::Accepted(owner) => owner,
+            PostCommitAuthorityAcceptanceOutcome::Mismatch { .. } => {
+                panic!("the exact post-commit receiver must be accepted")
+            }
+        };
+        let accepted_before = engine.snapshot();
+        assert_eq!(
+            engine.observe_cleanup_receipt(
+                &normal,
+                crate::trace::CleanupDisposition::RemovedDetached,
+            ),
+            Err(CleanupError::Stale)
+        );
+        assert_eq!(engine.snapshot(), accepted_before);
+        let prepared = match engine.prepare_post_commit_authority_transfer(
+            CorePostCommitAuthorityPreparationSource::new(accepted, lease),
+            CleanupManifestSeal::new(
+                engine.active().frames().iter().rev().cloned().collect(),
+                manifest_digest(0xa1),
+                engine.active().frames().len(),
+            ),
+        ) {
+            PostCommitAuthorityPreparationOutcome::Prepared { owner, .. } => owner,
+            _ => panic!("the exact accepted source must prepare"),
+        };
+        let installed = std::cell::RefCell::new(None);
+        assert!(matches!(
+            engine.begin_post_commit_authority_transfer(
+                &mut issuer,
+                prepared,
+                (),
+                |(), _, plan| {
+                    let settled_obligation = settlement_key(1, 100);
+                    let settled_receipt = settlement_key(10, 0xabc);
+                    let settled = vec![super::CorePostCommitSettledOriginalProjection::new(
+                        settled_obligation,
+                        settled_receipt,
+                        crate::trace::CleanupDisposition::Removed,
+                    )];
+                    let (plan, physical_authority) =
+                        bind_test_settlement_plan_with_authority(plan, prior_trace_start, settled);
+                    Ok::<_, ((), ())>((((), physical_authority), plan))
+                },
+                |((), physical_authority), batch| {
+                    *installed.borrow_mut() = Some((batch, physical_authority));
+                },
+            ),
+            PostCommitAuthorityBeginCoreOutcome::Begun
+        ));
+        let (batch, physical_authority) = installed.into_inner().unwrap();
+        let trace = batch.settlement_projection();
+        assert_eq!(trace.binding.prior_trace_start, prior_trace_start);
+        assert_eq!(trace.binding.settled_original.len(), 1);
+        assert_eq!(
+            trace.binding.settled_original[0].receipt.identity(),
+            &[0xabc]
+        );
+        assert_eq!(
+            trace
+                .expected
+                .iter()
+                .filter(|entry| entry.role == CorePostCommitSettlementRole::OriginalResidual)
+                .count(),
+            normal.obligation_count() - 1
+        );
+        assert!(trace.expected.iter().all(|entry| {
+            entry.obligation() != &settlement_key(1, 100)
+                && entry.physical_source() != &settlement_key(10, 0xabc)
+        }));
+        let trace_len_before = engine.request(request).unwrap().trace().len();
+        let disposition_count_before = engine
+            .request(request)
+            .unwrap()
+            .trace()
+            .iter()
+            .filter(|event| event.cleanup_disposition().is_some())
+            .count();
+        assert_eq!(
+            disposition_count_before, 2,
+            "the unrelated event and exact settled L receipt remain distinct from the new trace"
+        );
+        let expected_new_events = trace.expected.len();
+        let expected_new_receipts = trace
+            .expected
+            .iter()
+            .filter(|entry| entry.disposition().is_some())
+            .count();
+        let (_batch, complete) =
+            record_exact_post_commit_settlement_trace(&mut engine, batch, &physical_authority);
+        assert_eq!(
+            complete
+                .expected
+                .iter()
+                .filter(|entry| entry.role == CorePostCommitSettlementRole::OriginalResidual)
+                .count(),
+            normal.obligation_count() - 1
+        );
+        assert_eq!(complete.recorded.len(), expected_new_events);
+        assert_eq!(
+            engine.request(request).unwrap().trace().len(),
+            trace_len_before + expected_new_events,
+            "every planned L/A/H settlement appends exactly one public trace event"
+        );
+        assert_eq!(
+            engine
+                .request(request)
+                .unwrap()
+                .trace()
+                .iter()
+                .filter(|event| event.cleanup_disposition().is_some())
+                .count(),
+            disposition_count_before + expected_new_receipts,
+            "the already-settled L receipt is not recorded again by residual settlement"
+        );
+    }
+
+    #[test]
+    fn post_commit_settlement_trace_is_exact_ordered_and_zero_write_on_mismatch() {
+        let (mut engine, request, normal, authority, batch, physical_authority) =
+            active_post_commit_compound_fixture();
+        assert!(normal.obligation_count() > 0);
+        assert!(authority.obligation_count() > 0);
+
+        let inputs = exact_post_commit_completion_inputs(&normal, &authority, &batch);
+        let before_incomplete = engine.snapshot();
+        let PostCommitCompoundCompletionPreparationOutcome::Mismatch {
+            batch,
+            inputs: _,
+            evidence: CorePostCommitCompoundMismatchEvidence::SettlementTrace { observed, .. },
+        } = engine.prepare_post_commit_compound_completion(batch, inputs)
+        else {
+            panic!("completion preparation must reject an incomplete typed settlement trace")
+        };
+        assert_eq!(
+            observed
+                .expect("begin installs the initial typed trace")
+                .progress(),
+            CorePostCommitSettlementTraceProgress::OriginalResidual
+        );
+        assert_eq!(engine.snapshot(), before_incomplete);
+        let first_expected = physical_authority.planned[0].clone();
+        let mut wrong_source = first_expected.clone();
+        wrong_source.physical_source = settlement_key(99, 1);
+        let mut wrong_disposition = first_expected;
+        wrong_disposition.disposition = Some(crate::trace::CleanupDisposition::AlreadyAbsent);
+        let mut attempt = match engine.prepare_next_post_commit_settlement(batch) {
+            CorePostCommitSettlementPermitOutcome::Prepared(attempt) => attempt,
+            CorePostCommitSettlementPermitOutcome::Mismatch { .. } => {
+                panic!("the live compound owner must issue the first private permit")
+            }
+        };
+        let foreign_authority = physical_authority.foreign_equivalent();
+        let before_foreign_source = engine.snapshot();
+        let foreign_dropped = std::rc::Rc::new(std::cell::Cell::new(0));
+        let foreign_proof = foreign_authority.issue(0, foreign_dropped.clone());
+        let CorePostCommitSettlementRecordOutcome::BindingMismatch {
+            attempt: returned_attempt,
+            physical,
+            bind_error: TestPostCommitPhysicalBindError::WrongSource,
+        } = engine.record_next_post_commit_settlement(attempt, foreign_proof, |proof, permit| {
+            physical_authority.attest(proof, permit)
+        })
+        else {
+            panic!("a proof issued by a foreign physical source must return whole")
+        };
+        assert_eq!(foreign_dropped.get(), 0);
+        assert_eq!(engine.snapshot(), before_foreign_source);
+        drop(physical);
+        assert_eq!(foreign_dropped.get(), 1);
+        attempt = returned_attempt;
+        for wrong_fact in [wrong_source, wrong_disposition] {
+            let before = engine.snapshot();
+            let dropped = std::rc::Rc::new(std::cell::Cell::new(0));
+            let calls = std::cell::Cell::new(0usize);
+            let proof = physical_authority.issue_fact(wrong_fact, dropped.clone());
+            let CorePostCommitSettlementRecordOutcome::BindingMismatch {
+                attempt: returned_attempt,
+                physical,
+                bind_error: TestPostCommitPhysicalBindError::WrongFact,
+            } = engine.record_next_post_commit_settlement(attempt, proof, |proof, permit| {
+                calls.set(calls.get() + 1);
+                physical_authority.attest(proof, permit)
+            })
+            else {
+                panic!("wrong physical facts must return the whole permit and proof")
+            };
+            assert_eq!(calls.get(), 1);
+            assert_eq!(dropped.get(), 0);
+            assert_eq!(engine.snapshot(), before);
+            drop(physical);
+            assert_eq!(dropped.get(), 1);
+            attempt = returned_attempt;
+        }
+        let first_ordinal = attempt.permit.expected.ordinal;
+        let mut batch = match engine.record_next_post_commit_settlement(
+            attempt,
+            physical_authority.issue(first_ordinal, std::rc::Rc::new(std::cell::Cell::new(0))),
+            |proof, permit| physical_authority.attest(proof, permit),
+        ) {
+            CorePostCommitSettlementRecordOutcome::Recorded { owner, .. } => owner,
+            _ => panic!("the exact independently frozen proof must consume the permit"),
+        };
+
+        let receiver_attempt = match engine.prepare_next_post_commit_settlement(batch) {
+            CorePostCommitSettlementPermitOutcome::Prepared(attempt) => attempt,
+            CorePostCommitSettlementPermitOutcome::Mismatch { .. } => {
+                panic!("the next exact permit must remain available")
+            }
+        };
+        let receiver_ordinal = receiver_attempt.permit.expected.ordinal;
+        engine.current.as_mut().unwrap().identity.branch_index += 1;
+        let before_receiver = engine.snapshot();
+        let receiver_dropped = std::rc::Rc::new(std::cell::Cell::new(0));
+        let receiver_proof = physical_authority.issue(receiver_ordinal, receiver_dropped.clone());
+        let receiver_calls = std::cell::Cell::new(0usize);
+        let CorePostCommitSettlementRecordOutcome::Mismatch {
+            attempt: receiver_attempt,
+            physical,
+            evidence,
+        } = engine.record_next_post_commit_settlement(
+            receiver_attempt,
+            receiver_proof,
+            |proof, permit| {
+                receiver_calls.set(receiver_calls.get() + 1);
+                physical_authority.attest(proof, permit)
+            },
+        )
+        else {
+            panic!("receiver drift must return whole owner and physical evidence")
+        };
+        assert_eq!(
+            evidence.kind(),
+            CorePostCommitSettlementTraceMismatchKind::Receiver
+        );
+        assert_eq!(receiver_calls.get(), 0);
+        assert_eq!(receiver_dropped.get(), 0);
+        assert_eq!(engine.snapshot(), before_receiver);
+        engine.current.as_mut().unwrap().identity.branch_index -= 1;
+        batch = match engine.record_next_post_commit_settlement(
+            receiver_attempt,
+            physical,
+            |proof, permit| physical_authority.attest(proof, permit),
+        ) {
+            CorePostCommitSettlementRecordOutcome::Recorded { owner, .. } => owner,
+            _ => panic!("the returned whole permit and proof must remain retryable"),
+        };
+        assert_eq!(receiver_dropped.get(), 1);
+
+        let out_of_order_attempt = match engine.prepare_next_post_commit_settlement(batch) {
+            CorePostCommitSettlementPermitOutcome::Prepared(attempt) => attempt,
+            CorePostCommitSettlementPermitOutcome::Mismatch { .. } => {
+                panic!("the next exact permit must remain available")
+            }
+        };
+        let expected_ordinal = out_of_order_attempt.permit.expected.ordinal;
+        let later_authority_ordinal = physical_authority.planned.len() - 1;
+        assert_eq!(
+            physical_authority.planned[later_authority_ordinal]
+                .obligation
+                .identity(),
+            &[7]
+        );
+        let out_of_order_ordinal = if expected_ordinal == later_authority_ordinal {
+            0
+        } else {
+            later_authority_ordinal
+        };
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(0));
+        let callback_calls = std::cell::Cell::new(0usize);
+        let before_out_of_order = engine.snapshot();
+        let proof = physical_authority.issue(out_of_order_ordinal, dropped.clone());
+        let CorePostCommitSettlementRecordOutcome::BindingMismatch {
+            attempt: out_of_order_attempt,
+            physical,
+            bind_error: TestPostCommitPhysicalBindError::WrongFact,
+        } = engine.record_next_post_commit_settlement(
+            out_of_order_attempt,
+            proof,
+            |proof, permit| {
+                callback_calls.set(callback_calls.get() + 1);
+                physical_authority.attest(proof, permit)
+            },
+        )
+        else {
+            panic!("an out-of-order typed physical proof must be returned whole")
+        };
+        assert_ne!(
+            physical.fact.obligation,
+            out_of_order_attempt.permit.expected.obligation
+        );
+        assert_eq!(callback_calls.get(), 1);
+        assert_eq!(dropped.get(), 0);
+        assert_eq!(engine.snapshot(), before_out_of_order);
+        drop(physical);
+        assert_eq!(dropped.get(), 1);
+        batch = match engine.record_next_post_commit_settlement(
+            out_of_order_attempt,
+            physical_authority.issue(expected_ordinal, std::rc::Rc::new(std::cell::Cell::new(0))),
+            |proof, permit| physical_authority.attest(proof, permit),
+        ) {
+            CorePostCommitSettlementRecordOutcome::Recorded { owner, .. } => owner,
+            _ => panic!("an out-of-order mismatch must preserve the exact permit for retry"),
+        };
+
+        let (
+            _foreign_engine,
+            _foreign_request,
+            _foreign_normal,
+            _foreign_authority,
+            foreign_batch,
+            _foreign_physical_authority,
+        ) = active_post_commit_compound_fixture();
+        let before_wrong_batch = engine.snapshot();
+        let CorePostCommitSettlementPermitOutcome::Mismatch {
+            owner: foreign_batch,
+            evidence: wrong_owner,
+        } = engine.prepare_next_post_commit_settlement(foreign_batch)
+        else {
+            panic!("a foreign whole owner must be rejected before requesting physical proof")
+        };
+        assert_eq!(
+            wrong_owner.kind(),
+            CorePostCommitSettlementTraceMismatchKind::WrongOwner
+        );
+        assert_eq!(engine.snapshot(), before_wrong_batch);
+        drop(foreign_batch);
+
+        let (batch, projection) =
+            record_exact_post_commit_settlement_trace(&mut engine, batch, &physical_authority);
+        assert_eq!(
+            projection.progress(),
+            CorePostCommitSettlementTraceProgress::Complete
+        );
+        assert_eq!(projection.cause(), batch.cause());
+        let trace = engine
+            .pending_post_commit_settlement_trace
+            .as_ref()
+            .expect("the complete typed trace remains linearly installed");
+        assert_eq!(
+            trace.expected.last().unwrap().role,
+            CorePostCommitSettlementRole::AuthorityTop
+        );
+        assert_eq!(trace.expected.last().unwrap().obligation.identity(), &[7]);
+        assert_eq!(
+            trace.expected[trace.expected.len() - 2].role,
+            CorePostCommitSettlementRole::RetiredHostEdge
+        );
+        let public_settlement_tail = engine
+            .request(request)
+            .unwrap()
+            .trace()
+            .get(trace.settlement_event_start..)
+            .unwrap();
+        let expected_public_settlement_tail = trace
+            .recorded
+            .iter()
+            .map(|entry| NavigationTraceEvent::cleanup_settled(entry.disposition))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            public_settlement_tail,
+            expected_public_settlement_tail.as_slice()
+        );
+
+        let before_terminal_replay = engine.snapshot();
+        let CorePostCommitSettlementPermitOutcome::Mismatch {
+            owner: _,
+            evidence: terminal_replay,
+        } = engine.prepare_next_post_commit_settlement(batch)
+        else {
+            panic!("the completed capability must reject replay")
+        };
+        assert_eq!(
+            terminal_replay.kind(),
+            CorePostCommitSettlementTraceMismatchKind::Replay
+        );
+        assert_eq!(engine.snapshot(), before_terminal_replay);
+    }
+
+    #[test]
+    fn post_commit_h_stage_requires_its_exact_typed_physical_proof() {
+        let (mut engine, _request, _normal, _authority, mut batch, physical_authority) =
+            active_post_commit_compound_fixture();
+        while batch.settlement_projection().progress()
+            != CorePostCommitSettlementTraceProgress::RetiredHostEdge
+        {
+            let attempt = match engine.prepare_next_post_commit_settlement(batch) {
+                CorePostCommitSettlementPermitOutcome::Prepared(attempt) => attempt,
+                CorePostCommitSettlementPermitOutcome::Mismatch { .. } => {
+                    panic!("the exact pre-H owner must issue its private permit")
+                }
+            };
+            let ordinal = attempt.permit.expected.ordinal;
+            batch = match engine.record_next_post_commit_settlement(
+                attempt,
+                physical_authority.issue(ordinal, std::rc::Rc::new(std::cell::Cell::new(0))),
+                |proof, permit| physical_authority.attest(proof, permit),
+            ) {
+                CorePostCommitSettlementRecordOutcome::Recorded { owner, .. } => owner,
+                _ => panic!("the exact pre-H typed proof must advance once"),
+            };
+        }
+        let h_attempt = match engine.prepare_next_post_commit_settlement(batch) {
+            CorePostCommitSettlementPermitOutcome::Prepared(attempt) => attempt,
+            CorePostCommitSettlementPermitOutcome::Mismatch { .. } => {
+                panic!("the exact H permit must remain available")
+            }
+        };
+        let h_expected = h_attempt.permit.expected.clone();
+        assert_eq!(
+            h_expected.role,
+            CorePostCommitSettlementRole::RetiredHostEdge
+        );
+        let before = engine.snapshot();
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(0));
+        let proof = physical_authority.issue(physical_authority.planned.len() - 1, dropped.clone());
+        let CorePostCommitSettlementRecordOutcome::BindingMismatch {
+            attempt: h_attempt,
+            physical,
+            bind_error: TestPostCommitPhysicalBindError::WrongFact,
+        } = engine.record_next_post_commit_settlement(h_attempt, proof, |proof, permit| {
+            physical_authority.attest(proof, permit)
+        })
+        else {
+            panic!("cleanup disposition cannot stand in for typed H evidence")
+        };
+        assert_eq!(engine.snapshot(), before);
+        drop(physical);
+        assert_eq!(dropped.get(), 1);
+        let batch = match engine.record_next_post_commit_settlement(
+            h_attempt,
+            physical_authority.issue(
+                h_expected.ordinal,
+                std::rc::Rc::new(std::cell::Cell::new(0)),
+            ),
+            |proof, permit| physical_authority.attest(proof, permit),
+        ) {
+            CorePostCommitSettlementRecordOutcome::Recorded { owner, .. } => owner,
+            _ => panic!("only the exact source-bound H proof may advance the permit"),
+        };
+        let (_batch, complete) =
+            record_exact_post_commit_settlement_trace(&mut engine, batch, &physical_authority);
+        assert_eq!(
+            complete.progress(),
+            CorePostCommitSettlementTraceProgress::Complete
+        );
+    }
+
+    #[test]
+    fn post_commit_authority_cause_survives_compound_terminal_and_diagnostic() {
+        let causes = [
+            PostCommitAuthorityCause::HostRegistrationLost,
+            PostCommitAuthorityCause::HostEntityMissing,
+            PostCommitAuthorityCause::RequiredResourcesLost,
+        ];
+        let mut terminal_causes = Vec::new();
+        let mut diagnostic_causes = Vec::new();
+
+        for cause in causes.iter().copied() {
+            let (mut engine, mut issuer, request, normal, prepared, authority) =
+                prepared_post_commit_authority_fixture_for_cause(cause);
+            assert_eq!(prepared.transfer.cause(), cause);
+            let installed = std::cell::RefCell::new(None);
+            assert!(matches!(
+                engine.begin_post_commit_authority_transfer(
+                    &mut issuer,
+                    prepared,
+                    (),
+                    |(), _, plan| {
+                        let prior_trace_start = plan.current_trace.len();
+                        let (plan, physical_authority) = bind_test_settlement_plan_with_authority(
+                            plan,
+                            prior_trace_start,
+                            Vec::new(),
+                        );
+                        Ok::<_, ((), ())>((((), physical_authority), plan))
+                    },
+                    |((), physical_authority), batch| {
+                        *installed.borrow_mut() = Some((batch, physical_authority));
+                    },
+                ),
+                PostCommitAuthorityBeginCoreOutcome::Begun
+            ));
+            let (batch, physical_authority) = installed.into_inner().unwrap();
+            assert_eq!(batch.cause(), cause);
+            assert_eq!(batch.host_edge.expected.cause(), cause);
+            let (batch, trace) =
+                record_exact_post_commit_settlement_trace(&mut engine, batch, &physical_authority);
+            assert_eq!(trace.cause(), cause);
+            let inputs = exact_post_commit_completion_inputs(&normal, &authority, &batch);
+            let owner = match engine.prepare_post_commit_compound_completion(batch, inputs) {
+                PostCommitCompoundCompletionPreparationOutcome::Prepared(owner) => owner,
+                PostCommitCompoundCompletionPreparationOutcome::Mismatch { .. } => {
+                    panic!("the complete exact trace must prepare for {cause:?}")
+                }
+            };
+            let PostCommitCompoundCompletionCoreOutcome::Terminal {
+                terminal,
+                retired_host,
+                physical: (),
+            } = engine.complete_post_commit_authority_compound(owner, |_| ())
+            else {
+                panic!("the exact compound must terminalize for {cause:?}")
+            };
+            assert_eq!(terminal.cause(), cause);
+            assert_eq!(retired_host.cause(), cause);
+            assert_eq!(
+                terminal.trace_digest(),
+                navigation_trace_digest(engine.request(request).unwrap().trace())
+            );
+            let request_diagnostic = engine
+                .request(request)
+                .unwrap()
+                .diagnostics()
+                .iter()
+                .find(|event| {
+                    event.kind()
+                        == crate::diagnostics::DiagnosticEventKind::PostCommitCleanupAnomaly
+                })
+                .unwrap();
+            let router_diagnostic = engine
+                .router_diagnostics()
+                .iter()
+                .find(|event| {
+                    event.kind()
+                        == crate::diagnostics::DiagnosticEventKind::PostCommitCleanupAnomaly
+                })
+                .unwrap();
+            assert_eq!(request_diagnostic, router_diagnostic);
+            let diagnostic_cause = PostCommitAuthorityCause::from(
+                request_diagnostic
+                    .post_commit_cleanup_anomaly_cause()
+                    .expect("the typed severe diagnostic retains its exact cause"),
+            );
+            assert_eq!(diagnostic_cause, cause);
+            terminal_causes.push(terminal.cause());
+            diagnostic_causes.push(diagnostic_cause);
+        }
+
+        assert_eq!(terminal_causes, causes.to_vec());
+        assert_eq!(diagnostic_causes, causes.to_vec());
+    }
+
+    #[test]
+    fn navigation_trace_digest_is_content_and_order_sensitive() {
+        let published_then_recovering = [
+            NavigationTraceEvent::commit_published(),
+            NavigationTraceEvent::request_phase_changed(NavigationPhase::Recovering),
+        ];
+        let recovering_then_published = [
+            NavigationTraceEvent::request_phase_changed(NavigationPhase::Recovering),
+            NavigationTraceEvent::commit_published(),
+        ];
+        assert_eq!(
+            published_then_recovering.len(),
+            recovering_then_published.len()
+        );
+        assert_ne!(
+            navigation_trace_digest(&published_then_recovering),
+            navigation_trace_digest(&recovering_then_published)
+        );
+
+        let removed = [NavigationTraceEvent::cleanup_settled(Some(
+            crate::trace::CleanupDisposition::Removed,
+        ))];
+        let already_absent = [NavigationTraceEvent::cleanup_settled(Some(
+            crate::trace::CleanupDisposition::AlreadyAbsent,
+        ))];
+        assert_eq!(removed.len(), already_absent.len());
+        assert_ne!(
+            navigation_trace_digest(&removed),
+            navigation_trace_digest(&already_absent)
+        );
+
+        let (_engine, _request, _normal, _authority, batch, _physical_authority) =
+            active_post_commit_compound_fixture();
+        let original = batch.settlement_projection();
+        let mut different_content = original.clone();
+        different_content.expected[0].physical_source = settlement_key(88, 1234);
+        different_content.digest = super::post_commit_settlement_trace_digest(&different_content);
+        assert_eq!(original.expected.len(), different_content.expected.len());
+        assert_ne!(original.digest(), different_content.digest());
+
+        let mut different_order = original.clone();
+        different_order.expected.swap(0, 1);
+        different_order.digest = super::post_commit_settlement_trace_digest(&different_order);
+        assert_eq!(original.expected.len(), different_order.expected.len());
+        assert_ne!(original.digest(), different_order.digest());
+
+        let mut different_compound = original.clone();
+        different_compound.binding.compound.receiver.stage =
+            CorePostCommitCleanupStageProjection::AuthorityAccepted;
+        different_compound.digest = super::post_commit_settlement_trace_digest(&different_compound);
+        assert_ne!(original.digest(), different_compound.digest());
+
+        let mut different_normal = original.clone();
+        different_normal.binding.normal_batch = different_normal
+            .binding
+            .normal_batch
+            .testing_with_binding_digest(
+                different_normal.binding.normal_batch.binding_digest() ^ 1,
+            );
+        different_normal.digest = super::post_commit_settlement_trace_digest(&different_normal);
+        assert_ne!(original.digest(), different_normal.digest());
+
+        let mut different_authority = original.clone();
+        different_authority.binding.authority_batch = different_authority
+            .binding
+            .authority_batch
+            .testing_with_binding_digest(
+                different_authority.binding.authority_batch.binding_digest() ^ 1,
+            );
+        different_authority.digest =
+            super::post_commit_settlement_trace_digest(&different_authority);
+        assert_ne!(original.digest(), different_authority.digest());
+    }
+
+    #[test]
+    fn post_commit_compound_completion_preparation_returns_whole_inputs_on_mismatch() {
+        #[derive(Clone, Copy, Debug)]
+        enum Drift {
+            Normal,
+            Authority,
+            Host,
+        }
+
+        for drift in [Drift::Normal, Drift::Authority, Drift::Host] {
+            let (mut engine, _request, normal, authority, batch, physical_authority) =
+                active_post_commit_compound_fixture();
+            let (batch, _) =
+                record_exact_post_commit_settlement_trace(&mut engine, batch, &physical_authority);
+            let batch_projection = batch.projection();
+            let mut inputs = exact_post_commit_completion_inputs(&normal, &authority, &batch);
+            match drift {
+                Drift::Normal => {
+                    inputs.normal_facts.completion_digest =
+                        CleanupCompletionDigest::from_opaque(0x1_bad);
+                }
+                Drift::Authority => {
+                    inputs.authority.completion_digest =
+                        CleanupCompletionDigest::from_opaque(0xa_bad);
+                }
+                Drift::Host => {
+                    inputs.host_edge.expected.receiver.stage =
+                        CorePostCommitCleanupStageProjection::AuthorityAccepted;
+                    inputs.host_edge.physical_digest ^= 1;
+                }
+            }
+            let returned_normal_owner = inputs.normal.token().source_projection();
+            let returned_normal_completion_digest = inputs.normal.completion_digest();
+            let returned_normal_settled_count = inputs.normal.settled_count();
+            let returned_normal = inputs.normal_facts.clone();
+            let returned_authority_expected = inputs.authority_expected.clone();
+            let returned_authority = inputs.authority.clone();
+            let returned_host = inputs.host_edge.clone();
+
+            let PostCommitCompoundCompletionPreparationOutcome::Mismatch {
+                batch,
+                mut inputs,
+                evidence:
+                    CorePostCommitCompoundMismatchEvidence::CompletionFacts { expected, observed },
+            } = engine.prepare_post_commit_compound_completion(batch, inputs)
+            else {
+                panic!("each independently drifted L/A/H row must retain the whole source")
+            };
+            assert_eq!(batch.projection(), batch_projection);
+            assert_eq!(
+                inputs.normal.token().source_projection(),
+                returned_normal_owner
+            );
+            assert_eq!(
+                inputs.normal.completion_digest(),
+                returned_normal_completion_digest
+            );
+            assert_eq!(inputs.normal.settled_count(), returned_normal_settled_count);
+            assert_eq!(inputs.normal_facts, returned_normal);
+            assert_eq!(inputs.authority_expected, returned_authority_expected);
+            assert_eq!(inputs.authority, returned_authority);
+            assert_eq!(inputs.host_edge, returned_host);
+            match drift {
+                Drift::Normal => {
+                    assert_eq!(expected.normal.batch, observed.normal.batch);
+                    assert_eq!(
+                        expected.normal.manifest_digest,
+                        observed.normal.manifest_digest
+                    );
+                    assert_eq!(expected.normal.settled_count, observed.normal.settled_count);
+                    assert_ne!(
+                        expected.normal.completion_digest,
+                        observed.normal.completion_digest
+                    );
+                    assert_eq!(expected.authority, observed.authority);
+                    assert_eq!(expected.host_edge, observed.host_edge);
+                }
+                Drift::Authority => {
+                    assert_eq!(expected.normal, observed.normal);
+                    assert_eq!(expected.authority.batch, observed.authority.batch);
+                    assert_eq!(
+                        expected.authority.settled_count,
+                        observed.authority.settled_count
+                    );
+                    assert_ne!(
+                        expected.authority.completion_digest,
+                        observed.authority.completion_digest
+                    );
+                    assert_eq!(expected.host_edge, observed.host_edge);
+                }
+                Drift::Host => {
+                    assert_eq!(expected.normal, observed.normal);
+                    assert_eq!(expected.authority, observed.authority);
+                    assert_ne!(expected.host_edge, observed.host_edge);
+                }
+            }
+            inputs.normal_facts = expected.normal.clone();
+            inputs.authority_expected = expected.authority.clone();
+            inputs.authority = expected.authority;
+            inputs.host_edge = expected.host_edge;
+            assert!(matches!(
+                engine.prepare_post_commit_compound_completion(batch, inputs),
+                PostCommitCompoundCompletionPreparationOutcome::Prepared(_)
+            ));
+            assert_eq!(
+                engine.availability(),
+                &crate::presentation::RouterAvailability::RecoveringAuthority
+            );
+        }
+    }
+
+    #[test]
+    fn post_commit_compound_completion_requires_exact_l_a_h_and_terminals_once() {
+        let (mut engine, request, normal, authority, batch, physical_authority) =
+            active_post_commit_compound_fixture();
+        let (batch, _) =
+            record_exact_post_commit_settlement_trace(&mut engine, batch, &physical_authority);
+        let inputs = exact_post_commit_completion_inputs(&normal, &authority, &batch);
+        let owner = match engine.prepare_post_commit_compound_completion(batch, inputs) {
+            PostCommitCompoundCompletionPreparationOutcome::Prepared(owner) => owner,
+            PostCommitCompoundCompletionPreparationOutcome::Mismatch { .. } => {
+                panic!("the exact L/A/H facts must prepare the unique completion owner")
+            }
+        };
+        let calls = std::cell::Cell::new(0usize);
+        engine
+            .current
+            .as_mut()
+            .expect("the prepared compound receiver remains current")
+            .identity
+            .branch_index += 1;
+        let owner = match engine.complete_post_commit_authority_compound(owner, |_| {
+            calls.set(calls.get() + 1);
+            0xbad_u64
+        }) {
+            PostCommitCompoundCompletionCoreOutcome::Mismatch { owner, .. } => owner,
+            PostCommitCompoundCompletionCoreOutcome::Terminal { .. } => {
+                panic!("completion receiver drift must return the unique owner")
+            }
+        };
+        assert_eq!(calls.get(), 0);
+        engine
+            .current
+            .as_mut()
+            .expect("the mismatched compound receiver remains current")
+            .identity
+            .branch_index -= 1;
+        let outcome = engine.complete_post_commit_authority_compound(owner, |_| {
+            calls.set(calls.get() + 1);
+            0xcafe_u64
+        });
+        let PostCommitCompoundCompletionCoreOutcome::Terminal {
+            physical,
+            terminal,
+            retired_host: _,
+        } = outcome
+        else {
+            panic!("the exact completion owner must terminalize")
+        };
+        assert_eq!(physical, 0xcafe);
+        assert_eq!(terminal.request, request);
+        assert_eq!(calls.get(), 1);
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Succeeded
+        ));
+    }
+
+    #[test]
+    fn post_commit_old_receipt_entry_is_stale_after_handoff_without_poisoning_trace() {
+        let (mut engine, _request, normal, _authority, batch, physical_authority) =
+            active_post_commit_compound_fixture();
+        let before = engine.snapshot();
+        assert_eq!(
+            engine.observe_cleanup_receipt(&normal, crate::trace::CleanupDisposition::Removed,),
+            Err(CleanupError::Stale)
+        );
+        assert_eq!(engine.snapshot(), before);
+
+        let (batch, _) =
+            record_exact_post_commit_settlement_trace(&mut engine, batch, &physical_authority);
+        let authority = batch.authority_batch.projection();
+        let inputs = exact_post_commit_completion_inputs(&normal, &authority, &batch);
+        let owner = match engine.prepare_post_commit_compound_completion(batch, inputs) {
+            PostCommitCompoundCompletionPreparationOutcome::Prepared(owner) => owner,
+            PostCommitCompoundCompletionPreparationOutcome::Mismatch { .. } => {
+                panic!("the stale legacy receipt must not poison the linear trace")
+            }
+        };
+        assert!(matches!(
+            engine.complete_post_commit_authority_compound(owner, |_| ()),
+            PostCommitCompoundCompletionCoreOutcome::Terminal { .. }
+        ));
+    }
+
+    #[test]
+    fn post_commit_completion_refreezes_full_trace_source_before_physical_callback() {
+        let (mut engine, request, normal, authority, batch, physical_authority) =
+            active_post_commit_compound_fixture();
+        let (batch, _) =
+            record_exact_post_commit_settlement_trace(&mut engine, batch, &physical_authority);
+        let inputs = exact_post_commit_completion_inputs(&normal, &authority, &batch);
+        let owner = match engine.prepare_post_commit_compound_completion(batch, inputs) {
+            PostCommitCompoundCompletionPreparationOutcome::Prepared(owner) => owner,
+            PostCommitCompoundCompletionPreparationOutcome::Mismatch { .. } => {
+                panic!("the exact full settlement source must prepare")
+            }
+        };
+        let frozen_owner_source = owner.source.clone();
+        let frozen_owner_trace = owner.batch.settlement_projection();
+        RouterEngine::append_cleanup_settlement_trace_record(
+            &mut engine.records,
+            request,
+            Some(crate::trace::CleanupDisposition::AlreadyAbsent),
+        )
+        .expect("the test models post-prepare live trace drift through the real trace writer");
+        let live_trace = engine.request(request).unwrap().trace().to_vec();
+        let live_capability = engine.pending_post_commit_settlement_trace.clone();
+        let calls = std::cell::Cell::new(0usize);
+        let PostCommitCompoundCompletionCoreOutcome::Mismatch {
+            owner,
+            evidence: CorePostCommitCompoundMismatchEvidence::Source { expected, observed },
+        } = engine.complete_post_commit_authority_compound(owner, |_| {
+            calls.set(calls.get() + 1);
+        })
+        else {
+            panic!("post-prepare live trace drift must fail as typed Source mismatch")
+        };
+        assert_eq!(calls.get(), 0);
+        assert_eq!(expected, frozen_owner_source);
+        assert_ne!(expected, observed);
+        assert_eq!(owner.source, frozen_owner_source);
+        assert_eq!(owner.batch.settlement_projection(), frozen_owner_trace);
+        assert_eq!(engine.pending_post_commit_settlement_trace, live_capability);
+        assert_eq!(engine.request(request).unwrap().trace(), live_trace);
+    }
+
+    #[test]
+    fn post_commit_host_loss_terminal_keeps_committed_history_and_succeeded_request() {
+        let (mut engine, mut issuer, request, normal, prepared, authority) =
+            prepared_post_commit_authority_fixture();
+        let history = engine.history_snapshot();
+        let queued = engine
+            .push(RouteLocation::new("/items/2"))
+            .expect("work submitted during post-commit cleanup must remain queued");
+        let installed = std::cell::RefCell::new(None);
+        assert!(matches!(
+            engine.begin_post_commit_authority_transfer(
+                &mut issuer,
+                prepared,
+                (),
+                |(), _, plan| {
+                    let prior_trace_start = plan.current_trace.len();
+                    let (plan, physical_authority) = bind_test_settlement_plan_with_authority(
+                        plan,
+                        prior_trace_start,
+                        Vec::new(),
+                    );
+                    Ok::<_, ((), ())>((((), physical_authority), plan))
+                },
+                |((), physical_authority), batch| {
+                    *installed.borrow_mut() = Some((batch, physical_authority));
+                },
+            ),
+            PostCommitAuthorityBeginCoreOutcome::Begun
+        ));
+        let (batch, physical_authority) = installed
+            .into_inner()
+            .expect("the exact compound owner must be installed once");
+        let expected_tombstones = vec![
+            normal.source_projection(),
+            batch.authority_batch.source_projection(),
+        ];
+        let (batch, _) =
+            record_exact_post_commit_settlement_trace(&mut engine, batch, &physical_authority);
+        let inputs = exact_post_commit_completion_inputs(&normal, &authority, &batch);
+        let owner = match engine.prepare_post_commit_compound_completion(batch, inputs) {
+            PostCommitCompoundCompletionPreparationOutcome::Prepared(owner) => owner,
+            PostCommitCompoundCompletionPreparationOutcome::Mismatch { .. } => {
+                panic!("the exact completion facts must prepare")
+            }
+        };
+        let outcome = engine.complete_post_commit_authority_compound(owner, |_| ());
+        assert!(matches!(
+            outcome,
+            PostCommitCompoundCompletionCoreOutcome::Terminal { .. }
+        ));
+        assert!(engine.pending_post_commit_terminal.is_none());
+        assert!(engine.pending_post_commit_settlement_trace.is_none());
+
+        assert_eq!(engine.history_snapshot(), history);
+        assert_eq!(
+            engine.request(request).unwrap().status(),
+            &RequestStatus::Succeeded
+        );
+        assert!(matches!(
+            engine.request(queued).unwrap().status(),
+            RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::HostLost
+        ));
+        assert_eq!(engine.active().kind(), ActivePresentationKind::None);
+        assert_eq!(
+            engine.availability(),
+            &crate::presentation::RouterAvailability::Unavailable(
+                crate::presentation::RouterUnavailableReason::HostLost
+            )
+        );
+        let diagnostics = engine.request(request).unwrap().diagnostics();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|event| event.kind()
+                    == crate::diagnostics::DiagnosticEventKind::PostCommitCleanupAnomaly)
+                .count(),
+            1
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .find(|event| event.kind()
+                    == crate::diagnostics::DiagnosticEventKind::PostCommitCleanupAnomaly)
+                .unwrap()
+                .severity(),
+            crate::diagnostics::DiagnosticSeverity::Severe
+        );
+        let router_diagnostics = engine
+            .router_diagnostics()
+            .iter()
+            .filter(|event| {
+                event.kind() == crate::diagnostics::DiagnosticEventKind::PostCommitCleanupAnomaly
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(router_diagnostics.len(), 1);
+        assert_eq!(
+            router_diagnostics[0].severity(),
+            crate::diagnostics::DiagnosticSeverity::Severe
+        );
+        assert_eq!(
+            router_diagnostics[0],
+            diagnostics
+                .iter()
+                .find(|event| {
+                    event.kind()
+                        == crate::diagnostics::DiagnosticEventKind::PostCommitCleanupAnomaly
+                })
+                .unwrap()
+        );
+
+        let trace = engine.request(request).unwrap().trace();
+        let aggregate_cleanup = trace
+            .iter()
+            .rposition(|event| {
+                event.kind() == NavigationTraceEventKind::CleanupSettled
+                    && event.cleanup_disposition().is_none()
+            })
+            .expect("compound completion publishes its aggregate cleanup event");
+        let request_terminal = trace
+            .iter()
+            .position(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+            .expect("compound completion publishes its request terminal event");
+        assert!(aggregate_cleanup < request_terminal);
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                .count(),
+            1
+        );
+
+        let exact_tombstones = engine
+            .completed_cleanup
+            .iter()
+            .filter(|tombstone| tombstone.request == request)
+            .map(|tombstone| tombstone.token.source_projection())
+            .collect::<Vec<_>>();
+        assert_eq!(exact_tombstones, expected_tombstones);
     }
 }

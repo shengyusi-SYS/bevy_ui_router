@@ -118,6 +118,29 @@ pub(crate) struct CleanupBatchToken {
     binding: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CleanupBatchSourceProjection {
+    identity: RootTaskIdentity,
+    batch: CleanupBatchId,
+    logical_roots_binding: u64,
+    manifest_digest: CleanupManifestDigest,
+    obligation_count: usize,
+    binding: u64,
+}
+
+impl CleanupBatchSourceProjection {
+    pub(crate) const fn binding_digest(&self) -> u64 {
+        self.binding
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_with_binding_digest(&self, binding: u64) -> Self {
+        let mut projection = self.clone();
+        projection.binding = binding;
+        projection
+    }
+}
+
 impl CleanupBatchToken {
     pub(crate) fn sealed(
         identity: RootTaskIdentity,
@@ -158,6 +181,17 @@ impl CleanupBatchToken {
 
     pub(crate) const fn obligation_count(&self) -> usize {
         self.obligation_count
+    }
+
+    pub(crate) fn source_projection(&self) -> CleanupBatchSourceProjection {
+        CleanupBatchSourceProjection {
+            identity: self.identity.clone(),
+            batch: self.batch,
+            logical_roots_binding: self.logical_roots_binding,
+            manifest_digest: self.manifest_digest,
+            obligation_count: self.obligation_count,
+            binding: self.binding,
+        }
     }
 
     fn has_valid_binding(&self) -> bool {
@@ -244,6 +278,14 @@ impl CleanupCompletion {
 
     pub(crate) const fn token(&self) -> &CleanupBatchToken {
         &self.token
+    }
+
+    pub(crate) const fn completion_digest(&self) -> CleanupCompletionDigest {
+        self.completion_digest
+    }
+
+    pub(crate) const fn settled_count(&self) -> usize {
+        self.settled_count
     }
 
     pub(crate) fn is_well_formed(&self) -> bool {
