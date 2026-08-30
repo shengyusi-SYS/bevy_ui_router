@@ -183,7 +183,7 @@ impl BackCapacityIssuer {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_domain_for_test(&mut self, domain: u64) {
+    pub(super) fn set_domain_for_test(&mut self, domain: u64) {
         self.domain = PreparationCapacityDomain(domain);
     }
 
