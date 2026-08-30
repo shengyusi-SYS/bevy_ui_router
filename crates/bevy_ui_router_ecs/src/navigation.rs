@@ -16056,7 +16056,23 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
 }
 
 mod authority_isolation;
-use authority_isolation::*;
+#[cfg(test)]
+use authority_isolation::{
+    AuthorityIsolationComponent, AuthorityIsolationPredicate, AuthorityIsolationViolation,
+    target_authority_missing_pickable_repair_is_exact,
+};
+use authority_isolation::{
+    AuthorityIsolationContradiction, AuthorityIsolationPreparation,
+    AuthoritySettlementBeginOutcome, PreparedAuthorityIsolation, begin_authority_settlement,
+    fail_closed_failed_authority_protocol, fail_closed_failed_manifest_protocol,
+    fail_closed_failed_owner_protocol, fail_closed_failed_owner_protocol_prepared,
+    fail_closed_failure_cleanup_completion_protocol, fail_closed_normal_authority_protocol,
+    fail_closed_normal_authority_protocol_prepared, fail_closed_normal_owner_protocol,
+    fail_closed_projectionless_owner_protocol, prepare_authority_isolation_targets,
+    prepare_failed_branch_authority_isolation, prepare_failed_manifest_protocol_isolation,
+    prepare_normal_authority_isolation, prepare_post_commit_input_isolation,
+    prepare_target_preparation_permanent_isolation,
+};
 
 enum ProjectionlessFallbackPreflight {
     Ready {

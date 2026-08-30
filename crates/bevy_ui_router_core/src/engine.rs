@@ -2945,7 +2945,43 @@ impl<Physical> std::fmt::Debug for FailureCleanupCompletionCommitError<Physical>
 }
 
 mod post_commit;
-pub(crate) use post_commit::*;
+pub(crate) use post_commit::{
+    CleanupBatchProjection, CoreAuthorityCleanupCompletionFacts, CoreBoundPostCommitSettlementPlan,
+    CoreCompetingCleanupOwnerProjection, CoreCompetingCleanupOwnerStage,
+    CoreNormalCleanupCompletionFacts, CorePostCommitAuthorityBeginPermanentEvidence,
+    CorePostCommitAuthorityBeginRetryEvidence, CorePostCommitAuthorityContradiction,
+    CorePostCommitAuthorityPreparationSource, CorePostCommitAuthorityTransferOwner,
+    CorePostCommitCapacityKind, CorePostCommitCleanupObservedProjection,
+    CorePostCommitCleanupReceiverProjection, CorePostCommitCleanupStageProjection,
+    CorePostCommitCompletionSourceProjection, CorePostCommitCompoundBatchOwner,
+    CorePostCommitCompoundCompletionFactsProjection, CorePostCommitCompoundCompletionOwner,
+    CorePostCommitCompoundMismatchEvidence, CorePostCommitCompoundProjection,
+    CorePostCommitPlannedCleanupProjection, CorePostCommitPlannedHostEdgeProjection,
+    CorePostCommitReceiverMismatchProjection, CorePostCommitSettledOriginalProjection,
+    CorePostCommitSettlementAttestation, CorePostCommitSettlementAttestationMismatchEvidence,
+    CorePostCommitSettlementExpectedProjection, CorePostCommitSettlementKeyProjection,
+    CorePostCommitSettlementPermit, CorePostCommitSettlementPermitOutcome,
+    CorePostCommitSettlementPlanBuilder, CorePostCommitSettlementPlanDescriptor,
+    CorePostCommitSettlementPlanMismatchEvidence, CorePostCommitSettlementPlanMismatchKind,
+    CorePostCommitSettlementRecordOutcome, CorePostCommitSettlementRole,
+    CorePostCommitSettlementTraceCompletionExpectedProjection,
+    CorePostCommitSettlementTraceMismatchEvidence, CorePostCommitSettlementTraceMismatchKind,
+    CorePostCommitSettlementTraceProgress, CorePostCommitSettlementTraceProjection,
+    CorePostCommitTerminalProjection, CorePreparedPostCommitAuthorityTransfer,
+    CorePreparedPostCommitSettlement, CoreRetiredHostAuthorityExpectedProjection,
+    CoreRetiredHostAuthorityTerminalEvidence, CoreRetiredHostEdgeCompletionFacts,
+    CoreRetiredHostEdgeSettlementOwner, FrozenActiveBranchProjection,
+    FrozenCommittedHistoryProjection, PostCommitAuthorityAcceptanceOutcome,
+    PostCommitAuthorityBeginCoreOutcome, PostCommitAuthorityCause,
+    PostCommitAuthorityPreparationOutcome, PostCommitCompoundCompletionCoreOutcome,
+    PostCommitCompoundCompletionInputs, PostCommitCompoundCompletionPreparationOutcome,
+};
+use post_commit::{
+    CoreCompletedCleanupSourceProjection, CorePostCommitAuthorityCleanupSourceProjection,
+    CorePostCommitCurrentSourceProjection, CorePostCommitSettlementCapability,
+    CorePostCommitTerminalPreparationFailure, CorePreparedPostCommitTerminalSourceProjection,
+    PreparedPostCommitTerminalPlan,
+};
 
 #[derive(Clone, Debug)]
 enum AttemptKind {
