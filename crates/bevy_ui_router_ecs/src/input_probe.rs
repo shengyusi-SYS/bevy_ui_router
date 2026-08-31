@@ -7,7 +7,7 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RouterInputModality {
+pub enum RouterInputModality {
     Pointer,
     Keyboard,
     Gamepad,
@@ -24,7 +24,7 @@ impl RouterInputModality {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum InputProbeResult {
+pub enum InputProbeResult {
     Delivered,
     Blocked,
     Unknown,
@@ -42,7 +42,7 @@ struct InputProbeDeliveryCounter {
 }
 
 #[derive(Resource)]
-pub(crate) struct RouterInputProbes {
+pub struct RouterInputProbes {
     targets: Vec<InputProbeTarget>,
     deliveries: Vec<InputProbeDeliveryCounter>,
 }
@@ -55,7 +55,7 @@ impl RouterInputProbes {
         }
     }
 
-    pub(crate) fn dispatch(
+    pub fn dispatch(
         &mut self,
         router: RouterHandle,
         target: AuditEntityId,
@@ -93,11 +93,7 @@ impl RouterInputProbes {
         InputProbeResult::Delivered
     }
 
-    pub(crate) fn delivery_count(
-        &self,
-        target: AuditEntityId,
-        modality: RouterInputModality,
-    ) -> u64 {
+    pub fn delivery_count(&self, target: AuditEntityId, modality: RouterInputModality) -> u64 {
         self.deliveries
             .iter()
             .find(|counter| counter.target == target)

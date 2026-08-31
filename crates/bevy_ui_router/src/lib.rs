@@ -68,8 +68,10 @@ pub mod ecs {
     pub use bevy_ui_router_ecs::{
         AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
         AuthorityFrameMapping, AuthorityHostMapping, AuthorityOutletMapping, AuthoritySlotKind,
-        AuthoritySlotMapping, RouterAuthorityAuditSnapshot, RouterAuthorityAudits,
-        RouterLifecycleAuditEvent, RouterLifecycleAuditEventKind,
+        AuthoritySlotMapping, InputProbeResult, QuarantineLeaseId, QuarantineOwnerKind,
+        QuarantineOwnerSnapshot, QuarantineSnapshot, RouterAuthorityAuditSnapshot,
+        RouterAuthorityAudits, RouterInputModality, RouterInputProbes, RouterLifecycleAuditEvent,
+        RouterLifecycleAuditEventKind,
     };
 }
 
@@ -121,7 +123,9 @@ pub mod prelude {
     pub use crate::ecs::{
         AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
         AuthorityFrameMapping, AuthorityHostMapping, AuthorityOutletMapping, AuthoritySlotKind,
-        AuthoritySlotMapping, RouterAuthorityAuditSnapshot, RouterAuthorityAudits,
-        RouterLifecycleAuditEvent, RouterLifecycleAuditEventKind,
+        AuthoritySlotMapping, InputProbeResult, QuarantineLeaseId, QuarantineOwnerKind,
+        QuarantineOwnerSnapshot, QuarantineSnapshot, RouterAuthorityAuditSnapshot,
+        RouterAuthorityAudits, RouterInputModality, RouterInputProbes, RouterLifecycleAuditEvent,
+        RouterLifecycleAuditEventKind,
     };
 }

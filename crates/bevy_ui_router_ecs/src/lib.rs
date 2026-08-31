@@ -36,8 +36,9 @@ pub use app_ext::{
 pub use audit::{
     AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
     AuthorityFrameMapping, AuthorityHostMapping, AuthorityOutletMapping, AuthoritySlotKind,
-    AuthoritySlotMapping, RouterAuthorityAuditSnapshot, RouterAuthorityAudits,
-    RouterLifecycleAuditEvent, RouterLifecycleAuditEventKind,
+    AuthoritySlotMapping, QuarantineOwnerKind, QuarantineOwnerSnapshot, QuarantineSnapshot,
+    RouterAuthorityAuditSnapshot, RouterAuthorityAudits, RouterLifecycleAuditEvent,
+    RouterLifecycleAuditEventKind,
 };
 pub use content::{
     ContentColor, ContentEntity, ContentPrimitiveError, ContentPrimitiveErrorKind,
@@ -45,8 +46,12 @@ pub use content::{
 };
 pub use driver::{EcsViewDriver, EcsViewReportSession, ViewBuildReport, ViewBuildReportKind};
 pub use input::RouterInputGate;
+#[cfg(feature = "test-support")]
+pub use input_probe::{InputProbeResult, RouterInputModality, RouterInputProbes};
 pub use navigation::{NavigationEnqueueError, NavigationEnqueueErrorKind, RouterNavigation};
 pub use plugin::{BevyUiRouterPlugin, RouterInputSet, RouterScheduleSet};
+#[cfg(feature = "test-support")]
+pub use registry::QuarantineLeaseId;
 pub use snapshots::{NavigationRequestSnapshot, RequestLookup, RouterSnapshot, RouterSnapshots};
 
 pub mod prelude {
@@ -65,7 +70,9 @@ pub mod prelude {
     pub use crate::{
         AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
         AuthorityFrameMapping, AuthorityHostMapping, AuthorityOutletMapping, AuthoritySlotKind,
-        AuthoritySlotMapping, RouterAuthorityAuditSnapshot, RouterAuthorityAudits,
-        RouterLifecycleAuditEvent, RouterLifecycleAuditEventKind,
+        AuthoritySlotMapping, InputProbeResult, QuarantineLeaseId, QuarantineOwnerKind,
+        QuarantineOwnerSnapshot, QuarantineSnapshot, RouterAuthorityAuditSnapshot,
+        RouterAuthorityAudits, RouterInputModality, RouterInputProbes, RouterLifecycleAuditEvent,
+        RouterLifecycleAuditEventKind,
     };
 }

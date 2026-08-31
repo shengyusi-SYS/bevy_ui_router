@@ -312,7 +312,7 @@ Facade `Cargo.toml` 必须声明：
 | `facade_export_allowlist` | `tests/facade_export_allowlist.rs` | `[]`；内部按 cfg 分组 |
 | `facade_authority_compile_fail` | `tests/facade_authority_compile_fail.rs` | `[]`；生成 feature-specific consumer |
 
-Facade integration tests必须在facade package的`[dev-dependencies]`直接声明`bevy_app`、`bevy_ecs`、`bevy_ui`，官方crates.io `0.19.1`与default-feature约束必须和ECS crate完全相同，且不得声明替代source。ECS crate-private物理UI/picking regression必须在`bevy_ui_router_ecs [dev-dependencies]`直接声明官方`0.19.1`的`bevy_internal`，`default-features = false, features = ["bevy_window", "bevy_camera", "bevy_ui", "bevy_picking"]`，并使用其单个`DefaultPlugins`装配；不得同时手动添加`UiPickingPlugin`。ECS authority catalogue使用的`syn`也属于ECS direct dev-dependency；facade completeness使用的`syn`属于facade direct dev-dependency。Workspace`Cargo.lock`必须tracked；主workspace gates一律`--locked`。
+Facade integration tests必须在facade package的`[dev-dependencies]`直接声明`bevy_app`、`bevy_camera`、`bevy_ecs`、`bevy_input_focus`、`bevy_picking`、`bevy_ui`，官方crates.io `0.19.1`与default-feature约束必须和ECS crate完全相同，且不得声明替代source。ECS crate-private物理UI/picking regression必须在`bevy_ui_router_ecs [dev-dependencies]`直接声明官方`0.19.1`的`bevy_internal`，`default-features = false, features = ["bevy_window", "bevy_camera", "bevy_ui", "bevy_picking"]`，并使用其单个`DefaultPlugins`装配；不得同时手动添加`UiPickingPlugin`。ECS authority catalogue使用的`syn`也属于ECS direct dev-dependency；facade completeness使用的`syn`属于facade direct dev-dependency。Workspace`Cargo.lock`必须tracked；主workspace gates一律`--locked`。
 
 Harness 解析 facade manifest并断言 feature key/edge 与 Target 完全相等；旧 `view-test-support` key 必须不存在，`FakeViewRenderer*` 只能由直接依赖 owner crate 的内部测试使用，不能通过 facade feature或path恢复。
 

@@ -21,7 +21,22 @@
 7. **Authority closure**：补齐多 router、quarantine、后台 reaper、真实 input probe 和攻击性回归，关闭绕过 facade 或伪造生命周期身份的路径。
 8. **MVP gate**：统一运行 facade journeys、authority audit、ECS 私有回归、feature/consumer compile gates 与 workspace 验证，并进行最终事实性审查。
 
-当前事实：Root push、Nested push、Reconciliation、History、Recovery 与结构治理已完成。结构治理范围 `211874a..2f2cb42` 保持行为与公共 API 不变，并通过 workspace 1222/1222、doctest 28/28、authority 27/27/27 与独立复审。当前直接执行 Authority closure；`RouterInputProbes`、actual old-lease reap、完整 Journey G 与 MVP gate 仍未完成，因此当前结论不是 MVP PASS。
+当前事实：Root push、Nested push、Reconciliation、History、Recovery 与结构治理已完成。结构治理范围 `211874a..2f2cb42` 保持行为与公共 API 不变，并通过 workspace 1222/1222、doctest 28/28、authority 27/27/27 与独立复审。Authority 已形成 quarantine reaper、opaque audit 与 input probe wiring 的独立实现 checkpoint；当前 candidate 的公开 input-isolation row 已通过 focused Journey G，但 Authority 独立审查、阶段门禁与 MVP gate 仍未完成，因此当前结论不是 Authority PASS 或 MVP PASS。
+
+## Authority public contract activation
+
+本表只记录当前 Authority 公开 test-support 面的激活事实；Recovery 文档中的八条排除继续作为历史阶段事实保留。激活不等于 Authority closure 或 MVP PASS。
+
+| Canonical path | State | Evidence |
+| --- | --- | --- |
+| `bevy_ui_router::ecs::InputProbeResult` | active | public_navigation_input_isolation PASS |
+| `bevy_ui_router::ecs::QuarantineLeaseId` | active | public_navigation_input_isolation PASS |
+| `bevy_ui_router::ecs::QuarantineOwnerKind` | active | public_navigation_input_isolation PASS |
+| `bevy_ui_router::ecs::QuarantineOwnerSnapshot` | active | public_navigation_input_isolation PASS |
+| `bevy_ui_router::ecs::QuarantineSnapshot` | active | public_navigation_input_isolation PASS |
+| `bevy_ui_router::ecs::RouterInputModality` | active | public_navigation_input_isolation PASS |
+| `bevy_ui_router::ecs::RouterInputProbes` | active | public_navigation_input_isolation PASS |
+| `bevy_ui_router::ecs::RouterAuthorityAuditSnapshot::quarantines` | active | public_navigation_input_isolation PASS |
 
 ## 执行与质量门槛
 

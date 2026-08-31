@@ -20,6 +20,13 @@ pub struct StagedProfileRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityPublicActivationRow {
+    pub path: String,
+    pub state: String,
+    pub evidence: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistoryContractProfile {
     pub exclusions: Vec<TableRow>,
     pub contract_deltas: Vec<StagedProfileRow>,
@@ -188,11 +195,54 @@ pub fn parse_recovery_contract_profile(source: &str) -> HistoryContractProfile {
     profile
 }
 
+pub fn parse_authority_public_activation(source: &str) -> Vec<AuthorityPublicActivationRow> {
+    let rows = strict_profile_table(
+        source,
+        "## Authority public contract activation",
+        &["Canonical path", "State", "Evidence"],
+        "Authority",
+    )
+    .into_iter()
+    .map(|row| AuthorityPublicActivationRow {
+        path: row.0[0].clone(),
+        state: row.0[1].clone(),
+        evidence: row.0[2].clone(),
+    })
+    .collect::<Vec<_>>();
+    validate_authority_public_activation(&rows);
+    rows
+}
+
+pub fn authority_public_activation() -> Vec<AuthorityPublicActivationRow> {
+    parse_authority_public_activation(&read_workspace("docs/implementation-goals.md"))
+}
+
 pub fn stage_contract_profile() -> HistoryContractProfile {
     let history = history_contract_profile();
     let recovery = parse_recovery_contract_profile(&read_workspace(
         "docs/superpowers/specs/2026-08-12-recovery-design.md",
     ));
+    let activated = authority_public_activation()
+        .into_iter()
+        .filter(|row| row.state == "active")
+        .map(|row| row.path)
+        .collect::<BTreeSet<_>>();
+    for path in &activated {
+        assert_eq!(
+            recovery
+                .exclusions
+                .iter()
+                .filter(|row| row.0[1] == *path)
+                .count(),
+            1,
+            "Authority activation `{path}` must match exactly one inherited exclusion"
+        );
+    }
+    let exclusions = recovery
+        .exclusions
+        .into_iter()
+        .filter(|row| !activated.contains(&row.0[1]))
+        .collect::<Vec<_>>();
     let mut contract_deltas = history.contract_deltas;
     contract_deltas.extend(recovery.contract_deltas);
     let mut authority_additions = history
@@ -207,12 +257,45 @@ pub fn stage_contract_profile() -> HistoryContractProfile {
             .filter(|row| row.state == "active"),
     );
     let profile = HistoryContractProfile {
-        exclusions: recovery.exclusions,
+        exclusions,
         contract_deltas,
         authority_additions,
     };
     profile.assert_disjoint_keys();
     profile
+}
+
+fn validate_authority_public_activation(rows: &[AuthorityPublicActivationRow]) {
+    let expected_paths = BTreeSet::from([
+        "bevy_ui_router::ecs::InputProbeResult",
+        "bevy_ui_router::ecs::QuarantineLeaseId",
+        "bevy_ui_router::ecs::QuarantineOwnerKind",
+        "bevy_ui_router::ecs::QuarantineOwnerSnapshot",
+        "bevy_ui_router::ecs::QuarantineSnapshot",
+        "bevy_ui_router::ecs::RouterInputModality",
+        "bevy_ui_router::ecs::RouterInputProbes",
+        "bevy_ui_router::ecs::RouterAuthorityAuditSnapshot::quarantines",
+    ]);
+    let actual_paths = rows
+        .iter()
+        .map(|row| row.path.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual_paths, expected_paths,
+        "Authority activation paths must match the canonical Recovery exclusions"
+    );
+    assert_eq!(
+        actual_paths.len(),
+        rows.len(),
+        "Authority activation paths must be unique"
+    );
+    for row in rows {
+        assert_eq!(row.state, "active", "Authority public rows must be active");
+        assert_eq!(
+            row.evidence, "public_navigation_input_isolation PASS",
+            "Authority public rows require the canonical Journey G input evidence"
+        );
+    }
 }
 
 fn strict_history_table(input: &str, heading: &str, expected_header: &[&str]) -> Vec<TableRow> {
@@ -1129,7 +1212,7 @@ fn validate_exclusion_vocabulary(exclusions: &[TableRow]) {
         "Recovery",
     ));
     assert!(
-        actual == recovery_expected || actual == history_expected,
+        actual.is_empty() || actual == recovery_expected || actual == history_expected,
         "profile exclusion path/slice mapping drifted: {actual:?}"
     );
 }

@@ -1117,6 +1117,7 @@ dependencies = [
  "bevy_app",
  "bevy_camera",
  "bevy_ecs",
+ "bevy_input_focus",
  "bevy_picking",
  "bevy_ui",
  "bevy_ui_router_bsn",

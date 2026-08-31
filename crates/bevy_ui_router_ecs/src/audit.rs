@@ -276,7 +276,7 @@ impl RouterLifecycleAuditEvent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum QuarantineOwnerKind {
+pub enum QuarantineOwnerKind {
     HostTopSlot,
     ChildSlot,
     FrameShell,
@@ -284,7 +284,7 @@ pub(crate) enum QuarantineOwnerKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct QuarantineOwnerSnapshot {
+pub struct QuarantineOwnerSnapshot {
     lease_id: QuarantineLeaseId,
     kind: QuarantineOwnerKind,
     former_host: HostVersion,
@@ -292,25 +292,25 @@ pub(crate) struct QuarantineOwnerSnapshot {
 }
 
 impl QuarantineOwnerSnapshot {
-    pub(crate) fn lease_id(&self) -> QuarantineLeaseId {
+    pub fn lease_id(&self) -> QuarantineLeaseId {
         self.lease_id
     }
 
-    pub(crate) fn kind(&self) -> QuarantineOwnerKind {
+    pub fn kind(&self) -> QuarantineOwnerKind {
         self.kind
     }
 
-    pub(crate) fn former_host(&self) -> &HostVersion {
+    pub fn former_host(&self) -> &HostVersion {
         &self.former_host
     }
 
-    pub(crate) fn entity_count(&self) -> usize {
+    pub fn entity_count(&self) -> usize {
         self.entity_count
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct QuarantineSnapshot {
+pub struct QuarantineSnapshot {
     root: AuditEntityId,
     foreign_targets: Vec<AuditEntityId>,
     root_owner: QuarantineOwnerSnapshot,
@@ -320,35 +320,35 @@ pub(crate) struct QuarantineSnapshot {
 }
 
 impl QuarantineSnapshot {
-    pub(crate) fn former_host(&self) -> &HostVersion {
+    pub fn former_host(&self) -> &HostVersion {
         self.root_owner.former_host()
     }
 
-    pub(crate) fn root(&self) -> AuditEntityId {
+    pub fn root(&self) -> AuditEntityId {
         self.root
     }
 
-    pub(crate) fn foreign_targets(&self) -> &[AuditEntityId] {
+    pub fn foreign_targets(&self) -> &[AuditEntityId] {
         &self.foreign_targets
     }
 
-    pub(crate) fn root_owner(&self) -> &QuarantineOwnerSnapshot {
+    pub fn root_owner(&self) -> &QuarantineOwnerSnapshot {
         &self.root_owner
     }
 
-    pub(crate) fn foreign_count(&self) -> usize {
+    pub fn foreign_count(&self) -> usize {
         self.foreign_targets.len()
     }
 
-    pub(crate) fn foreign_component_count(&self) -> usize {
+    pub fn foreign_component_count(&self) -> usize {
         self.foreign_component_count
     }
 
-    pub(crate) fn protected_parent(&self) -> bool {
+    pub fn protected_parent(&self) -> bool {
         self.protected_parent
     }
 
-    pub(crate) fn inert(&self) -> bool {
+    pub fn inert(&self) -> bool {
         self.inert
     }
 }
@@ -411,7 +411,7 @@ impl RouterAuthorityAuditSnapshot {
         &self.orphan_slots
     }
 
-    pub(crate) fn quarantines(&self) -> &[QuarantineSnapshot] {
+    pub fn quarantines(&self) -> &[QuarantineSnapshot] {
         &self.quarantines
     }
 

@@ -5,10 +5,11 @@ use std::collections::BTreeSet;
 
 use facade_contract_cases::{
     assert_consumer_case_files, assert_devtools_adds_no_public_symbols, assert_facade_exports,
-    assert_golden_covers_symbols, assert_owner_source_matches_golden, facade_dir,
-    history_contract_profile, markdown_table, parse_golden, parse_recovery_contract_profile,
-    positive_consumer_cases, prepare_consumer_cases, public_facade_source_violations,
-    read_workspace, root_symbols, run_positive_consumer, stage_contract_profile,
+    assert_golden_covers_symbols, assert_owner_source_matches_golden, authority_public_activation,
+    facade_dir, history_contract_profile, markdown_table, parse_authority_public_activation,
+    parse_golden, parse_recovery_contract_profile, positive_consumer_cases, prepare_consumer_cases,
+    public_facade_source_violations, read_workspace, root_symbols, run_positive_consumer,
+    stage_contract_profile,
 };
 
 const BEVY_VERSION: &str = "0.19.1";
@@ -95,9 +96,44 @@ fn recovery_profile_has_exact_activation_machine_state() {
 }
 
 #[test]
-fn active_stage_profile_preserves_history_union_at_recovery_activation() {
+fn authority_public_activation_has_exact_machine_state() {
+    let rows = authority_public_activation();
+    assert_eq!(rows.len(), 8);
+    assert!(rows.iter().all(|row| row.state == "active"));
+    assert!(
+        rows.iter()
+            .all(|row| row.evidence == "public_navigation_input_isolation PASS")
+    );
+
+    let source = read_workspace("docs/implementation-goals.md");
+    for malformed in [
+        source.replacen(
+            "| `bevy_ui_router::ecs::InputProbeResult` | active | public_navigation_input_isolation PASS |",
+            "| `bevy_ui_router::ecs::UnknownProbe` | active | public_navigation_input_isolation PASS |",
+            1,
+        ),
+        source.replacen(
+            "| `bevy_ui_router::ecs::InputProbeResult` | active | public_navigation_input_isolation PASS |",
+            "| `bevy_ui_router::ecs::InputProbeResult` | planned | public_navigation_input_isolation PASS |",
+            1,
+        ),
+        source.replacen(
+            "| `bevy_ui_router::ecs::InputProbeResult` | active | public_navigation_input_isolation PASS |",
+            "| `bevy_ui_router::ecs::InputProbeResult` | active | private unit evidence |",
+            1,
+        ),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| parse_authority_public_activation(&malformed)).is_err(),
+            "Authority activation must reject noncanonical rows"
+        );
+    }
+}
+
+#[test]
+fn active_stage_profile_preserves_history_union_at_authority_activation() {
     let profile = stage_contract_profile();
-    assert_eq!(profile.exclusions.len(), 8);
+    assert!(profile.exclusions.is_empty());
     assert_eq!(profile.contract_deltas.len(), 6);
     assert_eq!(profile.authority_additions.len(), 4);
     assert_eq!(
@@ -453,7 +489,12 @@ fn assert_bevy_dependency(location: &str, name: &str, package: &str, dependency:
     assert!(
         matches!(
             package,
-            "bevy_app" | "bevy_camera" | "bevy_ecs" | "bevy_picking" | "bevy_ui"
+            "bevy_app"
+                | "bevy_camera"
+                | "bevy_ecs"
+                | "bevy_input_focus"
+                | "bevy_picking"
+                | "bevy_ui"
         ),
         "unexpected Bevy workspace package `{package}` in [{location}]"
     );
@@ -550,6 +591,7 @@ fn assert_facade_dependency_contract(manifest: &toml::Value, owner: &toml::Value
             "bevy_app",
             "bevy_camera",
             "bevy_ecs",
+            "bevy_input_focus",
             "bevy_picking",
             "bevy_ui",
             "syn",
@@ -562,6 +604,7 @@ fn assert_facade_dependency_contract(manifest: &toml::Value, owner: &toml::Value
         "bevy_app",
         "bevy_camera",
         "bevy_ecs",
+        "bevy_input_focus",
         "bevy_picking",
         "bevy_ui",
     ] {
@@ -846,7 +889,7 @@ fn active_stage_profile_tables_and_curated_facade_source_are_closed_world() {
     let exclusions = profile.exclusions;
     assert_eq!(modules.len(), 7);
     assert!(symbols.len() > 100);
-    assert_eq!(exclusions.len(), 8);
+    assert!(exclusions.is_empty());
 
     let source = std::fs::read_to_string(facade_dir().join("src/lib.rs")).unwrap();
     assert_eq!(

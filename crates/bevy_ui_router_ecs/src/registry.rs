@@ -993,7 +993,7 @@ impl Default for RouteEntityRegistry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct QuarantineLeaseId {
+pub struct QuarantineLeaseId {
     domain: u64,
     sequence: u64,
 }
