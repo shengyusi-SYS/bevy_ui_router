@@ -23,7 +23,10 @@ use super::{
 };
 
 #[cfg(test)]
-use super::{QuarantineFacts, RouteEntityRecord, try_component_difference};
+use super::{
+    QuarantineFacts, QuarantineRootProjection, RouteEntityRecord, quarantine_root_record,
+    try_component_difference,
+};
 
 #[cfg(test)]
 thread_local! {
@@ -109,6 +112,8 @@ fn reap_source_matches(current: &QuarantineLease, candidate: &QuarantineLease) -
     current.id == candidate.id
         && current.generation == candidate.generation
         && current.operation_sequence == candidate.operation_sequence
+        && current.root == candidate.root
+        && current.entity_count == candidate.entity_count
         && current.records == candidate.records
         && current.facts == candidate.facts
 }
@@ -1098,6 +1103,8 @@ mod tests {
         foreign_components: Vec<ComponentId>,
         protected_parent: Option<Entity>,
     ) -> QuarantineLease {
+        let record = quarantine_record(world, record);
+        let root = QuarantineRootProjection::from_record(&record).expect("record has audit root");
         QuarantineLease {
             id: QuarantineLeaseId {
                 domain: table.domain,
@@ -1105,7 +1112,9 @@ mod tests {
             },
             generation: 1,
             operation_sequence: 0,
-            records: vec![quarantine_record(world, record)],
+            root,
+            entity_count: 1,
+            records: vec![record],
             facts: QuarantineFacts::new(None, protected_parent, Vec::new(), foreign_components),
             last_attempt: None,
         }
@@ -1124,6 +1133,14 @@ mod tests {
             foreign_components,
             missing_components,
         }
+    }
+
+    fn refresh_fixture_lease_metadata(lease: &mut QuarantineLease) {
+        lease.entity_count = lease.records.len();
+        lease.root = QuarantineRootProjection::from_record(
+            quarantine_root_record(&lease.records).expect("fixture lease has a root"),
+        )
+        .expect("fixture root has an audit projection");
     }
 
     #[test]
@@ -1163,6 +1180,8 @@ mod tests {
         .apply();
         let mut table = QuarantineLeaseTable::new();
         table.next_sequence = 1;
+        let record = quarantine_record(&world, record);
+        let root = QuarantineRootProjection::from_record(&record).expect("record has audit root");
         table.leases.push(QuarantineLease {
             id: QuarantineLeaseId {
                 domain: table.domain,
@@ -1170,7 +1189,9 @@ mod tests {
             },
             generation: 1,
             operation_sequence: 0,
-            records: vec![quarantine_record(&world, record)],
+            root,
+            entity_count: 1,
+            records: vec![record],
             facts: QuarantineFacts::new(None, None, vec![foreign], Vec::new()),
             last_attempt: None,
         });
@@ -1396,6 +1417,13 @@ mod tests {
             .expect("foreign component is registered");
         let mut table = QuarantineLeaseTable::new();
         table.next_sequence = 1;
+        let records = vec![
+            quarantine_record(&world, foreign_record),
+            quarantine_record(&world, legitimate_record),
+        ];
+        let root =
+            QuarantineRootProjection::from_record(&records[0]).expect("record has audit root");
+        let entity_count = records.len();
         table.leases.push(QuarantineLease {
             id: QuarantineLeaseId {
                 domain: table.domain,
@@ -1403,10 +1431,9 @@ mod tests {
             },
             generation: 1,
             operation_sequence: 0,
-            records: vec![
-                quarantine_record(&world, foreign_record),
-                quarantine_record(&world, legitimate_record),
-            ],
+            root,
+            entity_count,
+            records,
             facts: QuarantineFacts::new(None, None, Vec::new(), vec![component]),
             last_attempt: None,
         });
@@ -1440,6 +1467,13 @@ mod tests {
             .expect("foreign component is registered");
         let mut table = QuarantineLeaseTable::new();
         table.next_sequence = 1;
+        let records = vec![
+            quarantine_record(&world, missing_record),
+            quarantine_record(&world, protected_record),
+        ];
+        let root =
+            QuarantineRootProjection::from_record(&records[0]).expect("record has audit root");
+        let entity_count = records.len();
         table.leases.push(QuarantineLease {
             id: QuarantineLeaseId {
                 domain: table.domain,
@@ -1447,10 +1481,9 @@ mod tests {
             },
             generation: 1,
             operation_sequence: 0,
-            records: vec![
-                quarantine_record(&world, missing_record),
-                quarantine_record(&world, protected_record),
-            ],
+            root,
+            entity_count,
+            records,
             facts: QuarantineFacts::with_component_drift(
                 None,
                 None,
@@ -1570,6 +1603,9 @@ mod tests {
         table.next_sequence = 1;
         let mut combined = lease(&world, &table, 1, first, first_foreign, None);
         combined.records.push(quarantine_record(&world, second));
+        refresh_fixture_lease_metadata(&mut combined);
+        let frozen_root = combined.root.clone();
+        let frozen_entity_count = combined.entity_count;
         assert!(second_foreign.is_empty());
         table.leases.push(combined);
         world.insert_resource(table);
@@ -1581,6 +1617,8 @@ mod tests {
         let table = world.resource::<QuarantineLeaseTable>();
         assert_eq!(table.leases[0].records.len(), 1);
         assert_eq!(table.leases[0].records[0].entity(), second_entity);
+        assert_eq!(table.leases[0].root, frozen_root);
+        assert_eq!(table.leases[0].entity_count, frozen_entity_count);
         assert!(matches!(
             table.leases[0].last_attempt.as_ref().map(|attempt| &attempt.outcome),
             Some(QuarantineReapOutcome::Terminal { target, .. }) if target.entity() == first_entity
@@ -1614,6 +1652,7 @@ mod tests {
         table.next_sequence = 1;
         let mut combined = lease(&world, &table, 1, retired, retired_foreign, None);
         combined.records.push(quarantine_record(&world, survivor));
+        refresh_fixture_lease_metadata(&mut combined);
         assert!(survivor_foreign.is_empty());
         table.leases.push(combined);
         world.insert_resource(table);
@@ -1734,6 +1773,8 @@ mod tests {
         .apply();
         let mut table = QuarantineLeaseTable::new();
         table.next_sequence = 1;
+        let record = quarantine_record(&world, record);
+        let root = QuarantineRootProjection::from_record(&record).expect("record has audit root");
         table.leases.push(QuarantineLease {
             id: QuarantineLeaseId {
                 domain: table.domain,
@@ -1741,7 +1782,9 @@ mod tests {
             },
             generation: 1,
             operation_sequence: 0,
-            records: vec![quarantine_record(&world, record)],
+            root,
+            entity_count: 1,
+            records: vec![record],
             facts: QuarantineFacts::new(None, None, vec![foreign], Vec::new()),
             last_attempt: None,
         });
@@ -1776,6 +1819,7 @@ mod tests {
         table.next_sequence = 1;
         let mut combined = lease(&world, &table, 1, first, first_foreign, None);
         combined.records.push(quarantine_record(&world, second));
+        refresh_fixture_lease_metadata(&mut combined);
         assert!(second_foreign.is_empty());
         table.leases.push(combined);
         world.insert_resource(table);
@@ -1842,6 +1886,7 @@ mod tests {
         let mut combined = lease(&world, &table, 1, first, first_foreign, None);
         combined.records.push(quarantine_record(&world, parent));
         combined.records.push(quarantine_record(&world, child));
+        refresh_fixture_lease_metadata(&mut combined);
         assert!(parent_foreign.is_empty());
         assert!(child_foreign.is_empty());
         table.leases.push(combined);
@@ -1974,6 +2019,7 @@ mod tests {
         let mut combined = lease(&world, &table, 1, first, first_foreign, None);
         combined.records.push(quarantine_record(&world, parent));
         combined.records.push(quarantine_record(&world, child));
+        refresh_fixture_lease_metadata(&mut combined);
         assert!(parent_foreign.is_empty());
         assert!(child_foreign.is_empty());
         table.leases.push(combined);
@@ -2069,6 +2115,7 @@ mod tests {
         let mut combined = lease(&world, &table, 1, first, first_foreign, None);
         combined.records.push(quarantine_record(&world, parent));
         combined.records.push(quarantine_record(&world, child));
+        refresh_fixture_lease_metadata(&mut combined);
         assert!(parent_foreign.is_empty());
         assert!(child_foreign.is_empty());
         table.leases.push(combined);

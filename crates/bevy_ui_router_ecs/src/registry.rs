@@ -17,8 +17,11 @@ use bevy_ecs::{
 use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
 use bevy_ui_router_core::{
-    HostVersion, frame::RouteFrameVersion, ids::RouteSlotId,
-    integration::frame_versions_share_router, slot::RouteSlotKey,
+    HostVersion,
+    frame::RouteFrameVersion,
+    ids::RouteSlotId,
+    integration::{frame_versions_share_router, host_version_matches_frame},
+    slot::RouteSlotKey,
 };
 
 use crate::cleanup::{
@@ -989,7 +992,7 @@ impl Default for RouteEntityRegistry {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct QuarantineLeaseId {
     domain: u64,
     sequence: u64,
@@ -1052,6 +1055,22 @@ impl QuarantineFacts {
             missing_components,
         }
     }
+
+    pub(crate) const fn former_app_host(&self) -> Option<Entity> {
+        self.former_app_host
+    }
+
+    pub(crate) const fn protected_parent(&self) -> Option<Entity> {
+        self.protected_parent
+    }
+
+    pub(crate) fn foreign_descendants(&self) -> &[Entity] {
+        &self.foreign_descendants
+    }
+
+    pub(crate) fn foreign_components(&self) -> &[ComponentId] {
+        &self.foreign_components
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1094,6 +1113,170 @@ impl QuarantineLeaseRecord {
 
     pub(crate) fn missing_components(&self) -> &[ComponentId] {
         &self.missing_components
+    }
+}
+
+fn quarantine_root_rank(owner: &RegistryOwner) -> Option<u8> {
+    match owner {
+        RegistryOwner::Committed(EntityOwner::HostTopSlot { .. })
+        | RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(_)) => Some(0),
+        RegistryOwner::Committed(EntityOwner::ChildSlot { .. })
+        | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { .. }) => Some(1),
+        RegistryOwner::Committed(EntityOwner::FrameShell(_)) => Some(2),
+        RegistryOwner::Committed(EntityOwner::FrameOutput { .. }) => Some(3),
+        RegistryOwner::Committed(EntityOwner::FrameContentTarget(_)) => Some(4),
+    }
+}
+
+fn quarantine_record_is_nested(
+    records: &[QuarantineLeaseRecord],
+    record: &QuarantineLeaseRecord,
+) -> bool {
+    match record.record().owner() {
+        RegistryOwner::Committed(EntityOwner::HostTopSlot { .. })
+        | RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(_)) => false,
+        RegistryOwner::Committed(EntityOwner::ChildSlot { parent, .. })
+        | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { parent, .. }) => {
+            records.iter().any(|candidate| {
+                matches!(
+                    candidate.record().owner(),
+                    RegistryOwner::Committed(EntityOwner::FrameShell(frame)) if frame == parent
+                )
+            })
+        }
+        RegistryOwner::Committed(EntityOwner::FrameShell(frame)) => {
+            records
+                .iter()
+                .any(|candidate| match candidate.record().owner() {
+                    RegistryOwner::Committed(EntityOwner::HostTopSlot { host, slot }) => {
+                        *slot == frame.slot() && host_version_matches_frame(host, frame)
+                    }
+                    RegistryOwner::Committed(EntityOwner::ChildSlot { parent, slot, .. })
+                    | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
+                        parent,
+                        slot,
+                        ..
+                    }) => *slot == frame.slot() && frame_versions_share_router(parent, frame),
+                    _ => false,
+                })
+        }
+        RegistryOwner::Committed(EntityOwner::FrameContentTarget(frame))
+        | RegistryOwner::Committed(EntityOwner::FrameOutput { frame, .. }) => {
+            records.iter().any(|candidate| {
+                matches!(
+                    candidate.record().owner(),
+                    RegistryOwner::Committed(EntityOwner::FrameShell(shell)) if shell == frame
+                )
+            })
+        }
+    }
+}
+
+fn quarantine_root_record(records: &[QuarantineLeaseRecord]) -> Option<&QuarantineLeaseRecord> {
+    records
+        .iter()
+        .filter_map(|record| {
+            quarantine_root_rank(record.record().owner())
+                .filter(|_| !quarantine_record_is_nested(records, record))
+                .map(|rank| (rank, record.entity().to_bits(), record))
+        })
+        .min_by_key(|(rank, entity, _)| (*rank, *entity))
+        .map(|(_, _, record)| record)
+        .or_else(|| {
+            records
+                .iter()
+                .filter_map(|record| {
+                    quarantine_root_rank(record.record().owner())
+                        .map(|rank| (rank, record.entity().to_bits(), record))
+                })
+                .min_by_key(|(rank, entity, _)| (*rank, *entity))
+                .map(|(_, _, record)| record)
+        })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QuarantineRootKind {
+    HostTopSlot,
+    ChildSlot,
+    FrameShell,
+    FrameOutput,
+    ResidualContentTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct QuarantineRootProjection {
+    entity: Entity,
+    kind: QuarantineRootKind,
+    committed_host: Option<HostVersion>,
+    frame: Option<RouteFrameVersion>,
+    provisional_top: bool,
+}
+
+impl QuarantineRootProjection {
+    fn from_record(record: &QuarantineLeaseRecord) -> Option<Self> {
+        let (kind, committed_host, frame, provisional_top) = match record.record().owner() {
+            RegistryOwner::Committed(EntityOwner::HostTopSlot { host, .. }) => (
+                QuarantineRootKind::HostTopSlot,
+                Some(host.clone()),
+                None,
+                false,
+            ),
+            RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(_)) => {
+                (QuarantineRootKind::HostTopSlot, None, None, true)
+            }
+            RegistryOwner::Committed(EntityOwner::ChildSlot { parent, .. })
+            | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { parent, .. }) => (
+                QuarantineRootKind::ChildSlot,
+                None,
+                Some(parent.clone()),
+                false,
+            ),
+            RegistryOwner::Committed(EntityOwner::FrameShell(frame)) => (
+                QuarantineRootKind::FrameShell,
+                None,
+                Some(frame.clone()),
+                false,
+            ),
+            RegistryOwner::Committed(EntityOwner::FrameOutput { frame, .. }) => (
+                QuarantineRootKind::FrameOutput,
+                None,
+                Some(frame.clone()),
+                false,
+            ),
+            RegistryOwner::Committed(EntityOwner::FrameContentTarget(frame)) => (
+                QuarantineRootKind::ResidualContentTarget,
+                None,
+                Some(frame.clone()),
+                false,
+            ),
+        };
+        Some(Self {
+            entity: record.entity(),
+            kind,
+            committed_host,
+            frame,
+            provisional_top,
+        })
+    }
+
+    pub(crate) const fn entity(&self) -> Entity {
+        self.entity
+    }
+
+    pub(crate) const fn kind(&self) -> QuarantineRootKind {
+        self.kind
+    }
+
+    pub(crate) const fn committed_host(&self) -> Option<&HostVersion> {
+        self.committed_host.as_ref()
+    }
+
+    pub(crate) const fn frame(&self) -> Option<&RouteFrameVersion> {
+        self.frame.as_ref()
+    }
+
+    pub(crate) const fn provisional_top(&self) -> bool {
+        self.provisional_top
     }
 }
 
@@ -1580,6 +1763,8 @@ pub(crate) struct QuarantineLease {
     id: QuarantineLeaseId,
     generation: u64,
     operation_sequence: u64,
+    root: QuarantineRootProjection,
+    entity_count: usize,
     records: Vec<QuarantineLeaseRecord>,
     facts: QuarantineFacts,
     last_attempt: Option<QuarantineReapAttempt>,
@@ -1611,6 +1796,26 @@ impl QuarantineLease {
         &self.facts.foreign_descendants
     }
 
+    pub(crate) const fn id(&self) -> QuarantineLeaseId {
+        self.id
+    }
+
+    pub(crate) const fn root(&self) -> &QuarantineRootProjection {
+        &self.root
+    }
+
+    pub(crate) const fn entity_count(&self) -> usize {
+        self.entity_count
+    }
+
+    pub(crate) fn records(&self) -> &[QuarantineLeaseRecord] {
+        &self.records
+    }
+
+    pub(crate) const fn facts(&self) -> &QuarantineFacts {
+        &self.facts
+    }
+
     #[cfg(test)]
     pub(crate) const fn id_for_test(&self) -> QuarantineLeaseId {
         self.id
@@ -1627,6 +1832,8 @@ pub(crate) enum QuarantineTransferError {
 pub(crate) struct PreparedQuarantineTransfer {
     id: QuarantineLeaseId,
     source_claims: Vec<ExactRegistryClaim>,
+    root: QuarantineRootProjection,
+    entity_count: usize,
     records: Vec<QuarantineLeaseRecord>,
     facts: QuarantineFacts,
 }
@@ -2116,6 +2323,8 @@ fn try_clone_quarantine_lease(source: &QuarantineLease) -> Result<QuarantineLeas
         id: source.id,
         generation: source.generation,
         operation_sequence: source.operation_sequence,
+        root: source.root.clone(),
+        entity_count: source.entity_count,
         records: try_clone_quarantine_records(&source.records)?,
         facts: try_clone_quarantine_facts(&source.facts)?,
         last_attempt: source
@@ -2138,6 +2347,8 @@ fn try_clone_quarantine_lease_for_reap_with_record_capacity(
         id: source.id,
         generation: source.generation,
         operation_sequence: source.operation_sequence,
+        root: source.root.clone(),
+        entity_count: source.entity_count,
         records: try_clone_quarantine_records_with_capacity(
             &source.records,
             requested_record_capacity,
@@ -2294,6 +2505,10 @@ impl QuarantineLeaseTable {
         if records.len() != claims.len() {
             return Err(QuarantineTransferError::UnknownOwnedEntity);
         }
+        let root = quarantine_root_record(&records)
+            .and_then(QuarantineRootProjection::from_record)
+            .ok_or(QuarantineTransferError::UnknownOwnedEntity)?;
+        let entity_count = records.len();
         let id = if let Some(id) = assigned_id {
             if id.domain != self.domain || id.sequence == 0 || id.sequence > self.next_sequence {
                 return Err(QuarantineTransferError::UnknownOwnedEntity);
@@ -2317,6 +2532,8 @@ impl QuarantineLeaseTable {
         Ok(PreparedQuarantineTransfer {
             id,
             source_claims: claims,
+            root,
+            entity_count,
             records,
             facts,
         })
@@ -2344,6 +2561,8 @@ impl QuarantineLeaseTable {
             id: prepared.id,
             generation: 1,
             operation_sequence: 0,
+            root: prepared.root,
+            entity_count: prepared.entity_count,
             records: prepared.records,
             facts: prepared.facts,
             last_attempt: None,
@@ -3335,6 +3554,12 @@ mod tests {
         let mut expected = vec![first, second];
         expected.sort_by_key(|entity| entity.to_bits());
         assert_eq!(table.lease(lease).unwrap().owned_entities(), expected);
+        assert_eq!(table.lease(lease).unwrap().entity_count(), 2);
+        assert_eq!(table.lease(lease).unwrap().root().entity(), expected[0]);
+        assert_eq!(
+            table.lease(lease).unwrap().root().kind(),
+            QuarantineRootKind::HostTopSlot
+        );
         assert_eq!(
             table.lease(lease).unwrap().foreign_descendants(),
             &[foreign]

@@ -1,7 +1,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bevy_camera::visibility::Visibility;
-use bevy_ecs::{entity::Entity, hierarchy::ChildOf, prelude::World, resource::Resource};
+use bevy_ecs::{
+    entity::Entity,
+    hierarchy::{ChildOf, Children},
+    prelude::World,
+    resource::Resource,
+};
 use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
 use bevy_ui_router_core::{
@@ -14,6 +19,7 @@ use bevy_ui_router_core::{
 
 use crate::{
     app_ext::RouterHandle,
+    cleanup::cleanup_claim_has_exact_authority,
     components::{ProvisionalSlotLifecycle, RouteOwnershipSeal, RouterInputBarrier},
     content::{ContentColor, ContentPrimitiveKind},
     host::validated_host_candidate_is_current,
@@ -24,12 +30,13 @@ use crate::{
         validate_realized_frame_with_child_slots,
     },
     registry::{
-        EntityLifecycle, EntityOwner, QuarantineLeaseTable, RegistryOwner, RouteEntityRegistry,
-        observed_owned_state,
+        EntityLifecycle, EntityOwner, ProvisionalOwner, QuarantineLease, QuarantineLeaseTable,
+        QuarantineRootKind, RegistryOwner, RouteEntityRegistry, observed_owned_state,
     },
 };
 
 pub use crate::registry::AuditEntityState;
+use crate::registry::QuarantineLeaseId;
 
 const OWNED_ID_FLAG: u64 = 1 << 32;
 const AUDIT_NAMESPACE_SHIFT: u32 = 33;
@@ -268,6 +275,84 @@ impl RouterLifecycleAuditEvent {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QuarantineOwnerKind {
+    HostTopSlot,
+    ChildSlot,
+    FrameShell,
+    FrameOutput,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct QuarantineOwnerSnapshot {
+    lease_id: QuarantineLeaseId,
+    kind: QuarantineOwnerKind,
+    former_host: HostVersion,
+    entity_count: usize,
+}
+
+impl QuarantineOwnerSnapshot {
+    pub(crate) fn lease_id(&self) -> QuarantineLeaseId {
+        self.lease_id
+    }
+
+    pub(crate) fn kind(&self) -> QuarantineOwnerKind {
+        self.kind
+    }
+
+    pub(crate) fn former_host(&self) -> &HostVersion {
+        &self.former_host
+    }
+
+    pub(crate) fn entity_count(&self) -> usize {
+        self.entity_count
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct QuarantineSnapshot {
+    root: AuditEntityId,
+    foreign_targets: Vec<AuditEntityId>,
+    root_owner: QuarantineOwnerSnapshot,
+    foreign_component_count: usize,
+    protected_parent: bool,
+    inert: bool,
+}
+
+impl QuarantineSnapshot {
+    pub(crate) fn former_host(&self) -> &HostVersion {
+        self.root_owner.former_host()
+    }
+
+    pub(crate) fn root(&self) -> AuditEntityId {
+        self.root
+    }
+
+    pub(crate) fn foreign_targets(&self) -> &[AuditEntityId] {
+        &self.foreign_targets
+    }
+
+    pub(crate) fn root_owner(&self) -> &QuarantineOwnerSnapshot {
+        &self.root_owner
+    }
+
+    pub(crate) fn foreign_count(&self) -> usize {
+        self.foreign_targets.len()
+    }
+
+    pub(crate) fn foreign_component_count(&self) -> usize {
+        self.foreign_component_count
+    }
+
+    pub(crate) fn protected_parent(&self) -> bool {
+        self.protected_parent
+    }
+
+    pub(crate) fn inert(&self) -> bool {
+        self.inert
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouterAuthorityAuditSnapshot {
     host: Option<AuthorityHostMapping>,
@@ -277,6 +362,7 @@ pub struct RouterAuthorityAuditSnapshot {
     content: Vec<AuthorityContentMapping>,
     orphan_slots: Vec<RouteSlotId>,
     orphan_slot_mappings: Vec<AuthoritySlotMapping>,
+    quarantines: Vec<QuarantineSnapshot>,
     events: Vec<RouterLifecycleAuditEvent>,
     owned_states: Vec<(AuditEntityId, AuditEntityState)>,
     namespace: u32,
@@ -293,6 +379,7 @@ impl RouterAuthorityAuditSnapshot {
             content: Vec::new(),
             orphan_slots: Vec::new(),
             orphan_slot_mappings: Vec::new(),
+            quarantines: Vec::new(),
             events: Vec::new(),
             owned_states: Vec::new(),
             namespace: 0,
@@ -322,6 +409,10 @@ impl RouterAuthorityAuditSnapshot {
 
     pub fn orphan_slots(&self) -> &[RouteSlotId] {
         &self.orphan_slots
+    }
+
+    pub(crate) fn quarantines(&self) -> &[QuarantineSnapshot] {
+        &self.quarantines
     }
 
     pub fn events(&self) -> &[RouterLifecycleAuditEvent] {
@@ -426,6 +517,165 @@ fn sample_event_state(
         accepts_gamepad,
         focused,
     }
+}
+
+fn quarantine_owner_frame(owner: &RegistryOwner) -> Option<&RouteFrameVersion> {
+    match owner {
+        RegistryOwner::Committed(EntityOwner::ChildSlot { parent, .. })
+        | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { parent, .. }) => Some(parent),
+        RegistryOwner::Committed(
+            EntityOwner::FrameShell(frame)
+            | EntityOwner::FrameContentTarget(frame)
+            | EntityOwner::FrameOutput { frame, .. },
+        ) => Some(frame),
+        RegistryOwner::Committed(EntityOwner::HostTopSlot { .. })
+        | RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(_)) => None,
+    }
+}
+
+fn push_host_candidate(candidates: &mut Vec<HostVersion>, host: &HostVersion) {
+    if !candidates.contains(host) {
+        candidates.push(host.clone());
+    }
+}
+
+fn quarantine_host_candidates(
+    previous: Option<&RouterAuthorityAuditSnapshot>,
+    current: &RouterAuthorityAuditSnapshot,
+    entry_host: Option<&HostVersion>,
+) -> Vec<HostVersion> {
+    let mut candidates = Vec::new();
+    if let Some(previous) = previous {
+        if let Some(host) = previous.host.as_ref() {
+            push_host_candidate(&mut candidates, &host.version);
+        }
+        for slot in previous
+            .slots
+            .iter()
+            .chain(previous.orphan_slot_mappings.iter())
+        {
+            push_host_candidate(&mut candidates, &slot.host);
+        }
+        for quarantine in &previous.quarantines {
+            push_host_candidate(&mut candidates, quarantine.former_host());
+        }
+    }
+    if let Some(host) = current.host.as_ref() {
+        push_host_candidate(&mut candidates, &host.version);
+    }
+    for slot in current
+        .slots
+        .iter()
+        .chain(current.orphan_slot_mappings.iter())
+    {
+        push_host_candidate(&mut candidates, &slot.host);
+    }
+    if let Some(host) = entry_host {
+        push_host_candidate(&mut candidates, host);
+    }
+    candidates
+}
+
+fn quarantine_former_host(
+    lease: &QuarantineLease,
+    previous: Option<&RouterAuthorityAuditSnapshot>,
+    current: &RouterAuthorityAuditSnapshot,
+    entry_host: Option<&HostVersion>,
+) -> Option<HostVersion> {
+    if let Some(previous) = previous
+        && let Some(snapshot) = previous
+            .quarantines
+            .iter()
+            .find(|snapshot| snapshot.root_owner.lease_id == lease.id())
+    {
+        return Some(snapshot.former_host().clone());
+    }
+
+    let candidates = quarantine_host_candidates(previous, current, entry_host);
+    if let Some(host) = lease.root().committed_host() {
+        return candidates
+            .iter()
+            .find(|candidate| *candidate == host)
+            .cloned();
+    }
+    if let Some(frame) = lease.root().frame() {
+        return candidates
+            .iter()
+            .find(|candidate| host_version_matches_frame(candidate, frame))
+            .cloned();
+    }
+    if !lease.root().provisional_top() {
+        return None;
+    }
+    let former_app_host = lease.facts().former_app_host();
+    previous
+        .and_then(|snapshot| snapshot.host.as_ref())
+        .filter(|host| former_app_host.is_none_or(|entity| host.app_entity == entity))
+        .map(|host| host.version.clone())
+        .or_else(|| {
+            current
+                .host
+                .as_ref()
+                .filter(|host| former_app_host.is_none_or(|entity| host.app_entity == entity))
+                .map(|host| host.version.clone())
+        })
+        .or_else(|| candidates.first().cloned())
+}
+
+fn quarantine_lease_is_inert(world: &World, lease: &QuarantineLease) -> bool {
+    let Some(gate) = world.get_resource::<RouterInputGate>() else {
+        return false;
+    };
+    let mut focus_closure = Vec::new();
+    for record in lease.records() {
+        let entity = record.entity();
+        if world.get_entity(entity).is_err() {
+            continue;
+        }
+        let Ok(claim) = record.try_claim() else {
+            return false;
+        };
+        if !cleanup_claim_has_exact_authority(world, &claim)
+            || world.get::<Visibility>(entity) != Some(&Visibility::Hidden)
+            || world.get::<Pickable>(entity) != Some(&Pickable::IGNORE)
+            || !world
+                .get::<RouterInputBarrier>(entity)
+                .is_some_and(RouterInputBarrier::denies_all)
+            || gate.allows_pointer(entity)
+            || gate.allows_keyboard(entity)
+            || gate.allows_gamepad(entity)
+        {
+            return false;
+        }
+        if !focus_closure.contains(&entity) {
+            focus_closure.push(entity);
+        }
+    }
+
+    let mut cursor = 0;
+    while cursor < focus_closure.len() {
+        let entity = focus_closure[cursor];
+        cursor += 1;
+        if let Some(children) = world.get::<Children>(entity) {
+            for child in children.iter().copied() {
+                if !focus_closure.contains(&child) {
+                    focus_closure.push(child);
+                }
+            }
+        }
+    }
+    let Some(input_focus) = world.get_resource::<InputFocus>() else {
+        return false;
+    };
+    let Some(route_focus) = world.get_resource::<RouteFocusState>() else {
+        return false;
+    };
+    input_focus
+        .get()
+        .is_none_or(|focused| !focus_closure.contains(&focused))
+        && route_focus
+            .focused()
+            .is_none_or(|focused| !focus_closure.contains(&focused))
 }
 
 #[derive(Resource)]
@@ -891,6 +1141,7 @@ impl RouterAuthorityAudits {
                     content,
                     orphan_slots,
                     orphan_slot_mappings,
+                    quarantines: Vec::new(),
                     events: Vec::new(),
                     owned_states,
                     namespace,
@@ -911,6 +1162,7 @@ impl RouterAuthorityAudits {
         mut current: RouterAuthorityAuditSnapshot,
         samples: &[FrameAuditSample],
     ) -> RouterAuthorityAuditSnapshot {
+        self.collect_quarantine_snapshots(world, entry, previous, &mut current);
         if let Some(previous) = previous {
             for (id, _) in &previous.owned_states {
                 if current
@@ -982,6 +1234,12 @@ impl RouterAuthorityAudits {
                 .owned_states
                 .iter()
                 .filter(|(_, state)| *state == AuditEntityState::Unknown)
+                .filter(|(id, _)| {
+                    !current
+                        .quarantines
+                        .iter()
+                        .any(|quarantine| quarantine.root == *id)
+                })
                 .filter_map(|(id, _)| {
                     self.identities
                         .iter()
@@ -1018,12 +1276,130 @@ impl RouterAuthorityAudits {
         current.namespace = namespace.namespace;
         current.evicted_owned_through = namespace.evicted_owned_through;
         let current_host = current.host.as_ref().map(AuthorityHostMapping::entity);
+        let current_foreign_targets = current
+            .quarantines
+            .iter()
+            .flat_map(|quarantine| quarantine.foreign_targets.iter().copied())
+            .collect::<Vec<_>>();
         self.identities.retain(|item| {
             item.router != entry.handle
                 || item.id.0 & OWNED_ID_FLAG != 0
                 || Some(item.id) == current_host
+                || current_foreign_targets.contains(&item.id)
         });
         current
+    }
+
+    fn collect_quarantine_snapshots(
+        &mut self,
+        world: &World,
+        entry: &RouterEntry,
+        previous: Option<&RouterAuthorityAuditSnapshot>,
+        current: &mut RouterAuthorityAuditSnapshot,
+    ) {
+        let Some(table) = world.get_resource::<QuarantineLeaseTable>() else {
+            return;
+        };
+        let request = entry.engine.snapshot().running_request();
+        let entry_host = entry.host.as_ref().map(|host| &host.version);
+        let mut quarantines = Vec::new();
+        for lease in table.leases() {
+            let Some(former_host) = quarantine_former_host(lease, previous, current, entry_host)
+            else {
+                continue;
+            };
+            let root_entity = lease.root().entity();
+            for record in lease.records() {
+                let id = self.id_for(
+                    entry.handle,
+                    record.entity(),
+                    true,
+                    quarantine_owner_frame(record.record().owner()),
+                    request,
+                    false,
+                    record.entity() == root_entity,
+                );
+                let state = observed_owned_state(world, record.entity());
+                if let Some((_, current_state)) = current
+                    .owned_states
+                    .iter_mut()
+                    .find(|(current_id, _)| *current_id == id)
+                {
+                    *current_state = state;
+                } else {
+                    current.owned_states.push((id, state));
+                }
+            }
+            let kind = match lease.root().kind() {
+                QuarantineRootKind::HostTopSlot => QuarantineOwnerKind::HostTopSlot,
+                QuarantineRootKind::ChildSlot => QuarantineOwnerKind::ChildSlot,
+                QuarantineRootKind::FrameShell => QuarantineOwnerKind::FrameShell,
+                QuarantineRootKind::FrameOutput => QuarantineOwnerKind::FrameOutput,
+                QuarantineRootKind::ResidualContentTarget => continue,
+            };
+            let previous_quarantine = previous.and_then(|snapshot| {
+                snapshot
+                    .quarantines
+                    .iter()
+                    .find(|snapshot| snapshot.root_owner.lease_id == lease.id())
+            });
+            let root = if let Some(previous_quarantine) = previous_quarantine {
+                if self.entity_for(previous_quarantine.root) != Some(root_entity) {
+                    continue;
+                }
+                previous_quarantine.root
+            } else {
+                self.id_for(
+                    entry.handle,
+                    root_entity,
+                    true,
+                    lease.root().frame(),
+                    request,
+                    false,
+                    true,
+                )
+            };
+            if !lease
+                .records()
+                .iter()
+                .any(|record| record.entity() == root_entity)
+                && !current
+                    .owned_states
+                    .iter()
+                    .any(|(current_id, _)| *current_id == root)
+            {
+                current.owned_states.push((
+                    root,
+                    if world.get_entity(root_entity).is_err() {
+                        AuditEntityState::Removed
+                    } else {
+                        AuditEntityState::Unknown
+                    },
+                ));
+            }
+
+            let foreign_targets = lease
+                .facts()
+                .foreign_descendants()
+                .iter()
+                .copied()
+                .map(|entity| self.id_for(entry.handle, entity, false, None, request, false, false))
+                .collect();
+            quarantines.push(QuarantineSnapshot {
+                root,
+                foreign_targets,
+                root_owner: QuarantineOwnerSnapshot {
+                    lease_id: lease.id(),
+                    kind,
+                    former_host,
+                    entity_count: lease.entity_count(),
+                },
+                foreign_component_count: lease.facts().foreign_components().len(),
+                protected_parent: lease.facts().protected_parent().is_some(),
+                inert: quarantine_lease_is_inert(world, lease),
+            });
+        }
+        current.quarantines = quarantines;
     }
 
     fn append_lifecycle_events(
@@ -1217,11 +1593,11 @@ impl RouterAuthorityAudits {
         interactive: bool,
         frame_root: bool,
     ) -> AuditEntityId {
-        if let Some(item) = self
-            .identities
-            .iter_mut()
-            .find(|item| item.router == router && item.entity == entity)
-        {
+        if let Some(item) = self.identities.iter_mut().find(|item| {
+            item.router == router
+                && item.entity == entity
+                && (item.id.0 & OWNED_ID_FLAG != 0) == owned
+        }) {
             if frame.is_some() {
                 item.frame = frame.cloned();
             }
@@ -1689,7 +2065,7 @@ mod tests {
         commit_presentation_system(app.world_mut());
         settle_cleanup_system(app.world_mut());
 
-        let stale_output = {
+        let (stale_output, stale_root, stale_host) = {
             let active = app
                 .world()
                 .resource::<RouterAuthorityAudits>()
@@ -1716,7 +2092,11 @@ mod tests {
                     && event.accepts_gamepad()
             }));
             assert_ne!(active.frames()[0].root(), active.content()[0].entity());
-            active.content()[0].entity()
+            (
+                active.content()[0].entity(),
+                active.frames()[0].root(),
+                active.host().unwrap().version().clone(),
+            )
         };
 
         let (active_entities, active_interactive) = {
@@ -1752,6 +2132,7 @@ mod tests {
         drive_navigation_system(app.world_mut());
         commit_presentation_system(app.world_mut());
         app.world_mut().entity_mut(output).insert(AuditCleanupDrift);
+        let foreign_descendant = app.world_mut().spawn(ChildOf(output)).id();
         settle_cleanup_system(app.world_mut());
         if app
             .world()
@@ -1782,6 +2163,43 @@ mod tests {
         );
         assert_eq!(
             drifted.owned_entity_state(stale_output),
+            AuditEntityState::Quarantined
+        );
+        let quarantine = drifted
+            .quarantines()
+            .iter()
+            .find(|quarantine| quarantine.root() == stale_root)
+            .expect("foreign component cleanup exposes the frame-shell quarantine");
+        assert_eq!(quarantine.former_host(), &stale_host);
+        assert_eq!(
+            quarantine.root_owner().kind(),
+            QuarantineOwnerKind::FrameShell
+        );
+        assert_eq!(
+            quarantine.root_owner().entity_count(),
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .lease(quarantine.root_owner().lease_id())
+                .unwrap()
+                .entity_count()
+        );
+        assert!(!quarantine.foreign_targets().is_empty());
+        assert_eq!(
+            quarantine.foreign_count(),
+            quarantine.foreign_targets().len()
+        );
+        assert!(
+            quarantine
+                .foreign_targets()
+                .iter()
+                .all(|target| drifted.owned_entity_state(*target) == AuditEntityState::Unknown)
+        );
+        assert!(app.world().get_entity(foreign_descendant).is_ok());
+        assert_eq!(quarantine.foreign_component_count(), 1);
+        assert!(!quarantine.protected_parent());
+        assert!(quarantine.inert());
+        assert_eq!(
+            drifted.owned_entity_state(quarantine.root()),
             AuditEntityState::Quarantined
         );
         assert!(drifted.events().iter().any(|event| {
@@ -2392,6 +2810,33 @@ mod tests {
         );
         assert_eq!(
             snapshot.owned_entity_state(second_id),
+            AuditEntityState::Unknown
+        );
+    }
+
+    #[test]
+    fn owned_and_observed_audit_ids_for_one_entity_remain_in_distinct_domains() {
+        let mut world = World::new();
+        let entity = world.spawn_empty().id();
+        let router = RouterHandle::fixture(1, 1);
+        let mut audits = RouterAuthorityAudits::new();
+        let namespace = audits.ensure_namespace(router);
+
+        let owned = audits.id_for(router, entity, true, None, None, false, false);
+        let observed = audits.id_for(router, entity, false, None, None, false, false);
+        assert_ne!(owned, observed);
+
+        let mut snapshot = RouterAuthorityAuditSnapshot::empty();
+        snapshot.namespace = namespace;
+        snapshot
+            .owned_states
+            .push((owned, AuditEntityState::Quarantined));
+        assert_eq!(
+            snapshot.owned_entity_state(owned),
+            AuditEntityState::Quarantined
+        );
+        assert_eq!(
+            snapshot.owned_entity_state(observed),
             AuditEntityState::Unknown
         );
     }
