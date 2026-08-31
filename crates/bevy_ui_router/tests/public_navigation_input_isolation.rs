@@ -410,6 +410,13 @@ fn assert_quarantine_sample(sample: &QuarantineProbeSample) {
     assert!(sample.opened_event_isolated);
 }
 
+fn assert_persistently_blocked(previous: BlockedProbeSample, refreshed: BlockedProbeSample) {
+    assert_eq!(refreshed.target, previous.target);
+    assert_eq!(refreshed.counts_before, previous.counts_after);
+    assert_eq!(refreshed.results, [InputProbeResult::Blocked; 3]);
+    assert_eq!(refreshed.counts_after, refreshed.counts_before);
+}
+
 #[test]
 fn public_navigation_input_isolation_is_atomic_and_quarantines_remain_blocked() {
     let mut app = App::new();
@@ -525,4 +532,31 @@ fn public_navigation_input_isolation_is_atomic_and_quarantines_remain_blocked() 
             .map(ChildOf::parent),
         Some(protected_parent)
     );
+
+    let foreign_quarantine = foreign_quarantine.clone();
+    let protected_quarantine = protected_quarantine.clone();
+    app.update();
+    let (refreshed_foreign, refreshed_protected) = app.world_mut().resource_scope(
+        |_world, mut probes: bevy_ecs::prelude::Mut<RouterInputProbes>| {
+            (
+                (
+                    sample_blocked_target(&mut probes, routers[0], foreign_quarantine.root.target),
+                    foreign_quarantine.foreign.map(|foreign| {
+                        sample_blocked_target(&mut probes, routers[0], foreign.target)
+                    }),
+                ),
+                sample_blocked_target(&mut probes, routers[1], protected_quarantine.root.target),
+            )
+        },
+    );
+    assert_persistently_blocked(foreign_quarantine.root, refreshed_foreign.0);
+    assert_persistently_blocked(
+        foreign_quarantine
+            .foreign
+            .expect("the foreign quarantine retains its observed descendant"),
+        refreshed_foreign
+            .1
+            .expect("the refreshed probes retain the observed descendant"),
+    );
+    assert_persistently_blocked(protected_quarantine.root, refreshed_protected);
 }

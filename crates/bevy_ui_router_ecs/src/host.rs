@@ -30,8 +30,8 @@ use crate::input::{RouteFocusState, RouterInputGate};
 use crate::registry::{
     ComponentManifest, EntityLifecycle, EntityOwner, ExactRegistryClaim,
     ProtectedRegistryProjection, ProvisionalOwner, ProvisionalTopSlotOwner, QuarantineFacts,
-    QuarantineLeaseTable, RegistryOwner, RouteEntityRegistry, apply_prepared_quarantine_transfer,
-    prepare_verified_quarantine_transfer,
+    QuarantineLeaseTable, QuarantineOrigin, RegistryOwner, RouteEntityRegistry,
+    apply_prepared_quarantine_transfer, prepare_verified_quarantine_transfer,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1115,6 +1115,7 @@ pub(crate) struct VerifiedQuarantineTransfer {
     claims: Vec<ExactRegistryClaim>,
     manifests: Vec<(Entity, ComponentManifest)>,
     facts: QuarantineFacts,
+    origin: Option<QuarantineOrigin>,
 }
 
 impl VerifiedQuarantineTransfer {
@@ -1122,11 +1123,13 @@ impl VerifiedQuarantineTransfer {
         claims: Vec<ExactRegistryClaim>,
         manifests: Vec<(Entity, ComponentManifest)>,
         facts: QuarantineFacts,
+        origin: Option<QuarantineOrigin>,
     ) -> Self {
         Self {
             claims,
             manifests,
             facts,
+            origin,
         }
     }
 
@@ -1136,8 +1139,9 @@ impl VerifiedQuarantineTransfer {
         Vec<ExactRegistryClaim>,
         Vec<(Entity, ComponentManifest)>,
         QuarantineFacts,
+        Option<QuarantineOrigin>,
     ) {
-        (self.claims, self.manifests, self.facts)
+        (self.claims, self.manifests, self.facts, self.origin)
     }
 
     #[cfg(test)]
@@ -1150,6 +1154,7 @@ impl VerifiedQuarantineTransfer {
             claims,
             manifests,
             facts,
+            origin: None,
         }
     }
 }
@@ -1748,6 +1753,8 @@ impl StagedProvisionalTopSlot {
         ProvisionalHostSettlement {
             staged: self,
             authorized_host: candidate.host,
+            candidate_router: candidate.router,
+            quarantine_origin: None,
         }
     }
 }
@@ -1787,6 +1794,8 @@ impl ProvisionalStageError {
 pub(crate) struct ProvisionalHostSettlement {
     staged: StagedProvisionalTopSlot,
     authorized_host: Entity,
+    candidate_router: RouterHandle,
+    quarantine_origin: Option<QuarantineOrigin>,
 }
 
 impl ProvisionalHostSettlement {
@@ -1800,6 +1809,24 @@ impl ProvisionalHostSettlement {
 
     pub(crate) fn failure_evidence(&self) -> Arc<ProvisionalStagingFailureEvidence> {
         Arc::clone(&self.staged.failure_evidence)
+    }
+
+    pub(crate) fn bind_quarantine_origin(
+        &mut self,
+        router: RouterHandle,
+        former_host: bevy_ui_router_core::HostVersion,
+    ) -> bool {
+        if router != self.candidate_router {
+            return false;
+        }
+        let origin = QuarantineOrigin::provisional(router, former_host);
+        match self.quarantine_origin.as_ref() {
+            Some(bound) => bound == &origin,
+            None => {
+                self.quarantine_origin = Some(origin);
+                true
+            }
+        }
     }
 }
 
@@ -3010,6 +3037,7 @@ fn settle_failed_provisional(
             vec![prepared_claim.clone()],
             vec![(slot, actual_manifest)],
             facts,
+            settlement.quarantine_origin.clone(),
         );
         let prepared = world.resource_scope(
             |world, registry: bevy_ecs::prelude::Mut<RouteEntityRegistry>| {

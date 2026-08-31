@@ -15,11 +15,12 @@ use crate::{
 };
 
 use super::{
-    ComponentManifest, QuarantineBarrierKind, QuarantineBoundaryObservation, QuarantineLease,
-    QuarantineLeaseRecord, QuarantineLeaseTable, QuarantineReapAttempt, QuarantineReapBlockReason,
-    QuarantineReapEvidence, QuarantineReapOutcome, QuarantineReapPostwrite,
-    QuarantineReapProjectionPhase, try_clone_quarantine_lease_for_reap,
-    try_clone_quarantine_lease_for_reap_with_record_capacity,
+    AuthorityLostResidual, AuthorityLostResidualProvenance, ComponentManifest,
+    QuarantineBarrierKind, QuarantineBoundaryObservation, QuarantineLease, QuarantineLeaseRecord,
+    QuarantineLeaseTable, QuarantineReapAttempt, QuarantineReapBlockReason, QuarantineReapEvidence,
+    QuarantineReapOutcome, QuarantineReapPostwrite, QuarantineReapProjectionPhase,
+    QuarantineReaperAuthorityLostResidualProvenance, ResidualLeaseId, try_clone_quarantine_facts,
+    try_clone_quarantine_lease_for_reap, try_clone_quarantine_lease_for_reap_with_record_capacity,
 };
 
 #[cfg(test)]
@@ -88,6 +89,9 @@ enum ReapDisposition {
     Terminal {
         target: super::ExactRegistryClaim,
     },
+    AuthorityLost {
+        target: super::ExactRegistryClaim,
+    },
     Despawn {
         target: super::ExactRegistryClaim,
     },
@@ -99,6 +103,15 @@ struct PreparedQuarantineReap {
     focus_targets: Vec<Entity>,
     observations: Vec<QuarantineBoundaryObservation>,
     disposition: ReapDisposition,
+}
+
+struct PreparedReaperAuthorityLostRetirement {
+    lease_id: super::QuarantineLeaseId,
+    lease_generation: u64,
+    source_operation_sequence: u64,
+    authority_lost_len: usize,
+    authority_lost_capacity: usize,
+    residual: AuthorityLostResidual,
 }
 
 #[derive(Clone, Copy)]
@@ -116,12 +129,14 @@ fn reap_source_matches(current: &QuarantineLease, candidate: &QuarantineLease) -
         && current.entity_count == candidate.entity_count
         && current.records == candidate.records
         && current.facts == candidate.facts
+        && current.origin == candidate.origin
 }
 
 fn outcome_evidence(outcome: &QuarantineReapOutcome) -> &QuarantineReapEvidence {
     match outcome {
         QuarantineReapOutcome::Blocked { evidence, .. }
         | QuarantineReapOutcome::Terminal { evidence, .. }
+        | QuarantineReapOutcome::AuthorityLost { evidence, .. }
         | QuarantineReapOutcome::Despawned { evidence, .. }
         | QuarantineReapOutcome::DespawnRejected { evidence, .. } => evidence,
     }
@@ -147,21 +162,29 @@ fn evidence_matches_attempt(
         })
 }
 
-fn evidence_proves_terminal(
+fn evidence_proves_entity_absent(
     evidence: &QuarantineReapEvidence,
     target: &super::ExactRegistryClaim,
-    despawned: bool,
+) -> bool {
+    let QuarantineReapEvidence::Observed(observations) = evidence else {
+        return false;
+    };
+    observations
+        .iter()
+        .any(|observation| observation.target == *target && !observation.authority.entity_present)
+}
+
+fn evidence_proves_live_authority_loss(
+    evidence: &QuarantineReapEvidence,
+    target: &super::ExactRegistryClaim,
 ) -> bool {
     let QuarantineReapEvidence::Observed(observations) = evidence else {
         return false;
     };
     observations.iter().any(|observation| {
         observation.target == *target
-            && if despawned {
-                !observation.authority.entity_present
-            } else {
-                !observation.exact_authority
-            }
+            && observation.authority.entity_present
+            && !observation.exact_authority
     })
 }
 
@@ -205,10 +228,89 @@ impl QuarantineLeaseTable {
             .any(|lease| reap_source_matches(lease, candidate))
     }
 
+    fn try_prepare_reaper_authority_lost_retirement(
+        &mut self,
+        candidate: &QuarantineLease,
+        target: &super::ExactRegistryClaim,
+        observations: &[QuarantineBoundaryObservation],
+    ) -> Result<Option<PreparedReaperAuthorityLostRetirement>, ()> {
+        if !self.candidate_is_current(candidate)
+            || self
+                .authority_lost
+                .iter()
+                .any(|residual| residual.retired_claim.entity() == target.entity())
+        {
+            return Ok(None);
+        }
+        let Some(observation) = observations.iter().find(|observation| {
+            observation.target == *target
+                && observation.authority.entity_present
+                && !observation.exact_authority
+        }) else {
+            return Ok(None);
+        };
+        let Some(record) = candidate
+            .records
+            .iter()
+            .find(|record| record.record().matches_claim(target))
+        else {
+            return Ok(None);
+        };
+        let sequence = self.next_residual_sequence.checked_add(1).ok_or(())?;
+        let residual = AuthorityLostResidual {
+            id: ResidualLeaseId {
+                domain: self.domain,
+                sequence,
+            },
+            generation: 1,
+            operation_sequence: 0,
+            provenance: AuthorityLostResidualProvenance::QuarantineReaper(
+                QuarantineReaperAuthorityLostResidualProvenance {
+                    lease_id: candidate.id,
+                    lease_generation: candidate.generation,
+                    operation_sequence: observation.operation_sequence,
+                },
+            ),
+            retired_claim: super::try_clone_exact_registry_claim(target)?,
+            frozen_expected_manifest: record.record().manifest().try_clone()?,
+            observed_manifest: observation
+                .authority
+                .observed_manifest
+                .as_ref()
+                .map(ComponentManifest::try_clone)
+                .transpose()?,
+            entity_present_at_receipt: true,
+            observed_registry_claim: None,
+            actual_parent_at_receipt: observation.parent,
+            facts: try_clone_quarantine_facts(&candidate.facts)?,
+        };
+        super::note_authority_reservation_attempt();
+        self.authority_lost.try_reserve_exact(1).map_err(|_| ())?;
+        let prepared = PreparedReaperAuthorityLostRetirement {
+            lease_id: candidate.id,
+            lease_generation: candidate.generation,
+            source_operation_sequence: candidate.operation_sequence,
+            authority_lost_len: self.authority_lost.len(),
+            authority_lost_capacity: self.authority_lost.capacity(),
+            residual,
+        };
+        self.next_residual_sequence = sequence;
+        Ok(Some(prepared))
+    }
+
     fn settle_reap_attempt(
         &mut self,
         candidate: &QuarantineLease,
         attempt: QuarantineReapAttempt,
+    ) -> bool {
+        self.settle_reap_attempt_with_authority_lost(candidate, attempt, None)
+    }
+
+    fn settle_reap_attempt_with_authority_lost(
+        &mut self,
+        candidate: &QuarantineLease,
+        attempt: QuarantineReapAttempt,
+        authority_lost: Option<PreparedReaperAuthorityLostRetirement>,
     ) -> bool {
         let Some(index) = self
             .leases
@@ -232,6 +334,7 @@ impl QuarantineLeaseTable {
         let target = match &attempt.outcome {
             QuarantineReapOutcome::Blocked { target, .. } => target.as_ref(),
             QuarantineReapOutcome::Terminal { target, .. }
+            | QuarantineReapOutcome::AuthorityLost { target, .. }
             | QuarantineReapOutcome::Despawned { target, .. }
             | QuarantineReapOutcome::DespawnRejected { target, .. } => Some(target),
         };
@@ -246,22 +349,42 @@ impl QuarantineLeaseTable {
         let terminal = match &attempt.outcome {
             QuarantineReapOutcome::Terminal {
                 target, evidence, ..
-            } if evidence_proves_terminal(evidence, target, false) => Some(target.entity()),
+            } if evidence_proves_entity_absent(evidence, target) => Some(target.entity()),
             QuarantineReapOutcome::Despawned {
                 target, evidence, ..
-            } if evidence_proves_terminal(evidence, target, true) => Some(target.entity()),
+            } if evidence_proves_entity_absent(evidence, target) => Some(target.entity()),
             QuarantineReapOutcome::Blocked { .. }
             | QuarantineReapOutcome::Terminal { .. }
+            | QuarantineReapOutcome::AuthorityLost { .. }
             | QuarantineReapOutcome::Despawned { .. }
             | QuarantineReapOutcome::DespawnRejected { .. } => None,
+        };
+        let authority_lost = match (&attempt.outcome, authority_lost) {
+            (QuarantineReapOutcome::AuthorityLost { target, evidence }, Some(prepared))
+                if evidence_proves_live_authority_loss(evidence, target)
+                    && prepared.matches(self, candidate, target, evidence) =>
+            {
+                Some(prepared)
+            }
+            (QuarantineReapOutcome::AuthorityLost { .. }, _) => return false,
+            (_, Some(_)) => return false,
+            (_, None) => None,
         };
         self.reap_cursor = Some(candidate.id);
         let lease = &mut self.leases[index];
         lease.operation_sequence = next_operation;
-        if let Some(entity) = terminal {
+        if let Some(entity) = terminal.or_else(|| {
+            authority_lost
+                .as_ref()
+                .map(|prepared| prepared.residual.retired_claim.entity())
+        }) {
             lease.records.retain(|record| record.entity() != entity);
         }
         lease.last_attempt = Some(attempt);
+        if let Some(prepared) = authority_lost {
+            debug_assert!(self.authority_lost.len() < self.authority_lost.capacity());
+            self.authority_lost.push(prepared.residual);
+        }
         if lease.records.is_empty() {
             let closed = self.leases.remove(index);
             self.last_closed_reap_attempt = closed.last_attempt;
@@ -298,6 +421,49 @@ impl QuarantineLeaseTable {
         self.leases[index].operation_sequence = operation_sequence;
         self.leases[index].last_attempt = Some(attempt);
         true
+    }
+}
+
+impl PreparedReaperAuthorityLostRetirement {
+    fn matches(
+        &self,
+        table: &QuarantineLeaseTable,
+        candidate: &QuarantineLease,
+        target: &super::ExactRegistryClaim,
+        evidence: &QuarantineReapEvidence,
+    ) -> bool {
+        let QuarantineReapEvidence::Observed(observations) = evidence else {
+            return false;
+        };
+        let Some(observation) = observations.iter().find(|observation| {
+            observation.target == *target
+                && observation.authority.entity_present
+                && !observation.exact_authority
+        }) else {
+            return false;
+        };
+        self.lease_id == candidate.id
+            && self.lease_generation == candidate.generation
+            && self.source_operation_sequence == candidate.operation_sequence
+            && self.authority_lost_len == table.authority_lost.len()
+            && self.authority_lost_capacity == table.authority_lost.capacity()
+            && self.residual.id.domain == table.domain
+            && self.residual.id.sequence == table.next_residual_sequence
+            && self.residual.retired_claim == *target
+            && self.residual.entity_present_at_receipt
+            && self.residual.observed_manifest == observation.authority.observed_manifest
+            && self.residual.actual_parent_at_receipt == observation.parent
+            && matches!(
+                &self.residual.provenance,
+                AuthorityLostResidualProvenance::QuarantineReaper(provenance)
+                    if provenance.lease_id == candidate.id
+                        && provenance.lease_generation == candidate.generation
+                        && provenance.operation_sequence == observation.operation_sequence
+            )
+            && table
+                .authority_lost
+                .iter()
+                .all(|residual| residual.retired_claim.entity() != target.entity())
     }
 }
 
@@ -423,24 +589,29 @@ fn try_prepare_reap(world: &World, lease: QuarantineLease) -> Result<PreparedQua
     }
     let mut exact_entities = Vec::new();
     let mut terminal_records = Vec::new();
+    let mut authority_lost_records = Vec::new();
     exact_entities
         .try_reserve_exact(lease.records.len())
         .map_err(|_| ())?;
     terminal_records
         .try_reserve_exact(lease.records.len())
         .map_err(|_| ())?;
+    authority_lost_records
+        .try_reserve_exact(lease.records.len())
+        .map_err(|_| ())?;
     for record in &lease.records {
         let target = record.try_claim()?;
-        if world.get_entity(record.entity()).is_err()
-            || !cleanup_claim_has_exact_authority(world, &target)
-        {
+        if world.get_entity(record.entity()).is_err() {
             terminal_records.push((record.entity(), target));
+        } else if !cleanup_claim_has_exact_authority(world, &target) {
+            authority_lost_records.push((record.entity(), target));
         } else {
             exact_entities.push(record.entity());
         }
     }
     exact_entities.sort_by_key(|entity| entity.to_bits());
     terminal_records.sort_by_key(|(entity, _)| entity.to_bits());
+    authority_lost_records.sort_by_key(|(entity, _)| entity.to_bits());
 
     let focus_targets = try_focus_closure(world, &exact_entities)?;
     world.get_resource::<RouterInputGate>().ok_or(())?;
@@ -449,6 +620,8 @@ fn try_prepare_reap(world: &World, lease: QuarantineLease) -> Result<PreparedQua
     let disposition =
         if let Some((_, target)) = terminal_records.into_iter().next() {
             ReapDisposition::Terminal { target }
+        } else if let Some((_, target)) = authority_lost_records.into_iter().next() {
+            ReapDisposition::AuthorityLost { target }
         } else {
             let relationship_components = [
                 world.components().component_id::<ChildOf>(),
@@ -827,7 +1000,8 @@ fn postwrite_refreeze(
             evidence: QuarantineReapEvidence::Observed(observations),
         },
         PreparedQuarantineReap {
-            disposition: ReapDisposition::Terminal { target },
+            disposition:
+                ReapDisposition::Terminal { target } | ReapDisposition::AuthorityLost { target },
             observations,
             ..
         } => {
@@ -912,6 +1086,32 @@ pub(crate) fn reap_quarantines_system(world: &mut World) {
         return;
     }
 
+    let authority_lost_retirement = match &prepared.disposition {
+        ReapDisposition::AuthorityLost { target } => {
+            match world
+                .resource_mut::<QuarantineLeaseTable>()
+                .try_prepare_reaper_authority_lost_retirement(
+                    &prepared.lease,
+                    target,
+                    &prepared.observations,
+                ) {
+                Ok(Some(prepared)) => Some(prepared),
+                Ok(None) => return,
+                Err(()) => {
+                    settle_projection_unavailable(
+                        world,
+                        &prepared.lease,
+                        QuarantineReapProjectionPhase::InitialPreparation,
+                    );
+                    return;
+                }
+            }
+        }
+        ReapDisposition::Blocked { .. }
+        | ReapDisposition::Terminal { .. }
+        | ReapDisposition::Despawn { .. } => None,
+    };
+
     apply_inert_barrier(world, &prepared);
     world.flush();
     let refreshed = match try_clone_quarantine_lease_for_reap(&prepared.lease)
@@ -949,6 +1149,24 @@ pub(crate) fn reap_quarantines_system(world: &mut World) {
             target,
             evidence: observations,
         },
+        ReapDisposition::AuthorityLost { target } => {
+            if authority_lost_retirement
+                .as_ref()
+                .is_some_and(|prepared| prepared.residual.retired_claim == target)
+            {
+                QuarantineReapOutcome::AuthorityLost {
+                    target,
+                    evidence: observations,
+                }
+            } else {
+                let entity = target.entity();
+                QuarantineReapOutcome::Blocked {
+                    target: Some(target),
+                    reason: QuarantineReapBlockReason::AuthorityDrift { entity },
+                    evidence: observations,
+                }
+            }
+        }
         ReapDisposition::Despawn { target } => {
             let entity = target.entity();
             let _ = world.despawn(entity);
@@ -970,6 +1188,9 @@ pub(crate) fn reap_quarantines_system(world: &mut World) {
             }
         }
     };
+    let authority_lost_retirement = matches!(&outcome, QuarantineReapOutcome::AuthorityLost { .. })
+        .then_some(authority_lost_retirement)
+        .flatten();
     let attempt = QuarantineReapAttempt {
         lease_id: refreshed.lease.id,
         generation: refreshed.lease.generation,
@@ -978,7 +1199,11 @@ pub(crate) fn reap_quarantines_system(world: &mut World) {
     };
     world
         .resource_mut::<QuarantineLeaseTable>()
-        .settle_reap_attempt(&refreshed.lease, attempt);
+        .settle_reap_attempt_with_authority_lost(
+            &refreshed.lease,
+            attempt,
+            authority_lost_retirement,
+        );
 }
 
 #[cfg(test)]
@@ -1116,6 +1341,7 @@ mod tests {
             entity_count: 1,
             records: vec![record],
             facts: QuarantineFacts::new(None, protected_parent, Vec::new(), foreign_components),
+            origin: None,
             last_attempt: None,
         }
     }
@@ -1193,6 +1419,7 @@ mod tests {
             entity_count: 1,
             records: vec![record],
             facts: QuarantineFacts::new(None, None, vec![foreign], Vec::new()),
+            origin: None,
             last_attempt: None,
         });
         world.insert_resource(table);
@@ -1435,6 +1662,7 @@ mod tests {
             entity_count,
             records,
             facts: QuarantineFacts::new(None, None, Vec::new(), vec![component]),
+            origin: None,
             last_attempt: None,
         });
         world.insert_resource(table);
@@ -1491,6 +1719,7 @@ mod tests {
                 Vec::new(),
                 vec![component],
             ),
+            origin: None,
             last_attempt: None,
         });
         world.insert_resource(table);
@@ -1640,6 +1869,35 @@ mod tests {
     }
 
     #[test]
+    fn live_authority_drift_retires_to_a_fact_only_tombstone() {
+        let mut world = World::new();
+        install_reaper_resources(&mut world);
+        let frame = frame_fixture();
+        let (record, foreign) = spawn_record(&mut world, &frame, 1, false, None);
+        let entity = record.entity;
+        let former_claim = record.claim();
+        let mut table = QuarantineLeaseTable::new();
+        table.next_sequence = 1;
+        table
+            .leases
+            .push(lease(&world, &table, 1, record, foreign, None));
+        world.insert_resource(table);
+        world.entity_mut(entity).remove::<RouteOwnershipSeal>();
+        world.flush();
+
+        reap_quarantines_system(&mut world);
+
+        assert!(world.get_entity(entity).is_ok());
+        let table = world.resource::<QuarantineLeaseTable>();
+        assert!(table.leases.is_empty());
+        assert!(
+            table
+                .authority_lost_tombstone(entity)
+                .is_some_and(|tombstone| tombstone.former_claim() == &former_claim)
+        );
+    }
+
+    #[test]
     fn reused_entity_slot_cannot_authorize_reaping_the_replacement_or_survivor() {
         let mut world = World::new();
         install_reaper_resources(&mut world);
@@ -1786,6 +2044,7 @@ mod tests {
             entity_count: 1,
             records: vec![record],
             facts: QuarantineFacts::new(None, None, vec![foreign], Vec::new()),
+            origin: None,
             last_attempt: None,
         });
         world.insert_resource(table);

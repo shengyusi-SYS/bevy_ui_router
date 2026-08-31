@@ -7872,10 +7872,13 @@ fn retain_r3_provisional_failure(
     entry: &mut RouterEntry,
     grant: r3_core::SourceBoundHostGrant,
     candidate: PreparedEcsHostCandidateSource,
-    settlement: ProvisionalHostSettlement,
+    mut settlement: ProvisionalHostSettlement,
     failure: Option<r3_core::HostAdmissionConfirmationFailureEvidence>,
-    stable_inert: bool,
+    mut stable_inert: bool,
 ) {
+    if !settlement.bind_quarantine_origin(entry.handle, grant.version().clone()) {
+        stable_inert = true;
+    }
     let receiver = failure.as_ref().and_then(|failure| match failure {
         r3_core::HostAdmissionConfirmationFailureEvidence::Receiver(receiver) => {
             Some(receiver.clone())

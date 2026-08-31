@@ -24,6 +24,7 @@ use bevy_ui_router_core::{
     slot::RouteSlotKey,
 };
 
+use crate::app_ext::RouterHandle;
 use crate::cleanup::{
     PreparedAuthorityLostResidualProjection, VerifiedCleanupQuarantineTransfer,
     cleanup_claim_has_exact_authority,
@@ -1014,6 +1015,29 @@ pub(crate) struct QuarantineFacts {
     missing_components: Vec<ComponentId>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct QuarantineOrigin {
+    router: RouterHandle,
+    former_host: HostVersion,
+}
+
+impl QuarantineOrigin {
+    pub(crate) const fn provisional(router: RouterHandle, former_host: HostVersion) -> Self {
+        Self {
+            router,
+            former_host,
+        }
+    }
+
+    pub(crate) const fn router(&self) -> RouterHandle {
+        self.router
+    }
+
+    pub(crate) const fn former_host(&self) -> &HostVersion {
+        &self.former_host
+    }
+}
+
 impl QuarantineFacts {
     pub(crate) fn new(
         former_app_host: Option<Entity>,
@@ -1518,6 +1542,10 @@ pub(crate) enum QuarantineReapOutcome {
         target: ExactRegistryClaim,
         evidence: QuarantineReapEvidence,
     },
+    AuthorityLost {
+        target: ExactRegistryClaim,
+        evidence: QuarantineReapEvidence,
+    },
     Despawned {
         target: ExactRegistryClaim,
         evidence: QuarantineReapEvidence,
@@ -1729,6 +1757,12 @@ fn try_clone_quarantine_reap_outcome(
                 evidence: try_clone_quarantine_evidence(evidence)?,
             })
         }
+        QuarantineReapOutcome::AuthorityLost { target, evidence } => {
+            Ok(QuarantineReapOutcome::AuthorityLost {
+                target: try_clone_exact_registry_claim(target)?,
+                evidence: try_clone_quarantine_evidence(evidence)?,
+            })
+        }
         QuarantineReapOutcome::Despawned {
             target,
             evidence,
@@ -1767,6 +1801,7 @@ pub(crate) struct QuarantineLease {
     entity_count: usize,
     records: Vec<QuarantineLeaseRecord>,
     facts: QuarantineFacts,
+    origin: Option<QuarantineOrigin>,
     last_attempt: Option<QuarantineReapAttempt>,
 }
 
@@ -1816,6 +1851,10 @@ impl QuarantineLease {
         &self.facts
     }
 
+    pub(crate) const fn origin(&self) -> Option<&QuarantineOrigin> {
+        self.origin.as_ref()
+    }
+
     #[cfg(test)]
     pub(crate) const fn id_for_test(&self) -> QuarantineLeaseId {
         self.id
@@ -1836,6 +1875,7 @@ pub(crate) struct PreparedQuarantineTransfer {
     entity_count: usize,
     records: Vec<QuarantineLeaseRecord>,
     facts: QuarantineFacts,
+    origin: Option<QuarantineOrigin>,
 }
 
 pub(crate) struct PreparedUnresolvedResidualTransfer {
@@ -1875,13 +1915,26 @@ struct AuthorityLostResidual {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct AuthorityLostResidualProvenance {
+enum AuthorityLostResidualProvenance {
+    Cleanup(CleanupAuthorityLostResidualProvenance),
+    QuarantineReaper(QuarantineReaperAuthorityLostResidualProvenance),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CleanupAuthorityLostResidualProvenance {
     ledger_domain: u64,
     manifest_digest: u64,
     attempt_revision: u64,
     obligation: usize,
     obligation_binding: u64,
     terminal_receipt_binding: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QuarantineReaperAuthorityLostResidualProvenance {
+    lease_id: QuarantineLeaseId,
+    lease_generation: u64,
+    operation_sequence: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1913,7 +1966,8 @@ impl AuthorityLostTombstone<'_> {
         self.residual.id == expected.id
             && self.residual.generation == expected.generation
             && self.residual.operation_sequence == expected.operation_sequence
-            && self.residual.provenance == expected.provenance
+            && self.residual.provenance
+                == AuthorityLostResidualProvenance::Cleanup(expected.provenance.clone())
             && self.residual.retired_claim == expected.retired_claim
             && self.residual.frozen_expected_manifest == expected.frozen_expected_manifest
             && self.residual.observed_manifest == expected.observed_manifest
@@ -1934,7 +1988,7 @@ pub(crate) struct PreparedAuthorityLostResidualTerminalProjection {
     id: ResidualLeaseId,
     generation: u64,
     operation_sequence: u64,
-    provenance: AuthorityLostResidualProvenance,
+    provenance: CleanupAuthorityLostResidualProvenance,
     retired_claim: ExactRegistryClaim,
     frozen_expected_manifest: ComponentManifest,
     observed_manifest: Option<ComponentManifest>,
@@ -2016,7 +2070,12 @@ impl PreparedAuthorityLostResidualTransfer {
                 id: residual.id,
                 generation: residual.generation,
                 operation_sequence: residual.operation_sequence,
-                provenance: residual.provenance.clone(),
+                provenance: match &residual.provenance {
+                    AuthorityLostResidualProvenance::Cleanup(provenance) => provenance.clone(),
+                    AuthorityLostResidualProvenance::QuarantineReaper(_) => unreachable!(
+                        "cleanup authority-lost preparation cannot contain reaper provenance"
+                    ),
+                },
                 retired_claim: residual.retired_claim.clone(),
                 frozen_expected_manifest: residual.frozen_expected_manifest.clone(),
                 observed_manifest: residual.observed_manifest.clone(),
@@ -2327,6 +2386,7 @@ fn try_clone_quarantine_lease(source: &QuarantineLease) -> Result<QuarantineLeas
         entity_count: source.entity_count,
         records: try_clone_quarantine_records(&source.records)?,
         facts: try_clone_quarantine_facts(&source.facts)?,
+        origin: source.origin.clone(),
         last_attempt: source
             .last_attempt
             .as_ref()
@@ -2354,6 +2414,7 @@ fn try_clone_quarantine_lease_for_reap_with_record_capacity(
             requested_record_capacity,
         )?,
         facts: try_clone_quarantine_facts(&source.facts)?,
+        origin: source.origin.clone(),
         last_attempt: None,
     })
 }
@@ -2455,6 +2516,7 @@ impl QuarantineLeaseTable {
         claims: Vec<ExactRegistryClaim>,
         manifests: Vec<(Entity, ComponentManifest)>,
         facts: QuarantineFacts,
+        origin: Option<QuarantineOrigin>,
         assigned_id: Option<QuarantineLeaseId>,
     ) -> Result<PreparedQuarantineTransfer, QuarantineTransferError> {
         if verified_preparation_fault_injected() {
@@ -2536,6 +2598,7 @@ impl QuarantineLeaseTable {
             entity_count,
             records,
             facts,
+            origin,
         })
     }
 
@@ -2565,6 +2628,7 @@ impl QuarantineLeaseTable {
             entity_count: prepared.entity_count,
             records: prepared.records,
             facts: prepared.facts,
+            origin: prepared.origin,
             last_attempt: None,
         });
         assert_eq!(self.leases.capacity(), capacity);
@@ -2686,14 +2750,18 @@ impl QuarantineLeaseTable {
                 || self.unresolved_record(entity).is_some()
                 || self.authority_lost.iter().any(|residual| {
                     residual.retired_claim.entity() == entity
-                        || (
-                            residual.provenance.ledger_domain,
-                            residual.provenance.attempt_revision,
-                            residual.provenance.obligation,
-                        ) == (
-                            fact.ledger_domain(),
-                            fact.attempt_revision(),
-                            fact.obligation(),
+                        || matches!(
+                            &residual.provenance,
+                            AuthorityLostResidualProvenance::Cleanup(provenance)
+                                if (
+                                    provenance.ledger_domain,
+                                    provenance.attempt_revision,
+                                    provenance.obligation,
+                                ) == (
+                                    fact.ledger_domain(),
+                                    fact.attempt_revision(),
+                                    fact.obligation(),
+                                )
                         )
                 })
             {
@@ -2744,14 +2812,16 @@ impl QuarantineLeaseTable {
                     },
                     generation: 1,
                     operation_sequence: 0,
-                    provenance: AuthorityLostResidualProvenance {
-                        ledger_domain: fact.ledger_domain(),
-                        manifest_digest: fact.manifest_digest(),
-                        attempt_revision: fact.attempt_revision(),
-                        obligation: fact.obligation(),
-                        obligation_binding: fact.obligation_binding(),
-                        terminal_receipt_binding: fact.terminal_receipt_binding(),
-                    },
+                    provenance: AuthorityLostResidualProvenance::Cleanup(
+                        CleanupAuthorityLostResidualProvenance {
+                            ledger_domain: fact.ledger_domain(),
+                            manifest_digest: fact.manifest_digest(),
+                            attempt_revision: fact.attempt_revision(),
+                            obligation: fact.obligation(),
+                            obligation_binding: fact.obligation_binding(),
+                            terminal_receipt_binding: fact.terminal_receipt_binding(),
+                        },
+                    ),
                     retired_claim: fact.retired_claim().clone(),
                     frozen_expected_manifest: fact.frozen_expected_manifest().clone(),
                     observed_manifest: fact.observed_manifest().cloned(),
@@ -2867,8 +2937,8 @@ pub(crate) fn prepare_verified_quarantine_transfer(
     registry: &RouteEntityRegistry,
     transfer: VerifiedQuarantineTransfer,
 ) -> Result<PreparedQuarantineTransfer, QuarantineTransferError> {
-    let (claims, manifests, facts) = transfer.into_parts();
-    table.prepare_verified(registry, claims, manifests, facts, None)
+    let (claims, manifests, facts, origin) = transfer.into_parts();
+    table.prepare_verified(registry, claims, manifests, facts, origin, None)
 }
 
 pub(crate) fn prepare_verified_frame_quarantine_transfer(
@@ -2877,7 +2947,7 @@ pub(crate) fn prepare_verified_frame_quarantine_transfer(
     transfer: VerifiedFrameQuarantineTransfer,
 ) -> Result<PreparedQuarantineTransfer, QuarantineTransferError> {
     let (claims, manifests, facts) = transfer.into_parts();
-    table.prepare_verified(registry, claims, manifests, facts, None)
+    table.prepare_verified(registry, claims, manifests, facts, None, None)
 }
 
 pub(crate) fn prepare_verified_cleanup_quarantine_transfer(
@@ -2886,7 +2956,7 @@ pub(crate) fn prepare_verified_cleanup_quarantine_transfer(
     transfer: VerifiedCleanupQuarantineTransfer,
 ) -> Result<PreparedQuarantineTransfer, QuarantineTransferError> {
     let (claims, manifests, facts) = transfer.into_parts();
-    table.prepare_verified(registry, claims, manifests, facts, None)
+    table.prepare_verified(registry, claims, manifests, facts, None, None)
 }
 
 pub(crate) fn prepare_verified_authority_cleanup_quarantine_transfer(
@@ -2896,7 +2966,7 @@ pub(crate) fn prepare_verified_authority_cleanup_quarantine_transfer(
     id: QuarantineLeaseId,
 ) -> Result<PreparedQuarantineTransfer, QuarantineTransferError> {
     let (claims, manifests, facts) = transfer.into_parts();
-    table.prepare_verified(registry, claims, manifests, facts, Some(id))
+    table.prepare_verified(registry, claims, manifests, facts, None, Some(id))
 }
 
 pub(crate) fn apply_prepared_quarantine_transfer(

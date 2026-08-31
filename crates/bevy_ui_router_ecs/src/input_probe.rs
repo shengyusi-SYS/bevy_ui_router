@@ -1,9 +1,11 @@
-use bevy_ecs::{prelude::World, resource::Resource};
+use std::sync::Arc;
+
+use bevy_ecs::{entity::Entity, prelude::World, resource::Resource};
 
 use crate::{
     app_ext::RouterHandle,
     audit::{AuditEntityId, RouterAuthorityAudits},
-    input::RouterInputGate,
+    input::{InputProbeEndpoint, RouterInputGate},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,25 +35,21 @@ pub enum InputProbeResult {
 struct InputProbeTarget {
     router: RouterHandle,
     target: AuditEntityId,
-    allowed: [bool; 3],
-}
-
-struct InputProbeDeliveryCounter {
-    target: AuditEntityId,
-    counts: [u64; 3],
+    entity: Entity,
+    owned: bool,
 }
 
 #[derive(Resource)]
 pub struct RouterInputProbes {
     targets: Vec<InputProbeTarget>,
-    deliveries: Vec<InputProbeDeliveryCounter>,
+    endpoint: Option<Arc<InputProbeEndpoint>>,
 }
 
 impl RouterInputProbes {
     pub(crate) const fn new() -> Self {
         Self {
             targets: Vec::new(),
-            deliveries: Vec::new(),
+            endpoint: None,
         }
     }
 
@@ -68,51 +66,43 @@ impl RouterInputProbes {
         else {
             return InputProbeResult::Unknown;
         };
-        if !resolved.allowed[modality.index()] {
+        let Some(endpoint) = self.endpoint.as_ref() else {
+            return InputProbeResult::Unknown;
+        };
+        if !resolved.owned {
             return InputProbeResult::Blocked;
         }
-        let counter = match self
-            .deliveries
-            .iter_mut()
-            .find(|counter| counter.target == target)
-        {
-            Some(counter) => counter,
-            None => {
-                self.deliveries.push(InputProbeDeliveryCounter {
-                    target,
-                    counts: [0; 3],
-                });
-                self.deliveries
-                    .last_mut()
-                    .expect("the input probe delivery counter was just inserted")
-            }
-        };
-        counter.counts[modality.index()] = counter.counts[modality.index()]
-            .checked_add(1)
-            .expect("input probe delivery counter exhausted");
-        InputProbeResult::Delivered
+        if endpoint.dispatch(resolved.target, resolved.entity, modality.index()) {
+            InputProbeResult::Delivered
+        } else {
+            InputProbeResult::Blocked
+        }
     }
 
     pub fn delivery_count(&self, target: AuditEntityId, modality: RouterInputModality) -> u64 {
-        self.deliveries
+        let Some(resolved) = self
+            .targets
             .iter()
-            .find(|counter| counter.target == target)
-            .map_or(0, |counter| counter.counts[modality.index()])
+            .find(|resolved| resolved.target == target)
+        else {
+            return 0;
+        };
+        self.endpoint.as_ref().map_or(0, |endpoint| {
+            endpoint.delivery_count(resolved.target, modality.index())
+        })
     }
 
     pub(crate) fn refresh(&mut self, gate: &RouterInputGate, audits: &RouterAuthorityAudits) {
         self.targets.clear();
+        self.endpoint = Some(gate.input_probe_endpoint());
         self.targets.extend(
             audits
                 .input_probe_targets()
                 .map(|(router, target, entity, owned)| InputProbeTarget {
                     router,
                     target,
-                    allowed: [
-                        owned && gate.allows_pointer(entity),
-                        owned && gate.allows_keyboard(entity),
-                        owned && gate.allows_gamepad(entity),
-                    ],
+                    entity,
+                    owned,
                 }),
         );
     }

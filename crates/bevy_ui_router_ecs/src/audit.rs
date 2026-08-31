@@ -578,10 +578,17 @@ fn quarantine_host_candidates(
 
 fn quarantine_former_host(
     lease: &QuarantineLease,
+    router: RouterHandle,
     previous: Option<&RouterAuthorityAuditSnapshot>,
     current: &RouterAuthorityAuditSnapshot,
     entry_host: Option<&HostVersion>,
 ) -> Option<HostVersion> {
+    if lease.root().provisional_top() {
+        return lease
+            .origin()
+            .filter(|origin| origin.router() == router)
+            .map(|origin| origin.former_host().clone());
+    }
     if let Some(previous) = previous
         && let Some(snapshot) = previous
             .quarantines
@@ -604,22 +611,7 @@ fn quarantine_former_host(
             .find(|candidate| host_version_matches_frame(candidate, frame))
             .cloned();
     }
-    if !lease.root().provisional_top() {
-        return None;
-    }
-    let former_app_host = lease.facts().former_app_host();
-    previous
-        .and_then(|snapshot| snapshot.host.as_ref())
-        .filter(|host| former_app_host.is_none_or(|entity| host.app_entity == entity))
-        .map(|host| host.version.clone())
-        .or_else(|| {
-            current
-                .host
-                .as_ref()
-                .filter(|host| former_app_host.is_none_or(|entity| host.app_entity == entity))
-                .map(|host| host.version.clone())
-        })
-        .or_else(|| candidates.first().cloned())
+    None
 }
 
 fn quarantine_lease_is_inert(world: &World, lease: &QuarantineLease) -> bool {
@@ -1320,7 +1312,8 @@ impl RouterAuthorityAudits {
         let entry_host = entry.host.as_ref().map(|host| &host.version);
         let mut quarantines = Vec::new();
         for lease in table.leases() {
-            let Some(former_host) = quarantine_former_host(lease, previous, current, entry_host)
+            let Some(former_host) =
+                quarantine_former_host(lease, entry.handle, previous, current, entry_host)
             else {
                 continue;
             };
@@ -1872,6 +1865,7 @@ mod tests {
     use super::*;
     use crate::{
         app_ext::{AppRouterExt, RouterConfig, RouterHostRegistration},
+        components::ProvisionalPostWriteProbe,
         content::{ContentColor, FrameContentWriter, SolidRect},
         driver::{EcsViewDriver, EcsViewReportSession, ViewBuildReport},
         navigation::{
@@ -1881,7 +1875,10 @@ mod tests {
         plugin::BevyUiRouterPlugin,
     };
     use bevy_app::App;
-    use bevy_ecs::prelude::Component;
+    use bevy_ecs::{
+        lifecycle::HookContext,
+        prelude::{Component, Resource},
+    };
     use bevy_ui::Node;
     use bevy_ui_router_core::prelude::{
         RouteLocation, RouteNodeOptions, RoutePattern, RouteTree, RouteViewKey,
@@ -1894,6 +1891,100 @@ mod tests {
 
     #[derive(Component)]
     struct AuditCleanupDrift;
+
+    #[derive(Component)]
+    struct AuditProvisionalDrift;
+
+    #[derive(Resource)]
+    struct AuditProvisionalDriftHost(Entity);
+
+    #[test]
+    fn provisional_quarantine_is_attributed_only_to_its_exact_router_origin() {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        app.world_mut()
+            .register_component_hooks::<ProvisionalPostWriteProbe>()
+            .on_add(|mut world, HookContext { entity, .. }| {
+                let target = world
+                    .get_resource::<AuditProvisionalDriftHost>()
+                    .map(|target| target.0);
+                if world.get::<ChildOf>(entity).map(ChildOf::parent) == target {
+                    world
+                        .commands()
+                        .entity(entity)
+                        .insert(AuditProvisionalDrift);
+                }
+            });
+        let driver = ViewDriverKey::new("provisional-origin-audit-driver").unwrap();
+        app.register_ui_view_driver(AuditDriver(driver.clone()))
+            .unwrap();
+        let make_config = || {
+            let view = RouteViewKey::new("root").unwrap();
+            let routes = RouteTree::builder()
+                .root_with_options(
+                    RoutePattern::path("/").unwrap(),
+                    RouteNodeOptions::new().with_view(view.clone()),
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let mut views = RouteViewRegistry::new();
+            views
+                .insert(view.clone(), RouteViewDescriptor::new(driver.clone()))
+                .unwrap();
+            RouterConfig::new(routes, views, view)
+        };
+        let router_a = app.add_ui_router(make_config()).unwrap();
+        let router_b = app.add_ui_router(make_config()).unwrap();
+        app.world_mut()
+            .spawn((Node::default(), RouterHostRegistration::new(router_b)));
+        observe_authority_system(app.world_mut());
+        let host_a = app
+            .world_mut()
+            .spawn((Node::default(), RouterHostRegistration::new(router_a)))
+            .id();
+        app.world_mut()
+            .insert_resource(AuditProvisionalDriftHost(host_a));
+
+        observe_authority_system(app.world_mut());
+        assert_eq!(
+            app.world()
+                .iter_entities()
+                .filter(|entity| entity.contains::<AuditProvisionalDrift>())
+                .count(),
+            1,
+            "the production post-write hook changes the real staging predicate input"
+        );
+        observe_authority_system(app.world_mut());
+
+        let table = app.world().resource::<QuarantineLeaseTable>();
+        let lease = table
+            .leases()
+            .iter()
+            .find(|lease| lease.root().provisional_top())
+            .expect("the drifted first-admission top slot is quarantined");
+        assert_eq!(lease.origin().map(|origin| origin.router()), Some(router_a));
+        let audits = app.world().resource::<RouterAuthorityAudits>();
+        let snapshot_a = audits
+            .get(router_a)
+            .expect("router A audit remains present");
+        let snapshot_b = audits
+            .get(router_b)
+            .expect("router B audit remains present");
+        assert_eq!(snapshot_a.quarantines().len(), 1);
+        assert_eq!(
+            snapshot_a.quarantines()[0].root_owner().kind(),
+            QuarantineOwnerKind::HostTopSlot
+        );
+        assert_eq!(
+            snapshot_a.quarantines()[0].former_host(),
+            lease
+                .origin()
+                .expect("production quarantine freezes its exact origin")
+                .former_host()
+        );
+        assert!(snapshot_b.quarantines().is_empty());
+    }
 
     #[cfg(feature = "test-support")]
     #[test]
@@ -2878,6 +2969,7 @@ mod tests {
         audits.ensure_namespace(router);
         audits.ensure_namespace(foreign_router);
         let active = audits.id_for(router, active_entity, true, None, None, true, false);
+        let observed_active = audits.id_for(router, active_entity, false, None, None, false, false);
         let foreign = audits.id_for(router, foreign_entity, false, None, None, false, false);
 
         let mut probes = RouterInputProbes::new();
@@ -2894,6 +2986,11 @@ mod tests {
             );
             assert_eq!(probes.delivery_count(active, modality), 1);
             assert_eq!(
+                probes.dispatch(router, observed_active, modality),
+                InputProbeResult::Blocked
+            );
+            assert_eq!(probes.delivery_count(observed_active, modality), 0);
+            assert_eq!(
                 probes.dispatch(router, foreign, modality),
                 InputProbeResult::Blocked
             );
@@ -2904,5 +3001,20 @@ mod tests {
             );
             assert_eq!(probes.delivery_count(active, modality), 1);
         }
+
+        world.resource_scope(|_world, gate: bevy_ecs::prelude::Mut<RouterInputGate>| {
+            prepare_input_gate_mutation(gate, &[active_entity], Vec::new())
+                .expect("the production gate can revoke the active target")
+                .apply();
+        });
+        assert_eq!(
+            probes.dispatch(router, active, RouterInputModality::Pointer),
+            InputProbeResult::Blocked,
+            "dispatch must observe production-gate revocation without a probe refresh"
+        );
+        assert_eq!(
+            probes.delivery_count(active, RouterInputModality::Pointer),
+            1
+        );
     }
 }
