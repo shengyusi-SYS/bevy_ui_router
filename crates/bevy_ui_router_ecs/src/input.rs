@@ -63,6 +63,10 @@ impl RouterInputGate {
     pub(crate) fn allowed_projection(&self) -> &[Entity] {
         &self.allowed
     }
+
+    pub(crate) fn isolate_targets_in_place(&mut self, targets: &[Entity]) {
+        self.allowed.retain(|entity| !targets.contains(entity));
+    }
 }
 
 #[derive(Clone)]

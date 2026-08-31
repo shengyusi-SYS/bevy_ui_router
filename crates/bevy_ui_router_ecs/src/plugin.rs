@@ -1,5 +1,5 @@
 use bevy_app::{App, Plugin, PreUpdate, Update};
-use bevy_ecs::prelude::{Resource, SystemSet};
+use bevy_ecs::prelude::{Resource, SystemSet, World};
 use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_input_focus::InputFocus;
 
@@ -11,10 +11,10 @@ use crate::input::{
 use crate::navigation::RouterNavigation;
 use crate::navigation::{
     collect_navigation_system, commit_presentation_system, drive_navigation_system,
-    observe_authority_system, publish_snapshots_system, reap_quarantines_system,
+    observe_authority_system, publish_snapshots_system, refresh_authority_audits,
     settle_cleanup_system,
 };
-use crate::registry::{QuarantineLeaseTable, RouteEntityRegistry};
+use crate::registry::{QuarantineLeaseTable, RouteEntityRegistry, reap_quarantines_system};
 use crate::snapshots::RouterSnapshots;
 
 #[derive(Default)]
@@ -39,6 +39,11 @@ pub enum RouterInputSet {
 
 #[derive(Resource)]
 struct RouterInstallMarker;
+
+fn reap_quarantines_and_refresh_authority_audits_system(world: &mut World) {
+    reap_quarantines_system(world);
+    refresh_authority_audits(world);
+}
 
 pub(crate) fn install_foundations(app: &mut App) {
     if app.world().contains_resource::<RouterInstallMarker>() {
@@ -99,7 +104,8 @@ pub(crate) fn install_foundations(app: &mut App) {
             drive_navigation_system.in_set(RouterScheduleSet::DriveNavigation),
             commit_presentation_system.in_set(RouterScheduleSet::CommitPresentation),
             settle_cleanup_system.in_set(RouterScheduleSet::SettleCleanup),
-            reap_quarantines_system.in_set(RouterScheduleSet::ReapQuarantines),
+            reap_quarantines_and_refresh_authority_audits_system
+                .in_set(RouterScheduleSet::ReapQuarantines),
             publish_snapshots_system.in_set(RouterScheduleSet::PublishSnapshots),
         ),
     )

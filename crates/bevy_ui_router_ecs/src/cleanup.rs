@@ -38,10 +38,10 @@ use crate::{
         PreparedAuthorityLostResidualTerminalProjection, PreparedAuthorityLostResidualTransfer,
         PreparedAuthorityPublicationCapacity, PreparedExactRegistryRetirement,
         PreparedQuarantineTransfer, ProvisionalOwner, QuarantineFacts, QuarantineLeaseId,
-        QuarantineLeaseTable, RegistryOwner, ResidualLeaseId, RouteEntityRegistry,
-        apply_prepared_authority_lost_residual_transfer, apply_prepared_exact_registry_retirement,
-        apply_prepared_quarantine_transfer, apply_prepared_unresolved_residual_transfer,
-        prepare_authority_lost_residual_transfer,
+        QuarantineLeaseTable, RegistryOwner, ResidualLeaseId, RouteEntityRecord,
+        RouteEntityRegistry, apply_prepared_authority_lost_residual_transfer,
+        apply_prepared_exact_registry_retirement, apply_prepared_quarantine_transfer,
+        apply_prepared_unresolved_residual_transfer, prepare_authority_lost_residual_transfer,
         prepare_authority_lost_residual_transfer_in_publication, prepare_exact_registry_retirement,
         prepare_unresolved_residual_transfer,
         prepare_verified_authority_cleanup_quarantine_transfer,
@@ -12361,27 +12361,55 @@ fn lifecycle_is_exact(physical: ProvisionalSlotLifecycle, registered: EntityLife
 }
 
 pub(crate) fn cleanup_claim_has_exact_authority(world: &World, claim: &ExactRegistryClaim) -> bool {
-    let seal_is_exact = world.get::<RouteOwnershipSeal>(claim.entity())
-        == Some(&RouteOwnershipSeal::new(claim.seal()));
-    let lifecycle_is_exact = match claim.owner() {
+    cleanup_authority_components_are_exact(
+        world,
+        claim.entity(),
+        claim.owner(),
+        claim.seal(),
+        claim.lifecycle(),
+    )
+}
+
+pub(crate) fn cleanup_record_has_exact_authority(
+    world: &World,
+    record: &RouteEntityRecord,
+) -> bool {
+    cleanup_authority_components_are_exact(
+        world,
+        record.entity(),
+        record.owner(),
+        record.seal(),
+        record.lifecycle(),
+    )
+}
+
+fn cleanup_authority_components_are_exact(
+    world: &World,
+    entity: Entity,
+    owner: &RegistryOwner,
+    seal: crate::registry::OwnershipSeal,
+    lifecycle: EntityLifecycle,
+) -> bool {
+    let seal_is_exact =
+        world.get::<RouteOwnershipSeal>(entity) == Some(&RouteOwnershipSeal::new(seal));
+    let lifecycle_is_exact = match owner {
         RegistryOwner::Committed(
             EntityOwner::FrameShell(_)
             | EntityOwner::FrameContentTarget(_)
             | EntityOwner::FrameOutput { .. },
-        ) => {
-            world.get::<FrameLifecycle>(claim.entity()) == Some(&FrameLifecycle(claim.lifecycle()))
-        }
+        ) => world.get::<FrameLifecycle>(entity) == Some(&FrameLifecycle(lifecycle)),
         RegistryOwner::Committed(EntityOwner::ChildSlot { .. })
         | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { .. }) => {
-            child_slot_components_match_claim(
-                world.get::<ChildSlotLifecycle>(claim.entity()),
-                world.get::<ChildSlotAuthority>(claim.entity()),
-                claim,
+            child_slot_components_match(
+                world.get::<ChildSlotLifecycle>(entity),
+                world.get::<ChildSlotAuthority>(entity),
+                owner,
+                lifecycle,
             )
         }
         RegistryOwner::Committed(EntityOwner::HostTopSlot { .. }) => world
-            .get::<ProvisionalSlotLifecycle>(claim.entity())
-            .is_some_and(|lifecycle| lifecycle_is_exact(*lifecycle, claim.lifecycle())),
+            .get::<ProvisionalSlotLifecycle>(entity)
+            .is_some_and(|observed| lifecycle_is_exact(*observed, lifecycle)),
         _ => false,
     };
     seal_is_exact && lifecycle_is_exact
@@ -12533,7 +12561,16 @@ fn child_slot_components_match_claim(
     authority: Option<&ChildSlotAuthority>,
     claim: &ExactRegistryClaim,
 ) -> bool {
-    let expected_lifecycle = match (claim.owner(), claim.lifecycle()) {
+    child_slot_components_match(lifecycle, authority, claim.owner(), claim.lifecycle())
+}
+
+fn child_slot_components_match(
+    lifecycle: Option<&ChildSlotLifecycle>,
+    authority: Option<&ChildSlotAuthority>,
+    owner: &RegistryOwner,
+    registered_lifecycle: EntityLifecycle,
+) -> bool {
+    let expected_lifecycle = match (owner, registered_lifecycle) {
         (
             RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { .. }),
             EntityLifecycle::PreparedInert,
@@ -12555,7 +12592,7 @@ fn child_slot_components_match_claim(
         ) => ChildSlotLifecycle::Quarantined,
         _ => return false,
     };
-    let (parent, outlet, slot) = match claim.owner() {
+    let (parent, outlet, slot) = match owner {
         RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
             parent,
             outlet,

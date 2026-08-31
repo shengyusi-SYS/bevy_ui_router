@@ -1,15 +1,21 @@
 #![allow(dead_code)]
 
+mod quarantine_reaper;
+pub(crate) use quarantine_reaper::reap_quarantines_system;
+
 use std::{
     collections::HashSet,
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
     component::ComponentId,
-    hierarchy::ChildOf,
+    hierarchy::{ChildOf, Children},
     prelude::{Entity, Resource, World},
 };
+use bevy_input_focus::InputFocus;
+use bevy_picking::Pickable;
 use bevy_ui_router_core::{
     HostVersion, frame::RouteFrameVersion, ids::RouteSlotId,
     integration::frame_versions_share_router, slot::RouteSlotKey,
@@ -19,9 +25,14 @@ use crate::cleanup::{
     PreparedAuthorityLostResidualProjection, VerifiedCleanupQuarantineTransfer,
     cleanup_claim_has_exact_authority,
 };
+use crate::components::{
+    ChildSlotAuthority, ChildSlotLifecycle, ProvisionalSlotLifecycle, RouteOwnershipSeal,
+    RouterInputBarrier,
+};
 use crate::host::HostCandidateRevision;
 use crate::host::VerifiedQuarantineTransfer;
-use crate::presentation::VerifiedFrameQuarantineTransfer;
+use crate::input::{RouteFocusState, RouterInputGate};
+use crate::presentation::{FrameLifecycle, VerifiedFrameQuarantineTransfer};
 
 static NEXT_SEAL_DOMAIN: AtomicU64 = AtomicU64::new(1);
 static NEXT_QUARANTINE_DOMAIN: AtomicU64 = AtomicU64::new(1);
@@ -1044,12 +1055,534 @@ impl QuarantineFacts {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct QuarantineLeaseRecord {
+    record: RouteEntityRecord,
+    observed_manifest: ComponentManifest,
+    foreign_components: Vec<ComponentId>,
+    missing_components: Vec<ComponentId>,
+}
+
+impl QuarantineLeaseRecord {
+    pub(crate) const fn record(&self) -> &RouteEntityRecord {
+        &self.record
+    }
+
+    pub(crate) const fn entity(&self) -> Entity {
+        self.record.entity
+    }
+
+    pub(crate) fn claim(&self) -> ExactRegistryClaim {
+        self.record.claim()
+    }
+
+    pub(crate) fn try_claim(&self) -> Result<ExactRegistryClaim, ()> {
+        Ok(ExactRegistryClaim {
+            entity: self.record.entity,
+            owner: try_clone_registry_owner(&self.record.owner)?,
+            seal: self.record.seal,
+            lifecycle: self.record.lifecycle,
+        })
+    }
+
+    pub(crate) const fn observed_manifest(&self) -> &ComponentManifest {
+        &self.observed_manifest
+    }
+
+    pub(crate) fn foreign_components(&self) -> &[ComponentId] {
+        &self.foreign_components
+    }
+
+    pub(crate) fn missing_components(&self) -> &[ComponentId] {
+        &self.missing_components
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QuarantineBarrierKind {
+    Visibility,
+    Pickable,
+    Input,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum QuarantineReapBlockReason {
+    ManifestDrift {
+        entity: Entity,
+        expected: ComponentManifest,
+        observed: ComponentManifest,
+    },
+    MissingBarrier {
+        entity: Entity,
+        barrier: QuarantineBarrierKind,
+    },
+    ProtectedParent {
+        entity: Entity,
+        parent: Entity,
+    },
+    ForeignChild {
+        entity: Entity,
+        child: Entity,
+    },
+    AuthorityDrift {
+        entity: Entity,
+    },
+    NoOwnedLeaf,
+    ProjectionUnavailable {
+        phase: QuarantineReapProjectionPhase,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QuarantineReapProjectionPhase {
+    InitialPreparation,
+    PrewriteRefreeze,
+    PostwritePreparation,
+    PostwriteRefreeze,
+    PostdespawnObservation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum QuarantinePhysicalAuthorityObservation {
+    Frame {
+        lifecycle: Option<EntityLifecycle>,
+    },
+    ChildSlot {
+        lifecycle: Option<ChildSlotLifecycle>,
+        parent: Option<RouteFrameVersion>,
+        outlet: Option<RouteSlotKey>,
+        slot: Option<RouteSlotId>,
+    },
+    HostTopSlot {
+        lifecycle: Option<ProvisionalSlotLifecycle>,
+    },
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct QuarantineAuthorityObservation {
+    entity_present: bool,
+    observed_seal: Option<OwnershipSeal>,
+    observed_authority: QuarantinePhysicalAuthorityObservation,
+    observed_manifest: Option<ComponentManifest>,
+}
+
+impl QuarantineAuthorityObservation {
+    pub(crate) fn from_world(world: &World, claim: &ExactRegistryClaim) -> Result<Self, ()> {
+        let entity = claim.entity();
+        let observed_authority = match claim.owner() {
+            RegistryOwner::Committed(
+                EntityOwner::FrameShell(_)
+                | EntityOwner::FrameContentTarget(_)
+                | EntityOwner::FrameOutput { .. },
+            ) => QuarantinePhysicalAuthorityObservation::Frame {
+                lifecycle: world.get::<FrameLifecycle>(entity).map(|value| value.0),
+            },
+            RegistryOwner::Committed(EntityOwner::ChildSlot { .. })
+            | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { .. }) => {
+                let authority = world.get::<ChildSlotAuthority>(entity);
+                QuarantinePhysicalAuthorityObservation::ChildSlot {
+                    lifecycle: world.get::<ChildSlotLifecycle>(entity).copied(),
+                    parent: authority.map(|value| value.parent().clone()),
+                    outlet: authority
+                        .map(|value| try_clone_route_slot_key(value.outlet()))
+                        .transpose()?,
+                    slot: authority.map(ChildSlotAuthority::slot),
+                }
+            }
+            RegistryOwner::Committed(EntityOwner::HostTopSlot { .. }) => {
+                QuarantinePhysicalAuthorityObservation::HostTopSlot {
+                    lifecycle: world.get::<ProvisionalSlotLifecycle>(entity).copied(),
+                }
+            }
+            _ => QuarantinePhysicalAuthorityObservation::Unsupported,
+        };
+        Ok(Self {
+            entity_present: world.get_entity(entity).is_ok(),
+            observed_seal: world
+                .get::<RouteOwnershipSeal>(entity)
+                .map(|seal| seal.seal()),
+            observed_authority,
+            observed_manifest: ComponentManifest::try_from_world(world, entity)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct QuarantineInputGateObservation {
+    pointer: bool,
+    keyboard: bool,
+    gamepad: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct QuarantineBoundaryObservation {
+    lease_id: QuarantineLeaseId,
+    generation: u64,
+    operation_sequence: u64,
+    target: ExactRegistryClaim,
+    expected_manifest: ComponentManifest,
+    transfer_manifest: ComponentManifest,
+    authority: QuarantineAuthorityObservation,
+    exact_authority: bool,
+    exact_entities: Vec<Entity>,
+    focus_targets: Vec<Entity>,
+    parent: Option<Entity>,
+    children: Option<Vec<Entity>>,
+    visibility: Option<Visibility>,
+    pickable: Option<Pickable>,
+    input_barrier: Option<RouterInputBarrier>,
+    input_focus: Option<Option<Entity>>,
+    route_focus: Option<Option<Entity>>,
+    input_gate: Option<QuarantineInputGateObservation>,
+    input_gate_allowed: Option<Vec<Entity>>,
+}
+
+impl QuarantineBoundaryObservation {
+    pub(crate) fn try_from_world(
+        world: &World,
+        lease: &QuarantineLease,
+        record: &QuarantineLeaseRecord,
+        exact_entities: &[Entity],
+        focus_targets: &[Entity],
+    ) -> Result<Self, ()> {
+        let operation_sequence = lease.operation_sequence.checked_add(1).ok_or(())?;
+        let target = record.try_claim()?;
+        let entity = target.entity();
+        let children = world
+            .get::<Children>(entity)
+            .map(|children| {
+                let mut projection = Vec::<Entity>::new();
+                projection
+                    .try_reserve_exact(children.len())
+                    .map_err(|_| ())?;
+                projection.extend(children.iter());
+                projection.sort_by_key(|child| child.to_bits());
+                projection.dedup();
+                Ok(projection)
+            })
+            .transpose()?;
+        let try_clone_entities = |source: &[Entity]| {
+            let mut projection = Vec::new();
+            projection.try_reserve_exact(source.len()).map_err(|_| ())?;
+            projection.extend_from_slice(source);
+            Ok::<Vec<Entity>, ()>(projection)
+        };
+        let authority = QuarantineAuthorityObservation::from_world(world, &target)?;
+        let exact_authority = cleanup_claim_has_exact_authority(world, &target);
+        Ok(Self {
+            lease_id: lease.id,
+            generation: lease.generation,
+            operation_sequence,
+            target,
+            expected_manifest: record.record.manifest.try_clone()?,
+            transfer_manifest: record.observed_manifest.try_clone()?,
+            authority,
+            exact_authority,
+            exact_entities: try_clone_entities(exact_entities)?,
+            focus_targets: try_clone_entities(focus_targets)?,
+            parent: world.get::<ChildOf>(entity).map(ChildOf::parent),
+            children,
+            visibility: world.get::<Visibility>(entity).copied(),
+            pickable: world.get::<Pickable>(entity).copied(),
+            input_barrier: world.get::<RouterInputBarrier>(entity).copied(),
+            input_focus: world.get_resource::<InputFocus>().map(InputFocus::get),
+            route_focus: world
+                .get_resource::<RouteFocusState>()
+                .map(RouteFocusState::focused),
+            input_gate: world.get_resource::<RouterInputGate>().map(|gate| {
+                QuarantineInputGateObservation {
+                    pointer: gate.allows_pointer(entity),
+                    keyboard: gate.allows_keyboard(entity),
+                    gamepad: gate.allows_gamepad(entity),
+                }
+            }),
+            input_gate_allowed: world
+                .get_resource::<RouterInputGate>()
+                .map(|gate| try_clone_entities(gate.allowed_projection()))
+                .transpose()?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum QuarantineReapEvidence {
+    Observed(Vec<QuarantineBoundaryObservation>),
+    Unavailable {
+        phase: QuarantineReapProjectionPhase,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum QuarantineReapPostwrite {
+    Refrozen {
+        survivors: Vec<QuarantineBoundaryObservation>,
+    },
+    Superseded {
+        target: Option<ExactRegistryClaim>,
+        reason: QuarantineReapBlockReason,
+        evidence: QuarantineReapEvidence,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum QuarantineReapOutcome {
+    Blocked {
+        target: Option<ExactRegistryClaim>,
+        reason: QuarantineReapBlockReason,
+        evidence: QuarantineReapEvidence,
+    },
+    Terminal {
+        target: ExactRegistryClaim,
+        evidence: QuarantineReapEvidence,
+    },
+    Despawned {
+        target: ExactRegistryClaim,
+        evidence: QuarantineReapEvidence,
+        postwrite: QuarantineReapPostwrite,
+    },
+    DespawnRejected {
+        target: ExactRegistryClaim,
+        evidence: QuarantineReapEvidence,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct QuarantineReapAttempt {
+    lease_id: QuarantineLeaseId,
+    generation: u64,
+    operation_sequence: u64,
+    outcome: QuarantineReapOutcome,
+}
+
+fn try_clone_quarantine_authority_observation(
+    source: &QuarantineAuthorityObservation,
+) -> Result<QuarantineAuthorityObservation, ()> {
+    Ok(QuarantineAuthorityObservation {
+        entity_present: source.entity_present,
+        observed_seal: source.observed_seal,
+        observed_authority: try_clone_quarantine_physical_authority_observation(
+            &source.observed_authority,
+        )?,
+        observed_manifest: source
+            .observed_manifest
+            .as_ref()
+            .map(ComponentManifest::try_clone)
+            .transpose()?,
+    })
+}
+
+fn try_clone_quarantine_physical_authority_observation(
+    source: &QuarantinePhysicalAuthorityObservation,
+) -> Result<QuarantinePhysicalAuthorityObservation, ()> {
+    Ok(match source {
+        QuarantinePhysicalAuthorityObservation::Frame { lifecycle } => {
+            QuarantinePhysicalAuthorityObservation::Frame {
+                lifecycle: *lifecycle,
+            }
+        }
+        QuarantinePhysicalAuthorityObservation::ChildSlot {
+            lifecycle,
+            parent,
+            outlet,
+            slot,
+        } => QuarantinePhysicalAuthorityObservation::ChildSlot {
+            lifecycle: *lifecycle,
+            parent: parent.clone(),
+            outlet: outlet.as_ref().map(try_clone_route_slot_key).transpose()?,
+            slot: *slot,
+        },
+        QuarantinePhysicalAuthorityObservation::HostTopSlot { lifecycle } => {
+            QuarantinePhysicalAuthorityObservation::HostTopSlot {
+                lifecycle: *lifecycle,
+            }
+        }
+        QuarantinePhysicalAuthorityObservation::Unsupported => {
+            QuarantinePhysicalAuthorityObservation::Unsupported
+        }
+    })
+}
+
+fn try_clone_quarantine_boundary_observation(
+    source: &QuarantineBoundaryObservation,
+) -> Result<QuarantineBoundaryObservation, ()> {
+    Ok(QuarantineBoundaryObservation {
+        lease_id: source.lease_id,
+        generation: source.generation,
+        operation_sequence: source.operation_sequence,
+        target: try_clone_exact_registry_claim(&source.target)?,
+        expected_manifest: source.expected_manifest.try_clone()?,
+        transfer_manifest: source.transfer_manifest.try_clone()?,
+        authority: try_clone_quarantine_authority_observation(&source.authority)?,
+        exact_authority: source.exact_authority,
+        exact_entities: try_clone_copy_slice(&source.exact_entities)?,
+        focus_targets: try_clone_copy_slice(&source.focus_targets)?,
+        parent: source.parent,
+        children: source
+            .children
+            .as_ref()
+            .map(|children| try_clone_copy_slice(children))
+            .transpose()?,
+        visibility: source.visibility,
+        pickable: source.pickable,
+        input_barrier: source.input_barrier,
+        input_focus: source.input_focus,
+        route_focus: source.route_focus,
+        input_gate: source.input_gate,
+        input_gate_allowed: source
+            .input_gate_allowed
+            .as_ref()
+            .map(|allowed| try_clone_copy_slice(allowed))
+            .transpose()?,
+    })
+}
+
+fn try_clone_quarantine_evidence(
+    source: &QuarantineReapEvidence,
+) -> Result<QuarantineReapEvidence, ()> {
+    match source {
+        QuarantineReapEvidence::Observed(source) => {
+            let mut observations = Vec::new();
+            observations
+                .try_reserve_exact(source.len())
+                .map_err(|_| ())?;
+            for observation in source {
+                observations.push(try_clone_quarantine_boundary_observation(observation)?);
+            }
+            Ok(QuarantineReapEvidence::Observed(observations))
+        }
+        QuarantineReapEvidence::Unavailable { phase } => {
+            Ok(QuarantineReapEvidence::Unavailable { phase: *phase })
+        }
+    }
+}
+
+fn try_clone_quarantine_block_reason(
+    source: &QuarantineReapBlockReason,
+) -> Result<QuarantineReapBlockReason, ()> {
+    match source {
+        QuarantineReapBlockReason::ManifestDrift {
+            entity,
+            expected,
+            observed,
+        } => Ok(QuarantineReapBlockReason::ManifestDrift {
+            entity: *entity,
+            expected: expected.try_clone()?,
+            observed: observed.try_clone()?,
+        }),
+        QuarantineReapBlockReason::MissingBarrier { entity, barrier } => {
+            Ok(QuarantineReapBlockReason::MissingBarrier {
+                entity: *entity,
+                barrier: *barrier,
+            })
+        }
+        QuarantineReapBlockReason::ProtectedParent { entity, parent } => {
+            Ok(QuarantineReapBlockReason::ProtectedParent {
+                entity: *entity,
+                parent: *parent,
+            })
+        }
+        QuarantineReapBlockReason::ForeignChild { entity, child } => {
+            Ok(QuarantineReapBlockReason::ForeignChild {
+                entity: *entity,
+                child: *child,
+            })
+        }
+        QuarantineReapBlockReason::AuthorityDrift { entity } => {
+            Ok(QuarantineReapBlockReason::AuthorityDrift { entity: *entity })
+        }
+        QuarantineReapBlockReason::NoOwnedLeaf => Ok(QuarantineReapBlockReason::NoOwnedLeaf),
+        QuarantineReapBlockReason::ProjectionUnavailable { phase } => {
+            Ok(QuarantineReapBlockReason::ProjectionUnavailable { phase: *phase })
+        }
+    }
+}
+
+fn try_clone_quarantine_postwrite(
+    source: &QuarantineReapPostwrite,
+) -> Result<QuarantineReapPostwrite, ()> {
+    match source {
+        QuarantineReapPostwrite::Refrozen { survivors } => {
+            let mut cloned = Vec::new();
+            cloned.try_reserve_exact(survivors.len()).map_err(|_| ())?;
+            for survivor in survivors {
+                cloned.push(try_clone_quarantine_boundary_observation(survivor)?);
+            }
+            Ok(QuarantineReapPostwrite::Refrozen { survivors: cloned })
+        }
+        QuarantineReapPostwrite::Superseded {
+            target,
+            reason,
+            evidence,
+        } => Ok(QuarantineReapPostwrite::Superseded {
+            target: target
+                .as_ref()
+                .map(try_clone_exact_registry_claim)
+                .transpose()?,
+            reason: try_clone_quarantine_block_reason(reason)?,
+            evidence: try_clone_quarantine_evidence(evidence)?,
+        }),
+    }
+}
+
+fn try_clone_quarantine_reap_outcome(
+    source: &QuarantineReapOutcome,
+) -> Result<QuarantineReapOutcome, ()> {
+    match source {
+        QuarantineReapOutcome::Blocked {
+            target,
+            reason,
+            evidence,
+        } => Ok(QuarantineReapOutcome::Blocked {
+            target: target
+                .as_ref()
+                .map(try_clone_exact_registry_claim)
+                .transpose()?,
+            reason: try_clone_quarantine_block_reason(reason)?,
+            evidence: try_clone_quarantine_evidence(evidence)?,
+        }),
+        QuarantineReapOutcome::Terminal { target, evidence } => {
+            Ok(QuarantineReapOutcome::Terminal {
+                target: try_clone_exact_registry_claim(target)?,
+                evidence: try_clone_quarantine_evidence(evidence)?,
+            })
+        }
+        QuarantineReapOutcome::Despawned {
+            target,
+            evidence,
+            postwrite,
+        } => Ok(QuarantineReapOutcome::Despawned {
+            target: try_clone_exact_registry_claim(target)?,
+            evidence: try_clone_quarantine_evidence(evidence)?,
+            postwrite: try_clone_quarantine_postwrite(postwrite)?,
+        }),
+        QuarantineReapOutcome::DespawnRejected { target, evidence } => {
+            Ok(QuarantineReapOutcome::DespawnRejected {
+                target: try_clone_exact_registry_claim(target)?,
+                evidence: try_clone_quarantine_evidence(evidence)?,
+            })
+        }
+    }
+}
+
+fn try_clone_quarantine_reap_attempt(
+    source: &QuarantineReapAttempt,
+) -> Result<QuarantineReapAttempt, ()> {
+    Ok(QuarantineReapAttempt {
+        lease_id: source.lease_id,
+        generation: source.generation,
+        operation_sequence: source.operation_sequence,
+        outcome: try_clone_quarantine_reap_outcome(&source.outcome)?,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct QuarantineLease {
     id: QuarantineLeaseId,
     generation: u64,
     operation_sequence: u64,
-    records: Vec<RouteEntityRecord>,
+    records: Vec<QuarantineLeaseRecord>,
     facts: QuarantineFacts,
+    last_attempt: Option<QuarantineReapAttempt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1069,7 +1602,10 @@ impl UnresolvedResidual {
 
 impl QuarantineLease {
     pub(crate) fn owned_entities(&self) -> Vec<Entity> {
-        self.records.iter().map(RouteEntityRecord::entity).collect()
+        self.records
+            .iter()
+            .map(QuarantineLeaseRecord::entity)
+            .collect()
     }
     pub(crate) fn foreign_descendants(&self) -> &[Entity] {
         &self.facts.foreign_descendants
@@ -1091,7 +1627,7 @@ pub(crate) enum QuarantineTransferError {
 pub(crate) struct PreparedQuarantineTransfer {
     id: QuarantineLeaseId,
     source_claims: Vec<ExactRegistryClaim>,
-    records: Vec<RouteEntityRecord>,
+    records: Vec<QuarantineLeaseRecord>,
     facts: QuarantineFacts,
 }
 
@@ -1482,6 +2018,8 @@ pub(crate) struct QuarantineLeaseTable {
     domain: u64,
     next_sequence: u64,
     next_residual_sequence: u64,
+    reap_cursor: Option<QuarantineLeaseId>,
+    last_closed_reap_attempt: Option<QuarantineReapAttempt>,
     leases: Vec<QuarantineLease>,
     unresolved: Vec<UnresolvedResidual>,
     /// Fact-only terminal partition for retired claims whose physical
@@ -1496,6 +2034,23 @@ fn try_clone_copy_slice<T: Copy>(source: &[T]) -> Result<Vec<T>, ()> {
     cloned.try_reserve_exact(source.len()).map_err(|_| ())?;
     cloned.extend_from_slice(source);
     Ok(cloned)
+}
+
+fn try_component_difference(
+    left: &ComponentManifest,
+    right: &ComponentManifest,
+) -> Result<Vec<ComponentId>, ()> {
+    let mut difference = Vec::new();
+    difference
+        .try_reserve_exact(left.component_ids().len())
+        .map_err(|_| ())?;
+    difference.extend(
+        left.component_ids()
+            .iter()
+            .copied()
+            .filter(|component| !right.component_ids().contains(component)),
+    );
+    Ok(difference)
 }
 
 fn try_clone_quarantine_facts(source: &QuarantineFacts) -> Result<QuarantineFacts, ()> {
@@ -1517,6 +2072,34 @@ fn try_clone_registry_records(source: &[RouteEntityRecord]) -> Result<Vec<RouteE
     Ok(records)
 }
 
+fn try_clone_quarantine_records(
+    source: &[QuarantineLeaseRecord],
+) -> Result<Vec<QuarantineLeaseRecord>, ()> {
+    try_clone_quarantine_records_with_capacity(source, source.len())
+}
+
+fn try_clone_quarantine_records_with_capacity(
+    source: &[QuarantineLeaseRecord],
+    requested_capacity: usize,
+) -> Result<Vec<QuarantineLeaseRecord>, ()> {
+    if requested_capacity < source.len() {
+        return Err(());
+    }
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(requested_capacity)
+        .map_err(|_| ())?;
+    for record in source {
+        records.push(QuarantineLeaseRecord {
+            record: try_clone_route_entity_record(&record.record)?,
+            observed_manifest: record.observed_manifest.try_clone()?,
+            foreign_components: try_clone_copy_slice(&record.foreign_components)?,
+            missing_components: try_clone_copy_slice(&record.missing_components)?,
+        });
+    }
+    Ok(records)
+}
+
 fn try_clone_actual_manifests(
     source: &[(Entity, ComponentManifest)],
 ) -> Result<Vec<(Entity, ComponentManifest)>, ()> {
@@ -1533,8 +2116,34 @@ fn try_clone_quarantine_lease(source: &QuarantineLease) -> Result<QuarantineLeas
         id: source.id,
         generation: source.generation,
         operation_sequence: source.operation_sequence,
-        records: try_clone_registry_records(&source.records)?,
+        records: try_clone_quarantine_records(&source.records)?,
         facts: try_clone_quarantine_facts(&source.facts)?,
+        last_attempt: source
+            .last_attempt
+            .as_ref()
+            .map(try_clone_quarantine_reap_attempt)
+            .transpose()?,
+    })
+}
+
+fn try_clone_quarantine_lease_for_reap(source: &QuarantineLease) -> Result<QuarantineLease, ()> {
+    try_clone_quarantine_lease_for_reap_with_record_capacity(source, source.records.len())
+}
+
+fn try_clone_quarantine_lease_for_reap_with_record_capacity(
+    source: &QuarantineLease,
+    requested_record_capacity: usize,
+) -> Result<QuarantineLease, ()> {
+    Ok(QuarantineLease {
+        id: source.id,
+        generation: source.generation,
+        operation_sequence: source.operation_sequence,
+        records: try_clone_quarantine_records_with_capacity(
+            &source.records,
+            requested_record_capacity,
+        )?,
+        facts: try_clone_quarantine_facts(&source.facts)?,
+        last_attempt: None,
     })
 }
 
@@ -1580,6 +2189,8 @@ impl QuarantineLeaseTable {
                 .expect("quarantine lease domain exhausted"),
             next_sequence: 0,
             next_residual_sequence: 0,
+            reap_cursor: None,
+            last_closed_reap_attempt: None,
             leases: Vec::new(),
             unresolved: Vec::new(),
             authority_lost: Vec::new(),
@@ -1615,6 +2226,12 @@ impl QuarantineLeaseTable {
             domain: self.domain,
             next_sequence: self.next_sequence,
             next_residual_sequence: self.next_residual_sequence,
+            reap_cursor: self.reap_cursor,
+            last_closed_reap_attempt: self
+                .last_closed_reap_attempt
+                .as_ref()
+                .map(try_clone_quarantine_reap_attempt)
+                .transpose()?,
             leases,
             unresolved,
             authority_lost,
@@ -1656,13 +2273,24 @@ impl QuarantineLeaseTable {
             if matching_manifests.next().is_some() {
                 return Err(QuarantineTransferError::UnknownOwnedEntity);
             }
-            let mut record = record.clone();
+            let mut record = try_clone_route_entity_record(record)
+                .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
             record.lifecycle = EntityLifecycle::Quarantined;
-            record.manifest = manifest.clone();
-            records.push(record);
+            let foreign_components = try_component_difference(manifest, &record.manifest)
+                .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
+            let missing_components = try_component_difference(&record.manifest, manifest)
+                .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
+            records.push(QuarantineLeaseRecord {
+                record,
+                observed_manifest: manifest
+                    .try_clone()
+                    .map_err(|_| QuarantineTransferError::CapacityExhausted)?,
+                foreign_components,
+                missing_components,
+            });
         }
-        records.sort_by_key(|record| record.entity.to_bits());
-        records.dedup_by_key(|record| record.entity);
+        records.sort_by_key(|record| record.entity().to_bits());
+        records.dedup_by_key(|record| record.entity());
         if records.len() != claims.len() {
             return Err(QuarantineTransferError::UnknownOwnedEntity);
         }
@@ -1718,6 +2346,7 @@ impl QuarantineLeaseTable {
             operation_sequence: 0,
             records: prepared.records,
             facts: prepared.facts,
+            last_attempt: None,
         });
         assert_eq!(self.leases.capacity(), capacity);
         prepared.id
@@ -1972,7 +2601,8 @@ impl QuarantineLeaseTable {
         self.leases
             .iter()
             .flat_map(|lease| lease.records.iter())
-            .find(|record| record.entity == entity)
+            .find(|record| record.entity() == entity)
+            .map(QuarantineLeaseRecord::record)
     }
 
     pub(crate) fn unresolved_record(&self, entity: Entity) -> Option<&RouteEntityRecord> {
@@ -1998,6 +2628,7 @@ impl QuarantineLeaseTable {
         self.leases
             .iter()
             .flat_map(|lease| lease.records.iter())
+            .map(QuarantineLeaseRecord::record)
             .chain(
                 self.unresolved
                     .iter()
@@ -2726,6 +3357,82 @@ mod tests {
         );
         assert!(registry.records().is_empty());
         assert_eq!(table.leases(), baseline);
+    }
+
+    #[test]
+    fn quarantine_transfer_preserves_expected_and_observed_manifests_per_record() {
+        let mut world = World::new();
+        let entity = world.spawn(A).id();
+        let expected = ComponentManifest::from_world(&world, entity).unwrap();
+        let mut registry = RouteEntityRegistry::new();
+        let seal = registry.issue_seal();
+        registry
+            .register(
+                entity,
+                RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
+                    ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(7)),
+                )),
+                seal,
+                expected.clone(),
+                EntityLifecycle::PreparedInert,
+            )
+            .unwrap();
+        world.entity_mut(entity).insert(B);
+        let observed = ComponentManifest::from_world(&world, entity).unwrap();
+        let foreign = world.components().component_id::<B>().unwrap();
+        let mut table = QuarantineLeaseTable::new();
+        let transfer = VerifiedQuarantineTransfer::fixture(
+            vec![registry.record(entity).unwrap().claim()],
+            vec![(entity, observed.clone())],
+            QuarantineFacts::new(None, None, vec![], vec![foreign]),
+        );
+
+        let prepared =
+            prepare_verified_quarantine_transfer(&mut table, &registry, transfer).unwrap();
+        let lease = apply_prepared_quarantine_transfer(&mut table, &mut registry, prepared);
+        let record = &table.lease(lease).unwrap().records[0];
+
+        assert_eq!(record.record().manifest(), &expected);
+        assert_eq!(record.observed_manifest(), &observed);
+        assert_eq!(record.foreign_components(), &[foreign]);
+        assert!(record.missing_components().is_empty());
+    }
+
+    #[test]
+    fn quarantine_transfer_derives_record_drift_without_trusting_aggregate_facts() {
+        let mut world = World::new();
+        let entity = world.spawn(A).id();
+        let expected = ComponentManifest::from_world(&world, entity).unwrap();
+        let mut registry = RouteEntityRegistry::new();
+        let seal = registry.issue_seal();
+        registry
+            .register(
+                entity,
+                RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
+                    ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(8)),
+                )),
+                seal,
+                expected,
+                EntityLifecycle::PreparedInert,
+            )
+            .unwrap();
+        world.entity_mut(entity).insert(B);
+        let observed = ComponentManifest::from_world(&world, entity).unwrap();
+        let foreign = world.components().component_id::<B>().unwrap();
+        let mut table = QuarantineLeaseTable::new();
+        let transfer = VerifiedQuarantineTransfer::fixture(
+            vec![registry.record(entity).unwrap().claim()],
+            vec![(entity, observed)],
+            QuarantineFacts::new(None, None, vec![], vec![]),
+        );
+
+        let prepared =
+            prepare_verified_quarantine_transfer(&mut table, &registry, transfer).unwrap();
+        let lease = apply_prepared_quarantine_transfer(&mut table, &mut registry, prepared);
+        assert_eq!(
+            table.lease(lease).unwrap().records[0].foreign_components(),
+            &[foreign]
+        );
     }
 
     #[test]

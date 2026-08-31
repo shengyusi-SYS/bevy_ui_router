@@ -22095,8 +22095,6 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
     refresh_authority_audits(world);
 }
 
-pub(crate) fn reap_quarantines_system(_world: &mut World) {}
-
 pub(crate) fn publish_snapshots_system(world: &mut World) {
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
@@ -22111,7 +22109,7 @@ pub(crate) fn publish_snapshots_system(world: &mut World) {
 }
 
 #[cfg(feature = "test-support")]
-fn refresh_authority_audits(world: &mut World) {
+pub(crate) fn refresh_authority_audits(world: &mut World) {
     world.resource_scope(
         |world, navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             world.resource_scope(
@@ -22127,7 +22125,7 @@ fn refresh_authority_audits(world: &mut World) {
 }
 
 #[cfg(not(feature = "test-support"))]
-fn refresh_authority_audits(_world: &mut World) {}
+pub(crate) fn refresh_authority_audits(_world: &mut World) {}
 
 #[cfg(test)]
 #[path = "navigation_tests.rs"]

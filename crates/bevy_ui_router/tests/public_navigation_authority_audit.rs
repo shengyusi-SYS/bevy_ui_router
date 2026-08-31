@@ -55,6 +55,29 @@ struct RecoveryR3AuditLossInjection {
     fired: bool,
 }
 
+#[derive(Resource)]
+struct RecoveryR3ReapAuditWindowProbe {
+    router: RouterHandle,
+    target: AuditEntityId,
+    observed_removed: bool,
+}
+
+fn capture_recovery_r3_reap_audit_window(world: &mut World) {
+    let (router, target) = {
+        let probe = world.resource::<RecoveryR3ReapAuditWindowProbe>();
+        (probe.router, probe.target)
+    };
+    if world
+        .resource::<RouterAuthorityAudits>()
+        .get(router)
+        .is_some_and(|audit| audit.owned_entity_state(target) == AuditEntityState::Removed)
+    {
+        world
+            .resource_mut::<RecoveryR3ReapAuditWindowProbe>()
+            .observed_removed = true;
+    }
+}
+
 fn inject_recovery_r3_audit_registration_loss(world: &mut World) {
     let (host, fired) = {
         let injection = world.resource::<RecoveryR3AuditLossInjection>();
@@ -2428,7 +2451,7 @@ fn recovery_r3_same_host_and_stale_epoch_authority_audit_is_exact() {
         .resource::<RouterSnapshots>()
         .request(router, stale_request)
     {
-        RequestLookup::Found(snapshot) => snapshot,
+        RequestLookup::Found(snapshot) => snapshot.clone(),
         _ => panic!("the stale request remains retained after replay"),
     };
     assert_eq!(
@@ -2512,4 +2535,143 @@ fn recovery_r3_same_host_and_stale_epoch_authority_audit_is_exact() {
     assert!(snapshot_after_release.pending_phase().is_none());
     assert!(!snapshot_after_release.cleanup().foreground_pending());
     assert_eq!(snapshot_after_release.cleanup().quarantine_count(), 1);
+
+    app.world_mut()
+        .insert_resource(RecoveryR3ReapAuditWindowProbe {
+            router,
+            target: old_host_mapping.top_slot(),
+            observed_removed: false,
+        });
+    app.add_systems(
+        Update,
+        capture_recovery_r3_reap_audit_window
+            .after(RouterScheduleSet::ReapQuarantines)
+            .before(RouterScheduleSet::PublishSnapshots),
+    );
+    app.world_mut().despawn(foreign);
+    for _ in 0..24 {
+        app.update();
+        let audit = app
+            .world()
+            .resource::<RouterAuthorityAudits>()
+            .get(router)
+            .unwrap();
+        if audit.owned_entity_state(old_host_mapping.top_slot()) == AuditEntityState::Removed {
+            break;
+        }
+    }
+
+    let snapshot_after_reap = app
+        .world()
+        .resource::<RouterSnapshots>()
+        .get(router)
+        .unwrap();
+    assert_eq!(
+        snapshot_after_reap.requested(),
+        snapshot_after_release.requested()
+    );
+    assert_eq!(
+        snapshot_after_reap.matched(),
+        snapshot_after_release.matched()
+    );
+    assert_eq!(
+        snapshot_after_reap.active(),
+        snapshot_after_release.active()
+    );
+    assert_eq!(
+        snapshot_after_reap.availability(),
+        snapshot_after_release.availability()
+    );
+    assert_eq!(
+        snapshot_after_reap.history(),
+        snapshot_after_release.history()
+    );
+    assert_eq!(
+        snapshot_after_reap.diagnostics(),
+        snapshot_after_release.diagnostics()
+    );
+    assert_eq!(
+        snapshot_after_reap.running_request(),
+        snapshot_after_release.running_request()
+    );
+    assert!(!snapshot_after_reap.cleanup().foreground_pending());
+    assert_eq!(snapshot_after_reap.cleanup().quarantine_count(), 1);
+    assert!(
+        app.world()
+            .resource::<RecoveryR3ReapAuditWindowProbe>()
+            .observed_removed,
+        "an after-Reap/before-Publish consumer must observe the refreshed removal audit"
+    );
+    let audit_after_reap = app
+        .world()
+        .resource::<RouterAuthorityAudits>()
+        .get(router)
+        .unwrap();
+    assert_recovery_r3_observable_mapping_unchanged(&audit_before_release, audit_after_reap);
+    assert_eq!(
+        audit_after_reap.owned_entity_state(old_host_mapping.top_slot()),
+        AuditEntityState::Removed
+    );
+    assert!(current_entities.iter().all(|entity| {
+        audit_after_reap.owned_entity_state(*entity) == AuditEntityState::PresentOwned
+    }));
+    assert!(app.world().get_entity(old_top_slot).is_err());
+    assert!(app.world().get_entity(new_top_slot).is_ok());
+    assert_eq!(
+        app.world()
+            .get::<Children>(host)
+            .unwrap()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![first_child, second_child, new_top_slot]
+    );
+    assert_eq!(audit_component_manifest(&app, host), host_manifest);
+    assert_eq!(audit_component_manifest(&app, first_child), first_manifest);
+    assert_eq!(
+        audit_component_manifest(&app, second_child),
+        second_manifest
+    );
+    assert_eq!(effects.load(Ordering::SeqCst), effects_before_release);
+    assert_eq!(
+        app.world().get::<RecoveryAuditHostSentinel>(host),
+        Some(&RecoveryAuditHostSentinel(0x731))
+    );
+    assert_eq!(
+        app.world().get::<RecoveryAuditChildSentinel>(first_child),
+        Some(&RecoveryAuditChildSentinel(0x732))
+    );
+    assert_eq!(
+        app.world().get::<RecoveryAuditChildSentinel>(second_child),
+        Some(&RecoveryAuditChildSentinel(0x733))
+    );
+    assert_eq!(app.world().get::<Node>(host).unwrap().width, Val::Px(613.0));
+    assert_eq!(
+        app.world().get::<Node>(first_child).unwrap().width,
+        Val::Px(23.0)
+    );
+    assert_eq!(
+        app.world().get::<Node>(second_child).unwrap().width,
+        Val::Px(29.0)
+    );
+    let world = app.world();
+    assert_eq!(
+        world
+            .resource::<RouterSnapshots>()
+            .request(router, restored),
+        RequestLookup::Found(&restored_before_release)
+    );
+    assert_eq!(
+        world
+            .resource::<RouterSnapshots>()
+            .request(router, stale_request),
+        RequestLookup::Found(&stale_after_release)
+    );
+    assert_eq!(
+        testing_router_request_inventory(
+            world.resource::<RouterNavigation>(),
+            world.resource::<RouterSnapshots>(),
+        ),
+        inventory_before_release
+    );
 }
