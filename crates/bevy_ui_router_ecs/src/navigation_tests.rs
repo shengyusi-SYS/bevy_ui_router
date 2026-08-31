@@ -11,7 +11,8 @@ use crate::{
         BackCapacityCellDispositionForTest, BackCapacityDomainIssuer,
         BackCapacityIssuerInstallError, BackCapacityRetireOutcome,
         BackNoTargetDedicatedBatchObservation, BackNoTargetInstalledCapacitySource,
-        CleanupPostcheckDrift, CleanupPostcheckPhase, EnqueueRejected, FailedBoundaryExpectation,
+        CleanupPrepublicationDrift, CleanupPrepublicationPhase, EnqueueRejected,
+        FailedBoundaryExpectation,
     },
     components::{
         ChildSlotAuthority, ChildSlotAuthorityProbe, ChildSlotBarrierProbe, ChildSlotLifecycle,
@@ -624,6 +625,14 @@ struct ProvisionalDetachReentry {
     removals: usize,
     visibility_drift: Option<(usize, Entity)>,
     registration_reinsert: Option<(usize, Entity, RouterHandle)>,
+}
+
+#[derive(Resource, Default)]
+struct QuarantineDetachHookDrift {
+    target: Option<Entity>,
+    parent: Option<Entity>,
+    former_parent: Option<Entity>,
+    fired: bool,
 }
 
 #[derive(Component)]
@@ -6921,6 +6930,7 @@ fn vacant_back_capacity_entry(handle: RouterHandle) -> RouterEntry {
         pending_mount_mutation_rejection: None,
         pending_failed_branch: None,
         failure_cleanup_permanent: None,
+        cleanup_settlement_permanent_inert: None,
         projectionless_fail_close: None,
         active: None,
         cleanup_ledger: None,
@@ -33869,15 +33879,10 @@ fn active_pending_only_boundary_is_built_and_settled_without_touching_active() {
         {
             let entry = &app.world().resource::<RouterNavigation>().entries[0];
             assert!(entry.pending_failed_branch.is_none());
-            let ledger = entry
-                .cleanup_ledger
-                .as_ref()
-                .expect("ordinary cleanup retains its partial receipt owner");
-            assert!(ledger.receipt_count() > 0);
-            assert!(!ledger.is_settled());
+            assert!(entry.cleanup_ledger.is_none());
             assert!(matches!(
                 entry.engine.request(request).unwrap().status(),
-                RequestStatus::Running(_)
+                RequestStatus::Running(NavigationPhase::Recovering)
             ));
         }
         for (entity, before) in &active_fingerprint {
@@ -36001,6 +36006,32 @@ fn install_provisional_detach_reentry(app: &mut App) {
                     .entity(host)
                     .remove::<RouterHostRegistration>()
                     .insert(RouterHostRegistration::new(router));
+            }
+        });
+}
+
+fn install_quarantine_detach_hook_drift(app: &mut App) {
+    app.init_resource::<QuarantineDetachHookDrift>();
+    app.world_mut()
+        .register_component_hooks::<ChildOf>()
+        .on_remove(|mut world, HookContext { entity, .. }| {
+            let parent = {
+                let mut drift = world.resource_mut::<QuarantineDetachHookDrift>();
+                if drift.target != Some(entity) {
+                    return;
+                }
+                drift.fired = true;
+                drift.parent
+            };
+            if let Some(parent) = parent {
+                world.commands().entity(entity).insert(ChildOf(parent));
+            }
+            let former_parent = world.resource::<QuarantineDetachHookDrift>().former_parent;
+            if let Some(former_parent) = former_parent {
+                world
+                    .commands()
+                    .entity(former_parent)
+                    .insert(CleanupDriftMarker);
             }
         });
 }
@@ -39808,7 +39839,7 @@ fn nested_failed_transfer_keeps_the_same_ledger_for_a_higher_revision() {
 }
 
 #[test]
-fn refresh_does_not_cross_a_stale_terminal_root_after_quarantine_retry() {
+fn quarantine_prepublication_drift_retries_before_terminal_publication() {
     let mut app = App::new();
     app.add_plugins(BevyUiRouterPlugin::default());
     let router = install_atomic_router(&mut app, "quarantine-parent-postcheck");
@@ -39819,7 +39850,7 @@ fn refresh_does_not_cross_a_stale_terminal_root_after_quarantine_retry() {
         .unwrap();
     app.update();
 
-    let (leaving_output, obligation_count, top_slot, top_slot_seal) = {
+    let (leaving_output, top_slot, top_slot_seal) = {
         let navigation = app.world().resource::<RouterNavigation>();
         let frame = navigation.entries[0]
             .active
@@ -39829,7 +39860,6 @@ fn refresh_does_not_cross_a_stale_terminal_root_after_quarantine_retry() {
             .unwrap();
         (
             frame.interactive_entities()[0],
-            frame.obligation_count(),
             frame.top_slot(),
             frame.mount_binding().slot_claim().seal(),
         )
@@ -39839,8 +39869,8 @@ fn refresh_does_not_cross_a_stale_terminal_root_after_quarantine_retry() {
         .insert(FinalPreflightForeignComponent);
     let foreign = app.world_mut().spawn(ChildOf(leaving_output)).id();
     app.world_mut()
-        .insert_resource(CleanupPostcheckDrift::external_parent(
-            CleanupPostcheckPhase::VerifiedTransfer,
+        .insert_resource(CleanupPrepublicationDrift::external_parent(
+            CleanupPrepublicationPhase::VerifiedTransfer,
             top_slot,
         ));
     let request = app
@@ -39851,22 +39881,38 @@ fn refresh_does_not_cross_a_stale_terminal_root_after_quarantine_retry() {
 
     app.update();
 
-    let lease_count = app
+    let lease_count_before_retry = app
         .world()
         .resource::<QuarantineLeaseTable>()
         .leases()
         .len();
     let entry = &app.world().resource::<RouterNavigation>().entries[0];
     let ledger = entry.cleanup_ledger.as_ref().unwrap();
-    assert_eq!(ledger.receipt_count(), obligation_count);
+    assert_eq!(ledger.receipt_count(), 0);
     assert!(!ledger.is_settled());
     assert!(!ledger.leaving_frames().is_empty());
-    assert_eq!(lease_count, 1);
+    assert_eq!(lease_count_before_retry, 0);
     assert!(matches!(
         entry.engine.request(request).unwrap().status(),
         RequestStatus::Running(NavigationPhase::PostCommitCleanup)
     ));
 
+    app.world_mut()
+        .entity_mut(top_slot)
+        .insert(RouteOwnershipSeal::new(top_slot_seal));
+    settle_cleanup_system(app.world_mut());
+
+    let lease_count = app
+        .world()
+        .resource::<QuarantineLeaseTable>()
+        .leases()
+        .len();
+    assert_eq!(lease_count, 1);
+    assert!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .cleanup_ledger
+            .is_none()
+    );
     let stale_root_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
@@ -39878,11 +39924,6 @@ fn refresh_does_not_cross_a_stale_terminal_root_after_quarantine_retry() {
     app.world_mut()
         .resource_mut::<RouteFocusState>()
         .set_focused(Some(foreign));
-
-    app.world_mut()
-        .entity_mut(top_slot)
-        .insert(RouteOwnershipSeal::new(top_slot_seal));
-    settle_cleanup_system(app.world_mut());
     crate::input::refresh_input_gate_system(app.world_mut());
 
     assert!(matches!(
@@ -39932,6 +39973,143 @@ fn refresh_does_not_cross_a_stale_terminal_root_after_quarantine_retry() {
             .count(),
         completion_count
     );
+}
+
+#[test]
+fn quarantine_detach_hook_drift_is_not_rebaselined_or_published() {
+    let mut app = App::new();
+    install_quarantine_detach_hook_drift(&mut app);
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let router = install_atomic_router(&mut app, "quarantine-detach-observer-reparent");
+    app.update();
+    app.world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/"))
+        .unwrap();
+    app.update();
+
+    let (foreign_owner, detachable_root, former_parent) = {
+        let world = app.world();
+        let frame = world.resource::<RouterNavigation>().entries[0]
+            .active
+            .as_ref()
+            .unwrap()
+            .first_frame()
+            .unwrap();
+        let top_slot = frame.top_slot();
+        let detachable_root = frame
+            .claims()
+            .map(ExactRegistryClaim::entity)
+            .find(|entity| world.get::<ChildOf>(*entity).map(ChildOf::parent) == Some(top_slot))
+            .expect("the leaving frame retains one exact top-slot child");
+        let former_parent = world
+            .get::<ChildOf>(detachable_root)
+            .map(ChildOf::parent)
+            .expect("the detachable root retains its frozen Router-owned parent");
+        (
+            frame.interactive_entities()[0],
+            detachable_root,
+            former_parent,
+        )
+    };
+    app.world_mut()
+        .entity_mut(foreign_owner)
+        .insert(FinalPreflightForeignComponent);
+    let foreign_child = app.world_mut().spawn(ChildOf(foreign_owner)).id();
+    let app_parent = app.world_mut().spawn_empty().id();
+    *app.world_mut().resource_mut::<QuarantineDetachHookDrift>() = QuarantineDetachHookDrift {
+        target: Some(detachable_root),
+        parent: Some(app_parent),
+        former_parent: Some(former_parent),
+        fired: false,
+    };
+
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/").with_fragment("replacement"))
+        .unwrap();
+    app.update();
+
+    for _ in 0..8 {
+        if app.world().resource::<QuarantineDetachHookDrift>().fired {
+            break;
+        }
+        app.update();
+    }
+    assert!(app.world().resource::<QuarantineDetachHookDrift>().fired);
+    assert_eq!(
+        app.world()
+            .get::<ChildOf>(detachable_root)
+            .map(ChildOf::parent),
+        Some(app_parent)
+    );
+
+    for _ in 0..4 {
+        if matches!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .unwrap()
+                .status(),
+            RequestStatus::Failed(_)
+        ) {
+            break;
+        }
+        app.update();
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(matches!(
+        entry.engine.request(request).unwrap().status(),
+        RequestStatus::Failed(failure)
+            if failure.kind() == NavigationFailureKind::AuthorityLost
+    ));
+    assert!(entry.cleanup_ledger.is_none());
+    assert!(entry.cleanup_settlement_permanent_inert.is_none());
+    let residual = entry
+        .authority_protocol_residual
+        .as_ref()
+        .expect("permanent cleanup-settlement drift must retain one fail-closed owner");
+    assert!(matches!(
+        residual.kind,
+        AuthorityProtocolResidualKind::CleanupSettlementPermanent(_)
+    ));
+    assert_eq!(
+        residual
+            .cleanup_settlement_ledger
+            .as_ref()
+            .expect("the original cleanup ledger remains linearly owned")
+            .receipt_count(),
+        0,
+        "permanent protected drift must not publish an ordinary terminal receipt",
+    );
+    assert!(entry.active.is_none());
+    assert!(entry.host.is_none());
+    assert!(
+        residual
+            .active
+            .iter()
+            .flat_map(RealizedBranch::frames)
+            .all(|frame| frame.frame().origin() != &FrameOrigin::RouterFallback)
+    );
+    assert_eq!(
+        app.world()
+            .get::<ChildOf>(detachable_root)
+            .map(ChildOf::parent),
+        Some(app_parent)
+    );
+    assert!(
+        app.world()
+            .get::<CleanupDriftMarker>(former_parent)
+            .is_some()
+    );
+    assert_eq!(
+        app.world()
+            .get::<ChildOf>(foreign_child)
+            .map(ChildOf::parent),
+        Some(foreign_owner)
+    );
+    assert!(app.world().get_entity(app_parent).is_ok());
 }
 
 #[test]
@@ -44908,7 +45086,8 @@ fn post_commit_authority_bulk_quarantine_preserves_already_absent_target() {
     assert!(
         dispositions.contains(
             &bevy_ui_router_core::prelude::CleanupDisposition::QuarantinedForeignDescendant
-        )
+        ),
+        "observed cleanup dispositions: {dispositions:?}"
     );
     assert!(app.world().get_entity(absent).is_err());
     assert!(app.world().get_entity(top_slot).is_ok());
@@ -45780,8 +45959,7 @@ fn host_admission_request_and_grant_errors_retain_candidate_owner() {
     }
 }
 
-#[test]
-fn preallocation_grant_rejection_consumes_candidate_before_unavailable() {
+pub(crate) fn registry_invariant_violation_fail_closed_fixture() {
     let mut app = App::new();
     app.add_plugins(BevyUiRouterPlugin::default());
     let router = install_atomic_router(&mut app, "r3-preallocation-rejection");
@@ -45804,6 +45982,17 @@ fn preallocation_grant_rejection_consumes_candidate_before_unavailable() {
         ComponentManifest::from_world(app.world(), host),
         Some(host_manifest)
     );
+    let error = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/blocked"))
+        .expect_err("a registry invariant violation must reject new navigation");
+    assert_eq!(error.kind(), NavigationEnqueueErrorKind::HostUnavailable);
+}
+
+#[test]
+fn preallocation_grant_rejection_consumes_candidate_before_unavailable() {
+    registry_invariant_violation_fail_closed_fixture();
 }
 
 #[test]
@@ -46309,6 +46498,325 @@ fn sealed_stale_output_cleanup_is_disjoint_from_new_epoch() {
             .iter()
             .all(|entity| app.world().get_entity(*entity).is_err())
     );
+}
+
+pub(crate) fn old_quarantine_lease_cannot_mutate_new_epoch_fixture() {
+    let (mut app, router, request, host, committed_history) =
+        post_commit_nested_host_loss_fixture("authority-old-lease-new-epoch");
+    let leaving = app.world().resource::<RouterNavigation>().entries[0]
+        .cleanup_ledger
+        .as_ref()
+        .unwrap()
+        .leaving_frames()
+        .iter()
+        .flat_map(RealizedFrame::interactive_entities)
+        .next()
+        .expect("the real post-commit transition retains one old cleanup target");
+    app.world_mut()
+        .entity_mut(leaving)
+        .insert(FinalPreflightForeignComponent);
+    remove_post_commit_registration(&mut app, host);
+    settle_cleanup_system(app.world_mut());
+    assert!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .post_commit_compound
+            .is_some()
+            || app.world().resource::<RouterNavigation>().entries[0]
+                .settled_retired_host_evidence
+                .is_some(),
+        "the production authority-loss predicate must start or finish the compound"
+    );
+    for _ in 0..64 {
+        settle_cleanup_system(app.world_mut());
+        if app.world().resource::<RouterNavigation>().entries[0]
+            .settled_retired_host_evidence
+            .is_some()
+        {
+            break;
+        }
+    }
+    assert_post_commit_host_loss_retains_committed_result(&app, request, &committed_history);
+    let (old_lease, old_claims) = {
+        let table = app.world().resource::<QuarantineLeaseTable>();
+        assert!(!table.leases().is_empty());
+        let old_lease = table
+            .leases()
+            .iter()
+            .find(|lease| lease.owned_entities().contains(&leaving))
+            .expect("real old cleanup authority must become one quarantine lease");
+        (
+            old_lease.id(),
+            old_lease
+                .records()
+                .iter()
+                .map(|record| record.claim())
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert!(!old_claims.is_empty());
+    assert!(app.world().get_entity(leaving).is_ok());
+
+    app.world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(router));
+    for _ in 0..8 {
+        observe_authority_system(app.world_mut());
+        if app.world().resource::<RouterNavigation>().entries[0]
+            .host
+            .is_some()
+        {
+            break;
+        }
+    }
+    assert!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .host
+            .is_some()
+    );
+    commit_fresh_nested_epoch(&mut app, router, "authority-fresh-epoch");
+
+    let (fresh_top_slot, fresh_top_claim) = {
+        let host_binding = app.world().resource::<RouterNavigation>().entries[0]
+            .host
+            .as_ref()
+            .expect("readmission must retain a fresh host binding");
+        (host_binding.top_slot, host_binding.top_slot_claim.clone())
+    };
+    let fresh_top_manifest = ComponentManifest::from_world(app.world(), fresh_top_slot)
+        .expect("the fresh top slot remains present");
+    let fresh_top_parent = app
+        .world()
+        .get::<ChildOf>(fresh_top_slot)
+        .map(ChildOf::parent);
+    let fresh_top_lifecycle = app
+        .world()
+        .get::<ProvisionalSlotLifecycle>(fresh_top_slot)
+        .copied();
+    let fresh_top_visibility = app.world().get::<Visibility>(fresh_top_slot).copied();
+    let fresh_top_pickable = app.world().get::<Pickable>(fresh_top_slot).copied();
+    let fresh_top_barrier = app
+        .world()
+        .get::<RouterInputBarrier>(fresh_top_slot)
+        .copied();
+    let fresh_top_gate = {
+        let gate = app.world().resource::<RouterInputGate>();
+        (
+            gate.allows_pointer(fresh_top_slot),
+            gate.allows_keyboard(fresh_top_slot),
+            gate.allows_gamepad(fresh_top_slot),
+        )
+    };
+    let fresh_host_registration = app
+        .world()
+        .get::<RouterHostRegistration>(host)
+        .expect("the app-owned host retains its exact registration")
+        .testing_identity();
+    let fresh_host_manifest = ComponentManifest::from_world(app.world(), host)
+        .expect("the app-owned host remains present");
+    let fresh_host_parent = app.world().get::<ChildOf>(host).map(ChildOf::parent);
+    let fresh_host_children = app
+        .world()
+        .get::<Children>(host)
+        .map(|children| children.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let fresh_claims = app.world().resource::<RouterNavigation>().entries[0]
+        .active
+        .as_ref()
+        .expect("readmission must publish a fresh active epoch")
+        .claims()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(!fresh_claims.is_empty());
+    let fresh_projection = fresh_claims
+        .iter()
+        .map(|claim| {
+            let entity = claim.entity();
+            (
+                claim.clone(),
+                ComponentManifest::from_world(app.world(), entity)
+                    .expect("fresh exact claim entity remains present"),
+                app.world().get::<ChildOf>(entity).map(ChildOf::parent),
+                app.world().get::<Visibility>(entity).copied(),
+                app.world().get::<Pickable>(entity).copied(),
+                app.world().get::<RouterInputBarrier>(entity).copied(),
+                app.world().get::<FrameLifecycle>(entity).copied(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let engine_before = app.world().resource::<RouterNavigation>().entries[0]
+        .engine
+        .snapshot();
+
+    let assert_fresh_epoch_unchanged = |app: &App| {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(entry.engine.snapshot(), engine_before);
+        let registry = app.world().resource::<RouteEntityRegistry>();
+        assert!(
+            registry
+                .record(fresh_top_slot)
+                .is_some_and(|record| record.matches_claim(&fresh_top_claim))
+        );
+        assert_eq!(
+            ComponentManifest::from_world(app.world(), fresh_top_slot),
+            Some(fresh_top_manifest.clone())
+        );
+        assert_eq!(
+            app.world()
+                .get::<ChildOf>(fresh_top_slot)
+                .map(ChildOf::parent),
+            fresh_top_parent
+        );
+        assert_eq!(
+            app.world()
+                .get::<ProvisionalSlotLifecycle>(fresh_top_slot)
+                .copied(),
+            fresh_top_lifecycle
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(fresh_top_slot).copied(),
+            fresh_top_visibility
+        );
+        assert_eq!(
+            app.world().get::<Pickable>(fresh_top_slot).copied(),
+            fresh_top_pickable
+        );
+        assert_eq!(
+            app.world()
+                .get::<RouterInputBarrier>(fresh_top_slot)
+                .copied(),
+            fresh_top_barrier
+        );
+        let gate = app.world().resource::<RouterInputGate>();
+        assert_eq!(
+            (
+                gate.allows_pointer(fresh_top_slot),
+                gate.allows_keyboard(fresh_top_slot),
+                gate.allows_gamepad(fresh_top_slot),
+            ),
+            fresh_top_gate
+        );
+        assert_eq!(
+            app.world()
+                .get::<RouterHostRegistration>(host)
+                .map(RouterHostRegistration::testing_identity),
+            Some(fresh_host_registration)
+        );
+        assert_eq!(
+            ComponentManifest::from_world(app.world(), host),
+            Some(fresh_host_manifest.clone())
+        );
+        assert_eq!(
+            app.world().get::<ChildOf>(host).map(ChildOf::parent),
+            fresh_host_parent
+        );
+        assert_eq!(
+            app.world()
+                .get::<Children>(host)
+                .map(|children| children.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            fresh_host_children
+        );
+        for (claim, manifest, parent, visibility, pickable, barrier, lifecycle) in &fresh_projection
+        {
+            let entity = claim.entity();
+            assert!(
+                registry
+                    .record(entity)
+                    .is_some_and(|record| record.matches_claim(claim))
+            );
+            assert_eq!(
+                ComponentManifest::from_world(app.world(), entity),
+                Some(manifest.clone())
+            );
+            assert_eq!(
+                app.world().get::<ChildOf>(entity).map(ChildOf::parent),
+                *parent
+            );
+            assert_eq!(app.world().get::<Visibility>(entity).copied(), *visibility);
+            assert_eq!(app.world().get::<Pickable>(entity).copied(), *pickable);
+            assert_eq!(
+                app.world().get::<RouterInputBarrier>(entity).copied(),
+                *barrier
+            );
+            assert_eq!(
+                app.world().get::<FrameLifecycle>(entity).copied(),
+                *lifecycle
+            );
+        }
+    };
+
+    app.world_mut()
+        .entity_mut(leaving)
+        .remove::<FinalPreflightForeignComponent>();
+    app.world_mut().flush();
+    let reap_candidate_count = app
+        .world()
+        .resource::<QuarantineLeaseTable>()
+        .leases()
+        .len();
+    assert!(reap_candidate_count > 0);
+    assert_eq!(
+        app.world()
+            .resource::<QuarantineLeaseTable>()
+            .lease(old_lease)
+            .map(|lease| lease.records().len()),
+        Some(old_claims.len())
+    );
+    let max_reap_steps = reap_candidate_count
+        .checked_mul(old_claims.len())
+        .expect("frozen quarantine round-robin bound must not overflow");
+    let mut remaining_records = old_claims.len();
+    let mut target_closed = false;
+    for _ in 0..max_reap_steps {
+        crate::registry::reap_quarantines_system(app.world_mut());
+        assert_fresh_epoch_unchanged(&app);
+        let current_claims = app
+            .world()
+            .resource::<QuarantineLeaseTable>()
+            .lease(old_lease)
+            .map(|lease| {
+                lease
+                    .records()
+                    .iter()
+                    .map(|record| record.claim())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert!(
+            current_claims
+                .iter()
+                .all(|claim| old_claims.contains(claim)),
+            "reaper may only retain frozen exact records from the old lease"
+        );
+        assert!(
+            current_claims.len() <= remaining_records,
+            "the frozen target lease may not gain records while other round-robin candidates run"
+        );
+        remaining_records = current_claims.len();
+        if remaining_records == 0 {
+            target_closed = true;
+            break;
+        }
+    }
+    assert!(
+        target_closed,
+        "the target old lease must close within its frozen round-robin bound"
+    );
+    assert_eq!(remaining_records, 0);
+    assert!(
+        app.world()
+            .resource::<QuarantineLeaseTable>()
+            .lease(old_lease)
+            .is_none()
+    );
+    assert!(old_claims.iter().all(|claim| {
+        app.world().get_entity(claim.entity()).is_err()
+            && app
+                .world()
+                .resource::<RouteEntityRegistry>()
+                .record(claim.entity())
+                .is_none()
+    }));
 }
 
 #[test]

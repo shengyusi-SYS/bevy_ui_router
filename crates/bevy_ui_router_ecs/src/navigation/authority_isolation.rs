@@ -26,10 +26,10 @@ use crate::{
 
 use super::{
     AuthorityProtocolResidualKind, AuthorityProtocolResidualOwner,
-    FailureCleanupCompletionInertOwner, FrozenPostCommitInputIsolation,
-    FrozenTargetPreparationPermanentPhysicalManifest, HostBinding, PendingFailedBranch,
-    PostCommitInputIsolationFailure, PreparedPostCommitInputIsolation, RetiredHostBinding,
-    RouterEntry, authority_settlement_logical_roots, precommit_authority_cause,
+    CleanupSettlementPermanentInertOwner, FailureCleanupCompletionInertOwner,
+    FrozenPostCommitInputIsolation, FrozenTargetPreparationPermanentPhysicalManifest, HostBinding,
+    PendingFailedBranch, PostCommitInputIsolationFailure, PreparedPostCommitInputIsolation,
+    RetiredHostBinding, RouterEntry, authority_settlement_logical_roots, precommit_authority_cause,
     projectionless_fail_close_capacity_probe,
 };
 
@@ -846,6 +846,101 @@ pub(super) fn prepare_projectionless_authority_isolation(
     )
 }
 
+pub(super) fn fail_closed_cleanup_settlement_permanent(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    mut ledger: CleanupLedger,
+) -> Result<(), CleanupLedger> {
+    let preparation = prepare_authority_isolation_targets(
+        world,
+        ledger
+            .exact_claims()
+            .chain(entry.active.iter().flat_map(RealizedBranch::claims))
+            .chain(entry.host.iter().map(|host| &host.top_slot_claim)),
+        ledger
+            .exact_claims()
+            .map(ExactRegistryClaim::entity)
+            .chain(
+                entry
+                    .active
+                    .iter()
+                    .flat_map(RealizedBranch::interactive_entities),
+            )
+            .chain(entry.host.iter().map(|host| host.top_slot)),
+        0,
+    );
+    let (isolation, isolation_contradiction) = match preparation {
+        AuthorityIsolationPreparation::Ready(isolation) => (isolation, None),
+        AuthorityIsolationPreparation::RetryableCapacity => return Err(ledger),
+        AuthorityIsolationPreparation::PermanentContradiction {
+            contradiction,
+            fail_closed,
+        } => (fail_closed, Some(contradiction)),
+    };
+    let Some(evidence) = ledger.take_cleanup_settlement_permanent_evidence() else {
+        return Err(ledger);
+    };
+    let active = entry.active.take();
+    let (retired_host, lease) = match entry.host.take() {
+        Some(host) => {
+            let (retired, lease) = host.into_retired();
+            (Some(retired), Some(lease))
+        }
+        None => (None, None),
+    };
+    let mut residual = Some(AuthorityProtocolResidualOwner {
+        kind: AuthorityProtocolResidualKind::CleanupSettlementPermanent(evidence),
+        isolation_contradiction,
+        active,
+        pending: None,
+        failed: None,
+        failure_cleanup_completion: None,
+        failure_cleanup_ledger: None,
+        cleanup_settlement_ledger: Some(ledger),
+        failure_cleanup_permanent_authority: None,
+        host: retired_host,
+    });
+    let mut isolation = Some(isolation);
+    let protocol_residual = &mut entry.authority_protocol_residual;
+    if let Err(returned_lease) =
+        entry
+            .engine
+            .fail_closed_authority_protocol_retaining(lease, || {
+                isolation
+                    .take()
+                    .expect("cleanup permanent fail-close applies isolation once")
+                    .apply(world);
+                *protocol_residual = residual.take();
+            })
+    {
+        let mut owner = residual
+            .take()
+            .expect("rejected cleanup permanent fail-close retains its exact owner");
+        match (owner.host.take(), returned_lease) {
+            (Some(retired), Some(lease)) => entry.host = Some(retired.restore(lease)),
+            (None, None) => {}
+            _ => unreachable!("cleanup permanent fail-close returns the exact optional host lease"),
+        }
+        entry.active = owner.active.take();
+        isolation
+            .take()
+            .expect("rejected cleanup permanent fail-close retains prepared isolation")
+            .apply(world);
+        let AuthorityProtocolResidualKind::CleanupSettlementPermanent(evidence) = owner.kind else {
+            unreachable!("cleanup permanent residual retains its typed evidence")
+        };
+        entry.cleanup_settlement_permanent_inert = Some(CleanupSettlementPermanentInertOwner {
+            evidence,
+            ledger: owner
+                .cleanup_settlement_ledger
+                .take()
+                .expect("cleanup permanent residual retains its physical ledger"),
+            isolation_contradiction: owner.isolation_contradiction.take(),
+        });
+    }
+    Ok(())
+}
+
 /*
     The owner-specific functions above only select stored claims and gate targets. All authority,
     component-presence, focus, gate, and in-place mutation preparation is shared by
@@ -951,6 +1046,7 @@ pub(super) fn fail_closed_pending_owner_protocol_prepared(
         failed: None,
         failure_cleanup_completion: None,
         failure_cleanup_ledger: None,
+        cleanup_settlement_ledger: None,
         failure_cleanup_permanent_authority: None,
         host: retired_host,
     });
@@ -1063,6 +1159,7 @@ pub(super) fn fail_closed_failed_owner_protocol_prepared(
         failed: Some(failed),
         failure_cleanup_completion: None,
         failure_cleanup_ledger: None,
+        cleanup_settlement_ledger: None,
         failure_cleanup_permanent_authority: None,
         host: retired_host,
     });
@@ -1136,6 +1233,7 @@ pub(super) fn fail_closed_failure_cleanup_completion_protocol(
         failed: None,
         failure_cleanup_completion: completion,
         failure_cleanup_ledger: Some(ledger),
+        cleanup_settlement_ledger: None,
         failure_cleanup_permanent_authority: None,
         host: retired_host,
     });

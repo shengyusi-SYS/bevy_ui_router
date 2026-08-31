@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-mod quarantine_reaper;
+pub(crate) mod quarantine_reaper;
 pub(crate) use quarantine_reaper::reap_quarantines_system;
 
 use std::{
@@ -395,6 +395,17 @@ impl ComponentManifest {
     pub(crate) fn matches(&self, world: &World, entity: Entity) -> bool {
         Self::from_world(world, entity).is_some_and(|actual| actual == *self)
     }
+
+    pub(crate) fn matches_without_materialization(&self, world: &World, entity: Entity) -> bool {
+        let Ok(entity) = world.get_entity(entity) else {
+            return false;
+        };
+        let actual = entity.archetype().components();
+        actual.len() == self.component_ids.len()
+            && actual
+                .iter()
+                .all(|component| self.component_ids.contains(component))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -473,6 +484,10 @@ impl PreparedLifecycleMutation {
 }
 
 impl ExactRegistryClaim {
+    pub(crate) fn try_clone(&self) -> Result<Self, ()> {
+        try_clone_exact_registry_claim(self)
+    }
+
     pub(crate) const fn entity(&self) -> Entity {
         self.entity
     }
@@ -3059,7 +3074,7 @@ impl Default for QuarantineLeaseTable {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::host::HostCandidateRevision;
     use bevy_ui_router_core::{
@@ -3388,8 +3403,7 @@ mod tests {
         assert_eq!(registry.records(), baseline);
     }
 
-    #[test]
-    fn child_owner_uniqueness_keeps_opaque_router_instances_independent() {
+    pub(crate) fn opaque_router_registry_partition_fixture() {
         let (first_parent, _, first_child_slot) = child_owner_fixture();
         let (second_parent, _, second_child_slot) = child_owner_fixture();
         assert_eq!(first_parent.router(), second_parent.router());
@@ -3429,6 +3443,11 @@ mod tests {
                 EntityLifecycle::PreparedInert,
             )
             .expect("separate opaque router instances may reuse raw slot projections");
+    }
+
+    #[test]
+    fn child_owner_uniqueness_keeps_opaque_router_instances_independent() {
+        opaque_router_registry_partition_fixture();
     }
 
     #[test]

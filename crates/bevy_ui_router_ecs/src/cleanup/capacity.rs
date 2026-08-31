@@ -1282,6 +1282,9 @@ pub(super) fn prepared_installed_back_zero_completion(
         back_no_target_authority_partition: None,
         failure_cleanup_partition: None,
         failure_cleanup_inert: None,
+        quarantine_detachment: None,
+        cleanup_settlement_permanent_pending: None,
+        cleanup_settlement_permanent: None,
     };
     let source = ledger.back_no_target_zero_completion_source_identity();
     let prepared = PreparedBackNoTargetZeroCompletion {

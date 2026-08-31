@@ -28,7 +28,8 @@ use crate::{
     },
     presentation::FrameOutput,
     registry::{
-        EntityLifecycle, EntityOwner, QuarantineLeaseTable, RegistryOwner, RouteEntityRegistry,
+        ComponentManifest, EntityLifecycle, EntityOwner, QuarantineLeaseTable, RegistryOwner,
+        RouteEntityRegistry,
     },
 };
 
@@ -1265,4 +1266,183 @@ pub(crate) fn pickable_repair_observer_drift_supersedes_attempt_before_quarantin
 pub(crate) fn host_reacceptance_detaches_old_top_slot() {
     crate::navigation::tests::same_host_readmission_waits_for_retired_edge_and_old_slot_disposition(
     );
+}
+
+#[test]
+fn multi_router_registries_are_partitioned() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let (first_router, _first_host) = install_nested_authority_router(&mut app, "partition-first");
+    let (second_router, second_host) =
+        install_nested_authority_router(&mut app, "partition-second");
+    observe_authority_system(app.world_mut());
+
+    let first_initial =
+        settle_public_request(&mut app, first_router, RouteLocation::new("/items/1"));
+    let second_initial =
+        settle_public_request(&mut app, second_router, RouteLocation::new("/items/1"));
+    for (router, request) in [
+        (first_router, first_initial),
+        (second_router, second_initial),
+    ] {
+        assert!(matches!(
+            app.world().resource::<RouterSnapshots>().request(router, request),
+            RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded
+        ));
+    }
+
+    let (first_engine_before, second_engine_before, second_claims, second_interactive) = {
+        let navigation = app.world().resource::<RouterNavigation>();
+        let first = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == first_router)
+            .expect("the first production router retains its entry");
+        let second = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == second_router)
+            .expect("the second production router retains its entry");
+        let active = second
+            .active
+            .as_ref()
+            .expect("the second router has a committed branch");
+        let mut claims = active.claims().cloned().collect::<Vec<_>>();
+        claims.push(
+            second
+                .host
+                .as_ref()
+                .expect("the second router retains its exact host binding")
+                .top_slot_claim
+                .clone(),
+        );
+        claims.sort_by_key(|claim| claim.entity().to_bits());
+        assert!(
+            claims
+                .windows(2)
+                .all(|pair| pair[0].entity() != pair[1].entity()),
+            "the second router must retain one exact registry claim per entity"
+        );
+        (
+            first.engine.snapshot(),
+            second.engine.snapshot(),
+            claims,
+            active.interactive_entities(),
+        )
+    };
+    let second_public_snapshot = app
+        .world()
+        .resource::<RouterSnapshots>()
+        .get(second_router)
+        .expect("the second router publishes a public snapshot")
+        .clone();
+    let second_host_before = app_host_evidence(&app, second_host);
+    let second_projection = second_claims
+        .iter()
+        .map(|claim| {
+            let entity = claim.entity();
+            (
+                claim.clone(),
+                ComponentManifest::from_world(app.world(), entity)
+                    .expect("the second router exact claim entity remains present"),
+                app.world().get::<ChildOf>(entity).map(ChildOf::parent),
+                app.world().get::<Visibility>(entity).copied(),
+                app.world().get::<Pickable>(entity).copied(),
+                app.world().get::<RouterInputBarrier>(entity).copied(),
+                app.world()
+                    .get::<crate::presentation::FrameLifecycle>(entity)
+                    .copied(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let second_gate = {
+        let gate = app.world().resource::<RouterInputGate>();
+        second_interactive
+            .iter()
+            .map(|entity| {
+                (
+                    *entity,
+                    gate.allows_pointer(*entity),
+                    gate.allows_keyboard(*entity),
+                    gate.allows_gamepad(*entity),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let replacement = settle_public_request(&mut app, first_router, RouteLocation::new("/items/2"));
+    assert!(matches!(
+        app.world()
+            .resource::<RouterSnapshots>()
+            .request(first_router, replacement),
+        RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded
+    ));
+    let navigation = app.world().resource::<RouterNavigation>();
+    let first_after = navigation
+        .entries
+        .iter()
+        .find(|entry| entry.handle == first_router)
+        .expect("the first production router retains its entry after replacement");
+    let second_after = navigation
+        .entries
+        .iter()
+        .find(|entry| entry.handle == second_router)
+        .expect("the second production router retains its entry after first-router settlement");
+    assert_ne!(first_after.engine.snapshot(), first_engine_before);
+    assert_eq!(second_after.engine.snapshot(), second_engine_before);
+    assert_eq!(
+        app.world().resource::<RouterSnapshots>().get(second_router),
+        Some(&second_public_snapshot)
+    );
+    assert_eq!(app_host_evidence(&app, second_host), second_host_before);
+    let registry = app.world().resource::<RouteEntityRegistry>();
+    for (claim, manifest, parent, visibility, pickable, barrier, lifecycle) in second_projection {
+        let entity = claim.entity();
+        assert!(
+            registry
+                .record(entity)
+                .is_some_and(|record| record.matches_claim(&claim))
+        );
+        assert_eq!(
+            ComponentManifest::from_world(app.world(), entity),
+            Some(manifest)
+        );
+        assert_eq!(
+            app.world().get::<ChildOf>(entity).map(ChildOf::parent),
+            parent
+        );
+        assert_eq!(app.world().get::<Visibility>(entity).copied(), visibility);
+        assert_eq!(app.world().get::<Pickable>(entity).copied(), pickable);
+        assert_eq!(
+            app.world().get::<RouterInputBarrier>(entity).copied(),
+            barrier
+        );
+        assert_eq!(
+            app.world()
+                .get::<crate::presentation::FrameLifecycle>(entity)
+                .copied(),
+            lifecycle
+        );
+    }
+    let gate = app.world().resource::<RouterInputGate>();
+    for (entity, pointer, keyboard, gamepad) in second_gate {
+        assert_eq!(gate.allows_pointer(entity), pointer);
+        assert_eq!(gate.allows_keyboard(entity), keyboard);
+        assert_eq!(gate.allows_gamepad(entity), gamepad);
+    }
+}
+
+#[test]
+fn old_quarantine_lease_cannot_mutate_new_epoch() {
+    crate::navigation::tests::old_quarantine_lease_cannot_mutate_new_epoch_fixture();
+}
+
+#[test]
+fn quarantine_reaper_round_robin_is_fair() {
+    crate::registry::quarantine_reaper::tests::round_robin_reaper_fairness_fixture();
+}
+
+#[test]
+fn registry_invariant_violation_is_fail_closed() {
+    crate::navigation::tests::registry_invariant_violation_fail_closed_fixture();
 }

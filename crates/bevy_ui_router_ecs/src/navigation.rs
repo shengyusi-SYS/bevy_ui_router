@@ -99,9 +99,10 @@ use crate::{
         BackCapacityRetireDisposition, BackCapacityRetireError, BackCapacityRetireOutcome,
         BackCapacityRetirementEvidence, BackNoTargetZeroCompletionPreparationEvidence,
         BackNoTargetZeroCompletionSourceIdentity, BoundBackCapacityReservation, CleanupLedger,
-        CleanupLedgerReserveError, CleanupLedgerReserveErrorKind, EnqueueRejected,
-        FailedAuthorityBoundaryBinding, FailedBoundaryDrift, FailedBoundarySource,
-        FailedManifestBuildError, FailedPreparedTopologyError, FailureCleanupSourceProjection,
+        CleanupLedgerReserveError, CleanupLedgerReserveErrorKind,
+        CleanupSettlementPermanentEvidence, EnqueueRejected, FailedAuthorityBoundaryBinding,
+        FailedBoundaryDrift, FailedBoundarySource, FailedManifestBuildError,
+        FailedPreparedTopologyError, FailureCleanupSourceProjection,
         FrozenBackNoTargetAuthorityPartition, FrozenCleanupManifest,
         FrozenOriginalCleanupLedgerTransfer, FrozenPostCommitAuthorityPartition,
         ManifestNeutralLedgerSlot, NoTargetCapacityPermit, PendingBoundaryBinding,
@@ -714,6 +715,7 @@ struct FrozenStaleOutputOtherHolders {
     pending_mount_mutation_rejection: bool,
     pending_failed_branch: bool,
     failure_cleanup_permanent: bool,
+    cleanup_settlement_permanent_inert: bool,
     projectionless_fail_close: bool,
     cleanup_ledger: bool,
     post_commit_compound: bool,
@@ -745,6 +747,7 @@ impl FrozenStaleOutputOtherHolders {
             pending_mount_mutation_rejection: entry.pending_mount_mutation_rejection.is_some(),
             pending_failed_branch: entry.pending_failed_branch.is_some(),
             failure_cleanup_permanent: entry.failure_cleanup_permanent.is_some(),
+            cleanup_settlement_permanent_inert: entry.cleanup_settlement_permanent_inert.is_some(),
             projectionless_fail_close: entry.projectionless_fail_close.is_some(),
             cleanup_ledger: entry.cleanup_ledger.is_some(),
             post_commit_compound: entry.post_commit_compound.is_some(),
@@ -2515,6 +2518,7 @@ pub(crate) struct RouterEntry {
     pending_mount_mutation_rejection: Option<PendingMountMutationRejection>,
     pending_failed_branch: Option<PendingFailedBranch>,
     failure_cleanup_permanent: Option<FailureCleanupPermanentStableInertOwner>,
+    cleanup_settlement_permanent_inert: Option<CleanupSettlementPermanentInertOwner>,
     projectionless_fail_close: Option<ProjectionlessFailCloseContinuation>,
     pub(crate) active: Option<RealizedBranch>,
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
@@ -2958,6 +2962,7 @@ struct ProvenEmptyAttemptOwnerInventory {
     pending_mount_mutation_rejection_vacant: bool,
     pending_failed_branch_vacant: bool,
     failure_cleanup_permanent_vacant: bool,
+    cleanup_settlement_permanent_inert_vacant: bool,
     projectionless_fail_close_vacant: bool,
     cleanup_ledger_vacant: bool,
     authority_protocol_residual_vacant: bool,
@@ -2985,6 +2990,9 @@ impl ProvenEmptyAttemptOwnerInventory {
                 .is_none(),
             pending_failed_branch_vacant: entry.pending_failed_branch.is_none(),
             failure_cleanup_permanent_vacant: entry.failure_cleanup_permanent.is_none(),
+            cleanup_settlement_permanent_inert_vacant: entry
+                .cleanup_settlement_permanent_inert
+                .is_none(),
             projectionless_fail_close_vacant: entry.projectionless_fail_close.is_none(),
             cleanup_ledger_vacant: entry.cleanup_ledger.is_none(),
             authority_protocol_residual_vacant: entry.authority_protocol_residual.is_none(),
@@ -3016,6 +3024,7 @@ impl ProvenEmptyAttemptOwnerInventory {
             && self.pending_mount_mutation_rejection_vacant
             && self.pending_failed_branch_vacant
             && self.failure_cleanup_permanent_vacant
+            && self.cleanup_settlement_permanent_inert_vacant
             && self.projectionless_fail_close_vacant
             && self.cleanup_ledger_vacant
             && self.authority_protocol_residual_vacant
@@ -5843,6 +5852,7 @@ pub(crate) struct AuthorityProtocolResidualOwner {
     failed: Option<PendingFailedBranch>,
     failure_cleanup_completion: Option<FailureCleanupCompletionOwner>,
     failure_cleanup_ledger: Option<CleanupLedger>,
+    cleanup_settlement_ledger: Option<CleanupLedger>,
     failure_cleanup_permanent_authority: Option<R1FailureCleanupPermanentAuthorityPair>,
     pub(crate) host: Option<RetiredHostBinding>,
 }
@@ -5856,7 +5866,14 @@ enum AuthorityProtocolResidualKind {
     PostReportSourceDrift(ProjectionlessSourceDriftEvidence),
     PreflightAuthorityLost(LifecyclePreflightEvidence),
     FailureCleanupCompletion(FailureCleanupCompletionMismatchView),
+    CleanupSettlementPermanent(CleanupSettlementPermanentEvidence),
     FailureCleanupPermanentAuthority,
+}
+
+struct CleanupSettlementPermanentInertOwner {
+    evidence: CleanupSettlementPermanentEvidence,
+    ledger: CleanupLedger,
+    isolation_contradiction: Option<AuthorityIsolationContradiction>,
 }
 
 impl RouterEntry {
@@ -6317,6 +6334,12 @@ impl RouterEntry {
                     )
                     .chain(
                         residual
+                            .cleanup_settlement_ledger
+                            .iter()
+                            .flat_map(CleanupLedger::leaving_frames),
+                    )
+                    .chain(
+                        residual
                             .failure_cleanup_permanent_authority
                             .iter()
                             .flat_map(|pair| pair.physical.physical().branch.frames()),
@@ -6372,6 +6395,12 @@ impl RouterEntry {
                                     .flat_map(RealizedFrame::claims),
                             )
                     }),
+            )
+            .chain(
+                residual
+                    .cleanup_settlement_ledger
+                    .iter()
+                    .flat_map(CleanupLedger::exact_claims),
             )
             .chain(
                 residual
@@ -6437,6 +6466,16 @@ impl RouterEntry {
             .and_then(|residual| residual.failure_cleanup_permanent_authority.as_ref())
         {
             slots.extend(pair.physical.physical().branch.tracked_child_slots());
+        }
+        if let Some(ledger) = self
+            .authority_protocol_residual
+            .as_ref()
+            .and_then(|residual| residual.cleanup_settlement_ledger.as_ref())
+        {
+            slots.extend(ledger.tracked_child_slots());
+        }
+        if let Some(inert) = &self.cleanup_settlement_permanent_inert {
+            slots.extend(inert.ledger.tracked_child_slots());
         }
         if let Some(pending) = &self.pending_back_no_target_authority_cleanup {
             match pending {
@@ -6613,6 +6652,7 @@ impl RouterNavigation {
             pending_mount_mutation_rejection: None,
             pending_failed_branch: None,
             failure_cleanup_permanent: None,
+            cleanup_settlement_permanent_inert: None,
             projectionless_fail_close: None,
             active: None,
             cleanup_ledger: None,
@@ -6688,7 +6728,9 @@ impl RouterNavigation {
             .ok_or_else(|| {
                 NavigationEnqueueError::new(NavigationEnqueueErrorKind::UnknownRouter)
             })?;
-        if entry.authority_protocol_residual.is_some() {
+        if entry.authority_protocol_residual.is_some()
+            || entry.cleanup_settlement_permanent_inert.is_some()
+        {
             return Err(NavigationEnqueueError::new(
                 NavigationEnqueueErrorKind::HostUnavailable,
             ));
@@ -6713,7 +6755,9 @@ impl RouterNavigation {
             .ok_or_else(|| {
                 NavigationEnqueueError::new(NavigationEnqueueErrorKind::UnknownRouter)
             })?;
-        if entry.authority_protocol_residual.is_some() {
+        if entry.authority_protocol_residual.is_some()
+            || entry.cleanup_settlement_permanent_inert.is_some()
+        {
             return Err(NavigationEnqueueError::new(
                 NavigationEnqueueErrorKind::HostUnavailable,
             ));
@@ -6758,7 +6802,9 @@ impl RouterNavigation {
                         ));
                     }
                 }
-                if entry.authority_protocol_residual.is_some() {
+                if entry.authority_protocol_residual.is_some()
+                    || entry.cleanup_settlement_permanent_inert.is_some()
+                {
                     return Err(NavigationEnqueueError::new(
                         NavigationEnqueueErrorKind::HostUnavailable,
                     ));
@@ -7153,6 +7199,7 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                     if entry.host.is_some()
                         || entry.post_commit_compound.is_some()
                         || entry.authority_protocol_residual.is_some()
+                        || entry.cleanup_settlement_permanent_inert.is_some()
                         || entry
                             .cleanup_ledger
                             .as_ref()
@@ -8333,6 +8380,7 @@ fn install_failure_cleanup_permanent_authority(
         failed: None,
         failure_cleanup_completion: None,
         failure_cleanup_ledger: None,
+        cleanup_settlement_ledger: None,
         failure_cleanup_permanent_authority: Some(pair),
         host: retired_host,
     });
@@ -16067,14 +16115,14 @@ use authority_isolation::{
 use authority_isolation::{
     AuthorityIsolationContradiction, AuthorityIsolationPreparation,
     AuthoritySettlementBeginOutcome, PreparedAuthorityIsolation, begin_authority_settlement,
-    fail_closed_failed_authority_protocol, fail_closed_failed_manifest_protocol,
-    fail_closed_failed_owner_protocol, fail_closed_failed_owner_protocol_prepared,
-    fail_closed_failure_cleanup_completion_protocol, fail_closed_normal_authority_protocol,
-    fail_closed_normal_authority_protocol_prepared, fail_closed_normal_owner_protocol,
-    fail_closed_projectionless_owner_protocol, prepare_authority_isolation_targets,
-    prepare_failed_branch_authority_isolation, prepare_failed_manifest_protocol_isolation,
-    prepare_normal_authority_isolation, prepare_post_commit_input_isolation,
-    prepare_target_preparation_permanent_isolation,
+    fail_closed_cleanup_settlement_permanent, fail_closed_failed_authority_protocol,
+    fail_closed_failed_manifest_protocol, fail_closed_failed_owner_protocol,
+    fail_closed_failed_owner_protocol_prepared, fail_closed_failure_cleanup_completion_protocol,
+    fail_closed_normal_authority_protocol, fail_closed_normal_authority_protocol_prepared,
+    fail_closed_normal_owner_protocol, fail_closed_projectionless_owner_protocol,
+    prepare_authority_isolation_targets, prepare_failed_branch_authority_isolation,
+    prepare_failed_manifest_protocol_isolation, prepare_normal_authority_isolation,
+    prepare_post_commit_input_isolation, prepare_target_preparation_permanent_isolation,
 };
 
 enum ProjectionlessFallbackPreflight {
@@ -21571,6 +21619,9 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                 if entry.failure_cleanup_permanent.is_some() {
                     continue;
                 }
+                if entry.cleanup_settlement_permanent_inert.is_some() {
+                    continue;
+                }
                 if let Some(mut failed) = entry.pending_failed_branch.take() {
                     if entry.cleanup_ledger.is_some() {
                         entry.pending_failed_branch = Some(failed);
@@ -21933,6 +21984,14 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                 let Some(mut ledger) = entry.cleanup_ledger.take() else {
                     continue;
                 };
+                if ledger.cleanup_settlement_permanent_evidence().is_some() {
+                    if let Err(ledger) =
+                        fail_closed_cleanup_settlement_permanent(world, entry, ledger)
+                    {
+                        entry.cleanup_ledger = Some(ledger);
+                    }
+                    continue;
+                }
                 if !entry.observe_cleanup_receipts(&mut ledger) {
                     entry.cleanup_ledger = Some(ledger);
                     continue;
@@ -21960,7 +22019,15 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                         continue;
                     }
                     if !settled {
-                        entry.cleanup_ledger = Some(ledger);
+                        if ledger.cleanup_settlement_permanent_evidence().is_some() {
+                            if let Err(ledger) =
+                                fail_closed_cleanup_settlement_permanent(world, entry, ledger)
+                            {
+                                entry.cleanup_ledger = Some(ledger);
+                            }
+                        } else {
+                            entry.cleanup_ledger = Some(ledger);
+                        }
                         continue;
                     }
                 }

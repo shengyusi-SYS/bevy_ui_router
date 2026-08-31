@@ -1207,7 +1207,7 @@ pub(crate) fn reap_quarantines_system(world: &mut World) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use bevy_ecs::{
         component::Component,
         hierarchy::ChildOf,
@@ -1504,8 +1504,7 @@ mod tests {
         assert!(world.resource::<QuarantineLeaseTable>().leases.is_empty());
     }
 
-    #[test]
-    fn round_robin_cursor_does_not_let_permanent_lease_starve_reapable_successor() {
+    pub(crate) fn round_robin_reaper_fairness_fixture() {
         let mut world = World::new();
         install_reaper_resources(&mut world);
         let frame = frame_fixture();
@@ -1534,6 +1533,11 @@ mod tests {
         assert_eq!(table.leases.len(), 1);
         assert_eq!(table.leases[0].id.sequence, 1);
         assert_eq!(table.leases[0].operation_sequence, 1);
+    }
+
+    #[test]
+    fn round_robin_cursor_does_not_let_permanent_lease_starve_reapable_successor() {
+        round_robin_reaper_fairness_fixture();
     }
 
     fn assert_initial_capacity_failure_reapplies_inert_barrier(candidate_clone: bool) {

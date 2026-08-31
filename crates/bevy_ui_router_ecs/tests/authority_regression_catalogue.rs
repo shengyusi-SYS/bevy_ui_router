@@ -34,6 +34,17 @@ pub const AUTHORITY_REGRESSION_CATALOGUE: &[&str] = &[
     "error_outlet_role_classification_is_preserved",
     "post_commit_host_loss_preserves_committed_history",
     "host_reacceptance_detaches_old_top_slot",
+    "multi_router_registries_are_partitioned",
+    "old_quarantine_lease_cannot_mutate_new_epoch",
+    "quarantine_reaper_round_robin_is_fair",
+    "registry_invariant_violation_is_fail_closed",
+];
+
+const AUTHORITY_CLOSURE_ROWS: &[&str] = &[
+    "multi_router_registries_are_partitioned",
+    "old_quarantine_lease_cannot_mutate_new_epoch",
+    "quarantine_reaper_round_robin_is_fair",
+    "registry_invariant_violation_is_fail_closed",
 ];
 
 fn package_root() -> PathBuf {
@@ -789,8 +800,8 @@ fn recovery_activation_has_no_planned_runtime_rows() {
     let catalogue = catalogue_set();
     assert_eq!(
         catalogue.len(),
-        27,
-        "runtime catalogue must contain the completed R1–R3 rows"
+        31,
+        "runtime catalogue must contain the Authority-complete MVP rows"
     );
     let overlap = planned
         .intersection(&catalogue)
@@ -813,7 +824,7 @@ fn direct_tests(file: &syn::File) -> Vec<&ItemFn> {
 }
 
 #[test]
-fn catalogue_matches_root_nested_and_active_history_recovery_profiles_and_final_mvp_vocabulary() {
+fn catalogue_matches_root_nested_active_history_recovery_and_authority_final_mvp_vocabulary() {
     let root_profile =
         fs::read_to_string(workspace_root().join("docs/root-push-contract-profile.md"))
             .expect("Root profile must be readable");
@@ -840,10 +851,15 @@ fn catalogue_matches_root_nested_and_active_history_recovery_profiles_and_final_
         .into_iter()
         .filter_map(|row| (row.state == "active").then_some(row.test_function))
         .collect::<Vec<_>>();
+    let authority_names = AUTHORITY_CLOSURE_ROWS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
     let mut expected = root_names.clone();
     expected.extend(nested_names.clone());
     expected.extend(history_names.clone());
     expected.extend(recovery_names.clone());
+    expected.extend(authority_names.clone());
     assert_eq!(
         root_names.len(),
         20,
@@ -866,18 +882,24 @@ fn catalogue_matches_root_nested_and_active_history_recovery_profiles_and_final_
         "the Rust active History suffix must preserve the profile table order"
     );
     assert_eq!(
-        AUTHORITY_REGRESSION_CATALOGUE[24..],
+        AUTHORITY_REGRESSION_CATALOGUE[24..27],
         recovery_names,
         "the Rust active Recovery suffix must preserve the profile table order"
     );
     assert_eq!(
+        AUTHORITY_REGRESSION_CATALOGUE[27..],
+        authority_names,
+        "the Rust Authority suffix must preserve the final MVP authority order"
+    );
+    assert_eq!(
         AUTHORITY_REGRESSION_CATALOGUE, expected,
-        "Rust catalogue must preserve the Root, Nested, active History, and active Recovery profile union order"
+        "Rust catalogue must preserve the Root, Nested, active History, active Recovery, and Authority final union order"
     );
     let root_set = root_names.into_iter().collect::<BTreeSet<_>>();
     let nested_set = nested_names.into_iter().collect::<BTreeSet<_>>();
     let history_set = history_names.into_iter().collect::<BTreeSet<_>>();
     let recovery_set = recovery_names.into_iter().collect::<BTreeSet<_>>();
+    let authority_set = authority_names.into_iter().collect::<BTreeSet<_>>();
     let overlap = root_set.intersection(&nested_set).collect::<Vec<_>>();
     assert!(
         overlap.is_empty(),
@@ -899,30 +921,37 @@ fn catalogue_matches_root_nested_and_active_history_recovery_profiles_and_final_
             && recovery_set.is_disjoint(&history_set),
         "active Recovery authority rows must be disjoint from the existing catalogue"
     );
+    assert!(
+        authority_set.is_disjoint(&root_set)
+            && authority_set.is_disjoint(&nested_set)
+            && authority_set.is_disjoint(&history_set)
+            && authority_set.is_disjoint(&recovery_set),
+        "Authority closure rows must be disjoint from Root, Nested, History, and Recovery rows"
+    );
     let expected_set = expected.into_iter().collect::<BTreeSet<_>>();
     assert_eq!(
         expected_set.len(),
-        27,
-        "active History plus Recovery R1–R3 cumulative catalogue must be 27"
+        31,
+        "the Authority-complete MVP catalogue must contain exactly 31 rows"
     );
     let catalogue = catalogue_set();
     assert_eq!(
         catalogue.len(),
-        27,
-        "Rust catalogue must include the active Recovery R1–R3 rows"
+        31,
+        "Rust catalogue must include all Authority-complete MVP rows"
     );
     assert_eq!(
         catalogue, expected_set,
-        "Rust catalogue must match the Root, Nested, active History, and active Recovery profile union"
+        "Rust catalogue must match the Root, Nested, active History, active Recovery, and Authority final union"
     );
     let final_names = parse_final_mvp_catalogue(&final_mvp);
-    let unknown = catalogue
-        .difference(&final_names)
-        .cloned()
-        .collect::<Vec<_>>();
     assert!(
-        unknown.is_empty(),
-        "active profile union contains non-final-MVP names: {unknown:?}"
+        final_names.len() == 31,
+        "final MVP vocabulary must contain exactly 31 authority rows"
+    );
+    assert_eq!(
+        catalogue, final_names,
+        "the Authority-complete catalogue must exactly match the final MVP vocabulary"
     );
 }
 

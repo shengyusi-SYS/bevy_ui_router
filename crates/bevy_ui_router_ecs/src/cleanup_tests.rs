@@ -1829,11 +1829,10 @@ fn failed_prepared_branch_child_slot_lifecycle_drift_is_locally_lost_and_bounded
     let mut ledger = CleanupLedger::activate_failed(prepared, branch);
     let attempt = ledger.attempt(app.world()).unwrap();
 
-    assert!(!ledger.settle(app.world_mut(), attempt));
+    assert!(ledger.settle(app.world_mut(), attempt));
     assert_eq!(ledger.receipt_count(), ledger.obligations.len());
-    let retry = ledger.attempt(app.world()).unwrap();
-    assert!(ledger.settle(app.world_mut(), retry));
     assert!(ledger.is_settled());
+    assert!(ledger.attempt(app.world()).is_none());
     assert_eq!(
         app.world().get::<ChildSlotLifecycle>(child_slot),
         Some(&ChildSlotLifecycle::ProvisionalInert)
@@ -2417,6 +2416,72 @@ fn frame_quarantine_preserves_foreign_child_slot_lifecycle() {
         app.world().get::<ChildSlotLifecycle>(frame_shell),
         Some(&ChildSlotLifecycle::ProvisionalInert)
     );
+}
+
+#[test]
+fn quarantine_detachment_projection_accumulates_later_edges_without_rebaselining_targets() {
+    let (app, branch) = crate::navigation::tests::failed_deep_nested_branch_fixture();
+    let claims = branch
+        .frames()
+        .iter()
+        .flat_map(RealizedFrame::claims)
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(claims.len(), 4);
+    let registry = app.world().resource::<RouteEntityRegistry>();
+    let observed = |claim: &ExactRegistryClaim| {
+        FrozenFailureCleanupObservedEntity::observe(app.world(), registry, claim.entity())
+    };
+    let empty_manifest =
+        || ComponentManifest::new(std::iter::empty::<bevy_ecs::component::ComponentId>());
+    let edge = |parent: ExactRegistryClaim, child: ExactRegistryClaim| {
+        let parent_manifest = empty_manifest();
+        let child_manifest = empty_manifest();
+        PreparedCleanupQuarantineMountParentDetachment {
+            parent: CleanupMountParentSettlement {
+                claim: parent.clone(),
+                manifest: parent_manifest.clone(),
+                physical_manifest: parent_manifest.clone(),
+                expected_parent: parent.entity(),
+                expected_parent_claim: None,
+                removed_child: child.entity(),
+                removed_child_was_attached: true,
+                children_before: vec![child.entity()],
+                children_after: Vec::new(),
+            },
+            parent_next_manifest: parent_manifest.clone(),
+            parent_physical_manifest_after: parent_manifest,
+            child_claim: child,
+            child_manifest_before: child_manifest.clone(),
+            child_manifest_after: child_manifest,
+        }
+    };
+
+    let first = PreparedCleanupQuarantineDetachment {
+        targets_after_inert: vec![observed(&claims[1]), observed(&claims[3])],
+        protected_before: vec![observed(&claims[0]), observed(&claims[2])],
+        edges: vec![edge(claims[0].clone(), claims[1].clone())],
+    };
+    let mut accumulated = FrozenCleanupQuarantineDetachment::from_prepared(&first, 1);
+    let original_first_target = accumulated.targets_after[0].clone();
+    let mut second_targets = accumulated.targets_after.clone();
+    second_targets[0].parent = Some(claims[2].entity());
+    let second = PreparedCleanupQuarantineDetachment {
+        targets_after_inert: second_targets,
+        protected_before: accumulated.protected_after.clone(),
+        edges: vec![edge(claims[2].clone(), claims[3].clone())],
+    };
+
+    assert!(accumulated.reserve_merge_from_prepared(&second));
+    let second = FrozenCleanupQuarantineDetachment::from_prepared(&second, 1);
+    assert!(accumulated.merge_conflict_kind(&second).is_none());
+    accumulated.merge_prechecked(second);
+    assert_eq!(accumulated.edges.len(), 2);
+    assert!(accumulated.contains_parent(&claims[0]));
+    assert!(accumulated.contains_parent(&claims[2]));
+    assert_eq!(accumulated.targets_after.len(), 2);
+    assert_eq!(accumulated.targets_after[0], original_first_target);
 }
 
 #[test]
