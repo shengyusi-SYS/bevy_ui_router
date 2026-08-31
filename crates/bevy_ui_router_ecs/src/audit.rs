@@ -700,6 +700,22 @@ impl RouterAuthorityAudits {
             .find_map(|(stored, snapshot)| (*stored == router).then_some(snapshot))
     }
 
+    pub(crate) fn input_probe_targets(
+        &self,
+    ) -> impl Iterator<Item = (RouterHandle, AuditEntityId, Entity, bool)> + '_ {
+        self.identities
+            .iter()
+            .filter(|identity| identity.removed_at.is_none())
+            .map(|identity| {
+                (
+                    identity.router,
+                    identity.id,
+                    identity.entity,
+                    identity.id.0 & OWNED_ID_FLAG != 0,
+                )
+            })
+    }
+
     pub(crate) fn refresh(&mut self, world: &World, entries: &[RouterEntry]) {
         let mut snapshots = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -2839,5 +2855,54 @@ mod tests {
             snapshot.owned_entity_state(observed),
             AuditEntityState::Unknown
         );
+    }
+
+    #[test]
+    fn input_probes_resolve_router_scoped_audit_ids_through_the_production_gate() {
+        use crate::input::prepare_input_gate_mutation;
+        use crate::input_probe::{InputProbeResult, RouterInputModality, RouterInputProbes};
+
+        let mut world = World::new();
+        world.insert_resource(RouterInputGate::new());
+        let active_entity = world.spawn_empty().id();
+        let foreign_entity = world.spawn_empty().id();
+        world.resource_scope(|_world, gate: bevy_ecs::prelude::Mut<RouterInputGate>| {
+            prepare_input_gate_mutation(gate, &[], vec![active_entity])
+                .expect("the production gate accepts one exact active target")
+                .apply();
+        });
+
+        let router = RouterHandle::fixture(1, 1);
+        let foreign_router = RouterHandle::fixture(2, 1);
+        let mut audits = RouterAuthorityAudits::new();
+        audits.ensure_namespace(router);
+        audits.ensure_namespace(foreign_router);
+        let active = audits.id_for(router, active_entity, true, None, None, true, false);
+        let foreign = audits.id_for(router, foreign_entity, false, None, None, false, false);
+
+        let mut probes = RouterInputProbes::new();
+        probes.refresh(world.resource::<RouterInputGate>(), &audits);
+
+        for modality in [
+            RouterInputModality::Pointer,
+            RouterInputModality::Keyboard,
+            RouterInputModality::Gamepad,
+        ] {
+            assert_eq!(
+                probes.dispatch(router, active, modality),
+                InputProbeResult::Delivered
+            );
+            assert_eq!(probes.delivery_count(active, modality), 1);
+            assert_eq!(
+                probes.dispatch(router, foreign, modality),
+                InputProbeResult::Blocked
+            );
+            assert_eq!(probes.delivery_count(foreign, modality), 0);
+            assert_eq!(
+                probes.dispatch(foreign_router, active, modality),
+                InputProbeResult::Unknown
+            );
+            assert_eq!(probes.delivery_count(active, modality), 1);
+        }
     }
 }

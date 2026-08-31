@@ -13,6 +13,8 @@ mod driver;
 mod frame_local;
 mod host;
 mod input;
+#[cfg(feature = "test-support")]
+mod input_probe;
 mod lifecycle_preparation;
 mod mount;
 mod navigation;

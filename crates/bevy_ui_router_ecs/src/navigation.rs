@@ -22122,6 +22122,7 @@ pub(crate) fn refresh_authority_audits(world: &mut World) {
             );
         },
     );
+    crate::input_probe::refresh_input_probes(world);
 }
 
 #[cfg(not(feature = "test-support"))]

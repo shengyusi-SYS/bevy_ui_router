@@ -202,6 +202,8 @@ pub(crate) fn refresh_input_gate_system(world: &mut World) {
         .resource_mut::<RouterInputGate>()
         .allowed
         .retain(|entity| allowed.contains(entity));
+    #[cfg(feature = "test-support")]
+    crate::input_probe::refresh_input_probes(world);
 }
 
 struct PreparedPhysicalIsolation<'w> {

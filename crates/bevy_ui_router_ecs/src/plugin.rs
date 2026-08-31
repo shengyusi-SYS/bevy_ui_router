@@ -68,6 +68,13 @@ pub(crate) fn install_foundations(app: &mut App) {
     {
         app.insert_resource(crate::audit::RouterAuthorityAudits::new());
     }
+    #[cfg(feature = "test-support")]
+    if !app
+        .world()
+        .contains_resource::<crate::input_probe::RouterInputProbes>()
+    {
+        app.insert_resource(crate::input_probe::RouterInputProbes::new());
+    }
 
     if !app.world().contains_resource::<ViewDriverStore>() {
         app.insert_resource(ViewDriverStore::new());
