@@ -21,12 +21,16 @@ pub struct BevyUiRouterPlugin;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, SystemSet)]
 pub enum RouterScheduleSet {
+    PublishSnapshots,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, SystemSet)]
+pub(crate) enum RouterLifecycleSet {
     ObserveAuthority,
     CollectNavigation,
     DriveNavigation,
     CommitPresentation,
     SettleCleanup,
-    PublishSnapshots,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, SystemSet)]
@@ -54,21 +58,6 @@ pub(crate) fn install_foundations(app: &mut App) {
     if !app.world().contains_resource::<RouterInputGate>() {
         app.insert_resource(RouterInputGate::new());
     }
-    #[cfg(feature = "test-support")]
-    if !app
-        .world()
-        .contains_resource::<crate::audit::RouterAuthorityAudits>()
-    {
-        app.insert_resource(crate::audit::RouterAuthorityAudits::new());
-    }
-    #[cfg(feature = "test-support")]
-    if !app
-        .world()
-        .contains_resource::<crate::input_probe::RouterInputProbes>()
-    {
-        app.insert_resource(crate::input_probe::RouterInputProbes::new());
-    }
-
     if !app.world().contains_resource::<ViewDriverStore>() {
         app.insert_resource(ViewDriverStore::new());
     }
@@ -82,11 +71,11 @@ pub(crate) fn install_foundations(app: &mut App) {
     app.configure_sets(
         Update,
         (
-            RouterScheduleSet::ObserveAuthority,
-            RouterScheduleSet::CollectNavigation,
-            RouterScheduleSet::DriveNavigation,
-            RouterScheduleSet::CommitPresentation,
-            RouterScheduleSet::SettleCleanup,
+            RouterLifecycleSet::ObserveAuthority,
+            RouterLifecycleSet::CollectNavigation,
+            RouterLifecycleSet::DriveNavigation,
+            RouterLifecycleSet::CommitPresentation,
+            RouterLifecycleSet::SettleCleanup,
             RouterScheduleSet::PublishSnapshots,
         )
             .chain(),
@@ -98,11 +87,11 @@ pub(crate) fn install_foundations(app: &mut App) {
     .add_systems(
         Update,
         (
-            observe_authority_system.in_set(RouterScheduleSet::ObserveAuthority),
-            collect_navigation_system.in_set(RouterScheduleSet::CollectNavigation),
-            drive_navigation_system.in_set(RouterScheduleSet::DriveNavigation),
-            commit_presentation_system.in_set(RouterScheduleSet::CommitPresentation),
-            settle_cleanup_system.in_set(RouterScheduleSet::SettleCleanup),
+            observe_authority_system.in_set(RouterLifecycleSet::ObserveAuthority),
+            collect_navigation_system.in_set(RouterLifecycleSet::CollectNavigation),
+            drive_navigation_system.in_set(RouterLifecycleSet::DriveNavigation),
+            commit_presentation_system.in_set(RouterLifecycleSet::CommitPresentation),
+            settle_cleanup_system.in_set(RouterLifecycleSet::SettleCleanup),
             publish_snapshots_system.in_set(RouterScheduleSet::PublishSnapshots),
         ),
     )

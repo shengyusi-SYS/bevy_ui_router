@@ -1,6 +1,4 @@
 use std::collections::HashSet;
-#[cfg(feature = "test-support")]
-use std::sync::{Arc, Mutex, MutexGuard};
 
 use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
@@ -13,8 +11,6 @@ use bevy_ecs::{
 use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
 
-#[cfg(feature = "test-support")]
-use crate::audit::AuditEntityId;
 use crate::{
     components::{ChildSlotAuthority, ChildSlotLifecycle, RouteOwnershipSeal, RouterInputBarrier},
     frame_local::validate_active_branch_with_entering,
@@ -43,16 +39,12 @@ impl RouteFocusState {
 #[derive(Resource)]
 pub struct RouterInputGate {
     allowed: Vec<Entity>,
-    #[cfg(feature = "test-support")]
-    probe_endpoint: Arc<InputProbeEndpoint>,
 }
 
 impl RouterInputGate {
     pub(crate) fn new() -> Self {
         Self {
             allowed: Vec::new(),
-            #[cfg(feature = "test-support")]
-            probe_endpoint: Arc::new(InputProbeEndpoint::new()),
         }
     }
 
@@ -72,115 +64,23 @@ impl RouterInputGate {
         &self.allowed
     }
 
-    fn replace_allowed(
-        &mut self,
-        next: Vec<Entity>,
-        #[cfg(feature = "test-support")] probe_next: Vec<Entity>,
-    ) {
-        #[cfg(feature = "test-support")]
-        self.probe_endpoint.replace_allowed(probe_next);
+    fn replace_allowed(&mut self, next: Vec<Entity>) {
         self.allowed = next;
     }
 
     fn retain_allowed(&mut self, allowed: &HashSet<Entity>) {
         self.allowed.retain(|entity| allowed.contains(entity));
-        #[cfg(feature = "test-support")]
-        self.probe_endpoint.retain_allowed(allowed);
-    }
-
-    #[cfg(feature = "test-support")]
-    pub(crate) fn input_probe_endpoint(&self) -> Arc<InputProbeEndpoint> {
-        Arc::clone(&self.probe_endpoint)
-    }
-}
-
-#[cfg(feature = "test-support")]
-struct InputProbeEndpointState {
-    allowed: Vec<Entity>,
-    deliveries: Vec<(AuditEntityId, [u64; 3])>,
-}
-
-#[cfg(feature = "test-support")]
-pub(crate) struct InputProbeEndpoint {
-    state: Mutex<InputProbeEndpointState>,
-}
-
-#[cfg(feature = "test-support")]
-impl InputProbeEndpoint {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(InputProbeEndpointState {
-                allowed: Vec::new(),
-                deliveries: Vec::new(),
-            }),
-        }
-    }
-
-    fn state(&self) -> MutexGuard<'_, InputProbeEndpointState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
-
-    fn replace_allowed(&self, allowed: Vec<Entity>) {
-        self.state().allowed = allowed;
-    }
-
-    fn retain_allowed(&self, allowed: &HashSet<Entity>) {
-        self.state()
-            .allowed
-            .retain(|entity| allowed.contains(entity));
-    }
-
-    pub(crate) fn dispatch(&self, target: AuditEntityId, entity: Entity, modality: usize) -> bool {
-        let mut state = self.state();
-        if !state.allowed.contains(&entity) {
-            return false;
-        }
-        let counter = match state
-            .deliveries
-            .iter_mut()
-            .find(|(candidate, _)| *candidate == target)
-        {
-            Some((_, counts)) => counts,
-            None => {
-                state.deliveries.push((target, [0; 3]));
-                &mut state
-                    .deliveries
-                    .last_mut()
-                    .expect("the input probe counter was just inserted")
-                    .1
-            }
-        };
-        counter[modality] = counter[modality]
-            .checked_add(1)
-            .expect("input probe delivery counter exhausted");
-        true
-    }
-
-    pub(crate) fn delivery_count(&self, target: AuditEntityId, modality: usize) -> u64 {
-        self.state()
-            .deliveries
-            .iter()
-            .find(|(candidate, _)| *candidate == target)
-            .map_or(0, |(_, counts)| counts[modality])
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct PreparedInputGateIsolation {
     next: Vec<Entity>,
-    #[cfg(feature = "test-support")]
-    probe_next: Vec<Entity>,
 }
 
 impl PreparedInputGateIsolation {
     pub(crate) fn apply(self, gate: &mut RouterInputGate) {
-        gate.replace_allowed(
-            self.next,
-            #[cfg(feature = "test-support")]
-            self.probe_next,
-        );
+        gate.replace_allowed(self.next);
     }
 }
 
@@ -192,34 +92,17 @@ pub(crate) fn try_prepare_input_gate_isolation(
     next.try_reserve_exact(gate.allowed.len()).map_err(|_| ())?;
     next.extend(gate.allowed.iter().copied());
     next.retain(|entity| !targets.contains(entity));
-    #[cfg(feature = "test-support")]
-    let probe_next = {
-        let mut projection = Vec::new();
-        projection.try_reserve_exact(next.len()).map_err(|_| ())?;
-        projection.extend(next.iter().copied());
-        projection
-    };
-    Ok(PreparedInputGateIsolation {
-        next,
-        #[cfg(feature = "test-support")]
-        probe_next,
-    })
+    Ok(PreparedInputGateIsolation { next })
 }
 
 pub(crate) struct PreparedInputGateMutation<'w> {
     gate: Mut<'w, RouterInputGate>,
     next: Vec<Entity>,
-    #[cfg(feature = "test-support")]
-    probe_next: Vec<Entity>,
 }
 
 impl PreparedInputGateMutation<'_> {
     pub(crate) fn apply(mut self) {
-        self.gate.replace_allowed(
-            self.next,
-            #[cfg(feature = "test-support")]
-            self.probe_next,
-        );
+        self.gate.replace_allowed(self.next);
     }
 }
 
@@ -288,14 +171,7 @@ pub(crate) fn prepare_input_gate_mutation<'w>(
     let mut next = gate.allowed.clone();
     next.retain(|entity| !remove.contains(entity));
     next.extend(add);
-    #[cfg(feature = "test-support")]
-    let probe_next = next.clone();
-    Some(PreparedInputGateMutation {
-        gate,
-        next,
-        #[cfg(feature = "test-support")]
-        probe_next,
-    })
+    Some(PreparedInputGateMutation { gate, next })
 }
 
 pub(crate) fn refresh_input_gate_system(world: &mut World) {
@@ -329,8 +205,6 @@ pub(crate) fn refresh_input_gate_system(world: &mut World) {
     world
         .resource_mut::<RouterInputGate>()
         .retain_allowed(&allowed);
-    #[cfg(feature = "test-support")]
-    crate::input_probe::refresh_input_probes(world);
 }
 
 struct PreparedPhysicalIsolation<'w> {

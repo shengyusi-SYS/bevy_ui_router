@@ -1034,15 +1034,6 @@ impl RealizedFrame {
             outlet.apply_claim_rebind(all_claims);
         }
     }
-
-    #[cfg(feature = "test-support")]
-    pub(crate) fn audit_content(
-        &self,
-    ) -> impl Iterator<Item = (Entity, crate::content::SolidRect)> + '_ {
-        self.entities
-            .iter()
-            .filter_map(|entity| entity.solid_rect.map(|rect| (entity.entity, rect)))
-    }
 }
 
 pub(crate) fn claim_rebind_is_exact(

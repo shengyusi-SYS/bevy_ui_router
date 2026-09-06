@@ -64,8 +64,6 @@ static NEXT_LEDGER_DOMAIN: AtomicU64 = AtomicU64::new(1);
 mod capacity;
 #[cfg(test)]
 pub(crate) use capacity::BackCapacityCellDispositionForTest;
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) use capacity::BackCapacityIssuerSemanticSnapshot;
 #[cfg(test)]
 use capacity::prepared_installed_back_zero_completion;
 use capacity::{BackCapacityCellId, ManifestNeutralLedgerStorage};
@@ -8375,14 +8373,9 @@ impl PreparedBackNoTargetAuthorityCleanupLedger {
         )
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn leaving_frames(&self) -> &[RealizedFrame] {
         self.owner.active.frames()
-    }
-
-    #[cfg(feature = "test-support")]
-    pub(crate) fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
-        self.owner.active.tracked_child_slots()
     }
 }
 
@@ -9063,7 +9056,7 @@ impl CleanupLedger {
             && batch.obligation_count() == self.obligations.len()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn leaving_frames(&self) -> &[RealizedFrame] {
         match self.owner.as_ref() {
             Some(CleanupOwner::Leaving(branch)) => branch.frames(),
@@ -9077,7 +9070,7 @@ impl CleanupLedger {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn failed_prepared_frames(&self) -> &[RealizedFrame] {
         match self.owner.as_ref() {
             Some(CleanupOwner::FailedPrepared(owner)) => owner.branch.frames(),
@@ -9119,25 +9112,6 @@ impl CleanupLedger {
                 | CleanupOwner::Leaving(_),
             )
             | None => None,
-        }
-    }
-
-    #[cfg(feature = "test-support")]
-    pub(crate) fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
-        match self.owner.as_ref() {
-            Some(CleanupOwner::Leaving(branch)) => branch.tracked_child_slots(),
-            Some(CleanupOwner::FailedPrepared(owner)) => owner.branch.tracked_child_slots(),
-            Some(CleanupOwner::AuthoritySettlement(owner)) => {
-                let mut slots = owner
-                    .active
-                    .as_ref()
-                    .map(RealizedBranch::tracked_child_slots)
-                    .unwrap_or_default();
-                slots.extend(owner.pending.branch().tracked_child_slots());
-                slots
-            }
-            Some(CleanupOwner::BackNoTargetAuthority(owner)) => owner.active.tracked_child_slots(),
-            None => Vec::new(),
         }
     }
 

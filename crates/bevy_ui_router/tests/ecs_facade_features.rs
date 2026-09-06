@@ -11,4 +11,7 @@ fn ecs_facade_exposes_root_runtime_and_module_only_schedule_labels() {
     public::<RouterSnapshots>();
     public::<RouterInputSet>();
     public::<RouterScheduleSet>();
+    let _ = RouterInputSet::Refresh;
+    let _ = RouterInputSet::Ready;
+    let _ = RouterScheduleSet::PublishSnapshots;
 }

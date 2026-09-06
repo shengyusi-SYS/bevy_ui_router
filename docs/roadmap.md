@@ -4,12 +4,12 @@
 
 ## Now
 
-- 后台 reaper 已退出；继续精简 public audit/probe 与公开中间调度，保留有效前台修复、私有残留隔离责任和已有导航行为。
+- 候选精简和独立迁移基线已完成：后台 reaper、public audit/probe 与公开中间调度退出，前台修复和私有残留责任保留。下一步交付官方同步 BSN root 切片。
 
 ## Next
 
 - 交付官方同步代码驱动 BSN root 切片，包括创建期分配责任、current containment、真实输入与 focus 隔离。
-- 完成内部 default outlet 的嵌套布局、history、恢复和 host/stale 闭环；保留 renderer-neutral 独立验证。
+- 完成内部 default outlet 的嵌套布局、history、恢复和 host/stale 闭环；修复已确认的 idle host loss 不启动恢复缺口，保留 renderer-neutral 独立验证。
 - 通过推荐 facade 的独立 BSN consumer、示例、全量验证与独立交叉审查后集成 main；完成前不标记 MVP PASS。
 
 ## Post-MVP

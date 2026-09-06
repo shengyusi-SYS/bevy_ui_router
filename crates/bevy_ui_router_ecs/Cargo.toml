@@ -5,7 +5,6 @@ edition.workspace = true
 
 [features]
 default = []
-test-support = ["bevy_ui_router_core/test-support"]
 
 [dependencies]
 bevy_app = { version = "0.19.1", default-features = false }

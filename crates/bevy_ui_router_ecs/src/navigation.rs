@@ -775,7 +775,7 @@ impl FrozenStaleOutputOtherHolders {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 #[derive(Clone, Eq, PartialEq)]
 enum FrozenDelayedDriverReportReplayProjection {
     Armed {
@@ -800,9 +800,7 @@ struct FrozenStaleOutputCurrentEpoch {
     drivers: Option<ViewDriverStoreProjection>,
     registry: Option<ProtectedRegistryProjection>,
     quarantine: Option<QuarantineLeaseTable>,
-    #[cfg(feature = "test-support")]
-    audit: Option<crate::audit::RouterAuthorityAuditSnapshot>,
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     delayed_report: Option<FrozenDelayedDriverReportReplayProjection>,
 }
 
@@ -828,12 +826,7 @@ impl FrozenStaleOutputCurrentEpoch {
                 .get_resource::<RouteEntityRegistry>()
                 .map(|registry| registry.protected_projection_excluding(targets)),
             quarantine: world.get_resource::<QuarantineLeaseTable>().cloned(),
-            #[cfg(feature = "test-support")]
-            audit: world
-                .get_resource::<crate::audit::RouterAuthorityAudits>()
-                .and_then(|audits| audits.get(entry.handle))
-                .cloned(),
-            #[cfg(any(test, feature = "test-support"))]
+            #[cfg(test)]
             delayed_report: entry
                 .delayed_driver_report_replay
                 .as_ref()
@@ -880,7 +873,7 @@ enum PendingStaleOutputCleanup {
     },
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 enum TestingDelayedDriverReportReplayState {
     Armed {
         control: u64,
@@ -892,7 +885,7 @@ enum TestingDelayedDriverReportReplayState {
     },
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TestingDelayedDriverReportReplayControlError {
     UnknownRouter,
@@ -2223,97 +2216,6 @@ enum PostCommitCompoundHolder {
     Inert(ActivePostCommitCompoundOwner),
 }
 
-impl PostCommitCompoundHolder {
-    #[cfg(feature = "test-support")]
-    fn leaving_frames(&self) -> Vec<&RealizedFrame> {
-        match self {
-            Self::PreAcceptInert { physical, .. } => {
-                physical.original.leaving_frames().iter().collect()
-            }
-            Self::AcceptedInert { physical, .. } => physical
-                .original
-                .leaving_frames()
-                .iter()
-                .chain(physical.active.frames())
-                .collect(),
-            Self::PreparedInert { physical, .. } => physical
-                .original
-                .leaving_frames()
-                .iter()
-                .chain(physical.active.frames())
-                .collect(),
-            Self::BoundInert { physical, .. } => physical
-                .original
-                .leaving_frames()
-                .iter()
-                .chain(physical.active.frames())
-                .collect(),
-            Self::PermitMismatchInert { physical, .. }
-            | Self::PermitInert { physical, .. }
-            | Self::CompletionPreparationInert { physical, .. }
-            | Self::CompletionInert { physical, .. } => physical
-                .original
-                .leaving_frames()
-                .iter()
-                .chain(physical.active.frames())
-                .collect(),
-            Self::Active(active) | Self::Inert(active) => active
-                .physical
-                .original
-                .leaving_frames()
-                .iter()
-                .chain(active.physical.active.frames())
-                .collect(),
-            Self::SettlementInert(inert) => inert
-                .physical
-                .original
-                .leaving_frames()
-                .iter()
-                .chain(inert.physical.active.frames())
-                .collect(),
-        }
-    }
-
-    #[cfg(feature = "test-support")]
-    fn append_tracked_child_slots(
-        &self,
-        slots: &mut Vec<crate::branch_transaction::TrackedChildSlot>,
-    ) {
-        match self {
-            Self::PreAcceptInert { physical, .. } => {
-                slots.extend(physical.original.tracked_child_slots());
-            }
-            Self::AcceptedInert { physical, .. } => {
-                slots.extend(physical.original.tracked_child_slots());
-                slots.extend(physical.active.tracked_child_slots());
-            }
-            Self::PreparedInert { physical, .. } => {
-                slots.extend(physical.original.tracked_child_slots());
-                slots.extend(physical.active.tracked_child_slots());
-            }
-            Self::BoundInert { physical, .. } => {
-                slots.extend(physical.original.tracked_child_slots());
-                slots.extend(physical.active.tracked_child_slots());
-            }
-            Self::PermitMismatchInert { physical, .. }
-            | Self::PermitInert { physical, .. }
-            | Self::CompletionPreparationInert { physical, .. }
-            | Self::CompletionInert { physical, .. } => {
-                slots.extend(physical.original.tracked_child_slots());
-                slots.extend(physical.active.tracked_child_slots());
-            }
-            Self::Active(active) | Self::Inert(active) => {
-                slots.extend(active.physical.original.tracked_child_slots());
-                slots.extend(active.physical.active.tracked_child_slots());
-            }
-            Self::SettlementInert(inert) => {
-                slots.extend(inert.physical.original.tracked_child_slots());
-                slots.extend(inert.physical.active.tracked_child_slots());
-            }
-        }
-    }
-}
-
 struct SettledRetiredHostEvidence {
     host: RetiredHostBinding,
     edge: FrozenRetiredHostEdge,
@@ -2511,7 +2413,7 @@ pub(crate) struct RouterEntry {
     pending_commit: Option<PendingCommit>,
     pending_frame_drive: Option<PendingFrameDrive>,
     pending_stale_output_cleanup: Option<PendingStaleOutputCleanup>,
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     delayed_driver_report_replay: Option<TestingDelayedDriverReportReplayState>,
     pending_mount_frame_task: Option<RootFrameTask>,
     pending_mount_request: Option<MountRequest>,
@@ -2524,9 +2426,9 @@ pub(crate) struct RouterEntry {
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
     post_commit_compound: Option<Box<PostCommitCompoundHolder>>,
     settled_retired_host_evidence: Option<SettledRetiredHostEvidence>,
-    #[cfg(feature = "test-support")]
+    #[cfg(test)]
     commit_sealed_registration_removal_armed: bool,
-    #[cfg(feature = "test-support")]
+    #[cfg(test)]
     commit_sealed_registration_removal_fired: bool,
     failure_cleanup_completion: Option<FailureCleanupCompletionInertOwner>,
     cleanup_observation: RouterCleanupObservation,
@@ -2569,7 +2471,7 @@ pub(crate) struct RouterEntry {
     failure_cleanup_completion_receiver_drift_armed: bool,
     #[cfg(test)]
     back_no_target_completion_fact_drift: Option<BackNoTargetCompletionFactDrift>,
-    #[cfg(feature = "test-support")]
+    #[cfg(test)]
     back_capacity_facade_producer:
         Option<bevy_ui_router_core::test_support::BackCapacityFacadeProducer>,
 }
@@ -2644,19 +2546,11 @@ enum BackNoTargetAuthorityLedgerHolder {
 }
 
 impl BackNoTargetAuthorityLedgerHolder {
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     fn leaving_frames(&self) -> &[RealizedFrame] {
         match self {
             Self::Prepared(ledger) => ledger.leaving_frames(),
             Self::Active(ledger) => ledger.leaving_frames(),
-        }
-    }
-
-    #[cfg(feature = "test-support")]
-    fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
-        match self {
-            Self::Prepared(ledger) => ledger.tracked_child_slots(),
-            Self::Active(ledger) => ledger.tracked_child_slots(),
         }
     }
 }
@@ -2733,90 +2627,6 @@ pub(crate) struct BackNoTargetAuthorityCompletionInert {
     mismatch: BackNoTargetAuthorityCleanupMismatchEvidence,
     physical: Option<BackNoTargetAuthorityCompletionInertPhysical>,
     evidence: BackNoTargetAuthorityCompletionInertEvidence,
-}
-
-impl BackNoTargetAuthorityBeginInertPhysical {
-    #[cfg(any(test, feature = "test-support"))]
-    fn leaving_frames(&self) -> &[RealizedFrame] {
-        match self {
-            Self::Installed(installed) => installed.ledger.leaving_frames(),
-            Self::Completing(completing) => completing.ledger.leaving_frames(),
-            Self::Settled(settled) => settled.prepared.ledger.leaving_frames(),
-            Self::PriorInert(inert) => inert.leaving_frames(),
-            Self::CompletionInert(inert) => inert.leaving_frames(),
-        }
-    }
-
-    #[cfg(feature = "test-support")]
-    fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
-        match self {
-            Self::Installed(installed) => installed.ledger.tracked_child_slots(),
-            Self::Completing(completing) => completing.ledger.tracked_child_slots(),
-            Self::Settled(settled) => settled.prepared.ledger.tracked_child_slots(),
-            Self::PriorInert(inert) => inert.tracked_child_slots(),
-            Self::CompletionInert(inert) => inert.tracked_child_slots(),
-        }
-    }
-}
-
-impl BackNoTargetAuthorityBeginInert {
-    #[cfg(any(test, feature = "test-support"))]
-    fn leaving_frames(&self) -> &[RealizedFrame] {
-        self.physical
-            .as_ref()
-            .map(BackNoTargetAuthorityBeginInertPhysical::leaving_frames)
-            .unwrap_or(&[])
-    }
-
-    #[cfg(feature = "test-support")]
-    fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
-        self.physical
-            .as_ref()
-            .map(BackNoTargetAuthorityBeginInertPhysical::tracked_child_slots)
-            .unwrap_or_default()
-    }
-}
-
-impl BackNoTargetAuthorityCompletionInertPhysical {
-    #[cfg(any(test, feature = "test-support"))]
-    fn leaving_frames(&self) -> &[RealizedFrame] {
-        match self {
-            Self::Installed(installed) => installed.ledger.leaving_frames(),
-            Self::Completing(completing) => completing.ledger.leaving_frames(),
-            Self::Settled(settled) => settled.prepared.ledger.leaving_frames(),
-            Self::AuthorityBeginInert(inert) => inert.leaving_frames(),
-            Self::PriorCompletionInert(inert) => inert.leaving_frames(),
-        }
-    }
-
-    #[cfg(feature = "test-support")]
-    fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
-        match self {
-            Self::Installed(installed) => installed.ledger.tracked_child_slots(),
-            Self::Completing(completing) => completing.ledger.tracked_child_slots(),
-            Self::Settled(settled) => settled.prepared.ledger.tracked_child_slots(),
-            Self::AuthorityBeginInert(inert) => inert.tracked_child_slots(),
-            Self::PriorCompletionInert(inert) => inert.tracked_child_slots(),
-        }
-    }
-}
-
-impl BackNoTargetAuthorityCompletionInert {
-    #[cfg(any(test, feature = "test-support"))]
-    fn leaving_frames(&self) -> &[RealizedFrame] {
-        self.physical
-            .as_ref()
-            .map(BackNoTargetAuthorityCompletionInertPhysical::leaving_frames)
-            .unwrap_or(&[])
-    }
-
-    #[cfg(feature = "test-support")]
-    fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
-        self.physical
-            .as_ref()
-            .map(BackNoTargetAuthorityCompletionInertPhysical::tracked_child_slots)
-            .unwrap_or_default()
-    }
 }
 
 pub(crate) enum PendingBackNoTargetAuthorityCleanup {
@@ -5881,7 +5691,7 @@ impl RouterEntry {
         &self,
         task: &RootFrameTask,
     ) -> Option<&AppliedDriverReportArtifact> {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(test)]
         {
             return match self.delayed_driver_report_replay.as_ref() {
                 Some(TestingDelayedDriverReportReplayState::Captured { artifact, .. })
@@ -5892,7 +5702,7 @@ impl RouterEntry {
                 _ => None,
             };
         }
-        #[cfg(not(any(test, feature = "test-support")))]
+        #[cfg(not(test))]
         {
             let _ = task;
             None
@@ -5900,7 +5710,7 @@ impl RouterEntry {
     }
 
     fn delayed_driver_report_replay_blocks_drive(&self, task: &RootFrameTask) -> bool {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(test)]
         {
             return matches!(
                 self.delayed_driver_report_replay.as_ref(),
@@ -5911,7 +5721,7 @@ impl RouterEntry {
                 }) if artifact.identity == task.report_identity()
             );
         }
-        #[cfg(not(any(test, feature = "test-support")))]
+        #[cfg(not(test))]
         {
             let _ = task;
             false
@@ -5922,7 +5732,7 @@ impl RouterEntry {
         &mut self,
         artifact: &AppliedDriverReportArtifact,
     ) -> bool {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(test)]
         {
             let Some(state) = self.delayed_driver_report_replay.take() else {
                 return false;
@@ -5943,7 +5753,7 @@ impl RouterEntry {
                 }
             }
         }
-        #[cfg(not(any(test, feature = "test-support")))]
+        #[cfg(not(test))]
         {
             let _ = artifact;
             false
@@ -5954,7 +5764,7 @@ impl RouterEntry {
         &mut self,
         task: &RootFrameTask,
     ) -> Option<AppliedDriverReportArtifact> {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(test)]
         {
             let state = self.delayed_driver_report_replay.take()?;
             match state {
@@ -5969,7 +5779,7 @@ impl RouterEntry {
                 }
             }
         }
-        #[cfg(not(any(test, feature = "test-support")))]
+        #[cfg(not(test))]
         {
             let _ = task;
             None
@@ -5980,7 +5790,7 @@ impl RouterEntry {
         &mut self,
         source: &OldOutputSourceIdentity,
     ) -> Option<AppliedDriverReportArtifact> {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(test)]
         {
             let state = self.delayed_driver_report_replay.take()?;
             match state {
@@ -5995,7 +5805,7 @@ impl RouterEntry {
                 }
             }
         }
-        #[cfg(not(any(test, feature = "test-support")))]
+        #[cfg(not(test))]
         {
             let _ = source;
             None
@@ -6215,315 +6025,16 @@ impl RouterEntry {
         }
         true
     }
-
-    #[cfg(feature = "test-support")]
-    pub(crate) fn pending_frame(&self) -> Option<&RealizedFrame> {
-        self.pending_commit
-            .as_ref()
-            .and_then(|pending| pending.branch.first_frame())
-            .or_else(|| {
-                self.pending_frame_drive
-                    .as_ref()
-                    .and_then(|pending| pending.pending.branch.first_frame())
-            })
-            .or_else(|| {
-                self.pending_mount_mutation_rejection
-                    .as_ref()
-                    .and_then(|pending| pending.pending.branch.first_frame())
-            })
-    }
-
-    #[cfg(feature = "test-support")]
-    pub(crate) fn pending_frames(&self) -> impl Iterator<Item = &RealizedFrame> {
-        self.pending_commit
-            .iter()
-            .flat_map(|pending| pending.branch.frames())
-            .chain(
-                self.pending_frame_drive
-                    .iter()
-                    .flat_map(|pending| pending.pending.branch.frames()),
-            )
-            .chain(
-                self.pending_mount_mutation_rejection
-                    .iter()
-                    .flat_map(|pending| pending.pending.branch.frames()),
-            )
-            .chain(
-                self.pending_failed_branch
-                    .iter()
-                    .flat_map(|pending| pending.branch.frames()),
-            )
-            .chain(
-                self.failure_cleanup_permanent
-                    .iter()
-                    .flat_map(|permanent| permanent.physical().branch.frames()),
-            )
-    }
-
-    #[cfg(feature = "test-support")]
-    pub(crate) fn leaving_cleanup_frames(&self) -> Vec<&RealizedFrame> {
-        self.post_commit_compound
-            .as_ref()
-            .map(|compound| compound.leaving_frames())
-            .or_else(|| {
-                self.pending_back_no_target_authority_cleanup
-                    .as_ref()
-                    .and_then(|pending| match pending {
-                        PendingBackNoTargetAuthorityCleanup::Installed(installed) => {
-                            Some(installed.ledger.leaving_frames().iter().collect())
-                        }
-                        PendingBackNoTargetAuthorityCleanup::Completing(completing) => {
-                            Some(completing.ledger.leaving_frames().iter().collect())
-                        }
-                        PendingBackNoTargetAuthorityCleanup::Settled(settled) => {
-                            Some(settled.prepared.ledger.leaving_frames().iter().collect())
-                        }
-                        PendingBackNoTargetAuthorityCleanup::AuthorityBeginInert(inert) => {
-                            Some(inert.leaving_frames().iter().collect())
-                        }
-                        PendingBackNoTargetAuthorityCleanup::CompletionInert(inert) => {
-                            Some(inert.leaving_frames().iter().collect())
-                        }
-                    })
-            })
-            .or_else(|| {
-                self.cleanup_ledger
-                    .as_ref()
-                    .map(|ledger| ledger.leaving_frames().iter().collect())
-            })
-            .unwrap_or_default()
-    }
-
-    #[cfg(feature = "test-support")]
-    pub(crate) fn failed_cleanup_frames(&self) -> &[RealizedFrame] {
-        if let Some(permanent) = self.failure_cleanup_permanent.as_ref() {
-            return permanent.physical().branch.frames();
-        }
-        self.cleanup_ledger
-            .as_ref()
-            .map(CleanupLedger::failed_prepared_frames)
-            .unwrap_or(&[])
-    }
-
-    #[cfg(feature = "test-support")]
-    pub(crate) fn authority_protocol_residual_frames(&self) -> Vec<&RealizedFrame> {
-        self.authority_protocol_residual
-            .as_ref()
-            .map(|residual| {
-                residual
-                    .active
-                    .iter()
-                    .flat_map(RealizedBranch::frames)
-                    .chain(
-                        residual
-                            .pending
-                            .iter()
-                            .flat_map(|pending| pending.branch.frames()),
-                    )
-                    .chain(
-                        residual
-                            .failed
-                            .iter()
-                            .flat_map(|failed| failed.branch.frames()),
-                    )
-                    .chain(
-                        residual
-                            .failure_cleanup_ledger
-                            .iter()
-                            .flat_map(CleanupLedger::failed_prepared_frames),
-                    )
-                    .chain(
-                        residual
-                            .cleanup_settlement_ledger
-                            .iter()
-                            .flat_map(CleanupLedger::leaving_frames),
-                    )
-                    .chain(
-                        residual
-                            .failure_cleanup_permanent_authority
-                            .iter()
-                            .flat_map(|pair| pair.physical.physical().branch.frames()),
-                    )
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    #[cfg(feature = "test-support")]
-    pub(crate) fn authority_protocol_residual_entities(&self) -> Vec<bevy_ecs::prelude::Entity> {
-        let Some(residual) = self.authority_protocol_residual.as_ref() else {
-            return Vec::new();
-        };
-        let mut entities = residual
-            .active
-            .iter()
-            .flat_map(RealizedBranch::claims)
-            .chain(
-                residual
-                    .pending
-                    .iter()
-                    .flat_map(|pending| pending.branch.as_realized().claims()),
-            )
-            .chain(residual.failed.iter().flat_map(|failed| {
-                failed
-                    .branch
-                    .frames()
-                    .iter()
-                    .flat_map(RealizedFrame::claims)
-                    .chain(
-                        failed
-                            .branch
-                            .detached_frames()
-                            .iter()
-                            .flat_map(RealizedFrame::claims),
-                    )
-            }))
-            .chain(
-                residual
-                    .failure_cleanup_ledger
-                    .iter()
-                    .filter_map(CleanupLedger::failed_prepared_branch)
-                    .flat_map(|branch| {
-                        branch
-                            .frames()
-                            .iter()
-                            .flat_map(RealizedFrame::claims)
-                            .chain(
-                                branch
-                                    .detached_frames()
-                                    .iter()
-                                    .flat_map(RealizedFrame::claims),
-                            )
-                    }),
-            )
-            .chain(
-                residual
-                    .cleanup_settlement_ledger
-                    .iter()
-                    .flat_map(CleanupLedger::exact_claims),
-            )
-            .chain(
-                residual
-                    .failure_cleanup_permanent_authority
-                    .iter()
-                    .flat_map(|pair| {
-                        pair.physical
-                            .physical()
-                            .branch
-                            .frames()
-                            .iter()
-                            .flat_map(RealizedFrame::claims)
-                            .chain(
-                                pair.physical
-                                    .physical()
-                                    .branch
-                                    .detached_frames()
-                                    .iter()
-                                    .flat_map(RealizedFrame::claims),
-                            )
-                    }),
-            )
-            .map(ExactRegistryClaim::entity)
-            .collect::<Vec<_>>();
-        if let Some(host) = &residual.host {
-            entities.push(host.top_slot);
-        }
-        entities.sort_by_key(|entity| entity.to_bits());
-        entities.dedup();
-        entities
-    }
-
-    #[cfg(feature = "test-support")]
-    pub(crate) fn tracked_child_slots(&self) -> Vec<crate::branch_transaction::TrackedChildSlot> {
-        let mut slots = Vec::new();
-        if let Some(compound) = &self.post_commit_compound {
-            compound.append_tracked_child_slots(&mut slots);
-        }
-        if let Some(pending) = &self.pending_commit {
-            slots.extend(pending.branch.tracked_child_slots());
-        }
-        if let Some(pending) = &self.pending_frame_drive {
-            slots.extend(pending.pending.branch.tracked_child_slots());
-        }
-        if let Some(pending) = &self.pending_mount_mutation_rejection {
-            slots.extend(pending.pending.branch.tracked_child_slots());
-        }
-        if let Some(pending) = &self.pending_failed_branch {
-            slots.extend(pending.branch.tracked_child_slots());
-        }
-        if let Some(permanent) = &self.failure_cleanup_permanent {
-            slots.extend(permanent.physical().branch.tracked_child_slots());
-        }
-        if let Some(active) = &self.active {
-            slots.extend(active.tracked_child_slots());
-        }
-        if let Some(ledger) = &self.cleanup_ledger {
-            slots.extend(ledger.tracked_child_slots());
-        }
-        if let Some(pair) = self
-            .authority_protocol_residual
-            .as_ref()
-            .and_then(|residual| residual.failure_cleanup_permanent_authority.as_ref())
-        {
-            slots.extend(pair.physical.physical().branch.tracked_child_slots());
-        }
-        if let Some(ledger) = self
-            .authority_protocol_residual
-            .as_ref()
-            .and_then(|residual| residual.cleanup_settlement_ledger.as_ref())
-        {
-            slots.extend(ledger.tracked_child_slots());
-        }
-        if let Some(inert) = &self.cleanup_settlement_permanent_inert {
-            slots.extend(inert.ledger.tracked_child_slots());
-        }
-        if let Some(pending) = &self.pending_back_no_target_authority_cleanup {
-            match pending {
-                PendingBackNoTargetAuthorityCleanup::Installed(installed) => {
-                    slots.extend(installed.ledger.tracked_child_slots());
-                }
-                PendingBackNoTargetAuthorityCleanup::Completing(completing) => {
-                    slots.extend(completing.ledger.tracked_child_slots());
-                }
-                PendingBackNoTargetAuthorityCleanup::Settled(settled) => {
-                    slots.extend(settled.prepared.ledger.tracked_child_slots());
-                }
-                PendingBackNoTargetAuthorityCleanup::AuthorityBeginInert(inert) => {
-                    slots.extend(inert.tracked_child_slots());
-                }
-                PendingBackNoTargetAuthorityCleanup::CompletionInert(inert) => {
-                    slots.extend(inert.tracked_child_slots());
-                }
-            }
-        }
-        slots
-    }
 }
 
 #[derive(Resource)]
 pub struct RouterNavigation {
     domain: u64,
     next_router: u64,
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     next_delayed_driver_report_replay_control: u64,
     back_capacity_domain_issuer: BackCapacityDomainIssuer,
     pub(crate) entries: Vec<RouterEntry>,
-}
-
-#[cfg(feature = "test-support")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackRequestInventoryProjection {
-    requests: Vec<NavigationRequestId>,
-    reservation_requests: Vec<NavigationRequestId>,
-    issuer: Option<crate::cleanup::BackCapacityIssuerSemanticSnapshot>,
-    enqueue_retire_residual: bool,
-    pending_resolution_action: bool,
-    pending_bound_resolution: bool,
-    pending_target_execution: bool,
-    pending_no_target_completion: bool,
-    pending_no_target_preparation: bool,
-    pending_no_target_authority_cleanup: bool,
-    pending_target_permanent_cleanup: bool,
 }
 
 impl RouterNavigation {
@@ -6535,14 +6046,14 @@ impl RouterNavigation {
         Self {
             domain,
             next_router: 1,
-            #[cfg(any(test, feature = "test-support"))]
+            #[cfg(test)]
             next_delayed_driver_report_replay_control: 1,
             back_capacity_domain_issuer: BackCapacityDomainIssuer::new(),
             entries: Vec::new(),
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn testing_arm_next_applied_driver_report_replay(
         &mut self,
         router: RouterHandle,
@@ -6563,7 +6074,7 @@ impl RouterNavigation {
         Ok(control)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn testing_release_applied_driver_report_replay(
         &mut self,
         router: RouterHandle,
@@ -6596,7 +6107,7 @@ impl RouterNavigation {
 
     /// Arms the test-only timing seam that removes the next committed host's real
     /// registration after Core has sealed the commit and before ECS publication.
-    #[cfg(feature = "test-support")]
+    #[cfg(test)]
     pub(crate) fn testing_remove_host_registration_after_next_commit_seal(
         &mut self,
         router: RouterHandle,
@@ -6611,7 +6122,7 @@ impl RouterNavigation {
 
     /// Reports whether the test-only post-seal/pre-publication seam removed the
     /// real host registration for this router.
-    #[cfg(feature = "test-support")]
+    #[cfg(test)]
     pub(crate) fn testing_commit_sealed_registration_removal_fired(
         &self,
         router: RouterHandle,
@@ -6645,7 +6156,7 @@ impl RouterNavigation {
             pending_commit: None,
             pending_frame_drive: None,
             pending_stale_output_cleanup: None,
-            #[cfg(any(test, feature = "test-support"))]
+            #[cfg(test)]
             delayed_driver_report_replay: None,
             pending_mount_frame_task: None,
             pending_mount_request: None,
@@ -6658,9 +6169,9 @@ impl RouterNavigation {
             cleanup_ledger: None,
             post_commit_compound: None,
             settled_retired_host_evidence: None,
-            #[cfg(feature = "test-support")]
+            #[cfg(test)]
             commit_sealed_registration_removal_armed: false,
-            #[cfg(feature = "test-support")]
+            #[cfg(test)]
             commit_sealed_registration_removal_fired: false,
             failure_cleanup_completion: None,
             cleanup_observation: RouterCleanupObservation::default(),
@@ -6703,7 +6214,7 @@ impl RouterNavigation {
             failure_cleanup_completion_receiver_drift_armed: false,
             #[cfg(test)]
             back_no_target_completion_fact_drift: None,
-            #[cfg(feature = "test-support")]
+            #[cfg(test)]
             back_capacity_facade_producer: None,
         };
         entry
@@ -6893,7 +6404,7 @@ impl RouterNavigation {
             Ok(request)
         })();
 
-        #[cfg(feature = "test-support")]
+        #[cfg(test)]
         if result.is_err() {
             if let Some(producer) = self.entries[entry_index]
                 .back_capacity_facade_producer
@@ -6907,52 +6418,7 @@ impl RouterNavigation {
     }
 }
 
-#[cfg(feature = "test-support")]
-pub(crate) fn back_request_inventory_projection(
-    navigation: &RouterNavigation,
-    router: RouterHandle,
-) -> Option<BackRequestInventoryProjection> {
-    let entry = navigation
-        .entries
-        .iter()
-        .find(|entry| entry.handle == router)?;
-    Some(BackRequestInventoryProjection {
-        requests: entry.requests.clone(),
-        reservation_requests: entry
-            .back_capacity_reservations
-            .iter()
-            .map(|(request, _)| *request)
-            .collect(),
-        issuer: entry
-            .back_capacity_issuer
-            .as_ref()
-            .map(|issuer| issuer.semantic_snapshot_for_test()),
-        enqueue_retire_residual: entry.back_capacity_enqueue_retire_residual.is_some(),
-        pending_resolution_action: entry.pending_back_resolution_action.is_some(),
-        pending_bound_resolution: entry.pending_bound_back_resolution.is_some(),
-        pending_target_execution: entry.pending_back_target_execution.is_some(),
-        pending_no_target_completion: entry.pending_back_no_target_completion.is_some(),
-        pending_no_target_preparation: entry.pending_back_no_target_preparation.is_some(),
-        pending_no_target_authority_cleanup: entry
-            .pending_back_no_target_authority_cleanup
-            .is_some(),
-        pending_target_permanent_cleanup: entry.pending_back_target_permanent_cleanup.is_some(),
-    })
-}
-
-#[cfg(feature = "test-support")]
-pub(crate) fn router_request_inventory_counts(navigation: &RouterNavigation) -> (usize, usize) {
-    (
-        navigation.entries.len(),
-        navigation
-            .entries
-            .iter()
-            .map(|entry| entry.requests.len())
-            .sum(),
-    )
-}
-
-#[cfg(feature = "test-support")]
+#[cfg(test)]
 pub(crate) fn install_back_capacity_order_observer_with<F>(
     navigation: &mut RouterNavigation,
     router: RouterHandle,
@@ -7284,7 +6750,7 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                         Ok(prepared) => prepared,
                         Err(_) => continue,
                     };
-                    #[cfg(any(test, feature = "test-support"))]
+                    #[cfg(test)]
                     if let Some(owner) = entry.engine.testing_take_armed_host_admission_owner() {
                         drive_armed_source_bound_host_admission(
                             entry,
@@ -7305,7 +6771,6 @@ pub(crate) fn observe_authority_system(world: &mut World) {
             });
         });
     });
-    refresh_authority_audits(world);
 }
 
 fn r3_unavailable_projection(
@@ -8089,7 +7554,7 @@ fn drive_pending_r3_host_admission_failure(world: &mut World, entry: &mut Router
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 fn drive_armed_source_bound_host_admission(
     entry: &mut RouterEntry,
     candidate: PreparedEcsHostCandidateSource,
@@ -8115,7 +7580,7 @@ fn drive_armed_source_bound_host_admission(
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 fn drive_armed_source_bound_host_grant(
     entry: &mut RouterEntry,
     candidate: PreparedEcsHostCandidateSource,
@@ -9289,7 +8754,6 @@ pub(crate) fn drive_navigation_system(world: &mut World) {
     if !redispatch.is_empty() {
         let _ = drive_navigation_pass(world, Some(&redispatch));
     }
-    refresh_authority_audits(world);
 }
 
 fn retain_frame_task_after_authority_retry(
@@ -11179,7 +10643,7 @@ fn current_host_binding_is_exact_with_registry(
         && membership_is_exact
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(test)]
 fn inject_commit_sealed_registration_removal(world: &mut World, entry: &mut RouterEntry) {
     if !std::mem::take(&mut entry.commit_sealed_registration_removal_armed) {
         return;
@@ -11196,15 +10660,15 @@ fn inject_commit_sealed_registration_removal(world: &mut World, entry: &mut Rout
     }
 }
 
-#[cfg(not(feature = "test-support"))]
+#[cfg(not(test))]
 fn inject_commit_sealed_registration_removal(_world: &mut World, _entry: &mut RouterEntry) {}
 
-#[cfg(feature = "test-support")]
+#[cfg(test)]
 fn commit_sealed_registration_removal_is_armed(entry: &RouterEntry) -> bool {
     entry.commit_sealed_registration_removal_armed
 }
 
-#[cfg(not(feature = "test-support"))]
+#[cfg(not(test))]
 fn commit_sealed_registration_removal_is_armed(_entry: &RouterEntry) -> bool {
     false
 }
@@ -16103,7 +15567,6 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
             }
         },
     );
-    refresh_authority_audits(world);
 }
 
 mod authority_isolation;
@@ -22162,7 +21625,6 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
             }
         },
     );
-    refresh_authority_audits(world);
 }
 
 pub(crate) fn publish_snapshots_system(world: &mut World) {
@@ -22175,28 +21637,7 @@ pub(crate) fn publish_snapshots_system(world: &mut World) {
             );
         },
     );
-    refresh_authority_audits(world);
 }
-
-#[cfg(feature = "test-support")]
-fn refresh_authority_audits(world: &mut World) {
-    world.resource_scope(
-        |world, navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
-            world.resource_scope(
-                |world,
-                 mut audits: bevy_ecs::change_detection::Mut<
-                    crate::audit::RouterAuthorityAudits,
-                >| {
-                    audits.refresh(world, &navigation.entries);
-                },
-            );
-        },
-    );
-    crate::input_probe::refresh_input_probes(world);
-}
-
-#[cfg(not(feature = "test-support"))]
-fn refresh_authority_audits(_world: &mut World) {}
 
 #[cfg(test)]
 #[path = "navigation_tests.rs"]

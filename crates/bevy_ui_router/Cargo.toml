@@ -8,8 +8,6 @@ autotests = false
 default = ["view"]
 view = ["dep:bevy_ui_router_view"]
 ecs = ["view", "dep:bevy_ui_router_ecs"]
-ecs-test-support = ["ecs", "bevy_ui_router_ecs/test-support"]
-test-support = ["ecs-test-support"]
 bsn = ["ecs", "dep:bevy_ui_router_bsn"]
 platform = ["dep:bevy_ui_router_platform"]
 devtools = []
@@ -41,16 +39,6 @@ path = "tests/public_navigation_journeys.rs"
 required-features = ["ecs"]
 
 [[test]]
-name = "public_navigation_authority_audit"
-path = "tests/public_navigation_authority_audit.rs"
-required-features = ["test-support"]
-
-[[test]]
-name = "public_navigation_input_isolation"
-path = "tests/public_navigation_input_isolation.rs"
-required-features = ["test-support"]
-
-[[test]]
 name = "ecs_facade_features"
 path = "tests/ecs_facade_features.rs"
 required-features = ["ecs"]
@@ -59,11 +47,6 @@ required-features = ["ecs"]
 name = "bsn_facade_features"
 path = "tests/bsn_facade_features.rs"
 required-features = ["bsn"]
-
-[[test]]
-name = "test_support_features"
-path = "tests/test_support_features.rs"
-required-features = ["test-support"]
 
 [[test]]
 name = "dependency_contract"

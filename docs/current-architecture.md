@@ -1,6 +1,6 @@
 # Current Architecture
 
-**类型**：实现事实与差距。**更新时间**：2026-09-07。**runtime 迁移**：从 `sys/structural-governance` 的 `0799098` 前向精简，后台 reaper 已退出；生产 BSN 迁移尚未完成。
+**类型**：实现事实与差距。**更新时间**：2026-09-07。**runtime 迁移**：从 `sys/structural-governance` 的 `0799098` 前向精简，后台 reaper 与公开 audit/probe 已退出；生产 BSN 迁移尚未完成。
 
 范围与验收以 [统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md) 为准，后续工作见 [实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)。
 
@@ -16,7 +16,7 @@
 | BSN | 空 prelude，当前仍依赖 ECS | 尚无 factory/Scene executor；须反转依赖并实现第一种生产 adapter |
 | Facade | 导航、snapshots、旧 driver/journeys；真实独立 Core/View/ECS consumer | 稳定 BSN 入口、真实 BSN consumer、普通嵌套示例及旧 API 退出尚未完成 |
 
-ECS 当前主链仍是 `EcsViewDriver → FrameContentWriter/ContentPlan → RealizedFrame`。其构建时内容名单与 authored UI component 写法不等于 native Scene 的 current containment/样式保留合同。后台 reaper/fairness 及 `ReapQuarantines` 调度标签已移除；其余公开中间调度、audit/probe 尚待收口。
+ECS 当前主链仍是 `EcsViewDriver → FrameContentWriter/ContentPlan → RealizedFrame`。其构建时内容名单与 authored UI component 写法不等于 native Scene 的 current containment/样式保留合同。后台 reaper/fairness、公开 audit/probe 和 ECS/facade test-support features 已移除；调度仅公开 `RouterInputSet::{Refresh,Ready}` 与 `RouterScheduleSet::PublishSnapshots`，中间 lifecycle 调度为 crate 私有，必要故障 seam 只在私测中编译。
 
 `QuarantineLeaseTable` 仍承担前台 cleanup/host 无法安全销毁的私有残留 ownership；verified、unresolved、authority-lost 转移、stale projection 和输入/focus 隔离仍使用它。旧残留不持有 terminal 请求的前台 capability，也不会因 blocker 消失自动回收；Entity/metadata 可能长期保留，不能清空 table 冒充完成 cleanup。
 
@@ -32,6 +32,8 @@ facade 合同验证已迁往独立 consumer 与语义依赖检查；ECS 遗漏�
 
 以上是已有行为与迁移保留项，不宣称当前旧输入实现已经满足全部 native BSN 输入情形。
 
+**已确认的 host 缺口**：完全终态、没有新前台请求时，移除 active host registration 后普通 `App::update` 不会启动 authority settlement，snapshot 仍为 Ready/旧 active。当前 observation 对已有 host 跳过 admission 检查，恢复依赖在途工作发现 loss。这是既存实现缺口，不是合法产品语义；阶段 D 必须补齐 idle registration removal/host despawn 的主动失效处理与公共回归。现有 queued-loss/re-admission 公共测试和 post-commit 私测不能替代该验收。
+
 ## 历史与候选证据
 
 Root、Nested、Reconciliation、History、Recovery 的完成记录见 [历史索引](superpowers/README.md)。Recovery 验证候选为 `494ae6b`；结构治理范围 `211874a..2f2cb42` 保存其行为，历史门禁只证明当时范围。
@@ -42,4 +44,4 @@ Root、Nested、Reconciliation、History、Recovery 的完成记录见 [历史�
 
 ## 尚未完成
 
-候选精简、生产 BSN root/nested/error 路径、旧 API 退出、独立 BSN consumer、MVP 全量验证、最终审查和 main 集成均仍需完成。旧阶段 PASS、规范修订或注册类型存在不能替代这些结果。
+生产 BSN root/nested/error 路径、idle host loss、旧 renderer API 退出、独立 BSN consumer、MVP 全量验证、最终审查和 main 集成均仍需完成。旧阶段 PASS、规范修订或注册类型存在不能替代这些结果。

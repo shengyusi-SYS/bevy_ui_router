@@ -90,7 +90,7 @@ impl BackCapacityDomainIssuer {
             cells: Vec::new(),
             live: HashMap::new(),
             next_owner: BackCapacityOwnerId(1),
-            #[cfg(feature = "test-support")]
+            #[cfg(test)]
             back_capacity_order_producer: None,
             #[cfg(test)]
             next_cell_growth_additional_capacity: None,
@@ -107,7 +107,7 @@ pub(crate) struct BackCapacityIssuer {
     cells: Vec<BackCapacityCell>,
     live: HashMap<BackCapacityOwnerId, BackCapacityLiveRecord>,
     next_owner: BackCapacityOwnerId,
-    #[cfg(feature = "test-support")]
+    #[cfg(test)]
     back_capacity_order_producer:
         Option<bevy_ui_router_core::test_support::BackCapacityIssuerProducer>,
     #[cfg(test)]
@@ -118,7 +118,7 @@ pub(crate) struct BackCapacityIssuer {
     drift_next_retire_unbound_generation: bool,
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BackCapacityIssuerSemanticSnapshot {
     cell_count: usize,
@@ -144,7 +144,7 @@ pub(crate) struct BackCapacityCellProjectionForTest {
     pub(crate) disposition: BackCapacityCellDispositionForTest,
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 impl BackCapacityIssuerSemanticSnapshot {
     pub(crate) const fn cell_count(&self) -> usize {
         self.cell_count
@@ -164,12 +164,12 @@ impl BackCapacityIssuerSemanticSnapshot {
 }
 
 impl BackCapacityIssuer {
-    #[cfg(feature = "test-support")]
+    #[cfg(test)]
     pub(crate) fn back_capacity_order_producer_slot_is_vacant(&self) -> bool {
         self.back_capacity_order_producer.is_none()
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(test)]
     pub(crate) fn install_back_capacity_order_producer(
         &mut self,
         producer: bevy_ui_router_core::test_support::BackCapacityIssuerProducer,
@@ -241,7 +241,7 @@ impl BackCapacityIssuer {
         })
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn semantic_snapshot_for_test(&self) -> BackCapacityIssuerSemanticSnapshot {
         #[cfg(test)]
         {
@@ -366,7 +366,7 @@ impl BackCapacityIssuer {
                 && self.cells[record.cell.0].generation == record.generation
         }));
         self.next_owner = next_owner;
-        #[cfg(feature = "test-support")]
+        #[cfg(test)]
         if let Some(producer) = self.back_capacity_order_producer.as_mut() {
             producer.record(bevy_ui_router_core::test_support::BackCapacityIssuerEvent::Issued);
         }
@@ -418,7 +418,7 @@ impl BackCapacityIssuer {
             generation: owner.generation,
             reason: BackCapacityRetirementReason::EnqueueRejected(rejection),
         };
-        #[cfg(feature = "test-support")]
+        #[cfg(test)]
         if let Some(producer) = self.back_capacity_order_producer.as_mut() {
             producer.record(bevy_ui_router_core::test_support::BackCapacityIssuerEvent::Retired);
         }

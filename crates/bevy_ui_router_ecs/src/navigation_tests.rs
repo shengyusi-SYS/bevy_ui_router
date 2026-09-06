@@ -1,7 +1,5 @@
 use super::*;
-#[cfg(feature = "test-support")]
-use crate::audit::RouterAuthorityAudits;
-#[cfg(feature = "test-support")]
+#[cfg(test)]
 use crate::cleanup::BackCapacityRetireError;
 use crate::{
     app_ext::{AppRouterExt, RouterConfig, RouterHostRegistration},
@@ -23,7 +21,7 @@ use crate::{
     driver::{EcsViewDriver, ViewBuildReport},
     host::HostCandidateRevision,
     input::{RouteFocusState, RouterInputGate},
-    plugin::{BevyUiRouterPlugin, RouterScheduleSet},
+    plugin::{BevyUiRouterPlugin, RouterLifecycleSet},
     presentation::{
         FrameLifecycle, FrameOutput, TestCommitMutation, arm_test_commit_mutation_trace,
         take_test_commit_mutation_trace,
@@ -3591,151 +3589,6 @@ fn failed_authority_composed_owner_isolates_optional_active_branch() {
     assert!(entry.cleanup_ledger.is_none());
 }
 
-#[cfg(feature = "test-support")]
-#[test]
-fn failed_cleanup_ledger_audits_frames_as_prepared_inert() {
-    let mut app = App::new();
-    app.add_plugins(BevyUiRouterPlugin::default());
-    let router = install_atomic_router(&mut app, "failed-cleanup-audit");
-    observe_authority_system(app.world_mut());
-    app.world_mut()
-        .resource_mut::<RouterNavigation>()
-        .push(router, RouteLocation::new("/first"))
-        .unwrap();
-    collect_navigation_system(app.world_mut());
-    drive_navigation_system(app.world_mut());
-    let branch = {
-        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
-        FailedPreparedBranch::new(navigation.entries[0].pending_commit.take().unwrap().branch)
-    };
-    let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
-        app.world(),
-        app.world().resource::<RouteEntityRegistry>(),
-        &branch,
-    )
-    .unwrap();
-    let prepared = CleanupLedger::reserve(manifest).unwrap();
-    app.world_mut().resource_mut::<RouterNavigation>().entries[0].cleanup_ledger =
-        Some(CleanupLedger::activate_failed(prepared, branch));
-
-    refresh_authority_audits(app.world_mut());
-
-    let snapshot = app
-        .world()
-        .resource::<crate::audit::RouterAuthorityAudits>()
-        .get(router)
-        .unwrap();
-    assert_eq!(snapshot.frames().len(), 1);
-    assert!(snapshot.frames().iter().all(|frame| {
-        frame.lifecycle() == crate::audit::AuthorityFrameLifecycle::PreparedInert
-    }));
-}
-
-#[cfg(feature = "test-support")]
-#[test]
-fn tracked_child_slot_is_current_on_first_fresh_audit() {
-    let (mut app, branch, _child_entities, child_slot_entity, _parent_entities) =
-        failed_nested_branch_fixture();
-    let router = app.world().resource::<RouterNavigation>().entries[0].handle;
-    let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
-        app.world(),
-        app.world().resource::<RouteEntityRegistry>(),
-        &branch,
-    )
-    .unwrap();
-    let expected_frames = branch
-        .frames()
-        .iter()
-        .map(|frame| frame.frame().clone())
-        .collect::<Vec<_>>();
-    let frame_validity = branch
-        .frames()
-        .iter()
-        .map(|frame| validate_realized_frame(app.world(), frame))
-        .collect::<Vec<_>>();
-    let prepared = CleanupLedger::reserve(manifest).unwrap();
-    app.world_mut().resource_mut::<RouterNavigation>().entries[0].cleanup_ledger =
-        Some(CleanupLedger::activate_failed(prepared, branch));
-    app.world_mut()
-        .insert_resource(crate::audit::RouterAuthorityAudits::new());
-
-    refresh_authority_audits(app.world_mut());
-
-    let snapshot = app
-        .world()
-        .resource::<crate::audit::RouterAuthorityAudits>()
-        .get(router)
-        .unwrap();
-    assert_eq!(
-        snapshot
-            .frames()
-            .iter()
-            .map(|frame| frame.frame().clone())
-            .collect::<Vec<_>>(),
-        expected_frames,
-        "standalone frame validity: {frame_validity:?}"
-    );
-    assert_eq!(snapshot.slots().len(), 2);
-    assert_eq!(
-        snapshot.slots()[1].kind(),
-        crate::audit::AuthoritySlotKind::ChildOutlet
-    );
-    assert!(snapshot.orphan_slots().is_empty());
-    let host_slot = snapshot
-        .slots()
-        .iter()
-        .find(|slot| slot.kind() == crate::audit::AuthoritySlotKind::HostTop)
-        .unwrap();
-    let child_slot_mapping = snapshot
-        .slots()
-        .iter()
-        .find(|slot| slot.kind() == crate::audit::AuthoritySlotKind::ChildOutlet)
-        .unwrap();
-    let parent_frame = snapshot
-        .frames()
-        .iter()
-        .find(|frame| frame.frame() == &expected_frames[0])
-        .unwrap();
-    let child_frame = snapshot
-        .frames()
-        .iter()
-        .find(|frame| frame.frame() == &expected_frames[1])
-        .unwrap();
-    assert_eq!(parent_frame.slot_entity(), host_slot.entity());
-    assert_eq!(child_frame.slot_entity(), child_slot_mapping.entity());
-    assert_ne!(child_frame.slot_entity(), host_slot.entity());
-    assert_ne!(child_frame.root(), child_frame.slot_entity());
-    let child_slot = child_slot_mapping.id();
-
-    app.world_mut().entity_mut(child_slot_entity).insert(Node {
-        width: Val::Percent(99.0),
-        height: Val::Percent(100.0),
-        ..Node::default()
-    });
-    app.world_mut().flush();
-    refresh_authority_audits(app.world_mut());
-    refresh_authority_audits(app.world_mut());
-    let drifted = app
-        .world()
-        .resource::<crate::audit::RouterAuthorityAudits>()
-        .get(router)
-        .unwrap();
-    assert_eq!(drifted.slots().len(), 1);
-    assert!(drifted.orphan_slots().contains(&child_slot));
-
-    app.world_mut().resource_mut::<RouterNavigation>().entries[0].cleanup_ledger = None;
-    refresh_authority_audits(app.world_mut());
-    refresh_authority_audits(app.world_mut());
-
-    let registry_only = app
-        .world()
-        .resource::<crate::audit::RouterAuthorityAudits>()
-        .get(router)
-        .unwrap();
-    assert_eq!(registry_only.slots().len(), 1);
-    assert!(registry_only.orphan_slots().contains(&child_slot));
-}
-
 #[test]
 fn nested_branch_drives_parent_mount_and_child_before_commit() {
     let mut app = App::new();
@@ -3874,14 +3727,14 @@ fn reconciliation_journey_b_schedule_probe_is_old_then_atomic_suffix_splice() {
         .add_systems(
             Update,
             observe_nested_commit_before
-                .after(RouterScheduleSet::DriveNavigation)
-                .before(RouterScheduleSet::CommitPresentation),
+                .after(RouterLifecycleSet::DriveNavigation)
+                .before(RouterLifecycleSet::CommitPresentation),
         )
         .add_systems(
             Update,
             observe_nested_commit_after
-                .after(RouterScheduleSet::CommitPresentation)
-                .before(RouterScheduleSet::SettleCleanup),
+                .after(RouterLifecycleSet::CommitPresentation)
+                .before(RouterLifecycleSet::SettleCleanup),
         );
     let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let router = install_nested_router(&mut app, observed, true);
@@ -4110,21 +3963,6 @@ fn reconciliation_journey_b_official_schedule_preserves_prefix_and_settles_once(
         .unwrap();
     run_updates_until_succeeded(&mut app, request);
 
-    #[cfg(feature = "test-support")]
-    {
-        observe_authority_system(app.world_mut());
-        let audits = app.world().resource::<RouterAuthorityAudits>();
-        let audit = audits.get(router).unwrap();
-        assert!(audit.orphan_slots().is_empty());
-        let slot = audit
-            .slots()
-            .iter()
-            .find(|slot| slot.id() == _preserved_slot_id)
-            .expect("preserved child slot remains in the private authority audit");
-        assert_eq!(slot.parent_frame(), Some(&preserved_slot_parent));
-        assert_eq!(slot.outlet(), Some(&_preserved_slot_outlet));
-    }
-
     let (trace_after, history_after, active_claims_after, active_facts_after) = {
         let navigation = app.world().resource::<RouterNavigation>();
         let entry = &navigation.entries[0];
@@ -4286,8 +4124,8 @@ fn reconciliation_scheduled_mount_new_retain_empty_and_activate_existing_reuse_e
         .add_systems(
             Update,
             observe_mount_new_role_before_commit
-                .after(RouterScheduleSet::DriveNavigation)
-                .before(RouterScheduleSet::CommitPresentation),
+                .after(RouterLifecycleSet::DriveNavigation)
+                .before(RouterLifecycleSet::CommitPresentation),
         );
     let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let router = install_nested_router(&mut app, observed, true);
@@ -6923,7 +6761,7 @@ fn vacant_back_capacity_entry(handle: RouterHandle) -> RouterEntry {
         pending_commit: None,
         pending_frame_drive: None,
         pending_stale_output_cleanup: None,
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(test)]
         delayed_driver_report_replay: None,
         pending_mount_frame_task: None,
         pending_mount_request: None,
@@ -6936,9 +6774,9 @@ fn vacant_back_capacity_entry(handle: RouterHandle) -> RouterEntry {
         cleanup_ledger: None,
         post_commit_compound: None,
         settled_retired_host_evidence: None,
-        #[cfg(feature = "test-support")]
+        #[cfg(test)]
         commit_sealed_registration_removal_armed: false,
-        #[cfg(feature = "test-support")]
+        #[cfg(test)]
         commit_sealed_registration_removal_fired: false,
         failure_cleanup_completion: None,
         cleanup_observation: RouterCleanupObservation::default(),
@@ -6981,12 +6819,12 @@ fn vacant_back_capacity_entry(handle: RouterHandle) -> RouterEntry {
         failure_cleanup_completion_receiver_drift_armed: false,
         #[cfg(test)]
         back_no_target_completion_fact_drift: None,
-        #[cfg(feature = "test-support")]
+        #[cfg(test)]
         back_capacity_facade_producer: None,
     }
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(test)]
 #[test]
 fn back_capacity_order_observer_same_domain_unknown_is_zero_write() {
     use crate::test_support::{
@@ -7315,7 +7153,7 @@ fn back_capacity_growth_failure_is_pre_mint_zero_write() {
     );
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(test)]
 #[test]
 fn back_capacity_precedes_core_reservation_failure_evidence() {
     use crate::test_support::testing_install_back_capacity_order_observer;
@@ -7531,7 +7369,7 @@ fn back_capacity_precedes_core_reservation_failure_evidence() {
     }
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(test)]
 #[test]
 fn back_capacity_retire_rejection_owner_is_retained_fail_closed() {
     use crate::test_support::testing_install_back_capacity_order_observer;
@@ -7687,9 +7525,9 @@ fn back_capacity_retire_rejection_owner_is_retained_fail_closed() {
 
 #[test]
 fn accepted_back_reserves_ecs_capacity_before_core_request_identity() {
-    #[cfg(feature = "test-support")]
+    #[cfg(test)]
     use crate::test_support::testing_install_back_capacity_order_observer;
-    #[cfg(feature = "test-support")]
+    #[cfg(test)]
     use bevy_ui_router_core::test_support::{BackCapacityIssuerEvent, BackCapacityOrderEvent};
 
     let mut app = App::new();
@@ -7710,7 +7548,7 @@ fn accepted_back_reserves_ecs_capacity_before_core_request_identity() {
         .unwrap();
     app.update();
 
-    #[cfg(feature = "test-support")]
+    #[cfg(test)]
     let observer = testing_install_back_capacity_order_observer(
         &mut app.world_mut().resource_mut::<RouterNavigation>(),
         router,
@@ -7762,7 +7600,7 @@ fn accepted_back_reserves_ecs_capacity_before_core_request_identity() {
         .back(router)
         .expect("eligible back must reserve ECS capacity before Core request identity");
 
-    #[cfg(feature = "test-support")]
+    #[cfg(test)]
     assert_eq!(
         observer.snapshot().events(),
         &[
@@ -15111,6 +14949,119 @@ fn back_target_missing_pickable_repair_refreezes_registry_manifest_before_later_
 }
 
 #[test]
+fn host_registration_loss_after_commit_seal_cancels_publication_and_settles_owner() {
+    for with_active in [false, true] {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        if with_active {
+            commit_initial_nested_branch(&mut app, router);
+        }
+        let (host, top_slot, history_before, active_before) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let binding = entry.host.as_ref().unwrap();
+            (
+                binding.host,
+                binding.top_slot,
+                entry.engine.history().clone(),
+                entry.engine.active().clone(),
+            )
+        };
+        let request =
+            prepare_nested_branch_for_commit(&mut app, router, RouteLocation::new("/items/2"));
+        assert!(app.world().get::<RouterHostRegistration>(host).is_some());
+        assert!(
+            app.world_mut()
+                .resource_mut::<RouterNavigation>()
+                .testing_remove_host_registration_after_next_commit_seal(router)
+        );
+
+        // Change the real registration only after Core has sealed this commit;
+        // the production authority predicate must reject before publication.
+        commit_presentation_system(app.world_mut());
+
+        {
+            let navigation = app.world().resource::<RouterNavigation>();
+            assert!(navigation.testing_commit_sealed_registration_removal_fired(router));
+            assert!(app.world().get::<RouterHostRegistration>(host).is_none());
+            let entry = &navigation.entries[0];
+            assert_eq!(entry.engine.history(), &history_before);
+            assert_eq!(entry.engine.active(), &active_before);
+            // Cancellation consumes publication authority, while ECS retains
+            // the physical pending owner for the next authority observation.
+            let pending = entry.pending_commit.as_ref().unwrap();
+            let ticket = pending.ticket.as_ref().unwrap();
+            assert_eq!(
+                entry.engine.inspect_commit_identity(ticket),
+                Err(IntegrationError::Stale),
+                "a cancelled CommitSealed ticket cannot authorize another commit"
+            );
+            assert!(pending.final_task.is_none());
+            assert!(pending.branch.as_realized().claims().all(|claim| {
+                claim.lifecycle() == EntityLifecycle::PreparedInert
+                    && !app
+                        .world()
+                        .resource::<RouterInputGate>()
+                        .allows_pointer(claim.entity())
+            }));
+            assert!(entry.cleanup_ledger.is_none());
+            assert!(entry.post_commit_compound.is_none());
+            assert!(entry.authority_protocol_residual.is_none());
+            assert!(
+                entry
+                    .engine
+                    .request(request)
+                    .unwrap()
+                    .trace()
+                    .iter()
+                    .all(|event| { event.kind() != NavigationTraceEventKind::CommitPublished })
+            );
+        }
+
+        for _ in 0..16 {
+            app.update();
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert_eq!(entry.engine.history(), &history_before);
+            if matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(_)
+            ) {
+                break;
+            }
+        }
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let record = entry.engine.request(request).unwrap();
+        assert!(matches!(record.status(), RequestStatus::Failed(failure)
+            if failure.kind() == NavigationFailureKind::HostLost));
+        assert!(
+            record
+                .trace()
+                .iter()
+                .all(|event| { event.kind() != NavigationTraceEventKind::CommitPublished })
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert_eq!(entry.engine.active().kind(), ActivePresentationKind::None);
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+        );
+        assert!(entry.active.is_none());
+        assert!(entry.host.is_none());
+        assert!(entry.pending_commit.is_none());
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(entry.post_commit_compound.is_none());
+        assert!(entry.authority_protocol_residual.is_none());
+        assert!(!entry.cleanup_summary().foreground_pending());
+        assert!(app.world().get_entity(host).is_ok());
+        assert!(app.world().get::<RouterHostRegistration>(host).is_none());
+        assert!(app.world().get_entity(top_slot).is_err());
+    }
+}
+
+#[test]
 fn precommit_host_binding_loss_enters_authority_settlement() {
     let mut app = App::new();
     app.add_plugins(BevyUiRouterPlugin::default());
@@ -16237,14 +16188,6 @@ fn stale_back_report_receipt_and_publication_are_zero_write() {
             public_current,
         )
     };
-    #[cfg(feature = "test-support")]
-    let audit_before = app
-        .world()
-        .resource::<RouterAuthorityAudits>()
-        .get(router)
-        .expect("the newer Back has one authority audit")
-        .clone();
-
     let assert_current_exact = |app: &App| {
         let world = app.world();
         let entry = world
@@ -16321,11 +16264,6 @@ fn stale_back_report_receipt_and_publication_are_zero_write() {
             crate::snapshots::RequestLookup::Found(snapshot)
                 if snapshot == &public_current_before
         ));
-        #[cfg(feature = "test-support")]
-        assert_eq!(
-            world.resource::<RouterAuthorityAudits>().get(router),
-            Some(&audit_before)
-        );
     };
     assert_current_exact(&app);
 
@@ -36397,8 +36335,8 @@ fn pending_preflight_drift_settles_and_terminates_without_replacing_active() {
     app.init_resource::<PendingPreflightDrift>().add_systems(
         Update,
         drift_pending_output_before_commit
-            .after(RouterScheduleSet::DriveNavigation)
-            .before(RouterScheduleSet::CommitPresentation),
+            .after(RouterLifecycleSet::DriveNavigation)
+            .before(RouterLifecycleSet::CommitPresentation),
     );
     let router = install_atomic_router(&mut app, "pending-preflight-drift");
     app.update();
@@ -38927,10 +38865,6 @@ fn reconciliation_authority_loss_inner_content_seal_drift_retires_claim_without_
             .authority_lost_tombstone(inner_content)
             .is_some()
     );
-    assert_eq!(
-        crate::registry::observed_owned_state(app.world(), inner_content),
-        crate::registry::AuditEntityState::PresentOwned
-    );
 }
 
 #[test]
@@ -40353,8 +40287,8 @@ fn atomic_switch_clears_foreign_descendant_focus_before_cleanup() {
     app.init_resource::<CommitWindowObservation>().add_systems(
         Update,
         observe_commit_before_cleanup
-            .after(RouterScheduleSet::CommitPresentation)
-            .before(RouterScheduleSet::SettleCleanup),
+            .after(RouterLifecycleSet::CommitPresentation)
+            .before(RouterLifecycleSet::SettleCleanup),
     );
     let router = install_atomic_router(&mut app, "atomic-foreign-focus");
     app.update();
@@ -41232,8 +41166,8 @@ fn root_fallback_existing_active_permanent_drift_fail_closes_without_retry() {
     app.init_resource::<FallbackReplacementDrift>().add_systems(
         Update,
         drift_fallback_active_before_commit
-            .after(RouterScheduleSet::DriveNavigation)
-            .before(RouterScheduleSet::CommitPresentation),
+            .after(RouterLifecycleSet::DriveNavigation)
+            .before(RouterLifecycleSet::CommitPresentation),
     );
     let router = install_failing_root_replacement_router(&mut app, "fallback-drift");
     let foreign = app.world_mut().spawn(NestedAppHostSentinel(0xFA11)).id();

@@ -1,8 +1,6 @@
 #![forbid(unsafe_code)]
 
 mod app_ext;
-#[cfg(feature = "test-support")]
-mod audit;
 #[cfg(test)]
 mod authority_regression_tests;
 mod branch_transaction;
@@ -13,8 +11,6 @@ mod driver;
 mod frame_local;
 mod host;
 mod input;
-#[cfg(feature = "test-support")]
-mod input_probe;
 mod lifecycle_preparation;
 mod mount;
 mod navigation;
@@ -24,21 +20,12 @@ mod registry;
 mod snapshots;
 #[cfg(test)]
 mod task10_regression_tests;
-#[cfg(feature = "test-support")]
-#[doc(hidden)]
-pub mod test_support;
+#[cfg(test)]
+mod test_support;
 
 pub use app_ext::{
     AppRouterExt, RouterConfig, RouterHandle, RouterHostRegistration, RouterInstallError,
     RouterInstallErrorKind, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
-};
-#[cfg(feature = "test-support")]
-pub use audit::{
-    AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
-    AuthorityFrameMapping, AuthorityHostMapping, AuthorityOutletMapping, AuthoritySlotKind,
-    AuthoritySlotMapping, QuarantineOwnerKind, QuarantineOwnerSnapshot, QuarantineSnapshot,
-    RouterAuthorityAuditSnapshot, RouterAuthorityAudits, RouterLifecycleAuditEvent,
-    RouterLifecycleAuditEventKind,
 };
 pub use content::{
     ContentColor, ContentEntity, ContentPrimitiveError, ContentPrimitiveErrorKind,
@@ -46,12 +33,8 @@ pub use content::{
 };
 pub use driver::{EcsViewDriver, EcsViewReportSession, ViewBuildReport, ViewBuildReportKind};
 pub use input::RouterInputGate;
-#[cfg(feature = "test-support")]
-pub use input_probe::{InputProbeResult, RouterInputModality, RouterInputProbes};
 pub use navigation::{NavigationEnqueueError, NavigationEnqueueErrorKind, RouterNavigation};
 pub use plugin::{BevyUiRouterPlugin, RouterInputSet, RouterScheduleSet};
-#[cfg(feature = "test-support")]
-pub use registry::QuarantineLeaseId;
 pub use snapshots::{NavigationRequestSnapshot, RequestLookup, RouterSnapshot, RouterSnapshots};
 
 pub mod prelude {
@@ -64,15 +47,5 @@ pub mod prelude {
         RouterInstallErrorKind, RouterNavigation, RouterScheduleSet, RouterSnapshot,
         RouterSnapshots, SolidRect, ViewBuildReport, ViewBuildReportKind,
         ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
-    };
-
-    #[cfg(feature = "test-support")]
-    pub use crate::{
-        AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
-        AuthorityFrameMapping, AuthorityHostMapping, AuthorityOutletMapping, AuthoritySlotKind,
-        AuthoritySlotMapping, InputProbeResult, QuarantineLeaseId, QuarantineOwnerKind,
-        QuarantineOwnerSnapshot, QuarantineSnapshot, RouterAuthorityAuditSnapshot,
-        RouterAuthorityAudits, RouterInputModality, RouterInputProbes, RouterLifecycleAuditEvent,
-        RouterLifecycleAuditEventKind,
     };
 }

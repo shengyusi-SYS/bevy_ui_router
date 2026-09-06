@@ -183,11 +183,6 @@ impl RouterSnapshots {
         }
     }
 
-    #[cfg(feature = "test-support")]
-    pub(crate) const fn inventory_counts(&self) -> (usize, usize) {
-        (self.routers.len(), self.requests.len())
-    }
-
     pub(crate) fn install_router(
         &mut self,
         router: RouterHandle,

@@ -20,132 +20,6 @@ use crate::{
     registry::{EntityLifecycle, EntityOwner, ExactRegistryClaim, RegistryOwner},
 };
 
-#[cfg(feature = "test-support")]
-pub(crate) struct TrackedChildSlot {
-    entity: bevy_ecs::prelude::Entity,
-    claim: crate::registry::ExactRegistryClaim,
-    parent: bevy_ui_router_core::frame::RouteFrameVersion,
-    outlet: bevy_ui_router_core::slot::RouteSlotKey,
-    slot: bevy_ui_router_core::ids::RouteSlotId,
-    anchor: bevy_ecs::prelude::Entity,
-    anchor_claim: crate::registry::ExactRegistryClaim,
-    expected_anchor_children: Vec<bevy_ecs::prelude::Entity>,
-}
-
-#[cfg(feature = "test-support")]
-impl TrackedChildSlot {
-    fn from_mounted(slot: &MountedChildSlot) -> Self {
-        Self {
-            entity: slot.slot(),
-            claim: slot.slot_claim().clone(),
-            parent: slot.parent().clone(),
-            outlet: slot.outlet().clone(),
-            slot: slot.slot_id(),
-            anchor: slot.anchor(),
-            anchor_claim: slot.anchor_claim().clone(),
-            expected_anchor_children: slot.expected_anchor_children().to_vec(),
-        }
-    }
-
-    pub(crate) const fn entity(&self) -> bevy_ecs::prelude::Entity {
-        self.entity
-    }
-
-    pub(crate) const fn parent(&self) -> &bevy_ui_router_core::frame::RouteFrameVersion {
-        &self.parent
-    }
-
-    pub(crate) const fn outlet(&self) -> &bevy_ui_router_core::slot::RouteSlotKey {
-        &self.outlet
-    }
-
-    pub(crate) const fn slot(&self) -> bevy_ui_router_core::ids::RouteSlotId {
-        self.slot
-    }
-
-    pub(crate) const fn anchor(&self) -> bevy_ecs::prelude::Entity {
-        self.anchor
-    }
-
-    pub(crate) fn expected_anchor_children(&self) -> &[bevy_ecs::prelude::Entity] {
-        &self.expected_anchor_children
-    }
-
-    pub(crate) fn is_current(&self, world: &bevy_ecs::prelude::World) -> bool {
-        use crate::{
-            components::{
-                ChildSlotAuthority, ChildSlotLifecycle, RouteOwnershipSeal, RouterInputBarrier,
-            },
-            registry::{EntityOwner, RegistryOwner, RouteEntityRegistry},
-        };
-        use bevy_camera::visibility::Visibility;
-        use bevy_ecs::hierarchy::{ChildOf, Children};
-        use bevy_picking::Pickable;
-        use bevy_ui::{Node, Val};
-
-        let Some(record) = world
-            .get_resource::<RouteEntityRegistry>()
-            .and_then(|registry| registry.record(self.entity))
-        else {
-            return false;
-        };
-        let (component_lifecycle, visibility) = match self.claim.lifecycle() {
-            crate::registry::EntityLifecycle::PreparedInert => {
-                (ChildSlotLifecycle::RegisteredInert, Visibility::Hidden)
-            }
-            crate::registry::EntityLifecycle::Active => {
-                (ChildSlotLifecycle::Active, Visibility::Visible)
-            }
-            crate::registry::EntityLifecycle::Leaving => {
-                (ChildSlotLifecycle::Leaving, Visibility::Hidden)
-            }
-            crate::registry::EntityLifecycle::Quarantined => return false,
-        };
-        let anchor_is_exact = world
-            .get_resource::<RouteEntityRegistry>()
-            .and_then(|registry| registry.record(self.anchor))
-            .is_some_and(|record| {
-                record.claim() == self.anchor_claim && record.manifest().matches(world, self.anchor)
-            });
-        record.claim() == self.claim
-            && record.lifecycle() == self.claim.lifecycle()
-            && record.manifest().matches(world, self.entity)
-            && matches!(
-                record.owner(),
-                RegistryOwner::Committed(EntityOwner::ChildSlot { parent, outlet, slot })
-                    if parent == &self.parent && outlet == &self.outlet && *slot == self.slot
-            )
-            && world.get::<RouteOwnershipSeal>(self.entity)
-                == Some(&RouteOwnershipSeal::new(self.claim.seal()))
-            && world.get::<ChildSlotLifecycle>(self.entity) == Some(&component_lifecycle)
-            && world
-                .get::<ChildSlotAuthority>(self.entity)
-                .is_some_and(|authority| {
-                    authority.parent() == &self.parent
-                        && authority.outlet() == &self.outlet
-                        && authority.slot() == self.slot
-                })
-            && world.get::<ChildOf>(self.entity).map(ChildOf::parent) == Some(self.anchor)
-            && world.get::<Visibility>(self.entity) == Some(&visibility)
-            && world.get::<Pickable>(self.entity) == Some(&Pickable::IGNORE)
-            && world.get::<Node>(self.entity)
-                == Some(&Node {
-                    width: Val::Percent(100.0),
-                    height: Val::Percent(100.0),
-                    ..Node::default()
-                })
-            && world
-                .get::<RouterInputBarrier>(self.entity)
-                .is_some_and(RouterInputBarrier::denies_all)
-            && world
-                .get::<Children>(self.anchor)
-                .map(|children| children.iter().copied().collect::<Vec<_>>())
-                .unwrap_or_default()
-                == self.expected_anchor_children
-            && anchor_is_exact
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct RealizedBranch {
     frames: Vec<RealizedFrame>,
@@ -2216,14 +2090,6 @@ impl RealizedBranch {
         self.child_slots.push(slot);
     }
 
-    #[cfg(feature = "test-support")]
-    pub(crate) fn tracked_child_slots(&self) -> Vec<TrackedChildSlot> {
-        self.child_slots
-            .iter()
-            .map(TrackedChildSlot::from_mounted)
-            .collect()
-    }
-
     pub(crate) fn push_frame(&mut self, frame: RealizedFrame) -> Result<(), RealizedFrame> {
         if self.frames.iter().any(|current| {
             current.frame() == frame.frame()
@@ -2717,11 +2583,6 @@ impl PreparedBranch {
         self.realized.child_slots()
     }
 
-    #[cfg(feature = "test-support")]
-    pub(crate) fn tracked_child_slots(&self) -> Vec<TrackedChildSlot> {
-        self.realized.tracked_child_slots()
-    }
-
     pub(crate) fn push_frame(&mut self, frame: RealizedFrame) -> Result<(), RealizedFrame> {
         self.realized.push_frame(frame)
     }
@@ -3016,11 +2877,6 @@ impl FailedPreparedBranch {
         &self.rejected_child_slots
     }
 
-    #[cfg(feature = "test-support")]
-    pub(crate) fn tracked_child_slots(&self) -> Vec<TrackedChildSlot> {
-        self.realized.tracked_child_slots()
-    }
-
     #[cfg(test)]
     pub(crate) const fn realized_for_test(&self) -> &RealizedBranch {
         &self.realized
@@ -3056,13 +2912,9 @@ impl FailedPreparedBranch {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "test-support")]
-    use bevy_camera::visibility::Visibility;
 
     use super::*;
     use crate::navigation::tests::failed_nested_branch_fixture;
-    #[cfg(feature = "test-support")]
-    use crate::{components::ChildSlotLifecycle, registry::RouteEntityRegistry};
 
     fn reconciliation_authority(branch: &RealizedBranch) -> ReconciliationAuthorityIdentity {
         let root = branch.frames().first().expect("fixture has a root").frame();
@@ -4332,38 +4184,6 @@ mod tests {
         assert!(parent_entities.iter().all(|entity| {
             order.iter().position(|current| current == entity).unwrap() > slot_index
         }));
-    }
-
-    #[cfg(feature = "test-support")]
-    #[test]
-    fn tracked_child_slot_follows_active_and_leaving_claim_lifecycles() {
-        let (mut app, branch, _, _, _) = failed_nested_branch_fixture();
-        let mut tracked = branch
-            .tracked_child_slots()
-            .pop()
-            .expect("nested branch retains one child slot");
-
-        let active = app
-            .world_mut()
-            .resource_mut::<RouteEntityRegistry>()
-            .compare_exchange_lifecycle(&tracked.claim, EntityLifecycle::Active)
-            .expect("prepared slot claim remains exact");
-        tracked.claim = active;
-        app.world_mut()
-            .entity_mut(tracked.entity)
-            .insert((ChildSlotLifecycle::Active, Visibility::Visible));
-        assert!(tracked.is_current(app.world()));
-
-        let leaving = app
-            .world_mut()
-            .resource_mut::<RouteEntityRegistry>()
-            .compare_exchange_lifecycle(&tracked.claim, EntityLifecycle::Leaving)
-            .expect("active slot claim remains exact");
-        tracked.claim = leaving;
-        app.world_mut()
-            .entity_mut(tracked.entity)
-            .insert((ChildSlotLifecycle::Leaving, Visibility::Hidden));
-        assert!(tracked.is_current(app.world()));
     }
 
     #[test]

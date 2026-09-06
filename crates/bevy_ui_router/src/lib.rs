@@ -63,16 +63,6 @@ pub mod ecs {
         RouterSnapshots, SolidRect, ViewBuildReport, ViewBuildReportKind,
         ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
     };
-
-    #[cfg(feature = "ecs-test-support")]
-    pub use bevy_ui_router_ecs::{
-        AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
-        AuthorityFrameMapping, AuthorityHostMapping, AuthorityOutletMapping, AuthoritySlotKind,
-        AuthoritySlotMapping, InputProbeResult, QuarantineLeaseId, QuarantineOwnerKind,
-        QuarantineOwnerSnapshot, QuarantineSnapshot, RouterAuthorityAuditSnapshot,
-        RouterAuthorityAudits, RouterInputModality, RouterInputProbes, RouterLifecycleAuditEvent,
-        RouterLifecycleAuditEventKind,
-    };
 }
 
 #[cfg(feature = "bsn")]
@@ -117,15 +107,5 @@ pub mod prelude {
         RouterInstallErrorKind, RouterNavigation, RouterSnapshot, RouterSnapshots, SolidRect,
         ViewBuildReport, ViewBuildReportKind, ViewDriverRegistrationError,
         ViewDriverRegistrationErrorKind,
-    };
-
-    #[cfg(feature = "ecs-test-support")]
-    pub use crate::ecs::{
-        AuditEntityId, AuditEntityState, AuthorityContentMapping, AuthorityFrameLifecycle,
-        AuthorityFrameMapping, AuthorityHostMapping, AuthorityOutletMapping, AuthoritySlotKind,
-        AuthoritySlotMapping, InputProbeResult, QuarantineLeaseId, QuarantineOwnerKind,
-        QuarantineOwnerSnapshot, QuarantineSnapshot, RouterAuthorityAuditSnapshot,
-        RouterAuthorityAudits, RouterInputModality, RouterInputProbes, RouterLifecycleAuditEvent,
-        RouterLifecycleAuditEventKind,
     };
 }

@@ -30,54 +30,6 @@ use crate::presentation::VerifiedFrameQuarantineTransfer;
 static NEXT_SEAL_DOMAIN: AtomicU64 = AtomicU64::new(1);
 static NEXT_QUARANTINE_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AuditEntityState {
-    PresentOwned,
-    Quarantined,
-    Removed,
-    NotRetained,
-    Unknown,
-}
-
-pub(crate) fn observed_owned_state(world: &World, entity: Entity) -> AuditEntityState {
-    let record = world
-        .get_resource::<RouteEntityRegistry>()
-        .and_then(|registry| registry.record(entity));
-    if let Some(lifecycle) = record.map(|record| record.lifecycle()) {
-        return match lifecycle {
-            EntityLifecycle::Quarantined => AuditEntityState::Quarantined,
-            _ => AuditEntityState::PresentOwned,
-        };
-    }
-    if world
-        .get_resource::<QuarantineLeaseTable>()
-        .is_some_and(|table| table.record(entity).is_some())
-    {
-        return AuditEntityState::Quarantined;
-    }
-    if world
-        .get_resource::<QuarantineLeaseTable>()
-        .is_some_and(|table| table.unresolved_record(entity).is_some())
-    {
-        return AuditEntityState::Unknown;
-    }
-    if world
-        .get_resource::<QuarantineLeaseTable>()
-        .is_some_and(|table| table.authority_lost_tombstone(entity).is_some())
-    {
-        return if world.get_entity(entity).is_err() {
-            AuditEntityState::Removed
-        } else {
-            AuditEntityState::Unknown
-        };
-    }
-    if world.get_entity(entity).is_err() {
-        AuditEntityState::Removed
-    } else {
-        AuditEntityState::Unknown
-    }
-}
-
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_UNRESOLVED_PREPARATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -998,7 +950,7 @@ impl Default for RouteEntityRegistry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct QuarantineLeaseId {
+pub(crate) struct QuarantineLeaseId {
     domain: u64,
     sequence: u64,
 }
