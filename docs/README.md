@@ -1,74 +1,27 @@
 # Bevy UI Router 文档索引
 
-## Recovery completion
+**更新时间**：2026-09-07。当前以包含官方同步 BSN adapter 的完整 MVP 为目标；统一设计已通过独立审查及交叉复核，进入实施，产品尚未完成。旧 data-only API 无兼容义务，不因此删去基础路由、内部 outlet、renderer-neutral 边界或输入/focus 责任。
 
-Recovery is complete at verified implementation candidate `494ae6b`. [Recovery 阶段设计](superpowers/specs/2026-08-12-recovery-design.md) and [Recovery 实施计划](superpowers/plans/2026-08-12-recovery-implementation-plan.md) are completed historical evidence. The final profile has eight Authority-owned exclusions, preserves History's three active deltas, activates all three Recovery deltas and authority rows, and fixes the runtime catalogue at 27. Journey D and Scenario E are complete; only Journey G's Recovery-owned foreground/readmission rows are complete. Background old-lease reap, full Journey G, Authority closure, and MVP PASS remain open.
+## 当前依据
 
-**状态**: Phase 3B.1 `Recovery PASS` + structural governance complete；Now = Authority closure
-**基准提交**: Recovery R2–R4 `d889942..494ae6b`
-**更新时间**: 2026-08-31
+已确认用户决策和 [AGENTS.md](../AGENTS.md) 优先。文档分别承担不同职责：
 
-## 权威顺序
-
-发生冲突时，按以下顺序判断：
-
-1. 已确认的用户决策与仓库根目录 [`AGENTS.md`](../AGENTS.md)。
-2. [Target Architecture](target-architecture.md) 的架构边界、依赖方向与不变量。
-3. [Authority Transition Matrix](authority-transition-matrix.md) 的生命周期转换细节；若生命周期细节与 Target 的概括冲突，以 Matrix 为准，但不得违反 Target 的架构不变量。
-4. [Facade Contract Fixture](facade-contract-fixture.md) 的公共签名与消费者装配形状。
-5. [Facade Export Allowlist](facade-export-allowlist.md) 的公共 module、path、prelude 与 feature 边界。
-6. [Facade Associated API Golden](facade-associated-api-golden.txt) 的逐类型 associated item、trait 与签名类型图闭包。
-7. [MVP Acceptance Journeys](mvp-acceptance-journeys.md) 的外部行为和验收门槛。
-8. [Current Architecture](current-architecture.md) 对基准提交的事实描述。
-9. [Roadmap](roadmap.md) 的执行顺序。
-10. 历史计划、研究资料和审查记录仅作为证据，不定义当前目标。
-
-History 与 Recovery completion gates 已通过。[History 阶段设计](superpowers/specs/2026-07-20-history-design.md) 与 [Recovery 阶段设计](superpowers/specs/2026-08-12-recovery-design.md) 的机器表均为 completed historical evidence。最终 union 是 History active 3 + Recovery active 3 = 6，authority catalogue 为 Root 20 + Nested 3 + History 1 + Recovery 3 = 27。结构治理 `211874a..2f2cb42` 已闭合；当前执行顺序是 Authority closure → MVP gate，old-lease reap 与完整 Journey G 仍属 Authority closure。
-
-## 当前文档
-
-| 文档 | 作用 |
+| 文档 | 职责 |
 | --- | --- |
-| [Current Architecture](current-architecture.md) | 记录当前代码已经实现、已经集成、公共可达和已演示的能力 |
-| [Target Architecture](target-architecture.md) | 定义 Phase 3B.1 的模块边界、身份模型、数据流和提交语义 |
-| [MVP Acceptance Journeys](mvp-acceptance-journeys.md) | 从 facade 公共 API 描述 MVP 必须通过的完整用户旅程 |
-| [Facade Contract Fixture](facade-contract-fixture.md) | 固定可编译的消费者装配、fault driver 与 trace 观察合同 |
-| [Facade Export Allowlist](facade-export-allowlist.md) | 固定逐 feature、逐 module、逐 symbol 的公共导出边界 |
-| [Facade Associated API Golden](facade-associated-api-golden.txt) | 固定所有允许类型的字段、variant、method、trait 与签名闭包 |
-| [Authority Transition Matrix](authority-transition-matrix.md) | 固定 token、closure、preflight、quarantine、epoch 与 request 终态 |
-| [Roadmap](roadmap.md) | 记录 Now、Next 和暂停项，不重复架构正文 |
-| [整体实施目标规划](implementation-goals.md) | 概括 MVP 实施目标、阶段主线、质量门槛与范围控制 |
-| [Root Push 阶段合同 Profile](root-push-contract-profile.md) | 从最终 facade 合同中选择 Root push 已兑现能力、延后项与回归 catalogue |
-| [Nested Push 阶段合同 Profile](nested-push-contract-profile.md) | 收窄首次嵌套 push、sealed child mount、逐层 apply 与阶段 exclusions |
-| [History 阶段设计](superpowers/specs/2026-07-20-history-design.md) | 已完成 History 的规范与最终机器 profile 历史证据；机器表位于 `10.1–10.3` |
-| [History 实施计划](superpowers/plans/2026-07-20-history-implementation-plan.md) | 已完成 History 的任务顺序、实现范围、复审与 completion gate 证据 |
-| [Recovery 阶段设计](superpowers/specs/2026-08-12-recovery-design.md) | 已完成 Recovery 的规范、最终机器 profile 与 completion record 历史证据 |
-| [Recovery 实施计划](superpowers/plans/2026-08-12-recovery-implementation-plan.md) | 已完成 Recovery R1–R4 的任务顺序、复审、门禁与 factual close 证据 |
-| [Root Push 实施计划](superpowers/plans/2026-07-11-root-push-implementation-plan.md) | Root push 的任务顺序、TDD 门禁、文件范围与提交边界 |
-| [Root Push 计划审查记录](superpowers/plans/2026-07-11-root-push-plan-review-log.md) | 记录多角度审查的共同根因、修订、复审与无需重写结论 |
-| [Phase 3B.1 Review Log](phase-3b1-architecture-review-log.md) | 记录审查共同根因、负责人处置和复审结论 |
-| [历史证据说明](superpowers/README.md) | 冻结旧计划和审查记录，说明其证据范围 |
+| [统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md) | 产品范围、架构、公共语义、设计理由与验收结果；状态以文件头为准 |
+| [唯一实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md) | 迁移依赖、结果阶段、验证、审查和提交边界 |
+| [Current Architecture](current-architecture.md) | 当前代码事实与缺口，不把目标写成已实现 |
+| [Roadmap](roadmap.md) | Now / Next / Post-MVP，不复制合同 |
+| [历史证据索引](superpowers/README.md) | 已完成阶段、研究和审查的追溯入口 |
 
-## 按问题查找
+## 被替代的协议目录
 
-- 架构边界、crate归属与数据流：查 [Target Architecture](target-architecture.md)。
-- token、commit、cleanup、quarantine与终态：查 [Authority Transition Matrix](authority-transition-matrix.md)。
-- 公共签名与消费者装配：查 [Facade Contract Fixture](facade-contract-fixture.md)；导出路径查 [Facade Export Allowlist](facade-export-allowlist.md)；逐类型关联API查 [Facade Associated API Golden](facade-associated-api-golden.txt)。
-- 用户可观察行为与最终门槛：查 [MVP Acceptance Journeys](mvp-acceptance-journeys.md)。
-- 实施顺序与当前基线差距：分别查 [Roadmap](roadmap.md) 与 [Current Architecture](current-architecture.md)。
+旧 [Target](target-architecture.md)、[Matrix](authority-transition-matrix.md)、[Fixture](facade-contract-fixture.md)、[Allowlist](facade-export-allowlist.md)、[Golden](facade-associated-api-golden.txt)、[Journeys](mvp-acceptance-journeys.md) 与 [Goals](implementation-goals.md) 不再独立定义新增 MVP 范围。它们暂留供旧实现和 parser/consumer tests 迁移、必要语义追溯；其“canonical”或 Authority closure 前置表述不覆盖已确认的新目标。
 
-## 参考资料
+[Root profile](root-push-contract-profile.md)、[Nested profile](nested-push-contract-profile.md) 和已完成 History/Recovery profiles 同样属于旧阶段证据。解除测试依赖、迁移有价值语义后再删除或归档；固定 catalogue、public audit/probe、background reaper/fairness 不因旧表存在而成为新 MVP 验收门。
 
-- [全局架构与工程决策指导](global-architecture-engineering-decision-guide.md) 是带日期、非规范的宏观纠偏与资源决策参考；它可以提出 canonical amendment，但不定义当前范围、顺序、状态或完成门槛。
-- [01 BSN scene authoring boundaries](01-BSN-scene-authoring-boundaries.md) 与 [02 Web router patterns for Bevy](02-Web-router-patterns-for-Bevy.md) 是研究参考，不是当前实现事实。
-- [03 Core architecture and MVP](03-Core-architecture-and-MVP.md)、[04 Risks, tests and handoff](04-Risks-tests-and-handoff.md) 与 [05 Non-MVP capabilities](05-Non-MVP-capabilities-in-Bevy.md) 是早期设计基线；其中与当前权威文档冲突的内容已被取代。
+## 参考与证据口径
 
-## 状态用语
+[全局工程决策指导](global-architecture-engineering-decision-guide.md) 和编号研究资料是非规范参考，不能另立范围或完成标准；引用旧依赖/API 时核对当前官方版本。
 
-- **Implemented**：局部算法或类型存在并有针对性验证。
-- **Integrated**：能力已接入统一运行路径。
-- **Low-level reachable**：外部可以通过 facade 的 crate/module re-export 直接调用局部协议，其中部分受 feature 控制。
-- **Facade reachable**：外部只用推荐的高层 facade API 即可触发完整流程。
-- **Demonstrated**：真实 `App::update` 旅程已证明用户可观察行为。
-
-只有实现、集成、推荐 facade 可达和真实旅程演示全部成立，才能把一项能力计入 MVP 完成度；低层可达只记录兼容面。`Plan PASS`、`Task PASS`、`Journey PASS` 和 `MVP PASS` 必须分别使用，不能相互替代。
+实现存在、生产集成、推荐 facade 可达和真实用户旅程通过分别记录。审查通过或探针通过不等于产品 gate 通过；历史 Recovery PASS 也不等于当前 BSN 或 MVP PASS。只有统一 spec 的实际验收、独立审查和集成全部完成，才能结束总体 MVP 目标。

@@ -1,42 +1,26 @@
-# 历史计划与审查证据
+# 当前规划与历史证据
 
-## Recovery completed profile
+## 当前 MVP
 
-[Recovery 阶段设计](specs/2026-08-12-recovery-design.md) and [Recovery 实施计划](plans/2026-08-12-recovery-implementation-plan.md) are completed historical evidence. Recovery PASS preserves History active delta 3, activates all three Recovery deltas and authority rows, keeps eight Authority-owned exclusions, and fixes the runtime catalogue at 27. Journey D and Scenario E are complete; only Journey G's Recovery-owned foreground/readmission rows are complete. Old-lease reap, full Journey G, Authority closure, and MVP PASS remain open.
+- [统一 MVP spec](specs/2026-09-07-router-mvp-design.md)：范围、架构、公共语义和验收；状态以文件头为准。
+- [唯一实施 plan](plans/2026-09-07-router-mvp-implementation.md)：结果阶段、依赖、验证、审查和提交。
 
-No spec/plan in this directory is currently an active runtime implementation exception. Structural governance is complete at `2f2cb42`; Authority closure now executes directly from the canonical Target, Matrix, Fixture, Allowlist/Golden and Journeys without adding a new phase spec/plan.
+二者是当前工作入口，其它旧阶段文档是历史证据，不另立当前路线。当前实现事实见 [Current Architecture](../current-architecture.md)。
 
-**状态**: frozen historical evidence；History 与 Recovery profiles 已完成
-**冻结日期**: 2026-08-31
-**冻结基准**: Recovery verified implementation candidate `494ae6b`
-**superseded_by**: `docs/current-architecture.md`、`docs/target-architecture.md`、`docs/mvp-acceptance-journeys.md`
+## 已完成阶段的追溯
 
-## 已完成 History profile
+| 阶段 | 设计/合同 | 实施与证据 |
+| --- | --- | --- |
+| Root Push | [profile](../root-push-contract-profile.md) | [plan](plans/2026-07-11-root-push-implementation-plan.md)、[review](plans/2026-07-11-root-push-review-log.md) |
+| Nested Push | [profile](../nested-push-contract-profile.md) | [plan](plans/2026-07-16-nested-push-implementation-plan.md) |
+| Reconciliation | 旧 [Target](../target-architecture.md) / [Matrix](../authority-transition-matrix.md) 中对应合同 | [历史 plans 目录](plans/) 中阶段记录 |
+| History | [spec](specs/2026-07-20-history-design.md) | [plan](plans/2026-07-20-history-implementation-plan.md) |
+| Recovery | [spec](specs/2026-08-12-recovery-design.md) | [plan](plans/2026-08-12-recovery-implementation-plan.md) |
 
-[History 阶段设计](specs/2026-07-20-history-design.md) 的 `10.1 Public contract and stage exclusions`、`10.2 Contract delta activation` 与 `10.3 History authority regression additions` 保存 History PASS 时的最终机器 profile，现为 completed historical evidence。它们不建立第二份 roadmap 或规范正文，也不授权 Recovery runtime。
-
-[History 实施计划](plans/2026-07-20-history-implementation-plan.md) 记录已完成任务顺序、验证边界与 completion evidence，不改变 canonical authority。当前完成度只由 canonical current facts 与 roadmap 定义；所有 historical spec、plan 和审查记录均保持 evidence-only。
-
-## 证据范围
-
-本目录下现有 `plans/` 与 `specs/` 文件记录过去的决策、任务拆分、审查过程和当时的验证结论。它们不定义当前架构、当前进度或 MVP 完成度。
-
-这些文件仍可用于：
-
-- 追溯某个类型、负向合同或测试为何存在。
-- 判断历史任务当时是否按其局部范围通过。
-- 在重构时识别应保留的可靠算法与已知风险。
-
-这些文件不可用于：
-
-- 证明当前 workspace 仍处于单 crate 或无实现状态。
-- 证明 Phase 3B 已整体完成或真实导航已公共可达。
-- 覆盖当前 Target Architecture 的 mount、registry、atomic commit 或 facade 决策。
-- 以旧的 `PASS` 标签替代 Journey PASS 或 MVP PASS。
+History、Recovery profiles 保存各自完成时的机器表和验证结果，不能据此要求新 MVP 维持固定 catalogue 或旧 Authority closure 前置；Recovery PASS 不包括本次生产 BSN 与完整 MVP。
 
 ## 维护规则
 
-- 原文件保留原路径和正文，原则上不再整理或重写。
-- 只有证据损坏、链接错误或明确事实误植时才做最小修正，并在提交中说明。
-- 新的 Phase 3B.1 实施计划可以继续存放在 `plans/`，但必须在文件头显式标记 `status`、适用的 Target Architecture 版本和验收文档。
-- 新审查记录必须区分事实发现、设计判断、负责人处置和最终结论。
+历史记录可用于追溯设计理由、已知风险与有效回归，不用于覆盖新合同或证明当前树已通过验证。一般保留正文与路径；仅纠正证据损坏、链接或事实误植。旧规范在必要语义和 parser/consumer 依赖迁移后可按计划删除/归档。
+
+临时评估稿在必要结论迁入正式 spec/plan 并提交后删除，不建设永久第二套规划。新审查记录区分源码事实、设计判断、负责人处置和实际验证；已完成计划归历史，不再保留并行 active 状态。
