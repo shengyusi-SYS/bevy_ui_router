@@ -72,3 +72,7 @@ path = "tests/facade_export_allowlist.rs"
 [[test]]
 name = "facade_authority_compile_fail"
 path = "tests/facade_authority_compile_fail.rs"
+
+[[test]]
+name = "dependency_contract"
+path = "tests/dependency_contract.rs"

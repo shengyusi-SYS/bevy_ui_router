@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+#[path = "dependency_policy.rs"]
+mod dependency_policy;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -4987,33 +4990,13 @@ fn run_success(output: Output, case: &ConsumerCase, command: &str) -> Output {
 fn assert_lock_is_pinned(path: &Path) {
     let lock = fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("failed to read '{}': {error}", path.display()));
-    assert!(
-        !lock.contains("github.com/shengyusi-SYS/bevy"),
-        "isolated lock still contains the retired Bevy fork"
-    );
     let lock: toml::Value = toml::from_str(&lock)
         .unwrap_or_else(|error| panic!("failed to parse '{}': {error}", path.display()));
-    for package in lock["package"].as_array().unwrap() {
-        let name = package["name"].as_str().unwrap();
-        if !name.starts_with("bevy") || name.starts_with("bevy_ui_router") {
-            continue;
-        }
-        let source = package
-            .get("source")
-            .and_then(toml::Value::as_str)
-            .unwrap_or_else(|| panic!("isolated lock Bevy package `{name}` must have a source"));
-        assert_eq!(
-            source, "registry+https://github.com/rust-lang/crates.io-index",
-            "isolated lock Bevy package `{name}` must come from crates.io"
-        );
-        let version = package["version"].as_str().unwrap();
-        if version.starts_with("0.19") {
-            assert_eq!(
-                version, "0.19.1",
-                "isolated lock Bevy package `{name}` must resolve to 0.19.1"
-            );
-        }
-    }
+    assert_eq!(
+        dependency_policy::lock_violations(&lock),
+        Vec::<String>::new(),
+        "isolated consumer lock must use official Bevy"
+    );
 }
 
 pub fn public_facade_source_violations(source: &str) -> Vec<String> {

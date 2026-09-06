@@ -72,7 +72,7 @@
 - [x] 重写 AGENTS 为长期护栏，保留身份、线性 owner、publication-last、局部 revalidation、owned-only、真实验证和共享工作区纪律；更新索引、current facts、roadmap 和历史定位。协议步骤、测试目录和已延期产品机制归 spec/历史，不按机械行数缩减。
 - [ ] 移除以多份 Markdown 表互相证明 API/能力的 gate；改用能编译的正向 facade consumer、少量真实权限边界 compile-fail、生产行为测试。尚未迁移的旧消费者保留到其替代落地，明确它是临时验证依赖而非兼容义务。
 - [ ] 复核并保留已修 Recovery profile 的 CRLF 回归，不重复安排旧修复；迁移仍需使用的文本/consumer harness 时以 `lines()` 或明确换行规范化消除残余 LF 假设，保留同份输入的 LF/CRLF 对照。使用 Rust `Path`/`Command` 构造临时 consumer，避免平台 shell 拼接。
-- [ ] 将依赖检查从精确私有 manifest/feature 列表改为语义约束：默认 facade 无 Bevy；Core/View 无 Scene/ECS；BSN 与 ECS 不成环；官方 release crates 解析为 `0.19.1` 且 source 为 crates.io；禁止 workspace/consumer 的 fork、patch/replacement。不能先按 `version.starts_with("0.19")` 过滤掉错误版本后再声称全图已锁定。
+- [x] 将依赖检查从精确私有 manifest/feature 列表改为语义约束：默认 facade 无 Bevy；Core/View 的 default/all-features 正常与构建依赖图均保持 renderer-neutral；官方 release crates 全部按包名选择并核对 `0.19.1` 与 crates.io。workspace/现有 consumer 共用 lock 检查；manifest 与实际 Cargo 配置检查 Bevy fork、patch、replacement 和路径覆盖，不限制普通依赖的合法配置。BSN→ECS 的现存错误方向仍在阶段 C 反转，Cargo 本身拒绝依赖环；这里不以依赖 gate 通过宣称 BSN 接线完成。
 - [ ] 检查 canonical docs 的有效语义全部迁入且 parser 引用已消除后，再删除/归档被替代文件。已完成 History/Recovery 记录保留为历史证据，不以旧 catalogue 数量约束新设计。
 
 **验证**：相关 facade/dependency/text tests；`cargo test --workspace --all-features` 作为迁移前基线，原样记录失败和环境限制。无 Rust 改动的合同提交仅要求 diff、引用和一致性检查；不能把文档审查写成 runtime PASS。
@@ -172,6 +172,8 @@ cargo test -p bevy_ui_router --features bsn --test bsn_facade_features --locked
 合同提交 `4bfbc4f` 仅修订 spec、工程护栏、索引、路线和当前事实，未改 runtime；双路独立复审与交叉复核 GO，7 份当前文档的本地链接检查及 staged diff 检查通过。临时探针 `cargo test --offline` 为 10 passed / 0 failed，格式检查成功。
 
 迁移前 `cargo test --workspace --all-features --locked` 已完成，exit 0，包含 Recovery CRLF 回归、29 项 public navigation journeys、完整 Core/ECS/View 与 28 项 Core doctests。命令仍报告现有 unused/deprecation 等 warnings，未作为本轮文档工作顺手修复；Windows 原生验证未运行。此结果是旧 runtime 的迁移基线，不是生产 BSN 或新 MVP PASS。下一工作是阶段 A 的测试合同迁移与阶段 B 候选精简，保留已有行为证据。
+
+阶段 A 的依赖测试迁移已落地：新增共享 source/version policy 和独立 dependency contract，移除 Core/View/ECS 的精确私有 manifest 清单及未注册的重复 facade 测试；尚保留旧 Markdown/Golden consumer gate，未变更 runtime。独立审查的配置覆盖、qualified replacement 与非默认 feature 三项漏检已修正，定向复审无阻断项。`cargo test -p bevy_ui_router --test dependency_contract --locked` 为 7 passed；`cargo check --workspace --all-targets --all-features --locked`、`cargo test --workspace --all-features --locked` 均 exit 0，后者包含 29 项 public journeys、418 项 Core 和 620 项 ECS 单元测试及现有 consumer/CRLF 回归。现有 warnings 与 Windows NOT_RUN 保持如实记录；阶段 A 仍待真实 consumer 替换和旧文档整理。
 
 每个阶段结束只补充：交付 commit、实际命令与结果、审查结论/未决项、下一依赖；临时构建路径、完整日志和细碎排查过程不固化成长期经验。阶段内私有文件布局和检查点可调整，影响公共语义、范围或信任边界才需要重新确认。
 
