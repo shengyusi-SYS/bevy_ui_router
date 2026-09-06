@@ -28,7 +28,7 @@ bevy_ecs = { version = "0.19.1", default-features = false }
 bevy_input_focus = { version = "0.19.1", default-features = false }
 bevy_picking = { version = "0.19.1", default-features = false }
 bevy_ui = { version = "0.19.1", default-features = false }
-syn = { version = "2", features = ["full", "visit"] }
+serde_json = "1"
 toml = "1.1.2"
 
 [[test]]
@@ -66,13 +66,9 @@ path = "tests/test_support_features.rs"
 required-features = ["test-support"]
 
 [[test]]
-name = "facade_export_allowlist"
-path = "tests/facade_export_allowlist.rs"
-
-[[test]]
-name = "facade_authority_compile_fail"
-path = "tests/facade_authority_compile_fail.rs"
-
-[[test]]
 name = "dependency_contract"
 path = "tests/dependency_contract.rs"
+
+[[test]]
+name = "facade_consumers"
+path = "tests/facade_consumers.rs"

@@ -1,5 +1,7 @@
 # Nested Push 阶段合同 Profile
 
+> **原位归档（2026-09-07）**：保留原路径和正文供历史追溯，不再定义当前 facade/API 或 MVP gate。当前范围以[统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md)为准，旧 profile parser 已移除。
+
 **状态**: Nested Push PASS
 
 **合同起点**: `1ccbcd7`

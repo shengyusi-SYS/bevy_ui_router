@@ -1,4 +1,6 @@
 # bevy-ui-router-facade-associated-api-v1
+# ARCHIVED 2026-09-07: historical API record only; no test/parser dependency or current API synchronization requirement.
+# Current contract: superpowers/specs/2026-09-07-router-mvp-design.md; execution: superpowers/plans/2026-09-07-router-mvp-implementation.md.
 # columns: feature | facade canonical path | owner crate | item kind | normalized public API
 # sort: feature-rank(default,view,ecs,ecs-test-support,platform), canonical-path ASCII, source/fixture declaration order; compile-assert entries follow their associated source contract
 # normalization: Self names the canonical-path type; lifetimes are normalized to 'a; impl Trait syntax is preserved; omitted field records mean zero public fields; compile-assert records are compiler-verified requirements rather than source-enumerated impls; the sole allowed public unit/zero-field struct is bevy_ui_router::ecs::BevyUiRouterPlugin

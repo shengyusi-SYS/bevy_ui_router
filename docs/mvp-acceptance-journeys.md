@@ -1,5 +1,7 @@
 # MVP Acceptance Journeys
 
+> **原位归档（2026-09-07）**：本文仅保留历史设计与证据。下文的 canonical、状态、清单和验收前置均属于旧阶段，不约束当前开发；当前合同与流程以[统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md)和[唯一实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)为准。已解除源码/tests 的解析依赖，不再维护本表与 API 同步。
+
 > **Recovery activation status:** Journey D 的 R1 Error presentation、Journey G 的 R2 pre/post-commit foreground host-loss，以及 R3 host re-admission/fresh epoch 与 Scenario E stale-output 合同已通过。background old-lease reap 与剩余完整 Journey G rows 仍属于 Authority closure；当前不是 Recovery 或 MVP 整体 PASS 声明。
 
 **文档类型**: 外部行为验收规范

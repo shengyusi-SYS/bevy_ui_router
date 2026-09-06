@@ -17,7 +17,7 @@
 | History | [spec](specs/2026-07-20-history-design.md) | [plan](plans/2026-07-20-history-implementation-plan.md) |
 | Recovery | [spec](specs/2026-08-12-recovery-design.md) | [plan](plans/2026-08-12-recovery-implementation-plan.md) |
 
-History、Recovery profiles 保存各自完成时的机器表和验证结果，不能据此要求新 MVP 维持固定 catalogue 或旧 Authority closure 前置；Recovery PASS 不包括本次生产 BSN 与完整 MVP。
+History、Recovery profiles 保存各自完成时的机器表和验证结果，不能据此要求新 MVP 维持固定 catalogue 或旧 Authority closure 前置；Recovery PASS 不包括本次生产 BSN 与完整 MVP。旧 Target/Matrix/Fixture/Allowlist/Golden/Journeys/Goals 与 Root/Nested profiles 已原位归档，保留正文与路径，相关 Markdown/Golden/AST gate 已被真实 consumer 替代。
 
 ## 维护规则
 

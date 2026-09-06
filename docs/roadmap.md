@@ -4,9 +4,7 @@
 
 ## Now
 
-- 收口范围/架构/验证去复杂化评审，统一 spec、plan、工程护栏与事实索引。
 - 从当前候选前向迁移，精简 public audit/probe/background reaper 外扩面；保留有效前台修复、私有残留隔离责任和已有导航行为。
-- 将多文档互证的 gate 迁往可编译 consumer 与真实行为回归，保留 LF/CRLF 和依赖语义检查。
 
 ## Next
 
@@ -24,3 +22,5 @@
 ## 历史定位
 
 Root、Nested、Reconciliation、History、Recovery 与结构治理是可复用基线，详细完成证据见 [历史索引](superpowers/README.md)。不重跑旧开发计划，也不将旧“Authority closure → MVP”路线延续为新目标。BSN adapter 和普通嵌套示例属于本次 MVP，不再列入 MVP 后。
+
+统一 spec/plan 与范围评审已完成；旧多文档/AST gate 已替换为实际 consumer、LF/CRLF 对照和语义依赖检查，历史协议原位归档。该进展不表示 BSN 产品路径已实现。

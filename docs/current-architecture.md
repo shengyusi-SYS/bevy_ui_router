@@ -1,6 +1,6 @@
 # Current Architecture
 
-**类型**：实现事实与差距。**更新时间**：2026-09-07。**代码基线**：`sys/structural-governance` 的 `0799098`；当前合同修订不代表 runtime 已完成迁移。
+**类型**：实现事实与差距。**更新时间**：2026-09-07。**runtime 基线**：`sys/structural-governance` 的 `0799098`；后续合同和 consumer 迁移不代表 runtime 已完成迁移。
 
 范围与验收以 [统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md) 为准，后续工作见 [实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)。
 
@@ -14,9 +14,11 @@
 | View | renderer-neutral key、registry、descriptor、effect/input 合同 | 清除旧公开 writer/report 耦合时保持独立性 |
 | ECS | host/slot/frame binding、data-only driver、manifest、staging、cleanup、输入/focus、physical authority | 迁移到 Scene root/current containment，接入创建期责任、真实输入撤权与 BSN bridge |
 | BSN | 空 prelude，当前仍依赖 ECS | 尚无 factory/Scene executor；须反转依赖并实现第一种生产 adapter |
-| Facade | 导航、snapshots、旧 driver/consumer/journeys | 稳定 BSN 入口、独立 consumer、普通嵌套示例及旧 API 退出尚未完成 |
+| Facade | 导航、snapshots、旧 driver/journeys；真实独立 Core/View/ECS consumer | 稳定 BSN 入口、真实 BSN consumer、普通嵌套示例及旧 API 退出尚未完成 |
 
 ECS 当前主链仍是 `EcsViewDriver → FrameContentWriter/ContentPlan → RealizedFrame`。其构建时内容名单与 authored UI component 写法不等于 native Scene 的 current containment/样式保留合同。公开中间调度、audit/probe、reaper 仍存在，尚未精简。
+
+测试约束已迁往独立 consumer 与语义依赖检查，不再由 Markdown/Golden/AST 清单证明公共 API。现有 consumer 从独立 workspace 运行合法装配，并校验实际私有身份/authority 入口与 session 单次消费；默认 consumer 覆盖 LF/CRLF。`bsn-wiring` 仍使用迁移 renderer，只证明 feature 接线，不是 native Scene 的产品验证。
 
 ## 必须保留的行为
 
@@ -38,4 +40,4 @@ Root、Nested、Reconciliation、History、Recovery 的完成记录见 [历史�
 
 ## 尚未完成
 
-统一合同迁移、候选精简、生产 BSN root/nested/error 路径、旧 API 退出、独立 consumer、全量验证、最终审查和 main 集成均仍需完成。旧阶段 PASS、规范修订或注册类型存在不能替代这些结果。
+候选精简、生产 BSN root/nested/error 路径、旧 API 退出、独立 BSN consumer、MVP 全量验证、最终审查和 main 集成均仍需完成。旧阶段 PASS、规范修订或注册类型存在不能替代这些结果。

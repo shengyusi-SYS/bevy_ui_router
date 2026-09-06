@@ -14,11 +14,11 @@
 | [Roadmap](roadmap.md) | Now / Next / Post-MVP，不复制合同 |
 | [历史证据索引](superpowers/README.md) | 已完成阶段、研究和审查的追溯入口 |
 
-## 被替代的协议目录
+## 历史协议（原位归档）
 
-旧 [Target](target-architecture.md)、[Matrix](authority-transition-matrix.md)、[Fixture](facade-contract-fixture.md)、[Allowlist](facade-export-allowlist.md)、[Golden](facade-associated-api-golden.txt)、[Journeys](mvp-acceptance-journeys.md) 与 [Goals](implementation-goals.md) 不再独立定义新增 MVP 范围。它们暂留供旧实现和 parser/consumer tests 迁移、必要语义追溯；其“canonical”或 Authority closure 前置表述不覆盖已确认的新目标。
+旧 [Target](target-architecture.md)、[Matrix](authority-transition-matrix.md)、[Fixture](facade-contract-fixture.md)、[Allowlist](facade-export-allowlist.md)、[Golden](facade-associated-api-golden.txt)、[Journeys](mvp-acceptance-journeys.md) 与 [Goals](implementation-goals.md) 已原位归档，不再独立定义新增 MVP 范围。必要语义已迁入统一 spec，测试不再解析这些文件；保留原路径与正文供历史追溯，不再维护多表/API 同步。其“canonical”或 Authority closure 前置表述均属于历史。
 
-[Root profile](root-push-contract-profile.md)、[Nested profile](nested-push-contract-profile.md) 和已完成 History/Recovery profiles 同样属于旧阶段证据。解除测试依赖、迁移有价值语义后再删除或归档；固定 catalogue、public audit/probe、background reaper/fairness 不因旧表存在而成为新 MVP 验收门。
+[Root profile](root-push-contract-profile.md)、[Nested profile](nested-push-contract-profile.md) 和已完成 History/Recovery profiles 同样属于旧阶段证据，相关 parser 已删除。固定 catalogue、public audit/probe、background reaper/fairness 不因旧表存在而成为新 MVP 验收门。
 
 ## 参考与证据口径
 

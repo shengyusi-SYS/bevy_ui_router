@@ -1,5 +1,7 @@
 # Root Push 阶段合同 Profile
 
+> **原位归档（2026-09-07）**：保留原路径和正文供历史追溯，不再定义当前 facade/API 或 MVP gate。当前范围以[统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md)为准，旧 profile parser 已移除。
+
 **状态**：Root push `Plan PASS`
 
 **上位目标**：[Facade Export Allowlist](facade-export-allowlist.md) 与 [Facade Associated API Golden](facade-associated-api-golden.txt)

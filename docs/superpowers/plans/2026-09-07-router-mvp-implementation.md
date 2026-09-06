@@ -10,7 +10,7 @@
 
 **Spec:** [统一 MVP design spec](../specs/2026-09-07-router-mvp-design.md)。实现者同时读取 spec 和本计划；产品合同归 spec，本文件只拥有迁移顺序与证据。
 
-**状态**：Active implementation plan。两位独立审查者及交叉复核均确认可提交合同并开始实施；阶段 A 的设计收口已完成，测试合同迁移尚未完成。spec 第 12 节已选择并验证声明图预登记、私有 shell wrapper 与 attempt allocation obligations 的最小可行机制。当前候选实现和临时探针不代表 MVP PASS。
+**状态**：Active implementation plan。阶段 A 的统一合同、测试迁移与历史归档已完成，进入阶段 B 候选精简。spec 第 12 节已选择并验证声明图预登记、私有 shell wrapper 与 attempt allocation obligations 的最小可行机制；当前候选实现和临时探针不代表生产 BSN 或 MVP PASS。
 
 ## 全局约束
 
@@ -70,10 +70,10 @@
 - [x] 完成 spec 第 12 节的窄可行性验证：选择官方 resolve 后的直接 ChildOf 图预分配/登记、私有 shell wrapper 和独立 attempt obligations，不预挂 staging 树。探针覆盖匿名首 child、深层部分失败、根模板前向引用失败、root/child 双向引用、用户 resolve 整体替换、正常 Children 顺序与空 Children 差异。cached Scene inclusion 在 UI 分配前拒绝；机制结论已落实到 spec/阶段 C。
 - [x] 迁移基础路由、参数/search/fragment、single outlet 位置、独立 renderer 验证、错误恢复、history、host/input/focus 语义；收口复审及交叉复核无剩余合同阻断项，spec 标为 active，旧协议目录在索引中标为迁移/历史材料。
 - [x] 重写 AGENTS 为长期护栏，保留身份、线性 owner、publication-last、局部 revalidation、owned-only、真实验证和共享工作区纪律；更新索引、current facts、roadmap 和历史定位。协议步骤、测试目录和已延期产品机制归 spec/历史，不按机械行数缩减。
-- [ ] 移除以多份 Markdown 表互相证明 API/能力的 gate；改用能编译的正向 facade consumer、少量真实权限边界 compile-fail、生产行为测试。尚未迁移的旧消费者保留到其替代落地，明确它是临时验证依赖而非兼容义务。
-- [ ] 复核并保留已修 Recovery profile 的 CRLF 回归，不重复安排旧修复；迁移仍需使用的文本/consumer harness 时以 `lines()` 或明确换行规范化消除残余 LF 假设，保留同份输入的 LF/CRLF 对照。使用 Rust `Path`/`Command` 构造临时 consumer，避免平台 shell 拼接。
+- [x] 移除多份 Markdown/Golden 与源码互证 API/能力的 gate，包括专为 AST 闭世界扫描器维护的 mutation fixtures；替换为三类实际 Core/View/ECS 程序、六组独立 workspace 配置和六个真实权限边界拒绝点。普通导航/恢复/输入行为测试保留；旧 driver 仅为迁移 renderer，阶段 C 用真实 BSN 替代，独立验证能力长期保留。
+- [x] 已修 Recovery profile 的 CRLF 回归在迁移基线和依赖迁移提交中重跑成功。无用途的 profile parser 整体退出后，不为留旧测试继续维护它；LF/CRLF 对照迁到同源 consumer TOML/Rust 写入→Cargo 运行路径，使用 Rust `Path`/`Command`，不拼接平台 shell。独立评估确认这是回归责任迁移，不是恢复 LF 假设；Windows 原生验证仍为 NOT_RUN。
 - [x] 将依赖检查从精确私有 manifest/feature 列表改为语义约束：默认 facade 无 Bevy；Core/View 的 default/all-features 正常与构建依赖图均保持 renderer-neutral；官方 release crates 全部按包名选择并核对 `0.19.1` 与 crates.io。workspace/现有 consumer 共用 lock 检查；manifest 与实际 Cargo 配置检查 Bevy fork、patch、replacement 和路径覆盖，不限制普通依赖的合法配置。BSN→ECS 的现存错误方向仍在阶段 C 反转，Cargo 本身拒绝依赖环；这里不以依赖 gate 通过宣称 BSN 接线完成。
-- [ ] 检查 canonical docs 的有效语义全部迁入且 parser 引用已消除后，再删除/归档被替代文件。已完成 History/Recovery 记录保留为历史证据，不以旧 catalogue 数量约束新设计。
+- [x] 有效合同已迁入经审查的统一 spec，旧文档 parser 引用已消除。Target/Matrix/Fixture/Allowlist/Golden/Journeys/Goals 和 Root/Nested profiles 原位归档，显式声明旧状态/清单不约束当前开发；保留路径和正文以免破坏历史引用。History/Recovery 完成记录继续作为历史证据，不以旧 catalogue 数量约束新设计。
 
 **验证**：相关 facade/dependency/text tests；`cargo test --workspace --all-features` 作为迁移前基线，原样记录失败和环境限制。无 Rust 改动的合同提交仅要求 diff、引用和一致性检查；不能把文档审查写成 runtime PASS。
 
@@ -174,6 +174,8 @@ cargo test -p bevy_ui_router --features bsn --test bsn_facade_features --locked
 迁移前 `cargo test --workspace --all-features --locked` 已完成，exit 0，包含 Recovery CRLF 回归、29 项 public navigation journeys、完整 Core/ECS/View 与 28 项 Core doctests。命令仍报告现有 unused/deprecation 等 warnings，未作为本轮文档工作顺手修复；Windows 原生验证未运行。此结果是旧 runtime 的迁移基线，不是生产 BSN 或新 MVP PASS。下一工作是阶段 A 的测试合同迁移与阶段 B 候选精简，保留已有行为证据。
 
 阶段 A 的依赖测试迁移已落地：新增共享 source/version policy 和独立 dependency contract，移除 Core/View/ECS 的精确私有 manifest 清单及未注册的重复 facade 测试；尚保留旧 Markdown/Golden consumer gate，未变更 runtime。独立审查的配置覆盖、qualified replacement 与非默认 feature 三项漏检已修正，定向复审无阻断项。`cargo test -p bevy_ui_router --test dependency_contract --locked` 为 7 passed；`cargo check --workspace --all-targets --all-features --locked`、`cargo test --workspace --all-features --locked` 均 exit 0，后者包含 29 项 public journeys、418 项 Core 和 620 项 ECS 单元测试及现有 consumer/CRLF 回归。现有 warnings 与 Windows NOT_RUN 保持如实记录；阶段 A 仍待真实 consumer 替换和旧文档整理。
+
+阶段 A consumer 迁移与归档（本记录所在提交）：上项依赖迁移已提交为 `3f8ff83`；本次删除旧 Markdown/Golden/AST harness 后，六组真实正向 consumer 和六个单独拒绝点通过。迁移范围和新实现分别获独立只读审查；主代理按建议改用真实内部 entry/publication 入口、完整 handle 构造和 session 二次消费，不以缺字段或其它编译故障冒充权限拒绝。`cargo test -p bevy_ui_router --test facade_consumers --offline --locked`、格式检查及显式 consumer fixture 格式检查、`cargo check --workspace --all-targets --all-features --locked`、`cargo test --workspace --all-features --locked` 均 exit 0。全量保留 29 项 public journeys、418 项 Core / 620 项 ECS 单元测试和 28 项 Core doctests。旧协议原位归档、当前事实/路线同步；阶段 A 交付，下一项是阶段 B 精简候选，MVP 仍未完成。Windows NOT_RUN，现有 warnings 未顺手处理；`bsn-wiring` 不证明 native Scene。
 
 每个阶段结束只补充：交付 commit、实际命令与结果、审查结论/未决项、下一依赖；临时构建路径、完整日志和细碎排查过程不固化成长期经验。阶段内私有文件布局和检查点可调整，影响公共语义、范围或信任边界才需要重新确认。
 

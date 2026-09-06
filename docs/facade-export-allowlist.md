@@ -1,5 +1,7 @@
 # Facade Export Allowlist
 
+> **原位归档（2026-09-07）**：本文仅保留历史设计与证据。下文的 canonical、状态、清单和验收前置均属于旧阶段，不约束当前开发；当前合同与流程以[统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md)和[唯一实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)为准。已解除源码/tests 的解析依赖，不再维护本表与 API 同步。
+
 **文档类型**: Phase 3B.1 公共导出规范附录
 **状态**: Phase 3B.1 `Plan PASS`
 **上位规范**: [Target Architecture](target-architecture.md)
