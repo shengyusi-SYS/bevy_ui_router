@@ -72,12 +72,6 @@ impl RouterInputGate {
         &self.allowed
     }
 
-    pub(crate) fn isolate_targets_in_place(&mut self, targets: &[Entity]) {
-        self.allowed.retain(|entity| !targets.contains(entity));
-        #[cfg(feature = "test-support")]
-        self.probe_endpoint.deny_targets(targets);
-    }
-
     fn replace_allowed(
         &mut self,
         next: Vec<Entity>,
@@ -136,12 +130,6 @@ impl InputProbeEndpoint {
         self.state()
             .allowed
             .retain(|entity| allowed.contains(entity));
-    }
-
-    fn deny_targets(&self, targets: &[Entity]) {
-        self.state()
-            .allowed
-            .retain(|entity| !targets.contains(entity));
     }
 
     pub(crate) fn dispatch(&self, target: AuditEntityId, entity: Entity, modality: usize) -> bool {

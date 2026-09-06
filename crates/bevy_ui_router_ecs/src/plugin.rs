@@ -1,5 +1,5 @@
 use bevy_app::{App, Plugin, PreUpdate, Update};
-use bevy_ecs::prelude::{Resource, SystemSet, World};
+use bevy_ecs::prelude::{Resource, SystemSet};
 use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_input_focus::InputFocus;
 
@@ -11,10 +11,9 @@ use crate::input::{
 use crate::navigation::RouterNavigation;
 use crate::navigation::{
     collect_navigation_system, commit_presentation_system, drive_navigation_system,
-    observe_authority_system, publish_snapshots_system, refresh_authority_audits,
-    settle_cleanup_system,
+    observe_authority_system, publish_snapshots_system, settle_cleanup_system,
 };
-use crate::registry::{QuarantineLeaseTable, RouteEntityRegistry, reap_quarantines_system};
+use crate::registry::{QuarantineLeaseTable, RouteEntityRegistry};
 use crate::snapshots::RouterSnapshots;
 
 #[derive(Default)]
@@ -27,7 +26,6 @@ pub enum RouterScheduleSet {
     DriveNavigation,
     CommitPresentation,
     SettleCleanup,
-    ReapQuarantines,
     PublishSnapshots,
 }
 
@@ -39,11 +37,6 @@ pub enum RouterInputSet {
 
 #[derive(Resource)]
 struct RouterInstallMarker;
-
-fn reap_quarantines_and_refresh_authority_audits_system(world: &mut World) {
-    reap_quarantines_system(world);
-    refresh_authority_audits(world);
-}
 
 pub(crate) fn install_foundations(app: &mut App) {
     if app.world().contains_resource::<RouterInstallMarker>() {
@@ -94,7 +87,6 @@ pub(crate) fn install_foundations(app: &mut App) {
             RouterScheduleSet::DriveNavigation,
             RouterScheduleSet::CommitPresentation,
             RouterScheduleSet::SettleCleanup,
-            RouterScheduleSet::ReapQuarantines,
             RouterScheduleSet::PublishSnapshots,
         )
             .chain(),
@@ -111,8 +103,6 @@ pub(crate) fn install_foundations(app: &mut App) {
             drive_navigation_system.in_set(RouterScheduleSet::DriveNavigation),
             commit_presentation_system.in_set(RouterScheduleSet::CommitPresentation),
             settle_cleanup_system.in_set(RouterScheduleSet::SettleCleanup),
-            reap_quarantines_and_refresh_authority_audits_system
-                .in_set(RouterScheduleSet::ReapQuarantines),
             publish_snapshots_system.in_set(RouterScheduleSet::PublishSnapshots),
         ),
     )
@@ -149,12 +139,14 @@ mod tests {
     fn lifecycle_installation_is_idempotent_and_registers_the_single_system_chain() {
         fn lifecycle_system_names(schedules: &Schedules, label: impl ScheduleLabel) -> Vec<String> {
             schedules.get(label).map_or_else(Vec::new, |schedule| {
-                schedule
+                let mut names = schedule
                     .systems()
                     .expect("configured schedule should be initialized")
                     .filter(|(_, system)| system.system_type() != TypeId::of::<ApplyDeferred>())
                     .map(|(_, system)| system.name().to_string())
-                    .collect()
+                    .collect::<Vec<_>>();
+                names.sort();
+                names
             })
         }
         let mut app = App::new();
@@ -187,6 +179,16 @@ mod tests {
         assert!(app.world().contains_resource::<RouteEntityRegistry>());
         assert!(app.world().contains_resource::<QuarantineLeaseTable>());
 
+        app.update();
+        let installed_systems = {
+            let schedules = app.world().resource::<Schedules>();
+            (
+                lifecycle_system_names(schedules, Update),
+                lifecycle_system_names(schedules, PreUpdate),
+            )
+        };
+        assert_eq!(installed_systems.0.len(), 6);
+        assert_eq!(installed_systems.1.len(), 2);
         let resource_addresses = (
             app.world().resource::<RouteFocusState>() as *const _,
             app.world().resource::<RouterInputGate>() as *const _,
@@ -230,7 +232,13 @@ mod tests {
         app.update();
 
         let schedules = app.world().resource::<Schedules>();
-        assert_eq!(lifecycle_system_names(schedules, Update).len(), 7);
-        assert_eq!(lifecycle_system_names(schedules, PreUpdate).len(), 2);
+        assert_eq!(
+            (
+                lifecycle_system_names(schedules, Update),
+                lifecycle_system_names(schedules, PreUpdate),
+            ),
+            installed_systems,
+            "reinstalling must not add or replace scheduled systems"
+        );
     }
 }

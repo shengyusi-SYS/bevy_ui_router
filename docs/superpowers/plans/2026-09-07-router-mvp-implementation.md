@@ -10,7 +10,7 @@
 
 **Spec:** [统一 MVP design spec](../specs/2026-09-07-router-mvp-design.md)。实现者同时读取 spec 和本计划；产品合同归 spec，本文件只拥有迁移顺序与证据。
 
-**状态**：Active implementation plan。阶段 A 的统一合同、测试迁移与历史归档已完成，进入阶段 B 候选精简。spec 第 12 节已选择并验证声明图预登记、私有 shell wrapper 与 attempt allocation obligations 的最小可行机制；当前候选实现和临时探针不代表生产 BSN 或 MVP PASS。
+**状态**：Active implementation plan。阶段 A 的统一合同、测试迁移与历史归档（含 ECS 遗漏补清）已完成；阶段 B 已移除后台 reaper，公开 audit/probe 和其余中间调度仍待收口。spec 第 12 节已选择并验证声明图预登记、私有 shell wrapper 与 attempt allocation obligations 的最小可行机制；当前候选实现和临时探针不代表生产 BSN 或 MVP PASS。
 
 ## 全局约束
 
@@ -180,6 +180,10 @@ cargo test -p bevy_ui_router --features bsn --test bsn_facade_features --locked
 阶段 A 补漏：阶段 B 的调用者核查发现 ECS `authority_regression_catalogue` 仍解析已归档文档，之前“旧 parser 引用已消除”的范围判断不完整。独立只读核查确认其 18 项测试全部是文档/AST/源码形状扫描，没有 runtime 或独立 compile consumer；现已删除该文件及 `app_ext`/`snapshots` 两项同类 exact API shape gate、失去消费者的 ECS dev `syn`/`toml` 依赖。真实注册、snapshot retention、authority/cleanup/navigation 回归及外部正向/拒绝 consumer 保留。其它私有源码形状断言的合并仍按阶段 E 处理，不以本次补漏宣称所有静态测试已退出。
 
 该补漏独立复核无阻断项，与阶段 B reaper 候选在同一工作区完成 `cargo fmt --all -- --check`、`cargo check --workspace --all-targets --all-features --locked`、`cargo test --workspace --all-features --locked`，均 exit 0；其中仍有 29 项 public journeys、独立 consumer 和完整 Core/ECS/View 回归。测试/依赖补漏单独提交，不含 runtime 修改；reaper 删除及其行为验证另记下一检查点。Windows NOT_RUN，现有 warnings 未顺手处理。
+
+阶段 B reaper 检查点（本记录所在提交）：阶段 A 补漏已单独提交为 `d7155d9`。本次删除后台 reaper/fairness、专用 observation/evidence/游标和 `ReapQuarantines` 调度，保留前台 host、cleanup、presentation、input 与 stale-output 使用的 private residual owner、exact transfer 和 terminal provenance。旧 lease/fresh epoch 回归改走普通 `App::update`：旧实现会回收 claim，按新边界预期失败；删除后验证同一旧 owner/claims、Hidden/IGNORE/deny-all/三 modality 拒绝和 fresh epoch 不变。插件安装保留首次系统数量与重复安装列表一致性检查；facade 仅移除后台 GC 断言，并把 cleanup 采样点移到 Settle 后。
+
+两位独立只读审查并交叉复核，首次安装测试缺口已补，定向复审无阻断项。补后 focused 回归、`cargo fmt --all -- --check`、`cargo check --workspace --all-targets --all-features --locked`、`cargo test --workspace --all-features --locked` 均 exit 0；全量包括 597 项 ECS 单元测试、418 项 Core 单元测试、29 项 public journeys、独立 consumer 和 28 项 Core doctests。7 份当前文档的本地引用检查通过。Windows NOT_RUN，现有 warnings 未顺手处理。此检查点不完成阶段 B：public audit/probe/test-support 外扩面和其余公开内部调度仍待迁移，生产 BSN 与 MVP 集成尚未完成。
 
 每个阶段结束只补充：交付 commit、实际命令与结果、审查结论/未决项、下一依赖；临时构建路径、完整日志和细碎排查过程不固化成长期经验。阶段内私有文件布局和检查点可调整，影响公共语义、范围或信任边界才需要重新确认。
 

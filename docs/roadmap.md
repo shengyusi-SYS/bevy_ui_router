@@ -4,7 +4,7 @@
 
 ## Now
 
-- 从当前候选前向迁移，精简 public audit/probe/background reaper 外扩面；保留有效前台修复、私有残留隔离责任和已有导航行为。
+- 后台 reaper 已退出；继续精简 public audit/probe 与公开中间调度，保留有效前台修复、私有残留隔离责任和已有导航行为。
 
 ## Next
 

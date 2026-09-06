@@ -39,7 +39,7 @@ use crate::{
         PreparedAuthorityPublicationCapacity, PreparedExactRegistryRetirement,
         PreparedQuarantineTransfer, PreparedUnresolvedResidualTransfer, ProvisionalOwner,
         QuarantineFacts, QuarantineLeaseId, QuarantineLeaseTable, RegistryOwner, ResidualLeaseId,
-        RouteEntityRecord, RouteEntityRegistry, apply_prepared_authority_lost_residual_transfer,
+        RouteEntityRegistry, apply_prepared_authority_lost_residual_transfer,
         apply_prepared_exact_registry_retirement, apply_prepared_quarantine_transfer,
         apply_prepared_unresolved_residual_transfer, prepare_authority_lost_residual_transfer,
         prepare_authority_lost_residual_transfer_in_publication, prepare_exact_registry_retirement,
@@ -13649,19 +13649,6 @@ pub(crate) fn cleanup_claim_has_exact_authority(world: &World, claim: &ExactRegi
         claim.owner(),
         claim.seal(),
         claim.lifecycle(),
-    )
-}
-
-pub(crate) fn cleanup_record_has_exact_authority(
-    world: &World,
-    record: &RouteEntityRecord,
-) -> bool {
-    cleanup_authority_components_are_exact(
-        world,
-        record.entity(),
-        record.owner(),
-        record.seal(),
-        record.lifecycle(),
     )
 }
 

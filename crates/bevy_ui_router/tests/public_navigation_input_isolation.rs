@@ -303,7 +303,7 @@ fn quarantine_opened_is_isolated(
     })
 }
 
-fn capture_after_reaper(world: &mut World) {
+fn capture_after_cleanup(world: &mut World) {
     let (routers, armed, already_captured) = {
         let state = world.resource::<IsolationBoundaryState>();
         (
@@ -470,8 +470,8 @@ fn public_navigation_input_isolation_is_atomic_and_quarantines_remain_blocked() 
     );
     app.add_systems(
         Update,
-        capture_after_reaper
-            .after(RouterScheduleSet::ReapQuarantines)
+        capture_after_cleanup
+            .after(RouterScheduleSet::SettleCleanup)
             .before(RouterScheduleSet::PublishSnapshots),
     );
 

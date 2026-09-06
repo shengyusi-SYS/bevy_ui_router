@@ -46749,74 +46749,41 @@ pub(crate) fn old_quarantine_lease_cannot_mutate_new_epoch_fixture() {
         .entity_mut(leaving)
         .remove::<FinalPreflightForeignComponent>();
     app.world_mut().flush();
-    let reap_candidate_count = app
-        .world()
-        .resource::<QuarantineLeaseTable>()
-        .leases()
-        .len();
-    assert!(reap_candidate_count > 0);
-    assert_eq!(
-        app.world()
-            .resource::<QuarantineLeaseTable>()
-            .lease(old_lease)
-            .map(|lease| lease.records().len()),
-        Some(old_claims.len())
-    );
-    let max_reap_steps = reap_candidate_count
-        .checked_mul(old_claims.len())
-        .expect("frozen quarantine round-robin bound must not overflow");
-    let mut remaining_records = old_claims.len();
-    let mut target_closed = false;
-    for _ in 0..max_reap_steps {
-        crate::registry::reap_quarantines_system(app.world_mut());
+    // Foreground settlement has transferred these exact claims, not erased them.
+    // A fresh epoch must remain usable while the private residual stays inert;
+    // This MVP does not run background GC when the foreign blocker disappears.
+    for _ in 0..4 {
+        app.update();
         assert_fresh_epoch_unchanged(&app);
         let current_claims = app
             .world()
             .resource::<QuarantineLeaseTable>()
             .lease(old_lease)
-            .map(|lease| {
-                lease
-                    .records()
-                    .iter()
-                    .map(|record| record.claim())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        assert!(
-            current_claims
-                .iter()
-                .all(|claim| old_claims.contains(claim)),
-            "reaper may only retain frozen exact records from the old lease"
-        );
-        assert!(
-            current_claims.len() <= remaining_records,
-            "the frozen target lease may not gain records while other round-robin candidates run"
-        );
-        remaining_records = current_claims.len();
-        if remaining_records == 0 {
-            target_closed = true;
-            break;
+            .expect("terminal cleanup must retain its private residual owner")
+            .records()
+            .iter()
+            .map(|record| record.claim())
+            .collect::<Vec<_>>();
+        assert_eq!(current_claims, old_claims);
+        let gate = app.world().resource::<RouterInputGate>();
+        for claim in &old_claims {
+            let entity = claim.entity();
+            assert!(app.world().get_entity(entity).is_ok());
+            assert_eq!(
+                app.world().get::<Visibility>(entity),
+                Some(&Visibility::Hidden)
+            );
+            assert_eq!(app.world().get::<Pickable>(entity), Some(&Pickable::IGNORE));
+            assert!(
+                app.world()
+                    .get::<RouterInputBarrier>(entity)
+                    .is_some_and(RouterInputBarrier::denies_all)
+            );
+            assert!(!gate.allows_pointer(entity));
+            assert!(!gate.allows_keyboard(entity));
+            assert!(!gate.allows_gamepad(entity));
         }
     }
-    assert!(
-        target_closed,
-        "the target old lease must close within its frozen round-robin bound"
-    );
-    assert_eq!(remaining_records, 0);
-    assert!(
-        app.world()
-            .resource::<QuarantineLeaseTable>()
-            .lease(old_lease)
-            .is_none()
-    );
-    assert!(old_claims.iter().all(|claim| {
-        app.world().get_entity(claim.entity()).is_err()
-            && app
-                .world()
-                .resource::<RouteEntityRegistry>()
-                .record(claim.entity())
-                .is_none()
-    }));
 }
 
 #[test]

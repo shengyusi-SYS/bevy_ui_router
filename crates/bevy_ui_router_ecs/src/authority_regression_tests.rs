@@ -1438,11 +1438,6 @@ fn old_quarantine_lease_cannot_mutate_new_epoch() {
 }
 
 #[test]
-fn quarantine_reaper_round_robin_is_fair() {
-    crate::registry::quarantine_reaper::tests::round_robin_reaper_fairness_fixture();
-}
-
-#[test]
 fn registry_invariant_violation_is_fail_closed() {
     crate::navigation::tests::registry_invariant_violation_fail_closed_fixture();
 }
