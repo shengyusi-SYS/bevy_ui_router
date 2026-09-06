@@ -301,62 +301,6 @@ mod tests {
         request
     }
 
-    fn public_methods(type_name: &str) -> Vec<(String, bool)> {
-        let file = syn::parse_file(include_str!("snapshots.rs")).unwrap();
-        file.items
-            .iter()
-            .filter_map(|item| match item {
-                syn::Item::Impl(item) if item.trait_.is_none() => Some(item),
-                _ => None,
-            })
-            .filter(|item| match item.self_ty.as_ref() {
-                syn::Type::Path(path) => path.path.segments.last().unwrap().ident == type_name,
-                _ => false,
-            })
-            .flat_map(|item| item.items.iter())
-            .filter_map(|item| match item {
-                syn::ImplItem::Fn(method) if matches!(method.vis, syn::Visibility::Public(_)) => {
-                    Some((method.sig.ident.to_string(), method.sig.constness.is_some()))
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn associated_api_exposes_the_canonical_root_snapshot_surface() {
-        assert_eq!(
-            public_methods("NavigationRequestSnapshot"),
-            vec![
-                ("requested".into(), false),
-                ("matched".into(), false),
-                ("status".into(), false),
-                ("trace".into(), false),
-                ("diagnostics".into(), false),
-            ]
-        );
-        assert_eq!(
-            public_methods("RouterSnapshot"),
-            vec![
-                ("requested".into(), false),
-                ("matched".into(), false),
-                ("active".into(), false),
-                ("availability".into(), false),
-                ("pending_phase".into(), false),
-                ("history".into(), false),
-                ("running_request".into(), false),
-                ("earliest_retained_sequence".into(), false),
-                ("cleanup".into(), false),
-                ("host".into(), false),
-                ("diagnostics".into(), false),
-            ]
-        );
-        assert_eq!(
-            public_methods("RouterSnapshots"),
-            vec![("get".into(), false), ("request".into(), false)]
-        );
-    }
-
     #[test]
     fn request_snapshot_exposes_only_frozen_read_only_data() {
         fn assert_traits<T: Clone + std::fmt::Debug + Eq + PartialEq>() {}

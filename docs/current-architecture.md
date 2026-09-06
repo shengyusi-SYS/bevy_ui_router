@@ -18,7 +18,7 @@
 
 ECS 当前主链仍是 `EcsViewDriver → FrameContentWriter/ContentPlan → RealizedFrame`。其构建时内容名单与 authored UI component 写法不等于 native Scene 的 current containment/样式保留合同。公开中间调度、audit/probe、reaper 仍存在，尚未精简。
 
-测试约束已迁往独立 consumer 与语义依赖检查，不再由 Markdown/Golden/AST 清单证明公共 API。现有 consumer 从独立 workspace 运行合法装配，并校验实际私有身份/authority 入口与 session 单次消费；默认 consumer 覆盖 LF/CRLF。`bsn-wiring` 仍使用迁移 renderer，只证明 feature 接线，不是 native Scene 的产品验证。
+facade 合同验证已迁往独立 consumer 与语义依赖检查；ECS 遗漏的旧文档 catalogue 和两项 AST API 清单也已退出，私有源码形状断言仍待阶段 E 合并。现有 consumer 从独立 workspace 运行合法装配，并校验实际私有身份/authority 入口与 session 单次消费；默认 consumer 覆盖 LF/CRLF。`bsn-wiring` 仍使用迁移 renderer，只证明 feature 接线，不是 native Scene 的产品验证。
 
 ## 必须保留的行为
 

@@ -392,46 +392,6 @@ mod tests {
     >() {
     }
 
-    fn public_methods(type_name: &str) -> Vec<(String, bool)> {
-        let file = syn::parse_file(include_str!("app_ext.rs")).unwrap();
-        file.items
-            .iter()
-            .filter_map(|item| match item {
-                syn::Item::Impl(item) if item.trait_.is_none() => Some(item),
-                _ => None,
-            })
-            .filter(|item| match item.self_ty.as_ref() {
-                syn::Type::Path(path) => path.path.segments.last().unwrap().ident == type_name,
-                _ => false,
-            })
-            .flat_map(|item| item.items.iter())
-            .filter_map(|item| match item {
-                syn::ImplItem::Fn(method) if matches!(method.vis, syn::Visibility::Public(_)) => {
-                    Some((method.sig.ident.to_string(), method.sig.constness.is_some()))
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn associated_api_is_closed_and_uses_the_exact_golden_function_shape() {
-        assert_eq!(public_methods("RouterConfig"), vec![("new".into(), false)]);
-        assert!(public_methods("RouterHandle").is_empty());
-        assert_eq!(
-            public_methods("RouterHostRegistration"),
-            vec![("new".into(), false)]
-        );
-        assert_eq!(
-            public_methods("RouterInstallError"),
-            vec![("kind".into(), false)]
-        );
-        assert_eq!(
-            public_methods("ViewDriverRegistrationError"),
-            vec![("kind".into(), false)]
-        );
-    }
-
     #[test]
     fn config_stores_exact_inert_install_data() {
         let routes = RouteTree::builder()

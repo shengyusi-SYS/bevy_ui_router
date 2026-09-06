@@ -21,5 +21,3 @@ bevy_ui_router_view = { path = "../bevy_ui_router_view" }
 [dev-dependencies]
 bevy_ui_router_core = { path = "../bevy_ui_router_core", features = ["test-support"] }
 bevy_internal = { version = "0.19.1", default-features = false, features = ["bevy_window", "bevy_camera", "bevy_ui", "bevy_picking"] }
-syn = { version = "2", features = ["full"] }
-toml = "1.1.2"

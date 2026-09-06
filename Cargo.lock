@@ -1156,8 +1156,6 @@ dependencies = [
  "bevy_ui",
  "bevy_ui_router_core",
  "bevy_ui_router_view",
- "syn",
- "toml",
 ]
 
 [[package]]
