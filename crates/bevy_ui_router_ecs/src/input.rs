@@ -9,7 +9,11 @@ use bevy_ecs::{
     resource::Resource,
 };
 use bevy_input_focus::InputFocus;
-use bevy_picking::Pickable;
+use bevy_picking::{
+    Pickable,
+    events::PointerState,
+    hover::{HoverMap, PickingInteraction, PreviousHoverMap},
+};
 
 use crate::{
     components::{ChildSlotAuthority, ChildSlotLifecycle, RouteOwnershipSeal, RouterInputBarrier},
@@ -39,12 +43,16 @@ impl RouteFocusState {
 #[derive(Resource)]
 pub struct RouterInputGate {
     allowed: Vec<Entity>,
+    /// Targets that were previously authorized and must have all retained
+    /// native pointer state removed before the next dispatch.
+    revoked: Vec<Entity>,
 }
 
 impl RouterInputGate {
     pub(crate) fn new() -> Self {
         Self {
             allowed: Vec::new(),
+            revoked: Vec::new(),
         }
     }
 
@@ -64,23 +72,31 @@ impl RouterInputGate {
         &self.allowed
     }
 
-    fn replace_allowed(&mut self, next: Vec<Entity>) {
+    fn replace_allowed(&mut self, next: Vec<Entity>, revoked: Vec<Entity>) {
         self.allowed = next;
+        self.revoked = revoked;
     }
 
     fn retain_allowed(&mut self, allowed: &HashSet<Entity>) {
+        for entity in self.allowed.iter().copied() {
+            if !allowed.contains(&entity) && !self.revoked.contains(&entity) {
+                self.revoked.push(entity);
+            }
+        }
         self.allowed.retain(|entity| allowed.contains(entity));
+        self.revoked.retain(|entity| !allowed.contains(entity));
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct PreparedInputGateIsolation {
     next: Vec<Entity>,
+    revoked: Vec<Entity>,
 }
 
 impl PreparedInputGateIsolation {
     pub(crate) fn apply(self, gate: &mut RouterInputGate) {
-        gate.replace_allowed(self.next);
+        gate.replace_allowed(self.next, self.revoked);
     }
 }
 
@@ -92,17 +108,19 @@ pub(crate) fn try_prepare_input_gate_isolation(
     next.try_reserve_exact(gate.allowed.len()).map_err(|_| ())?;
     next.extend(gate.allowed.iter().copied());
     next.retain(|entity| !targets.contains(entity));
-    Ok(PreparedInputGateIsolation { next })
+    let revoked = try_prepare_pointer_revocations(gate, &next)?;
+    Ok(PreparedInputGateIsolation { next, revoked })
 }
 
 pub(crate) struct PreparedInputGateMutation<'w> {
     gate: Mut<'w, RouterInputGate>,
     next: Vec<Entity>,
+    revoked: Vec<Entity>,
 }
 
 impl PreparedInputGateMutation<'_> {
     pub(crate) fn apply(mut self) {
-        self.gate.replace_allowed(self.next);
+        self.gate.replace_allowed(self.next, self.revoked);
     }
 }
 
@@ -171,7 +189,33 @@ pub(crate) fn prepare_input_gate_mutation<'w>(
     let mut next = gate.allowed.clone();
     next.retain(|entity| !remove.contains(entity));
     next.extend(add);
-    Some(PreparedInputGateMutation { gate, next })
+    let revoked = try_prepare_pointer_revocations(&gate, &next).ok()?;
+    Some(PreparedInputGateMutation {
+        gate,
+        next,
+        revoked,
+    })
+}
+
+fn try_prepare_pointer_revocations(
+    gate: &RouterInputGate,
+    next: &[Entity],
+) -> Result<Vec<Entity>, ()> {
+    let capacity = gate
+        .revoked
+        .len()
+        .checked_add(gate.allowed.len())
+        .ok_or(())?;
+    let mut revoked = Vec::new();
+    revoked.try_reserve_exact(capacity).map_err(|_| ())?;
+    revoked.extend(gate.revoked.iter().copied());
+    for entity in gate.allowed.iter().copied() {
+        if !next.contains(&entity) && !revoked.contains(&entity) {
+            revoked.push(entity);
+        }
+    }
+    revoked.retain(|entity| !next.contains(entity));
+    Ok(revoked)
 }
 
 pub(crate) fn refresh_input_gate_system(world: &mut World) {
@@ -205,6 +249,10 @@ pub(crate) fn refresh_input_gate_system(world: &mut World) {
     world
         .resource_mut::<RouterInputGate>()
         .retain_allowed(&allowed);
+    // Lifecycle publication may have revoked a target after the preceding
+    // picking pass. Clear its retained gesture state before the next backend
+    // sample; the second scheduled pass also filters newly generated hits.
+    revoke_pending_router_pointer_targets(world);
 }
 
 struct PreparedPhysicalIsolation<'w> {
@@ -429,6 +477,128 @@ pub(crate) fn observed_descendant_closure(
     visited
 }
 
+/// Removes exact targets from Bevy's persistent pointer state without touching
+/// application-owned or other Router targets. Callers must supply a target set
+/// already authorized by their lifecycle/ownership preparation; this function
+/// deliberately does not infer Router authority.
+pub(crate) fn revoke_router_pointer_targets(world: &mut World, targets: &HashSet<Entity>) {
+    if targets.is_empty() {
+        return;
+    }
+    if let Some(mut hover_map) = world.get_resource_mut::<HoverMap>() {
+        for hits in hover_map.values_mut() {
+            hits.retain(|entity, _| !targets.contains(entity));
+        }
+    }
+    if let Some(mut previous_hover_map) = world.get_resource_mut::<PreviousHoverMap>() {
+        for hits in previous_hover_map.values_mut() {
+            hits.retain(|entity, _| !targets.contains(entity));
+        }
+    }
+    if let Some(mut pointer_state) = world.get_resource_mut::<PointerState>() {
+        for state in pointer_state.pointer_buttons.values_mut() {
+            state.pressing.retain(|entity, _| !targets.contains(entity));
+            state.clicking.retain(|entity, _| !targets.contains(entity));
+            state.dragging.retain(|entity, _| !targets.contains(entity));
+            state
+                .dragging_over
+                .retain(|entity, _| !targets.contains(entity));
+        }
+        pointer_state
+            .hovered_entity_ancestors
+            .retain(|hovered, ancestors| {
+                ancestors.retain(|ancestor| !targets.contains(ancestor));
+                !targets.contains(hovered)
+            });
+    }
+    for target in targets.iter().copied() {
+        if let Some(mut interaction) = world.get_mut::<PickingInteraction>(target)
+            && *interaction != PickingInteraction::None
+        {
+            *interaction = PickingInteraction::None;
+        }
+    }
+}
+
+fn revoke_pending_router_pointer_targets(world: &mut World) {
+    let targets = world
+        .get_resource::<RouterInputGate>()
+        .map(|gate| gate.revoked.iter().copied().collect::<HashSet<_>>())
+        .unwrap_or_default();
+    revoke_router_pointer_targets(world, &targets);
+}
+
+/// Filters Bevy picking state immediately before its interaction/event chain.
+///
+/// The gate remains the authority snapshot. Registry/quarantine records are
+/// consulted only to distinguish a denied Router scope from unrelated
+/// application state; an exact ownership seal is required before filtering.
+pub(crate) fn filter_inactive_router_pointer_state_system(world: &mut World) {
+    if world.get_resource::<RouterInputGate>().is_none()
+        || world.get_resource::<RouteEntityRegistry>().is_none()
+        || world.get_resource::<QuarantineLeaseTable>().is_none()
+    {
+        return;
+    }
+
+    let mut candidates = HashSet::new();
+    if let Some(hover_map) = world.get_resource::<HoverMap>() {
+        candidates.extend(hover_map.values().flat_map(|hits| hits.keys().copied()));
+    }
+    if let Some(previous_hover_map) = world.get_resource::<PreviousHoverMap>() {
+        candidates.extend(
+            previous_hover_map
+                .values()
+                .flat_map(|hits| hits.keys().copied()),
+        );
+    }
+    if let Some(pointer_state) = world.get_resource::<PointerState>() {
+        for state in pointer_state.pointer_buttons.values() {
+            candidates.extend(state.pressing.keys().copied());
+            candidates.extend(state.clicking.keys().copied());
+            candidates.extend(state.dragging.keys().copied());
+            candidates.extend(state.dragging_over.keys().copied());
+        }
+        candidates.extend(pointer_state.hovered_entity_ancestors.keys().copied());
+    }
+
+    let gate = world.resource::<RouterInputGate>();
+    let mut denied = gate.revoked.iter().copied().collect::<HashSet<_>>();
+    denied.extend(candidates.into_iter().filter(|target| {
+        !gate.allows_pointer(*target) && target_has_exact_router_boundary(world, *target)
+    }));
+    revoke_router_pointer_targets(world, &denied);
+    world.resource_mut::<RouterInputGate>().revoked.clear();
+}
+
+fn target_has_exact_router_boundary(world: &World, target: Entity) -> bool {
+    let registry = world.resource::<RouteEntityRegistry>();
+    let quarantine = world.resource::<QuarantineLeaseTable>();
+    let mut current = target;
+    let mut visited = HashSet::new();
+    while visited.insert(current) {
+        let claim = registry
+            .record(current)
+            .map(|record| record.claim())
+            .or_else(|| quarantine.record(current).map(|record| record.claim()))
+            .or_else(|| {
+                quarantine
+                    .unresolved_record(current)
+                    .map(|record| record.claim())
+            });
+        if claim.is_some_and(|claim| {
+            world.get::<RouteOwnershipSeal>(current) == Some(&RouteOwnershipSeal::new(claim.seal()))
+        }) {
+            return true;
+        }
+        let Some(parent) = world.get::<ChildOf>(current).map(ChildOf::parent) else {
+            return false;
+        };
+        current = parent;
+    }
+    false
+}
+
 pub(crate) fn input_ready_system(_world: &mut World) {}
 
 #[cfg(test)]
@@ -438,12 +608,36 @@ mod tests {
         app_ext::{AppRouterExt, RouterConfig, RouterHostRegistration},
         content::{ContentColor, FrameContentWriter, SolidRect},
         driver::{EcsViewDriver, EcsViewReportSession, ViewBuildReport},
-        navigation::{RouterNavigation, collect_navigation_system, drive_navigation_system},
+        navigation::{
+            RouterNavigation, collect_navigation_system, commit_presentation_system,
+            drive_navigation_system,
+        },
         plugin::BevyUiRouterPlugin,
     };
-    use bevy_app::App;
+    use bevy_app::{App, PreUpdate};
+    use bevy_ecs::{
+        event::EntityEvent,
+        observer::On,
+        prelude::{ResMut, Resource},
+        query::With,
+    };
     use bevy_input_focus::InputFocus;
-    use bevy_ui::Node;
+    use bevy_internal::{
+        DefaultPlugins,
+        camera::{Camera2d, NormalizedRenderTarget},
+        math::Vec2,
+        picking::{
+            events::{Click, Drag, DragEnd, Pointer, Press, Release},
+            hover::{HoverMap, PreviousHoverMap},
+            pointer::{
+                Location, PointerAction, PointerButton, PointerId, PointerInput,
+                PointerInteraction, PointerLocation, PointerPress,
+            },
+        },
+        window::{PrimaryWindow, Window, WindowRef},
+    };
+    use bevy_picking::events::PointerState;
+    use bevy_ui::{ComputedNode, Node, PositionType, UiGlobalTransform, Val};
     use bevy_ui_router_core::prelude::{
         RouteLocation, RouteNodeOptions, RoutePattern, RouteTree, RouteViewKey,
     };
@@ -593,6 +787,434 @@ mod tests {
             }
         }
         panic!("nested replacement did not reach its sealed pending projection");
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct PointerDeliveryCounts {
+        presses: usize,
+        drags: usize,
+        releases: usize,
+        clicks: usize,
+        drag_ends: usize,
+    }
+
+    #[derive(Resource, Default)]
+    struct PointerDeliveries(std::collections::BTreeMap<Entity, PointerDeliveryCounts>);
+
+    fn install_pointer_history_observers(app: &mut App) {
+        app.world_mut().add_observer(
+            |event: On<Pointer<Press>>, mut deliveries: ResMut<PointerDeliveries>| {
+                deliveries
+                    .0
+                    .entry(event.event_target())
+                    .or_default()
+                    .presses += 1;
+            },
+        );
+        app.world_mut().add_observer(
+            |event: On<Pointer<Drag>>, mut deliveries: ResMut<PointerDeliveries>| {
+                deliveries.0.entry(event.event_target()).or_default().drags += 1;
+            },
+        );
+        app.world_mut().add_observer(
+            |event: On<Pointer<Release>>, mut deliveries: ResMut<PointerDeliveries>| {
+                deliveries
+                    .0
+                    .entry(event.event_target())
+                    .or_default()
+                    .releases += 1;
+            },
+        );
+        app.world_mut().add_observer(
+            |event: On<Pointer<Click>>, mut deliveries: ResMut<PointerDeliveries>| {
+                deliveries.0.entry(event.event_target()).or_default().clicks += 1;
+            },
+        );
+        app.world_mut().add_observer(
+            |event: On<Pointer<DragEnd>>, mut deliveries: ResMut<PointerDeliveries>| {
+                deliveries
+                    .0
+                    .entry(event.event_target())
+                    .or_default()
+                    .drag_ends += 1;
+            },
+        );
+    }
+
+    fn pointer_location(world: &World, window: Entity, target: Entity) -> Location {
+        let position = *world.get::<UiGlobalTransform>(target).unwrap() * Vec2::ZERO;
+        Location {
+            target: NormalizedRenderTarget::Window(
+                WindowRef::Primary.normalize(Some(window)).unwrap(),
+            ),
+            position,
+        }
+    }
+
+    fn write_pointer_inputs(app: &mut App, inputs: impl IntoIterator<Item = PointerInput>) {
+        for input in inputs {
+            app.world_mut().write_message(input);
+        }
+        app.world_mut().run_schedule(PreUpdate);
+    }
+
+    fn stage_atomic_replacement(app: &mut App) {
+        let router = app.world().resource::<RouterNavigation>().entries[0].handle;
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/").with_fragment("pointer-replacement"),
+            )
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        for _ in 0..8 {
+            drive_navigation_system(app.world_mut());
+            if app
+                .world()
+                .resource::<RouterNavigation>()
+                .pending_shape_for_test()
+                .is_some_and(|(_, _, final_task)| final_task)
+            {
+                return;
+            }
+        }
+        panic!("atomic replacement did not reach its sealed pending projection");
+    }
+
+    #[test]
+    fn native_pointer_history_is_revoked_before_dispatch_without_touching_app_state() {
+        let mut app = App::new();
+        app.add_plugins(DefaultPlugins);
+        app.add_plugins(BevyUiRouterPlugin::default());
+        app.init_resource::<PointerDeliveries>();
+        install_pointer_history_observers(&mut app);
+
+        let primary_window = app
+            .world_mut()
+            .query_filtered::<Entity, With<PrimaryWindow>>()
+            .single(app.world())
+            .unwrap();
+        app.world_mut()
+            .get_mut::<Window>(primary_window)
+            .unwrap()
+            .resolution
+            .set(320.0, 180.0);
+        app.world_mut().spawn(Camera2d);
+
+        let driver = ViewDriverKey::new("pointer-history-driver").unwrap();
+        app.register_ui_view_driver(InputTestDriver {
+            key: driver.clone(),
+            nested: false,
+        })
+        .unwrap();
+        let view = RouteViewKey::new("pointer-history-view").unwrap();
+        let routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(view.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut views = RouteViewRegistry::new();
+        views
+            .insert(view.clone(), RouteViewDescriptor::new(driver))
+            .unwrap();
+        let router = app
+            .add_ui_router(RouterConfig::new(routes, views, view))
+            .unwrap();
+        app.world_mut().spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                ..Node::default()
+            },
+            RouterHostRegistration::new(router),
+        ));
+        let application_target = app
+            .world_mut()
+            .spawn(Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(100.0),
+                top: Val::Px(60.0),
+                width: Val::Px(24.0),
+                height: Val::Px(16.0),
+                ..Node::default()
+            })
+            .id();
+        app.update();
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        app.update();
+        app.update();
+
+        let router_target = app.world().resource::<RouterNavigation>().entries[0]
+            .active
+            .as_ref()
+            .unwrap()
+            .interactive_entities()[0];
+        assert!(
+            app.world()
+                .get::<ComputedNode>(router_target)
+                .is_some_and(|computed| computed.size().cmpgt(Vec2::ZERO).all())
+        );
+        assert!(
+            app.world()
+                .get::<ComputedNode>(application_target)
+                .is_some_and(|computed| computed.size().cmpgt(Vec2::ZERO).all())
+        );
+
+        let mouse_location = pointer_location(app.world(), primary_window, router_target);
+        let application_location =
+            pointer_location(app.world(), primary_window, application_target);
+        let mouse_pointer = app
+            .world_mut()
+            .query::<(Entity, &PointerId)>()
+            .iter(app.world())
+            .find_map(|(entity, id)| (*id == PointerId::Mouse).then_some(entity))
+            .unwrap();
+        *app.world_mut()
+            .get_mut::<PointerLocation>(mouse_pointer)
+            .unwrap() = PointerLocation::new(mouse_location.clone());
+        let application_pointer = PointerId::Touch(0x5255_4954);
+        app.world_mut().spawn((
+            application_pointer,
+            PointerLocation::new(application_location.clone()),
+            PointerPress::default(),
+            PointerInteraction::default(),
+        ));
+        app.world_mut().run_schedule(PreUpdate);
+        assert!(
+            app.world()
+                .resource::<HoverMap>()
+                .get(&PointerId::Mouse)
+                .is_some_and(|hits| hits.contains_key(&router_target)),
+            "the real UI backend must positively hit active router content"
+        );
+        assert!(
+            app.world()
+                .resource::<HoverMap>()
+                .get(&application_pointer)
+                .is_some_and(|hits| hits.contains_key(&application_target)),
+            "the real UI backend must positively hit independent application content"
+        );
+        let active_router_ancestor = {
+            let world = app.world();
+            let gate = world.resource::<RouterInputGate>();
+            let mut current = router_target;
+            let mut visited = HashSet::new();
+            loop {
+                assert!(
+                    visited.insert(current),
+                    "the active Router hierarchy must remain acyclic"
+                );
+                let parent = world
+                    .get::<ChildOf>(current)
+                    .map(ChildOf::parent)
+                    .expect("active Router content must remain below its sealed allocation");
+                if world.get::<RouteOwnershipSeal>(parent).is_some() && !gate.allows_pointer(parent)
+                {
+                    break parent;
+                }
+                current = parent;
+            }
+        };
+
+        write_pointer_inputs(
+            &mut app,
+            [
+                PointerInput::new(
+                    PointerId::Mouse,
+                    mouse_location.clone(),
+                    PointerAction::Press(PointerButton::Primary),
+                ),
+                PointerInput::new(
+                    application_pointer,
+                    application_location.clone(),
+                    PointerAction::Press(PointerButton::Primary),
+                ),
+            ],
+        );
+        let moved_mouse = Location {
+            position: mouse_location.position + Vec2::X,
+            ..mouse_location.clone()
+        };
+        let moved_application = Location {
+            position: application_location.position + Vec2::X,
+            ..application_location.clone()
+        };
+        write_pointer_inputs(
+            &mut app,
+            [
+                PointerInput::new(
+                    PointerId::Mouse,
+                    moved_mouse.clone(),
+                    PointerAction::Move { delta: Vec2::X },
+                ),
+                PointerInput::new(
+                    application_pointer,
+                    moved_application.clone(),
+                    PointerAction::Move { delta: Vec2::X },
+                ),
+            ],
+        );
+        let before_leave = app.world().resource::<PointerDeliveries>().0.clone();
+        assert_eq!(before_leave[&router_target].presses, 1);
+        assert_eq!(before_leave[&router_target].drags, 1);
+        assert_eq!(before_leave[&application_target].presses, 1);
+        assert_eq!(before_leave[&application_target].drags, 1);
+        assert!(
+            app.world()
+                .resource::<PointerState>()
+                .get_ancestors(&router_target)
+                .is_some_and(|ancestors| ancestors.contains(&active_router_ancestor)),
+            "an active leaf must retain its non-interactive Router ancestor cache"
+        );
+        assert_eq!(
+            app.world().get::<PickingInteraction>(router_target),
+            Some(&PickingInteraction::Pressed)
+        );
+        assert_eq!(
+            app.world().get::<PickingInteraction>(application_target),
+            Some(&PickingInteraction::Pressed)
+        );
+
+        stage_atomic_replacement(&mut app);
+        commit_presentation_system(app.world_mut());
+        assert!(
+            !app.world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(router_target)
+        );
+        assert!(app.world().get_entity(router_target).is_ok());
+        // Historical authorization, rather than an ancestor boundary or the
+        // now-drifted physical claim, must still revoke the gesture begun active.
+        app.world_mut()
+            .entity_mut(router_target)
+            .remove::<(ChildOf, RouteOwnershipSeal)>();
+
+        let moved_mouse_again = Location {
+            position: moved_mouse.position + Vec2::X,
+            ..moved_mouse.clone()
+        };
+        let moved_application_again = Location {
+            position: moved_application.position + Vec2::X,
+            ..moved_application.clone()
+        };
+        write_pointer_inputs(
+            &mut app,
+            [
+                PointerInput::new(
+                    PointerId::Mouse,
+                    moved_mouse_again.clone(),
+                    PointerAction::Move { delta: Vec2::X },
+                ),
+                PointerInput::new(
+                    application_pointer,
+                    moved_application_again.clone(),
+                    PointerAction::Move { delta: Vec2::X },
+                ),
+            ],
+        );
+
+        let after_filtered_move = app.world().resource::<PointerDeliveries>().0.clone();
+        assert_eq!(
+            after_filtered_move[&router_target].drags, before_leave[&router_target].drags,
+            "a surviving leaving target must not receive a continued drag"
+        );
+        assert_eq!(
+            after_filtered_move[&application_target].drags,
+            before_leave[&application_target].drags + 1,
+            "another pointer's application-owned drag must remain live"
+        );
+        let state = app.world().resource::<PointerState>();
+        let router_button = state.get(PointerId::Mouse, PointerButton::Primary).unwrap();
+        assert!(!router_button.pressing.contains_key(&router_target));
+        assert!(!router_button.clicking.contains_key(&router_target));
+        assert!(!router_button.dragging.contains_key(&router_target));
+        assert!(!router_button.dragging_over.contains_key(&router_target));
+        let application_button = state
+            .get(application_pointer, PointerButton::Primary)
+            .unwrap();
+        assert!(
+            application_button
+                .pressing
+                .contains_key(&application_target)
+        );
+        assert!(
+            application_button
+                .clicking
+                .contains_key(&application_target)
+        );
+        assert!(
+            application_button
+                .dragging
+                .contains_key(&application_target)
+        );
+        assert_eq!(
+            app.world().get::<PickingInteraction>(router_target),
+            Some(&PickingInteraction::None),
+            "revoking both hover maps must also clear retained interaction state"
+        );
+        assert_eq!(
+            app.world().get::<PickingInteraction>(application_target),
+            Some(&PickingInteraction::Pressed),
+            "application interaction state must remain live"
+        );
+        assert!(
+            app.world()
+                .resource::<HoverMap>()
+                .get(&PointerId::Mouse)
+                .is_none_or(|hits| !hits.contains_key(&router_target))
+        );
+        assert!(
+            app.world()
+                .resource::<PreviousHoverMap>()
+                .get(&PointerId::Mouse)
+                .is_none_or(|hits| !hits.contains_key(&router_target))
+        );
+        assert!(state.get_ancestors(&router_target).is_none());
+        assert!(
+            state
+                .hovered_entity_ancestors
+                .values()
+                .all(|ancestors| !ancestors.contains(&router_target))
+        );
+
+        write_pointer_inputs(
+            &mut app,
+            [
+                PointerInput::new(
+                    PointerId::Mouse,
+                    moved_mouse_again,
+                    PointerAction::Release(PointerButton::Primary),
+                ),
+                PointerInput::new(
+                    application_pointer,
+                    moved_application_again,
+                    PointerAction::Release(PointerButton::Primary),
+                ),
+            ],
+        );
+        let after_release = &app.world().resource::<PointerDeliveries>().0;
+        assert_eq!(
+            after_release[&router_target].releases,
+            before_leave[&router_target].releases
+        );
+        assert_eq!(
+            after_release[&router_target].clicks,
+            before_leave[&router_target].clicks
+        );
+        assert_eq!(
+            after_release[&router_target].drag_ends,
+            before_leave[&router_target].drag_ends
+        );
+        assert_eq!(after_release[&application_target].releases, 1);
+        assert_eq!(after_release[&application_target].clicks, 1);
+        assert_eq!(after_release[&application_target].drag_ends, 1);
     }
 
     #[test]

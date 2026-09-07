@@ -20,6 +20,8 @@ ECS 当前主链仍是 `EcsViewDriver → FrameContentWriter/ContentPlan → Rea
 
 ECS 的私有 BSN preparation 已调用真实官方 `ScenePatch::load/resolve`：一次 factory 调用消费 fresh Scene，检查 runtime、cached inclusion 和重复引用，准备保持 ChildOf 顺序的声明图及 attempt 唯一匿名引用。成功与失败结果均携带 dependency handles，供后续执行/结算保活。此代码尚未接入导航；`AppBsnExt` 要与能够成功执行的 root realization 同时启用，不注册一个只能返回“未实现”的 driver，也不把 Scene 放进可克隆的 `ContentPlan`/replay artifact。私测的直接 Scene spawn 只验证解析 payload 与声明组件，不证明 Router ownership、publication、输入或 cleanup。
 
+原生 pointer 派发前增加定点过滤：gate mutation preparation 预备旧权限撤销名单，`Refresh` 清理已撤权目标的历史状态，`generate_hovermap` 之后、`update_interactions`/`pointer_events` 之前再次过滤新命中与 hover/press/click/drag/祖先缓存。其它有效目标和 app-owned 输入不整体清空。此接线仍以现有内容名单为基础；native current containment、publication 同一 exclusive 调用内的 Bevy 缓存撤权、Scene staging/AutoFocus 与 idle host-loss 的联动仍未闭合。
+
 `QuarantineLeaseTable` 仍承担前台 cleanup/host 无法安全销毁的私有残留 ownership；verified、unresolved、authority-lost 转移、stale projection 和输入/focus 隔离仍使用它。旧残留不持有 terminal 请求的前台 capability，也不会因 blocker 消失自动回收；Entity/metadata 可能长期保留，不能清空 table 冒充完成 cleanup。
 
 facade 合同验证已迁往独立 consumer 与语义依赖检查；ECS 遗漏的旧文档 catalogue 和两项 AST API 清单也已退出，私有源码形状断言仍待阶段 E 合并。现有 consumer 从独立 workspace 运行合法装配，并校验实际私有身份/authority 入口与 session 单次消费；默认 consumer 覆盖 LF/CRLF。`bsn-wiring` 仍使用迁移 renderer，只证明 feature 接线，不是 native Scene 的产品验证。

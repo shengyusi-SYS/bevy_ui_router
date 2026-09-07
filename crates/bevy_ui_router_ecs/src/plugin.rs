@@ -2,11 +2,16 @@ use bevy_app::{App, Plugin, PreUpdate, Update};
 use bevy_ecs::prelude::{Resource, SystemSet};
 use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_input_focus::InputFocus;
+use bevy_picking::{
+    PickingSystems,
+    hover::{generate_hovermap, update_interactions},
+};
 
 use crate::app_ext::ViewDriverStore;
 use crate::host::{HostCandidateRevisionLatch, HostCandidateRevisionState};
 use crate::input::{
-    RouteFocusState, RouterInputGate, input_ready_system, refresh_input_gate_system,
+    RouteFocusState, RouterInputGate, filter_inactive_router_pointer_state_system,
+    input_ready_system, refresh_input_gate_system,
 };
 use crate::navigation::RouterNavigation;
 use crate::navigation::{
@@ -82,7 +87,11 @@ pub(crate) fn install_foundations(app: &mut App) {
     )
     .configure_sets(
         PreUpdate,
-        (RouterInputSet::Refresh, RouterInputSet::Ready).chain(),
+        (
+            RouterInputSet::Refresh.before(PickingSystems::Hover),
+            RouterInputSet::Ready.after(PickingSystems::Hover),
+        )
+            .chain(),
     )
     .add_systems(
         Update,
@@ -99,6 +108,10 @@ pub(crate) fn install_foundations(app: &mut App) {
         PreUpdate,
         (
             refresh_input_gate_system.in_set(RouterInputSet::Refresh),
+            filter_inactive_router_pointer_state_system
+                .in_set(PickingSystems::Hover)
+                .after(generate_hovermap)
+                .before(update_interactions),
             input_ready_system.in_set(RouterInputSet::Ready),
         ),
     );
@@ -177,7 +190,7 @@ mod tests {
             )
         };
         assert_eq!(installed_systems.0.len(), 6);
-        assert_eq!(installed_systems.1.len(), 2);
+        assert_eq!(installed_systems.1.len(), 3);
         let resource_addresses = (
             app.world().resource::<RouteFocusState>() as *const _,
             app.world().resource::<RouterInputGate>() as *const _,
