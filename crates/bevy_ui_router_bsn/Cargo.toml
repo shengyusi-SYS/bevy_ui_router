@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+bevy_ecs = { version = "0.19.1", default-features = false }
+bevy_scene = { version = "0.19.1", default-features = false }
 bevy_ui_router_core = { path = "../bevy_ui_router_core" }
-bevy_ui_router_ecs = { path = "../bevy_ui_router_ecs" }
 bevy_ui_router_view = { path = "../bevy_ui_router_view" }

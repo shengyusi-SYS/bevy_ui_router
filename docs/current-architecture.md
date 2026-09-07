@@ -1,6 +1,6 @@
 # Current Architecture
 
-**类型**：实现事实与差距。**更新时间**：2026-09-07。**runtime 迁移**：从 `sys/structural-governance` 的 `0799098` 前向精简，后台 reaper 与公开 audit/probe 已退出；生产 BSN 迁移尚未完成。
+**类型**：实现事实与差距。**更新时间**：2026-09-08。**runtime 迁移**：从 `sys/structural-governance` 的 `0799098` 前向精简，后台 reaper 与公开 audit/probe 已退出；生产 BSN 迁移尚未完成。
 
 范围与验收以 [统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md) 为准，后续工作见 [实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)。
 
@@ -13,10 +13,12 @@
 | Core | builder/matching、请求顺序、branch diff、frame/generation、history、recovery 和唯一逻辑 publication | 保留既有行为；仅按新证据修正，不整体重写 |
 | View | renderer-neutral key、registry、descriptor、effect/input 合同 | 清除旧公开 writer/report 耦合时保持独立性 |
 | ECS | host/slot/frame binding、data-only driver、manifest、staging、cleanup、输入/focus、physical authority | 迁移到 Scene root/current containment，接入创建期责任、真实输入撤权与 BSN bridge |
-| BSN | 空 prelude，当前仍依赖 ECS | 尚无 factory/Scene executor；须反转依赖并实现第一种生产 adapter |
+| BSN | owned `BsnSceneFactory`、`BsnBuildError`、`DefaultOutlet`；已反转依赖，由 ECS optional bridge 消费 | 公开注册、原生 realization 与导航闭环尚未启用 |
 | Facade | 导航、snapshots、旧 driver/journeys；真实独立 Core/View/ECS consumer | 稳定 BSN 入口、真实 BSN consumer、普通嵌套示例及旧 API 退出尚未完成 |
 
 ECS 当前主链仍是 `EcsViewDriver → FrameContentWriter/ContentPlan → RealizedFrame`。其构建时内容名单与 authored UI component 写法不等于 native Scene 的 current containment/样式保留合同。后台 reaper/fairness、公开 audit/probe 和 ECS/facade test-support features 已移除；调度仅公开 `RouterInputSet::{Refresh,Ready}` 与 `RouterScheduleSet::PublishSnapshots`，中间 lifecycle 调度为 crate 私有，必要故障 seam 只在私测中编译。
+
+ECS 的私有 BSN preparation 已调用真实官方 `ScenePatch::load/resolve`：一次 factory 调用消费 fresh Scene，检查 runtime、cached inclusion 和重复引用，准备保持 ChildOf 顺序的声明图及 attempt 唯一匿名引用。成功与失败结果均携带 dependency handles，供后续执行/结算保活。此代码尚未接入导航；`AppBsnExt` 要与能够成功执行的 root realization 同时启用，不注册一个只能返回“未实现”的 driver，也不把 Scene 放进可克隆的 `ContentPlan`/replay artifact。私测的直接 Scene spawn 只验证解析 payload 与声明组件，不证明 Router ownership、publication、输入或 cleanup。
 
 `QuarantineLeaseTable` 仍承担前台 cleanup/host 无法安全销毁的私有残留 ownership；verified、unresolved、authority-lost 转移、stale projection 和输入/focus 隔离仍使用它。旧残留不持有 terminal 请求的前台 capability，也不会因 blocker 消失自动回收；Entity/metadata 可能长期保留，不能清空 table 冒充完成 cleanup。
 

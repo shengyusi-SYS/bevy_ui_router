@@ -66,7 +66,9 @@ pub mod ecs {
 }
 
 #[cfg(feature = "bsn")]
-pub mod bsn {}
+pub mod bsn {
+    pub use bevy_ui_router_bsn::{BsnBuildError, BsnSceneFactory, DefaultOutlet};
+}
 
 #[cfg(feature = "platform")]
 pub mod platform {
@@ -76,6 +78,9 @@ pub mod platform {
 }
 
 pub mod prelude {
+    #[cfg(feature = "bsn")]
+    pub use crate::bsn::{BsnBuildError, BsnSceneFactory, DefaultOutlet};
+
     pub use crate::core::{
         ActivePresentation, ActivePresentationKind, BackCapabilitySnapshot, BackIntent, BackPolicy,
         BranchDiff, BranchDiffRoute, CleanupDisposition, CleanupSummary, DiagnosticSeverity,

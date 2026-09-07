@@ -10,7 +10,7 @@
 
 **Spec:** [统一 MVP design spec](../specs/2026-09-07-router-mvp-design.md)。实现者同时读取 spec 和本计划；产品合同归 spec，本文件只拥有迁移顺序与证据。
 
-**状态**：Active implementation plan。阶段 A 的统一合同、测试迁移与历史归档（含 ECS 遗漏补清），以及阶段 B 的候选精简和独立基线已完成。下一阶段交付官方 BSN root；阶段 D 明确包含已暴露的 idle host-loss 缺口。spec 第 12 节已选择并验证声明图预登记、私有 shell wrapper 与 attempt allocation obligations 的最小可行机制；当前候选实现和临时探针不代表生产 BSN 或 MVP PASS。
+**状态**：Active implementation plan。阶段 A 的统一合同、测试迁移与历史归档（含 ECS 遗漏补清），以及阶段 B 的候选精简和独立基线已完成。阶段 C 正在实现官方 BSN root，已进入合同/私有解析准备检查点；阶段 D 明确包含已暴露的 idle host-loss 缺口。spec 第 12 节已选择并验证声明图预登记、私有 shell wrapper 与 attempt allocation obligations 的最小可行机制；当前候选实现和临时探针不代表生产 BSN 或 MVP PASS。
 
 ## 全局约束
 
@@ -29,7 +29,7 @@
 
 进入 runtime 阶段前，用 `git status --short`、`git branch --show-current`、`git worktree list` 复核实时环境，遵循 worktree skill 的已有隔离检查。用户变更不能纳入或回退。出现新并行实现需求时再选择独立 worktree；不为纯文档审查复制工作区。
 
-当前 Core/View 可以作为迁移锚点。ECS 主路径仍使用 `EcsViewDriver -> FrameContentWriter/ContentPlan -> RealizedFrame`；BSN crate 尚无实现且反向依赖 ECS。输入 gate 的名单来自构建时输出，不能直接覆盖动态 native Scene。六个候选含可删产品外扩张，也含必须保留的前台安全修复。
+迁移起点的 Core/View 作为锚点。ECS 主路径仍使用 `EcsViewDriver -> FrameContentWriter/ContentPlan -> RealizedFrame`；BSN 的反向依赖已在阶段 C 准备检查点修正，但尚未接入导航。输入 gate 的名单来自构建时输出，不能直接覆盖动态 native Scene。六个候选含可删产品外扩张，也含必须保留的前台安全修复。
 
 ### 1.1 候选行为 retention map
 
@@ -120,7 +120,7 @@
 
 **验证入口**：`cargo test -p bevy_ui_router_bsn`、`cargo test -p bevy_ui_router_ecs --all-features`、新增 facade `bsn` 集成 test 与独立 workspace consumer；涉及 lifecycle 的变化同时重跑最高层导航/恢复 journeys。
 
-**提交边界**：依赖/注册和实际调用的最小接线可以独立提交；shell/current-containment/input/cleanup 的一致性作为一个联动迁移审查单元，可以分内部检查点但不能宣称仅注册成功就完成 BSN。暂留迁移 executor 必须标注用途/退出阶段，不新增兼容包装。
+**提交边界**：依赖/合同与私有官方 Scene 解析准备可以先形成检查点；公开注册与能够成功执行的 native root realization 一起启用，避免安装接受一个只能失败的 driver。shell/current-containment/input/cleanup 的一致性作为一个联动迁移审查单元，可以分内部检查点但不能宣称仅注册成功就完成 BSN。暂留迁移 executor 必须标注用途/退出阶段，不新增兼容包装。
 
 ## 5. 阶段 D：嵌套布局、history 与恢复闭环
 
@@ -188,7 +188,7 @@ cargo test -p bevy_ui_router --features bsn --test bsn_facade_features --locked
 
 两位独立只读审查并交叉复核，首次安装测试缺口已补，定向复审无阻断项。补后 focused 回归、`cargo fmt --all -- --check`、`cargo check --workspace --all-targets --all-features --locked`、`cargo test --workspace --all-features --locked` 均 exit 0；全量包括 597 项 ECS 单元测试、418 项 Core 单元测试、29 项 public journeys、独立 consumer 和 28 项 Core doctests。7 份当前文档的本地引用检查通过。Windows NOT_RUN，现有 warnings 未顺手处理。此检查点不完成阶段 B：public audit/probe/test-support 外扩面和其余公开内部调度仍待迁移，生产 BSN 与 MVP 集成尚未完成。
 
-阶段 B surface/调度收口（本记录所在提交）：reaper 检查点已提交为 `7e00b99`。本次删除公开 audit/probe DTO、计数端点、专属 projection/inventory/tracked-slot traversal、ECS/facade test-support features 和中间 public 调度标签。真正供私测使用的 back-capacity 顺序、delayed-report replay、host-admission 和 commit-seal seam 收为 `cfg(test)`；Core dev test-support 与前台 residual owner 保留。迁移关系如下：
+阶段 B surface/调度收口（`0493e48`）：reaper 检查点已提交为 `7e00b99`。本次删除公开 audit/probe DTO、计数端点、专属 projection/inventory/tracked-slot traversal、ECS/facade test-support features 和中间 public 调度标签。真正供私测使用的 back-capacity 顺序、delayed-report replay、host-admission 和 commit-seal seam 收为 `cfg(test)`；Core dev test-support 与前台 residual owner 保留。迁移关系如下：
 
 | 原验证职责 | 当前验证落点 |
 | --- | --- |
@@ -200,6 +200,10 @@ cargo test -p bevy_ui_router --features bsn --test bsn_facade_features --locked
 普通 `App::update` 返回时本 fixture 已完成 cleanup，不能以“已观察 publication”推断仍处于内部窗口。测试迁移暴露完全 idle 的 registration loss 不启动恢复；它是既存 MVP 缺口，已列入阶段 D 和 current architecture，未通过新增前台请求冒充修复。两位独立审查及交叉复核确认上述分层迁移无剩余阶段 B 阻断项；同一编译意见合并处理，最后修订重新验证。
 
 最终 `cargo fmt --all -- --check`、`cargo check --workspace --all-targets --all-features --locked`、`cargo test --workspace --all-features --locked` 均 exit 0；包含 582 项 ECS / 418 项 Core 单元测试、30 项 public journeys、独立 consumer 和 28 项 Core doctests。精确 seal focused 回归也通过。Windows NOT_RUN，现有 warnings 保留。阶段 B 的独立迁移基线完成；生产 BSN、idle host loss、MVP 验收和 main 集成未完成。
+
+阶段 C 解析准备检查点（本记录所在提交）：反转 BSN/ECS 依赖，新增官方 Scene 依赖与 optional bridge，提供 `BsnSceneFactory`、`BsnBuildError`、`DefaultOutlet` 及 facade 导出。私有 preparation 消费真实 owned Scene、检查必需 runtime、保留原引用与 ChildOf 顺序、拒绝 cached inclusion/重复引用，并准备 attempt 唯一匿名引用。resolve 与图预检失败也携带 dependencies 到后续结算；没有把 Scene 放进旧可克隆 artifact。公开注册和 native realization 尚未接入，阶段 C 各交付项仍保持未闭合。
+
+该检查点的双路独立审查及交叉复核无阻断项；按意见补齐失败 dependency lifetime。`cargo fmt --all -- --check`、`cargo check --workspace --all-targets --all-features --locked`、`cargo test --workspace --all-features --locked` 均 exit 0，含 592 项 ECS（新增 10 项 preparation）、418 项 Core、30 项 public journeys、8 项 dependency contract、独立 consumer 和 28 项 Core doctests。另行 `cargo test -p bevy_ui_router_bsn --offline --locked` 与 facade `--no-default-features --features bsn` check 通过；BSN crate 自身尚无独立 tests，行为测试在 ECS 与 facade。facade 的官方 Scene outlet 声明测试不等于 Router native gate。7 份当前文档的本地链接检查通过，现有 warnings 保留，Windows NOT_RUN。下一依赖仍是 exact 创建期义务、wrapper apply、current-containment/input/cleanup 联动与真实 root consumer；consumer 同时补普通非 Scene asset handle 的正向用法，不能仅靠现有 ScenePatch dependency 用例代替。
 
 每个阶段结束只补充：交付 commit、实际命令与结果、审查结论/未决项、下一依赖；临时构建路径、完整日志和细碎排查过程不固化成长期经验。阶段内私有文件布局和检查点可调整，影响公共语义、范围或信任边界才需要重新确认。
 

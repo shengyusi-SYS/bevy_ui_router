@@ -4,6 +4,8 @@ mod app_ext;
 #[cfg(test)]
 mod authority_regression_tests;
 mod branch_transaction;
+#[cfg(feature = "bsn")]
+mod bsn;
 mod cleanup;
 mod components;
 mod content;

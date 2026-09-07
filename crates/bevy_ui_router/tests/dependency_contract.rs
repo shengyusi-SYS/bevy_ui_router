@@ -158,6 +158,61 @@ fn renderer_neutral_packages_and_default_facade_resolve_without_bevy() {
 }
 
 #[test]
+fn bsn_dependency_direction_and_optional_bridge_resolve_as_declared() {
+    for (package, features, expect_bsn, expect_ecs, expect_scene) in [
+        ("bevy_ui_router_bsn", None, true, false, true),
+        ("bevy_ui_router_ecs", None, false, true, false),
+        ("bevy_ui_router_ecs", Some("bsn"), true, true, true),
+        ("bevy_ui_router", Some("bsn"), true, true, true),
+    ] {
+        let mut command = Command::new(env!("CARGO"));
+        command.current_dir(workspace()).args([
+            "tree",
+            "--offline",
+            "--locked",
+            "--edges",
+            "normal,build",
+            "--prefix",
+            "none",
+            "--format",
+            "{p}",
+            "--no-default-features",
+            "--package",
+            package,
+        ]);
+        if let Some(features) = features {
+            command.args(["--features", features]);
+        }
+        let output = command.output().expect("Cargo tree runs");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let tree = String::from_utf8(output.stdout).unwrap();
+        let packages = tree
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            packages.contains(package),
+            "Cargo must return the requested graph"
+        );
+        for (dependency, expected) in [
+            ("bevy_ui_router_bsn", expect_bsn),
+            ("bevy_ui_router_ecs", expect_ecs),
+            ("bevy_scene", expect_scene),
+        ] {
+            assert_eq!(
+                packages.contains(dependency),
+                expected,
+                "{package} ({features:?}): {dependency}"
+            );
+        }
+    }
+}
+
+#[test]
 fn dependency_policy_accepts_aliases_features_and_both_line_endings() {
     let source = r#"
 [dependencies]

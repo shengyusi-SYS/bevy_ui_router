@@ -918,6 +918,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_scene"
+version = "0.19.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33f6f4f24cd771c6fd67286a8f264a45a644dc798a36614252db220d4fbbd63b"
+dependencies = [
+ "bevy_app",
+ "bevy_asset",
+ "bevy_derive",
+ "bevy_ecs",
+ "bevy_log",
+ "bevy_platform",
+ "bevy_reflect",
+ "bevy_scene_macros",
+ "bevy_utils",
+ "smallvec",
+ "thiserror 2.0.18",
+ "tracing",
+ "variadics_please",
+]
+
+[[package]]
+name = "bevy_scene_macros"
+version = "0.19.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fc7844c3410e228581200f73be123467c424f62fc40499c3e869b641b582748"
+dependencies = [
+ "bevy_ecs_macro_logic",
+ "bevy_macro_utils",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "bevy_shader"
 version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1115,10 +1149,12 @@ name = "bevy_ui_router"
 version = "0.1.0"
 dependencies = [
  "bevy_app",
+ "bevy_asset",
  "bevy_camera",
  "bevy_ecs",
  "bevy_input_focus",
  "bevy_picking",
+ "bevy_scene",
  "bevy_ui",
  "bevy_ui_router_bsn",
  "bevy_ui_router_core",
@@ -1133,8 +1169,9 @@ dependencies = [
 name = "bevy_ui_router_bsn"
 version = "0.1.0"
 dependencies = [
+ "bevy_ecs",
+ "bevy_scene",
  "bevy_ui_router_core",
- "bevy_ui_router_ecs",
  "bevy_ui_router_view",
 ]
 
@@ -1147,13 +1184,16 @@ name = "bevy_ui_router_ecs"
 version = "0.1.0"
 dependencies = [
  "bevy_app",
+ "bevy_asset",
  "bevy_camera",
  "bevy_color",
  "bevy_ecs",
  "bevy_input_focus",
  "bevy_internal",
  "bevy_picking",
+ "bevy_scene",
  "bevy_ui",
+ "bevy_ui_router_bsn",
  "bevy_ui_router_core",
  "bevy_ui_router_view",
 ]
