@@ -32,6 +32,7 @@ pub(crate) struct BsnSceneDeclaration {
 /// One-shot resolved payload. Keep the dependency handles with this payload
 /// through apply and settlement, rather than dropping its ScenePatch after resolve.
 pub(crate) struct PreparedBsnScene {
+    pub(crate) attempt: u64,
     pub(crate) root: ResolvedSceneRoot,
     pub(crate) declarations: Vec<BsnSceneDeclaration>,
     pub(crate) dependencies: Vec<UntypedHandle>,
@@ -140,10 +141,11 @@ fn prepare_bsn_scene(
                 });
         let attempt = next_scene_attempt(&NEXT_SCENE_ATTEMPT)?;
         let declarations = prepare_declarations(&mut root, attempt)?;
-        Ok((root, declarations))
+        Ok((attempt, root, declarations))
     })();
     match prepared {
-        Ok((root, declarations)) => Ok(PreparedBsnScene {
+        Ok((attempt, root, declarations)) => Ok(PreparedBsnScene {
+            attempt,
             root,
             declarations,
             dependencies: patch.dependencies,

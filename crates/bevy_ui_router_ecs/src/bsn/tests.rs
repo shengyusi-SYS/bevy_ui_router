@@ -2,8 +2,13 @@ use super::*;
 use std::sync::atomic::AtomicUsize;
 
 use bevy_app::{App, TaskPoolPlugin};
-use bevy_asset::AssetPlugin;
-use bevy_ecs::{component::Component, hierarchy::Children};
+use bevy_asset::{AssetApp, AssetPlugin, Handle};
+use bevy_ecs::{
+    component::Component,
+    hierarchy::Children,
+    template::{FnTemplate, TemplateContext},
+};
+use bevy_internal::image::Image;
 use bevy_scene::{
     ResolveContext, ResolvedScene, SceneDependencies, SceneFunction, ScenePlugin, bsn,
 };
@@ -55,6 +60,9 @@ fn input() -> RouteViewInput {
 
 #[derive(Component, Default, Clone, Debug, PartialEq)]
 struct ContentValue(usize);
+
+#[derive(Component, Clone)]
+struct ContentImage(Handle<Image>);
 
 #[test]
 fn each_preparation_calls_the_factory_once_and_consumes_a_fresh_scene() {
@@ -307,25 +315,37 @@ fn dependency_handles_survive_resolve_without_blanket_loaded_asset_rejection() {
     struct WithDependency;
     impl Scene for WithDependency {
         fn register_dependencies(&self, dependencies: &mut SceneDependencies) {
-            dependencies.register::<ScenePatch>("unused.scene".into());
+            dependencies.register::<Image>("unused.png".into());
         }
         fn resolve(
             self,
-            _: &mut ResolveContext,
+            context: &mut ResolveContext,
             scene: &mut ResolvedScene,
         ) -> Result<(), ResolveSceneError> {
-            scene.push_template(ContentValue(17));
+            let image = context.assets.load("unused.png");
+            scene.push_template(FnTemplate(move |_: &mut TemplateContext| {
+                Ok(ContentImage(image.clone()))
+            }));
             Ok(())
         }
     }
-    let app = app();
+    let mut app = app();
+    app.init_asset::<Image>();
     let prepared = prepare_bsn_scene(app.world(), Box::new(WithDependency)).unwrap();
     assert_eq!(prepared.dependencies.len(), 1);
     assert_eq!(
         prepared.dependencies[0].path().unwrap().to_string(),
-        "unused.scene"
+        "unused.png"
     );
     assert!(matches!(prepared.dependencies[0], UntypedHandle::Strong(_)));
+    let dependency = prepared.dependencies[0].clone().typed::<Image>();
+    // This preparation-level consumer checks the authored handle survives the
+    // adapter boundary; Router allocation/adoption belongs to native creation.
+    let root = prepared.root.spawn(app.world_mut()).unwrap().id();
+    assert_eq!(
+        app.world().get::<ContentImage>(root).unwrap().0.id(),
+        dependency.id()
+    );
 }
 
 #[test]
@@ -335,7 +355,7 @@ fn resolve_and_graph_rejections_return_dependency_lifetimes_for_settlement() {
     }
     impl Scene for FailsWithDependency {
         fn register_dependencies(&self, dependencies: &mut SceneDependencies) {
-            dependencies.register::<ScenePatch>("failed-attempt.scene".into());
+            dependencies.register::<Image>("failed-attempt.png".into());
         }
 
         fn resolve(
@@ -345,7 +365,7 @@ fn resolve_and_graph_rejections_return_dependency_lifetimes_for_settlement() {
         ) -> Result<(), ResolveSceneError> {
             if self.during_resolve {
                 return Err(ResolveSceneError::MissingSceneDependency(
-                    "failed-attempt.scene".into(),
+                    "failed-attempt.png".into(),
                 ));
             }
             let duplicate = SceneEntityReference::new(("application", 1, 1), 0, 1);
@@ -353,7 +373,8 @@ fn resolve_and_graph_rejections_return_dependency_lifetimes_for_settlement() {
             Ok(())
         }
     }
-    let app = app();
+    let mut app = app();
+    app.init_asset::<Image>();
     for during_resolve in [true, false] {
         let failure = prepare_bsn_scene(
             app.world(),
@@ -372,8 +393,12 @@ fn resolve_and_graph_rejections_return_dependency_lifetimes_for_settlement() {
         assert_eq!(failure.dependencies.len(), 1);
         assert!(matches!(failure.dependencies[0], UntypedHandle::Strong(_)));
         assert_eq!(
+            failure.dependencies[0].type_id(),
+            std::any::TypeId::of::<Image>()
+        );
+        assert_eq!(
             failure.dependencies[0].path().unwrap().to_string(),
-            "failed-attempt.scene"
+            "failed-attempt.png"
         );
     }
 }

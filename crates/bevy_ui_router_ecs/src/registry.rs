@@ -488,6 +488,7 @@ impl ExactRegistryClaim {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RegistryWriteError {
     CapacityExhausted,
+    SealExhausted,
     ForeignOrUnissuedSeal,
     DuplicateEntity,
     DuplicateOwner,
@@ -711,6 +712,41 @@ impl RouteEntityRegistry {
             .map_err(|_| RegistryWriteError::CapacityExhausted)?;
         self.records
             .try_reserve(1)
+            .map_err(|_| RegistryWriteError::CapacityExhausted)
+    }
+
+    /// Preflights a complete Scene allocation batch before any Entity or
+    /// hook-triggering component is created. Repeating the single-item reserve
+    /// without inserting records does not reserve space for the whole batch.
+    ///
+    /// This is metadata preparation, not ownership. Callers still issue a seal
+    /// and register each exact Entity, without running application code between
+    /// this check and the registrations, then revalidate after component writes.
+    pub(crate) fn try_reserve_registrations(
+        &mut self,
+        owners: &[RegistryOwner],
+    ) -> Result<(), RegistryWriteError> {
+        for (index, owner) in owners.iter().enumerate() {
+            if self
+                .records
+                .iter()
+                .any(|record| record.owner.conflicts_with(owner))
+                || owners[..index]
+                    .iter()
+                    .any(|prior| prior.conflicts_with(owner))
+            {
+                return Err(RegistryWriteError::DuplicateOwner);
+            }
+        }
+        let count = u64::try_from(owners.len()).map_err(|_| RegistryWriteError::SealExhausted)?;
+        self.next_seal_sequence
+            .checked_add(count)
+            .ok_or(RegistryWriteError::SealExhausted)?;
+        self.consumed_seal_sequences
+            .try_reserve(owners.len())
+            .map_err(|_| RegistryWriteError::CapacityExhausted)?;
+        self.records
+            .try_reserve(owners.len())
             .map_err(|_| RegistryWriteError::CapacityExhausted)
     }
 
@@ -2685,6 +2721,137 @@ pub(crate) mod tests {
             Err(RegistryWriteError::DuplicateSeal)
         );
         assert_eq!(registry.records(), baseline.as_slice());
+    }
+
+    #[test]
+    fn registration_batch_reserves_every_record_and_does_not_recycle_retired_seals() {
+        let frame = frame_fixture();
+        let owners = (0..13)
+            .map(|local_index| {
+                RegistryOwner::Committed(EntityOwner::FrameOutput {
+                    frame: frame.clone(),
+                    output: 1,
+                    local_index,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut registry = RouteEntityRegistry::new();
+        registry.try_reserve_registrations(&owners).unwrap();
+        let capacities = (
+            registry.records.capacity(),
+            registry.consumed_seal_sequences.capacity(),
+        );
+        assert_eq!(
+            registry.next_seal_sequence, 0,
+            "reservation is not seal issuance"
+        );
+        assert!(registry.records.is_empty());
+        let mut world = World::new();
+        for owner in owners {
+            let entity = world.spawn_empty().id();
+            let seal = registry.issue_seal();
+            registry
+                .register(
+                    entity,
+                    owner,
+                    seal,
+                    ComponentManifest::new([]),
+                    EntityLifecycle::PreparedInert,
+                )
+                .unwrap();
+            assert_eq!(
+                (
+                    registry.records.capacity(),
+                    registry.consumed_seal_sequences.capacity()
+                ),
+                capacities,
+                "every registration must fit the prepared batch capacity"
+            );
+        }
+        let retired = registry.records[0].claim();
+        assert!(registry.remove_exact(&retired));
+        assert_eq!(
+            registry.register(
+                retired.entity(),
+                retired.owner().clone(),
+                retired.seal(),
+                ComponentManifest::new([]),
+                retired.lifecycle()
+            ),
+            Err(RegistryWriteError::DuplicateSeal)
+        );
+        assert_eq!(registry.next_seal_sequence, 13);
+        assert_eq!(registry.consumed_seal_sequences.len(), 13);
+    }
+
+    #[test]
+    fn registration_batch_rejects_internal_and_existing_owner_conflicts_without_issuance() {
+        let (frame, _, slot) = child_owner_fixture();
+        let provisional = RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
+            parent: frame.clone(),
+            outlet: RouteSlotKey::default(),
+            slot,
+        });
+        let committed = RegistryOwner::Committed(EntityOwner::ChildSlot {
+            parent: frame,
+            outlet: RouteSlotKey::default(),
+            slot,
+        });
+        let mut registry = RouteEntityRegistry::new();
+        let before = registry.clone();
+        assert_eq!(
+            registry.try_reserve_registrations(&[provisional.clone(), committed.clone()]),
+            Err(RegistryWriteError::DuplicateOwner)
+        );
+        assert_eq!(registry, before);
+        let mut world = World::new();
+        let entity = world.spawn_empty().id();
+        let seal = registry.issue_seal();
+        registry
+            .register(
+                entity,
+                provisional,
+                seal,
+                ComponentManifest::new([]),
+                EntityLifecycle::PreparedInert,
+            )
+            .unwrap();
+        let before = registry.clone();
+        assert_eq!(
+            registry.try_reserve_registrations(&[committed]),
+            Err(RegistryWriteError::DuplicateOwner)
+        );
+        assert_eq!(registry, before);
+    }
+
+    #[test]
+    fn registration_batch_seal_exhaustion_is_permanent_and_zero_batch_is_a_no_op() {
+        let frame = frame_fixture();
+        let owners = [
+            RegistryOwner::Committed(EntityOwner::FrameShell(frame.clone())),
+            RegistryOwner::Committed(EntityOwner::FrameContentTarget(frame)),
+        ];
+        let mut registry = RouteEntityRegistry::new();
+        registry.next_seal_sequence = u64::MAX - 1;
+        let before = registry.clone();
+        assert_eq!(
+            registry.try_reserve_registrations(&owners),
+            Err(RegistryWriteError::SealExhausted)
+        );
+        assert_eq!(registry, before);
+        registry.try_reserve_registrations(&owners[..1]).unwrap();
+        let last = registry.issue_seal();
+        assert_eq!(last.sequence, u64::MAX);
+        for _ in 0..2 {
+            assert_eq!(
+                registry.try_reserve_registrations(&owners[..1]),
+                Err(RegistryWriteError::SealExhausted)
+            );
+            assert_eq!(registry.next_seal_sequence, u64::MAX);
+        }
+        let exhausted = registry.clone();
+        registry.try_reserve_registrations(&[]).unwrap();
+        assert_eq!(registry, exhausted);
     }
 
     #[test]

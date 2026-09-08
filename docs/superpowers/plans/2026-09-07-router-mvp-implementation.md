@@ -10,7 +10,7 @@
 
 **Spec:** [统一 MVP design spec](../specs/2026-09-07-router-mvp-design.md)。实现者同时读取 spec 和本计划；产品合同归 spec，本文件只拥有迁移顺序与证据。
 
-**状态**：Active implementation plan。阶段 A 的统一合同、测试迁移与历史归档（含 ECS 遗漏补清），以及阶段 B 的候选精简和独立基线已完成。阶段 C 正在实现官方 BSN root，已落地合同/私有解析准备和原生 pointer 派发前撤权检查点；创建期 ownership、current containment、publication 与 cleanup 的联动仍待实现。阶段 D 明确包含已暴露的 idle host-loss 缺口。spec 第 12 节已选择并验证声明图预登记、私有 shell wrapper 与 attempt allocation obligations 的最小可行机制；当前候选实现和临时探针不代表生产 BSN 或 MVP PASS。
+**状态**：Active implementation plan。阶段 A 的统一合同、测试迁移与历史归档（含 ECS 遗漏补清），以及阶段 B 的候选精简和独立基线已完成。阶段 C 正在实现官方 BSN root，已落地合同/私有解析准备、原生 pointer 派发前撤权，以及私有 Scene 创建/adoption/失败结算检查点；尚需将创建期 owner、current containment、publication、输入/focus 与 cleanup 联动接入导航。阶段 D 明确包含已暴露的 idle host-loss 缺口。spec 第 12 节已选择并验证声明图预登记、私有 shell wrapper 与 attempt allocation obligations 的最小可行机制；私有检查点和临时探针不代表生产 BSN 或 MVP PASS。
 
 ## 全局约束
 
@@ -52,6 +52,7 @@
 | `crates/bevy_ui_router_view/src/` | 保留 key/descriptor/只读 contract；清除旧公开 report/writer 依赖时维持独立测试 |
 | `crates/bevy_ui_router_bsn/{Cargo.toml,src/lib.rs}`；可拆出 `src/factory.rs`、`src/outlet.rs` | factory、`BsnBuildError`、`DefaultOutlet`，无 ECS 依赖 |
 | `crates/bevy_ui_router_ecs/src/bsn.rs`（新增） | optional App extension/注册包装、官方 Scene 执行与错误映射 |
+| `crates/bevy_ui_router_ecs/src/presentation/native_scene.rs`（新增） | 声明图创建期登记、私有 wrapper apply、adoption 与同次失败结算；不替代导航/publication |
 | `crates/bevy_ui_router_ecs/src/{app_ext,driver,content,presentation,frame_local,mount}.rs` | store 分派、Scene-writable root、frame-local containment、outlet binding；旧 writer 退出 |
 | `crates/bevy_ui_router_ecs/src/{components,registry,cleanup,input,plugin,branch_transaction,lifecycle_preparation,navigation}.rs` | owned structure、隔离、publication、前台 cleanup/residual 与稳定调度 |
 | `crates/bevy_ui_router_ecs/src/{audit,input_probe,test_support}.rs` 与 `registry/quarantine_reaper.rs` | 移除外扩 surface；只保留有真实前台用途或私有测试用途的最小部分 |
@@ -205,11 +206,17 @@ cargo test -p bevy_ui_router --features bsn --test bsn_facade_features --locked
 
 该检查点的双路独立审查及交叉复核无阻断项；按意见补齐失败 dependency lifetime。`cargo fmt --all -- --check`、`cargo check --workspace --all-targets --all-features --locked`、`cargo test --workspace --all-features --locked` 均 exit 0，含 592 项 ECS（新增 10 项 preparation）、418 项 Core、30 项 public journeys、8 项 dependency contract、独立 consumer 和 28 项 Core doctests。另行 `cargo test -p bevy_ui_router_bsn --offline --locked` 与 facade `--no-default-features --features bsn` check 通过；BSN crate 自身尚无独立 tests，行为测试在 ECS 与 facade。facade 的官方 Scene outlet 声明测试不等于 Router native gate。7 份当前文档的本地链接检查通过，现有 warnings 保留，Windows NOT_RUN。下一依赖仍是 exact 创建期义务、wrapper apply、current-containment/input/cleanup 联动与真实 root consumer；consumer 同时补普通非 Scene asset handle 的正向用法，不能仅靠现有 ScenePatch dependency 用例代替。
 
-阶段 C pointer 派发前撤权检查点（本记录所在提交）：真实 UI/picking 测试复现旧页面离场后继续收到 Drag。修复在 gate mutation preparation 预备历史撤权目标，`Refresh` 清既有缓存，并在 `generate_hovermap` 后、`update_interactions`/`pointer_events` 前按目标过滤新命中、前次 hover、press/click/drag 与祖先缓存，复位已有 `PickingInteraction`；保留 app-owned 和其它有效目标。原子 apply 只替换已准备的 gate 数据，没有把查询/分配放进 publication tail。
+阶段 C pointer 派发前撤权检查点（`09642d1`）：真实 UI/picking 测试复现旧页面离场后继续收到 Drag。修复在 gate mutation preparation 预备历史撤权目标，`Refresh` 清既有缓存，并在 `generate_hovermap` 后、`update_interactions`/`pointer_events` 前按目标过滤新命中、前次 hover、press/click/drag 与祖先缓存，复位已有 `PickingInteraction`；保留 app-owned 和其它有效目标。原子 apply 只替换已准备的 gate 数据，没有把查询/分配放进 publication tail。
 
 两份独立审查及交叉复核无剩余阻断项。按审查修正 active 祖先误分类与 interaction 残留，并让真实回归在旧目标移除父链和 seal 后仍验证历史撤权；它同时验证有效祖先与独立 app-owned 交互保持。最终 `cargo fmt --all -- --check`、`cargo check --workspace --all-targets --all-features --locked`、`cargo test --workspace --all-features --locked` 均 exit 0，包含 593 项 ECS、418 项 Core、30 项 public journeys、独立 consumer 与 28 项 Core doctests；focused 原生手势回归也通过。现有 warnings 保留，Windows NOT_RUN。
 
 本检查点不闭合阶段 C 的 pointer 整项：publication 同一 exclusive 调用内直接清 Bevy 缓存、native current-containment 目标、Scene failure/AutoFocus 及 host-loss 接线仍在后续。下一实现继续声明图 exact 创建义务与 wrapper apply，同步迁移 adoption/input/cleanup；生产路径核查确认可复用 exact registry retirement 和局部 cleanup 证据，但不能直接复用旧 closed manifest 或永久输出名单。相关映射仅为临时实现依据，未记作 native apply 验收。
+
+阶段 C 私有 native 创建检查点（本记录所在提交）：新增批量 registration/seal 预备与完整声明图先登记，传播解析 attempt，使用官方引用 seed/wrapper apply；成功后校验 live adoption、逐项释放 descendant 临时标记并退役 exact claims，返回最终真实闭包。失败结算区分 exact 叶节点删除与 protected 残留，保留 authored 组件值；写后复验全体剩余目标、关系和 shell 隔离。独立审查发现的合法声明/普通容器交错误判、遗漏 live quarantine/unresolved owner，以及 marker hook 后闭包/结算问题已修正。普通 Image 的成功/失败 dependency handles 也由实际 preparation 路径验证。
+
+本次新增 13 项 native 私测覆盖双向引用与首写前完整登记、部分 Node 写入失败及原错误深度、合法交错拓扑、真实 hook 漂移、普通组件正向、既存 residual owner 保护和 marker-release 后结果；三项 registry batch 测试另验证完整容量、owner 冲突与 seal 永不复用。用例必须先建立真实触发窗口：官方 scratch 写入会替换提前附加的 Children，hook 不能在正常 root 挂接时提前触发；Entity 活数量使用 `count_spawned`，不是索引容量 `len`。
+
+修正后两名独立代理复审并交叉评价，无剩余私有检查点阻断项；主代理核实对应生产路径与实际测试。定向 native 验证为 13 passed；`cargo fmt --all -- --check`、`cargo check --workspace --all-targets --all-features --locked`、`cargo test --workspace --all-features --locked` 均 exit 0，包含 609 项 ECS、418 项 Core、30 项 public journeys、8 项 dependency contract、独立 consumer 和 28 项 Core doctests。registry batch 另有 no-default-features 定向与完整 ECS 验证。现有 warnings 保留，Windows NOT_RUN。公开注册、导航/前台 owner、mount、输入/focus、统一 cleanup 及最高层 BSN consumer 均未闭合，`Unisolated` 仅为错误证据而非已隔离结果；下一步接入这些相互依赖的 production consumers，阶段 C 各产品交付项不因此打勾。
 
 每个阶段结束只补充：交付 commit、实际命令与结果、审查结论/未决项、下一依赖；临时构建路径、完整日志和细碎排查过程不固化成长期经验。阶段内私有文件布局和检查点可调整，影响公共语义、范围或信任边界才需要重新确认。
 

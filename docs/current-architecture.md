@@ -12,13 +12,15 @@
 | --- | --- | --- |
 | Core | builder/matching、请求顺序、branch diff、frame/generation、history、recovery 和唯一逻辑 publication | 保留既有行为；仅按新证据修正，不整体重写 |
 | View | renderer-neutral key、registry、descriptor、effect/input 合同 | 清除旧公开 writer/report 耦合时保持独立性 |
-| ECS | host/slot/frame binding、data-only driver、manifest、staging、cleanup、输入/focus、physical authority | 迁移到 Scene root/current containment，接入创建期责任、真实输入撤权与 BSN bridge |
+| ECS | host/slot/frame binding、data-only driver、manifest、staging、cleanup、输入/focus、physical authority；私有 native Scene 创建与失败结算 | 将 native 创建结果接入导航，并联动 current containment、输入/focus、publication 与 cleanup |
 | BSN | owned `BsnSceneFactory`、`BsnBuildError`、`DefaultOutlet`；已反转依赖，由 ECS optional bridge 消费 | 公开注册、原生 realization 与导航闭环尚未启用 |
 | Facade | 导航、snapshots、旧 driver/journeys；真实独立 Core/View/ECS consumer | 稳定 BSN 入口、真实 BSN consumer、普通嵌套示例及旧 API 退出尚未完成 |
 
 ECS 当前主链仍是 `EcsViewDriver → FrameContentWriter/ContentPlan → RealizedFrame`。其构建时内容名单与 authored UI component 写法不等于 native Scene 的 current containment/样式保留合同。后台 reaper/fairness、公开 audit/probe 和 ECS/facade test-support features 已移除；调度仅公开 `RouterInputSet::{Refresh,Ready}` 与 `RouterScheduleSet::PublishSnapshots`，中间 lifecycle 调度为 crate 私有，必要故障 seam 只在私测中编译。
 
 ECS 的私有 BSN preparation 已调用真实官方 `ScenePatch::load/resolve`：一次 factory 调用消费 fresh Scene，检查 runtime、cached inclusion 和重复引用，准备保持 ChildOf 顺序的声明图及 attempt 唯一匿名引用。成功与失败结果均携带 dependency handles，供后续执行/结算保活。此代码尚未接入导航；`AppBsnExt` 要与能够成功执行的 root realization 同时启用，不注册一个只能返回“未实现”的 driver，也不把 Scene 放进可克隆的 `ContentPlan`/replay artifact。私测的直接 Scene spawn 只验证解析 payload 与声明组件，不证明 Router ownership、publication、输入或 cleanup。
+
+新增私有 `presentation::native_scene` 消费同一 prepared Scene：先批量预备 registry 容量和 seal，再登记 shell 与全部声明 Entity，之后才写私有组件；引用 seed 与 shell wrapper 交由官方 executor 执行。成功 adoption 检查实际关系与其它 live owner，逐次复验临时标记移除产生的变化，退役 descendant 创建期 claims，并返回最后的真实内容闭包快照；该快照不是永久 ownership 名单。失败时只删除有 exact 证明的叶节点，保留 protected closure，并在每次关系/删除写入后复验剩余目标与隔离 shell；合法声明/普通容器交错不再误判为关系环。无法证明隔离时仍返回明确 `Unisolated` 残留证据，不能当成 inert 或 publication 成功。此单元尚未接入前台 owner、mount、输入/focus 或通用 cleanup，不闭合 BSN 产品路径。
 
 原生 pointer 派发前增加定点过滤：gate mutation preparation 预备旧权限撤销名单，`Refresh` 清理已撤权目标的历史状态，`generate_hovermap` 之后、`update_interactions`/`pointer_events` 之前再次过滤新命中与 hover/press/click/drag/祖先缓存。其它有效目标和 app-owned 输入不整体清空。此接线仍以现有内容名单为基础；native current containment、publication 同一 exclusive 调用内的 Bevy 缓存撤权、Scene staging/AutoFocus 与 idle host-loss 的联动仍未闭合。
 

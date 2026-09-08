@@ -31,6 +31,9 @@ use crate::{
     },
 };
 
+#[cfg(feature = "bsn")]
+pub(crate) mod native_scene;
+
 #[cfg(test)]
 use crate::registry::{
     apply_prepared_quarantine_transfer, apply_prepared_unresolved_residual_transfer,
