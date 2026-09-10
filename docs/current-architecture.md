@@ -22,7 +22,11 @@ ECS 的私有 BSN preparation 已调用真实官方 `ScenePatch::load/resolve`�
 
 新增私有 `presentation::native_scene` 消费同一 prepared Scene：先批量预备 registry 容量和 seal，再登记 shell 与全部声明 Entity，之后才写私有组件；引用 seed 与 shell wrapper 交由官方 executor 执行。成功 adoption 检查实际关系与其它 live owner，逐次复验临时标记移除产生的变化，退役 descendant 创建期 claims，并返回最后的真实内容闭包快照；该快照不是永久 ownership 名单。失败时只删除有 exact 证明的叶节点，保留 protected closure，并在每次关系/删除写入后复验剩余目标与隔离 shell；合法声明/普通容器交错不再误判为关系环。无法证明隔离时仍返回明确 `Unisolated` 残留证据，不能当成 inert 或 publication 成功。此单元尚未接入前台 owner、mount、输入/focus 或通用 cleanup，不闭合 BSN 产品路径。
 
-原生 pointer 派发前增加定点过滤：gate mutation preparation 预备旧权限撤销名单，`Refresh` 清理已撤权目标的历史状态，`generate_hovermap` 之后、`update_interactions`/`pointer_events` 之前再次过滤新命中与 hover/press/click/drag/祖先缓存。其它有效目标和 app-owned 输入不整体清空。此接线仍以现有内容名单为基础；native current containment、publication 同一 exclusive 调用内的 Bevy 缓存撤权、Scene staging/AutoFocus 与 idle host-loss 的联动仍未闭合。
+原生 pointer 的既有 hover/press/click/drag/祖先缓存与 `PickingInteraction` 已在三个正常 publication 入口及 authority isolation 的同一 exclusive 调用内撤销。正常发布通过 exact resource Entity 联合查询预借资源/组件，新增 pointer tail 只做原位修改；历史目标或资源 Entity 被禁用也不会漏清，正常 presentation 的默认查询过滤不因此放宽。post-commit 的观察 partition 不再被全量用作撤权目标，protected/app 状态保持。`Refresh` 与 `generate_hovermap` 之后、`update_interactions`/`pointer_events` 之前的定点过滤继续防止旧或新非活动命中派发。此接线仍以现有内容名单为基础；native current containment、Scene staging/AutoFocus 与 idle host-loss 的联动仍未闭合。
+
+**已确认的资源借用缺口**：官方 Bevy 0.19.1 的 Resource 是 Entity component；`resource_scope` 退出会重新插入组件、改变 tick，并可能执行 hook/flush，不能当作纯借用。既有 publication 外层的 gate/focus/registry 等资源 scope 仍需迁移并验证，不能只检查显式 tail 函数体就宣称整个 publication 边界无结构写入。
+
+**待确认的 focus 集成边界**：官方 `InputFocus` 没有直接按 target 过滤待派发变化队列的公开入口。Scene apply 后整体恢复快照虽可抑制 pending `AutoFocus`，也会撤销同次 Scene 对其它有效目标的合法 focus 改写；目前不采用该无条件恢复方案。若选择构建期 focus 变化不生效、应用在 Scene 执行之外显式设置焦点，需要先明确接受这一限制，不把它默认为既有合同。
 
 `QuarantineLeaseTable` 仍承担前台 cleanup/host 无法安全销毁的私有残留 ownership；verified、unresolved、authority-lost 转移、stale projection 和输入/focus 隔离仍使用它。旧残留不持有 terminal 请求的前台 capability，也不会因 blocker 消失自动回收；Entity/metadata 可能长期保留，不能清空 table 冒充完成 cleanup。
 

@@ -161,8 +161,8 @@ use crate::{
         DeferredRealizationFailure, FrameLifecycle, FrameMountBinding, RealizedFrame,
         expected_children, frame_is_isolated_for_settlement, isolate_frame_for_settlement,
         isolate_frame_for_settlement_guarded, prepare_presentation_mutation,
-        realize_child_frame_deferred, realize_frame_deferred,
-        realize_reconciliation_child_frame_deferred, validate_active_frame,
+        prepare_presentation_with_pointer_revocation, realize_child_frame_deferred,
+        realize_frame_deferred, realize_reconciliation_child_frame_deferred, validate_active_frame,
         validate_realized_frame,
     },
     registry::{
@@ -14747,8 +14747,9 @@ fn publish_ready_back_target(
                                     let claim_rebind =
                                         splice.prepare_claim_rebind(&resulting_claims)?;
                                     let presentation_plan =
-                                        prepare_presentation_mutation(world, &targets)?
-                                            .seal_commit(isolate_count)?;
+                                        prepare_presentation_with_pointer_revocation(
+                                            world, &targets, gate_plan.revoked_targets(),
+                                        )?.seal_commit(isolate_count)?;
 
                                     let BackTargetReadyAcceptanceOwner {
                                         physical,
@@ -15418,8 +15419,9 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                                                     timing_seam_prepared = Some(prepared);
                                                 }
                                                 let presentation_plan =
-                                                    prepare_presentation_mutation(world, &targets)?
-                                                        .seal_commit(isolate_count)?;
+                                                    prepare_presentation_with_pointer_revocation(
+                                                        world, &targets, gate_plan.revoked_targets(),
+                                                    )?.seal_commit(isolate_count)?;
                                                 let prepared = match timing_seam_prepared {
                                                     Some(prepared) => prepared,
                                                     None => {
@@ -16393,9 +16395,10 @@ fn commit_projectionless_branch(
                                     .expect("prevalidated projectionless gate plan remains exact");
                                     let focus_plan =
                                         prepare_focus_mutation(input_focus, route_focus, &focus_leaving);
-                                    let presentation_plan = prepare_presentation_mutation(
+                                    let presentation_plan = prepare_presentation_with_pointer_revocation(
                                         world,
                                         &targets,
+                                        gate_plan.revoked_targets(),
                                     )
                                     .and_then(|prepared| prepared.seal_commit(isolate_count))
                                     .expect(

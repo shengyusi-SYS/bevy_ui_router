@@ -159,7 +159,7 @@ leaf 不要求 outlet。需要 child 时缺失、重复、非容器或失效声�
 
 ## 7. Scene 执行、切换与隔离
 
-一个 view effect 的处理为：验证当前任务与 host → 注册 inert shell/root → 调用 factory → 消费 owned Scene → 重建内容 closure 并复验 root/binding → 必要时绑定 outlet/进入 child → 准备 publication。中途失败进入对应 cleanup/recovery；旧或不匹配的任务不调用可见 publication。
+一个 view effect 的处理为：验证当前任务与 host → 调用 factory 并消费 owned Scene 完成 resolve/声明图预检 → 预分配并登记 inert shell/root 及声明图 → 官方 apply/adoption，重建内容 closure 并复验 root/binding → 必要时绑定 outlet/进入 child → 准备 publication。顺序与第 12 节一致，cached inclusion 等预检失败在 UI 分配前拒绝。中途失败进入对应 cleanup/recovery；旧或不匹配的任务不调用可见 publication。
 
 执行器按第 12 节使用官方 resolve/apply 与私有 shell wrapper；不能用裸 `apply_scene` 加事后 Children 遍历替代创建期追踪。Scene root 和 child 可能在 relationship 建立前返回 apply error；apply 与其返回后的 adoption/失败隔离在同一 exclusive 调用内处理，不把未挂接的部分 UI 留到普通系统或下一输入/呈现边界。后续可延迟安全销毁，但必须先以本次 exact obligations 完成 inert 隔离，不能把“以后 cleanup”当成当前隔离。
 

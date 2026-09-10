@@ -17,7 +17,7 @@ use crate::{
     components::{RouteOwnershipSeal, RouterInputBarrier},
     input::{
         PreparedInputGateIsolation, RouteFocusState, RouterInputGate, observed_descendant_closure,
-        try_prepare_input_gate_isolation,
+        revoke_router_pointer_targets, try_prepare_input_gate_isolation,
     },
     mount::ChildSlotResidual,
     presentation::RealizedFrame,
@@ -32,6 +32,50 @@ use super::{
     RetiredHostBinding, RouterEntry, authority_settlement_logical_roots, precommit_authority_cause,
     projectionless_fail_close_capacity_probe,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::tests::{
+        active_atomic_app, assert_pointer_target_preserved, assert_pointer_target_revoked,
+        seed_pointer_history,
+    };
+
+    #[test]
+    fn authority_pointer_isolation_without_gate_requires_exact_owned_targets() {
+        let (mut app, target) = active_atomic_app("pointer-isolation-without-gate");
+        let application_target = app.world_mut().spawn_empty().id();
+        seed_pointer_history(app.world_mut(), &[target, application_target]);
+        let before = app
+            .world()
+            .resource::<bevy_picking::events::PointerState>()
+            .clone();
+        let claims = app
+            .world()
+            .resource::<crate::navigation::RouterNavigation>()
+            .entries[0]
+            .active
+            .as_ref()
+            .unwrap()
+            .claims()
+            .cloned()
+            .collect::<Vec<_>>();
+        app.world_mut().remove_resource::<RouterInputGate>();
+        let prepared = prepare_authority_isolation_targets(
+            app.world(),
+            claims.iter(),
+            [target, application_target],
+            0,
+        );
+        let AuthorityIsolationPreparation::Ready(prepared) = prepared else {
+            panic!("the fixture must retain exact owned physical targets without a gate");
+        };
+        prepared.apply(app.world_mut());
+        assert_pointer_target_revoked(app.world(), target);
+        assert_pointer_target_preserved(app.world(), application_target, &before);
+        assert!(!app.world().contains_resource::<RouterInputGate>());
+    }
+}
 
 pub(super) enum AuthoritySettlementBeginOutcome {
     Begun,
@@ -275,10 +319,12 @@ pub(super) struct PreparedAuthorityIsolation {
     pub(super) entities: Vec<PreparedAuthorityEntityIsolation>,
     pub(super) focus: Vec<bevy_ecs::entity::Entity>,
     pub(super) gate: Option<PreparedInputGateIsolation>,
+    pointer_targets: std::collections::HashSet<bevy_ecs::entity::Entity>,
 }
 
 impl PreparedAuthorityIsolation {
     pub(super) fn apply(self, world: &mut World) {
+        revoke_router_pointer_targets(world, &self.pointer_targets);
         if let Some(gate) = self.gate
             && let Some(mut current) = world.get_resource_mut::<RouterInputGate>()
         {
@@ -323,6 +369,7 @@ impl PreparedAuthorityIsolation {
     }
 
     pub(super) fn apply_guarded(self, world: &mut World, guard: &impl Fn(&World) -> bool) -> bool {
+        revoke_router_pointer_targets(world, &self.pointer_targets);
         if let Some(gate) = self.gate
             && let Some(mut current) = world.get_resource_mut::<RouterInputGate>()
         {
@@ -469,7 +516,7 @@ pub(super) fn prepare_authority_isolation_targets<'a>(
 
     let mut entities = Vec::new();
     let mut violations = Vec::new();
-    for entity in exact {
+    for entity in exact.iter().copied() {
         let visibility = match world.get::<bevy_camera::visibility::Visibility>(entity) {
             Some(visibility) => *visibility != bevy_camera::visibility::Visibility::Hidden,
             None => {
@@ -561,10 +608,28 @@ pub(super) fn prepare_authority_isolation_targets<'a>(
         },
         None => None,
     };
+    let mut pointer_targets = std::collections::HashSet::new();
+    let revoked = gate
+        .as_ref()
+        .map(PreparedInputGateIsolation::revoked_targets)
+        .unwrap_or_default();
+    let Some(pointer_capacity) = exact.len().checked_add(revoked.len()) else {
+        return AuthorityIsolationPreparation::RetryableCapacity;
+    };
+    if pointer_targets.try_reserve(pointer_capacity).is_err() {
+        return AuthorityIsolationPreparation::RetryableCapacity;
+    }
+    // A gate-removal candidate may be a protected app descendant, for which
+    // removing a nonexistent Router permission was a no-op. Native writes need
+    // actual revoked permission history or an exact target ownership claim.
+    // Exact targets still provide authority when the gate resource is absent.
+    pointer_targets.extend(exact);
+    pointer_targets.extend(revoked.iter().copied());
     let prepared = PreparedAuthorityIsolation {
         entities,
         focus,
         gate,
+        pointer_targets,
     };
     if violations.is_empty() {
         AuthorityIsolationPreparation::Ready(prepared)
@@ -583,7 +648,9 @@ pub(super) fn prepare_post_commit_input_isolation(
     authority: &PreparedPostCommitAuthorityLedger,
 ) -> Result<PreparedPostCommitInputIsolation, PostCommitInputIsolationFailure> {
     let mut gate_targets = active.interactive_entities();
-    gate_targets.extend(original.partition_entities().iter().copied());
+    // Protected descendants participate in read-only partition validation, not
+    // input revocation. Only the original owned cleanup obligations are targets.
+    gate_targets.extend(original.immutable_entities().iter().copied());
     gate_targets.sort_by_key(|entity| entity.to_bits());
     gate_targets.dedup();
     let gate_required = world.get_resource::<RouterInputGate>().is_some();

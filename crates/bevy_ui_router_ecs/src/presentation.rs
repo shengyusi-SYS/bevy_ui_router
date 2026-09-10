@@ -10,7 +10,11 @@ use bevy_ecs::{
     prelude::{Entity, World},
 };
 use bevy_input_focus::InputFocus;
-use bevy_picking::{Pickable, hover::PickingInteraction};
+use bevy_picking::{
+    Pickable,
+    events::PointerState,
+    hover::{HoverMap, PickingInteraction, PreviousHoverMap},
+};
 use bevy_ui::{BackgroundColor, ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Node, Val};
 use bevy_ui_router_core::{
     frame::RouteFrameVersion,
@@ -23,7 +27,10 @@ use crate::{
     components::{ChildSlotAuthority, ChildSlotLifecycle, RouteOwnershipSeal, RouterInputBarrier},
     content::{AcceptedContentPlan, RealizedContentKind},
     host::{ValidatedHostCandidate, validated_host_candidate_is_current},
-    input::RouteFocusState,
+    input::{
+        PointerStateResources, PreparedPointerMutation, RouteFocusState, pointer_query,
+        pointer_resource_entity,
+    },
     mount::MountedChildSlot,
     registry::{
         ComponentManifest, EntityLifecycle, EntityOwner, ExactRegistryClaim, QuarantineFacts,
@@ -510,10 +517,12 @@ struct PreparedEntityMutation<'w> {
 
 pub(crate) struct PreparedPresentationMutation<'w> {
     entities: Vec<(usize, PreparedEntityMutation<'w>)>,
+    pointer: PreparedPointerMutation<'w>,
 }
 
 pub(crate) struct PreparedCommitPresentationMutation<'w> {
     entities: Vec<(usize, PreparedEntityMutation<'w>)>,
+    pointer: PreparedPointerMutation<'w>,
     split_at: usize,
 }
 
@@ -659,6 +668,7 @@ impl PreparedEntityMutation<'_> {
 
 impl<'w> PreparedPresentationMutation<'w> {
     pub(crate) fn apply(self) {
+        self.pointer.apply();
         for (_, mut entity) in self.entities {
             entity.apply_final();
         }
@@ -691,6 +701,7 @@ impl<'w> PreparedPresentationMutation<'w> {
                 });
         valid.then_some(PreparedCommitPresentationMutation {
             entities: self.entities,
+            pointer: self.pointer,
             split_at,
         })
     }
@@ -723,7 +734,11 @@ impl<'w> PreparedCommitPresentationMutation<'w> {
         for (_, entity) in &mut self.entities[self.split_at..] {
             entity.apply_capabilities();
         }
-        gate(self.state());
+        // Native state is revoked in place while all prepared component and
+        // resource borrows are still held, before gate publication returns.
+        self.pointer.apply();
+        let (leaving, entering) = self.entities.split_at(self.split_at);
+        gate(CommitPresentationState { leaving, entering });
     }
 }
 
@@ -2328,19 +2343,71 @@ pub(crate) fn prepare_presentation_mutation<'w>(
     world: &'w mut World,
     targets: &[FrameMutationTarget],
 ) -> Option<PreparedPresentationMutation<'w>> {
-    let mut query = world.query::<(
-        Entity,
-        &mut Visibility,
-        Option<&mut Pickable>,
-        &mut RouterInputBarrier,
-        Option<&mut FrameLifecycle>,
-        Option<&mut ChildSlotLifecycle>,
+    prepare_presentation_with_pointer_revocation(world, targets, &[])
+}
+
+/// Acquire presentation and existing pointer component borrows together. Pointer
+/// revocations may include a previously allowed target absent from the current
+/// presentation mutation, so their selection is independent of that partition.
+pub(crate) fn prepare_presentation_with_pointer_revocation<'w>(
+    world: &'w mut World,
+    targets: &[FrameMutationTarget],
+    pointer_targets: &[Entity],
+) -> Option<PreparedPresentationMutation<'w>> {
+    // Preserve the original presentation query's default-filter eligibility.
+    // Native pointer history, unlike presentation mutation, must still be
+    // reachable for entities disabled after the gesture began.
+    let mut presentation_eligibility = world.query::<(
+        &Visibility,
+        Option<&Pickable>,
+        &RouterInputBarrier,
+        Option<&FrameLifecycle>,
+        Option<&ChildSlotLifecycle>,
     )>();
+    if targets
+        .iter()
+        .any(|target| presentation_eligibility.get(world, target.entity).is_err())
+    {
+        return None;
+    }
+    let pointer_targets = pointer_targets.iter().copied().collect::<HashSet<_>>();
+    let hover_entity = pointer_resource_entity::<HoverMap>(world);
+    let previous_hover_entity = pointer_resource_entity::<PreviousHoverMap>(world);
+    let state_entity = pointer_resource_entity::<PointerState>(world);
+    let mut query = pointer_query::<(
+        Entity,
+        Option<(
+            &mut Visibility,
+            Option<&mut Pickable>,
+            &mut RouterInputBarrier,
+            Option<&mut FrameLifecycle>,
+            Option<&mut ChildSlotLifecycle>,
+        )>,
+        Option<&mut PickingInteraction>,
+        Option<&mut HoverMap>,
+        Option<&mut PreviousHoverMap>,
+        Option<&mut PointerState>,
+    )>(world);
     let mut found = vec![false; targets.len()];
     let mut entities = Vec::with_capacity(targets.len());
-    for (entity, visibility, pickable, barrier, frame_lifecycle, slot_lifecycle) in
-        query.iter_mut(world)
-    {
+    let mut pointer_interactions = Vec::with_capacity(pointer_targets.len());
+    let mut pointer_resources = PointerStateResources::default();
+    for (entity, presentation, interaction, hover, previous_hover, state) in query.iter_mut(world) {
+        if Some(entity) == hover_entity {
+            pointer_resources.hover = hover;
+        }
+        if Some(entity) == previous_hover_entity {
+            pointer_resources.previous_hover = previous_hover;
+        }
+        if Some(entity) == state_entity {
+            pointer_resources.state = state;
+        }
+        if pointer_targets.contains(&entity)
+            && let Some(interaction) = interaction
+            && *interaction != PickingInteraction::None
+        {
+            pointer_interactions.push(interaction);
+        }
         let Some((index, target)) = targets
             .iter()
             .enumerate()
@@ -2348,6 +2415,7 @@ pub(crate) fn prepare_presentation_mutation<'w>(
         else {
             continue;
         };
+        let (visibility, pickable, barrier, frame_lifecycle, slot_lifecycle) = presentation?;
         let expected_pickable = if target.current == EntityLifecycle::Active && target.interactive {
             ACTIVE_PICKABLE
         } else {
@@ -2408,7 +2476,10 @@ pub(crate) fn prepare_presentation_mutation<'w>(
     found
         .into_iter()
         .all(|present| present)
-        .then_some(PreparedPresentationMutation { entities })
+        .then_some(PreparedPresentationMutation {
+            entities,
+            pointer: pointer_resources.prepare(pointer_targets, pointer_interactions),
+        })
 }
 
 pub(crate) fn prepare_cleanup_quarantine_mutation<'w>(
@@ -4386,6 +4457,23 @@ pub(crate) mod tests {
                 .get::<RouterInputBarrier>(child_slot)
                 .is_some_and(RouterInputBarrier::denies_all)
         );
+    }
+
+    #[test]
+    fn pointer_preparation_keeps_disabled_presentation_rejected() {
+        let mut world = World::new();
+        let (leaving, entering, _, targets) = presentation_commit_fixture(&mut world);
+        crate::input::tests::seed_pointer_history(&mut world, &[leaving]);
+        let before = world.resource::<PointerState>().clone();
+        world
+            .entity_mut(entering)
+            .insert(bevy_ecs::entity_disabling::Disabled);
+        assert!(
+            prepare_presentation_with_pointer_revocation(&mut world, &targets, &[leaving])
+                .is_none()
+        );
+        crate::input::tests::assert_pointer_target_preserved(&world, leaving, &before);
+        assert_eq!(world.get::<Visibility>(entering), Some(&Visibility::Hidden));
     }
 
     #[test]

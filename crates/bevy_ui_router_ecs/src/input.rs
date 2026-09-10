@@ -4,8 +4,10 @@ use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
     change_detection::Mut,
     entity::Entity,
+    entity_disabling::DefaultQueryFilters,
     hierarchy::{ChildOf, Children},
     prelude::World,
+    query::{FilteredAccess, QueryBuilder, QueryData, QueryState},
     resource::Resource,
 };
 use bevy_input_focus::InputFocus;
@@ -95,6 +97,10 @@ pub(crate) struct PreparedInputGateIsolation {
 }
 
 impl PreparedInputGateIsolation {
+    pub(crate) fn revoked_targets(&self) -> &[Entity] {
+        &self.revoked
+    }
+
     pub(crate) fn apply(self, gate: &mut RouterInputGate) {
         gate.replace_allowed(self.next, self.revoked);
     }
@@ -119,9 +125,133 @@ pub(crate) struct PreparedInputGateMutation<'w> {
 }
 
 impl PreparedInputGateMutation<'_> {
+    pub(crate) fn revoked_targets(&self) -> &[Entity] {
+        &self.revoked
+    }
+
     pub(crate) fn apply(mut self) {
         self.gate.replace_allowed(self.next, self.revoked);
     }
+}
+
+/// Only the native resource entities registered in World's resource mapping
+/// contribute these borrows. Ordinary components of the same type do not.
+#[derive(Default)]
+pub(crate) struct PointerStateResources<'w> {
+    pub(crate) hover: Option<Mut<'w, HoverMap>>,
+    pub(crate) previous_hover: Option<Mut<'w, PreviousHoverMap>>,
+    pub(crate) state: Option<Mut<'w, PointerState>>,
+}
+
+pub(crate) struct PreparedPointerMutation<'w> {
+    targets: HashSet<Entity>,
+    resources: PointerStateResources<'w>,
+    interactions: Vec<Mut<'w, PickingInteraction>>,
+}
+
+impl<'w> PointerStateResources<'w> {
+    pub(crate) fn prepare(
+        self,
+        targets: HashSet<Entity>,
+        interactions: Vec<Mut<'w, PickingInteraction>>,
+    ) -> PreparedPointerMutation<'w> {
+        // Only retain borrows that need a write, so an empty or unrelated target
+        // set does not mark otherwise untouched native resources changed.
+        let hover = self.hover.filter(|hover| {
+            hover
+                .values()
+                .any(|hits| hits.keys().any(|entity| targets.contains(entity)))
+        });
+        let previous_hover = self.previous_hover.filter(|hover| {
+            hover
+                .values()
+                .any(|hits| hits.keys().any(|entity| targets.contains(entity)))
+        });
+        let state = self.state.filter(|state| {
+            state.pointer_buttons.values().any(|button| {
+                button
+                    .pressing
+                    .keys()
+                    .chain(button.clicking.keys())
+                    .chain(button.dragging.keys())
+                    .chain(button.dragging_over.keys())
+                    .any(|entity| targets.contains(entity))
+            }) || state
+                .hovered_entity_ancestors
+                .iter()
+                .any(|(hovered, ancestors)| {
+                    targets.contains(hovered)
+                        || ancestors.iter().any(|entity| targets.contains(entity))
+                })
+        });
+        PreparedPointerMutation {
+            targets,
+            resources: PointerStateResources {
+                hover,
+                previous_hover,
+                state,
+            },
+            interactions,
+        }
+    }
+}
+
+impl PreparedPointerMutation<'_> {
+    /// No World access, allocation, validation or component insertion belongs
+    /// here: the exclusive publication tail only edits already borrowed state.
+    pub(crate) fn apply(self) {
+        let targets = self.targets;
+        for mut interaction in self.interactions {
+            *interaction = PickingInteraction::None;
+        }
+        if let Some(mut hover) = self.resources.hover {
+            for hits in hover.values_mut() {
+                hits.retain(|entity, _| !targets.contains(entity));
+            }
+        }
+        if let Some(mut hover) = self.resources.previous_hover {
+            for hits in hover.values_mut() {
+                hits.retain(|entity, _| !targets.contains(entity));
+            }
+        }
+        if let Some(mut pointer_state) = self.resources.state {
+            for state in pointer_state.pointer_buttons.values_mut() {
+                state.pressing.retain(|entity, _| !targets.contains(entity));
+                state.clicking.retain(|entity, _| !targets.contains(entity));
+                state.dragging.retain(|entity, _| !targets.contains(entity));
+                state
+                    .dragging_over
+                    .retain(|entity, _| !targets.contains(entity));
+            }
+            pointer_state
+                .hovered_entity_ancestors
+                .retain(|hovered, ancestors| {
+                    ancestors.retain(|ancestor| !targets.contains(ancestor));
+                    !targets.contains(hovered)
+                });
+        }
+    }
+}
+
+pub(crate) fn pointer_resource_entity<R: Resource>(world: &World) -> Option<Entity> {
+    world
+        .component_id::<R>()
+        .and_then(|id| world.resource_entities().get(id))
+}
+
+/// Native history must remain reachable after a target or resource entity is
+/// disabled. This is the dynamic equivalent of Allow<T> for the currently
+/// registered disabling components; it never changes the World's filters.
+pub(crate) fn pointer_query<D: QueryData>(world: &mut World) -> QueryState<D> {
+    let mut access = FilteredAccess::default();
+    if let Some(filters) = world.get_resource::<DefaultQueryFilters>() {
+        for component in filters.disabling_ids() {
+            access.access_mut().add_archetypal(component);
+        }
+    }
+    let mut builder = QueryBuilder::<D>::new(world);
+    builder.extend_access(access);
+    builder.build()
 }
 
 pub(crate) struct PreparedFocusMutation<'w> {
@@ -485,39 +615,43 @@ pub(crate) fn revoke_router_pointer_targets(world: &mut World, targets: &HashSet
     if targets.is_empty() {
         return;
     }
-    if let Some(mut hover_map) = world.get_resource_mut::<HoverMap>() {
-        for hits in hover_map.values_mut() {
-            hits.retain(|entity, _| !targets.contains(entity));
+    prepare_pointer_mutation(world, targets.clone()).apply();
+}
+
+fn prepare_pointer_mutation<'w>(
+    world: &'w mut World,
+    targets: HashSet<Entity>,
+) -> PreparedPointerMutation<'w> {
+    let hover_entity = pointer_resource_entity::<HoverMap>(world);
+    let previous_hover_entity = pointer_resource_entity::<PreviousHoverMap>(world);
+    let state_entity = pointer_resource_entity::<PointerState>(world);
+    let mut query = pointer_query::<(
+        Entity,
+        Option<&mut HoverMap>,
+        Option<&mut PreviousHoverMap>,
+        Option<&mut PointerState>,
+        Option<&mut PickingInteraction>,
+    )>(world);
+    let mut resources = PointerStateResources::default();
+    let mut interactions = Vec::with_capacity(targets.len());
+    for (entity, hover, previous_hover, state, interaction) in query.iter_mut(world) {
+        if Some(entity) == hover_entity {
+            resources.hover = hover;
         }
-    }
-    if let Some(mut previous_hover_map) = world.get_resource_mut::<PreviousHoverMap>() {
-        for hits in previous_hover_map.values_mut() {
-            hits.retain(|entity, _| !targets.contains(entity));
+        if Some(entity) == previous_hover_entity {
+            resources.previous_hover = previous_hover;
         }
-    }
-    if let Some(mut pointer_state) = world.get_resource_mut::<PointerState>() {
-        for state in pointer_state.pointer_buttons.values_mut() {
-            state.pressing.retain(|entity, _| !targets.contains(entity));
-            state.clicking.retain(|entity, _| !targets.contains(entity));
-            state.dragging.retain(|entity, _| !targets.contains(entity));
-            state
-                .dragging_over
-                .retain(|entity, _| !targets.contains(entity));
+        if Some(entity) == state_entity {
+            resources.state = state;
         }
-        pointer_state
-            .hovered_entity_ancestors
-            .retain(|hovered, ancestors| {
-                ancestors.retain(|ancestor| !targets.contains(ancestor));
-                !targets.contains(hovered)
-            });
-    }
-    for target in targets.iter().copied() {
-        if let Some(mut interaction) = world.get_mut::<PickingInteraction>(target)
+        if targets.contains(&entity)
+            && let Some(interaction) = interaction
             && *interaction != PickingInteraction::None
         {
-            *interaction = PickingInteraction::None;
+            interactions.push(interaction);
         }
     }
+    resources.prepare(targets, interactions)
 }
 
 fn revoke_pending_router_pointer_targets(world: &mut World) {
@@ -602,7 +736,7 @@ fn target_has_exact_router_boundary(world: &World, target: Entity) -> bool {
 pub(crate) fn input_ready_system(_world: &mut World) {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         app_ext::{AppRouterExt, RouterConfig, RouterHostRegistration},
@@ -610,7 +744,7 @@ mod tests {
         driver::{EcsViewDriver, EcsViewReportSession, ViewBuildReport},
         navigation::{
             RouterNavigation, collect_navigation_system, commit_presentation_system,
-            drive_navigation_system,
+            drive_navigation_system, settle_cleanup_system,
         },
         plugin::BevyUiRouterPlugin,
     };
@@ -627,7 +761,8 @@ mod tests {
         camera::{Camera2d, NormalizedRenderTarget},
         math::Vec2,
         picking::{
-            events::{Click, Drag, DragEnd, Pointer, Press, Release},
+            backend::HitData,
+            events::{Click, Drag, DragEnd, DragEntry, Pointer, Press, Release},
             hover::{HoverMap, PreviousHoverMap},
             pointer::{
                 Location, PointerAction, PointerButton, PointerId, PointerInput,
@@ -677,7 +812,7 @@ mod tests {
         }
     }
 
-    fn active_atomic_app(label: &str) -> (App, Entity) {
+    pub(crate) fn active_atomic_app(label: &str) -> (App, Entity) {
         let mut app = App::new();
         app.add_plugins(BevyUiRouterPlugin::default());
         let driver = ViewDriverKey::new(format!("{label}-driver")).unwrap();
@@ -1090,6 +1225,41 @@ mod tests {
                 .allows_pointer(router_target)
         );
         assert!(app.world().get_entity(router_target).is_ok());
+        // Publication itself must revoke existing gestures: no Refresh,
+        // backend hit generation or dispatch has run since this commit.
+        assert_pointer_target_revoked(app.world(), router_target);
+        let state = app.world().resource::<PointerState>();
+        let application_button = state
+            .get(application_pointer, PointerButton::Primary)
+            .unwrap();
+        assert!(
+            application_button
+                .pressing
+                .contains_key(&application_target)
+        );
+        assert!(
+            application_button
+                .clicking
+                .contains_key(&application_target)
+        );
+        assert!(
+            application_button
+                .dragging
+                .contains_key(&application_target)
+        );
+        assert!(
+            app.world().resource::<HoverMap>()[&application_pointer]
+                .contains_key(&application_target)
+        );
+        assert!(
+            app.world().resource::<PreviousHoverMap>()[&application_pointer]
+                .contains_key(&application_target)
+        );
+        assert!(state.get_ancestors(&application_target).is_some());
+        assert_eq!(
+            app.world().get::<PickingInteraction>(application_target),
+            Some(&PickingInteraction::Pressed)
+        );
         // Historical authorization, rather than an ancestor boundary or the
         // now-drifted physical claim, must still revoke the gesture begun active.
         app.world_mut()
@@ -1215,6 +1385,355 @@ mod tests {
         assert_eq!(after_release[&application_target].releases, 1);
         assert_eq!(after_release[&application_target].clicks, 1);
         assert_eq!(after_release[&application_target].drag_ends, 1);
+    }
+
+    pub(crate) fn assert_pointer_target_revoked(world: &World, target: Entity) {
+        assert!(
+            world
+                .resource::<HoverMap>()
+                .values()
+                .all(|hits| !hits.contains_key(&target)),
+            "the exclusive Router transition must immediately clear current hover"
+        );
+        assert!(
+            world
+                .resource::<PreviousHoverMap>()
+                .values()
+                .all(|hits| !hits.contains_key(&target)),
+            "the exclusive Router transition must immediately clear previous hover"
+        );
+        let state = world.resource::<PointerState>();
+        for button in state.pointer_buttons.values() {
+            assert!(!button.pressing.contains_key(&target));
+            assert!(!button.clicking.contains_key(&target));
+            assert!(!button.dragging.contains_key(&target));
+            assert!(!button.dragging_over.contains_key(&target));
+        }
+        assert!(state.get_ancestors(&target).is_none());
+        assert!(
+            state
+                .hovered_entity_ancestors
+                .values()
+                .all(|ancestors| !ancestors.contains(&target))
+        );
+        assert!(
+            world
+                .get::<PickingInteraction>(target)
+                .is_none_or(|interaction| *interaction == PickingInteraction::None)
+        );
+    }
+
+    pub(crate) fn seed_pointer_history(world: &mut World, targets: &[Entity]) {
+        world.init_resource::<HoverMap>();
+        world.init_resource::<PreviousHoverMap>();
+        world.init_resource::<PointerState>();
+        let camera = world.spawn_empty().id();
+        let location = Location {
+            target: NormalizedRenderTarget::Window(
+                WindowRef::Primary.normalize(Some(camera)).unwrap(),
+            ),
+            position: Vec2::new(12.0, 18.0),
+        };
+        for target in targets.iter().copied() {
+            let hit = HitData::new(camera, 7.0, None, None);
+            world
+                .resource_mut::<HoverMap>()
+                .entry(PointerId::Mouse)
+                .or_default()
+                .insert(target, hit.clone());
+            world
+                .resource_mut::<PreviousHoverMap>()
+                .entry(PointerId::Mouse)
+                .or_default()
+                .insert(target, hit.clone());
+            let mut state = world.resource_mut::<PointerState>();
+            let button = state.get_mut(PointerId::Mouse, PointerButton::Primary);
+            let now = bevy_internal::platform::time::Instant::now();
+            button
+                .pressing
+                .insert(target, (location.clone(), now, hit.clone()));
+            button.clicking.insert(target, (now, 2));
+            button.dragging.insert(
+                target,
+                DragEntry {
+                    start_pos: Vec2::ZERO,
+                    latest_pos: Vec2::X,
+                },
+            );
+            button.dragging_over.insert(target, hit);
+            state
+                .hovered_entity_ancestors
+                .insert(target, [camera].into_iter().collect());
+            world.entity_mut(target).insert(PickingInteraction::Pressed);
+        }
+    }
+
+    pub(crate) fn assert_pointer_target_preserved(
+        world: &World,
+        target: Entity,
+        before: &PointerState,
+    ) {
+        let state = world.resource::<PointerState>();
+        let before_button = before
+            .get(PointerId::Mouse, PointerButton::Primary)
+            .unwrap();
+        let after_button = state.get(PointerId::Mouse, PointerButton::Primary).unwrap();
+        assert_eq!(
+            after_button.pressing.get(&target),
+            before_button.pressing.get(&target)
+        );
+        assert_eq!(
+            after_button.clicking.get(&target),
+            before_button.clicking.get(&target)
+        );
+        assert_eq!(
+            after_button.dragging.get(&target),
+            before_button.dragging.get(&target)
+        );
+        assert_eq!(
+            after_button.dragging_over.get(&target),
+            before_button.dragging_over.get(&target)
+        );
+        assert_eq!(state.get_ancestors(&target), before.get_ancestors(&target));
+        assert_eq!(
+            world.resource::<HoverMap>()[&PointerId::Mouse][&target].depth,
+            7.0
+        );
+        assert_eq!(
+            world.resource::<PreviousHoverMap>()[&PointerId::Mouse][&target].depth,
+            7.0
+        );
+        assert_eq!(
+            world.get::<PickingInteraction>(target),
+            Some(&PickingInteraction::Pressed)
+        );
+    }
+
+    #[test]
+    fn pointer_history_is_revoked_by_replace_back_fallback_and_authority_consumers() {
+        for transition in [
+            "replace",
+            "back",
+            "fallback",
+            "precommit-host-loss",
+            "postcommit-host-loss",
+        ] {
+            let (mut app, initial_target) = active_atomic_app(transition);
+            // Leave an actual cleanup ledger outstanding for the guarded
+            // post-commit authority path; Back instead needs settled history.
+            if matches!(transition, "back" | "postcommit-host-loss") {
+                stage_atomic_replacement(&mut app);
+                commit_presentation_system(app.world_mut());
+                if transition == "back" {
+                    app.update();
+                }
+            }
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let router = entry.handle;
+            let old_target = entry.active.as_ref().unwrap().interactive_entities()[0];
+            let application_target = app.world_mut().spawn_empty().id();
+            if transition == "postcommit-host-loss" {
+                // This app-owned extra enters the original cleanup partition's
+                // protected closure, which is wider than native revoke authority.
+                app.world_mut()
+                    .entity_mut(application_target)
+                    .insert(ChildOf(initial_target));
+            }
+            seed_pointer_history(app.world_mut(), &[old_target, application_target]);
+            let before = app.world().resource::<PointerState>().clone();
+            match transition {
+                "replace" => {
+                    app.world_mut()
+                        .resource_mut::<RouterNavigation>()
+                        .replace(router, RouteLocation::new("/").with_fragment("replace"))
+                        .unwrap();
+                }
+                "back" => {
+                    app.world_mut()
+                        .resource_mut::<RouterNavigation>()
+                        .back(router)
+                        .unwrap();
+                }
+                "fallback" => {
+                    app.world_mut()
+                        .resource_mut::<RouterNavigation>()
+                        .push(router, RouteLocation::new("/missing"))
+                        .unwrap();
+                }
+                "precommit-host-loss" | "postcommit-host-loss" => {
+                    if transition == "precommit-host-loss" {
+                        stage_atomic_replacement(&mut app);
+                    }
+                    let host = app
+                        .world_mut()
+                        .query_filtered::<Entity, With<RouterHostRegistration>>()
+                        .single(app.world())
+                        .unwrap();
+                    app.world_mut()
+                        .entity_mut(host)
+                        .remove::<RouterHostRegistration>();
+                }
+                _ => unreachable!(),
+            }
+            if transition == "postcommit-host-loss" {
+                settle_cleanup_system(app.world_mut());
+            } else {
+                collect_navigation_system(app.world_mut());
+                for _ in 0..16 {
+                    drive_navigation_system(app.world_mut());
+                    commit_presentation_system(app.world_mut());
+                    if !app
+                        .world()
+                        .resource::<RouterInputGate>()
+                        .allows_pointer(old_target)
+                    {
+                        break;
+                    }
+                }
+            }
+            assert!(
+                !app.world()
+                    .resource::<RouterInputGate>()
+                    .allows_pointer(old_target),
+                "{transition} must actually consume its transition"
+            );
+            assert_pointer_target_revoked(app.world(), old_target);
+            assert_pointer_target_preserved(app.world(), application_target, &before);
+        }
+    }
+
+    #[test]
+    fn rejected_entering_preparation_preserves_the_current_pointer_gesture() {
+        let (mut app, active) = active_atomic_app("rejected-pointer-preparation");
+        seed_pointer_history(app.world_mut(), &[active]);
+        let before = app.world().resource::<PointerState>().clone();
+        stage_atomic_replacement(&mut app);
+        let entering = app
+            .world_mut()
+            .query::<(Entity, &FrameLifecycle, &PickingInteraction)>()
+            .iter(app.world())
+            .find_map(|(entity, lifecycle, _)| {
+                (lifecycle.0 == EntityLifecycle::PreparedInert).then_some(entity)
+            })
+            .unwrap();
+        *app.world_mut().get_mut::<Visibility>(entering).unwrap() = Visibility::Visible;
+
+        commit_presentation_system(app.world_mut());
+
+        assert!(
+            app.world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(active)
+        );
+        assert_pointer_target_preserved(app.world(), active, &before);
+    }
+
+    #[test]
+    fn pointer_preparation_is_read_only_and_handles_targets_outside_presentation() {
+        #[derive(bevy_ecs::component::Component)]
+        struct AppDisabled;
+        let mut world = World::new();
+        world.register_disabling_component::<AppDisabled>();
+        let removed = world.spawn_empty().id();
+        let preserved = world.spawn_empty().id();
+        seed_pointer_history(&mut world, &[removed, preserved]);
+        world
+            .entity_mut(removed)
+            .insert((bevy_ecs::entity_disabling::Disabled, AppDisabled));
+        for resource in [
+            pointer_resource_entity::<HoverMap>(&world),
+            pointer_resource_entity::<PreviousHoverMap>(&world),
+            pointer_resource_entity::<PointerState>(&world),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            world
+                .entity_mut(resource)
+                .insert(bevy_ecs::entity_disabling::Disabled);
+        }
+        let before = world.resource::<PointerState>().clone();
+        drop(prepare_pointer_mutation(
+            &mut world,
+            [removed].into_iter().collect(),
+        ));
+        assert_pointer_target_preserved(&world, removed, &before);
+        assert_pointer_target_preserved(&world, preserved, &before);
+        let presentation = crate::presentation::prepare_presentation_with_pointer_revocation(
+            &mut world,
+            &[],
+            &[removed],
+        )
+        .unwrap();
+        presentation.apply();
+        assert_pointer_target_revoked(&world, removed);
+        assert_pointer_target_preserved(&world, preserved, &before);
+    }
+
+    #[test]
+    fn pointer_preparation_does_not_install_optional_resources_or_change_unaffected_ticks() {
+        use bevy_ecs::change_detection::DetectChanges;
+        let mut world = World::new();
+        let target = world.spawn_empty().id();
+        prepare_pointer_mutation(&mut world, [target].into_iter().collect()).apply();
+        assert!(!world.contains_resource::<HoverMap>());
+        assert!(!world.contains_resource::<PreviousHoverMap>());
+        assert!(!world.contains_resource::<PointerState>());
+        assert!(world.get::<PickingInteraction>(target).is_none());
+        seed_pointer_history(&mut world, &[target]);
+        let resource_events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inserts = resource_events.clone();
+        world.add_observer(move |_: On<bevy_ecs::lifecycle::Insert, HoverMap>| {
+            inserts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let removals = resource_events.clone();
+        world.add_observer(move |_: On<bevy_ecs::lifecycle::Remove, HoverMap>| {
+            removals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let unrelated = world.spawn_empty().id();
+        world.clear_trackers();
+        for targets in [vec![], vec![unrelated]] {
+            let presentation = crate::presentation::prepare_presentation_with_pointer_revocation(
+                &mut world,
+                &[],
+                &targets,
+            )
+            .unwrap();
+            presentation.apply();
+            assert!(!world.get_resource_ref::<HoverMap>().unwrap().is_changed());
+            assert!(
+                !world
+                    .get_resource_ref::<PreviousHoverMap>()
+                    .unwrap()
+                    .is_changed()
+            );
+            assert!(
+                !world
+                    .get_resource_ref::<PointerState>()
+                    .unwrap()
+                    .is_changed()
+            );
+            assert!(
+                !world
+                    .entity(target)
+                    .get_ref::<PickingInteraction>()
+                    .unwrap()
+                    .is_changed()
+            );
+        }
+        prepare_pointer_mutation(&mut world, [target].into_iter().collect()).apply();
+        assert_eq!(
+            resource_events.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        // Prove the observer control is live; an actual remove/reinsert does
+        // produce lifecycle events, unlike prepared in-place native mutation.
+        let hover = world.remove_resource::<HoverMap>().unwrap();
+        world.insert_resource(hover);
+        assert_eq!(
+            resource_events.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
     }
 
     #[test]
