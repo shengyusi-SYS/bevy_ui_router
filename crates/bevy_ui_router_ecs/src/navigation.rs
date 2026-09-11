@@ -6685,14 +6685,10 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                         HostCandidateClassification::None(source) => {
                             if entry.engine.snapshot().availability()
                                 != &RouterAvailability::AwaitingHost
-                                && let r3_core::HostAdmissionSourcePermitOutcome::Ineligible {
-                                    source: core_source,
-                                    ..
-                                } = entry.engine.issue_host_admission_source_permit()
                             {
-                                complete_observed_r3_unavailable(
+                                drive_observed_candidate_rejection(
                                     entry,
-                                    core_source,
+                                    source.clone(),
                                     R3HostAdmissionUnavailableEvidence::NoCandidate(source),
                                     previous_candidate_source.as_ref().map(|source| source.digest()),
                                 );
@@ -8836,6 +8832,7 @@ fn begin_sealed_old_output_host_loss(
         }
         AuthoritySettlementBeginOutcome::RetryablePreparation { active, .. }
         | AuthoritySettlementBeginOutcome::ProtocolContradiction { active, .. }
+        | AuthoritySettlementBeginOutcome::TriggerContradiction { active, .. }
         | AuthoritySettlementBeginOutcome::IsolationContradiction { active, .. }
         | AuthoritySettlementBeginOutcome::LedgerContradiction { active, .. } => {
             retain_frame_task_after_authority_retry(
@@ -9479,6 +9476,13 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                         Some(logical_roots),
                                     ) {
                                         AuthoritySettlementBeginOutcome::Begun => {}
+                                        AuthoritySettlementBeginOutcome::TriggerContradiction { active, pending, kind } => {
+                                            if let Err((active, pending)) = fail_closed_normal_owner_protocol(
+                                                world, entry, active, pending, AuthorityProtocolResidualKind::AuthorityTrigger(kind),
+                                            ) {
+                                                retain_frame_task_after_authority_retry(entry, had_active, active, pending, task, retry_effect);
+                                            }
+                                        }
                                         AuthoritySettlementBeginOutcome::RetryablePreparation {
                                             active,
                                             pending,
@@ -10842,19 +10846,9 @@ pub(crate) fn classify_back_target(
         }
         ReconciliationPreflightOutcome::Ready {
             splice,
-            mut focus_leaving,
+            focus_leaving,
         } => {
-            let retained_empty_focus = observed_descendant_closure(
-                world,
-                splice
-                    .slot_roles()
-                    .iter()
-                    .filter(|role| role.kind() == ReconciliationSlotRoleKind::RetainEmpty)
-                    .map(|role| role.entity()),
-            );
-            focus_leaving.extend(retained_empty_focus);
-            focus_leaving.sort_by_key(|entity| entity.to_bits());
-            focus_leaving.dedup();
+            let focus_leaving = complete_back_target_focus_source(world, &splice, focus_leaving);
 
             let transitions = splice.lifecycle_transitions();
             let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
@@ -13811,14 +13805,9 @@ fn drive_back_target_applied_classification(world: &mut World, entry: &mut Route
         ReconciliationPreparationOutcome::Matched(ReconciliationPreparationDecision::Ready(
             owner,
         )) => {
-            let Some(pending) = entry.pending_commit.take() else {
-                entry.pending_back_target_execution =
-                    Some(PendingBackTargetExecution::Classifying(
-                        PendingBackTargetClassification::ReadyAwaitingAcceptance(owner),
-                    ));
-                return;
-            };
-            publish_ready_back_target(world, entry, pending, owner);
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::ReadyAwaitingAcceptance(owner),
+            ));
         }
         ReconciliationPreparationOutcome::Matched(
             ReconciliationPreparationDecision::PendingRejected { owner, evidence },
@@ -14303,6 +14292,33 @@ fn drive_back_target_authority_protocol(world: &mut World, entry: &mut RouterEnt
     }
 
     match begin_authority_settlement(world, entry, active, pending, None) {
+        AuthoritySettlementBeginOutcome::TriggerContradiction {
+            active,
+            pending,
+            kind,
+        } => {
+            match fail_closed_normal_owner_protocol(
+                world,
+                entry,
+                active,
+                pending,
+                AuthorityProtocolResidualKind::AuthorityTrigger(kind),
+            ) {
+                Ok(()) => {
+                    drop(history);
+                    drop(continuation);
+                }
+                Err((active, pending)) => store_back_target_authority_protocol(
+                    entry,
+                    active,
+                    pending,
+                    history,
+                    continuation,
+                    evidence,
+                    source,
+                ),
+            }
+        }
         AuthoritySettlementBeginOutcome::Begun => {
             drop(history);
             drop(continuation);
@@ -14619,23 +14635,136 @@ fn drive_back_target_root_commit(world: &mut World, entry: &mut RouterEntry) -> 
     }
 }
 
+fn complete_back_target_focus_source(
+    world: &World,
+    splice: &SealedReconciliationSplice,
+    mut focus_leaving: Vec<Entity>,
+) -> Vec<Entity> {
+    focus_leaving.extend(observed_descendant_closure(
+        world,
+        splice
+            .slot_roles()
+            .iter()
+            .filter(|role| role.kind() == ReconciliationSlotRoleKind::RetainEmpty)
+            .map(|role| role.entity()),
+    ));
+    focus_leaving.sort_by_key(|entity| entity.to_bits());
+    focus_leaving.dedup();
+    focus_leaving
+}
+
 fn publish_ready_back_target(
     world: &mut World,
-    entry: &mut RouterEntry,
+    handle: RouterHandle,
     mut pending: PendingCommit,
     owner: BackTargetReadyAcceptanceOwner,
 ) {
-    entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
-        PendingBackTargetClassification::ReadyAwaitingAcceptance(owner),
-    ));
-    let Some(PendingBackTargetExecution::Classifying(
-        PendingBackTargetClassification::ReadyAwaitingAcceptance(owner),
-    )) = entry.pending_back_target_execution.take()
-    else {
-        entry.pending_commit = Some(pending);
-        return;
+    let BackTargetReadyAcceptanceOwner {
+        physical,
+        continuation,
+        frozen_manifest,
+        manifest,
+    } = owner;
+    let PreparedBackTargetPhysicalOwner {
+        classified,
+        focus_leaving,
+    } = physical;
+    let BackTargetClassifiedPhysicalOwner {
+        splice,
+        history,
+        authority_preparation,
+    } = classified;
+    let host_is_current = world
+        .resource::<RouterNavigation>()
+        .entries
+        .iter()
+        .find(|entry| entry.handle == handle)
+        .and_then(|entry| entry.host.as_ref())
+        .is_some_and(|host| current_host_binding_is_exact(world, host));
+    let has_leaving =
+        !splice.leaving().frames().is_empty() || !splice.leaving().child_slots().is_empty();
+    let final_preflight =
+        match reconciliation_preflight(world, host_is_current, has_leaving, splice) {
+            ReconciliationPreflightOutcome::Ready {
+                splice,
+                focus_leaving: observed_focus,
+            } => {
+                let observed_focus =
+                    complete_back_target_focus_source(world, &splice, observed_focus);
+                if observed_focus == focus_leaving {
+                    ReconciliationPreflightOutcome::Ready {
+                        splice,
+                        focus_leaving: observed_focus,
+                    }
+                } else {
+                    // The issued Ready owner freezes the physical focus source, not
+                    // the focused value. Return its original capability for the
+                    // normal pending-rejection cleanup/fallback continuation.
+                    ReconciliationPreflightOutcome::PendingRejected {
+                        splice,
+                        evidence: LifecyclePreflightEvidence::new(
+                            LifecyclePreflightSource::TargetPartition,
+                            LifecyclePreflightExpectation::ExactRelationshipClosure,
+                            LifecyclePreflightObserved::Drifted,
+                        ),
+                    }
+                }
+            }
+            rejected => rejected,
+        };
+    let splice = match final_preflight {
+        ReconciliationPreflightOutcome::Ready { splice, .. } => splice,
+        rejected => {
+            let mut navigation = world.resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == handle)
+                .unwrap();
+            entry.pending_back_target_execution =
+                Some(PendingBackTargetExecution::Classifying(match rejected {
+                    ReconciliationPreflightOutcome::PendingRejected { splice, evidence } => {
+                        PendingBackTargetClassification::PendingRejectedUnaccepted {
+                            owner: TargetPreparationOwner {
+                                splice,
+                                history,
+                                continuation,
+                            },
+                            evidence,
+                        }
+                    }
+                    ReconciliationPreflightOutcome::AuthorityLost { splice, evidence } => {
+                        PendingBackTargetClassification::AuthorityLostUnaccepted {
+                            owner: TargetPreparationOwner {
+                                splice,
+                                history,
+                                continuation,
+                            },
+                            evidence,
+                        }
+                    }
+                    ReconciliationPreflightOutcome::Ready { .. } => unreachable!(),
+                }));
+            entry.pending_commit = Some(pending);
+            // Return the current branch held by a rejected splice before a
+            // future input Refresh observes the entry's temporary vacancy.
+            let _ = drive_back_target_pending_rejected(entry);
+            return;
+        }
     };
-
+    let owner = BackTargetReadyAcceptanceOwner {
+        physical: PreparedBackTargetPhysicalOwner {
+            classified: BackTargetClassifiedPhysicalOwner {
+                splice,
+                history,
+                authority_preparation,
+            },
+            focus_leaving,
+        },
+        continuation,
+        frozen_manifest,
+        manifest,
+    };
     let missing = RequiredResourceSet::missing_from(world);
     if !missing.is_empty() {
         let evidence = LifecyclePreflightEvidence::new(
@@ -14643,6 +14772,12 @@ fn publish_ready_back_target(
             LifecyclePreflightExpectation::ResourcePresent,
             LifecyclePreflightObserved::Missing,
         );
+        let mut navigation = world.resource_mut::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handle == handle)
+            .unwrap();
         entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
             PendingBackTargetClassification::ReadyPlanPermanent(PreparationPermanentOwner {
                 owner,
@@ -14658,6 +14793,12 @@ fn publish_ready_back_target(
             LifecyclePreflightExpectation::ExactTaskShape,
             LifecyclePreflightObserved::Contradictory,
         );
+        let mut navigation = world.resource_mut::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handle == handle)
+            .unwrap();
         entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
             PendingBackTargetClassification::ReadyPlanPermanent(PreparationPermanentOwner {
                 owner,
@@ -14673,6 +14814,9 @@ fn publish_ready_back_target(
     let gate_after = splice.resulting_interactive_entities();
     let (targets, isolate_count) = splice.presentation_mutation_targets();
     let transitions = splice.lifecycle_transitions();
+    let registry_changes = transitions
+        .iter()
+        .any(|(claim, next)| claim.lifecycle() != *next);
     let root_rebase = if !splice.leaving().frames().is_empty()
         && !splice.entering().frames().is_empty()
     {
@@ -14682,6 +14826,12 @@ fn publish_ready_back_target(
                 LifecyclePreflightExpectation::RebaseCompatible,
                 LifecyclePreflightObserved::Contradictory,
             );
+            let mut navigation = world.resource_mut::<RouterNavigation>();
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == handle)
+                .unwrap();
             entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
                 PendingBackTargetClassification::ReadyPlanPermanent(PreparationPermanentOwner {
                     owner,
@@ -14690,6 +14840,7 @@ fn publish_ready_back_target(
                     ),
                 }),
             ));
+            pending.ticket = Some(real_ticket);
             entry.pending_commit = Some(pending);
             return;
         };
@@ -14698,273 +14849,248 @@ fn publish_ready_back_target(
         None
     };
 
+    let frozen_is_exact = (|| {
+        let registry = world.get_resource::<RouteEntityRegistry>()?;
+        let ready = &owner;
+        let splice = &ready.physical.classified.splice;
+        let registry_plan = registry.prepare_lifecycle_mutation(&transitions)?;
+        let resulting_claims = registry_plan.resulting_claims().to_vec();
+        let frozen_again = if splice.leaving().obligation_count() == 0 {
+            FrozenCleanupManifest::empty()
+        } else {
+            FrozenCleanupManifest::from_leaving_branch(
+                world,
+                &registry,
+                splice.leaving(),
+                &resulting_claims,
+                (!splice.entering().frames().is_empty()).then_some(splice.entering()),
+            )?
+        };
+        if frozen_again != ready.frozen_manifest {
+            return None;
+        }
+
+        Some(())
+    })()
+    .is_some();
     let mut ready_owner = Some(owner);
     let mut ticket = Some(real_ticket);
     let mut next_stage = None;
-    let committed = world.resource_scope(
-        |world, gate: bevy_ecs::change_detection::Mut<RouterInputGate>| {
-            world.resource_scope(
-                |world, input_focus: bevy_ecs::change_detection::Mut<InputFocus>| {
-                    world.resource_scope(
-                        |world,
-                         route_focus: bevy_ecs::change_detection::Mut<RouteFocusState>| {
-                            world.resource_scope(
-                                |world,
-                                 mut registry: bevy_ecs::change_detection::Mut<
-                                    RouteEntityRegistry,
-                                >| {
-                                    let ready = ready_owner.as_ref()?;
-                                    let splice = &ready.physical.classified.splice;
-                                    let registry_plan =
-                                        registry.prepare_lifecycle_mutation(&transitions)?;
-                                    let resulting_claims =
-                                        registry_plan.resulting_claims().to_vec();
-                                    let frozen_again = if splice.leaving().obligation_count() == 0 {
-                                        FrozenCleanupManifest::empty()
-                                    } else {
-                                        FrozenCleanupManifest::from_leaving_branch(
-                                            world,
-                                            &registry,
-                                            splice.leaving(),
-                                            &resulting_claims,
-                                            (!splice.entering().frames().is_empty())
-                                                .then_some(splice.entering()),
-                                        )?
-                                    };
-                                    if frozen_again != ready.frozen_manifest {
-                                        return None;
-                                    }
-                                    let gate_plan = prepare_input_gate_mutation(
-                                        gate,
-                                        &gate_before,
-                                        gate_after,
-                                    )?;
-                                    let focus_plan = prepare_focus_mutation(
-                                        input_focus,
-                                        route_focus,
-                                        &ready.physical.focus_leaving,
-                                    );
-                                    let claim_rebind =
-                                        splice.prepare_claim_rebind(&resulting_claims)?;
-                                    let presentation_plan =
-                                        prepare_presentation_with_pointer_revocation(
-                                            world, &targets, gate_plan.revoked_targets(),
-                                        )?.seal_commit(isolate_count)?;
-
-                                    let BackTargetReadyAcceptanceOwner {
-                                        physical,
-                                        continuation,
-                                        frozen_manifest,
-                                        manifest,
-                                    } = ready_owner
-                                        .take()
-                                        .expect("the scoped Ready owner is consumed once");
-                                    let scope = continuation.preparation_boundary_scope();
-                                    let continuation = match entry
-                                        .engine
-                                        .accept_back_target_ready(continuation, scope)
-                                    {
-                                        BackTargetPreparationAcceptance::Matched(continuation) => {
-                                            continuation
-                                        }
-                                        BackTargetPreparationAcceptance::Mismatch {
-                                            capacity,
-                                            mismatch,
-                                        } => {
-                                            next_stage = Some(
-                                                PendingBackTargetExecution::Classifying(
-                                                    PendingBackTargetClassification::ReadyAcceptanceMismatch {
-                                                        owner: BackTargetReadyAcceptanceOwner {
-                                                            physical,
-                                                            continuation: capacity,
-                                                            frozen_manifest,
-                                                            manifest,
-                                                        },
-                                                        mismatch,
-                                                    },
-                                                ),
-                                            );
-                                            return None;
-                                        }
-                                    };
-                                    entry.pending_back_target_execution = Some(
-                                        PendingBackTargetExecution::Classifying(
-                                            PendingBackTargetClassification::ReadyAccepted(
-                                                PendingBackTargetReadyAccepted {
-                                                    physical,
-                                                    continuation,
-                                                    frozen_manifest,
-                                                    manifest,
-                                                },
-                                            ),
-                                        ),
-                                    );
-                                    let Some(PendingBackTargetExecution::Classifying(
-                                        PendingBackTargetClassification::ReadyAccepted(accepted),
-                                    )) = entry.pending_back_target_execution.take()
-                                    else {
-                                        return None;
-                                    };
-                                    let ledger =
-                                        match CleanupLedger::reserve(accepted.frozen_manifest) {
-                                            Ok(ledger) => ledger,
-                                            Err(error) => {
-                                                next_stage = Some(
-                                                    PendingBackTargetExecution::Classifying(
-                                                        PendingBackTargetClassification::ReadyReserveFailure {
-                                                            physical: accepted.physical,
-                                                            continuation: accepted.continuation,
-                                                            manifest: accepted.manifest,
-                                                            error,
-                                                        },
-                                                    ),
-                                                );
-                                                return None;
-                                            }
-                                        };
-                                    entry.pending_back_target_execution =
-                                        Some(PendingBackTargetExecution::Prepared(
-                                            PendingPreparedBackTargetCommit {
-                                                physical: accepted.physical,
-                                                continuation: accepted.continuation,
-                                                ledger,
-                                                manifest: accepted.manifest,
-                                            },
-                                        ));
-
-                                    let ticket_ref = ticket
-                                        .as_ref()
-                                        .expect("the scoped Ready driver retains its real ticket");
-                                    let pairing = {
-                                        let Some(PendingBackTargetExecution::Prepared(prepared)) =
-                                            entry.pending_back_target_execution.as_ref()
-                                        else {
-                                            return None;
-                                        };
-                                        entry.engine.validate_back_target_execution_pairing(
-                                            BackTargetExecutionOwnerRef::Prepared {
-                                                history: &prepared
-                                                    .physical
-                                                    .classified
-                                                    .history,
-                                                continuation: &prepared.continuation,
-                                            },
-                                            BackTargetPhysicalOwnerRef::CommitTicket(ticket_ref),
-                                        )
-                                    };
-                                    if let BackTargetExecutionPairingOutcome::Mismatch(mismatch) =
-                                        pairing
-                                    {
-                                        let Some(PendingBackTargetExecution::Prepared(owner)) =
-                                            entry.pending_back_target_execution.take()
-                                        else {
-                                            return None;
-                                        };
-                                        next_stage =
-                                            Some(PendingBackTargetExecution::CommitFailure(
-                                                PendingBackTargetCommitFailure::PairingMismatch {
-                                                    owner,
-                                                    mismatch,
-                                                },
-                                            ));
-                                        return None;
-                                    }
-                                    let Some(PendingBackTargetExecution::Prepared(prepared)) =
-                                        entry.pending_back_target_execution.take()
-                                    else {
-                                        return None;
-                                    };
-                                    let PendingPreparedBackTargetCommit {
-                                        physical,
-                                        continuation,
-                                        ledger,
-                                        manifest,
-                                    } = prepared;
-                                    match entry.engine.prepare_back_target_commit(
-                                        continuation,
-                                        ticket_ref,
-                                        manifest,
-                                    ) {
-                                        BackTargetCommitPreparationOutcome::Mismatch {
-                                            owner,
-                                            manifest,
-                                            mismatch,
-                                        } => {
-                                            next_stage =
-                                                Some(PendingBackTargetExecution::CommitFailure(
-                                                    PendingBackTargetCommitFailure::ReceiverMismatch {
-                                                        owner: PendingPreparedBackTargetCommit {
-                                                            physical,
-                                                            continuation: owner,
-                                                            ledger,
-                                                            manifest,
-                                                        },
-                                                        mismatch,
-                                                    },
-                                                ));
-                                            None
-                                        }
-                                        BackTargetCommitPreparationOutcome::PreparationFailed(
-                                            failure,
-                                        ) => {
-                                            next_stage =
-                                                Some(PendingBackTargetExecution::CommitFailure(
-                                                    PendingBackTargetCommitFailure::Failed {
-                                                        physical,
-                                                        ledger,
-                                                        failure,
-                                                    },
-                                                ));
-                                            None
-                                        }
-                                        BackTargetCommitPreparationOutcome::Validated(engine) => {
-                                            let cleanup =
-                                                ledger.bind_batch(engine.cleanup().clone());
-                                            drop(
-                                                ticket
-                                                    .take()
-                                                    .expect("successful publication ends the real ticket"),
-                                            );
-                                            let mut splice = physical.classified.splice;
-                                            splice.apply_claim_rebind(claim_rebind);
-                                            if let Some(rebase) = root_rebase {
-                                                splice.apply_root_rebase(rebase);
-                                            }
-                                            let outcome = splice.apply();
-                                            let (active, leaving) =
-                                                outcome.into_active_and_leaving();
-                                            let next_active =
-                                                (!active.frames().is_empty()).then_some(active);
-                                            let next_cleanup = Some(
-                                                CleanupLedger::activate_leaving_branch(
-                                                    cleanup,
-                                                    (!leaving.frames().is_empty()
-                                                        || !leaving.child_slots().is_empty())
-                                                    .then_some(leaving),
-                                                ),
-                                            );
-                                            let active_owner = &mut entry.active;
-                                            let cleanup_owner = &mut entry.cleanup_ledger;
-                                            engine.publish(|| {
-                                                presentation_plan.apply_staged(
-                                                    |_| focus_plan.apply(),
-                                                    |_| registry_plan.apply(&mut registry),
-                                                    |_| gate_plan.apply(),
-                                                );
-                                                *active_owner = next_active;
-                                                *cleanup_owner = next_cleanup;
-                                            });
-                                            Some(())
-                                        }
-                                    }
-                                },
-                            )
+    let committed = (|| {
+        if !frozen_is_exact {
+            return None;
+        }
+        let pointer_targets = prepare_input_gate_mutation(
+            world.get_resource_mut::<RouterInputGate>()?,
+            &gate_before,
+            gate_after.clone(),
+        )?
+        .revoked_targets()
+        .to_vec();
+        let (presentation, resources) =
+            crate::presentation::prepare_publication_access(world, &targets, &pointer_targets)?;
+        let crate::presentation::PublicationResources {
+            mut navigation,
+            mut registry,
+            gate,
+            input_focus,
+            route_focus,
+        } = resources;
+        let entry = navigation
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handle == handle)?;
+        let ready = ready_owner.as_ref()?;
+        let splice = &ready.physical.classified.splice;
+        let registry_plan = registry.prepare_lifecycle_mutation(&transitions)?;
+        let resulting_claims = registry_plan.resulting_claims().to_vec();
+        let gate_plan = prepare_input_gate_mutation(gate, &gate_before, gate_after)?;
+        let focus_plan =
+            prepare_focus_mutation(input_focus, route_focus, &ready.physical.focus_leaving);
+        let claim_rebind = splice.prepare_claim_rebind(&resulting_claims)?;
+        let presentation_plan = presentation.seal_commit(isolate_count)?;
+        let BackTargetReadyAcceptanceOwner {
+            physical,
+            continuation,
+            frozen_manifest,
+            manifest,
+        } = ready_owner
+            .take()
+            .expect("the scoped Ready owner is consumed once");
+        let scope = continuation.preparation_boundary_scope();
+        let continuation = match entry.engine.accept_back_target_ready(continuation, scope) {
+            BackTargetPreparationAcceptance::Matched(continuation) => continuation,
+            BackTargetPreparationAcceptance::Mismatch { capacity, mismatch } => {
+                next_stage = Some(PendingBackTargetExecution::Classifying(
+                    PendingBackTargetClassification::ReadyAcceptanceMismatch {
+                        owner: BackTargetReadyAcceptanceOwner {
+                            physical,
+                            continuation: capacity,
+                            frozen_manifest,
+                            manifest,
                         },
-                    )
+                        mismatch,
+                    },
+                ));
+                return None;
+            }
+        };
+        entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::ReadyAccepted(PendingBackTargetReadyAccepted {
+                physical,
+                continuation,
+                frozen_manifest,
+                manifest,
+            }),
+        ));
+        let Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::ReadyAccepted(accepted),
+        )) = entry.pending_back_target_execution.take()
+        else {
+            return None;
+        };
+        let ledger = match CleanupLedger::reserve(accepted.frozen_manifest) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                next_stage = Some(PendingBackTargetExecution::Classifying(
+                    PendingBackTargetClassification::ReadyReserveFailure {
+                        physical: accepted.physical,
+                        continuation: accepted.continuation,
+                        manifest: accepted.manifest,
+                        error,
+                    },
+                ));
+                return None;
+            }
+        };
+        entry.pending_back_target_execution = Some(PendingBackTargetExecution::Prepared(
+            PendingPreparedBackTargetCommit {
+                physical: accepted.physical,
+                continuation: accepted.continuation,
+                ledger,
+                manifest: accepted.manifest,
+            },
+        ));
+
+        let ticket_ref = ticket
+            .as_ref()
+            .expect("the scoped Ready driver retains its real ticket");
+        let pairing = {
+            let Some(PendingBackTargetExecution::Prepared(prepared)) =
+                entry.pending_back_target_execution.as_ref()
+            else {
+                return None;
+            };
+            entry.engine.validate_back_target_execution_pairing(
+                BackTargetExecutionOwnerRef::Prepared {
+                    history: &prepared.physical.classified.history,
+                    continuation: &prepared.continuation,
                 },
+                BackTargetPhysicalOwnerRef::CommitTicket(ticket_ref),
             )
-        },
-    );
+        };
+        if let BackTargetExecutionPairingOutcome::Mismatch(mismatch) = pairing {
+            let Some(PendingBackTargetExecution::Prepared(owner)) =
+                entry.pending_back_target_execution.take()
+            else {
+                return None;
+            };
+            next_stage = Some(PendingBackTargetExecution::CommitFailure(
+                PendingBackTargetCommitFailure::PairingMismatch { owner, mismatch },
+            ));
+            return None;
+        }
+        let Some(PendingBackTargetExecution::Prepared(prepared)) =
+            entry.pending_back_target_execution.take()
+        else {
+            return None;
+        };
+        let PendingPreparedBackTargetCommit {
+            physical,
+            continuation,
+            ledger,
+            manifest,
+        } = prepared;
+        match entry
+            .engine
+            .prepare_back_target_commit(continuation, ticket_ref, manifest)
+        {
+            BackTargetCommitPreparationOutcome::Mismatch {
+                owner,
+                manifest,
+                mismatch,
+            } => {
+                next_stage = Some(PendingBackTargetExecution::CommitFailure(
+                    PendingBackTargetCommitFailure::ReceiverMismatch {
+                        owner: PendingPreparedBackTargetCommit {
+                            physical,
+                            continuation: owner,
+                            ledger,
+                            manifest,
+                        },
+                        mismatch,
+                    },
+                ));
+                None
+            }
+            BackTargetCommitPreparationOutcome::PreparationFailed(failure) => {
+                next_stage = Some(PendingBackTargetExecution::CommitFailure(
+                    PendingBackTargetCommitFailure::Failed {
+                        physical,
+                        ledger,
+                        failure,
+                    },
+                ));
+                None
+            }
+            BackTargetCommitPreparationOutcome::Validated(engine) => {
+                let cleanup = ledger.bind_batch(engine.cleanup().clone());
+                drop(
+                    ticket
+                        .take()
+                        .expect("successful publication ends the real ticket"),
+                );
+                let mut splice = physical.classified.splice;
+                splice.apply_claim_rebind(claim_rebind);
+                if let Some(rebase) = root_rebase {
+                    splice.apply_root_rebase(rebase);
+                }
+                let outcome = splice.apply();
+                let (active, leaving) = outcome.into_active_and_leaving();
+                let next_active = (!active.frames().is_empty()).then_some(active);
+                let next_cleanup = Some(CleanupLedger::activate_leaving_branch(
+                    cleanup,
+                    (!leaving.frames().is_empty() || !leaving.child_slots().is_empty())
+                        .then_some(leaving),
+                ));
+                let active_owner = &mut entry.active;
+                let cleanup_owner = &mut entry.cleanup_ledger;
+                engine.publish(|| {
+                    presentation_plan.apply_staged(
+                        |_| focus_plan.apply(),
+                        |_| {
+                            if registry_changes {
+                                registry_plan.apply(&mut registry);
+                            }
+                        },
+                        |_| gate_plan.apply(),
+                    );
+                    *active_owner = next_active;
+                    *cleanup_owner = next_cleanup;
+                });
+                Some(())
+            }
+        }
+    })();
+    if committed.is_some() {
+        return;
+    }
+    let mut navigation = world.resource_mut::<RouterNavigation>();
+    let entry = navigation
+        .entries
+        .iter_mut()
+        .find(|entry| entry.handle == handle)
+        .unwrap();
     if committed.is_none() {
         pending.ticket = ticket.take();
         if let Some(stage) = next_stage {
@@ -14988,585 +15114,763 @@ fn publish_ready_back_target(
     }
 }
 
+struct SealedNormalPreparation {
+    prepared: r3_core::PreparedCommit,
+    manifest: FrozenCleanupManifest,
+}
+
+enum PendingPublicationWork {
+    Normal {
+        pending: PendingCommit,
+        splice: SealedReconciliationSplice,
+        had_active: bool,
+        has_leaving: bool,
+        sealed: Option<SealedNormalPreparation>,
+    },
+    Back {
+        pending: PendingCommit,
+        owner: BackTargetReadyAcceptanceOwner,
+    },
+    Projectionless(ProjectionlessPublicationWork),
+}
+
 pub(crate) fn commit_presentation_system(world: &mut World) {
-    world.resource_scope(
-        |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
-            for entry in &mut navigation.entries {
-                if entry.authority_protocol_residual.is_some() {
-                    continue;
-                }
-                if drive_back_target_root_commit(world, entry) {
-                    continue;
-                }
-                if let Some(continuation) = entry.projectionless_fail_close.take() {
-                    let source = match continuation {
-                        ProjectionlessFailCloseContinuation::Retryable(source) => source,
-                    };
-                    let active = entry.active.take();
-                    let pending = entry.pending_commit.take();
-                    let (active, pending) = match (active, pending) {
-                        (Some(active), Some(pending)) => (active, pending),
-                        (active, pending) => {
-                            entry.active = active;
-                            entry.pending_commit = pending;
-                            continue;
-                        }
-                    };
-                    match settle_projectionless_fail_close(world, entry, active, pending, source) {
-                        Ok(()) => {}
-                        Err((active, pending, source)) => {
-                            entry.active = Some(active);
-                            entry.pending_commit = Some(pending);
-                            entry.projectionless_fail_close = Some(
-                                ProjectionlessFailCloseContinuation::Retryable(source),
-                            );
-                        }
-                    }
-                    continue;
-                }
-                let Some(mut pending) = entry.pending_commit.take() else {
-                    continue;
-                };
-                if !pending.branch.frames().is_empty()
-                        && pending.ticket.is_none()
-                        && pending.final_task.is_none()
-                {
-                    entry.pending_commit = Some(pending);
-                    continue;
-                }
-                let Some(authority_root) = entry
-                    .active
-                    .as_ref()
-                    .and_then(RealizedBranch::first_frame)
-                    .or_else(|| pending.branch.first_frame())
-                else {
-                    entry.pending_commit = Some(pending);
-                    continue;
-                };
-                let Some(authority) = ReconciliationAuthorityIdentity::from_frame(
-                    authority_root.frame(),
-                    authority_root.frame().host(),
-                    authority_root.frame().slot(),
-                ) else {
-                    entry.pending_commit = Some(pending);
-                    continue;
-                };
-                let (facts, has_leaving) = {
-                    let projection = match (pending.ticket.as_ref(), pending.final_task.as_ref()) {
-                        (Some(ticket), _) => {
-                            entry.engine.reconciliation_projection_for_commit(ticket)
-                        }
-                        (None, Some(task)) => {
-                            entry.engine.reconciliation_projection_for_task(task)
-                        }
-                        (None, None) => {
-                            entry.pending_commit = Some(pending);
-                            continue;
-                        }
-                    };
-                    let Ok(projection) = projection else {
-                        match commit_projectionless_branch(world, entry, pending) {
-                            Ok(()) => continue,
-                            Err(owner) => {
-                                entry.pending_commit = Some(owner);
-                                continue;
+    let handles = world
+        .resource::<RouterNavigation>()
+        .entries
+        .iter()
+        .map(|entry| entry.handle)
+        .collect::<Vec<_>>();
+    for handle in handles {
+        let work = world.resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == handle)?;
+                prepare_commit_entry(world, entry)
+            },
+        );
+        match work {
+            Some(PendingPublicationWork::Normal {
+                pending,
+                splice,
+                had_active,
+                has_leaving,
+                sealed,
+            }) => publish_normal_work(
+                world,
+                handle,
+                pending,
+                splice,
+                had_active,
+                has_leaving,
+                sealed,
+            ),
+            Some(PendingPublicationWork::Back { pending, owner }) => {
+                publish_ready_back_target(world, handle, pending, owner);
+            }
+            Some(PendingPublicationWork::Projectionless(work)) => {
+                publish_projectionless_work(world, handle, work)
+            }
+            None => {}
+        }
+    }
+}
+
+fn prepare_commit_entry(
+    world: &mut World,
+    entry: &mut RouterEntry,
+) -> Option<PendingPublicationWork> {
+    if entry.authority_protocol_residual.is_some() {
+        return None;
+    }
+    if drive_back_target_root_commit(world, entry) {
+        let ready = matches!(
+            entry.pending_back_target_execution.as_ref(),
+            Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::ReadyAwaitingAcceptance(_)
+            ))
+        );
+        if ready && entry.pending_commit.is_some() {
+            let Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::ReadyAwaitingAcceptance(owner),
+            )) = entry.pending_back_target_execution.take()
+            else {
+                unreachable!()
+            };
+            return Some(PendingPublicationWork::Back {
+                pending: entry.pending_commit.take().unwrap(),
+                owner,
+            });
+        }
+        return None;
+    }
+    if let Some(continuation) = entry.projectionless_fail_close.take() {
+        let source = match continuation {
+            ProjectionlessFailCloseContinuation::Retryable(source) => source,
+        };
+        let active = entry.active.take();
+        let pending = entry.pending_commit.take();
+        let (active, pending) = match (active, pending) {
+            (Some(active), Some(pending)) => (active, pending),
+            (active, pending) => {
+                entry.active = active;
+                entry.pending_commit = pending;
+                return None;
+            }
+        };
+        match settle_projectionless_fail_close(world, entry, active, pending, source) {
+            Ok(()) => {}
+            Err((active, pending, source)) => {
+                entry.active = Some(active);
+                entry.pending_commit = Some(pending);
+                entry.projectionless_fail_close =
+                    Some(ProjectionlessFailCloseContinuation::Retryable(source));
+            }
+        }
+        return None;
+    }
+    let Some(mut pending) = entry.pending_commit.take() else {
+        return None;
+    };
+    if !pending.branch.frames().is_empty()
+        && pending.ticket.is_none()
+        && pending.final_task.is_none()
+    {
+        entry.pending_commit = Some(pending);
+        return None;
+    }
+    let Some(authority_root) = entry
+        .active
+        .as_ref()
+        .and_then(RealizedBranch::first_frame)
+        .or_else(|| pending.branch.first_frame())
+    else {
+        entry.pending_commit = Some(pending);
+        return None;
+    };
+    let Some(authority) = ReconciliationAuthorityIdentity::from_frame(
+        authority_root.frame(),
+        authority_root.frame().host(),
+        authority_root.frame().slot(),
+    ) else {
+        entry.pending_commit = Some(pending);
+        return None;
+    };
+    let (facts, has_leaving) = {
+        let projection = match (pending.ticket.as_ref(), pending.final_task.as_ref()) {
+            (Some(ticket), _) => entry.engine.reconciliation_projection_for_commit(ticket),
+            (None, Some(task)) => entry.engine.reconciliation_projection_for_task(task),
+            (None, None) => {
+                entry.pending_commit = Some(pending);
+                return None;
+            }
+        };
+        let Ok(projection) = projection else {
+            let mut work = None;
+            if let Err(pending) = prepare_projectionless_branch(world, entry, pending, &mut work) {
+                entry.pending_commit = Some(pending);
+            }
+            return work.map(PendingPublicationWork::Projectionless);
+        };
+        let has_leaving = projection.leaving().len() != 0;
+        let Some(facts) = ReconciliationProjectionFacts::from_core(&projection, authority) else {
+            entry.pending_commit = Some(pending);
+            return None;
+        };
+        (facts, has_leaving)
+    };
+    let had_active = entry.active.is_some();
+    let active_owner = entry.active.take().unwrap_or_else(RealizedBranch::empty);
+    let sealed = match SealedExistingReconciliation::prepare_from_projection(active_owner, facts) {
+        Ok(sealed) => sealed,
+        Err(failure) => {
+            let (active, _) = failure.into_parts();
+            entry.active = had_active.then_some(active);
+            entry.pending_commit = Some(pending);
+            return None;
+        }
+    };
+    let entering_owner = std::mem::replace(&mut pending.branch, PreparedBranch::empty());
+    let splice = match sealed.bind_entering(entering_owner) {
+        Ok(splice) => splice,
+        Err(failure) => {
+            let (sealed, entering, _) = failure.into_parts();
+            let (active, _, _roles) = sealed.reject().into_parts();
+            entry.active = had_active.then_some(active);
+            pending.branch = entering;
+            entry.pending_commit = Some(pending);
+            return None;
+        }
+    };
+
+    let mut splice = splice;
+    let sealed = if commit_sealed_registration_removal_is_armed(entry) {
+        let host_is_current = entry
+            .host
+            .as_ref()
+            .is_some_and(|host| current_host_binding_is_exact(world, host));
+        let (observed_splice, ready) =
+            match reconciliation_preflight(world, host_is_current, has_leaving, splice) {
+                ReconciliationPreflightOutcome::Ready { splice, .. } => (splice, true),
+                ReconciliationPreflightOutcome::PendingRejected { splice, .. }
+                | ReconciliationPreflightOutcome::AuthorityLost { splice, .. } => (splice, false),
+            };
+        splice = observed_splice;
+        if ready {
+            prepare_normal_registration_probe(world, entry, &mut pending, &splice)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Some(PendingPublicationWork::Normal {
+        pending,
+        splice,
+        had_active,
+        has_leaving,
+        sealed,
+    })
+}
+
+fn prepare_normal_registration_probe(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    pending: &mut PendingCommit,
+    splice: &SealedReconciliationSplice,
+) -> Option<SealedNormalPreparation> {
+    let registry = world.get_resource::<RouteEntityRegistry>()?;
+    let transitions = splice.lifecycle_transitions();
+    let registry_plan = registry.prepare_lifecycle_mutation(&transitions)?;
+    let manifest = if splice.leaving().obligation_count() == 0 {
+        FrozenCleanupManifest::empty()
+    } else {
+        FrozenCleanupManifest::from_leaving_branch(
+            world,
+            registry,
+            splice.leaving(),
+            registry_plan.resulting_claims(),
+            (!splice.entering().frames().is_empty()).then_some(splice.entering()),
+        )?
+    };
+    if pending.ticket.is_none() {
+        pending.ticket = Some(
+            entry
+                .engine
+                .report_applied(pending.final_task.take()?)
+                .expect("the preflighted probe retains its exact reportable task"),
+        );
+    }
+    let prepared = entry
+        .engine
+        .prepare_commit(
+            pending.ticket.as_ref()?,
+            CleanupManifest::new(
+                logical_cleanup_roots(splice.leaving()),
+                manifest.digest(),
+                manifest.len(),
+            ),
+        )
+        .ok()?;
+    // The probe changes a real authority input only after the owned Core seal.
+    // Its World writes and resource-scope exit precede the final refreeze.
+    inject_commit_sealed_registration_removal(world, entry);
+    Some(SealedNormalPreparation { prepared, manifest })
+}
+
+fn settle_prepublication_authority_loss(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    active: RealizedBranch,
+    pending: PendingCommit,
+    had_active: bool,
+    evidence: LifecyclePreflightEvidence,
+    initial_fallback: bool,
+) {
+    if evidence.is_missing_resource() {
+        if let Err((active, pending)) = fail_closed_normal_owner_protocol(
+            world,
+            entry,
+            active,
+            pending,
+            AuthorityProtocolResidualKind::PreflightAuthorityLost(evidence),
+        ) {
+            entry.active = had_active.then_some(active);
+            entry.pending_commit = Some(pending);
+        }
+        return;
+    }
+    let outcome = if initial_fallback {
+        begin_initial_fallback_authority_settlement(world, entry, pending)
+    } else {
+        begin_authority_settlement(world, entry, active, pending, None)
+    };
+    match outcome {
+        AuthoritySettlementBeginOutcome::TriggerContradiction {
+            active,
+            pending,
+            kind,
+        } => {
+            if let Err((active, pending)) = fail_closed_normal_owner_protocol(
+                world,
+                entry,
+                active,
+                pending,
+                AuthorityProtocolResidualKind::AuthorityTrigger(kind),
+            ) {
+                entry.active = had_active.then_some(active);
+                entry.pending_commit = Some(pending);
+            }
+        }
+        AuthoritySettlementBeginOutcome::Begun => {}
+        AuthoritySettlementBeginOutcome::RetryablePreparation { active, pending } => {
+            entry.active = had_active.then_some(active);
+            entry.pending_commit = Some(pending);
+        }
+        AuthoritySettlementBeginOutcome::ProtocolContradiction {
+            active,
+            pending,
+            kind,
+        } => {
+            if let Err((active, pending)) =
+                fail_closed_normal_authority_protocol(world, entry, active, pending, kind)
+            {
+                entry.active = had_active.then_some(active);
+                entry.pending_commit = Some(pending);
+                return;
+            }
+        }
+        AuthoritySettlementBeginOutcome::IsolationContradiction {
+            active,
+            pending,
+            contradiction,
+            isolation,
+        } => {
+            if let Err((active, pending)) = fail_closed_normal_authority_protocol_prepared(
+                world,
+                entry,
+                active,
+                pending,
+                AuthorityProtocolResidualKind::AuthorityIsolation(contradiction.clone()),
+                isolation,
+                Some(contradiction),
+            ) {
+                entry.active = had_active.then_some(active);
+                entry.pending_commit = Some(pending);
+                return;
+            }
+        }
+        AuthoritySettlementBeginOutcome::LedgerContradiction {
+            active,
+            pending,
+            kind,
+        } => {
+            if let Err((active, pending)) = fail_closed_normal_owner_protocol(
+                world,
+                entry,
+                active,
+                pending,
+                AuthorityProtocolResidualKind::CleanupLedger(kind),
+            ) {
+                entry.active = had_active.then_some(active);
+                entry.pending_commit = Some(pending);
+                return;
+            }
+        }
+    }
+}
+
+fn publish_normal_work(
+    world: &mut World,
+    handle: RouterHandle,
+    mut pending: PendingCommit,
+    splice: SealedReconciliationSplice,
+    had_active: bool,
+    has_leaving: bool,
+    mut sealed: Option<SealedNormalPreparation>,
+) {
+    let host_is_current = world
+        .resource::<RouterNavigation>()
+        .entries
+        .iter()
+        .find(|entry| entry.handle == handle)
+        .and_then(|entry| entry.host.as_ref())
+        .is_some_and(|host| current_host_binding_is_exact(world, host));
+    let missing = RequiredResourceSet::missing_from(world);
+    let preflight = if missing.is_empty() {
+        reconciliation_preflight(world, host_is_current, has_leaving, splice)
+    } else {
+        ReconciliationPreflightOutcome::AuthorityLost {
+            splice,
+            evidence: LifecyclePreflightEvidence::new(
+                LifecyclePreflightSource::RequiredResources(missing),
+                LifecyclePreflightExpectation::ResourcePresent,
+                LifecyclePreflightObserved::Missing,
+            ),
+        }
+    };
+    let (splice, mut focus_leaving) = match preflight {
+        ReconciliationPreflightOutcome::Ready {
+            splice,
+            focus_leaving,
+        } => (splice, focus_leaving),
+        rejected => {
+            world.resource_scope(
+                |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                    let entry = navigation
+                        .entries
+                        .iter_mut()
+                        .find(|entry| entry.handle == handle)
+                        .unwrap();
+                    if let Some(sealed) = sealed.take() {
+                        let splice = match rejected {
+                            ReconciliationPreflightOutcome::PendingRejected { splice, .. }
+                            | ReconciliationPreflightOutcome::AuthorityLost { splice, .. } => {
+                                splice
                             }
-                        }
-                    };
-                    let has_leaving = projection.leaving().len() != 0;
-                    let Some(facts) = ReconciliationProjectionFacts::from_core(&projection, authority)
-                    else {
-                        entry.pending_commit = Some(pending);
-                        continue;
-                    };
-                    (facts, has_leaving)
-                };
-                let had_active = entry.active.is_some();
-                let active_owner = entry.active.take().unwrap_or_else(RealizedBranch::empty);
-                let sealed = match SealedExistingReconciliation::prepare_from_projection(
-                    active_owner,
-                    facts,
-                ) {
-                    Ok(sealed) => sealed,
-                    Err(failure) => {
-                        let (active, _) = failure.into_parts();
-                        entry.active = had_active.then_some(active);
-                        entry.pending_commit = Some(pending);
-                        continue;
-                    }
-                };
-                let entering_owner =
-                    std::mem::replace(&mut pending.branch, PreparedBranch::empty());
-                let splice = match sealed.bind_entering(entering_owner) {
-                    Ok(splice) => splice,
-                    Err(failure) => {
-                        let (sealed, entering, _) = failure.into_parts();
-                        let (active, _, _roles) = sealed.reject().into_parts();
-                        entry.active = had_active.then_some(active);
-                        pending.branch = entering;
-                        entry.pending_commit = Some(pending);
-                        continue;
-                    }
-                };
-                let host_is_current = entry
-                    .host
-                    .as_ref()
-                    .is_some_and(|host| current_host_binding_is_exact(world, host));
-                let (splice, mut focus_leaving) = match reconciliation_preflight(
-                    world,
-                    host_is_current,
-                    has_leaving,
-                    splice,
-                ) {
-                    ReconciliationPreflightOutcome::Ready {
-                        splice,
-                        focus_leaving,
-                    } => (splice, focus_leaving),
-                    ReconciliationPreflightOutcome::PendingRejected {
-                        splice,
-                        evidence: _,
-                    } => {
-                        let (active, entering, _roles) = splice.reject().into_parts();
-                        entry.active = had_active.then_some(active);
-                        pending.branch = entering;
-                        let Some(task) = pending.final_task.take() else {
-                            entry.pending_commit = Some(pending);
-                            continue;
+                            ReconciliationPreflightOutcome::Ready { .. } => unreachable!(),
                         };
-                        let failed = PendingFailedBranch {
-                            terminal: PendingFailedBranchTerminal::TaskWithPhysicalResidual {
-                                task,
-                                failure: ViewFailureKind::Apply,
-                                message: "frame final preflight rejected",
-                            },
-                            branch: failed_prepared_branch(pending, None),
-                        };
-                        let _ = isolate_exact_failed_prepared_branch(
-                            world,
-                            &failed.branch,
-                            entry.active.as_ref(),
-                        );
-                        entry.pending_failed_branch = Some(failed);
-                        continue;
-                    }
-                    ReconciliationPreflightOutcome::AuthorityLost {
-                        splice,
-                        evidence,
-                    } => {
-                        let (active, entering, _roles) = splice.reject().into_parts();
+                        let (active, entering, _) = splice.reject().into_parts();
                         pending.branch = entering;
-                        if evidence.is_missing_resource() {
+                        if entry
+                            .engine
+                            .cancel_prepared_commit_for_authority_settlement(sealed.prepared)
+                            .is_err()
+                        {
                             if let Err((active, pending)) = fail_closed_normal_owner_protocol(
                                 world,
                                 entry,
                                 active,
                                 pending,
-                                AuthorityProtocolResidualKind::PreflightAuthorityLost(evidence),
+                                AuthorityProtocolResidualKind::Authority(
+                                    BeginAuthoritySettlementErrorKind::Stale,
+                                ),
                             ) {
                                 entry.active = had_active.then_some(active);
                                 entry.pending_commit = Some(pending);
                             }
-                            continue;
+                        } else {
+                            entry.active = had_active.then_some(active);
+                            entry.pending_commit = Some(pending);
                         }
-                        match begin_authority_settlement(
-                            world,
-                            entry,
-                            active,
-                            pending,
-                            None,
-                        ) {
-                            AuthoritySettlementBeginOutcome::Begun => {}
-                            AuthoritySettlementBeginOutcome::RetryablePreparation {
-                                active,
-                                pending,
-                            } => {
-                                entry.active = had_active.then_some(active);
-                                entry.pending_commit = Some(pending);
-                            }
-                            AuthoritySettlementBeginOutcome::ProtocolContradiction {
-                                active,
-                                pending,
-                                kind,
-                            } => {
-                                if let Err((active, pending)) =
-                                    fail_closed_normal_authority_protocol(
-                                        world, entry, active, pending, kind,
-                                    )
-                                {
-                                    entry.active = had_active.then_some(active);
-                                    entry.pending_commit = Some(pending);
-                                    continue;
-                                }
-                            }
-                            AuthoritySettlementBeginOutcome::IsolationContradiction {
-                                active,
-                                pending,
-                                contradiction,
-                                isolation,
-                            } => {
-                                if let Err((active, pending)) =
-                                    fail_closed_normal_authority_protocol_prepared(
-                                        world,
-                                        entry,
-                                        active,
-                                        pending,
-                                        AuthorityProtocolResidualKind::AuthorityIsolation(
-                                            contradiction.clone(),
-                                        ),
-                                        isolation,
-                                        Some(contradiction),
-                                    )
-                                {
-                                    entry.active = had_active.then_some(active);
-                                    entry.pending_commit = Some(pending);
-                                    continue;
-                                }
-                            }
-                            AuthoritySettlementBeginOutcome::LedgerContradiction {
-                                active,
-                                pending,
-                                kind,
-                            } => {
-                                if let Err((active, pending)) =
-                                    fail_closed_normal_owner_protocol(
-                                        world,
-                                        entry,
-                                        active,
-                                        pending,
-                                        AuthorityProtocolResidualKind::CleanupLedger(kind),
-                                    )
-                                {
-                                    entry.active = had_active.then_some(active);
-                                    entry.pending_commit = Some(pending);
-                                    continue;
-                                }
-                            }
-                        }
-                        continue;
+                        return;
                     }
-                };
-                let retained_empty_focus = observed_descendant_closure(
-                    world,
-                    splice
-                        .slot_roles()
-                        .iter()
-                        .filter(|role| role.kind() == ReconciliationSlotRoleKind::RetainEmpty)
-                        .map(|role| role.entity()),
-                );
-                focus_leaving.extend(retained_empty_focus);
-                focus_leaving.sort_by_key(|entity| entity.to_bits());
-                focus_leaving.dedup();
-                let logical_roots = logical_cleanup_roots(splice.leaving());
-                let gate_before = splice.current_interactive_entities();
-                let gate_after = splice.resulting_interactive_entities();
-                let (targets, isolate_count) = splice.presentation_mutation_targets();
-                let transitions = splice.lifecycle_transitions();
-                let leaving_count = splice.leaving().obligation_count();
-                let root_rebase = if !splice.leaving().frames().is_empty()
-                    && !splice.entering().frames().is_empty()
-                {
-                    match splice.prepare_root_rebase() {
-                        Some(prepared) => Some(prepared),
-                        None => {
+                    match rejected {
+                        ReconciliationPreflightOutcome::Ready { .. } => unreachable!(),
+                        ReconciliationPreflightOutcome::PendingRejected {
+                            splice,
+                            evidence: _,
+                        } => {
                             let (active, entering, _roles) = splice.reject().into_parts();
                             entry.active = had_active.then_some(active);
                             pending.branch = entering;
-                            entry.pending_commit = Some(pending);
-                            continue;
+                            let Some(task) = pending.final_task.take() else {
+                                entry.pending_commit = Some(pending);
+                                return;
+                            };
+                            let failed = PendingFailedBranch {
+                                terminal: PendingFailedBranchTerminal::TaskWithPhysicalResidual {
+                                    task,
+                                    failure: ViewFailureKind::Apply,
+                                    message: "frame final preflight rejected",
+                                },
+                                branch: failed_prepared_branch(pending, None),
+                            };
+                            let _ = isolate_exact_failed_prepared_branch(
+                                world,
+                                &failed.branch,
+                                entry.active.as_ref(),
+                            );
+                            entry.pending_failed_branch = Some(failed);
+                            return;
+                        }
+                        ReconciliationPreflightOutcome::AuthorityLost { splice, evidence } => {
+                            let (active, entering, _roles) = splice.reject().into_parts();
+                            pending.branch = entering;
+                            settle_prepublication_authority_loss(
+                                world, entry, active, pending, had_active, evidence, false,
+                            );
+                            return;
                         }
                     }
-                } else {
-                    None
-                };
-                let mut splice_owner = Some(splice);
-                let mut cleanup_reserve_contradiction = None;
-                let mut commit_authority_contradiction = None;
-                let committed = world.resource_scope(
-                    |world, gate: bevy_ecs::change_detection::Mut<RouterInputGate>| {
-                        world.resource_scope(
-                            |world, input_focus: bevy_ecs::change_detection::Mut<InputFocus>| {
-                                world.resource_scope(
-                                    |world,
-                                     route_focus: bevy_ecs::change_detection::Mut<
-                                        RouteFocusState,
-                                    >| {
-                                        world.resource_scope(
-                                            |world,
-                                             mut registry: bevy_ecs::change_detection::Mut<
-                                                RouteEntityRegistry,
-                                            >| {
-                                                let registry_plan = registry
-                                                    .prepare_lifecycle_mutation(&transitions)?;
-                                                let resulting_claims =
-                                                    registry_plan.resulting_claims().to_vec();
-                                                let frozen_manifest = if leaving_count == 0 {
-                                                    FrozenCleanupManifest::empty()
-                                                } else {
-                                                    let splice = splice_owner.as_ref()?;
-                                                    match FrozenCleanupManifest::from_leaving_branch(
-                                                        world,
-                                                        &registry,
-                                                        splice.leaving(),
-                                                        &resulting_claims,
-                                                        (!splice.entering().frames().is_empty())
-                                                            .then_some(splice.entering()),
-                                                    ) {
-                                                        Some(manifest) => manifest,
-                                                        None => {
-                                                            return None;
-                                                        }
-                                                    }
-                                                };
-                                                let manifest_digest = frozen_manifest.digest();
-                                                let obligation_count = frozen_manifest.len();
-                                                let reserved_ledger =
-                                                    match CleanupLedger::reserve(frozen_manifest) {
-                                                        Ok(reserved) => reserved,
-                                                        Err(error) => match error.kind() {
-                                                            CleanupLedgerReserveErrorKind::RetryableCapacity => {
-                                                                return None;
-                                                            }
-                                                            kind @ (CleanupLedgerReserveErrorKind::DomainExhausted
-                                                            | CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts) => {
-                                                                let _returned_manifest =
-                                                                    error.into_manifest();
-                                                                cleanup_reserve_contradiction =
-                                                                    Some(kind);
-                                                                return None;
-                                                            }
-                                                        },
-                                                    };
-                                                let gate_plan = prepare_input_gate_mutation(
-                                                    gate,
-                                                    &gate_before,
-                                                    gate_after,
-                                                )?;
-                                                let focus_plan = prepare_focus_mutation(
-                                                    input_focus,
-                                                    route_focus,
-                                                    &focus_leaving,
-                                                );
-                                                let claim_rebind = splice_owner
-                                                    .as_ref()?
-                                                    .prepare_claim_rebind(&resulting_claims)?;
-                                                if pending.ticket.is_none() {
-                                                    let task = pending.final_task.take().expect(
-                                                        "fully preflighted legacy leaf task remains owned",
-                                                    );
-                                                    pending.ticket = Some(
-                                                        entry.engine.report_applied(task).expect(
-                                                            "sealed task projection must report exactly once",
-                                                        ),
-                                                    );
-                                                }
-                                                let ticket = pending.ticket.as_ref()?;
-                                                let mut timing_seam_prepared = None;
-                                                if commit_sealed_registration_removal_is_armed(
-                                                    entry,
-                                                ) {
-                                                    let manifest = CleanupManifest::new(
-                                                        logical_roots.clone(),
-                                                        manifest_digest,
-                                                        obligation_count,
-                                                    );
-                                                    let prepared = match entry
-                                                        .engine
-                                                        .prepare_commit(ticket, manifest)
-                                                    {
-                                                        Ok(prepared) => prepared,
-                                                        Err(error) => {
-                                                            commit_authority_contradiction = Some(
-                                                                match error {
-                                                                    IntegrationError::InvalidManifest => {
-                                                                        BeginAuthoritySettlementErrorKind::InvalidManifest
-                                                                    }
-                                                                    IntegrationError::Exhausted
-                                                                    | IntegrationError::AwaitingHost
-                                                                    | IntegrationError::OutstandingAdmission
-                                                                    | IntegrationError::AuthorityExists
-                                                                    | IntegrationError::ForeignRouter
-                                                                    | IntegrationError::Duplicate
-                                                                    | IntegrationError::Stale
-                                                                    | IntegrationError::Invalid => {
-                                                                        BeginAuthoritySettlementErrorKind::Stale
-                                                                    }
-                                                                },
-                                                            );
-                                                            return None;
-                                                        }
-                                                    };
-                                                    inject_commit_sealed_registration_removal(
-                                                        world, entry,
-                                                    );
-                                                    if !entry.host.as_ref().is_some_and(|host| {
-                                                        current_host_binding_is_exact_with_registry(
-                                                            world, &registry, host,
-                                                        )
-                                                    }) {
-                                                        if entry
-                                                            .engine
-                                                            .cancel_prepared_commit_for_authority_settlement(
-                                                                prepared,
-                                                            )
-                                                            .is_err()
-                                                        {
-                                                            commit_authority_contradiction = Some(
-                                                                BeginAuthoritySettlementErrorKind::Stale,
-                                                            );
-                                                        }
-                                                        return None;
-                                                    }
-                                                    timing_seam_prepared = Some(prepared);
-                                                }
-                                                let presentation_plan =
-                                                    prepare_presentation_with_pointer_revocation(
-                                                        world, &targets, gate_plan.revoked_targets(),
-                                                    )?.seal_commit(isolate_count)?;
-                                                let prepared = match timing_seam_prepared {
-                                                    Some(prepared) => prepared,
-                                                    None => {
-                                                        let manifest = CleanupManifest::new(
-                                                            logical_roots.clone(),
-                                                            manifest_digest,
-                                                            obligation_count,
-                                                        );
-                                                        match entry
-                                                            .engine
-                                                            .prepare_commit(ticket, manifest)
-                                                        {
-                                                            Ok(prepared) => prepared,
-                                                            Err(error) => {
-                                                                commit_authority_contradiction = Some(
-                                                                    match error {
-                                                                        IntegrationError::InvalidManifest => {
-                                                                            BeginAuthoritySettlementErrorKind::InvalidManifest
-                                                                        }
-                                                                        IntegrationError::Exhausted
-                                                                        | IntegrationError::AwaitingHost
-                                                                        | IntegrationError::OutstandingAdmission
-                                                                        | IntegrationError::AuthorityExists
-                                                                        | IntegrationError::ForeignRouter
-                                                                        | IntegrationError::Duplicate
-                                                                        | IntegrationError::Stale
-                                                                        | IntegrationError::Invalid => {
-                                                                            BeginAuthoritySettlementErrorKind::Stale
-                                                                        }
-                                                                    },
-                                                                );
-                                                                return None;
-                                                            }
-                                                        }
-                                                    }
-                                                };
-                                                let engine = match entry
-                                                    .engine
-                                                    .validate_publication(prepared)
-                                                {
-                                                    Ok(validated) => validated,
-                                                    Err(error) => {
-                                                        commit_authority_contradiction = Some(
-                                                            match error {
-                                                                IntegrationError::InvalidManifest => {
-                                                                    BeginAuthoritySettlementErrorKind::InvalidManifest
-                                                                }
-                                                                IntegrationError::Exhausted
-                                                                | IntegrationError::AwaitingHost
-                                                                | IntegrationError::OutstandingAdmission
-                                                                | IntegrationError::AuthorityExists
-                                                                | IntegrationError::ForeignRouter
-                                                                | IntegrationError::Duplicate
-                                                                | IntegrationError::Stale
-                                                                | IntegrationError::Invalid => {
-                                                                    BeginAuthoritySettlementErrorKind::Stale
-                                                                }
-                                                            },
-                                                        );
-                                                        return None;
-                                                    }
-                                                };
-                                                let cleanup = engine.cleanup().clone();
-                                                let cleanup_ledger =
-                                                    reserved_ledger.bind_batch(cleanup);
-                                                pending.ticket.take();
-                                                let mut splice = splice_owner
-                                                    .take()
-                                                    .expect("fully prepared commit retains its sealed splice");
-                                                splice.apply_claim_rebind(claim_rebind);
-                                                if let Some(rebase) = root_rebase {
-                                                    splice.apply_root_rebase(rebase);
-                                                }
-                                                let outcome = splice.apply();
-                                                let (active, leaving) =
-                                                    outcome.into_active_and_leaving();
-                                                let next_active = (!active.frames().is_empty())
-                                                    .then_some(active);
-                                                let next_cleanup = Some(
-                                                    CleanupLedger::activate_leaving_branch(
-                                                        cleanup_ledger,
-                                                        (!leaving.frames().is_empty()
-                                                            || !leaving.child_slots().is_empty())
-                                                        .then_some(leaving),
-                                                    ),
-                                                );
-                                                let active_owner = &mut entry.active;
-                                                let cleanup_owner = &mut entry.cleanup_ledger;
-                                                engine.publish(|| {
-                                                    presentation_plan.apply_staged(
-                                                        |_| focus_plan.apply(),
-                                                        |_| registry_plan.apply(&mut registry),
-                                                        |_| gate_plan.apply(),
-                                                    );
-                                                    *active_owner = next_active;
-                                                    *cleanup_owner = next_cleanup;
-                                                });
-                                                Some(())
-                                            },
-                                        )
-                                    },
-                                )
-                            },
-                        )
-                    },
-                );
-                let Some(()) = committed else {
-                    let splice = splice_owner
-                        .take()
-                        .expect("failed commit retains its sealed splice owner");
+                },
+            );
+            return;
+        }
+    };
+    let retained_empty_focus = observed_descendant_closure(
+        world,
+        splice
+            .slot_roles()
+            .iter()
+            .filter(|role| role.kind() == ReconciliationSlotRoleKind::RetainEmpty)
+            .map(|role| role.entity()),
+    );
+    focus_leaving.extend(retained_empty_focus);
+    focus_leaving.sort_by_key(|entity| entity.to_bits());
+    focus_leaving.dedup();
+    let logical_roots = logical_cleanup_roots(splice.leaving());
+    let gate_before = splice.current_interactive_entities();
+    let gate_after = splice.resulting_interactive_entities();
+    let (targets, isolate_count) = splice.presentation_mutation_targets();
+    let transitions = splice.lifecycle_transitions();
+    let leaving_count = splice.leaving().obligation_count();
+    let registry_changes = transitions
+        .iter()
+        .any(|(claim, next)| claim.lifecycle() != *next);
+    let root_rebase =
+        if !splice.leaving().frames().is_empty() && !splice.entering().frames().is_empty() {
+            match splice.prepare_root_rebase() {
+                Some(prepared) => Some(prepared),
+                None => {
                     let (active, entering, _roles) = splice.reject().into_parts();
-                    pending.branch = entering;
-                    if let Some(kind) = commit_authority_contradiction {
-                        if let Err((active, pending)) = fail_closed_normal_owner_protocol(
-                            world,
-                            entry,
-                            active,
-                            pending,
-                            AuthorityProtocolResidualKind::Authority(kind),
-                        ) {
-                            entry.active = had_active.then_some(active);
-                            entry.pending_commit = Some(pending);
-                        }
-                        continue;
-                    }
-                    if let Some(kind) = cleanup_reserve_contradiction {
-                        if let Err((active, pending)) = fail_closed_normal_owner_protocol(
-                            world,
-                            entry,
-                            active,
-                            pending,
-                            AuthorityProtocolResidualKind::CleanupLedger(kind),
-                        ) {
-                            entry.active = had_active.then_some(active);
-                            entry.pending_commit = Some(pending);
-                        }
-                        continue;
-                    }
+                    let mut navigation = world.resource_mut::<RouterNavigation>();
+                    let entry = navigation
+                        .entries
+                        .iter_mut()
+                        .find(|entry| entry.handle == handle)
+                        .unwrap();
                     entry.active = had_active.then_some(active);
-                    if pending.ticket.is_some() || pending.final_task.is_some() {
+                    pending.branch = entering;
+                    entry.pending_commit = Some(pending);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+    let frozen_manifest = (|| {
+        let registry = world.get_resource::<RouteEntityRegistry>()?;
+        let registry_plan = registry.prepare_lifecycle_mutation(&transitions)?;
+        let resulting_claims = registry_plan.resulting_claims().to_vec();
+        let frozen_manifest = if leaving_count == 0 {
+            FrozenCleanupManifest::empty()
+        } else {
+            let splice = &splice;
+            match FrozenCleanupManifest::from_leaving_branch(
+                world,
+                &registry,
+                splice.leaving(),
+                &resulting_claims,
+                (!splice.entering().frames().is_empty()).then_some(splice.entering()),
+            ) {
+                Some(manifest) => manifest,
+                None => {
+                    return None;
+                }
+            }
+        };
+
+        Some(frozen_manifest)
+    })();
+    let mut splice_owner = Some(splice);
+    let mut cleanup_reserve_contradiction = None;
+    let mut commit_authority_contradiction = None;
+    let committed = (|| {
+        let frozen_manifest = frozen_manifest?;
+        if sealed
+            .as_ref()
+            .is_some_and(|sealed| sealed.manifest != frozen_manifest)
+        {
+            commit_authority_contradiction =
+                Some(BeginAuthoritySettlementErrorKind::InvalidManifest);
+            return None;
+        }
+        let pointer_targets = prepare_input_gate_mutation(
+            world.get_resource_mut::<RouterInputGate>()?,
+            &gate_before,
+            gate_after.clone(),
+        )?
+        .revoked_targets()
+        .to_vec();
+        let (presentation, resources) =
+            crate::presentation::prepare_publication_access(world, &targets, &pointer_targets)?;
+        let crate::presentation::PublicationResources {
+            mut navigation,
+            mut registry,
+            gate,
+            input_focus,
+            route_focus,
+        } = resources;
+        let entry = navigation
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handle == handle)?;
+        let registry_plan = registry.prepare_lifecycle_mutation(&transitions)?;
+        let resulting_claims = registry_plan.resulting_claims().to_vec();
+        let manifest_digest = frozen_manifest.digest();
+        let obligation_count = frozen_manifest.len();
+        let reserved_ledger = match CleanupLedger::reserve(frozen_manifest) {
+            Ok(reserved) => reserved,
+            Err(error) => match error.kind() {
+                CleanupLedgerReserveErrorKind::RetryableCapacity => {
+                    return None;
+                }
+                kind @ (CleanupLedgerReserveErrorKind::DomainExhausted
+                | CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts) => {
+                    let _returned_manifest = error.into_manifest();
+                    cleanup_reserve_contradiction = Some(kind);
+                    return None;
+                }
+            },
+        };
+
+        let gate_plan = prepare_input_gate_mutation(gate, &gate_before, gate_after)?;
+        let focus_plan = prepare_focus_mutation(input_focus, route_focus, &focus_leaving);
+        let claim_rebind = splice_owner
+            .as_ref()?
+            .prepare_claim_rebind(&resulting_claims)?;
+        if pending.ticket.is_none() {
+            let task = pending
+                .final_task
+                .take()
+                .expect("fully preflighted legacy leaf task remains owned");
+            pending.ticket = Some(
+                entry
+                    .engine
+                    .report_applied(task)
+                    .expect("sealed task projection must report exactly once"),
+            );
+        }
+        let ticket = pending.ticket.as_ref()?;
+        let presentation_plan = presentation.seal_commit(isolate_count)?;
+        let prepared = if let Some(sealed) = sealed.take() {
+            sealed.prepared
+        } else {
+            let manifest =
+                CleanupManifest::new(logical_roots.clone(), manifest_digest, obligation_count);
+            match entry.engine.prepare_commit(ticket, manifest) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    commit_authority_contradiction = Some(match error {
+                        IntegrationError::InvalidManifest => {
+                            BeginAuthoritySettlementErrorKind::InvalidManifest
+                        }
+                        IntegrationError::Exhausted
+                        | IntegrationError::AwaitingHost
+                        | IntegrationError::OutstandingAdmission
+                        | IntegrationError::AuthorityExists
+                        | IntegrationError::ForeignRouter
+                        | IntegrationError::Duplicate
+                        | IntegrationError::Stale
+                        | IntegrationError::Invalid => BeginAuthoritySettlementErrorKind::Stale,
+                    });
+                    return None;
+                }
+            }
+        };
+        let engine = match entry.engine.validate_publication(prepared) {
+            Ok(validated) => validated,
+            Err(error) => {
+                commit_authority_contradiction = Some(match error {
+                    IntegrationError::InvalidManifest => {
+                        BeginAuthoritySettlementErrorKind::InvalidManifest
+                    }
+                    IntegrationError::Exhausted
+                    | IntegrationError::AwaitingHost
+                    | IntegrationError::OutstandingAdmission
+                    | IntegrationError::AuthorityExists
+                    | IntegrationError::ForeignRouter
+                    | IntegrationError::Duplicate
+                    | IntegrationError::Stale
+                    | IntegrationError::Invalid => BeginAuthoritySettlementErrorKind::Stale,
+                });
+                return None;
+            }
+        };
+        let cleanup = engine.cleanup().clone();
+        let cleanup_ledger = reserved_ledger.bind_batch(cleanup);
+        pending.ticket.take();
+        let mut splice = splice_owner
+            .take()
+            .expect("fully prepared commit retains its sealed splice");
+        splice.apply_claim_rebind(claim_rebind);
+        if let Some(rebase) = root_rebase {
+            splice.apply_root_rebase(rebase);
+        }
+        let outcome = splice.apply();
+        let (active, leaving) = outcome.into_active_and_leaving();
+        let next_active = (!active.frames().is_empty()).then_some(active);
+        let next_cleanup = Some(CleanupLedger::activate_leaving_branch(
+            cleanup_ledger,
+            (!leaving.frames().is_empty() || !leaving.child_slots().is_empty()).then_some(leaving),
+        ));
+        let active_owner = &mut entry.active;
+        let cleanup_owner = &mut entry.cleanup_ledger;
+        engine.publish(|| {
+            presentation_plan.apply_staged(
+                |_| focus_plan.apply(),
+                |_| {
+                    if registry_changes {
+                        registry_plan.apply(&mut registry);
+                    }
+                },
+                |_| gate_plan.apply(),
+            );
+            *active_owner = next_active;
+            *cleanup_owner = next_cleanup;
+        });
+        Some(())
+    })();
+    if committed.is_some() {
+        return;
+    }
+    world.resource_scope(
+        |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == handle)
+                .unwrap();
+            let Some(()) = committed else {
+                if let Some(sealed) = sealed.take()
+                    && entry
+                        .engine
+                        .cancel_prepared_commit_for_authority_settlement(sealed.prepared)
+                        .is_err()
+                {
+                    commit_authority_contradiction = Some(BeginAuthoritySettlementErrorKind::Stale);
+                }
+                let splice = splice_owner
+                    .take()
+                    .expect("failed commit retains its sealed splice owner");
+                let (active, entering, _roles) = splice.reject().into_parts();
+                pending.branch = entering;
+                if let Some(kind) = commit_authority_contradiction {
+                    if let Err((active, pending)) = fail_closed_normal_owner_protocol(
+                        world,
+                        entry,
+                        active,
+                        pending,
+                        AuthorityProtocolResidualKind::Authority(kind),
+                    ) {
+                        entry.active = had_active.then_some(active);
                         entry.pending_commit = Some(pending);
                     }
-                    continue;
-                };
-            }
+                    return;
+                }
+                if let Some(kind) = cleanup_reserve_contradiction {
+                    if let Err((active, pending)) = fail_closed_normal_owner_protocol(
+                        world,
+                        entry,
+                        active,
+                        pending,
+                        AuthorityProtocolResidualKind::CleanupLedger(kind),
+                    ) {
+                        entry.active = had_active.then_some(active);
+                        entry.pending_commit = Some(pending);
+                    }
+                    return;
+                }
+                entry.active = had_active.then_some(active);
+                if pending.ticket.is_some() || pending.final_task.is_some() {
+                    entry.pending_commit = Some(pending);
+                }
+                return;
+            };
         },
     );
 }
@@ -15580,14 +15884,15 @@ use authority_isolation::{
 use authority_isolation::{
     AuthorityIsolationContradiction, AuthorityIsolationPreparation,
     AuthoritySettlementBeginOutcome, PreparedAuthorityIsolation, begin_authority_settlement,
-    fail_closed_cleanup_settlement_permanent, fail_closed_failed_authority_protocol,
-    fail_closed_failed_manifest_protocol, fail_closed_failed_owner_protocol,
-    fail_closed_failed_owner_protocol_prepared, fail_closed_failure_cleanup_completion_protocol,
-    fail_closed_normal_authority_protocol, fail_closed_normal_authority_protocol_prepared,
-    fail_closed_normal_owner_protocol, fail_closed_projectionless_owner_protocol,
-    prepare_authority_isolation_targets, prepare_failed_branch_authority_isolation,
-    prepare_failed_manifest_protocol_isolation, prepare_normal_authority_isolation,
-    prepare_post_commit_input_isolation, prepare_target_preparation_permanent_isolation,
+    begin_initial_fallback_authority_settlement, fail_closed_cleanup_settlement_permanent,
+    fail_closed_failed_authority_protocol, fail_closed_failed_manifest_protocol,
+    fail_closed_failed_owner_protocol, fail_closed_failed_owner_protocol_prepared,
+    fail_closed_failure_cleanup_completion_protocol, fail_closed_normal_authority_protocol,
+    fail_closed_normal_authority_protocol_prepared, fail_closed_normal_owner_protocol,
+    fail_closed_projectionless_owner_protocol, prepare_authority_isolation_targets,
+    prepare_failed_branch_authority_isolation, prepare_failed_manifest_protocol_isolation,
+    prepare_normal_authority_isolation, prepare_post_commit_input_isolation,
+    prepare_target_preparation_permanent_isolation,
 };
 
 enum ProjectionlessFallbackPreflight {
@@ -15604,6 +15909,21 @@ enum ProjectionlessCommitFailure {
         admission: ProjectionlessFallbackAdmission,
         reason: BeginAuthoritySettlementErrorKind,
     },
+    InitialPostReportAuthorityLost {
+        reason: BeginAuthoritySettlementErrorKind,
+    },
+}
+
+impl ProjectionlessCommitFailure {
+    fn post_report(
+        admission: Option<ProjectionlessFallbackAdmission>,
+        reason: BeginAuthoritySettlementErrorKind,
+    ) -> Self {
+        match admission {
+            Some(admission) => Self::PostReportAuthorityLost { admission, reason },
+            None => Self::InitialPostReportAuthorityLost { reason },
+        }
+    }
 }
 
 impl ProjectionlessFailCloseSource {
@@ -15848,7 +16168,7 @@ fn branch_owner_projection_is_exact(world: &World, branch: &RealizedBranch) -> b
 }
 
 fn projectionless_fallback_preflight(
-    world: &mut World,
+    world: &World,
     entry: &RouterEntry,
     pending: &PendingCommit,
 ) -> ProjectionlessFallbackPreflight {
@@ -16076,10 +16396,47 @@ fn fail_closed_projectionless_replacement_contradiction(
     )
 }
 
+struct ProjectionlessPublicationWork {
+    pending: PendingCommit,
+    admission: Option<ProjectionlessFallbackAdmission>,
+    host: Option<ProjectionlessHostProjection>,
+    focus_leaving: Vec<Entity>,
+    gate_before: Vec<Entity>,
+    gate_after: Vec<Entity>,
+    targets: Vec<crate::presentation::FrameMutationTarget>,
+    isolate_count: usize,
+    transitions: Vec<(ExactRegistryClaim, EntityLifecycle)>,
+    resulting_claims: Vec<ExactRegistryClaim>,
+    entering_rebind: crate::branch_transaction::PreparedBranchClaimRebind,
+    leaving_rebind: Option<crate::branch_transaction::PreparedBranchClaimRebind>,
+    expected_manifest: FrozenCleanupManifest,
+    reserved_ledger: PreparedCleanupLedger,
+    logical_roots: Vec<RouteFrameVersion>,
+    manifest_digest: u64,
+    obligation_count: usize,
+    reject_prepare_commit: bool,
+}
+
+#[cfg(test)]
 fn commit_projectionless_branch(
     world: &mut World,
     entry: &mut RouterEntry,
+    pending: PendingCommit,
+) -> Result<(), PendingCommit> {
+    let mut work = None;
+    let result = prepare_projectionless_branch(world, entry, pending, &mut work);
+    assert!(
+        work.is_none(),
+        "this rejection-only helper cannot publish through a resource scope"
+    );
+    result
+}
+
+fn prepare_projectionless_branch(
+    world: &mut World,
+    entry: &mut RouterEntry,
     mut pending: PendingCommit,
+    work: &mut Option<ProjectionlessPublicationWork>,
 ) -> Result<(), PendingCommit> {
     if pending.ticket.is_some()
         || pending.final_task.is_none()
@@ -16101,6 +16458,27 @@ fn commit_projectionless_branch(
         })
     {
         return Err(pending);
+    }
+    let missing = RequiredResourceSet::missing_from(world);
+    if !replaces_active && !missing.is_empty() {
+        let evidence = LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::RequiredResources(missing),
+            LifecyclePreflightExpectation::ResourcePresent,
+            LifecyclePreflightObserved::Missing,
+        );
+        return match fail_closed_normal_owner_protocol(
+            world,
+            entry,
+            RealizedBranch::empty(),
+            pending,
+            AuthorityProtocolResidualKind::PreflightAuthorityLost(evidence),
+        ) {
+            Ok(()) => Ok(()),
+            Err((active, pending)) => {
+                entry.active = (!active.frames().is_empty()).then_some(active);
+                Err(pending)
+            }
+        };
     }
     let (admission, focus_leaving) = if replaces_active {
         match projectionless_fallback_preflight(world, entry, &pending) {
@@ -16332,6 +16710,7 @@ fn commit_projectionless_branch(
         };
     }
 
+    let expected_manifest = frozen_manifest.clone();
     let reserved_ledger = match CleanupLedger::reserve(frozen_manifest) {
         Ok(reserved) => reserved,
         Err(error) => match error.kind() {
@@ -16364,186 +16743,391 @@ fn commit_projectionless_branch(
         },
     };
     let reject_prepare_commit = inject_projectionless_prepare_commit_rejection(world);
-    let leaving = entry.active.take();
-    let entering = std::mem::replace(&mut pending.branch, PreparedBranch::empty()).into_realized();
-    let root_rebase = leaving.as_ref().map(|leaving| {
-        entering
-            .prepare_root_rebase(leaving)
-            .expect("preflighted fallback replacement retains exact root rebase")
+    *work = Some(ProjectionlessPublicationWork {
+        pending,
+        admission,
+        host: entry.host.as_ref().map(ProjectionlessHostProjection::from),
+        focus_leaving,
+        gate_before,
+        gate_after,
+        targets,
+        isolate_count,
+        transitions,
+        resulting_claims,
+        entering_rebind,
+        leaving_rebind,
+        expected_manifest,
+        reserved_ledger,
+        logical_roots,
+        manifest_digest,
+        obligation_count,
+        reject_prepare_commit,
     });
-    let mut branch_owners = Some((leaving, entering));
-    let mut failure = None;
-    let committed = world.resource_scope(
-        |world, gate: bevy_ecs::change_detection::Mut<RouterInputGate>| {
-            world.resource_scope(
-                |world, input_focus: bevy_ecs::change_detection::Mut<InputFocus>| {
-                    world.resource_scope(
-                        |world, route_focus: bevy_ecs::change_detection::Mut<RouteFocusState>| {
-                            world.resource_scope(
-                                |world,
-                                 mut registry: bevy_ecs::change_detection::Mut<
-                                    RouteEntityRegistry,
-                                >| {
-                                    let registry_plan = registry
-                                        .prepare_lifecycle_mutation(&transitions)
-                                        .expect("prevalidated projectionless registry plan remains exact");
-                                    let gate_plan = prepare_input_gate_mutation(
-                                        gate,
-                                        &gate_before,
-                                        gate_after,
-                                    )
-                                    .expect("prevalidated projectionless gate plan remains exact");
-                                    let focus_plan =
-                                        prepare_focus_mutation(input_focus, route_focus, &focus_leaving);
-                                    let presentation_plan = prepare_presentation_with_pointer_revocation(
-                                        world,
-                                        &targets,
-                                        gate_plan.revoked_targets(),
-                                    )
-                                    .and_then(|prepared| prepared.seal_commit(isolate_count))
-                                    .expect(
-                                        "prevalidated projectionless presentation plan remains exact",
-                                    );
-                                    let task = pending
-                                        .final_task
-                                        .take()
-                                        .expect("projectionless fallback task remains owned");
-                                    let ticket = entry
-                                        .engine
-                                        .report_applied(task)
-                                        .expect("preflighted fallback task remains reportable");
-                                    pending.ticket = Some(ticket);
-                                    let mut manifest_logical_roots = logical_roots.clone();
-                                    if reject_prepare_commit {
-                                        let duplicate = manifest_logical_roots
-                                            .first()
-                                            .expect("replacement rejection fixture has one leaving root")
-                                            .clone();
-                                        manifest_logical_roots.push(duplicate);
-                                    }
-                                    let prepared = match entry.engine.prepare_commit(
-                                        pending
-                                            .ticket
-                                            .as_ref()
-                                            .expect("reported fallback task owns a commit ticket"),
-                                        CleanupManifest::new(
-                                            manifest_logical_roots,
-                                            manifest_digest,
-                                            obligation_count,
-                                        ),
-                                    ) {
-                                        Ok(prepared) => prepared,
-                                        Err(_) => {
-                                            failure = Some(
-                                                ProjectionlessCommitFailure::PostReportAuthorityLost {
-                                                    admission: admission.clone().expect(
-                                                        "fallback replacement owns frozen admission",
-                                                    ),
-                                                    reason: BeginAuthoritySettlementErrorKind::InvalidManifest,
-                                                },
-                                            );
-                                            return None;
-                                        }
-                                    };
-                                    let engine = match entry
-                                        .engine
-                                        .validate_publication(prepared)
-                                    {
-                                        Ok(validated) => validated,
-                                        Err(error) => {
-                                            failure = Some(
-                                                ProjectionlessCommitFailure::PostReportAuthorityLost {
-                                                    admission: admission.clone().expect(
-                                                        "fallback replacement owns frozen admission",
-                                                    ),
-                                                    reason: match error {
-                                                        IntegrationError::InvalidManifest => {
-                                                            BeginAuthoritySettlementErrorKind::InvalidManifest
-                                                        }
-                                                        IntegrationError::Exhausted
-                                                        | IntegrationError::AwaitingHost
-                                                        | IntegrationError::OutstandingAdmission
-                                                        | IntegrationError::AuthorityExists
-                                                        | IntegrationError::ForeignRouter
-                                                        | IntegrationError::Duplicate
-                                                        | IntegrationError::Stale
-                                                        | IntegrationError::Invalid => {
-                                                            BeginAuthoritySettlementErrorKind::Stale
-                                                        }
-                                                    },
-                                                },
-                                            );
-                                            return None;
-                                        }
-                                    };
-                                    let cleanup = engine.cleanup().clone();
-                                    let cleanup_ledger = reserved_ledger.bind_batch(cleanup);
-                                    pending.ticket.take();
-                                    let (mut leaving, mut entering) = branch_owners.take().expect(
-                                        "fully prepared projectionless commit retains its branch owners",
-                                    );
-                                    if let (Some(leaving), Some(rebind)) =
-                                        (leaving.as_mut(), leaving_rebind)
-                                    {
-                                        leaving.apply_claim_rebind(rebind);
-                                    }
-                                    entering.apply_claim_rebind(entering_rebind);
-                                    if let Some(rebase) = root_rebase {
-                                        entering.apply_root_rebase(rebase);
-                                    }
-                                    let next_active = Some(entering);
-                                    let next_cleanup = Some(
-                                        CleanupLedger::activate_leaving_branch(
-                                            cleanup_ledger,
-                                            leaving,
-                                        ),
-                                    );
-                                    let active_owner = &mut entry.active;
-                                    let cleanup_owner = &mut entry.cleanup_ledger;
-                                    engine.publish(|| {
-                                        presentation_plan.apply_staged(
-                                            |_| focus_plan.apply(),
-                                            |_| registry_plan.apply(&mut registry),
-                                            |_| gate_plan.apply(),
-                                        );
-                                        *active_owner = next_active;
-                                        *cleanup_owner = next_cleanup;
-                                    });
-                                    Some(())
-                                },
-                            )
-                        },
-                    )
-                },
-            )
-        },
-    );
-    let Some(()) = committed else {
-        let (leaving, entering) = branch_owners
-            .take()
-            .expect("failed projectionless commit retains its branch owners");
-        pending.branch = PreparedBranch::from_realized(entering);
-        return match failure.expect("projectionless commit returns None only with typed failure") {
-            ProjectionlessCommitFailure::PostReportAuthorityLost { admission, reason } => {
-                let active =
-                    leaving.expect("projectionless replacement continuation retains active owner");
-                let source = ProjectionlessFailCloseSource::freeze(
-                    world, entry, admission, reason, &active, &pending,
-                );
-                match settle_projectionless_fail_close(world, entry, active, pending, source) {
-                    Ok(()) => Ok(()),
-                    Err((active, pending, source)) => {
-                        entry.active = Some(active);
+    Ok(())
+}
+
+fn publish_projectionless_work(
+    world: &mut World,
+    handle: RouterHandle,
+    work: ProjectionlessPublicationWork,
+) {
+    let ProjectionlessPublicationWork {
+        mut pending,
+        admission,
+        host,
+        focus_leaving,
+        gate_before,
+        gate_after,
+        targets,
+        isolate_count,
+        transitions,
+        resulting_claims,
+        entering_rebind,
+        leaving_rebind,
+        expected_manifest,
+        reserved_ledger,
+        logical_roots,
+        manifest_digest,
+        obligation_count,
+        reject_prepare_commit,
+    } = work;
+    let preflight = {
+        let navigation = world.resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == handle)
+            .unwrap();
+        if admission.is_some() {
+            Some(projectionless_fallback_preflight(world, entry, &pending))
+        } else {
+            let missing = RequiredResourceSet::missing_from(world);
+            if !missing.is_empty() {
+                Some(ProjectionlessFallbackPreflight::AuthorityLost(
+                    LifecyclePreflightEvidence::new(
+                        LifecyclePreflightSource::RequiredResources(missing),
+                        LifecyclePreflightExpectation::ResourcePresent,
+                        LifecyclePreflightObserved::Missing,
+                    ),
+                ))
+            } else if entry.host.as_ref().map(ProjectionlessHostProjection::from) != host
+                || entry
+                    .host
+                    .as_ref()
+                    .is_none_or(|host| !current_host_binding_is_exact(world, host))
+                || entry.active.is_some()
+            {
+                Some(ProjectionlessFallbackPreflight::AuthorityLost(
+                    LifecyclePreflightEvidence::new(
+                        LifecyclePreflightSource::HostBinding,
+                        LifecyclePreflightExpectation::ExactAuthority,
+                        LifecyclePreflightObserved::Drifted,
+                    ),
+                ))
+            } else if validate_prepared_branch(world, pending.branch.as_realized()).is_err()
+                || validate_branch_descendants(world, pending.branch.as_realized()).is_err()
+            {
+                Some(ProjectionlessFallbackPreflight::PendingRejected(
+                    LifecyclePreflightEvidence::new(
+                        LifecyclePreflightSource::PendingEntering,
+                        LifecyclePreflightExpectation::ExactRelationshipClosure,
+                        LifecyclePreflightObserved::Drifted,
+                    ),
+                ))
+            } else {
+                None
+            }
+        }
+    };
+    let evidence = match preflight {
+        Some(ProjectionlessFallbackPreflight::Ready {
+            admission: current,
+            focus_leaving: current_focus,
+        }) if Some(&current) == admission.as_ref() && current_focus == focus_leaving => None,
+        Some(ProjectionlessFallbackPreflight::PendingRejected(evidence)) => Some((false, evidence)),
+        Some(ProjectionlessFallbackPreflight::AuthorityLost(evidence)) => Some((true, evidence)),
+        Some(ProjectionlessFallbackPreflight::Ready { .. }) => Some((
+            true,
+            LifecyclePreflightEvidence::new(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactAuthority,
+                LifecyclePreflightObserved::Drifted,
+            ),
+        )),
+        None => None,
+    };
+    if let Some((authority, evidence)) = evidence {
+        world.resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == handle)
+                    .unwrap();
+                if authority {
+                    if entry.active.is_none() {
+                        settle_prepublication_authority_loss(
+                            world,
+                            entry,
+                            RealizedBranch::empty(),
+                            pending,
+                            false,
+                            evidence,
+                            true,
+                        );
+                    } else if let Err(pending) =
+                        fail_closed_projectionless_replacement_contradiction_with_evidence(
+                            world, entry, pending, evidence,
+                        )
+                    {
                         entry.pending_commit = Some(pending);
-                        entry.projectionless_fail_close =
-                            Some(ProjectionlessFailCloseContinuation::Retryable(source));
-                        Ok(())
                     }
+                } else {
+                    reject_projectionless_fallback_pending(
+                        entry,
+                        pending,
+                        evidence.pending_message(),
+                    );
                 }
+            },
+        );
+        return;
+    }
+    let frozen_is_exact = (|| {
+        let navigation = world.get_resource::<RouterNavigation>()?;
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == handle)?;
+        let registry = world.get_resource::<RouteEntityRegistry>()?;
+        entry
+            .engine
+            .inspect_report_identity(pending.final_task.as_ref()?)
+            .ok()?;
+        let current = registry.prepare_lifecycle_mutation(&transitions)?;
+        if current.resulting_claims() != resulting_claims {
+            return None;
+        }
+        let frozen = match entry.active.as_ref() {
+            Some(leaving) => FrozenCleanupManifest::from_leaving_branch(
+                world,
+                registry,
+                leaving,
+                &resulting_claims,
+                Some(pending.branch.as_realized()),
+            )?,
+            None => FrozenCleanupManifest::empty(),
+        };
+        (frozen == expected_manifest).then_some(())
+    })()
+    .is_some();
+    let pointer_targets = world
+        .get_resource_mut::<RouterInputGate>()
+        .and_then(|gate| prepare_input_gate_mutation(gate, &gate_before, gate_after.clone()))
+        .map(|plan| plan.revoked_targets().to_vec());
+    let mut branch_owners = None;
+    let mut failure = None;
+    let committed = (|| {
+        if !frozen_is_exact {
+            return None;
+        }
+        let (presentation, resources) = crate::presentation::prepare_publication_access(
+            world,
+            &targets,
+            pointer_targets.as_ref()?,
+        )?;
+        let crate::presentation::PublicationResources {
+            mut navigation,
+            mut registry,
+            gate,
+            input_focus,
+            route_focus,
+        } = resources;
+        let entry = navigation
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handle == handle)?;
+        let registry_plan = registry.prepare_lifecycle_mutation(&transitions)?;
+        let gate_plan = prepare_input_gate_mutation(gate, &gate_before, gate_after)?;
+        let focus_plan = prepare_focus_mutation(input_focus, route_focus, &focus_leaving);
+        let presentation_plan = presentation.seal_commit(isolate_count)?;
+        let root_rebase = match entry.active.as_ref() {
+            Some(leaving) => Some(pending.branch.as_realized().prepare_root_rebase(leaving)?),
+            None => None,
+        };
+        let leaving = entry.active.take();
+        let entering =
+            std::mem::replace(&mut pending.branch, PreparedBranch::empty()).into_realized();
+        branch_owners = Some((leaving, entering));
+        let task = pending
+            .final_task
+            .take()
+            .expect("projectionless fallback task remains owned");
+        let ticket = entry
+            .engine
+            .report_applied(task)
+            .expect("preflighted fallback task remains reportable");
+        pending.ticket = Some(ticket);
+        let mut manifest_logical_roots = logical_roots.clone();
+        if reject_prepare_commit {
+            let duplicate = manifest_logical_roots
+                .first()
+                .expect("replacement rejection fixture has one leaving root")
+                .clone();
+            manifest_logical_roots.push(duplicate);
+        }
+        let prepared = match entry.engine.prepare_commit(
+            pending
+                .ticket
+                .as_ref()
+                .expect("reported fallback task owns a commit ticket"),
+            CleanupManifest::new(manifest_logical_roots, manifest_digest, obligation_count),
+        ) {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                failure = Some(ProjectionlessCommitFailure::post_report(
+                    admission.clone(),
+                    BeginAuthoritySettlementErrorKind::InvalidManifest,
+                ));
+                return None;
             }
         };
-    };
-    Ok(())
+        let engine = match entry.engine.validate_publication(prepared) {
+            Ok(validated) => validated,
+            Err(error) => {
+                failure = Some(ProjectionlessCommitFailure::post_report(
+                    admission.clone(),
+                    match error {
+                        IntegrationError::InvalidManifest => {
+                            BeginAuthoritySettlementErrorKind::InvalidManifest
+                        }
+                        IntegrationError::Exhausted
+                        | IntegrationError::AwaitingHost
+                        | IntegrationError::OutstandingAdmission
+                        | IntegrationError::AuthorityExists
+                        | IntegrationError::ForeignRouter
+                        | IntegrationError::Duplicate
+                        | IntegrationError::Stale
+                        | IntegrationError::Invalid => BeginAuthoritySettlementErrorKind::Stale,
+                    },
+                ));
+                return None;
+            }
+        };
+        let cleanup = engine.cleanup().clone();
+        let cleanup_ledger = reserved_ledger.bind_batch(cleanup);
+        pending.ticket.take();
+        let (mut leaving, mut entering) = branch_owners
+            .take()
+            .expect("fully prepared projectionless commit retains its branch owners");
+        if let (Some(leaving), Some(rebind)) = (leaving.as_mut(), leaving_rebind) {
+            leaving.apply_claim_rebind(rebind);
+        }
+        entering.apply_claim_rebind(entering_rebind);
+        if let Some(rebase) = root_rebase {
+            entering.apply_root_rebase(rebase);
+        }
+        let next_active = Some(entering);
+        let next_cleanup = Some(CleanupLedger::activate_leaving_branch(
+            cleanup_ledger,
+            leaving,
+        ));
+        let active_owner = &mut entry.active;
+        let cleanup_owner = &mut entry.cleanup_ledger;
+        engine.publish(|| {
+            presentation_plan.apply_staged(
+                |_| focus_plan.apply(),
+                |_| registry_plan.apply(&mut registry),
+                |_| gate_plan.apply(),
+            );
+            *active_owner = next_active;
+            *cleanup_owner = next_cleanup;
+        });
+        Some(())
+    })();
+    if committed.is_some() {
+        return;
+    }
+    world.resource_scope(
+        |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == handle)
+                .unwrap();
+            if branch_owners.is_none() {
+                let result = if entry.active.is_some() {
+                    fail_closed_projectionless_replacement_contradiction(world, entry, pending)
+                } else {
+                    reject_projectionless_fallback_pending(
+                        entry,
+                        pending,
+                        "initial fallback final preparation rejected",
+                    );
+                    Ok(())
+                };
+                if let Err(pending) = result {
+                    entry.pending_commit = Some(pending);
+                }
+                return;
+            }
+            let result = (|| {
+                let Some(()) = committed else {
+                    let (leaving, entering) = branch_owners
+                        .take()
+                        .expect("failed projectionless commit retains its branch owners");
+                    pending.branch = PreparedBranch::from_realized(entering);
+                    return match failure
+                        .expect("projectionless commit returns None only with typed failure")
+                    {
+                        ProjectionlessCommitFailure::InitialPostReportAuthorityLost { reason } => {
+                            match fail_closed_normal_owner_protocol(
+                                world,
+                                entry,
+                                leaving.unwrap_or_else(RealizedBranch::empty),
+                                pending,
+                                AuthorityProtocolResidualKind::Authority(reason),
+                            ) {
+                                Ok(()) => Ok(()),
+                                Err((active, pending)) => {
+                                    entry.active = (!active.frames().is_empty()).then_some(active);
+                                    Err(pending)
+                                }
+                            }
+                        }
+                        ProjectionlessCommitFailure::PostReportAuthorityLost {
+                            admission,
+                            reason,
+                        } => {
+                            let active = leaving.expect(
+                                "projectionless replacement continuation retains active owner",
+                            );
+                            let source = ProjectionlessFailCloseSource::freeze(
+                                world, entry, admission, reason, &active, &pending,
+                            );
+                            match settle_projectionless_fail_close(
+                                world, entry, active, pending, source,
+                            ) {
+                                Ok(()) => Ok(()),
+                                Err((active, pending, source)) => {
+                                    entry.active = Some(active);
+                                    entry.pending_commit = Some(pending);
+                                    entry.projectionless_fail_close = Some(
+                                        ProjectionlessFailCloseContinuation::Retryable(source),
+                                    );
+                                    Ok(())
+                                }
+                            }
+                        }
+                    };
+                };
+                Ok(())
+            })();
+            if let Err(pending) = result {
+                entry.pending_commit = Some(pending);
+            }
+        },
+    );
 }
 
 fn focus_targets_for_commit(

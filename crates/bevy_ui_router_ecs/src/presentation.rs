@@ -2354,6 +2354,38 @@ pub(crate) fn prepare_presentation_with_pointer_revocation<'w>(
     targets: &[FrameMutationTarget],
     pointer_targets: &[Entity],
 ) -> Option<PreparedPresentationMutation<'w>> {
+    prepare_presentation_access(world, targets, pointer_targets, false).map(|access| access.0)
+}
+
+/// All publication receivers remain components on their exact resource
+/// entities. Dropping these borrows never inserts a component or flushes World.
+pub(crate) struct PublicationResources<'w> {
+    pub(crate) navigation: Mut<'w, crate::navigation::RouterNavigation>,
+    pub(crate) registry: Mut<'w, RouteEntityRegistry>,
+    pub(crate) gate: Mut<'w, crate::input::RouterInputGate>,
+    pub(crate) input_focus: Mut<'w, InputFocus>,
+    pub(crate) route_focus: Mut<'w, RouteFocusState>,
+}
+
+pub(crate) fn prepare_publication_access<'w>(
+    world: &'w mut World,
+    targets: &[FrameMutationTarget],
+    pointer_targets: &[Entity],
+) -> Option<(PreparedPresentationMutation<'w>, PublicationResources<'w>)> {
+    let (presentation, resources) =
+        prepare_presentation_access(world, targets, pointer_targets, true)?;
+    Some((presentation, resources?))
+}
+
+fn prepare_presentation_access<'w>(
+    world: &'w mut World,
+    targets: &[FrameMutationTarget],
+    pointer_targets: &[Entity],
+    publication: bool,
+) -> Option<(
+    PreparedPresentationMutation<'w>,
+    Option<PublicationResources<'w>>,
+)> {
     // Preserve the original presentation query's default-filter eligibility.
     // Native pointer history, unlike presentation mutation, must still be
     // reachable for entities disabled after the gesture began.
@@ -2374,6 +2406,11 @@ pub(crate) fn prepare_presentation_with_pointer_revocation<'w>(
     let hover_entity = pointer_resource_entity::<HoverMap>(world);
     let previous_hover_entity = pointer_resource_entity::<PreviousHoverMap>(world);
     let state_entity = pointer_resource_entity::<PointerState>(world);
+    let navigation_entity = pointer_resource_entity::<crate::navigation::RouterNavigation>(world);
+    let registry_entity = pointer_resource_entity::<RouteEntityRegistry>(world);
+    let gate_entity = pointer_resource_entity::<crate::input::RouterInputGate>(world);
+    let input_focus_entity = pointer_resource_entity::<InputFocus>(world);
+    let route_focus_entity = pointer_resource_entity::<RouteFocusState>(world);
     let mut query = pointer_query::<(
         Entity,
         Option<(
@@ -2387,12 +2424,41 @@ pub(crate) fn prepare_presentation_with_pointer_revocation<'w>(
         Option<&mut HoverMap>,
         Option<&mut PreviousHoverMap>,
         Option<&mut PointerState>,
+        (
+            Option<&mut crate::navigation::RouterNavigation>,
+            Option<&mut RouteEntityRegistry>,
+            Option<&mut crate::input::RouterInputGate>,
+            Option<&mut InputFocus>,
+            Option<&mut RouteFocusState>,
+        ),
     )>(world);
     let mut found = vec![false; targets.len()];
     let mut entities = Vec::with_capacity(targets.len());
     let mut pointer_interactions = Vec::with_capacity(pointer_targets.len());
     let mut pointer_resources = PointerStateResources::default();
-    for (entity, presentation, interaction, hover, previous_hover, state) in query.iter_mut(world) {
+    let (mut navigation, mut registry, mut gate, mut input_focus, mut route_focus) =
+        (None, None, None, None, None);
+    for (entity, presentation, interaction, hover, previous_hover, state, resources) in
+        query.iter_mut(world)
+    {
+        let (nav, reg, input_gate, focus, route) = resources;
+        if publication {
+            if Some(entity) == navigation_entity {
+                navigation = nav;
+            }
+            if Some(entity) == registry_entity {
+                registry = reg;
+            }
+            if Some(entity) == gate_entity {
+                gate = input_gate;
+            }
+            if Some(entity) == input_focus_entity {
+                input_focus = focus;
+            }
+            if Some(entity) == route_focus_entity {
+                route_focus = route;
+            }
+        }
         if Some(entity) == hover_entity {
             pointer_resources.hover = hover;
         }
@@ -2473,13 +2539,24 @@ pub(crate) fn prepare_presentation_with_pointer_revocation<'w>(
         ));
     }
     entities.sort_by_key(|(index, _)| *index);
-    found
-        .into_iter()
-        .all(|present| present)
-        .then_some(PreparedPresentationMutation {
+    let resources = if publication {
+        Some(PublicationResources {
+            navigation: navigation?,
+            registry: registry?,
+            gate: gate?,
+            input_focus: input_focus?,
+            route_focus: route_focus?,
+        })
+    } else {
+        None
+    };
+    found.into_iter().all(|present| present).then_some((
+        PreparedPresentationMutation {
             entities,
             pointer: pointer_resources.prepare(pointer_targets, pointer_interactions),
-        })
+        },
+        resources,
+    ))
 }
 
 pub(crate) fn prepare_cleanup_quarantine_mutation<'w>(

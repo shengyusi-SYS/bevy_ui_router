@@ -1,6 +1,6 @@
 # Current Architecture
 
-**类型**：实现事实与差距。**更新时间**：2026-09-08。**runtime 迁移**：从 `sys/structural-governance` 的 `0799098` 前向精简，后台 reaper 与公开 audit/probe 已退出；生产 BSN 迁移尚未完成。
+**类型**：实现事实与差距。**更新时间**：2026-09-12。**runtime 迁移**：从 `sys/structural-governance` 的 `0799098` 前向精简，后台 reaper 与公开 audit/probe 已退出；生产 BSN 迁移尚未完成。
 
 范围与验收以 [统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md) 为准，后续工作见 [实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)。
 
@@ -24,7 +24,9 @@ ECS 的私有 BSN preparation 已调用真实官方 `ScenePatch::load/resolve`�
 
 原生 pointer 的既有 hover/press/click/drag/祖先缓存与 `PickingInteraction` 已在三个正常 publication 入口及 authority isolation 的同一 exclusive 调用内撤销。正常发布通过 exact resource Entity 联合查询预借资源/组件，新增 pointer tail 只做原位修改；历史目标或资源 Entity 被禁用也不会漏清，正常 presentation 的默认查询过滤不因此放宽。post-commit 的观察 partition 不再被全量用作撤权目标，protected/app 状态保持。`Refresh` 与 `generate_hovermap` 之后、`update_interactions`/`pointer_events` 之前的定点过滤继续防止旧或新非活动命中派发。此接线仍以现有内容名单为基础；native current containment、Scene staging/AutoFocus 与 idle host-loss 的联动仍未闭合。
 
-**已确认的资源借用缺口**：官方 Bevy 0.19.1 的 Resource 是 Entity component；`resource_scope` 退出会重新插入组件、改变 tick，并可能执行 hook/flush，不能当作纯借用。既有 publication 外层的 gate/focus/registry 等资源 scope 仍需迁移并验证，不能只检查显式 tail 函数体就宣称整个 publication 边界无结构写入。
+三个成功发布路径（normal reconciliation、Back target、projectionless fallback）现已将 World preparation 及外层 `RouterNavigation` 资源 scope 的退出放到最终复验之前，再按 exact resource Entity 联合借用常驻 navigation/registry/gate/focus/pointer/presentation。原 active/cleanup owner 在 Core publication 前安装，发布后不再通过资源重新插入补装 owner。Back 最终复验比较完整 leaving 与 RetainEmpty focus 来源；来源漂移沿现有 pending rejection 同调用归还原 active，再由正常调度清理与 fallback，不让临时 owner 存放位置导致下一次 Refresh 误撤有效权限。仅 focus 值变化仍可发布，等价 gate 变化保持原顺序与 tick。此迁移不宣称其它 terminal、cleanup、no-target 或 snapshot 路径的资源边界全部闭合，也不替代 native current-containment 接线。
+
+无 active 的初始 unbound RouterFallback 在发布前失去 host 时，Core 现在接纳原 failed Task source 进入现有 authority settlement，保持 `HostLost` 而非协议错误；有 active 的 fallback 不由此窄分支接纳。Core 保留其合法逻辑 roots 选择，ECS 则提交实际 pending 的完整物理义务。无候选观察也已复用完整 permit outcome 处理，避免丢失 Issued owner 后重新注册永远 Outstanding。上述修复不等于完全 idle 的 host-loss 主动检测已实现。
 
 **待确认的 focus 集成边界**：官方 `InputFocus` 没有直接按 target 过滤待派发变化队列的公开入口。Scene apply 后整体恢复快照虽可抑制 pending `AutoFocus`，也会撤销同次 Scene 对其它有效目标的合法 focus 改写；目前不采用该无条件恢复方案。若选择构建期 focus 变化不生效、应用在 Scene 执行之外显式设置焦点，需要先明确接受这一限制，不把它默认为既有合同。
 

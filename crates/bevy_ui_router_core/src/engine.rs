@@ -7010,7 +7010,23 @@ impl RouterEngine {
             ));
         }
         let valid_common_phase = self.current.as_ref().is_some_and(|current| {
-            current.reconciliation.is_some() && current.retired_host.is_none()
+            // A consumed Task source covers the unbound fallback's current/target
+            // roots, but never an existing committed presentation's roots.
+            let initial_fallback_task = failed.as_ref().is_some_and(|source| {
+                matches!(
+                    source.logical_roots,
+                    FailedAuthoritySettlementLogicalRoots::Task { .. }
+                )
+            }) && matches!(
+                current.attempt,
+                AttemptKind::Fallback {
+                    bound_error: None,
+                    ..
+                }
+            ) && self.state.active().kind()
+                == ActivePresentationKind::None;
+            (current.reconciliation.is_some() || initial_fallback_task)
+                && current.retired_host.is_none()
         }) && self.action.is_none()
             && self.current_reconciliation_matches_active();
         let valid_source_phase = match &failed {

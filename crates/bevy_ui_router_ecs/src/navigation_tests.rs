@@ -16507,32 +16507,47 @@ fn stage_real_back_target_ready_plan_permanent(
         .and_then(|entry| entry.host.as_ref())
         .expect("the real Ready-plan fixture retains its exact host binding")
         .host;
-    let ready_plan_owner = app.world_mut().resource_scope(
-            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
-                let input_gate = world
-                    .remove_resource::<RouterInputGate>()
-                    .expect("the real fixture starts with its Router input gate");
-                let entry = navigation
-                    .entries
-                    .iter_mut()
-                    .find(|entry| entry.handle == router)
-                    .expect("the real Ready-plan fixture retains its exact entry");
-                assert!(
-                    drive_back_target_applied_commit(world, entry),
-                    "the real applied commit must run through classifier Ready into plan preparation"
-                );
-                world.insert_resource(input_gate);
-                let Some(PendingBackTargetExecution::Classifying(
-                    PendingBackTargetClassification::ReadyPlanPermanent(owner),
-                )) = entry.pending_back_target_execution.take()
-                else {
-                    panic!(
-                        "the production missing-resource plan predicate must retain the whole Ready-plan permanent source"
-                    )
-                };
-                owner
-            },
-        );
+    let input_gate = app
+        .world_mut()
+        .remove_resource::<RouterInputGate>()
+        .expect("the real fixture starts with its Router input gate");
+    let (pending, owner) = app.world_mut().resource_scope(
+        |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == router)
+                .unwrap();
+            assert!(drive_back_target_applied_commit(world, entry));
+            let Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::ReadyAwaitingAcceptance(owner),
+            )) = entry.pending_back_target_execution.take()
+            else {
+                panic!("the real classifier must retain the Ready acceptance owner");
+            };
+            (entry.pending_commit.take().unwrap(), owner)
+        },
+    );
+    // The production publisher now starts after every preparation scope exits.
+    publish_ready_back_target(app.world_mut(), router, pending, owner);
+    app.world_mut().insert_resource(input_gate);
+    let ready_plan_owner = {
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter_mut()
+            .find(|entry| entry.handle == router)
+            .unwrap();
+        let Some(PendingBackTargetExecution::Classifying(
+            PendingBackTargetClassification::ReadyPlanPermanent(owner),
+        )) = entry.pending_back_target_execution.take()
+        else {
+            panic!(
+                "the production missing-resource plan predicate must retain the whole Ready-plan permanent source"
+            );
+        };
+        owner
+    };
     let PreparationPermanentEvidence::PhysicalPreparationContradiction(evidence) =
         &ready_plan_owner.evidence;
     assert_eq!(
@@ -42783,6 +42798,1201 @@ fn commits_preserve_other_router_gate_permissions() {
     let gate = app.world().resource::<RouterInputGate>();
     assert_eq!(outputs.len(), 2);
     assert!(outputs.iter().all(|entity| gate.allows_pointer(*entity)));
+}
+
+type PublicationResourceEvents = std::sync::Arc<std::sync::Mutex<Vec<(&'static str, bool)>>>;
+
+fn publication_was_committed(
+    navigation: &RouterNavigation,
+    router: RouterHandle,
+    request: NavigationRequestId,
+) -> bool {
+    navigation
+        .entries
+        .iter()
+        .find(|entry| entry.handle == router)
+        .and_then(|entry| entry.engine.request(request))
+        .is_some_and(|record| {
+            record
+                .trace()
+                .iter()
+                .any(|event| event.kind() == NavigationTraceEventKind::CommitPublished)
+        })
+}
+
+fn observe_publication_resource<R: Resource>(
+    world: &mut World,
+    router: RouterHandle,
+    request: NavigationRequestId,
+    label: &'static str,
+    events: &PublicationResourceEvents,
+) {
+    let resource = crate::input::pointer_resource_entity::<R>(world).unwrap();
+    let inserts = events.clone();
+    world.add_observer(
+        move |event: On<bevy_ecs::lifecycle::Insert, R>,
+              navigation: Option<bevy_ecs::prelude::Res<RouterNavigation>>| {
+            if event.entity == resource {
+                inserts.lock().unwrap().push((
+                    label,
+                    navigation.is_some_and(|navigation| {
+                        publication_was_committed(&navigation, router, request)
+                    }),
+                ));
+            }
+        },
+    );
+    let removals = events.clone();
+    world.add_observer(
+        move |event: On<bevy_ecs::lifecycle::Remove, R>,
+              navigation: Option<bevy_ecs::prelude::Res<RouterNavigation>>| {
+            if event.entity == resource {
+                removals.lock().unwrap().push((
+                    label,
+                    navigation.is_some_and(|navigation| {
+                        publication_was_committed(&navigation, router, request)
+                    }),
+                ));
+            }
+        },
+    );
+}
+
+fn publication_resource_entities(world: &World) -> Vec<Entity> {
+    vec![
+        crate::input::pointer_resource_entity::<RouterNavigation>(world).unwrap(),
+        crate::input::pointer_resource_entity::<RouteEntityRegistry>(world).unwrap(),
+        crate::input::pointer_resource_entity::<RouterInputGate>(world).unwrap(),
+        crate::input::pointer_resource_entity::<InputFocus>(world).unwrap(),
+        crate::input::pointer_resource_entity::<RouteFocusState>(world).unwrap(),
+    ]
+}
+
+#[test]
+fn back_publication_refreezes_complete_retain_empty_focus_source() {
+    for focus_descendant in [false, true] {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = install_nested_router(&mut app, observed, true);
+        app.update();
+        for location in [RouteLocation::new("/"), RouteLocation::new("/items/1")] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, location)
+                .unwrap();
+            run_updates_until_succeeded(&mut app, request);
+        }
+        let retained_slot = app.world().resource::<RouterNavigation>().entries[0]
+            .active
+            .as_ref()
+            .unwrap()
+            .child_slots()[0]
+            .slot();
+        let foreign = app.world_mut().spawn(ChildOf(retained_slot)).id();
+        let focused = if focus_descendant {
+            foreign
+        } else {
+            retained_slot
+        };
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(focused);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(focused));
+        let back = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .back(router)
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        let work = app.world_mut().resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                prepare_commit_entry(world, &mut navigation.entries[0])
+            },
+        );
+        let Some(PendingPublicationWork::Back { pending, owner }) = work else {
+            panic!("real nested Back truncation must reach the target publisher");
+        };
+        assert!(
+            owner
+                .physical
+                .classified
+                .splice
+                .slot_roles()
+                .iter()
+                .any(
+                    |role| role.kind() == ReconciliationSlotRoleKind::RetainEmpty
+                        && role.entity() == retained_slot
+                )
+        );
+        assert!(owner.physical.focus_leaving.contains(&retained_slot));
+        assert!(owner.physical.focus_leaving.contains(&foreign));
+        let leaving_only =
+            validate_branch_descendants(app.world(), owner.physical.classified.splice.leaving())
+                .unwrap();
+        assert!(!leaving_only.contains(&retained_slot));
+        assert!(
+            !leaving_only.contains(&foreign),
+            "RetainEmpty descendants are a separate focus source"
+        );
+        assert!(
+            owner
+                .physical
+                .focus_leaving
+                .windows(2)
+                .all(|pair| pair[0].to_bits() < pair[1].to_bits()),
+            "the complete focus source is canonical and duplicate-free"
+        );
+        publish_ready_back_target(app.world_mut(), router, pending, owner);
+        assert!(publication_was_committed(
+            app.world().resource::<RouterNavigation>(),
+            router,
+            back
+        ));
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+        assert_eq!(app.world().resource::<RouteFocusState>().focused(), None);
+        run_updates_until_succeeded(&mut app, back);
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.history().current(),
+            Some(&RouteLocation::new("/"))
+        );
+        assert_eq!(
+            entry.active.as_ref().unwrap().child_slots()[0].slot(),
+            retained_slot
+        );
+        assert!(entry.pending_back_target_execution.is_none());
+        assert!(entry.pending_commit.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert_eq!(
+            app.world().get::<Visibility>(retained_slot),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(
+            app.world().get::<ChildOf>(foreign).map(ChildOf::parent),
+            Some(retained_slot)
+        );
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(foreign)
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn back_publication_refreezes_focus_when_foreign_child_enters_leaving_output() {
+    assert_back_publication_focus_after_preparation_observer(Some(true));
+}
+
+#[test]
+fn back_publication_refreezes_focus_when_foreign_child_leaves_leaving_output() {
+    assert_back_publication_focus_after_preparation_observer(Some(false));
+}
+
+#[test]
+fn back_publication_refreezes_focus_value_without_rejecting_unchanged_closure() {
+    assert_back_publication_focus_after_preparation_observer(None);
+}
+
+fn assert_back_publication_focus_after_preparation_observer(move_into_leaving: Option<bool>) {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let router = install_atomic_router(&mut app, "back-final-focus-closure");
+    observe_authority_system(app.world_mut());
+    for location in [
+        RouteLocation::new("/"),
+        RouteLocation::new("/").with_fragment("second"),
+    ] {
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, location)
+            .unwrap();
+        run_updates_until_succeeded(&mut app, request);
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    let history_before = entry.engine.history().clone();
+    let core_active_before = entry.engine.active().clone();
+    let active_claims_before = entry
+        .active
+        .as_ref()
+        .unwrap()
+        .claims()
+        .cloned()
+        .collect::<Vec<_>>();
+    let leaving_output = entry.active.as_ref().unwrap().interactive_entities()[0];
+    let foreign = app.world_mut().spawn(CleanupDriftMarker).id();
+    if move_into_leaving == Some(false) {
+        app.world_mut()
+            .entity_mut(leaving_output)
+            .add_child(foreign);
+    }
+    let before_focus = app.world_mut().spawn_empty().id();
+    *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(before_focus);
+    app.world_mut()
+        .resource_mut::<RouteFocusState>()
+        .set_focused(Some(before_focus));
+    let back = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(router)
+        .unwrap();
+    collect_navigation_system(app.world_mut());
+    drive_navigation_system(app.world_mut());
+    let entering_claims = app.world().resource::<RouterNavigation>().entries[0]
+        .pending_commit
+        .as_ref()
+        .unwrap()
+        .branch
+        .as_realized()
+        .claims()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(!entering_claims.is_empty());
+    assert!(
+        app.world()
+            .resource::<RouteEntityRegistry>()
+            .record(foreign)
+            .is_none()
+    );
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observer_fired = fired.clone();
+    app.world_mut().add_observer(
+        move |_: On<bevy_ecs::lifecycle::Insert, RouterNavigation>,
+              navigation: bevy_ecs::prelude::Res<RouterNavigation>,
+              mut commands: bevy_ecs::prelude::Commands,
+              mut focus: bevy_ecs::prelude::ResMut<InputFocus>,
+              mut route_focus: bevy_ecs::prelude::ResMut<RouteFocusState>| {
+            if observer_fired.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            assert!(!publication_was_committed(&navigation, router, back));
+            assert_eq!(navigation.entries[0].engine.active(), &core_active_before);
+            match move_into_leaving {
+                Some(true) => {
+                    commands.entity(leaving_output).add_child(foreign);
+                }
+                Some(false) => {
+                    commands.entity(foreign).remove::<ChildOf>();
+                }
+                None => {}
+            }
+            *focus = InputFocus::from_entity(foreign);
+            route_focus.set_focused(Some(foreign));
+        },
+    );
+    commit_presentation_system(app.world_mut());
+    assert!(fired.load(Ordering::SeqCst));
+    assert_eq!(
+        app.world().get::<ChildOf>(foreign).map(ChildOf::parent),
+        (move_into_leaving == Some(true)).then_some(leaving_output)
+    );
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    let published =
+        publication_was_committed(app.world().resource::<RouterNavigation>(), router, back);
+    if move_into_leaving.is_some() {
+        assert!(
+            !published,
+            "changed frozen Back focus closure must not publish: move_into={move_into_leaving:?}, input={:?}, route={:?}, leaving_visibility={:?}, pending_owner={}, execution_owner={}",
+            app.world().resource::<InputFocus>().get(),
+            app.world().resource::<RouteFocusState>().focused(),
+            app.world().get::<Visibility>(leaving_output),
+            entry.pending_commit.is_some(),
+            entry.pending_back_target_execution.is_some()
+        );
+        assert_eq!(entry.engine.history(), &history_before);
+        assert!(entry.pending_commit.is_none());
+        assert!(entry.pending_back_target_execution.is_none());
+        let failed = entry.pending_failed_branch.as_ref().expect(
+            "focus-source drift must return the original entering owner to driven failed cleanup before Refresh",
+        );
+        let PendingFailedBranchTerminal::BackTargetPendingRejected { request, evidence } =
+            &failed.terminal
+        else {
+            panic!("the original pending-rejection cleanup continuation must remain typed");
+        };
+        assert_eq!(request.request(), back);
+        assert_eq!(request.failure().kind(), NavigationFailureKind::Apply);
+        assert_eq!(
+            failed_branch_primary_claims(&failed.branch)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            entering_claims
+        );
+        assert_eq!(
+            *evidence,
+            LifecyclePreflightEvidence::new(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactRelationshipClosure,
+                LifecyclePreflightObserved::Drifted,
+            )
+        );
+        assert_eq!(
+            entry
+                .active
+                .as_ref()
+                .unwrap()
+                .claims()
+                .cloned()
+                .collect::<Vec<_>>(),
+            active_claims_before,
+            "the real current owner must be restored before the next scheduled Refresh"
+        );
+        assert!(
+            app.world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(leaving_output)
+        );
+        assert!(
+            app.world()
+                .resource::<RouterInputGate>()
+                .allows_keyboard(leaving_output)
+        );
+        assert!(
+            app.world()
+                .resource::<RouterInputGate>()
+                .allows_gamepad(leaving_output)
+        );
+        assert!(entry.cleanup_ledger.is_none());
+        for claim in &entering_claims {
+            assert_eq!(
+                &app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(claim.entity())
+                    .unwrap()
+                    .claim(),
+                claim
+            );
+        }
+    } else {
+        assert!(
+            published,
+            "a focused-value update does not change the frozen target closure"
+        );
+        assert!(entry.pending_commit.is_none());
+        assert!(entry.cleanup_ledger.is_some());
+        assert!(entry.active.is_some());
+    }
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(foreign));
+    assert_eq!(
+        app.world().resource::<RouteFocusState>().focused(),
+        Some(foreign)
+    );
+
+    for _ in 0..16 {
+        app.update();
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        if matches!(
+            entry.engine.request(back).unwrap().status(),
+            RequestStatus::Succeeded | RequestStatus::Failed(_)
+        ) {
+            break;
+        }
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    let request = entry.engine.request(back).unwrap();
+    if move_into_leaving.is_some() {
+        assert!(
+            matches!(request.status(), RequestStatus::Failed(failure)
+            if failure.kind() == NavigationFailureKind::Apply),
+            "rejected Back must complete cleanup and fallback: {:?}",
+            request.status()
+        );
+        assert_eq!(
+            entry.engine.history(),
+            &history_before,
+            "fallback must not advance the rejected Back history intent"
+        );
+        assert_eq!(
+            entry.active.as_ref().unwrap().frames()[0].frame().origin(),
+            &FrameOrigin::RouterFallback
+        );
+        assert!(entering_claims.iter().all(|claim| {
+            app.world().get_entity(claim.entity()).is_err()
+                && app
+                    .world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(claim.entity())
+                    .is_none()
+        }));
+    } else {
+        assert!(matches!(request.status(), RequestStatus::Succeeded));
+    }
+    assert_eq!(
+        request
+            .trace()
+            .iter()
+            .filter(|event| event.kind() == NavigationTraceEventKind::CommitPublished)
+            .count(),
+        1,
+        "only the successful target or subsequent fallback may publish"
+    );
+    assert!(entry.pending_commit.is_none());
+    assert!(entry.pending_frame_drive.is_none());
+    assert!(entry.pending_failed_branch.is_none());
+    assert!(entry.pending_back_target_execution.is_none());
+    assert!(entry.pending_back_target_permanent_cleanup.is_none());
+    assert!(entry.cleanup_ledger.is_none());
+    assert!(entry.failure_cleanup_permanent.is_none());
+    assert!(entry.authority_protocol_residual.is_none());
+    assert!(entry.back_capacity_reservations.is_empty());
+    assert!(
+        app.world().get_entity(foreign).is_ok(),
+        "the application entity is never cleanup-owned"
+    );
+    assert!(
+        app.world()
+            .resource::<RouteEntityRegistry>()
+            .record(foreign)
+            .is_none()
+    );
+    assert_eq!(
+        app.world().get::<ChildOf>(foreign).map(ChildOf::parent),
+        (move_into_leaving == Some(true)).then_some(leaving_output)
+    );
+    let final_focus = (move_into_leaving != Some(true)).then_some(foreign);
+    assert_eq!(app.world().resource::<InputFocus>().get(), final_focus);
+    assert_eq!(
+        app.world().resource::<RouteFocusState>().focused(),
+        final_focus
+    );
+    let gate = app.world().resource::<RouterInputGate>();
+    assert!(!gate.allows_pointer(foreign));
+    assert!(!gate.allows_keyboard(foreign));
+    assert!(!gate.allows_gamepad(foreign));
+    assert!(
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+            .engine
+            .action()
+            .is_none()
+    );
+}
+
+#[test]
+fn publication_does_not_trigger_resource_observers_after_core_commit() {
+    use bevy_picking::{events::PointerState, hover::PreviousHoverMap};
+    for case in [
+        "root",
+        "replace",
+        "back",
+        "equivalent",
+        "fallback",
+        "initial-fallback",
+    ] {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = if case == "fallback" {
+            install_failing_root_replacement_router(&mut app, case)
+        } else {
+            install_atomic_router(&mut app, case)
+        };
+        observe_authority_system(app.world_mut());
+        if case != "root" && case != "initial-fallback" {
+            let initial = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(
+                    router,
+                    RouteLocation::new(if case == "fallback" { "/one" } else { "/" }),
+                )
+                .unwrap();
+            run_updates_until_succeeded(&mut app, initial);
+        }
+        if case == "back" {
+            let second = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new("/").with_fragment("second"))
+                .unwrap();
+            run_updates_until_succeeded(&mut app, second);
+        }
+        let before_entities = app.world().resource::<RouterNavigation>().entries[0]
+            .active
+            .as_ref()
+            .map(RealizedBranch::interactive_entities)
+            .unwrap_or_default();
+        let app_focus = app.world_mut().spawn_empty().id();
+        let focused = before_entities.first().copied().unwrap_or(app_focus);
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(focused);
+        app.world_mut()
+            .resource_mut::<RouteFocusState>()
+            .set_focused(Some(app_focus));
+        let request = {
+            let mut nav = app.world_mut().resource_mut::<RouterNavigation>();
+            match case {
+                "replace" => nav
+                    .replace(router, RouteLocation::new("/").with_fragment("replaced"))
+                    .unwrap(),
+                "back" => nav.back(router).unwrap(),
+                "fallback" => nav.push(router, RouteLocation::new("/two")).unwrap(),
+                "initial-fallback" => nav.push(router, RouteLocation::new("/unmatched")).unwrap(),
+                _ => nav.push(router, RouteLocation::new("/")).unwrap(),
+            }
+        };
+        collect_navigation_system(app.world_mut());
+        if case == "fallback" || case == "initial-fallback" {
+            drive_until_projectionless_fallback_pending(&mut app);
+        } else {
+            drive_navigation_system(app.world_mut());
+        }
+        assert!(!publication_was_committed(
+            app.world().resource::<RouterNavigation>(),
+            router,
+            request
+        ));
+        app.world_mut().init_resource::<HoverMap>();
+        app.world_mut().init_resource::<PreviousHoverMap>();
+        app.world_mut().init_resource::<PointerState>();
+        let events = PublicationResourceEvents::default();
+        observe_publication_resource::<RouterNavigation>(
+            app.world_mut(),
+            router,
+            request,
+            "navigation",
+            &events,
+        );
+        observe_publication_resource::<RouterInputGate>(
+            app.world_mut(),
+            router,
+            request,
+            "gate",
+            &events,
+        );
+        observe_publication_resource::<InputFocus>(
+            app.world_mut(),
+            router,
+            request,
+            "input-focus",
+            &events,
+        );
+        observe_publication_resource::<RouteFocusState>(
+            app.world_mut(),
+            router,
+            request,
+            "route-focus",
+            &events,
+        );
+        observe_publication_resource::<RouteEntityRegistry>(
+            app.world_mut(),
+            router,
+            request,
+            "registry",
+            &events,
+        );
+        observe_publication_resource::<HoverMap>(
+            app.world_mut(),
+            router,
+            request,
+            "hover",
+            &events,
+        );
+        observe_publication_resource::<PreviousHoverMap>(
+            app.world_mut(),
+            router,
+            request,
+            "previous-hover",
+            &events,
+        );
+        observe_publication_resource::<PointerState>(
+            app.world_mut(),
+            router,
+            request,
+            "pointer-state",
+            &events,
+        );
+        let input = app.world_mut().remove_resource::<InputFocus>().unwrap();
+        app.world_mut().insert_resource(input);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [("input-focus", false), ("input-focus", false)]
+        );
+        events.lock().unwrap().clear();
+        let identities = publication_resource_entities(app.world());
+        let registry_tick = app
+            .world()
+            .get_resource_change_ticks::<RouteEntityRegistry>()
+            .unwrap()
+            .changed;
+        let gate_tick = app
+            .world()
+            .get_resource_change_ticks::<RouterInputGate>()
+            .unwrap()
+            .changed;
+        app.world_mut().increment_change_tick();
+        commit_presentation_system(app.world_mut());
+        let navigation = app.world().resource::<RouterNavigation>();
+        assert!(
+            publication_was_committed(navigation, router, request),
+            "{case}"
+        );
+        let entry = &navigation.entries[0];
+        assert!(entry.pending_commit.is_none(), "{case}");
+        assert!(entry.cleanup_ledger.is_some(), "{case}");
+        let active = entry.active.as_ref().unwrap();
+        assert!(
+            active.interactive_entities().iter().all(|target| app
+                .world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(*target)),
+            "{case}"
+        );
+        if case == "equivalent" {
+            assert_eq!(active.interactive_entities(), before_entities);
+            assert_eq!(
+                app.world()
+                    .get_resource_change_ticks::<RouteEntityRegistry>()
+                    .unwrap()
+                    .changed,
+                registry_tick
+            );
+            assert_eq!(
+                app.world()
+                    .get_resource_change_ticks::<RouterInputGate>()
+                    .unwrap()
+                    .changed,
+                gate_tick
+            );
+        }
+        assert_eq!(
+            app.world().resource::<RouteFocusState>().focused(),
+            Some(app_focus),
+            "{case}"
+        );
+        if ["replace", "back", "fallback"].contains(&case) {
+            assert_eq!(app.world().resource::<InputFocus>().get(), None, "{case}");
+            assert!(
+                before_entities.iter().all(|target| !app
+                    .world()
+                    .resource::<RouterInputGate>()
+                    .allows_pointer(*target)),
+                "{case}"
+            );
+        } else {
+            assert_eq!(app.world().resource::<InputFocus>().get(), Some(focused));
+        }
+        assert_eq!(publication_resource_entities(app.world()), identities);
+        let observed = events.lock().unwrap().clone();
+        events.lock().unwrap().clear();
+        let input = app.world_mut().remove_resource::<InputFocus>().unwrap();
+        app.world_mut().insert_resource(input);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [("input-focus", true), ("input-focus", true)]
+        );
+        assert!(
+            !observed.iter().any(|(_, published)| *published),
+            "{case}: resource observers ran after this request's actual Core publication: {observed:?}"
+        );
+    }
+}
+
+#[test]
+fn publication_refreezes_host_after_preparation_resource_observer() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let router = install_atomic_router(&mut app, "publication-observer-host-drift");
+    observe_authority_system(app.world_mut());
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/"))
+        .unwrap();
+    collect_navigation_system(app.world_mut());
+    drive_navigation_system(app.world_mut());
+    let host = app.world().resource::<RouterNavigation>().entries[0]
+        .host
+        .as_ref()
+        .unwrap()
+        .host;
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observer_fired = fired.clone();
+    app.world_mut().add_observer(
+        move |_: On<bevy_ecs::lifecycle::Insert, RouterNavigation>,
+              mut commands: bevy_ecs::prelude::Commands| {
+            if !observer_fired.swap(true, Ordering::SeqCst) {
+                commands.entity(host).remove::<RouterHostRegistration>();
+            }
+        },
+    );
+    commit_presentation_system(app.world_mut());
+    assert!(fired.load(Ordering::SeqCst));
+    assert!(app.world().get::<RouterHostRegistration>(host).is_none());
+    assert!(!publication_was_committed(
+        app.world().resource::<RouterNavigation>(),
+        router,
+        request
+    ));
+    for _ in 0..16 {
+        app.update();
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.engine.history().is_empty());
+        if matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(_)
+        ) {
+            break;
+        }
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(
+        matches!(entry.engine.request(request).unwrap().status(), RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::HostLost)
+    );
+    assert!(entry.pending_commit.is_none());
+    assert!(entry.active.is_none());
+    assert!(!publication_was_committed(
+        app.world().resource::<RouterNavigation>(),
+        router,
+        request
+    ));
+    assert!(app.world().get_entity(host).is_ok());
+}
+
+#[test]
+fn publication_preserves_valid_focus_written_by_preparation_observer() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let router = install_atomic_router(&mut app, "publication-observer-focus");
+    observe_authority_system(app.world_mut());
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/"))
+        .unwrap();
+    collect_navigation_system(app.world_mut());
+    drive_navigation_system(app.world_mut());
+    let target = app.world_mut().spawn_empty().id();
+    app.world_mut().add_observer(
+        move |_: On<bevy_ecs::lifecycle::Insert, RouterNavigation>,
+              mut focus: bevy_ecs::prelude::ResMut<InputFocus>| {
+            *focus = InputFocus::from_entity(target);
+        },
+    );
+    commit_presentation_system(app.world_mut());
+    assert!(publication_was_committed(
+        app.world().resource::<RouterNavigation>(),
+        router,
+        request
+    ));
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(target));
+}
+
+#[test]
+fn publication_missing_required_resource_after_preparation_keeps_original_failure_owner() {
+    for fallback in [false, true] {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "publication-missing-focus");
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new(if fallback { "/unmatched" } else { "/" }),
+            )
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        if fallback {
+            drive_until_projectionless_fallback_pending(&mut app);
+        } else {
+            drive_navigation_system(app.world_mut());
+        }
+        app.world_mut().add_observer(
+            |_: On<bevy_ecs::lifecycle::Insert, RouterNavigation>,
+             mut commands: bevy_ecs::prelude::Commands| {
+                commands.queue(|world: &mut World| {
+                    world.remove_resource::<InputFocus>();
+                });
+            },
+        );
+        commit_presentation_system(app.world_mut());
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(!publication_was_committed(
+            app.world().resource::<RouterNavigation>(),
+            router,
+            request
+        ));
+        assert!(entry.engine.history().is_empty());
+        assert!(entry.pending_commit.is_none());
+        assert!(entry.active.is_none());
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(_)
+        ));
+        let residual = entry
+            .authority_protocol_residual
+            .as_ref()
+            .expect("the source's private physical obligation remains owned");
+        assert!(
+            matches!(&residual.kind, AuthorityProtocolResidualKind::PreflightAuthorityLost(evidence) if evidence.is_missing_resource())
+        );
+        assert!(
+            residual
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.ticket.is_none() && pending.final_task.is_none())
+        );
+    }
+}
+
+#[test]
+fn initial_awaiting_no_candidate_remains_stable_without_admission_owner() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let router = install_atomic_router(&mut app, "initial-no-candidate");
+    let host = registered_host(&mut app, router);
+    app.world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    for _ in 0..4 {
+        app.update();
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::AwaitingHost
+        );
+        assert!(entry.engine.snapshot().host().trace().is_empty());
+        assert!(
+            entry
+                .engine
+                .testing_pending_host_admission_projection()
+                .is_none()
+        );
+        assert!(entry.pending_host_admission_failure.is_none());
+        assert!(entry.host.is_none());
+        assert!(app.world().get_entity(host).is_ok());
+    }
+    app.world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(router));
+    app.update();
+    assert!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .host
+            .is_some()
+    );
+}
+
+#[test]
+fn initial_fallback_publication_refreezes_host_and_parent_after_resource_observer() {
+    for drift_host in [false, true] {
+        let mut app = App::new();
+        app.add_plugins(BevyUiRouterPlugin::default());
+        let router = install_atomic_router(&mut app, "initial-fallback-drift");
+        observe_authority_system(app.world_mut());
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/unmatched"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_until_projectionless_fallback_pending(&mut app);
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.active.is_none());
+        let host = entry.host.as_ref().unwrap().host;
+        let top_slot = entry.host.as_ref().unwrap().top_slot;
+        let shell = entry.pending_commit.as_ref().unwrap().branch.frames()[0].shell();
+        let pending_entities = entry
+            .pending_commit
+            .as_ref()
+            .unwrap()
+            .branch
+            .as_realized()
+            .claims()
+            .map(|claim| claim.entity())
+            .collect::<Vec<_>>();
+        let sentinel = app.world_mut().spawn((Node::default(), ChildOf(host))).id();
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(sentinel);
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observe_fired = fired.clone();
+        app.world_mut().add_observer(
+            move |_: On<bevy_ecs::lifecycle::Insert, RouterNavigation>,
+                  mut commands: bevy_ecs::prelude::Commands| {
+                if !observe_fired.swap(true, Ordering::SeqCst) {
+                    if drift_host {
+                        commands.entity(host).remove::<RouterHostRegistration>();
+                    } else {
+                        commands.entity(shell).remove::<ChildOf>();
+                    }
+                }
+            },
+        );
+        commit_presentation_system(app.world_mut());
+        assert!(fired.load(Ordering::SeqCst));
+        assert!(!publication_was_committed(
+            app.world().resource::<RouterNavigation>(),
+            router,
+            request
+        ));
+        for _ in 0..16 {
+            app.update();
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(entry.engine.history().is_empty());
+            assert!(!publication_was_committed(
+                app.world().resource::<RouterNavigation>(),
+                router,
+                request
+            ));
+            if matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(_)
+            ) {
+                break;
+            }
+        }
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(
+            matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(_)
+            ),
+            "host={drift_host}"
+        );
+        if drift_host {
+            assert!(
+                matches!(entry.engine.request(request).unwrap().status(), RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::HostLost)
+            );
+        } else {
+            assert!(
+                matches!(entry.engine.request(request).unwrap().status(), RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::RecoveryFailed)
+            );
+        }
+        assert!(entry.active.is_none());
+        assert!(entry.pending_commit.is_none());
+        assert!(entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(entry.post_commit_compound.is_none());
+        assert!(!entry.cleanup_summary().foreground_pending());
+        assert!(entry.engine.snapshot().running_request().is_none());
+        assert!(app.world().get_entity(host).is_ok());
+        assert_eq!(
+            app.world().get::<ChildOf>(sentinel).map(ChildOf::parent),
+            Some(host)
+        );
+        assert_eq!(app.world().resource::<InputFocus>().get(), Some(sentinel));
+        if drift_host {
+            assert!(entry.host.is_none());
+            assert!(entry.authority_protocol_residual.is_none());
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+            );
+            assert!(app.world().get_entity(top_slot).is_err());
+            assert!(
+                pending_entities
+                    .iter()
+                    .all(|entity| app.world().get_entity(*entity).is_err())
+            );
+        }
+        assert!(
+            !app.world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(shell)
+        );
+        for _ in 0..4 {
+            app.update();
+            assert!(
+                app.world().resource::<RouterNavigation>().entries[0]
+                    .engine
+                    .testing_pending_host_admission_projection()
+                    .is_none(),
+                "no-candidate observation must consume or retain every issued permit"
+            );
+        }
+        assert!(!publication_was_committed(
+            app.world().resource::<RouterNavigation>(),
+            router,
+            request
+        ));
+        if drift_host {
+            app.world_mut()
+                .entity_mut(host)
+                .insert(RouterHostRegistration::new(router));
+            for _ in 0..8 {
+                app.update();
+            }
+            let readmitted = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(readmitted.host.is_some());
+            assert!(readmitted.pending_host_admission_failure.is_none());
+            assert!(
+                readmitted
+                    .engine
+                    .testing_pending_host_admission_projection()
+                    .is_none()
+            );
+            assert!(
+                app.world().resource::<RouterNavigation>().entries[0]
+                    .active
+                    .is_none()
+            );
+            let next = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new("/"))
+                .unwrap();
+            for _ in 0..16 {
+                app.update();
+            }
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(matches!(
+                entry.engine.request(next).unwrap().status(),
+                RequestStatus::Succeeded
+            ));
+            assert!(
+                matches!(entry.engine.request(request).unwrap().status(), RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::HostLost)
+            );
+            assert_eq!(entry.engine.history().len(), 1);
+        }
+    }
+}
+
+#[test]
+fn publication_borrow_uses_exact_resource_mapping_and_is_inert_until_applied() {
+    #[derive(Resource)]
+    struct ImpostorCarrier;
+    #[derive(Resource)]
+    struct HistoricalFocusCarrier;
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let world = app.world_mut();
+    let target = world.spawn_empty().id();
+    let other = world.spawn_empty().id();
+    *world.resource_mut::<InputFocus>() = InputFocus::from_entity(target);
+    world
+        .resource_mut::<RouteFocusState>()
+        .set_focused(Some(target));
+    let navigation_domain = world.resource::<RouterNavigation>().domain;
+    let carrier_id = world.register_component::<ImpostorCarrier>();
+    let impostors = world
+        .spawn((
+            ImpostorCarrier,
+            bevy_ecs::resource::IsResource::new(carrier_id),
+            RouterNavigation::new(),
+            RouteEntityRegistry::new(),
+            RouterInputGate::new(),
+            InputFocus::from_entity(other),
+            RouteFocusState::default(),
+        ))
+        .id();
+    assert_ne!(
+        world.get::<RouterNavigation>(impostors).unwrap().domain,
+        navigation_domain
+    );
+    let snapshot = |world: &World| {
+        let mut ticks = Vec::new();
+        macro_rules! tick {
+            ($resource:ty) => {{
+                let t = world.get_resource_change_ticks::<$resource>().unwrap();
+                ticks.push((t.added, t.changed));
+            }};
+        }
+        tick!(RouterNavigation);
+        tick!(RouteEntityRegistry);
+        tick!(RouterInputGate);
+        tick!(InputFocus);
+        tick!(RouteFocusState);
+        (
+            publication_resource_entities(world),
+            ticks,
+            world.resource::<InputFocus>().clone(),
+            world.resource::<RouteFocusState>().focused(),
+            world
+                .resource::<RouterInputGate>()
+                .allowed_projection()
+                .to_vec(),
+            world.resource::<RouteEntityRegistry>().clone(),
+        )
+    };
+    let before = snapshot(world);
+    world.increment_change_tick();
+    {
+        let (_, resources) =
+            crate::presentation::prepare_publication_access(world, &[], &[]).unwrap();
+        assert_eq!(resources.navigation.domain, navigation_domain);
+        assert_eq!(resources.input_focus.get(), Some(target));
+        assert_eq!(resources.route_focus.focused(), Some(target));
+    }
+    assert_eq!(
+        snapshot(world),
+        before,
+        "abandoning preparation must be a pure borrow"
+    );
+    {
+        let (presentation, resources) =
+            crate::presentation::prepare_publication_access(world, &[], &[]).unwrap();
+        prepare_focus_mutation(resources.input_focus, resources.route_focus, &[]).apply();
+        prepare_input_gate_mutation(resources.gate, &[], Vec::new())
+            .unwrap()
+            .apply();
+        presentation.apply();
+    }
+    assert_eq!(
+        snapshot(world),
+        before,
+        "empty application must preserve focus queues and ticks"
+    );
+    // Rebind the official resource mapping in one tick; a same-type component
+    // at the historical entity is no longer the resource.
+    let tick = world.read_change_tick();
+    let old_entity = crate::input::pointer_resource_entity::<InputFocus>(world).unwrap();
+    let resource_id = world.component_id::<InputFocus>().unwrap();
+    let focus = world.remove_resource::<InputFocus>().unwrap();
+    world
+        .entity_mut(old_entity)
+        .remove::<bevy_ecs::resource::IsResource>();
+    world.flush();
+    let historical_carrier_id = world.register_component::<HistoricalFocusCarrier>();
+    world.entity_mut(old_entity).insert((
+        HistoricalFocusCarrier,
+        bevy_ecs::resource::IsResource::new(historical_carrier_id),
+        InputFocus::from_entity(other),
+    ));
+    let new_entity = world
+        .spawn((
+            focus,
+            bevy_ecs::resource::IsResource::new(resource_id),
+            bevy_ecs::entity_disabling::Disabled,
+        ))
+        .id();
+    assert_eq!(world.read_change_tick(), tick);
+    assert_eq!(
+        crate::input::pointer_resource_entity::<InputFocus>(world),
+        Some(new_entity)
+    );
+    {
+        let (_, resources) =
+            crate::presentation::prepare_publication_access(world, &[], &[]).unwrap();
+        prepare_focus_mutation(resources.input_focus, resources.route_focus, &[target]).apply();
+    }
+    assert_eq!(world.resource::<InputFocus>().get(), None);
+    assert_eq!(
+        world.get::<InputFocus>(old_entity).unwrap().get(),
+        Some(other)
+    );
+    assert_eq!(
+        world.get::<InputFocus>(impostors).unwrap().get(),
+        Some(other)
+    );
+    assert_eq!(
+        world.get::<RouteFocusState>(impostors).unwrap().focused(),
+        None
+    );
+    let missing = world.remove_resource::<InputFocus>().unwrap();
+    world.increment_change_tick();
+    assert!(
+        crate::presentation::prepare_publication_access(world, &[], &[]).is_none(),
+        "ordinary same-type components cannot fill a missing resource"
+    );
+    assert_eq!(
+        world.get::<InputFocus>(old_entity).unwrap().get(),
+        Some(other)
+    );
+    world.entity_mut(new_entity).insert(missing);
 }
 
 #[test]

@@ -9486,6 +9486,218 @@ mod tests {
     }
 
     #[test]
+    fn initial_fallback_task_host_loss_preserves_roots_history_and_terminal_semantics() {
+        for include_target in [false, true] {
+            let (mut engine, grant) = ready_engine();
+            engine.record_top_slot_registered(&grant).unwrap();
+            let lease = engine.confirm_host(grant);
+            settle_push(&mut engine, RouteLocation::new("/"));
+            let retained_history = engine.history().clone();
+
+            // Retire the first live host through the existing reconciled path:
+            // no active presentation does not mean there has never been history.
+            engine
+                .push(RouteLocation::new("/").with_fragment("host-loss"))
+                .unwrap();
+            engine.collect();
+            let EngineAction::FrameTask(_old_task) = engine.action().unwrap() else {
+                panic!("changed root requires the actual applying task")
+            };
+            let roots = engine.authority_settlement_logical_roots();
+            let cleanup = engine
+                .begin_authority_settlement_for_cause_retaining(
+                    lease,
+                    PreCommitAuthorityCause::HostLost,
+                    CleanupManifest::new(roots, 0xFA20, 1),
+                    |_| {},
+                )
+                .unwrap();
+            engine
+                .complete_authority_cleanup(cleanup.complete(0xFA21, 1), || {})
+                .unwrap();
+            let HostAdmissionSourcePermitOutcome::Ineligible { source, .. } =
+                engine.issue_host_admission_source_permit()
+            else {
+                panic!("HostLost remains closed until a changed candidate observation")
+            };
+            let observation = HostAdmissionUnavailableEvidenceProjection::host_lost(
+                &source,
+                Some(2),
+                0xFA20,
+                0xFA21,
+            );
+            let HostAdmissionUnavailableCauseBindOutcome::Bound(cause) =
+                engine.bind_host_admission_unavailable_cause(source, &observation, ())
+            else {
+                panic!("the changed host-candidate observation binds to the real lost source")
+            };
+            assert!(matches!(
+                engine.complete_observed_host_admission_unavailable(cause, || {}),
+                HostAdmissionUnavailableObservedOutcome::Published(_)
+            ));
+            let HostAdmissionSourcePermitOutcome::Issued(permit) =
+                engine.issue_host_admission_source_permit()
+            else {
+                panic!("settled HostLost opens its source-bound admission")
+            };
+            let token = engine
+                .request_source_bound_host_admission(permit)
+                .ok()
+                .expect("live source permit");
+            let grant = engine
+                .grant_source_bound_host_admission(token)
+                .ok()
+                .expect("live source token");
+            engine
+                .record_source_bound_top_slot_registered(&grant)
+                .ok()
+                .expect("real top-slot registration");
+            let HostConfirmationPreparationOutcome::Prepared(prepared) =
+                engine.prepare_host_confirmation(bind_granted_host_admission_source(grant, ()))
+            else {
+                panic!("exact source-bound confirmation prepares")
+            };
+            let HostAdmissionConfirmationCoreOutcome::Ready {
+                installed: lease, ..
+            } = engine.confirm_host_admission_with_binding(prepared, |(), lease| lease)
+            else {
+                panic!("source-bound confirmation installs the sole lease")
+            };
+            assert_eq!(engine.active().kind(), ActivePresentationKind::None);
+
+            let request = engine.push(RouteLocation::new("/unmatched")).unwrap();
+            engine.collect();
+            let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+                panic!("unmatched navigation must issue the real fallback task")
+            };
+            assert_eq!(task.frame().origin(), &FrameOrigin::RouterFallback);
+            let queued = engine.push(RouteLocation::new("/")).unwrap();
+            let trigger = engine.failed_authority_trigger_for_task(&task).unwrap();
+            let roots = if include_target {
+                vec![task.frame().clone()]
+            } else {
+                Vec::new()
+            };
+            let installed = std::cell::Cell::new(false);
+            let cleanup = engine
+                .begin_failed_authority_settlement_for_cause_retaining(
+                    lease,
+                    trigger,
+                    PreCommitAuthorityCause::HostLost,
+                    CleanupManifest::new(roots.clone(), 0xFA22, 1),
+                    |_| installed.set(true),
+                )
+                .unwrap();
+            assert!(installed.get());
+            assert_eq!(cleanup.manifest_digest(), 0xFA22);
+            engine
+                .complete_authority_cleanup(cleanup.complete(0xFA23, 1), || {})
+                .unwrap();
+            assert_eq!(engine.history(), &retained_history);
+            assert_eq!(engine.active().kind(), ActivePresentationKind::None);
+            assert_eq!(
+                engine.snapshot().availability(),
+                &RouterAvailability::Unavailable(crate::prelude::RouterUnavailableReason::HostLost)
+            );
+            assert!(engine.snapshot().running_request().is_none());
+            assert!(engine.action().is_none());
+            for failed in [request, queued] {
+                assert!(
+                    matches!(engine.request(failed).unwrap().status(), RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::HostLost)
+                );
+                assert!(
+                    !engine
+                        .request(failed)
+                        .unwrap()
+                        .trace()
+                        .iter()
+                        .any(|event| event.kind() == NavigationTraceEventKind::CommitPublished)
+                );
+            }
+            assert!(engine.inspect_report_identity(&task).is_err());
+            assert!(matches!(
+                engine.issue_host_admission_source_permit(),
+                HostAdmissionSourcePermitOutcome::Ineligible { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn initial_fallback_authority_requires_task_source_and_absent_active() {
+        for with_active in [false, true] {
+            let (mut engine, grant) = ready_engine();
+            engine.record_top_slot_registered(&grant).unwrap();
+            let lease = engine.confirm_host(grant);
+            if with_active {
+                settle_push(&mut engine, RouteLocation::new("/"));
+            }
+            engine.push(RouteLocation::new("/unmatched")).unwrap();
+            engine.collect();
+            let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+                panic!("fallback task expected")
+            };
+            let snapshot = engine.snapshot();
+            let error = engine
+                .begin_authority_settlement_for_cause_retaining(
+                    lease,
+                    PreCommitAuthorityCause::HostLost,
+                    CleanupManifest::new(vec![task.frame().clone()], 0xFA24, 1),
+                    |_| panic!("untriggered projectionless settlement must reject"),
+                )
+                .err()
+                .expect("projectionless settlement needs its Task source");
+            assert_eq!(error.kind(), BeginAuthoritySettlementErrorKind::WrongPhase);
+            assert_eq!(engine.snapshot(), snapshot);
+            let lease = error.into_owner();
+            if with_active {
+                let trigger = engine.failed_authority_trigger_for_task(&task).unwrap();
+                let error = engine
+                    .begin_failed_authority_settlement_for_cause_retaining(
+                        lease,
+                        trigger,
+                        PreCommitAuthorityCause::HostLost,
+                        CleanupManifest::new(vec![task.frame().clone()], 0xFA25, 1),
+                        |_| panic!("task-only roots do not cover a committed active presentation"),
+                    )
+                    .err()
+                    .expect("active presentation remains protected");
+                assert_eq!(error.kind(), BeginAuthoritySettlementErrorKind::WrongPhase);
+                assert_eq!(engine.snapshot(), snapshot);
+                assert!(engine.inspect_report_identity(&task).is_ok());
+            } else {
+                let failure = engine
+                    .report_failed_with_physical_residual(
+                        task,
+                        ViewFailureKind::Apply,
+                        "actual fallback apply failure",
+                    )
+                    .unwrap();
+                let trigger = engine
+                    .failed_authority_trigger_for_cleanup(&failure)
+                    .unwrap();
+                let error = engine
+                    .begin_failed_authority_settlement_for_cause_retaining(
+                        lease,
+                        trigger,
+                        PreCommitAuthorityCause::HostLost,
+                        CleanupManifest::new(failure.logical_roots().to_vec(), 0xFA26, 1),
+                        |_| panic!("non-Task failed source does not gain projectionless authority"),
+                    )
+                    .err()
+                    .expect("non-Task projectionless source remains rejected");
+                assert_eq!(error.kind(), BeginAuthoritySettlementErrorKind::WrongPhase);
+                assert!(matches!(
+                    engine.prepare_failure_cleanup_retaining(
+                        failure,
+                        CleanupManifest::new(Vec::new(), 0xFA27, 1),
+                    ),
+                    FailureCleanupPrepareOutcome::Prepared(_)
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn failed_authority_trigger_is_burned_on_rejection_and_cannot_replay() {
         let (mut engine, lease) = confirmed_nested_engine_with_lease();
         engine.push(RouteLocation::new("/items/1")).unwrap();

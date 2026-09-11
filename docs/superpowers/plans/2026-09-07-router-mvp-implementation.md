@@ -10,7 +10,7 @@
 
 **Spec:** [统一 MVP design spec](../specs/2026-09-07-router-mvp-design.md)。实现者同时读取 spec 和本计划；产品合同归 spec，本文件只拥有迁移顺序与证据。
 
-**状态**：Active implementation plan。阶段 A 的统一合同、测试迁移与历史归档（含 ECS 遗漏补清），以及阶段 B 的候选精简和独立基线已完成。阶段 C 正在实现官方 BSN root，已落地合同/私有解析准备、原生 pointer 派发前及同调用撤权，以及私有 Scene 创建/adoption/失败结算检查点；尚需将创建期 owner、current containment、publication、输入/focus 与 cleanup 联动接入导航。阶段 D 明确包含已暴露的 idle host-loss 缺口。spec 第 12 节已选择并验证声明图预登记、私有 shell wrapper 与 attempt allocation obligations 的最小可行机制；私有检查点和临时探针不代表生产 BSN 或 MVP PASS。
+**状态**：Active implementation plan。阶段 A 的统一合同、测试迁移与历史归档（含 ECS 遗漏补清），以及阶段 B 的候选精简和独立基线已完成。阶段 C 正在实现官方 BSN root，已落地合同/私有解析准备、原生 pointer 派发前及同调用撤权、私有 Scene 创建/adoption/失败结算，以及三个成功发布路径的常驻资源借用；尚需将 native 创建期 owner、current containment、publication、输入/focus 与 cleanup 联动接入导航。阶段 D 明确包含已暴露的 idle host-loss 缺口。spec 第 12 节已选择并验证声明图预登记、私有 shell wrapper 与 attempt allocation obligations 的最小可行机制；私有检查点和临时探针不代表生产 BSN 或 MVP PASS。
 
 ## 全局约束
 
@@ -114,8 +114,12 @@
 - [ ] 将 authorized target 的原生 hover/previous-hover/press/click/drag/祖先缓存撤销纳入 isolation preparation，并在真实 dispatch 前过滤非活动 owned scope；保留 app/其它有效目标的输入状态。真实按下/拖拽后离场或 host loss、旧目标作为 residual 存活、继续 Move/Release 都不得再触发其 observer；不能仅测试新命中，也不能误将 `PostHover` 排在官方 `pointer_events` 前。
 - [ ] `RouterInputGate` 每个输入边界从当前 active frame-local Children closure 导出；publication 同步撤销旧权限、安装新权限并释放目标 focus。动态 child 添加/移出、显式 `Visibility::Visible`/自定义 `Pickable`、保留 app focus 都有真实对照；不覆盖 authored presentation 值。
 - [ ] 以真实 `AutoFocus` 的 staging 成功/失败对照验证原有效 focus、当前非活动 focus 与延后的 FocusGained/Lost；明确推荐路径与原生 Tab/dispatch 的接线边界，不把完整原生 Tab 支持偷偷加入 MVP。官方 `InputFocus` 无直接按 target 过滤队列的公开 API；整体快照恢复会误撤销 Scene 中对其它有效目标的合法改写。构建期 focus 不生效、由应用在 Scene 执行之外显式设置的候选限制尚需确认，不能静默采用。
-- [ ] 所有 allocation/query/claim/cleanup/input preparation 在 `Ready` 之前完成，publication tail 只执行已准备的不可失败原位 mutation；successful presentation/history 是最后语义步骤。检查范围包括外层资源 scope 的退出：官方 Bevy 0.19.1 的 `resource_scope` 会取出并重新插入 Resource component，不能把它当作无副作用借用。既有 gate/focus/registry 等 publication 资源 scope 仍须核实并迁移。失败留原 owner，stale 丢弃而不发布。
+- [ ] 所有 allocation/query/claim/cleanup/input preparation 在 `Ready` 之前完成，publication tail 只执行已准备的不可失败原位 mutation；successful presentation/history 是最后语义步骤。检查范围包括外层资源 scope 的退出：官方 Bevy 0.19.1 的 `resource_scope` 会取出并重新插入 Resource component，不能把它当作无副作用借用。三个成功发布路径已迁往 exact resource Entity 联合借用；native owner/内容边界接入后仍须验证完整 preparation 与 publication，不能将此检查点推广为其它 terminal/cleanup/no-target/snapshot 路径全部闭合。失败留原 owner，stale 丢弃而不发布。
 - [ ] 建立真实 BSN root consumer 和 build/resolve/apply error 回归；由外部系统在 `RouterScheduleSet::PublishSnapshots` 后读取同帧 snapshot，补足目前仅编译 label 的边界验证。resolve/apply 故障使用官方 Scene/template 的实际失败，不制造假的 Router report。验证 host sentinel/关系、旧 active、history、pending cleanup、partial subtree、focus 和 request failure 来源。
+
+**已落实的发布迁移依赖**：无已提交 active 的 RouterFallback 在最终复验发现 host loss 时，原 Core authority settlement 因缺少 reconciliation 拒绝，错误进入协议 fail-close 而非 `HostLost`。独立评估及交叉复核后复用已消费的 failed Task source、原 HostLease 与 authority cleanup，仅为 unbound fallback 且 Core active kind 为 None 增加窄接纳分支；既有身份、Applying、action、retirement、lease 和 exact roots 校验继续复用，不伪造 reconciliation 或新增清理协议。Core 保留 Task source 的两种合法 roots 选择；当前已 realized 的 ECS caller 必须据真实 pending owner 提交包含 target 的完整 manifest，不能按物理数量反推逻辑 roots。拒绝返还原 task/lease；host loss 与 parent-only rejection 分别验证 `HostLost`、`RecoveryFailed`。完整 Core/ECS 和最高层 public/consumer 验收结果见执行记录；此窄修不代表有旧 active 的全部 projectionless host-loss、idle host loss 或其它 terminal/snapshot 资源边界已闭合。
+
+同一回归进一步确认，无候选的空闲观察只匹配 permit 签发结果中的 `Ineligible`，会丢弃实际 `Issued` owner，令之后重新注册永久停在 `Outstanding`。本检查点复用既有 candidate rejection/pre-staging unavailable 结算处理全部返回类型，保留首次 `AwaitingHost` 的无候选语义；验证先经历无候选空闲更新再重新注册、无悬空 admission owner、旧请求不重放和新命令可用。这是既定 host/re-registration 合同的实际依赖，不通过移动注册时序绕过；不因此宣称阶段 D 的完全 idle host-loss 检测已完成。
 
 **可行性证据，非产品 gate**：隔离临时 workspace 的官方 `0.19.1` 探针已验证 owned Scene 应用到既有 root、内部 outlet、resolve error、真实 UI layout/picking 的 shell 隔离，以及局部 pointer 缓存过滤；也复现未挂接 Node 和隐藏后缓存 Click 两个缺口。新增探针验证声明图分配、外层 wrapper、命名引用和失败产物追踪，合计 10 passed / 0 failed。此结果包含反例测试，不是 10 项产品能力通过；尚未证明 Router owner/observer drift、依赖 handle 保活、原子切换、完整手势撤销、keyboard/gamepad/focus 或 Windows。产品 tests 必须重新覆盖这些范围，不能引用临时 `/tmp` 路径作为持久依赖，也不能复制探针的直接 despawn 或计数检查作为权限证明。
 
@@ -221,6 +225,12 @@ cargo test -p bevy_ui_router --features bsn --test bsn_facade_features --locked
 阶段 C pointer 同调用撤权检查点（本记录所在提交）：三个正常 publication consumer 与 authority isolation 均直接清理已授权目标的原生缓存和已有 interaction。新增资源借用采用 exact resource Entity 联合 query，不使用会 take/reinsert 的 `resource_scope`；默认禁用目标/资源仍可撤销历史输入，但正常 presentation 的查询资格不放宽。post-commit 原观察 partition 收窄为 owned obligations，并以实际历史撤权及当前 exact claims 授权 native 写入，保留 protected/app 状态。真实双 pointer 管线、Replace/Back/fallback/host-loss consumer、拒绝准备、无 gate、禁用实体和无操作 resource tick/observer 对照均由生产路径或真实输入事实验证。
 
 两名独立代理复审并交叉评价，无剩余本检查点阻断，主代理核实了生产路径与运行输出。最终 all-features 与 no-default-features pointer 定向各为 7 passed；fmt、workspace all-targets/all-features check 和 workspace all-features test 均 exit 0，包含 615 项 ECS、418 项 Core、30 项 public journeys、独立 consumer 和 28 项 Core doctests。既有 warnings 保留，Windows NOT_RUN。此结果不闭合 native current-containment、Scene focus、idle host loss，或旧 gate/focus/registry 资源 scope 的整个 publication 边界；这些义务继续保留在阶段 C/D，不因 pointer 检查点通过而打勾。spec §7 创建总览同时校准为 §12 已选定的 factory/resolve/预检后才分配 UI 的顺序。
+
+阶段 C 常驻资源 publication 检查点（2026-09-12，本记录所在提交）：normal reconciliation、Back target、projectionless fallback 在 World preparation 及外层资源 scope 退出后重新验证原来源，最终借用 exact resource Entity 上的常驻资源。原 active/cleanup owner 在 Core publication 前安装，发布后不再重新插入资源或补装 owner；registry index plan 在可变准备后重建。保留真实 Core commit seal 后 registration loss 的回归窗口，不用更早的失败替代。初始无 active fallback 的窄 HostLost 接纳及无候选 Issued permit 丢失修复一并落地，保持原 task/lease、完整物理义务和重新注册语义。
+
+独立审查与交叉复核发现并修正 Back 最终 focus 来源漏验，以及等价 gate 因顺序改变而误写 tick。完整来源包含 leaving 与 RetainEmpty，来源漂移拒绝，单纯 focus 值变化仍允许发布。进一步用普通 `App::update` 复现了测试第二次手动 commit 曾掩盖的调度缺口：原 active 暂存于 splice，下一 Refresh 误撤 gate，后续 fallback 误变 AuthorityLost。最终在同调用复用原 pending-rejection consumer 归还 active；测试不再额外手动推进，验证原 entering owner、Apply/fallback、history 保持、app focus 与前台 owner 清空。最终两位原代理分别定向复审并交叉评价，无剩余本检查点阻断；主代理核实了生产路径、修复增量和实际命令输出。
+
+最终冻结源码的 `cargo fmt --all -- --check`、`cargo check --workspace --all-targets --all-features --locked`、`cargo test --workspace --all-features --locked`、`cargo test --workspace --doc --all-features --locked` 均 exit 0。全量包含 420 项 Core、627 项 ECS、30 项 public journeys、独立 facade consumer、8 项 dependency contract、12 项 Core compile-fail 与 28 项 Core doctests。另行完整 ECS `--no-default-features` 为 604 项单元测试及 public API 通过；阶段 E 列明的 facade minimal/default/ecs/bsn 四组 check 与 `bsn_facade_features` test 均 exit 0。定向 Back focus 3 项、publication 21 项（含 RetainEmpty/资源 observer/初始 fallback）、gate 13 项、真实 pointer consumer 7 项均通过。既有 warnings 保留，Windows 原生验证 NOT_RUN。此结果不是完整 BSN 或 MVP 验收：下一依赖仍是 native store/执行与 RealizedFrame owner 转移、current containment/mount/input/focus/cleanup 的联动、真实 facade consumer，以及阶段 D/E 的其余闭环与 main 集成。
 
 每个阶段结束只补充：交付 commit、实际命令与结果、审查结论/未决项、下一依赖；临时构建路径、完整日志和细碎排查过程不固化成长期经验。阶段内私有文件布局和检查点可调整，影响公共语义、范围或信任边界才需要重新确认。
 

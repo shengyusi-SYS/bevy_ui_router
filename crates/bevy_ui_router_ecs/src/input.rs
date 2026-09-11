@@ -122,6 +122,7 @@ pub(crate) struct PreparedInputGateMutation<'w> {
     gate: Mut<'w, RouterInputGate>,
     next: Vec<Entity>,
     revoked: Vec<Entity>,
+    changed: bool,
 }
 
 impl PreparedInputGateMutation<'_> {
@@ -130,7 +131,9 @@ impl PreparedInputGateMutation<'_> {
     }
 
     pub(crate) fn apply(mut self) {
-        self.gate.replace_allowed(self.next, self.revoked);
+        if self.changed {
+            self.gate.replace_allowed(self.next, self.revoked);
+        }
     }
 }
 
@@ -320,10 +323,14 @@ pub(crate) fn prepare_input_gate_mutation<'w>(
     next.retain(|entity| !remove.contains(entity));
     next.extend(add);
     let revoked = try_prepare_pointer_revocations(&gate, &next).ok()?;
+    let same_permissions =
+        gate.allowed.len() == next.len() && next.iter().all(|entity| gate.allowed.contains(entity));
+    let changed = !same_permissions || gate.revoked != revoked;
     Some(PreparedInputGateMutation {
         gate,
         next,
         revoked,
+        changed,
     })
 }
 
@@ -1733,6 +1740,53 @@ pub(crate) mod tests {
         assert_eq!(
             resource_events.load(std::sync::atomic::Ordering::Relaxed),
             2
+        );
+    }
+
+    #[test]
+    fn gate_equivalent_delta_preserves_other_permissions_order_and_tick() {
+        let mut world = World::new();
+        let first = world.spawn_empty().id();
+        let second = world.spawn_empty().id();
+        world.insert_resource(RouterInputGate::new());
+        prepare_input_gate_mutation(
+            world.resource_mut::<RouterInputGate>(),
+            &[],
+            vec![first, second],
+        )
+        .unwrap()
+        .apply();
+        let before = (
+            world.resource::<RouterInputGate>().allowed.clone(),
+            world.resource::<RouterInputGate>().revoked.clone(),
+        );
+        let tick = world
+            .get_resource_change_ticks::<RouterInputGate>()
+            .unwrap()
+            .changed;
+        world.increment_change_tick();
+
+        prepare_input_gate_mutation(
+            world.resource_mut::<RouterInputGate>(),
+            &[first],
+            vec![first],
+        )
+        .unwrap()
+        .apply();
+
+        assert_eq!(
+            (
+                &world.resource::<RouterInputGate>().allowed,
+                &world.resource::<RouterInputGate>().revoked
+            ),
+            (&before.0, &before.1)
+        );
+        assert_eq!(
+            world
+                .get_resource_change_ticks::<RouterInputGate>()
+                .unwrap()
+                .changed,
+            tick
         );
     }
 

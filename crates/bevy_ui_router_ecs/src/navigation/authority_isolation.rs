@@ -3,7 +3,9 @@ use bevy_ecs::prelude::World;
 use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
 use bevy_ui_router_core::{
-    integration::{BeginAuthoritySettlementErrorKind, CleanupManifest},
+    integration::{
+        BeginAuthoritySettlementErrorKind, CleanupManifest, FailedAuthorityTriggerError,
+    },
     prelude::RouteFrameVersion,
 };
 
@@ -88,6 +90,11 @@ pub(super) enum AuthoritySettlementBeginOutcome {
         pending: PendingCommit,
         kind: BeginAuthoritySettlementErrorKind,
     },
+    TriggerContradiction {
+        active: RealizedBranch,
+        pending: PendingCommit,
+        kind: FailedAuthorityTriggerError,
+    },
     IsolationContradiction {
         active: RealizedBranch,
         pending: PendingCommit,
@@ -107,6 +114,39 @@ pub(super) fn begin_authority_settlement(
     active: RealizedBranch,
     pending: PendingCommit,
     logical_roots_override: Option<Vec<RouteFrameVersion>>,
+) -> AuthoritySettlementBeginOutcome {
+    begin_authority_settlement_from_source(
+        world,
+        entry,
+        active,
+        pending,
+        logical_roots_override,
+        false,
+    )
+}
+
+pub(super) fn begin_initial_fallback_authority_settlement(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    pending: PendingCommit,
+) -> AuthoritySettlementBeginOutcome {
+    begin_authority_settlement_from_source(
+        world,
+        entry,
+        RealizedBranch::empty(),
+        pending,
+        None,
+        true,
+    )
+}
+
+fn begin_authority_settlement_from_source(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    active: RealizedBranch,
+    pending: PendingCommit,
+    logical_roots_override: Option<Vec<RouteFrameVersion>>,
+    initial_fallback_task: bool,
 ) -> AuthoritySettlementBeginOutcome {
     let Some(host) = entry.host.as_ref() else {
         return AuthoritySettlementBeginOutcome::ProtocolContradiction {
@@ -201,6 +241,27 @@ pub(super) fn begin_authority_settlement(
             }
         };
 
+    // All physical preparation precedes minting the one-shot trigger. The
+    // original task remains in pending until the retaining callback succeeds.
+    let trigger = if initial_fallback_task {
+        let result = pending
+            .final_task
+            .as_ref()
+            .ok_or(FailedAuthorityTriggerError::WrongPhase)
+            .and_then(|task| entry.engine.failed_authority_trigger_for_task(task));
+        match result {
+            Ok(trigger) => Some(trigger),
+            Err(kind) => {
+                return AuthoritySettlementBeginOutcome::TriggerContradiction {
+                    active,
+                    pending,
+                    kind,
+                };
+            }
+        }
+    } else {
+        None
+    };
     let HostBinding {
         version,
         slot_id,
@@ -228,24 +289,29 @@ pub(super) fn begin_authority_settlement(
     let mut settlement_owner = Some((reserved, active, pending, retired_host));
     let engine = &mut entry.engine;
     let cleanup_ledger = &mut entry.cleanup_ledger;
-    match engine.begin_authority_settlement_for_cause_retaining(
-        lease,
-        cause,
-        CleanupManifest::new(logical_roots, manifest_digest, obligation_count),
-        |batch| {
-            isolation.apply(world);
-            let (reserved, active, pending, owner) = settlement_owner
-                .take()
-                .expect("authority publication consumes its composed owner once");
-            *cleanup_ledger = Some(CleanupLedger::activate_authority_settlement(
-                reserved.bind_batch(batch),
-                active,
-                FailedPreparedBranch::new(pending.branch),
-                owner,
-                host_children,
-            ));
-        },
-    ) {
+    let manifest = CleanupManifest::new(logical_roots, manifest_digest, obligation_count);
+    let publish = |batch| {
+        isolation.apply(world);
+        let (reserved, active, pending, owner) = settlement_owner
+            .take()
+            .expect("authority publication consumes its composed owner once");
+        *cleanup_ledger = Some(CleanupLedger::activate_authority_settlement(
+            reserved.bind_batch(batch),
+            active,
+            FailedPreparedBranch::new(pending.branch),
+            owner,
+            host_children,
+        ));
+    };
+    let result = match trigger {
+        Some(trigger) => engine.begin_failed_authority_settlement_for_cause_retaining(
+            lease, trigger, cause, manifest, publish,
+        ),
+        None => {
+            engine.begin_authority_settlement_for_cause_retaining(lease, cause, manifest, publish)
+        }
+    };
+    match result {
         Ok(_) => AuthoritySettlementBeginOutcome::Begun,
         Err(error) => {
             let kind = error.kind();
