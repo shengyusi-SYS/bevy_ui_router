@@ -1841,6 +1841,30 @@ pub struct HostLease {
     inner: CoreHostLease,
 }
 
+pub use crate::engine::idle_host_loss::{
+    IdleHostLossErrorKind, IdleHostLossPhysicalDisposition, IdleHostLossPhysicalFacts,
+};
+
+#[doc(hidden)]
+pub struct IdleHostLossOwner {
+    inner: crate::engine::idle_host_loss::IdleHostLossOwner,
+}
+
+#[doc(hidden)]
+pub struct IdleHostLossTerminal {
+    inner: crate::engine::idle_host_loss::IdleHostLossTerminal,
+}
+
+impl IdleHostLossTerminal {
+    pub fn matches_host(&self, version: &HostVersion, top_slot: RouteSlotId) -> bool {
+        self.inner.grant.version() == version && self.inner.grant.top_slot() == top_slot
+    }
+
+    pub const fn physical_facts(&self) -> IdleHostLossPhysicalFacts {
+        self.inner.physical
+    }
+}
+
 #[doc(hidden)]
 pub struct FailedAuthoritySettlementTrigger {
     inner: CoreFailedAuthoritySettlementTrigger,
@@ -5742,6 +5766,50 @@ pub struct RouterEngine {
 }
 
 impl RouterEngine {
+    #[doc(hidden)]
+    pub fn idle_host_loss_eligible(&self) -> bool {
+        self.inner.idle_host_loss_eligible()
+    }
+
+    #[doc(hidden)]
+    pub fn begin_idle_host_loss<F>(
+        &mut self,
+        lease: HostLease,
+        manifest: &CleanupManifest,
+        install: F,
+    ) -> Result<(), (IdleHostLossErrorKind, HostLease)>
+    where
+        F: FnOnce(IdleHostLossOwner),
+    {
+        self.inner
+            .begin_idle_host_loss(
+                &mut self.admission,
+                lease.inner,
+                &manifest.logical_roots,
+                manifest.manifest_digest,
+                manifest.obligation_count,
+                |inner| install(IdleHostLossOwner { inner }),
+            )
+            .map_err(|(kind, inner)| (kind, HostLease { inner }))
+    }
+
+    #[doc(hidden)]
+    pub fn complete_idle_host_loss<F, T>(
+        &mut self,
+        owner: IdleHostLossOwner,
+        facts: IdleHostLossPhysicalFacts,
+        install: F,
+    ) -> Result<T, IdleHostLossOwner>
+    where
+        F: FnOnce(IdleHostLossTerminal) -> T,
+    {
+        self.inner
+            .complete_idle_host_loss(owner.inner, facts, |inner| {
+                install(IdleHostLossTerminal { inner })
+            })
+            .map_err(|inner| IdleHostLossOwner { inner })
+    }
+
     pub fn install(tree: RouteTree, fallback: RouteViewKey) -> Result<Self, IntegrationError> {
         let inner = CoreRouterEngine::install(tree, fallback).map_err(map_install_error)?;
         let admission = HostAdmissionIssuer::new().map_err(|_| IntegrationError::Exhausted)?;

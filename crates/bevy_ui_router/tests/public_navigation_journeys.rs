@@ -1724,8 +1724,8 @@ fn assert_recovery_r3_enqueue_is_request_zero(
 
 fn settle_recovery_r3_queued_registration_loss(fixture: &mut RecoveryR1Fixture) -> RouterSnapshot {
     // Exercise re-admission after a real foreground HostLost. Exact loss during
-    // post-commit cleanup is covered privately; fully idle host loss remains a
-    // separately recorded MVP gap, not something this extra request fixes.
+    // post-commit cleanup is covered privately; fully idle loss has separate
+    // ordinary-App-update regressions and does not rely on this queued request.
     let request = fixture
         .app
         .world_mut()
@@ -4028,6 +4028,297 @@ fn recovery_r3_unavailable_reason_and_enqueue_mapping_are_source_bound() {
             assert_eq!(entity_set(&fixture.app), stable_entities);
         }
     }
+}
+
+#[test]
+fn idle_host_loss_registration_removal_clears_active_without_a_new_request() {
+    assert_idle_host_loss(RecoveryR2LossKind::RegistrationRemoval, true);
+}
+
+#[test]
+fn idle_host_loss_despawn_clears_active_without_a_new_request() {
+    assert_idle_host_loss(RecoveryR2LossKind::HostDespawn, true);
+}
+
+#[test]
+fn idle_host_loss_registration_removal_invalidates_ready_without_active() {
+    assert_idle_host_loss(RecoveryR2LossKind::RegistrationRemoval, false);
+}
+
+#[test]
+fn idle_host_loss_despawn_invalidates_ready_without_active() {
+    assert_idle_host_loss(RecoveryR2LossKind::HostDespawn, false);
+}
+
+#[test]
+fn idle_host_loss_same_entity_new_incarnation_re_admits_without_replay() {
+    let mut fixture = recovery_r1_fixture("idle-same-incarnation");
+    let request = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        RouteLocation::new("/section/items/1"),
+        None,
+        None,
+    );
+    let committed = request_snapshot(&fixture.app, fixture.router, request);
+    assert_succeeded(&committed);
+    for _ in 0..3 {
+        fixture.app.update();
+    }
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    let before = router_snapshot(&fixture.app, fixture.router);
+    let effects = fixture.control.effects();
+    let old_top = fixture.host_fingerprint.top_slot.unwrap();
+    remove_recovery_host(&mut fixture, RecoveryR2LossKind::RegistrationRemoval);
+    fixture
+        .app
+        .world_mut()
+        .entity_mut(fixture.host_fingerprint.host)
+        .insert(RouterHostRegistration::new(fixture.router));
+    fixture.app.update();
+    let unavailable = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(
+        unavailable.availability(),
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+    );
+    assert_eq!(unavailable.active().kind(), ActivePresentationKind::None);
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    let ready = drive_recovery_r3_availability(
+        &mut fixture.app,
+        fixture.router,
+        &RouterAvailability::Ready,
+    );
+    assert_ne!(ready.host().version(), before.host().version());
+    assert_ne!(ready.host().top_slot(), before.host().top_slot());
+    assert!(fixture.app.world().get_entity(old_top).is_err());
+    assert_eq!(ready.active().kind(), ActivePresentationKind::None);
+    assert_eq!(ready.history(), before.history());
+    assert_eq!(fixture.control.effects(), effects);
+    assert_eq!(
+        request_snapshot(&fixture.app, fixture.router, request),
+        committed
+    );
+    let restored = replace_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        RouteLocation::new("/section/items/1"),
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, restored));
+    assert_eq!(
+        router_snapshot(&fixture.app, fixture.router).history(),
+        before.history()
+    );
+}
+
+fn assert_idle_host_loss(loss: RecoveryR2LossKind, with_active: bool) {
+    let mut fixture = recovery_r1_fixture("idle-host-loss");
+    let committed = if with_active {
+        let first = push_and_settle(
+            &mut fixture.app,
+            fixture.router,
+            RouteLocation::new("/section/items/1"),
+            None,
+            None,
+        );
+        let second = push_and_settle(
+            &mut fixture.app,
+            fixture.router,
+            RouteLocation::new("/section/items/2"),
+            None,
+            None,
+        );
+        [first, second]
+            .into_iter()
+            .map(|request| {
+                let snapshot = request_snapshot(&fixture.app, fixture.router, request);
+                assert_succeeded(&snapshot);
+                (request, snapshot)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    let before = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(before.availability(), &RouterAvailability::Ready);
+    assert!(before.host().version().is_some());
+    assert!(before.host().top_slot().is_some());
+    assert_eq!(
+        before.active().kind(),
+        if with_active {
+            ActivePresentationKind::Route
+        } else {
+            ActivePresentationKind::None
+        }
+    );
+    if with_active {
+        assert_eq!(
+            before.history().entries(),
+            [
+                RouteLocation::new("/section/items/1"),
+                RouteLocation::new("/section/items/2"),
+            ]
+        );
+        assert_eq!(before.history().cursor(), Some(1));
+    } else {
+        assert!(before.history().entries().is_empty());
+    }
+
+    // Let ordinary scheduling run after terminal settlement, with no commands.
+    // Stable public state proves this is not the post-commit cleanup window.
+    for _ in 0..3 {
+        fixture.app.update();
+        assert_terminal_owner_closure(&fixture.app, fixture.router);
+        assert_eq!(router_snapshot(&fixture.app, fixture.router), before);
+        for (request, snapshot) in &committed {
+            assert_eq!(
+                request_snapshot(&fixture.app, fixture.router, *request),
+                *snapshot
+            );
+        }
+    }
+    let effects_before = fixture.control.effects();
+    let old_targets = [51, 53, 55]
+        .into_iter()
+        .flat_map(|width| node_entities_with_width(&mut fixture.app, width))
+        .collect::<Vec<_>>();
+    assert_eq!(old_targets.len(), if with_active { 3 } else { 0 });
+    for target in &old_targets {
+        let gate = fixture.app.world().resource::<RouterInputGate>();
+        assert!(gate.allows_pointer(*target));
+        assert!(gate.allows_keyboard(*target));
+        assert!(gate.allows_gamepad(*target));
+    }
+    let app_target = fixture
+        .app
+        .world_mut()
+        .spawn((Node::default(), HostSentinel(991)))
+        .id();
+    let app_target_components = component_manifest(&fixture.app, app_target);
+    let focus = old_targets.first().copied().unwrap_or(app_target);
+    *fixture.app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(focus);
+
+    remove_recovery_host(&mut fixture, loss);
+    for _ in 0..24 {
+        fixture.app.update();
+        // The existing input refresh must revoke invalid targets on the first
+        // ordinary update, independently of eventual lifecycle settlement.
+        for target in &old_targets {
+            let gate = fixture.app.world().resource::<RouterInputGate>();
+            assert!(!gate.allows_pointer(*target));
+            assert!(!gate.allows_keyboard(*target));
+            assert!(!gate.allows_gamepad(*target));
+        }
+        assert_eq!(
+            fixture.app.world().resource::<InputFocus>().get(),
+            if with_active { None } else { Some(app_target) }
+        );
+        let snapshot = router_snapshot(&fixture.app, fixture.router);
+        assert_eq!(
+            snapshot.history(),
+            before.history(),
+            "host loss never rolls history back"
+        );
+        for (request, committed) in &committed {
+            assert_eq!(
+                request_snapshot(&fixture.app, fixture.router, *request),
+                *committed
+            );
+        }
+        assert_eq!(
+            fixture.control.effects(),
+            effects_before,
+            "idle observation must not build a view"
+        );
+        if snapshot.availability()
+            == &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+            && snapshot.running_request().is_none()
+            && snapshot.pending_phase().is_none()
+            && !snapshot.cleanup().foreground_pending()
+        {
+            break;
+        }
+    }
+    let unavailable = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(
+        component_manifest(&fixture.app, app_target),
+        app_target_components
+    );
+    assert_eq!(
+        fixture.app.world().get::<HostSentinel>(app_target),
+        Some(&HostSentinel(991))
+    );
+    assert_eq!(
+        unavailable.availability(),
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost),
+        "ordinary App::update must observe {loss:?} after genuine idle (with_active={with_active}); observed active={:?}",
+        unavailable.active().kind()
+    );
+    assert_eq!(unavailable.active().kind(), ActivePresentationKind::None);
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    for target in old_targets {
+        assert!(fixture.app.world().get_entity(target).is_err());
+    }
+    match loss {
+        RecoveryR2LossKind::RegistrationRemoval => {
+            assert_host_after_registration_loss(&fixture.app, &fixture.host_fingerprint);
+        }
+        RecoveryR2LossKind::HostDespawn => {
+            assert!(
+                fixture
+                    .app
+                    .world()
+                    .get_entity(fixture.host_fingerprint.host)
+                    .is_err()
+            );
+            assert!(
+                fixture
+                    .app
+                    .world()
+                    .get_entity(fixture.host_fingerprint.top_slot.unwrap())
+                    .is_err()
+            );
+        }
+    }
+    let new_host = match loss {
+        RecoveryR2LossKind::RegistrationRemoval => {
+            fixture
+                .app
+                .world_mut()
+                .entity_mut(fixture.host_fingerprint.host)
+                .insert(RouterHostRegistration::new(fixture.router));
+            fixture.host_fingerprint.host
+        }
+        RecoveryR2LossKind::HostDespawn => {
+            spawn_recovery_r3_app_host(&mut fixture.app, fixture.router).host
+        }
+    };
+    let ready = drive_recovery_r3_availability(
+        &mut fixture.app,
+        fixture.router,
+        &RouterAvailability::Ready,
+    );
+    assert_ne!(ready.host().version(), before.host().version());
+    assert_ne!(ready.host().top_slot(), before.host().top_slot());
+    assert_eq!(ready.active().kind(), ActivePresentationKind::None);
+    assert_eq!(ready.history(), before.history());
+    assert_eq!(fixture.control.effects(), effects_before);
+    assert!(fixture.app.world().get_entity(new_host).is_ok());
+    for (request, committed) in &committed {
+        assert_eq!(
+            request_snapshot(&fixture.app, fixture.router, *request),
+            *committed
+        );
+    }
+    let restored = replace_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        RouteLocation::new("/section/items/2"),
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, restored));
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
 }
 
 #[test]

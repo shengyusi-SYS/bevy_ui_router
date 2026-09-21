@@ -614,10 +614,106 @@ pub(crate) fn observed_descendant_closure(
     visited
 }
 
-/// Removes exact targets from Bevy's persistent pointer state without touching
-/// application-owned or other Router targets. Callers must supply a target set
-/// already authorized by their lifecycle/ownership preparation; this function
-/// deliberately does not infer Router authority.
+/// Current native input facts for one already-authorized cleanup target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RouterTargetInputObservation {
+    target: Entity,
+    gate: [bool; 3],
+    input_focus: bool,
+    route_focus: bool,
+    current_hover: bool,
+    previous_hover: bool,
+    press: bool,
+    click: bool,
+    drag: bool,
+    drag_over: bool,
+    ancestors: bool,
+    interaction: bool,
+}
+
+impl RouterTargetInputObservation {
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.gate == [false; 3]
+            && !self.input_focus
+            && !self.route_focus
+            && !self.current_hover
+            && !self.previous_hover
+            && !self.press
+            && !self.click
+            && !self.drag
+            && !self.drag_over
+            && !self.ancestors
+            && !self.interaction
+    }
+}
+
+pub(crate) fn observe_router_target_input(
+    world: &World,
+    target: Entity,
+) -> RouterTargetInputObservation {
+    let gate = world.get_resource::<RouterInputGate>();
+    let state = world.get_resource::<PointerState>();
+    RouterTargetInputObservation {
+        target,
+        gate: gate
+            .map(|gate| {
+                [
+                    gate.allows_pointer(target),
+                    gate.allows_keyboard(target),
+                    gate.allows_gamepad(target),
+                ]
+            })
+            .unwrap_or([false; 3]),
+        input_focus: world.get_resource::<InputFocus>().and_then(InputFocus::get) == Some(target),
+        route_focus: world
+            .get_resource::<RouteFocusState>()
+            .and_then(RouteFocusState::focused)
+            == Some(target),
+        current_hover: world
+            .get_resource::<HoverMap>()
+            .is_some_and(|map| map.values().any(|hits| hits.contains_key(&target))),
+        previous_hover: world
+            .get_resource::<PreviousHoverMap>()
+            .is_some_and(|map| map.values().any(|hits| hits.contains_key(&target))),
+        press: state.is_some_and(|state| {
+            state
+                .pointer_buttons
+                .values()
+                .any(|button| button.pressing.contains_key(&target))
+        }),
+        click: state.is_some_and(|state| {
+            state
+                .pointer_buttons
+                .values()
+                .any(|button| button.clicking.contains_key(&target))
+        }),
+        drag: state.is_some_and(|state| {
+            state
+                .pointer_buttons
+                .values()
+                .any(|button| button.dragging.contains_key(&target))
+        }),
+        drag_over: state.is_some_and(|state| {
+            state
+                .pointer_buttons
+                .values()
+                .any(|button| button.dragging_over.contains_key(&target))
+        }),
+        ancestors: state.is_some_and(|state| {
+            state.hovered_entity_ancestors.contains_key(&target)
+                || state
+                    .hovered_entity_ancestors
+                    .values()
+                    .any(|ancestors| ancestors.contains(&target))
+        }),
+        interaction: world
+            .get::<PickingInteraction>(target)
+            .is_some_and(|interaction| *interaction != PickingInteraction::None),
+    }
+}
+
+/// Removes exact authorized targets from persistent pointer state, preserving
+/// application-owned and other Router targets without inferring authority.
 pub(crate) fn revoke_router_pointer_targets(world: &mut World, targets: &HashSet<Entity>) {
     if targets.is_empty() {
         return;
@@ -1524,8 +1620,17 @@ pub(crate) mod tests {
             "fallback",
             "precommit-host-loss",
             "postcommit-host-loss",
+            "idle-host-loss",
         ] {
             let (mut app, initial_target) = active_atomic_app(transition);
+            if transition == "idle-host-loss" {
+                for _ in 0..3 {
+                    app.update();
+                }
+                let entry = &app.world().resource::<RouterNavigation>().entries[0];
+                assert!(entry.engine.idle_host_loss_eligible());
+                assert!(entry.cleanup_ledger.is_none());
+            }
             // Leave an actual cleanup ledger outstanding for the guarded
             // post-commit authority path; Back instead needs settled history.
             if matches!(transition, "back" | "postcommit-host-loss") {
@@ -1567,7 +1672,7 @@ pub(crate) mod tests {
                         .push(router, RouteLocation::new("/missing"))
                         .unwrap();
                 }
-                "precommit-host-loss" | "postcommit-host-loss" => {
+                "precommit-host-loss" | "postcommit-host-loss" | "idle-host-loss" => {
                     if transition == "precommit-host-loss" {
                         stage_atomic_replacement(&mut app);
                     }
@@ -1582,7 +1687,9 @@ pub(crate) mod tests {
                 }
                 _ => unreachable!(),
             }
-            if transition == "postcommit-host-loss" {
+            if transition == "idle-host-loss" {
+                app.update();
+            } else if transition == "postcommit-host-loss" {
                 settle_cleanup_system(app.world_mut());
             } else {
                 collect_navigation_system(app.world_mut());

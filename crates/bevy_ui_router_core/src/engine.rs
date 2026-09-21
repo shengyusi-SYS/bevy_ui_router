@@ -2,6 +2,8 @@
 
 use std::collections::VecDeque;
 
+pub(crate) mod idle_host_loss;
+
 use crate::admission::{
     AdmissionError, HostAdmissionAllocatorCounter, HostAdmissionAllocatorExhaustionEvidence,
     HostAdmissionConfirmation, HostAdmissionIssuer, HostAdmissionIssuerOutstandingProjection,
@@ -4253,6 +4255,7 @@ pub(crate) struct RouterEngine {
     pending_post_commit_settlement_trace: Option<CorePostCommitSettlementTraceProjection>,
     #[cfg(test)]
     testing_back_target_source_drift_before_freeze_once: bool,
+    pending_idle_host_loss: Option<idle_host_loss::IdleHostLossSource>,
 }
 
 impl RouterEngine {
@@ -4305,6 +4308,7 @@ impl RouterEngine {
             pending_back_no_target_authority: None,
             pending_back_target_permanent_cleanup: None,
             pending_post_commit_terminal: None,
+            pending_idle_host_loss: None,
             pending_post_commit_settlement_trace: None,
             #[cfg(test)]
             testing_back_target_source_drift_before_freeze_once: false,

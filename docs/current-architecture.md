@@ -44,7 +44,7 @@ facade 合同验证已迁往独立 consumer 与语义依赖检查；ECS 遗漏�
 
 以上是已有行为与迁移保留项，不宣称当前旧输入实现已经满足全部 native BSN 输入情形。
 
-**已确认的 host 缺口**：完全终态、没有新前台请求时，移除 active host registration 后普通 `App::update` 不会启动 authority settlement，snapshot 仍为 Ready/旧 active。当前 observation 对已有 host 跳过 admission 检查，恢复依赖在途工作发现 loss。这是既存实现缺口，不是合法产品语义；阶段 D 必须补齐 idle registration removal/host despawn 的主动失效处理与公共回归。现有 queued-loss/re-admission 公共测试和 post-commit 私测不能替代该验收。
+**idle host-loss 已闭合**：所有请求终态后的 registration removal/host despawn 会主动处理，包括 Ready 无 active 的绑定；真实 retired grant 建立请求独立的 owner，旧请求/history 保持。重新接纳将原 grant/candidate/staged slot 交给唯一 pending holder，全部 staging/activation 与外层资源重插后再复验实际旧残留、候选和新 slot，以常驻资源借用完成确认；真实拒绝原因与物理清理证据分开保留。两个真实 hook 回归、17 项定向、冻结版本 workspace/feature 验证及独立/交叉复审通过；native Scene 尚未接入，不能将该证据推广为其输入/cleanup 已验收。
 
 ## 历史与候选证据
 
@@ -56,4 +56,4 @@ Root、Nested、Reconciliation、History、Recovery 的完成记录见 [历史�
 
 ## 尚未完成
 
-生产 BSN root/nested/error 路径、idle host loss、旧 renderer API 退出、独立 BSN consumer、MVP 全量验证、最终审查和 main 集成均仍需完成。旧阶段 PASS、规范修订或注册类型存在不能替代这些结果。
+生产 BSN root/nested/error 路径、旧 renderer API 退出、独立 BSN consumer、MVP 全量验证、最终审查和 main 集成均仍需完成。旧阶段 PASS、规范修订或注册类型存在不能替代这些结果。

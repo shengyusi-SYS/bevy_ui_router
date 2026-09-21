@@ -450,6 +450,12 @@ fn back_no_target_zero_completion_max_generation_permanently_retires_cell() {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CleanupOwnerSnapshot {
+    IdleHostAuthority {
+        active_claims: Option<Vec<ExactRegistryClaim>>,
+        host: Entity,
+        top_slot: Entity,
+        top_slot_claim: ExactRegistryClaim,
+    },
     None,
     Leaving {
         claims: Vec<ExactRegistryClaim>,
@@ -475,6 +481,12 @@ enum CleanupOwnerSnapshot {
 fn cleanup_owner_snapshot(owner: Option<&CleanupOwner>) -> CleanupOwnerSnapshot {
     let claims = |branch: &RealizedBranch| branch.claims().cloned().collect::<Vec<_>>();
     match owner {
+        Some(CleanupOwner::IdleHostAuthority(owner)) => CleanupOwnerSnapshot::IdleHostAuthority {
+            active_claims: owner.active.as_ref().map(&claims),
+            host: owner.host.host,
+            top_slot: owner.host.top_slot,
+            top_slot_claim: owner.host.top_slot_claim.clone(),
+        },
         None => CleanupOwnerSnapshot::None,
         Some(CleanupOwner::Leaving(branch)) => CleanupOwnerSnapshot::Leaving {
             claims: claims(branch),

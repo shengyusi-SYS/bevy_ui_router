@@ -706,6 +706,10 @@ struct SealedOldOutputOwner {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FrozenStaleOutputOtherHolders {
+    pending_host_confirmation: bool,
+    deferred_host_observation: Option<DeferredHostObservation>,
+    idle_host_loss: bool,
+    idle_host_terminal: bool,
     host_settlement: bool,
     pending_host_admission_failure: bool,
     pending_commit: bool,
@@ -738,6 +742,10 @@ struct FrozenStaleOutputOtherHolders {
 impl FrozenStaleOutputOtherHolders {
     fn observe(entry: &RouterEntry) -> Self {
         Self {
+            pending_host_confirmation: entry.pending_host_confirmation.is_some(),
+            deferred_host_observation: entry.deferred_host_observation.clone(),
+            idle_host_loss: entry.idle_host_loss.is_some(),
+            idle_host_terminal: entry.idle_host_terminal.is_some(),
             host_settlement: entry.host_settlement.is_some(),
             pending_host_admission_failure: entry.pending_host_admission_failure.is_some(),
             pending_commit: entry.pending_commit.is_some(),
@@ -2293,6 +2301,14 @@ enum R3HostAdmissionUnavailableEvidence {
         source: HostCandidateObservationSource,
         evidence: Arc<ProvisionalStagingFailureEvidence>,
     },
+    RetainedAdmission {
+        source: HostCandidateObservationSource,
+        evidence: idle_host_loss::IdleHostAdmissionFailure,
+    },
+    PostScopePhysical {
+        source: HostCandidateObservationSource,
+        evidence: crate::host::PostScopeHostConfirmationFailure,
+    },
 }
 
 struct PreparedProvisionalHostInstallation {
@@ -2301,6 +2317,15 @@ struct PreparedProvisionalHostInstallation {
     claim: ExactRegistryClaim,
     version: bevy_ui_router_core::HostVersion,
     slot_id: bevy_ui_router_core::ids::RouteSlotId,
+}
+
+struct PendingHostConfirmation {
+    grant: r3_core::SourceBoundHostGrant,
+    candidate: PreparedEcsHostCandidateSource,
+    staged: StagedProvisionalTopSlot,
+    claim: ExactRegistryClaim,
+    rejection: PreparedHostCandidateRejection,
+    reinserted_resources: [(Entity, bevy_ecs::component::ComponentId); 3],
 }
 
 struct ProvisionalHostAdmissionFailure {
@@ -2410,6 +2435,7 @@ pub(crate) struct RouterEntry {
     pub(crate) host: Option<HostBinding>,
     host_settlement: Option<ProvisionalHostSettlement>,
     pending_host_admission_failure: Option<HostAdmissionFailureHolder>,
+    pending_host_confirmation: Option<PendingHostConfirmation>,
     pending_commit: Option<PendingCommit>,
     pending_frame_drive: Option<PendingFrameDrive>,
     pending_stale_output_cleanup: Option<PendingStaleOutputCleanup>,
@@ -2426,6 +2452,9 @@ pub(crate) struct RouterEntry {
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
     post_commit_compound: Option<Box<PostCommitCompoundHolder>>,
     settled_retired_host_evidence: Option<SettledRetiredHostEvidence>,
+    idle_host_loss: Option<idle_host_loss::IdleHostLoss>,
+    idle_host_terminal: Option<idle_host_loss::IdleHostTerminal>,
+    deferred_host_observation: Option<DeferredHostObservation>,
     #[cfg(test)]
     commit_sealed_registration_removal_armed: bool,
     #[cfg(test)]
@@ -5993,13 +6022,15 @@ impl RouterEntry {
 
     pub(crate) fn cleanup_summary(&self) -> bevy_ui_router_core::CleanupSummary {
         self.cleanup_observation.summary(
-            self.cleanup_ledger.is_some()
+            self.idle_host_loss.is_some()
+                || self.cleanup_ledger.is_some()
                 || self.post_commit_compound.is_some()
                 || self.pending_failed_branch.is_some()
                 || self.failure_cleanup_permanent.is_some()
                 || self.pending_mount_mutation_rejection.is_some()
                 || self.host_settlement.is_some()
                 || self.pending_host_admission_failure.is_some()
+                || self.pending_host_confirmation.is_some()
                 || self.pending_back_no_target_completion.is_some()
                 || self.pending_back_no_target_preparation.is_some()
                 || self.pending_back_no_target_authority_cleanup.is_some(),
@@ -6153,6 +6184,7 @@ impl RouterNavigation {
             host: None,
             host_settlement: None,
             pending_host_admission_failure: None,
+            pending_host_confirmation: None,
             pending_commit: None,
             pending_frame_drive: None,
             pending_stale_output_cleanup: None,
@@ -6169,6 +6201,9 @@ impl RouterNavigation {
             cleanup_ledger: None,
             post_commit_compound: None,
             settled_retired_host_evidence: None,
+            idle_host_loss: None,
+            idle_host_terminal: None,
+            deferred_host_observation: None,
             #[cfg(test)]
             commit_sealed_registration_removal_armed: false,
             #[cfg(test)]
@@ -6650,17 +6685,79 @@ impl std::fmt::Display for NavigationEnqueueError {
 
 impl std::error::Error for NavigationEnqueueError {}
 
+/// The earliest local observation not yet submitted to Core. This is comparison
+/// evidence only: the current candidate is always rebuilt from World.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeferredHostObservation {
+    previous: Option<HostCandidateObservationSource>,
+}
+
+#[derive(Clone, Copy)]
+enum HostObservationDelivery {
+    DeferredBeforeCore,
+    CoreHandled,
+    OwnerTransferred,
+}
+
+impl HostObservationDelivery {
+    fn after_core(entry: &RouterEntry) -> Self {
+        if entry.pending_host_admission_failure.is_some()
+            || entry.host.is_some()
+            || entry.pending_host_confirmation.is_some()
+        {
+            Self::OwnerTransferred
+        } else {
+            Self::CoreHandled
+        }
+    }
+
+    fn reconcile(self, entry: &mut RouterEntry) {
+        if !matches!(self, Self::DeferredBeforeCore) {
+            entry.deferred_host_observation = None;
+        }
+    }
+}
+
 pub(crate) fn observe_authority_system(world: &mut World) {
-    world.resource_scope(|world, mut revisions: bevy_ecs::change_detection::Mut<HostCandidateRevisionState>| {
+    let reinserted_resources = [
+        world
+            .component_id::<RouterNavigation>()
+            .expect("installed navigation"),
+        world
+            .component_id::<HostCandidateRevisionLatch>()
+            .expect("installed latch"),
+        world
+            .component_id::<HostCandidateRevisionState>()
+            .expect("installed revisions"),
+    ]
+    .map(|component| {
+        (
+            world
+                .resource_entities()
+                .get(component)
+                .expect("installed resource carrier"),
+            component,
+        )
+    });
+    let count = world.resource::<RouterNavigation>().entries.len();
+    for index in 0..count {
+        world.resource_scope(|world, mut revisions: bevy_ecs::change_detection::Mut<HostCandidateRevisionState>| {
         world.resource_scope(|world, mut latch: bevy_ecs::change_detection::Mut<HostCandidateRevisionLatch>| {
             world.resource_scope(|world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
-                for entry in &mut navigation.entries {
+                'entry_work: {
+                    let entry = &mut navigation.entries[index];
+                    if entry.pending_host_confirmation.is_some() {
+                        break 'entry_work;
+                    }
+                    if idle_host_loss::observe(world, entry) {
+                        break 'entry_work;
+                    }
                     if entry.pending_host_admission_failure.is_some() {
                         drive_pending_r3_host_admission_failure(world, entry);
-                        continue;
+                        break 'entry_work;
                     }
                     if entry.host_settlement.is_some() {
-                        continue;
+                        break 'entry_work;
                     }
                     if entry.host.is_some()
                         || entry.post_commit_compound.is_some()
@@ -6673,12 +6770,15 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                         || entry.pending_back_no_target_authority_cleanup.is_some()
                         || entry.pending_back_no_target_preparation.is_some()
                     {
-                        continue;
+                        break 'entry_work;
                     }
                     let previous_candidate_source = match revisions.current_source(entry.handle) {
                         Ok(source) => source,
-                        Err(_) => continue,
+                        Err(_) => break 'entry_work,
                     };
+                    let previous_candidate_source = entry.deferred_host_observation
+                        .get_or_insert(DeferredHostObservation { previous: previous_candidate_source })
+                        .previous.clone();
                     let classification =
                         classify_host_candidate(world, entry.handle, &mut revisions);
                     let candidate = match classification {
@@ -6692,8 +6792,10 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                                     R3HostAdmissionUnavailableEvidence::NoCandidate(source),
                                     previous_candidate_source.as_ref().map(|source| source.digest()),
                                 );
+                            } else {
+                                entry.deferred_host_observation = None;
                             }
-                            continue;
+                            break 'entry_work;
                         }
                         HostCandidateClassification::InvalidTopology(candidate) => {
                             let source = candidate.observation_source();
@@ -6703,7 +6805,7 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                                 R3HostAdmissionUnavailableEvidence::InvalidTopology(source),
                                 previous_candidate_source.as_ref().map(|source| source.digest()),
                             );
-                            continue;
+                            break 'entry_work;
                         }
                         HostCandidateClassification::Conflict(candidate) => {
                             let source = candidate.observation_source();
@@ -6713,9 +6815,9 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                                 R3HostAdmissionUnavailableEvidence::Conflict(source),
                                 previous_candidate_source.as_ref().map(|source| source.digest()),
                             );
-                            continue;
+                            break 'entry_work;
                         }
-                        HostCandidateClassification::RetryableCapacity(_) => continue,
+                        HostCandidateClassification::RetryableCapacity(_) => break 'entry_work,
                         HostCandidateClassification::IdentityExhausted {
                             source,
                             counter,
@@ -6733,18 +6835,20 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                                 },
                                 previous_candidate_source.as_ref().map(|source| source.digest()),
                             );
-                            continue;
+                            break 'entry_work;
                         }
                         HostCandidateClassification::Unique(candidate) => candidate,
                     };
                     if !latch.allows(candidate.revision()) {
-                        continue;
+                        // This exact revision already has a delivered rejection.
+                        entry.deferred_host_observation = None;
+                        break 'entry_work;
                     }
                     let prepared_rejection = match latch
                         .prepare_rejection(entry.handle, candidate.revision())
                     {
                         Ok(prepared) => prepared,
-                        Err(_) => continue,
+                        Err(_) => break 'entry_work,
                     };
                     #[cfg(test)]
                     if let Some(owner) = entry.engine.testing_take_armed_host_admission_owner() {
@@ -6753,20 +6857,28 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                             PreparedEcsHostCandidateSource::prepare(candidate),
                             owner,
                         );
-                        continue;
+                        entry.deferred_host_observation = None;
+                        break 'entry_work;
                     }
-                    let _ = drive_r3_unique_host_candidate(
+                    let delivery = drive_r3_unique_host_candidate(
                         world,
                         entry,
                         PreparedEcsHostCandidateSource::prepare(candidate),
                         previous_candidate_source.as_ref().map(|source| source.digest()),
                         &mut latch,
                         prepared_rejection,
+                        reinserted_resources,
                     );
+                    if let Ok(delivery) = delivery {
+                        delivery.reconcile(entry);
+                    }
                 }
             });
         });
     });
+        complete_pending_host_confirmations(world);
+    }
+    idle_host_loss::complete_ready(world);
 }
 
 fn r3_unavailable_projection(
@@ -6857,6 +6969,24 @@ fn r3_unavailable_projection(
             )
         }
         R3HostAdmissionUnavailableEvidence::PostAllocation { source, evidence } => {
+            r3_core::HostAdmissionUnavailableEvidenceProjection::authority_establishment_failed(
+                core_source,
+                Some(source.revision().raw()),
+                evidence.expected_digest(),
+                evidence.observed_digest(),
+                None,
+            )
+        }
+        R3HostAdmissionUnavailableEvidence::RetainedAdmission { source, evidence } => {
+            r3_core::HostAdmissionUnavailableEvidenceProjection::authority_establishment_failed(
+                core_source,
+                Some(source.revision().raw()),
+                evidence.expected_digest(),
+                evidence.observed_digest(),
+                None,
+            )
+        }
+        R3HostAdmissionUnavailableEvidence::PostScopePhysical { source, evidence } => {
             r3_core::HostAdmissionUnavailableEvidenceProjection::authority_establishment_failed(
                 core_source,
                 Some(source.revision().raw()),
@@ -7013,7 +7143,7 @@ fn drive_observed_candidate_rejection(
     evidence: R3HostAdmissionUnavailableEvidence,
     expected_observation_digest: Option<u64>,
 ) {
-    match entry.engine.issue_host_admission_source_permit() {
+    let delivery = match entry.engine.issue_host_admission_source_permit() {
         r3_core::HostAdmissionSourcePermitOutcome::Issued(permit) => {
             complete_pre_staging_r3_unavailable(
                 entry,
@@ -7021,12 +7151,17 @@ fn drive_observed_candidate_rejection(
                 source_evidence,
                 evidence,
             );
+            HostObservationDelivery::after_core(entry)
         }
         r3_core::HostAdmissionSourcePermitOutcome::Ineligible { source, .. } => {
             complete_observed_r3_unavailable(entry, source, evidence, expected_observation_digest);
+            HostObservationDelivery::after_core(entry)
         }
-        r3_core::HostAdmissionSourcePermitOutcome::Outstanding { .. } => {}
-    }
+        r3_core::HostAdmissionSourcePermitOutcome::Outstanding { .. } => {
+            HostObservationDelivery::DeferredBeforeCore
+        }
+    };
+    delivery.reconcile(entry);
 }
 
 fn drive_r3_unique_host_candidate(
@@ -7036,16 +7171,24 @@ fn drive_r3_unique_host_candidate(
     expected_observation_digest: Option<u64>,
     latch: &mut HostCandidateRevisionLatch,
     prepared_rejection: PreparedHostCandidateRejection,
-) -> Result<(), HostCandidateCapacityEvidence> {
+    reinserted_resources: [(Entity, bevy_ecs::component::ComponentId); 3],
+) -> Result<HostObservationDelivery, HostCandidateCapacityEvidence> {
     if entry
         .settled_retired_host_evidence
         .as_ref()
         .is_some_and(|evidence| !settled_retired_host_allows_candidate(world, evidence, &candidate))
     {
-        return Ok(());
+        return Ok(HostObservationDelivery::DeferredBeforeCore);
+    }
+    if entry
+        .idle_host_terminal
+        .as_ref()
+        .is_some_and(|terminal| !idle_host_loss::allows_candidate(world, terminal, &candidate))
+    {
+        return Ok(HostObservationDelivery::DeferredBeforeCore);
     }
     if !candidate.prepare_staging_revalidation(world)? {
-        return Ok(());
+        return Ok(HostObservationDelivery::DeferredBeforeCore);
     }
     let permit = match entry.engine.issue_host_admission_source_permit() {
         r3_core::HostAdmissionSourcePermitOutcome::Issued(permit) => permit,
@@ -7069,9 +7212,11 @@ fn drive_r3_unique_host_candidate(
                 evidence,
                 expected_observation_digest,
             );
-            return Ok(());
+            return Ok(HostObservationDelivery::after_core(entry));
         }
-        r3_core::HostAdmissionSourcePermitOutcome::Outstanding { .. } => return Ok(()),
+        r3_core::HostAdmissionSourcePermitOutcome::Outstanding { .. } => {
+            return Ok(HostObservationDelivery::DeferredBeforeCore);
+        }
     };
     let token = match entry.engine.request_source_bound_host_admission(permit) {
         Ok(token) => token,
@@ -7083,7 +7228,7 @@ fn drive_r3_unique_host_candidate(
                 error.evidence,
             );
             latch.commit_rejection(prepared_rejection);
-            return Ok(());
+            return Ok(HostObservationDelivery::OwnerTransferred);
         }
     };
     let grant = match entry.engine.grant_source_bound_host_admission(token) {
@@ -7096,7 +7241,7 @@ fn drive_r3_unique_host_candidate(
                 error.evidence,
             );
             latch.commit_rejection(prepared_rejection);
-            return Ok(());
+            return Ok(HostObservationDelivery::OwnerTransferred);
         }
     };
     if !world.contains_resource::<RouteEntityRegistry>()
@@ -7110,12 +7255,28 @@ fn drive_r3_unique_host_candidate(
             R3HostAdmissionUnavailableEvidence::Preallocation(observation),
         );
         latch.commit_rejection(prepared_rejection);
-        return Ok(());
+        return Ok(HostObservationDelivery::after_core(entry));
     }
     match stage_source_bound_granted_top_slot(world, &mut candidate, &grant) {
         Ok(staged) => {
-            drive_r3_staged_host_confirmation(world, entry, grant, candidate, staged);
-            if entry.host.is_none() {
+            let claim = world
+                .resource::<RouteEntityRegistry>()
+                .record(staged.entity())
+                .expect("source-bound staging retained its exact claim")
+                .claim();
+            if activate_source_bound_granted_top_slot(world, &candidate, &grant, &staged) {
+                entry.pending_host_confirmation = Some(PendingHostConfirmation {
+                    grant,
+                    candidate,
+                    staged,
+                    claim,
+                    rejection: prepared_rejection,
+                    reinserted_resources,
+                });
+            } else {
+                let settlement =
+                    retain_staged_top_slot_for_settlement(world, &candidate.candidate, staged);
+                retain_r3_provisional_failure(entry, grant, candidate, settlement, None, false);
                 latch.commit_rejection(prepared_rejection);
             }
         }
@@ -7138,7 +7299,7 @@ fn drive_r3_unique_host_candidate(
             latch.commit_rejection(prepared_rejection);
         }
     }
-    Ok(())
+    Ok(HostObservationDelivery::after_core(entry))
 }
 
 fn complete_granted_candidate_unavailable(
@@ -7192,24 +7353,129 @@ fn complete_granted_candidate_unavailable(
     }
 }
 
-fn drive_r3_staged_host_confirmation(
-    world: &mut World,
+enum PendingHostRejectionCause {
+    Physical(crate::host::PostScopeHostConfirmationFailure),
+    Retained(idle_host_loss::IdleHostAdmissionFailure),
+    Core(r3_core::HostAdmissionConfirmationFailureEvidence),
+}
+
+fn complete_pending_host_confirmations(world: &mut World) {
+    let count = world.resource::<RouterNavigation>().entries.len();
+    for index in 0..count {
+        let entry = &world.resource::<RouterNavigation>().entries[index];
+        let Some(pending) = entry.pending_host_confirmation.as_ref() else {
+            continue;
+        };
+        let cause = entry
+            .idle_host_terminal
+            .as_ref()
+            .and_then(|terminal| {
+                idle_host_loss::admission_failure(world, terminal, &pending.candidate)
+            })
+            .map(PendingHostRejectionCause::Retained)
+            .or_else(|| {
+                crate::host::post_scope_host_confirmation_failure(
+                    world,
+                    &pending.candidate,
+                    &pending.grant,
+                    &pending.staged,
+                    &pending.reinserted_resources,
+                )
+                .map(PendingHostRejectionCause::Physical)
+            });
+        let (rejected, rejection) = {
+            let mut navigation = world.resource_mut::<RouterNavigation>();
+            let entry = &mut navigation.entries[index];
+            let PendingHostConfirmation {
+                grant,
+                candidate,
+                staged,
+                claim,
+                rejection,
+                ..
+            } = entry
+                .pending_host_confirmation
+                .take()
+                .expect("observed pending confirmation");
+            let rejected = match cause {
+                Some(cause) => Some(HostConfirmationRejection::Granted {
+                    grant,
+                    candidate,
+                    staged,
+                    cause,
+                }),
+                None => confirm_prepared_host_after_scopes(entry, grant, candidate, staged, claim),
+            };
+            (rejected, rejection)
+        };
+        let Some(rejected) = rejected else {
+            continue;
+        };
+        world
+            .resource_mut::<HostCandidateRevisionLatch>()
+            .commit_rejection(rejection);
+        // Only rejection performs further World effects/scopes. The successful
+        // path above has already ended with its final resident publication.
+        world.resource_scope(|world, _: bevy_ecs::change_detection::Mut<HostCandidateRevisionState>| {
+        world.resource_scope(|world, _: bevy_ecs::change_detection::Mut<HostCandidateRevisionLatch>| {
+        world.resource_scope(|world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+            let entry = &mut navigation.entries[index];
+            match rejected {
+                HostConfirmationRejection::Granted { grant, candidate, staged, cause } => {
+                    let stable_inert = !hide_source_bound_granted_top_slot(world, &candidate, &grant, &staged);
+                    let settlement = retain_staged_top_slot_for_settlement(world, &candidate.candidate, staged);
+                    match cause {
+                        PendingHostRejectionCause::Retained(evidence) => {
+                            let source = candidate.observation_source();
+                            retain_r3_provisional_failure_with_cause(entry, grant, candidate, settlement,
+                                R3HostAdmissionUnavailableEvidence::RetainedAdmission { source, evidence }, None, stable_inert);
+                        }
+                        PendingHostRejectionCause::Core(evidence) => retain_r3_provisional_failure(entry, grant, candidate, settlement, Some(evidence), stable_inert),
+                        PendingHostRejectionCause::Physical(evidence) => {
+                            let source = candidate.observation_source();
+                            retain_r3_provisional_failure_with_cause(entry, grant, candidate, settlement,
+                                R3HostAdmissionUnavailableEvidence::PostScopePhysical { source, evidence }, None, stable_inert);
+                        }
+                    }
+                }
+                HostConfirmationRejection::Confirming { owner, evidence, candidate, version, slot_id, entity, claim } => {
+                    retain_r3_confirmation_failure(world, entry, owner, evidence, candidate, version, slot_id, entity, claim);
+                }
+            }
+        });
+        });
+        });
+    }
+}
+
+enum HostConfirmationRejection {
+    Granted {
+        grant: r3_core::SourceBoundHostGrant,
+        candidate: PreparedEcsHostCandidateSource,
+        staged: StagedProvisionalTopSlot,
+        cause: PendingHostRejectionCause,
+    },
+    Confirming {
+        owner: r3_core::CorePreparedHostConfirmation<PreparedProvisionalHostInstallation>,
+        evidence: r3_core::HostAdmissionConfirmationFailureEvidence,
+        candidate: ValidatedHostCandidate,
+        version: bevy_ui_router_core::HostVersion,
+        slot_id: bevy_ui_router_core::ids::RouteSlotId,
+        entity: Entity,
+        claim: ExactRegistryClaim,
+    },
+}
+
+// This tail has no World access. All successful-path effects and validation
+// precede its resident-resource borrow; errors return the original real owner.
+fn confirm_prepared_host_after_scopes(
     entry: &mut RouterEntry,
     grant: r3_core::SourceBoundHostGrant,
     mut candidate: PreparedEcsHostCandidateSource,
     staged: StagedProvisionalTopSlot,
-) {
+    claim: ExactRegistryClaim,
+) -> Option<HostConfirmationRejection> {
     let staged_entity = staged.entity();
-    let claim = world
-        .resource::<RouteEntityRegistry>()
-        .record(staged_entity)
-        .expect("source-bound staging retained its exact claim")
-        .claim();
-    if !activate_source_bound_granted_top_slot(world, &candidate, &grant, &staged) {
-        let settlement = retain_staged_top_slot_for_settlement(world, &candidate.candidate, staged);
-        retain_r3_provisional_failure(entry, grant, candidate, settlement, None, false);
-        return;
-    }
     if let Err(error) = entry.engine.record_source_bound_top_slot_registered(&grant) {
         let failure = match error {
             r3_core::SourceBoundTopSlotRegistrationError::Operation(evidence) => Some(
@@ -7223,10 +7489,12 @@ fn drive_r3_staged_host_confirmation(
                 ),
             ),
         };
-        let stable_inert = !hide_source_bound_granted_top_slot(world, &candidate, &grant, &staged);
-        let settlement = retain_staged_top_slot_for_settlement(world, &candidate.candidate, staged);
-        retain_r3_provisional_failure(entry, grant, candidate, settlement, failure, stable_inert);
-        return;
+        return Some(HostConfirmationRejection::Granted {
+            grant,
+            candidate,
+            staged,
+            cause: PendingHostRejectionCause::Core(failure.expect("actual registration error")),
+        });
     }
     #[cfg(test)]
     if std::mem::take(&mut entry.host_confirmation_preparation_receiver_drift_before_prepare_armed)
@@ -7258,23 +7526,14 @@ fn drive_r3_staged_host_confirmation(
             let PreparedProvisionalHostInstallation {
                 staged, candidate, ..
             } = installation;
-            let stable_inert =
-                !hide_source_bound_granted_top_slot(world, &candidate, &grant, &staged);
-            let settlement =
-                retain_staged_top_slot_for_settlement(world, &candidate.candidate, staged);
-            retain_r3_provisional_failure(
-                entry,
-                grant,
-                candidate,
-                settlement,
-                Some(
+            return Some(HostConfirmationRejection::Granted {
+                grant, candidate, staged,
+                cause: PendingHostRejectionCause::Core(
                     r3_core::HostAdmissionConfirmationFailureEvidence::ConfirmationPreparationRejected(
                         evidence,
                     ),
                 ),
-                stable_inert,
-            );
-            return;
+            });
         }
         r3_core::HostConfirmationPreparationOutcome::ReceiverMismatch { owner, evidence } => {
             let rejected =
@@ -7283,21 +7542,14 @@ fn drive_r3_staged_host_confirmation(
             let PreparedProvisionalHostInstallation {
                 staged, candidate, ..
             } = installation;
-            let stable_inert =
-                !hide_source_bound_granted_top_slot(world, &candidate, &grant, &staged);
-            let settlement =
-                retain_staged_top_slot_for_settlement(world, &candidate.candidate, staged);
-            retain_r3_provisional_failure(
-                entry,
+            return Some(HostConfirmationRejection::Granted {
                 grant,
                 candidate,
-                settlement,
-                Some(r3_core::HostAdmissionConfirmationFailureEvidence::Receiver(
-                    evidence,
-                )),
-                stable_inert,
-            );
-            return;
+                staged,
+                cause: PendingHostRejectionCause::Core(
+                    r3_core::HostAdmissionConfirmationFailureEvidence::Receiver(evidence),
+                ),
+            });
         }
     };
     #[cfg(test)]
@@ -7328,51 +7580,44 @@ fn drive_r3_staged_host_confirmation(
         })
     };
     match confirmation {
-        r3_core::HostAdmissionConfirmationCoreOutcome::Ready { installed: (), .. } => {}
+        r3_core::HostAdmissionConfirmationCoreOutcome::Ready { installed: (), .. } => None,
         r3_core::HostAdmissionConfirmationCoreOutcome::ReceiverMismatch { owner, evidence } => {
-            retain_r3_confirmation_failure(
-                world,
-                entry,
+            Some(HostConfirmationRejection::Confirming {
                 owner,
-                r3_core::HostAdmissionConfirmationFailureEvidence::Receiver(evidence),
-                cached_candidate,
-                cached_grant_version,
-                cached_grant_top_slot,
-                staged_entity,
+                evidence: r3_core::HostAdmissionConfirmationFailureEvidence::Receiver(evidence),
+                candidate: cached_candidate,
+                version: cached_grant_version,
+                slot_id: cached_grant_top_slot,
+                entity: staged_entity,
                 claim,
-            );
+            })
         }
         r3_core::HostAdmissionConfirmationCoreOutcome::IssuerRejected { owner, evidence } => {
-            retain_r3_confirmation_failure(
-                world,
-                entry,
+            Some(HostConfirmationRejection::Confirming {
                 owner,
-                r3_core::HostAdmissionConfirmationFailureEvidence::Issuer(evidence),
-                cached_candidate,
-                cached_grant_version,
-                cached_grant_top_slot,
-                staged_entity,
+                evidence: r3_core::HostAdmissionConfirmationFailureEvidence::Issuer(evidence),
+                candidate: cached_candidate,
+                version: cached_grant_version,
+                slot_id: cached_grant_top_slot,
+                entity: staged_entity,
                 claim,
-            );
+            })
         }
         r3_core::HostAdmissionConfirmationCoreOutcome::PublicationPreparationRejected {
             owner,
             evidence,
-        } => {
-            retain_r3_confirmation_failure(
-                world,
-                entry,
-                owner,
+        } => Some(HostConfirmationRejection::Confirming {
+            owner,
+            evidence:
                 r3_core::HostAdmissionConfirmationFailureEvidence::ConfirmationPublicationRejected(
                     evidence,
                 ),
-                cached_candidate,
-                cached_grant_version,
-                cached_grant_top_slot,
-                staged_entity,
-                claim,
-            );
-        }
+            candidate: cached_candidate,
+            version: cached_grant_version,
+            slot_id: cached_grant_top_slot,
+            entity: staged_entity,
+            claim,
+        }),
     }
 }
 
@@ -7380,13 +7625,10 @@ fn retain_r3_provisional_failure(
     entry: &mut RouterEntry,
     grant: r3_core::SourceBoundHostGrant,
     candidate: PreparedEcsHostCandidateSource,
-    mut settlement: ProvisionalHostSettlement,
+    settlement: ProvisionalHostSettlement,
     failure: Option<r3_core::HostAdmissionConfirmationFailureEvidence>,
-    mut stable_inert: bool,
+    stable_inert: bool,
 ) {
-    if !settlement.bind_quarantine_origin(entry.handle, grant.version().clone()) {
-        stable_inert = true;
-    }
     let receiver = failure.as_ref().and_then(|failure| match failure {
         r3_core::HostAdmissionConfirmationFailureEvidence::Receiver(receiver) => {
             Some(receiver.clone())
@@ -7413,6 +7655,29 @@ fn retain_r3_provisional_failure(
             evidence: settlement.failure_evidence(),
         }
     };
+    retain_r3_provisional_failure_with_cause(
+        entry,
+        grant,
+        candidate,
+        settlement,
+        evidence,
+        receiver,
+        stable_inert,
+    );
+}
+
+fn retain_r3_provisional_failure_with_cause(
+    entry: &mut RouterEntry,
+    grant: r3_core::SourceBoundHostGrant,
+    candidate: PreparedEcsHostCandidateSource,
+    mut settlement: ProvisionalHostSettlement,
+    evidence: R3HostAdmissionUnavailableEvidence,
+    receiver: Option<r3_core::HostConfirmationReceiverMismatchProjection>,
+    mut stable_inert: bool,
+) {
+    if !settlement.bind_quarantine_origin(entry.handle, grant.version().clone()) {
+        stable_inert = true;
+    }
     let source = grant.source_projection();
     let projection = r3_unavailable_projection(&source, &evidence, None);
     entry.host_admission_operation_counts.0 += 1;
@@ -15876,6 +16141,7 @@ fn publish_normal_work(
 }
 
 mod authority_isolation;
+mod idle_host_loss;
 #[cfg(test)]
 use authority_isolation::{
     AuthorityIsolationComponent, AuthorityIsolationPredicate, AuthorityIsolationViolation,

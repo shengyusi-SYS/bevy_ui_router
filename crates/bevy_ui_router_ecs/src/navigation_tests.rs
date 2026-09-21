@@ -89,6 +89,1388 @@ fn exhausted_navigation_domain_never_wraps_or_reuses_authority() {
     assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
 }
 
+fn idle_host_loss_atomic_fixture(
+    label: &str,
+) -> (App, RouterHandle, NavigationRequestId, Entity, Entity) {
+    idle_host_loss_fixture_in_app(App::new(), label)
+}
+
+fn idle_host_loss_fixture_in_app(
+    mut app: App,
+    label: &str,
+) -> (App, RouterHandle, NavigationRequestId, Entity, Entity) {
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let router = install_atomic_router(&mut app, label);
+    app.update();
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/"))
+        .unwrap();
+    for _ in 0..12 {
+        app.update();
+        if app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .idle_host_loss_eligible()
+        {
+            break;
+        }
+    }
+    for _ in 0..3 {
+        app.update();
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(entry.engine.idle_host_loss_eligible());
+    assert_eq!(
+        entry.engine.request(request).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+    assert!(entry.cleanup_ledger.is_none());
+    assert!(entry.pending_commit.is_none());
+    let host = entry.host.as_ref().unwrap();
+    let (entity, top) = (host.host, host.top_slot);
+    (app, router, request, entity, top)
+}
+
+#[test]
+fn idle_host_loss_scope_exit_focus_drift_is_unproven_then_fresh_evidence_allows_admission() {
+    #[derive(Resource)]
+    struct RefocusAtNavigationReinsertion(Option<Entity>);
+    let mut app = App::new();
+    app.world_mut()
+        .register_component_hooks::<RouterNavigation>()
+        .on_insert(|mut world, _| {
+            if world
+                .get_resource::<RouterNavigation>()
+                .is_none_or(|navigation| {
+                    navigation
+                        .entries
+                        .iter()
+                        .all(|entry| entry.idle_host_loss.is_none())
+                })
+            {
+                return;
+            }
+            let Some(target) = world
+                .get_resource_mut::<RefocusAtNavigationReinsertion>()
+                .and_then(|mut armed| armed.0.take())
+            else {
+                return;
+            };
+            *world.resource_mut::<InputFocus>() = InputFocus::from_entity(target);
+            world
+                .resource_mut::<RouteFocusState>()
+                .set_focused(Some(target));
+        });
+    let (mut app, router, request, host, top) =
+        idle_host_loss_fixture_in_app(app, "idle-scope-focus");
+    app.world_mut()
+        .insert_resource(RefocusAtNavigationReinsertion(Some(top)));
+    app.world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    app.update();
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(entry.idle_host_loss.is_none());
+    assert!(matches!(
+        entry.idle_host_terminal.as_ref().unwrap().disposition(),
+        bevy_ui_router_core::integration::IdleHostLossPhysicalDisposition::IsolationUnproven { .. }
+    ));
+    assert_eq!(
+        entry.engine.request(request).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(top));
+    assert_eq!(
+        app.world().resource::<RouteFocusState>().focused(),
+        Some(top)
+    );
+    *app.world_mut().resource_mut::<InputFocus>() = InputFocus::default();
+    app.world_mut()
+        .resource_mut::<RouteFocusState>()
+        .set_focused(None);
+    app.world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(router));
+    for _ in 0..5 {
+        app.update();
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert_eq!(
+        entry.engine.snapshot().availability(),
+        &RouterAvailability::Ready
+    );
+    assert!(entry.active.is_none());
+}
+
+#[test]
+fn idle_host_loss_capacity_retry_keeps_requestless_owner_until_settlement() {
+    let (mut app, router, request, host, _) =
+        idle_host_loss_atomic_fixture("idle-reserve-capacity");
+    let before = app.world().resource::<RouterNavigation>().entries[0]
+        .engine
+        .request(request)
+        .unwrap()
+        .status()
+        .clone();
+    app.world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    crate::cleanup::fail_next_reservation_for_test();
+    app.update();
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert_eq!(
+        entry.engine.snapshot().availability(),
+        &RouterAvailability::RecoveringAuthority
+    );
+    assert!(matches!(
+        entry.idle_host_loss,
+        Some(idle_host_loss::IdleHostLoss::Reserving(_))
+    ));
+    assert!(entry.host.is_none());
+    assert!(entry.active.is_none());
+    assert_eq!(entry.engine.request(request).unwrap().status(), &before);
+    assert!(entry.cleanup_summary().foreground_pending());
+    assert_eq!(
+        app.world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .cleanup(),
+        &entry.cleanup_summary()
+    );
+    app.update();
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(entry.idle_host_loss.is_none());
+    assert_eq!(
+        entry.engine.snapshot().availability(),
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+    );
+    assert_eq!(entry.engine.request(request).unwrap().status(), &before);
+    assert!(!entry.cleanup_summary().foreground_pending());
+    assert_eq!(
+        entry.cleanup_summary().last_disposition(),
+        Some(bevy_ui_router_core::prelude::CleanupDisposition::RemovedDetached)
+    );
+    assert_eq!(
+        app.world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .cleanup(),
+        &entry.cleanup_summary()
+    );
+}
+
+fn idle_host_loss_retained_success_fixture() -> (
+    App,
+    RouterHandle,
+    NavigationRequestId,
+    Entity,
+    Entity,
+    Entity,
+) {
+    idle_host_loss_retained_success_fixture_with_candidate(false)
+}
+
+fn idle_host_loss_retained_success_fixture_with_candidate(
+    direct: bool,
+) -> (
+    App,
+    RouterHandle,
+    NavigationRequestId,
+    Entity,
+    Entity,
+    Entity,
+) {
+    idle_host_loss_retained_success_fixture_in_app(App::new(), direct)
+}
+
+fn idle_host_loss_retained_success_fixture_in_app(
+    app: App,
+    direct: bool,
+) -> (
+    App,
+    RouterHandle,
+    NavigationRequestId,
+    Entity,
+    Entity,
+    Entity,
+) {
+    let (mut app, router, request, host, top) =
+        idle_host_loss_fixture_in_app(app, "idle-retained-success");
+    let protected = if direct {
+        top
+    } else {
+        app.world_mut()
+            .spawn((Node::default(), ChildOf(top), NestedAppHostSentinel(0xd3)))
+            .id()
+    };
+    let candidate = app
+        .world_mut()
+        .spawn((Node::default(), ChildOf(protected)))
+        .id();
+    app.update();
+    assert!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .idle_host_loss_eligible()
+    );
+    app.world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    app.update();
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(entry.idle_host_loss.is_none());
+    assert!(
+        matches!(
+            entry.idle_host_terminal.as_ref().unwrap().disposition(),
+            bevy_ui_router_core::integration::IdleHostLossPhysicalDisposition::Settled { .. }
+        ),
+        "{:?} {:?}",
+        entry.idle_host_terminal.as_ref().unwrap().disposition(),
+        entry.idle_host_terminal.as_ref().unwrap().failure_kind()
+    );
+    assert!(app.world().get_entity(top).is_ok());
+    assert!(app.world().get::<ChildOf>(top).is_none());
+    assert_eq!(
+        app.world().get::<Visibility>(top),
+        Some(&Visibility::Hidden)
+    );
+    (app, router, request, host, top, candidate)
+}
+
+#[test]
+fn idle_host_loss_retained_admission_revalidates_after_real_staging_hook() {
+    idle_host_loss_retained_admission_hook_diagnostic(false);
+}
+
+#[test]
+fn idle_host_loss_retained_admission_revalidates_after_navigation_reinsertion() {
+    idle_host_loss_retained_admission_hook_diagnostic(true);
+}
+
+fn idle_host_loss_retained_admission_hook_diagnostic(scope_exit: bool) {
+    #[derive(Resource)]
+    struct RetainedStagingDrift {
+        armed: Option<(Entity, Entity)>,
+        mutate: bool,
+        observed: Vec<(
+            Entity,
+            Entity,
+            ProvisionalSlotLifecycle,
+            Visibility,
+            Option<RouterAvailability>,
+        )>,
+    }
+
+    fn current_proof(world: &World, router: RouterHandle) -> bool {
+        // An independent read-only observation, never installed as the Router's
+        // revision state or delivered as authority to Core.
+        let mut observation = HostCandidateRevisionState::default();
+        let HostCandidateClassification::Unique(candidate) =
+            classify_host_candidate(world, router, &mut observation)
+        else {
+            panic!("diagnostic requires the actual unique World candidate");
+        };
+        let entry = &world.resource::<RouterNavigation>().entries[0];
+        idle_host_loss::allows_candidate(
+            world,
+            entry.idle_host_terminal.as_ref().unwrap(),
+            &PreparedEcsHostCandidateSource::prepare(candidate),
+        )
+    }
+
+    for mutate in [false, true] {
+        let mut app = App::new();
+        app.world_mut().insert_resource(RetainedStagingDrift {
+            armed: None,
+            mutate,
+            observed: Vec::new(),
+        });
+        if scope_exit {
+            app.world_mut()
+                .register_component_hooks::<RouterNavigation>()
+                .on_insert(|mut world, _| {
+                    let Some((candidate_host, retained_top)) =
+                        world.resource::<RetainedStagingDrift>().armed
+                    else {
+                        return;
+                    };
+                    let Some(top) = world.get::<Children>(candidate_host).and_then(|children| {
+                        children.iter().copied().find(|entity| {
+                            *entity != retained_top
+                                && world.get::<ProvisionalSlotLifecycle>(*entity)
+                                    == Some(&ProvisionalSlotLifecycle::PreparedInert)
+                                && world.get::<ChildOf>(*entity).map(ChildOf::parent)
+                                    == Some(candidate_host)
+                        })
+                    }) else {
+                        return;
+                    };
+                    // Availability is observed, never used to arm or select the
+                    // callback. The new slot's current physical facts trigger it.
+                    let availability = world.get_resource::<RouterNavigation>().map(|navigation| {
+                        navigation.entries[0]
+                            .engine
+                            .snapshot()
+                            .availability()
+                            .clone()
+                    });
+                    assert_ne!(
+                        availability,
+                        Some(RouterAvailability::Ready),
+                        "Ready cannot precede the real outer resource reinsertion"
+                    );
+                    let entry = &world.resource::<RouterNavigation>().entries[0];
+                    let pending = entry
+                        .pending_host_confirmation
+                        .as_ref()
+                        .expect("scope exit retains the original pending owner");
+                    assert_eq!(pending.staged.entity(), top);
+                    assert_eq!(pending.candidate.candidate.host(), candidate_host);
+                    assert!(entry.host.is_none());
+                    assert!(entry.pending_host_admission_failure.is_none());
+                    let before = *world.get::<Visibility>(retained_top).unwrap();
+                    let mutate = {
+                        let mut drift = world.resource_mut::<RetainedStagingDrift>();
+                        drift.armed = None;
+                        drift.observed.push((
+                            top,
+                            candidate_host,
+                            ProvisionalSlotLifecycle::PreparedInert,
+                            before,
+                            availability,
+                        ));
+                        drift.mutate
+                    };
+                    if mutate {
+                        *world.get_mut::<Visibility>(retained_top).unwrap() = Visibility::Visible;
+                    }
+                });
+        } else {
+            app.world_mut()
+                .register_component_hooks::<ProvisionalPostWriteProbe>()
+                .on_add(|mut world, HookContext { entity, .. }| {
+                    let Some((candidate_host, retained_top)) =
+                        world.resource::<RetainedStagingDrift>().armed
+                    else {
+                        return;
+                    };
+                    let Some(lifecycle) = world.get::<ProvisionalSlotLifecycle>(entity).copied()
+                    else {
+                        return;
+                    };
+                    if entity == retained_top
+                        || world.get::<ChildOf>(entity).map(ChildOf::parent) != Some(candidate_host)
+                    {
+                        return;
+                    }
+                    let before = *world.get::<Visibility>(retained_top).unwrap();
+                    let mutate = {
+                        let mut drift = world.resource_mut::<RetainedStagingDrift>();
+                        drift.armed = None;
+                        drift
+                            .observed
+                            .push((entity, candidate_host, lifecycle, before, None));
+                        drift.mutate
+                    };
+                    if mutate {
+                        *world.get_mut::<Visibility>(retained_top).unwrap() = Visibility::Visible;
+                    }
+                });
+        }
+        let (mut app, router, request, host, retained_top, _) =
+            idle_host_loss_retained_success_fixture_in_app(app, false);
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let history = entry.engine.history().clone();
+        let RequestLookup::Found(request_before) = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .request(router, request)
+        else {
+            panic!("successful request snapshot must remain available");
+        };
+        let request_before = request_before.clone();
+        app.world_mut()
+            .entity_mut(host)
+            .insert(RouterHostRegistration::new(router));
+        assert!(current_proof(app.world(), router));
+        app.world_mut().resource_mut::<RetainedStagingDrift>().armed = Some((host, retained_top));
+        assert!(
+            app.world()
+                .resource::<RetainedStagingDrift>()
+                .observed
+                .is_empty()
+        );
+        for _ in 0..5 {
+            app.update();
+            if !app
+                .world()
+                .resource::<RetainedStagingDrift>()
+                .observed
+                .is_empty()
+            {
+                break;
+            }
+        }
+        let hook = &app.world().resource::<RetainedStagingDrift>().observed;
+        assert_eq!(
+            hook.len(),
+            1,
+            "the new top-slot staging hook must actually run"
+        );
+        assert_ne!(hook[0].0, retained_top);
+        assert_eq!(hook[0].1, host);
+        assert_eq!(hook[0].2, ProvisionalSlotLifecycle::PreparedInert);
+        assert_eq!(hook[0].3, Visibility::Hidden);
+        let proof = current_proof(app.world(), router);
+        assert_eq!(proof, !mutate);
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(entry.engine.history(), &history);
+        assert_eq!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .request(router, request),
+            RequestLookup::Found(&request_before)
+        );
+        if !mutate {
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::Ready
+            );
+            assert_eq!(entry.host.as_ref().unwrap().top_slot, hook[0].0);
+        } else {
+            assert_ne!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::Ready,
+                "Ready must not publish after the real hook invalidated the retained proof (scope_exit={scope_exit})"
+            );
+            let new_top = hook[0].0;
+            let Some(HostAdmissionFailureHolder::Provisional(failed)) =
+                entry.pending_host_admission_failure.as_ref()
+            else {
+                panic!("rejected confirmation must retain its actual grant and staged ledger");
+            };
+            assert!(entry.pending_host_confirmation.is_none());
+            assert!(entry.host.is_none());
+            assert!(!failed.stable_inert);
+            assert_eq!(failed.ledger.slot(), new_top);
+            assert_eq!(failed.candidate.candidate.host(), host);
+            let rejected_version = failed.grant.version().clone();
+            let rejected_slot = failed.grant.top_slot();
+            let R3HostAdmissionUnavailableEvidence::RetainedAdmission { source, evidence } =
+                &failed.prepared.evidence
+            else {
+                panic!("old retained proof failure is not a new-slot partition or Core error");
+            };
+            assert_eq!(source, &failed.candidate.observation_source());
+            let idle_host_loss::IdleHostAdmissionFailedFact::Retained(facts) = &evidence.detail
+            else {
+                panic!("the actual old retained target must supply the cause");
+            };
+            assert_eq!(
+                facts.observed_visibility(retained_top),
+                Some(Visibility::Visible)
+            );
+            assert_eq!(
+                app.world().get::<Visibility>(new_top),
+                Some(&Visibility::Hidden)
+            );
+            assert_eq!(
+                app.world().get::<Visibility>(retained_top),
+                Some(&Visibility::Visible)
+            );
+            assert!(entry.idle_host_terminal.is_some());
+            for _ in 0..5 {
+                app.update();
+            }
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(entry.pending_host_admission_failure.is_none());
+            assert!(entry.pending_host_confirmation.is_none());
+            assert!(entry.host.is_none());
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::Unavailable(
+                    RouterUnavailableReason::AuthorityEstablishmentFailed
+                )
+            );
+            assert!(app.world().get_entity(new_top).is_err());
+            assert!(
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(new_top)
+                    .is_none()
+            );
+            assert!(app.world().get_entity(host).is_ok());
+            assert!(app.world().get_entity(retained_top).is_ok());
+            assert_eq!(
+                app.world().get::<Visibility>(retained_top),
+                Some(&Visibility::Visible)
+            );
+            app.world_mut()
+                .entity_mut(retained_top)
+                .insert(Visibility::Hidden);
+            app.world_mut()
+                .entity_mut(host)
+                .insert(RouterHostRegistration::new(router));
+            for _ in 0..5 {
+                app.update();
+            }
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::Ready
+            );
+            assert_ne!(entry.host.as_ref().unwrap().version, rejected_version);
+            assert_ne!(entry.host.as_ref().unwrap().slot_id, rejected_slot);
+            assert_ne!(entry.host.as_ref().unwrap().top_slot, new_top);
+            assert!(entry.active.is_none());
+            assert_eq!(entry.engine.history(), &history);
+            assert_eq!(
+                app.world()
+                    .resource::<RouterSnapshots>()
+                    .request(router, request),
+                RequestLookup::Found(&request_before)
+            );
+        }
+    }
+}
+
+fn idle_host_loss_assert_unavailable(app: &mut App) {
+    for _ in 0..5 {
+        app.update();
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(matches!(
+        entry.engine.snapshot().availability(),
+        RouterAvailability::Unavailable(_)
+    ));
+    assert!(entry.host.is_none());
+    assert!(entry.idle_host_loss.is_none());
+}
+
+#[test]
+fn idle_host_loss_postscope_confirmation_rechecks_new_slot_and_candidate() {
+    #[derive(Resource)]
+    struct PostScopeAdmissionDrift {
+        armed: Option<(Entity, RouterHandle)>,
+        candidate: bool,
+        slot: Option<Entity>,
+    }
+    for candidate_drift in [false, true] {
+        let mut app = App::new();
+        app.world_mut().insert_resource(PostScopeAdmissionDrift {
+            armed: None,
+            candidate: candidate_drift,
+            slot: None,
+        });
+        app.world_mut()
+            .register_component_hooks::<RouterNavigation>()
+            .on_insert(|mut world, _| {
+                let Some((host, router)) = world.resource::<PostScopeAdmissionDrift>().armed else {
+                    return;
+                };
+                let Some(top) = world.get::<Children>(host).and_then(|children| {
+                    children.iter().copied().find(|entity| {
+                        world.get::<ProvisionalSlotLifecycle>(*entity)
+                            == Some(&ProvisionalSlotLifecycle::PreparedInert)
+                            && world.get::<ChildOf>(*entity).map(ChildOf::parent) == Some(host)
+                    })
+                }) else {
+                    return;
+                };
+                let entry = &world.resource::<RouterNavigation>().entries[0];
+                assert_ne!(
+                    entry.engine.snapshot().availability(),
+                    &RouterAvailability::Ready
+                );
+                assert_eq!(
+                    entry
+                        .pending_host_confirmation
+                        .as_ref()
+                        .unwrap()
+                        .staged
+                        .entity(),
+                    top
+                );
+                let candidate = {
+                    let mut drift = world.resource_mut::<PostScopeAdmissionDrift>();
+                    drift.armed = None;
+                    drift.slot = Some(top);
+                    drift.candidate
+                };
+                if candidate {
+                    *world.get_mut::<RouterHostRegistration>(host).unwrap() =
+                        RouterHostRegistration::new(router);
+                } else {
+                    *world.get_mut::<Pickable>(top).unwrap() = Pickable::default();
+                }
+            });
+        let (mut app, router, request, host, retained_top, _) =
+            idle_host_loss_retained_success_fixture_in_app(app, false);
+        let history = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .history()
+            .clone();
+        let RequestLookup::Found(snapshot) = app
+            .world()
+            .resource::<RouterSnapshots>()
+            .request(router, request)
+        else {
+            panic!("success snapshot")
+        };
+        let snapshot = snapshot.clone();
+        app.world_mut()
+            .entity_mut(host)
+            .insert(RouterHostRegistration::new(router));
+        app.world_mut()
+            .resource_mut::<PostScopeAdmissionDrift>()
+            .armed = Some((host, router));
+        for _ in 0..5 {
+            app.update();
+            if app
+                .world()
+                .resource::<PostScopeAdmissionDrift>()
+                .slot
+                .is_some()
+            {
+                break;
+            }
+        }
+        let slot = app
+            .world()
+            .resource::<PostScopeAdmissionDrift>()
+            .slot
+            .expect("actual scope callback");
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_ne!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::Ready
+        );
+        assert!(entry.host.is_none());
+        assert!(entry.pending_host_confirmation.is_none());
+        let Some(HostAdmissionFailureHolder::Provisional(failed)) =
+            entry.pending_host_admission_failure.as_ref()
+        else {
+            panic!("exact failed new slot owner")
+        };
+        assert_eq!(failed.ledger.slot(), slot);
+        assert!(matches!(
+            failed.prepared.evidence,
+            R3HostAdmissionUnavailableEvidence::PostScopePhysical { .. }
+        ));
+        assert_eq!(
+            app.world().get::<Visibility>(retained_top),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(entry.engine.history(), &history);
+        assert_eq!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .request(router, request),
+            RequestLookup::Found(&snapshot)
+        );
+        let version = failed.grant.version().clone();
+        let claim = failed.ledger.claim();
+        for _ in 0..3 {
+            app.update();
+        }
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let Some(HostAdmissionFailureHolder::Provisional(failed)) =
+            entry.pending_host_admission_failure.as_ref()
+        else {
+            panic!("permanent new-slot mismatch keeps its original explicit inert holder")
+        };
+        assert_eq!(failed.grant.version(), &version);
+        assert_eq!(failed.ledger.claim(), claim);
+        assert_eq!(failed.ledger.slot(), slot);
+        assert!(entry.host.is_none());
+    }
+}
+
+#[test]
+fn idle_host_loss_retained_success_excludes_contained_candidate_then_admits_outside() {
+    let (mut app, router, request, _, _, candidate) = idle_host_loss_retained_success_fixture();
+    let history = app.world().resource::<RouterNavigation>().entries[0]
+        .engine
+        .history()
+        .clone();
+    app.world_mut()
+        .entity_mut(candidate)
+        .insert(RouterHostRegistration::new(router));
+    idle_host_loss_assert_unavailable(&mut app);
+    app.world_mut().entity_mut(candidate).remove::<ChildOf>();
+    for _ in 0..5 {
+        app.update();
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert_eq!(
+        entry.engine.snapshot().availability(),
+        &RouterAvailability::Ready
+    );
+    assert_eq!(entry.host.as_ref().unwrap().host, candidate);
+    assert!(entry.active.is_none());
+    assert_eq!(entry.engine.history(), &history);
+    assert_eq!(
+        entry.engine.request(request).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+}
+
+#[test]
+fn idle_host_loss_retained_success_admits_direct_protected_child_after_move_outside() {
+    let (mut app, router, request, _, top, candidate) =
+        idle_host_loss_retained_success_fixture_with_candidate(true);
+    let history = app.world().resource::<RouterNavigation>().entries[0]
+        .engine
+        .history()
+        .clone();
+    app.world_mut()
+        .entity_mut(candidate)
+        .insert(RouterHostRegistration::new(router));
+    idle_host_loss_assert_unavailable(&mut app);
+    app.world_mut().entity_mut(candidate).remove::<ChildOf>();
+    assert!(app.world().get::<Children>(top).is_none());
+    for _ in 0..5 {
+        app.update();
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert_eq!(
+        entry.engine.snapshot().availability(),
+        &RouterAvailability::Ready
+    );
+    assert_eq!(entry.host.as_ref().unwrap().host, candidate);
+    assert!(entry.active.is_none());
+    assert_eq!(entry.engine.history(), &history);
+    assert_eq!(
+        entry.engine.request(request).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+}
+
+#[test]
+fn idle_host_loss_retained_success_requires_current_isolation_across_epochs() {
+    let (mut app, router, _, host, top, _) = idle_host_loss_retained_success_fixture();
+    app.world_mut().entity_mut(top).insert(Visibility::Visible);
+    app.world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(router));
+    idle_host_loss_assert_unavailable(&mut app);
+    app.world_mut().entity_mut(top).insert(Visibility::Hidden);
+    for _ in 0..5 {
+        app.update();
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert_eq!(
+        entry.engine.snapshot().availability(),
+        &RouterAvailability::Ready,
+        "pending admission failure={} operation counts={:?}",
+        entry.pending_host_admission_failure.is_some(),
+        entry.host_admission_operation_counts
+    );
+    app.world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    app.update();
+    app.world_mut().entity_mut(top).insert(Visibility::Visible);
+    app.world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(router));
+    idle_host_loss_assert_unavailable(&mut app);
+    app.world_mut().entity_mut(top).insert(Visibility::Hidden);
+    for _ in 0..5 {
+        app.update();
+    }
+    assert_eq!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .snapshot()
+            .availability(),
+        &RouterAvailability::Ready
+    );
+}
+
+#[test]
+fn idle_host_loss_deferred_observation_reconciles_current_candidate_transitions() {
+    for transition in ["replacement", "none", "conflict", "invalid"] {
+        let (mut app, router, request, host, top, _) = idle_host_loss_retained_success_fixture();
+        app.world_mut().entity_mut(top).insert(Visibility::Visible);
+        app.world_mut()
+            .entity_mut(host)
+            .insert(RouterHostRegistration::new(router));
+        app.update();
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let deferred = entry.deferred_host_observation.clone().unwrap();
+        let counts = entry.host_admission_operation_counts;
+        let source = app
+            .world()
+            .resource::<HostCandidateRevisionState>()
+            .current_source(router)
+            .unwrap()
+            .unwrap();
+        let records = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .records()
+            .len();
+        for _ in 0..4 {
+            app.update();
+        }
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(entry.deferred_host_observation.as_ref(), Some(&deferred));
+        assert_eq!(entry.host_admission_operation_counts, counts);
+        assert_eq!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .records()
+                .len(),
+            records
+        );
+        assert!(
+            app.world()
+                .resource::<HostCandidateRevisionLatch>()
+                .allows(source.revision())
+        );
+        let replacement = match transition {
+            "replacement" => {
+                app.world_mut()
+                    .entity_mut(host)
+                    .remove::<RouterHostRegistration>();
+                app.world_mut()
+                    .spawn((Node::default(), RouterHostRegistration::new(router)))
+                    .id()
+            }
+            "none" => {
+                app.world_mut()
+                    .entity_mut(host)
+                    .remove::<RouterHostRegistration>();
+                host
+            }
+            "conflict" => app
+                .world_mut()
+                .spawn((Node::default(), RouterHostRegistration::new(router)))
+                .id(),
+            "invalid" => {
+                app.world_mut().entity_mut(host).remove::<Node>();
+                host
+            }
+            _ => unreachable!(),
+        };
+        app.update();
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        if transition == "replacement" {
+            assert_eq!(entry.deferred_host_observation.as_ref(), Some(&deferred));
+        } else {
+            assert!(entry.deferred_host_observation.is_none(), "{transition}");
+            let stable = entry.engine.snapshot();
+            for _ in 0..3 {
+                app.update();
+            }
+            assert_eq!(
+                app.world().resource::<RouterNavigation>().entries[0]
+                    .engine
+                    .snapshot(),
+                stable
+            );
+        }
+        match transition {
+            "none" => {
+                app.world_mut()
+                    .entity_mut(host)
+                    .insert(RouterHostRegistration::new(router));
+            }
+            "conflict" => {
+                app.world_mut()
+                    .entity_mut(host)
+                    .remove::<RouterHostRegistration>();
+            }
+            "invalid" => {
+                app.world_mut().entity_mut(host).insert(Node::default());
+            }
+            _ => {}
+        }
+        app.world_mut().entity_mut(top).insert(Visibility::Hidden);
+        for _ in 0..5 {
+            app.update();
+        }
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::Ready,
+            "{transition}"
+        );
+        assert_eq!(entry.host.as_ref().unwrap().host, replacement);
+        assert!(entry.deferred_host_observation.is_none());
+        assert_eq!(
+            entry.engine.request(request).unwrap().status(),
+            &RequestStatus::Succeeded
+        );
+    }
+}
+
+#[test]
+fn idle_host_loss_staging_capacity_keeps_undelivered_full_source() {
+    let (mut app, router, _, host, _, _) = idle_host_loss_retained_success_fixture();
+    let previous = app
+        .world()
+        .resource::<HostCandidateRevisionState>()
+        .current_source(router)
+        .unwrap();
+    let counts =
+        app.world().resource::<RouterNavigation>().entries[0].host_admission_operation_counts;
+    app.world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(router));
+    for _ in 0..3 {
+        crate::host::fail_next_staging_reservation_for_test();
+        app.update();
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.host.is_none());
+        assert_eq!(entry.host_admission_operation_counts, counts);
+        assert_eq!(
+            entry.deferred_host_observation.as_ref().unwrap().previous,
+            previous
+        );
+        assert!(entry.pending_host_admission_failure.is_none());
+    }
+    for _ in 0..5 {
+        app.update();
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert_eq!(
+        entry.engine.snapshot().availability(),
+        &RouterAvailability::Ready
+    );
+    assert!(entry.deferred_host_observation.is_none());
+}
+
+#[test]
+fn idle_host_loss_retained_admission_does_not_normalize_non_relationship_drift() {
+    for drift in ["foreign-component", "seal", "pickable", "lifecycle"] {
+        let (mut app, router, _, host, top, _) = idle_host_loss_retained_success_fixture();
+        let seal = *app.world().get::<RouteOwnershipSeal>(top).unwrap();
+        match drift {
+            "foreign-component" => {
+                app.world_mut()
+                    .entity_mut(top)
+                    .insert(NestedAppHostSentinel(0xf4));
+            }
+            "seal" => {
+                let replacement = app
+                    .world_mut()
+                    .resource_mut::<RouteEntityRegistry>()
+                    .issue_seal();
+                app.world_mut()
+                    .entity_mut(top)
+                    .insert(RouteOwnershipSeal::new(replacement));
+            }
+            "pickable" => {
+                app.world_mut().entity_mut(top).insert(Pickable::default());
+            }
+            "lifecycle" => {
+                app.world_mut()
+                    .entity_mut(top)
+                    .insert(ProvisionalSlotLifecycle::PreparedInert);
+            }
+            _ => unreachable!(),
+        }
+        app.world_mut()
+            .entity_mut(host)
+            .insert(RouterHostRegistration::new(router));
+        idle_host_loss_assert_unavailable(&mut app);
+        match drift {
+            "foreign-component" => {
+                app.world_mut()
+                    .entity_mut(top)
+                    .remove::<NestedAppHostSentinel>();
+            }
+            "seal" => {
+                app.world_mut().entity_mut(top).insert(seal);
+            }
+            "pickable" => {
+                app.world_mut().entity_mut(top).insert(Pickable::IGNORE);
+            }
+            "lifecycle" => {
+                app.world_mut()
+                    .entity_mut(top)
+                    .insert(ProvisionalSlotLifecycle::Quarantined);
+            }
+            _ => unreachable!(),
+        }
+        for _ in 0..5 {
+            app.update();
+        }
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .snapshot()
+                .availability(),
+            &RouterAvailability::Ready,
+            "{drift}"
+        );
+    }
+}
+
+#[test]
+fn idle_host_loss_retained_success_observes_quarantine_once() {
+    let (mut app, router, _, _, _, _) = idle_host_loss_retained_success_fixture();
+    let summary = app.world().resource::<RouterNavigation>().entries[0].cleanup_summary();
+    assert!(!summary.foreground_pending());
+    assert_eq!(summary.quarantine_count(), 1);
+    assert_eq!(
+        summary.last_disposition(),
+        Some(bevy_ui_router_core::prelude::CleanupDisposition::QuarantinedForeignDescendant)
+    );
+    assert_eq!(
+        app.world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .cleanup(),
+        &summary
+    );
+    for _ in 0..5 {
+        app.update();
+    }
+    assert_eq!(
+        app.world().resource::<RouterNavigation>().entries[0].cleanup_summary(),
+        summary
+    );
+}
+
+#[test]
+fn idle_host_loss_nested_capacity_retains_owner_and_terminal_history() {
+    use crate::cleanup::AuthorityPreparationCapacitySite;
+    for site in [
+        AuthorityPreparationCapacitySite::Dispositions,
+        AuthorityPreparationCapacitySite::RetainedEntities,
+        AuthorityPreparationCapacitySite::ResidualGroups,
+        AuthorityPreparationCapacitySite::PickableRepair,
+        AuthorityPreparationCapacitySite::LostProjection,
+    ] {
+        let (mut app, router, request, host, top) =
+            idle_host_loss_atomic_fixture("idle-nested-capacity");
+        app.world_mut().spawn((Node::default(), ChildOf(top)));
+        let history = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .history()
+            .clone();
+        app.world_mut()
+            .entity_mut(host)
+            .remove::<RouterHostRegistration>();
+        crate::cleanup::fail_next_authority_preparation_capacity_for_test(site);
+        app.update();
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::RecoveringAuthority,
+            "{site:?}"
+        );
+        assert!(matches!(
+            entry.idle_host_loss,
+            Some(idle_host_loss::IdleHostLoss::Settling(_))
+        ));
+        assert!(entry.cleanup_summary().foreground_pending());
+        assert_eq!(entry.engine.history(), &history);
+        assert_eq!(
+            entry.engine.request(request).unwrap().status(),
+            &RequestStatus::Succeeded
+        );
+        let Some(idle_host_loss::IdleHostLoss::Settling(pending)) = entry.idle_host_loss.as_ref()
+        else {
+            unreachable!()
+        };
+        let owner = pending.ledger_projection();
+        crate::cleanup::fail_next_authority_preparation_capacity_for_test(site);
+        app.update();
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let Some(idle_host_loss::IdleHostLoss::Settling(pending)) = entry.idle_host_loss.as_ref()
+        else {
+            panic!("nested retry lost its owner");
+        };
+        assert_eq!(pending.ledger_projection(), owner);
+        assert!(entry.cleanup_summary().foreground_pending());
+        assert_eq!(entry.engine.history(), &history);
+        app.update();
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.idle_host_loss.is_none());
+        assert!(!entry.cleanup_summary().foreground_pending());
+        assert_eq!(entry.engine.history(), &history);
+        app.world_mut()
+            .entity_mut(host)
+            .insert(RouterHostRegistration::new(router));
+        for _ in 0..5 {
+            app.update();
+        }
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .snapshot()
+                .availability(),
+            &RouterAvailability::Ready
+        );
+    }
+}
+
+#[test]
+fn idle_host_loss_lost_projection_capacity_retries_real_authority_lost_facts() {
+    let (mut app, router, request, host, _) =
+        idle_host_loss_atomic_fixture("idle-lost-projection-capacity");
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    let history = entry.engine.history().clone();
+    let target = entry
+        .active
+        .as_ref()
+        .unwrap()
+        .claims()
+        .find(|claim| {
+            matches!(
+                claim.owner(),
+                RegistryOwner::Committed(EntityOwner::FrameOutput { .. })
+            )
+        })
+        .unwrap()
+        .entity();
+    app.world_mut()
+        .entity_mut(target)
+        .remove::<RouteOwnershipSeal>();
+    app.world_mut().entity_mut(target).insert((
+        Visibility::Hidden,
+        Pickable::IGNORE,
+        RouterInputBarrier::deny_all(),
+    ));
+    app.world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    crate::cleanup::fail_next_authority_preparation_capacity_for_test(
+        crate::cleanup::AuthorityPreparationCapacitySite::LostProjection,
+    );
+    app.update();
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert_eq!(
+        entry.engine.snapshot().availability(),
+        &RouterAvailability::RecoveringAuthority
+    );
+    let Some(idle_host_loss::IdleHostLoss::Settling(pending)) = entry.idle_host_loss.as_ref()
+    else {
+        panic!("capacity retains ledger");
+    };
+    assert_eq!(pending.ledger_projection().receipt_count(), 0);
+    assert!(entry.cleanup_summary().foreground_pending());
+    assert_eq!(entry.engine.history(), &history);
+    app.update();
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(entry.idle_host_loss.is_none());
+    assert!(!entry.cleanup_summary().foreground_pending());
+    assert_eq!(entry.engine.history(), &history);
+    assert_eq!(
+        entry.engine.request(request).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+    assert!(
+        app.world()
+            .resource::<QuarantineLeaseTable>()
+            .authority_lost_tombstone(target)
+            .is_some()
+    );
+    app.world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(router));
+    for _ in 0..5 {
+        app.update();
+    }
+    assert_eq!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .snapshot()
+            .availability(),
+        &RouterAvailability::Ready
+    );
+}
+
+#[test]
+fn idle_host_loss_completed_receipts_are_observed_once_across_retention_preparation_retry() {
+    let (mut app, router, _, host, top) =
+        idle_host_loss_atomic_fixture("idle-completed-receipts-retry");
+    app.world_mut().spawn((Node::default(), ChildOf(top)));
+    app.world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    crate::cleanup::fail_next_authority_preparation_capacity_for_test(
+        crate::cleanup::AuthorityPreparationCapacitySite::CompletedRetention,
+    );
+    app.update();
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert_eq!(
+        entry.engine.snapshot().availability(),
+        &RouterAvailability::RecoveringAuthority
+    );
+    let Some(idle_host_loss::IdleHostLoss::Settling(pending)) = entry.idle_host_loss.as_ref()
+    else {
+        panic!("preparation keeps actual ledger");
+    };
+    let owner = pending.ledger_projection();
+    assert_eq!(owner.receipt_count(), owner.obligation_count());
+    let summary = entry.cleanup_summary();
+    assert!(summary.foreground_pending());
+    assert_eq!(summary.quarantine_count(), 1);
+    assert_eq!(
+        summary.last_disposition(),
+        Some(bevy_ui_router_core::prelude::CleanupDisposition::QuarantinedForeignDescendant)
+    );
+    assert_eq!(
+        app.world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .cleanup(),
+        &summary
+    );
+    crate::cleanup::fail_next_authority_preparation_capacity_for_test(
+        crate::cleanup::AuthorityPreparationCapacitySite::CompletedRetention,
+    );
+    app.update();
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    let Some(idle_host_loss::IdleHostLoss::Settling(pending)) = entry.idle_host_loss.as_ref()
+    else {
+        panic!("retry keeps ledger");
+    };
+    assert_eq!(pending.ledger_projection(), owner);
+    assert_eq!(entry.cleanup_summary(), summary);
+    app.update();
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(entry.idle_host_loss.is_none());
+    assert!(!entry.cleanup_summary().foreground_pending());
+    assert_eq!(entry.cleanup_summary().quarantine_count(), 1);
+    assert_eq!(
+        entry.cleanup_summary().last_disposition(),
+        summary.last_disposition()
+    );
+    assert_eq!(
+        app.world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .cleanup(),
+        &entry.cleanup_summary()
+    );
+    for _ in 0..5 {
+        app.update();
+    }
+    assert_eq!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .cleanup_summary()
+            .quarantine_count(),
+        1
+    );
+}
+
+#[test]
+fn idle_host_loss_permanent_domain_exhaustion_closes_foreground_with_explicit_residue() {
+    let (mut app, _, request, host, top) = idle_host_loss_atomic_fixture("idle-domain-exhausted");
+    let before = app.world().resource::<RouterNavigation>().entries[0]
+        .engine
+        .request(request)
+        .unwrap()
+        .status()
+        .clone();
+    app.world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    crate::cleanup::fail_next_ledger_domain_for_test();
+    app.update();
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(entry.idle_host_loss.is_none());
+    assert!(entry.idle_host_terminal.is_some());
+    assert!(!entry.cleanup_summary().foreground_pending());
+    assert_eq!(entry.cleanup_summary().last_disposition(), None);
+    assert_eq!(entry.cleanup_summary().quarantine_count(), 0);
+    assert_eq!(
+        entry.engine.snapshot().availability(),
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+    );
+    assert_eq!(entry.engine.request(request).unwrap().status(), &before);
+    assert!(app.world().get_entity(top).is_ok());
+    for _ in 0..3 {
+        app.update();
+    }
+    assert!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .idle_host_loss
+            .is_none()
+    );
+}
+
+#[test]
+fn idle_host_loss_postwrite_protected_child_preserves_residue_and_allows_fresh_epoch() {
+    let (mut app, router, request, host, top) =
+        idle_host_loss_atomic_fixture("idle-postwrite-protected");
+    let before = app.world().resource::<RouterNavigation>().entries[0]
+        .engine
+        .request(request)
+        .unwrap()
+        .status()
+        .clone();
+    let old_version = app.world().resource::<RouterNavigation>().entries[0]
+        .host
+        .as_ref()
+        .unwrap()
+        .version
+        .clone();
+    let sentinel = app.world_mut().spawn(NestedAppHostSentinel(0xc2)).id();
+    app.world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    app.world_mut().insert_resource(
+        crate::cleanup::AuthorityRemovalPostwriteDrift::reparent_after_first_removal(sentinel, top),
+    );
+    app.update();
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(entry.idle_host_loss.is_none());
+    assert!(entry.idle_host_terminal.is_some());
+    let partial_summary = entry.cleanup_summary();
+    assert!(!partial_summary.foreground_pending());
+    assert_eq!(
+        partial_summary.last_disposition(),
+        Some(bevy_ui_router_core::prelude::CleanupDisposition::Removed)
+    );
+    assert_eq!(partial_summary.quarantine_count(), 0);
+    assert_eq!(
+        entry.engine.snapshot().availability(),
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+    );
+    assert_eq!(entry.engine.request(request).unwrap().status(), &before);
+    assert_eq!(
+        app.world().get::<ChildOf>(sentinel).map(ChildOf::parent),
+        Some(top)
+    );
+    assert!(app.world().get::<ChildOf>(top).is_none());
+    app.world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(router));
+    for _ in 0..5 {
+        app.update();
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert_eq!(
+        entry.engine.snapshot().availability(),
+        &RouterAvailability::Ready
+    );
+    assert_ne!(entry.host.as_ref().unwrap().version, old_version);
+    assert_eq!(entry.cleanup_summary(), partial_summary);
+    assert!(entry.active.is_none());
+    assert_eq!(entry.engine.request(request).unwrap().status(), &before);
+    assert_eq!(
+        app.world().get::<NestedAppHostSentinel>(sentinel),
+        Some(&NestedAppHostSentinel(0xc2))
+    );
+    assert_eq!(
+        app.world().get::<ChildOf>(sentinel).map(ChildOf::parent),
+        Some(top)
+    );
+}
+
 #[test]
 fn back_no_target_authority_topology_prioritizes_disconnected_cycle_after_root_closure() {
     assert_eq!(
@@ -6758,6 +8140,7 @@ fn vacant_back_capacity_entry(handle: RouterHandle) -> RouterEntry {
         host: None,
         host_settlement: None,
         pending_host_admission_failure: None,
+        pending_host_confirmation: None,
         pending_commit: None,
         pending_frame_drive: None,
         pending_stale_output_cleanup: None,
@@ -6774,6 +8157,9 @@ fn vacant_back_capacity_entry(handle: RouterHandle) -> RouterEntry {
         cleanup_ledger: None,
         post_commit_compound: None,
         settled_retired_host_evidence: None,
+        idle_host_loss: None,
+        idle_host_terminal: None,
+        deferred_host_observation: None,
         #[cfg(test)]
         commit_sealed_registration_removal_armed: false,
         #[cfg(test)]

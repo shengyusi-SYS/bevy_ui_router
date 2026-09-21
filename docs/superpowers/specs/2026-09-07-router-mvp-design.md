@@ -197,6 +197,8 @@ BSN build error、官方 `ResolveSceneError`、`ApplySceneError`、依赖未就�
 
 boundary 从失败 route 向祖先查找；保留严格位于 boundary 之上的合法 prefix，错误 view 取代 boundary 及其 suffix。新错误尝试使用新身份，不能继承原 capability。恢复只尝试一次，失败后不递归创建 error view。无 binding 的 nested Push 失败在 pending cleanup 后进入 RouterFallback，不恢复旧 Terminal 语义。
 
+Host loss 也适用于所有请求已终态、没有在途 cleanup 的空闲 Router，包括 Ready 但尚无 active 的已绑定 host。此时由真实 host grant 的单次退役建立独立于请求的 settlement owner，不伪造新请求或重新打开旧 terminal 请求；旧请求记录与 history 保持，诊断属于 Router。无 active 仍须结算 top slot 和授权挂载边。永久清理矛盾转为独立的私有残留责任，不以保留前台 owner 无限重试；原边安全结算后，重新注册只接受新的显式命令。
+
 失败 cleanup 的 target/obligation 与 cleanup 后继续哪个生命周期分支分别冻结。continuation 来自原始 failure/authority 与 attempt，不能由是否有旧 active、obligation 数量或是否真的删除实体反推。terminal 前前台 owner/action/ticket 必须消费完毕；永久矛盾有界 fail closed，只有可证明能完成的暂时前置不足才 retry。
 
 清理先隔离输入/focus，再按 child-frame 到 parent-frame、内容叶到根顺序处理当前可证明 owned scope。当前关系、protected targets 与写入范围在会触发 observer 的操作后重新验证。不得因 root 曾 owned 就级联删除 app-owned/protected extras；不确定时停止破坏性操作，保留 private inert residual。独立 residual owner 可以继续负责隔离，但不持有已经 terminal 请求的前台 capability，不承诺后台最终 GC。

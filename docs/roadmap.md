@@ -1,15 +1,15 @@
 # Roadmap
 
-**更新时间**：2026-09-07。范围与验收归 [统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md)，具体依赖和证据归 [实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)。
+**更新时间**：2026-09-21。范围与验收归 [统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md)，具体依赖和证据归 [实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)。
 
 ## Now
 
-- 候选精简和独立迁移基线已完成：后台 reaper、public audit/probe 与公开中间调度退出，前台修复和私有残留责任保留。下一步交付官方同步 BSN root 切片。
+- 候选精简、独立迁移基线及 idle host-loss 已完成；native 解析/创建及 pointer/publication 私有检查点已落地，生产 BSN 尚未接通。当前以真实 facade root 成功与失败闭环推进 BSN，联动 owner、内容边界及输入/focus，不扩成旧 renderer 全面整顿。
 
 ## Next
 
 - 交付官方同步代码驱动 BSN root 切片，包括创建期分配责任、current containment、真实输入与 focus 隔离。
-- 完成内部 default outlet 的嵌套布局、history、恢复和 host/stale 闭环；修复已确认的 idle host loss 不启动恢复缺口，保留 renderer-neutral 独立验证。
+- 完成内部 default outlet 的嵌套布局、history、恢复和 host/stale 的真实 BSN 闭环；联动替换旧内容模型并保留 renderer-neutral 独立验证。
 - 通过推荐 facade 的独立 BSN consumer、示例、全量验证与独立交叉审查后集成 main；完成前不标记 MVP PASS。
 
 ## Post-MVP

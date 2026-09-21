@@ -549,6 +549,28 @@ pub(super) fn try_push<T>(values: &mut Vec<T>, value: T) -> Result<(), ()> {
     Ok(())
 }
 
+pub(super) fn prepare_idle_host_isolation<'a>(
+    world: &World,
+    claims: impl IntoIterator<Item = &'a ExactRegistryClaim>,
+    targets: Vec<bevy_ecs::entity::Entity>,
+) -> AuthorityIsolationPreparation {
+    let mut preparation =
+        prepare_authority_isolation_targets(world, claims, targets.iter().copied(), 0);
+    // Idle cleanup owns the frozen target set. A protected descendant is not an
+    // authorized focus target simply because an old owned ancestor reaches it.
+    match &mut preparation {
+        AuthorityIsolationPreparation::Ready(prepared)
+        | AuthorityIsolationPreparation::PermanentContradiction {
+            fail_closed: prepared,
+            ..
+        } => {
+            prepared.focus.retain(|entity| targets.contains(entity));
+        }
+        AuthorityIsolationPreparation::RetryableCapacity => {}
+    }
+    preparation
+}
+
 pub(super) fn prepare_authority_isolation_targets<'a>(
     world: &World,
     stored_claims: impl IntoIterator<Item = &'a ExactRegistryClaim>,

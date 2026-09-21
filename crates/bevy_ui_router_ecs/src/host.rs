@@ -1391,6 +1391,24 @@ impl PreparedProvisionalStaging {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_NEXT_STAGING_RESERVATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_staging_reservation_for_test() {
+    FAIL_NEXT_STAGING_RESERVATION.with(|value| value.set(true));
+}
+
+fn staging_reservation_capacity_input(count: usize) -> usize {
+    #[cfg(test)]
+    if FAIL_NEXT_STAGING_RESERVATION.with(|value| value.replace(false)) {
+        return usize::MAX;
+    }
+    count
+}
+
 impl FrozenProvisionalStagingPartition {
     fn try_freeze(
         world: &World,
@@ -1416,7 +1434,7 @@ impl FrozenProvisionalStagingPartition {
             .count();
         let mut protected_foreign = Vec::new();
         protected_foreign
-            .try_reserve_exact(protected_count)
+            .try_reserve_exact(staging_reservation_capacity_input(protected_count))
             .map_err(|_| staging_capacity_evidence(world, candidate, protected_count))?;
         for entity in world
             .iter_entities()
@@ -1537,14 +1555,14 @@ impl FrozenProvisionalStagingPartition {
         self.slot_target.is_none()
             && self.allowed_writes.is_empty()
             && candidate_is_current(world, candidate)
-            && self.protected_matches_inner(world, false, None)
+            && self.protected_matches_inner(world, false, None, &[])
     }
 
     fn protected_matches(&self, world: &World, edge_written: bool) -> bool {
         let Some(slot_target) = self.slot_target else {
             return false;
         };
-        self.protected_matches_inner(world, edge_written, Some(slot_target))
+        self.protected_matches_inner(world, edge_written, Some(slot_target), &[])
     }
 
     fn protected_matches_inner(
@@ -1552,6 +1570,7 @@ impl FrozenProvisionalStagingPartition {
         world: &World,
         edge_written: bool,
         slot_target: Option<Entity>,
+        reinserted_resources: &[(Entity, bevy_ecs::component::ComponentId)],
     ) -> bool {
         if slot_target.is_some_and(|slot| self.allowed_writes.as_slice() != [slot])
             || slot_target.is_none() && !self.allowed_writes.is_empty()
@@ -1668,7 +1687,10 @@ impl FrozenProvisionalStagingPartition {
                 .filter(|component| Some(*component) != children_component);
             let observed_non_children_count = observed_components
                 .iter()
-                .filter(|component| Some(**component) != children_component)
+                .filter(|component| {
+                    Some(**component) != children_component
+                        && !reinserted_resources.contains(&(expected.entity, **component))
+                })
                 .count();
             let expected_non_children_count = expected
                 .manifest
@@ -2096,7 +2118,51 @@ pub(crate) fn activate_source_bound_granted_top_slot(
         .get_mut::<Visibility>(staged.entity)
         .expect("validated granted slot retains Visibility") = Visibility::Visible;
     world.flush();
-    staged.partition.protected_matches(world, true)
+    activated_source_bound_granted_top_slot_is_current(world, candidate, grant, staged)
+}
+
+pub(crate) fn activated_source_bound_granted_top_slot_is_current(
+    world: &World,
+    candidate: &PreparedEcsHostCandidateSource,
+    grant: &bevy_ui_router_core::integration::SourceBoundHostGrant,
+    staged: &StagedProvisionalTopSlot,
+) -> bool {
+    activated_source_bound_granted_top_slot_after_scopes_is_current(
+        world,
+        candidate,
+        grant,
+        staged,
+        &[],
+    )
+}
+
+pub(crate) fn activated_source_bound_granted_top_slot_after_scopes_is_current(
+    world: &World,
+    candidate: &PreparedEcsHostCandidateSource,
+    grant: &bevy_ui_router_core::integration::SourceBoundHostGrant,
+    staged: &StagedProvisionalTopSlot,
+    reinserted_resources: &[(Entity, bevy_ecs::component::ComponentId)],
+) -> bool {
+    // Only the exact resource component reinsertion planned before the scopes
+    // may differ. Their carrier identity and every other component/edge remain
+    // protected by the original partition; callbacks are not normalized away.
+    reinserted_resources.iter().all(|(entity, component)| {
+        world.resource_entities().get(*component) == Some(*entity)
+            && world
+                .get_entity(*entity)
+                .is_ok_and(|entity| entity.contains_id(*component))
+            && staged.partition.protected_foreign.iter().any(|expected| {
+                expected.entity == *entity && !expected.manifest.component_ids().contains(component)
+            })
+    }) && staged.partition.protected_matches_inner(
+        world,
+        true,
+        Some(staged.entity),
+        reinserted_resources,
+    ) && world
+        .resource::<RouteEntityRegistry>()
+        .record(staged.entity)
+        .is_some_and(|record| record.claim() == staged.claim)
         && validate_source_bound_granted_top_slot(
             world,
             &candidate.candidate,
@@ -2104,6 +2170,101 @@ pub(crate) fn activate_source_bound_granted_top_slot(
             staged.entity,
             Visibility::Visible,
         )
+}
+
+#[derive(Debug)]
+pub(crate) struct PostScopeHostConfirmationFailure {
+    expected_partition: Arc<FrozenProvisionalStagingPartition>,
+    observed_partition: ProvisionalStagingPartitionObservation,
+    reinserted_resources: Vec<(Entity, bevy_ecs::component::ComponentId)>,
+    expected: HostConfirmationSlotObservation,
+    observed: HostConfirmationSlotObservation,
+}
+
+#[derive(Debug)]
+struct HostConfirmationSlotObservation {
+    entity: Entity,
+    claim: Option<ExactRegistryClaim>,
+    manifest: Option<ComponentManifest>,
+    candidate: ValidatedHostCandidateObservation,
+    parent: Option<Entity>,
+    visibility: Option<Visibility>,
+    pickable: Option<Pickable>,
+    barrier: Option<RouterInputBarrier>,
+    lifecycle: Option<ProvisionalSlotLifecycle>,
+}
+
+impl PostScopeHostConfirmationFailure {
+    pub(crate) fn expected_digest(&self) -> u64 {
+        crate::cleanup::admission_evidence_digest(&(
+            &self.expected_partition,
+            &self.reinserted_resources,
+            &self.expected,
+        ))
+    }
+    pub(crate) fn observed_digest(&self) -> u64 {
+        crate::cleanup::admission_evidence_digest(&(
+            &self.observed_partition,
+            &self.reinserted_resources,
+            &self.observed,
+        ))
+    }
+}
+
+pub(crate) fn post_scope_host_confirmation_failure(
+    world: &World,
+    candidate: &PreparedEcsHostCandidateSource,
+    grant: &bevy_ui_router_core::integration::SourceBoundHostGrant,
+    staged: &StagedProvisionalTopSlot,
+    reinserted_resources: &[(Entity, bevy_ecs::component::ComponentId)],
+) -> Option<PostScopeHostConfirmationFailure> {
+    if activated_source_bound_granted_top_slot_after_scopes_is_current(
+        world,
+        candidate,
+        grant,
+        staged,
+        reinserted_resources,
+    ) {
+        return None;
+    }
+    Some(PostScopeHostConfirmationFailure {
+        expected_partition: Arc::clone(&staged.partition),
+        observed_partition: FrozenProvisionalStagingPartition::observe_live(
+            world,
+            &candidate.candidate,
+            staged.entity,
+        ),
+        reinserted_resources: reinserted_resources.to_vec(),
+        expected: HostConfirmationSlotObservation {
+            entity: staged.entity,
+            claim: Some(staged.claim.clone()),
+            manifest: Some(staged.manifest.clone()),
+            candidate: ValidatedHostCandidateObservation(Some(
+                candidate.candidate.fingerprint.clone(),
+            )),
+            parent: Some(candidate.candidate.host),
+            visibility: Some(Visibility::Visible),
+            pickable: Some(Pickable::IGNORE),
+            barrier: Some(RouterInputBarrier::deny_all()),
+            lifecycle: Some(ProvisionalSlotLifecycle::PreparedInert),
+        },
+        observed: HostConfirmationSlotObservation {
+            entity: staged.entity,
+            claim: world
+                .resource::<RouteEntityRegistry>()
+                .record(staged.entity)
+                .map(|record| record.claim()),
+            manifest: ComponentManifest::from_world(world, staged.entity),
+            candidate: observe_validated_host_candidate(world, &candidate.candidate),
+            parent: world.get::<ChildOf>(staged.entity).map(ChildOf::parent),
+            visibility: world.get::<Visibility>(staged.entity).copied(),
+            pickable: world.get::<Pickable>(staged.entity).copied(),
+            barrier: world.get::<RouterInputBarrier>(staged.entity).copied(),
+            lifecycle: world
+                .get::<ProvisionalSlotLifecycle>(staged.entity)
+                .copied(),
+        },
+    })
 }
 
 pub(crate) fn hide_source_bound_granted_top_slot(

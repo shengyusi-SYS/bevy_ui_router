@@ -62,6 +62,110 @@ use crate::view_key::RouteViewKey;
 
 const NONZERO_OBLIGATION_COUNT: usize = 3;
 
+#[test]
+fn idle_host_loss_core_rejects_foreign_queued_and_invalid_manifest_without_consuming_lease() {
+    use super::idle_host_loss::IdleHostLossErrorKind;
+    let (mut engine, mut issuer, lease) = ready_engine_with_tree_and_authority(tree());
+    let identity = lease.retirement_projection();
+    let before = engine.state.clone();
+    let (_, mut foreign_issuer, _) = ready_engine_with_tree_and_authority(tree());
+    let (_, lease) = engine
+        .begin_idle_host_loss(&mut foreign_issuer, lease, &[], 31, 1, |_| {
+            panic!("foreign issuer cannot install")
+        })
+        .unwrap_err();
+    assert_eq!(lease.retirement_projection(), identity);
+    assert_eq!(engine.state, before);
+    let (kind, lease) = engine
+        .begin_idle_host_loss(&mut issuer, lease, &[], 31, 0, |_| {
+            panic!("top-slot obligation is mandatory")
+        })
+        .unwrap_err();
+    assert_eq!(kind, IdleHostLossErrorKind::InvalidManifest);
+    assert_eq!(lease.retirement_projection(), identity);
+    let queued = engine.push(RouteLocation::new("/items/1")).unwrap();
+    assert!(!engine.idle_host_loss_eligible());
+    let before = engine.request(queued).unwrap().clone();
+    let (kind, lease) = engine
+        .begin_idle_host_loss(&mut issuer, lease, &[], 31, 1, |_| {
+            panic!("queued request owns foreground")
+        })
+        .unwrap_err();
+    assert_eq!(kind, IdleHostLossErrorKind::ReceiverMismatch);
+    assert_eq!(lease.retirement_projection(), identity);
+    assert_eq!(engine.request(queued), Some(&before));
+    assert!(issuer.has_current());
+}
+
+#[test]
+fn idle_host_loss_core_completion_returns_exact_owner_and_preserves_terminal_success() {
+    use super::idle_host_loss::{IdleHostLossPhysicalDisposition, IdleHostLossPhysicalFacts};
+    for with_active in [false, true] {
+        let (mut engine, mut issuer, lease) = ready_engine_with_tree_and_authority(tree());
+        if with_active {
+            engine.push(RouteLocation::new("/items/1")).unwrap();
+            settle_current(&mut engine);
+        }
+        assert!(engine.idle_host_loss_eligible());
+        let records = engine.records.clone();
+        let history = engine.history.snapshot().clone();
+        let roots = engine
+            .state
+            .active()
+            .frames()
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut owner = None;
+        assert!(
+            engine
+                .begin_idle_host_loss(&mut issuer, lease, &roots, 71, 5, |value| owner =
+                    Some(value))
+                .is_ok()
+        );
+        assert!(!issuer.has_current());
+        assert!(!engine.idle_host_loss_eligible());
+        assert_eq!(
+            engine.state.availability(),
+            &RouterAvailability::RecoveringAuthority
+        );
+        assert_eq!(engine.state.active().kind(), ActivePresentationKind::None);
+        assert!(engine.current.is_none());
+        assert!(engine.action.is_none());
+        assert_eq!(engine.records, records);
+        assert_eq!(engine.router_diagnostics.last().unwrap().request(), None);
+        let facts = IdleHostLossPhysicalFacts {
+            manifest_digest: 71,
+            obligation_count: 5,
+            disposition: IdleHostLossPhysicalDisposition::Settled {
+                completion_digest: 99,
+                settled_count: 5,
+            },
+        };
+        let bad = IdleHostLossPhysicalFacts {
+            obligation_count: 4,
+            ..facts
+        };
+        let owner = match engine.complete_idle_host_loss(owner.unwrap(), bad, |_| {
+            panic!("wrong physical manifest must not install")
+        }) {
+            Err(owner) => owner,
+            Ok(_) => panic!("wrong manifest must return owner"),
+        };
+        assert!(engine.complete_idle_host_loss(owner, facts, |_| ()).is_ok());
+        assert!(engine.pending_idle_host_loss.is_none());
+        assert!(engine.current.is_none());
+        assert!(engine.action.is_none());
+        assert_eq!(engine.records, records);
+        assert_eq!(engine.history.snapshot(), history);
+        assert_eq!(
+            engine.state.availability(),
+            &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+        );
+    }
+}
+
 fn tree() -> RouteTree {
     let mut builder = RouteTree::builder()
         .root_with_options(

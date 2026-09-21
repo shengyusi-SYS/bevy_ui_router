@@ -1658,6 +1658,13 @@ pub(crate) struct PreparedAuthorityPublicationCapacity {
     group_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthorityPublicationReserveError {
+    RetryableCapacity,
+    IdentityExhausted,
+    InvalidGroups,
+}
+
 impl PreparedAuthorityPublicationCapacity {
     pub(crate) fn reserve(
         table: &mut QuarantineLeaseTable,
@@ -1665,37 +1672,58 @@ impl PreparedAuthorityPublicationCapacity {
         lost_fact_count: usize,
         group_count: usize,
     ) -> Result<Self, QuarantineTransferError> {
+        Self::reserve_typed(table, verified_group_count, lost_fact_count, group_count).map_err(
+            |error| match error {
+                AuthorityPublicationReserveError::InvalidGroups => {
+                    QuarantineTransferError::UnknownOwnedEntity
+                }
+                AuthorityPublicationReserveError::RetryableCapacity
+                | AuthorityPublicationReserveError::IdentityExhausted => {
+                    QuarantineTransferError::CapacityExhausted
+                }
+            },
+        )
+    }
+
+    pub(crate) fn reserve_typed(
+        table: &mut QuarantineLeaseTable,
+        verified_group_count: usize,
+        lost_fact_count: usize,
+        group_count: usize,
+    ) -> Result<Self, AuthorityPublicationReserveError> {
         note_authority_reservation_attempt();
-        if authority_publication_capacity_fault_injected() {
-            return Err(QuarantineTransferError::CapacityExhausted);
-        }
+        let lease_reservation_count = if authority_publication_capacity_fault_injected() {
+            usize::MAX
+        } else {
+            verified_group_count
+        };
         if verified_group_count > group_count || (group_count == 0 && lost_fact_count != 0) {
-            return Err(QuarantineTransferError::UnknownOwnedEntity);
+            return Err(AuthorityPublicationReserveError::InvalidGroups);
         }
         let lease_sequence_start = table
             .next_sequence
             .checked_add(1)
-            .ok_or(QuarantineTransferError::CapacityExhausted)?;
+            .ok_or(AuthorityPublicationReserveError::IdentityExhausted)?;
         let lease_sequence_end = table
             .next_sequence
             .checked_add(verified_group_count as u64)
-            .ok_or(QuarantineTransferError::CapacityExhausted)?;
+            .ok_or(AuthorityPublicationReserveError::IdentityExhausted)?;
         let residual_sequence_start = table
             .next_residual_sequence
             .checked_add(1)
-            .ok_or(QuarantineTransferError::CapacityExhausted)?;
+            .ok_or(AuthorityPublicationReserveError::IdentityExhausted)?;
         let residual_sequence_end = table
             .next_residual_sequence
             .checked_add(lost_fact_count as u64)
-            .ok_or(QuarantineTransferError::CapacityExhausted)?;
+            .ok_or(AuthorityPublicationReserveError::IdentityExhausted)?;
         table
             .leases
-            .try_reserve_exact(verified_group_count)
-            .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
+            .try_reserve_exact(lease_reservation_count)
+            .map_err(|_| AuthorityPublicationReserveError::RetryableCapacity)?;
         table
             .authority_lost
             .try_reserve_exact(lost_fact_count)
-            .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
+            .map_err(|_| AuthorityPublicationReserveError::RetryableCapacity)?;
         table.next_sequence = lease_sequence_end;
         table.next_residual_sequence = residual_sequence_end;
         Ok(Self {
@@ -2621,6 +2649,27 @@ pub(crate) mod tests {
         assert_eq!(table.next_sequence, 2);
         assert_eq!(table.next_residual_sequence, 3);
         assert!(owner.revalidates(&table));
+    }
+
+    #[test]
+    fn authority_publication_reservation_distinguishes_capacity_from_identity_exhaustion() {
+        let mut table = QuarantineLeaseTable::new();
+        fail_next_authority_publication_capacity_reservation_for_test();
+        assert!(matches!(
+            PreparedAuthorityPublicationCapacity::reserve_typed(&mut table, 1, 0, 1),
+            Err(AuthorityPublicationReserveError::RetryableCapacity)
+        ));
+        assert_eq!(table.next_sequence, 0);
+        let reserved =
+            PreparedAuthorityPublicationCapacity::reserve_typed(&mut table, 1, 0, 1).unwrap();
+        assert!(reserved.revalidates(&table));
+        assert_eq!(table.next_sequence, 1);
+        table.next_sequence = u64::MAX;
+        assert!(matches!(
+            PreparedAuthorityPublicationCapacity::reserve_typed(&mut table, 1, 0, 1),
+            Err(AuthorityPublicationReserveError::IdentityExhausted)
+        ));
+        assert_eq!(table.next_sequence, u64::MAX);
     }
 
     #[test]
