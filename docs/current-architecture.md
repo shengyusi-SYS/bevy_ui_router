@@ -12,11 +12,11 @@
 | --- | --- | --- |
 | Core | builder/matching、请求顺序、branch diff、frame/generation、history、recovery 和唯一逻辑 publication | 保留既有行为；仅按新证据修正，不整体重写 |
 | View | renderer-neutral key、registry、descriptor、effect/input 合同 | 清除旧公开 writer/report 耦合时保持独立性 |
-| ECS | host/slot/frame binding、native 执行、staging、cleanup、输入/focus、physical authority 与 idle host-loss；旧 Data 注册仅在单元测试中编译 | 仅供旧回放的内部机制退出、私有替身收窄 |
+| ECS | host/slot/frame binding、native 执行、staging、cleanup、输入/focus、physical authority 与 idle host-loss；旧 Data 注册仅在单元测试中编译，专属延迟回放机制已退出 | 最小私有替身的最终边界核查 |
 | BSN | owned `BsnSceneFactory`、`BsnBuildError`、`DefaultOutlet`、公开注册与真实导航；依赖已反转 | 完整 MVP 验收归集与示例仍待完成 |
 | Facade | 导航、snapshots、真实 native public journeys；独立 Core/View/ECS/BSN consumer；旧 writer/report 导出及注册已撤下 | 最终验收、普通嵌套示例未完成 |
 
-迁移前主链为 `EcsViewDriver → FrameContentWriter/ContentPlan → RealizedFrame`；现在公开 BSN 注册经真实 FrameTask 分派到 native Scene，原 adoption 直接进入 RealizedFrame。旧 writer/report 不再公开，Data executor 的注册和可构造变体只在单元测试中编译，由私有扩展驱动原 Core/ECS 管线；其内部执行协议与回放依赖尚待成组精简，不能把公开面退出当作全部旧实现已删除。调度仅公开 `RouterInputSet::{Refresh,Ready}` 与 `RouterScheduleSet::PublishSnapshots`，中间 lifecycle 调度为 crate 私有，必要故障 seam 只在私测中编译。
+迁移前主链为 `EcsViewDriver → FrameContentWriter/ContentPlan → RealizedFrame`；现在公开 BSN 注册经真实 FrameTask 分派到 native Scene，原 adoption 直接进入 RealizedFrame。旧 writer/report 不再公开，Data executor 的注册和可构造变体只在单元测试中编译，由私有扩展驱动原 Core/ECS 管线。仅供测试捕获/延迟释放旧输出的 owner、投影、调度与 cleanup 包装已成组删除；真实 `pending_frame_drive` 重试、stale 接收、旧残留隔离和写后复验保留。剩余 ContentPlan 执行器服务 no-BSN 独立行为验证，不要求为符号归零而删除。调度仅公开 `RouterInputSet::{Refresh,Ready}` 与 `RouterScheduleSet::PublishSnapshots`，中间 lifecycle 调度为 crate 私有，必要故障 seam 只在私测中编译。
 
 BSN preparation 调用真实官方 `ScenePatch::load/resolve`：一次 factory 调用消费 fresh Scene，检查 runtime、cached inclusion 和重复引用，准备保持 ChildOf 顺序的声明图及 attempt 唯一匿名引用。成功与失败结果均携带 dependency handles，供实际 apply/settlement 保活；这不承诺为已结算的 inert residual 保活到实体销毁。已应用组件中的强 Handle 按 Bevy 自身规则保活。
 
@@ -72,4 +72,4 @@ Root、Nested、Reconciliation、History、Recovery 的完成记录见 [历史�
 
 ## 尚未完成
 
-仅供旧回放的内部机制退出与私有替身收窄、推荐 quick start/普通嵌套示例、统一 spec 验收归集、MVP 最终验证审查及 main 集成仍需完成。已通过的 native public journeys 和公共观察边界不重复开发，也不替代完整 MVP 验收；Windows 原生验证保持 NOT_RUN。
+私有替身最终边界核查、推荐 quick start/普通嵌套示例、统一 spec 验收归集、MVP 最终验证审查及 main 集成仍需完成。已退出的公开 Data 入口与延迟回放机制、已通过的 native public journeys 和公共观察边界不重复开发，也不替代完整 MVP 验收；Windows 原生验证保持 NOT_RUN。

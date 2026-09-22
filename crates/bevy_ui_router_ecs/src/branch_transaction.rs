@@ -979,14 +979,6 @@ impl SealedReconciliationSplice {
         (targets, isolate_count)
     }
 
-    pub(crate) fn current_interactive_entities(&self) -> Vec<bevy_ecs::prelude::Entity> {
-        self.preserved
-            .interactive_entities()
-            .into_iter()
-            .chain(self.leaving.interactive_entities())
-            .collect()
-    }
-
     pub(crate) fn current_live_interactive_entities(
         &self,
         world: &bevy_ecs::world::World,
@@ -1008,14 +1000,6 @@ impl SealedReconciliationSplice {
             .iter()
             .chain(self.entering.frames())
             .flat_map(|frame| frame.content_input_facts(world, next).1)
-            .collect()
-    }
-
-    pub(crate) fn resulting_interactive_entities(&self) -> Vec<bevy_ecs::prelude::Entity> {
-        self.preserved
-            .interactive_entities()
-            .into_iter()
-            .chain(self.entering.interactive_entities())
             .collect()
     }
 

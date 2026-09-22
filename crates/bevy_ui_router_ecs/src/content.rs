@@ -77,11 +77,6 @@ impl SolidRect {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ContentPrimitiveKind {
-    SolidRect,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContentPrimitiveErrorKind {
     ZeroWidth,
@@ -543,50 +538,6 @@ pub(crate) mod tests {
 
     fn writer(plan: &mut ContentPlan) -> FrameContentWriter<'_> {
         FrameContentWriter::new(plan)
-    }
-
-    #[test]
-    fn public_content_types_have_the_final_shape() {
-        fn assert_value<T: Clone + Copy + std::fmt::Debug + Eq + std::hash::Hash + PartialEq>() {}
-        fn assert_error_kind<T: Clone + Copy + std::fmt::Debug + Eq + PartialEq>() {}
-        fn assert_error<
-            T: std::fmt::Debug + std::fmt::Display + std::error::Error + Send + Sync + 'static,
-        >() {
-        }
-
-        let _: fn(&ContentColor) -> u8 = ContentColor::red;
-        let _: fn(&ContentColor) -> u8 = ContentColor::green;
-        let _: fn(&ContentColor) -> u8 = ContentColor::blue;
-        let _: fn(&ContentColor) -> u8 = ContentColor::alpha;
-        let _: fn(&SolidRect) -> u16 = SolidRect::width_px;
-        let _: fn(&SolidRect) -> u16 = SolidRect::height_px;
-        let _: fn(&SolidRect) -> ContentColor = SolidRect::color;
-        let _: fn(&ContentPrimitiveError) -> ContentPrimitiveErrorKind =
-            ContentPrimitiveError::kind;
-        let _: fn(&ContentWriteError) -> ContentWriteErrorKind = ContentWriteError::kind;
-
-        let primitive = ContentPrimitiveKind::SolidRect;
-        assert_eq!(primitive, ContentPrimitiveKind::SolidRect);
-        assert_value::<ContentColor>();
-        assert_value::<SolidRect>();
-        assert_value::<ContentPrimitiveKind>();
-        assert_error_kind::<ContentPrimitiveErrorKind>();
-        assert_error_kind::<ContentWriteErrorKind>();
-        assert_error::<ContentPrimitiveError>();
-        assert_error::<ContentWriteError>();
-    }
-
-    #[test]
-    fn kind_getters_are_not_const() {
-        let sources = [include_str!("content.rs"), include_str!("driver.rs")];
-        let forbidden = ["pub const fn ", "kind"].concat();
-        assert!(sources.iter().all(|source| !source.contains(&forbidden)));
-    }
-
-    #[test]
-    fn content_write_error_discriminants_are_stable() {
-        assert_eq!(ContentWriteErrorKind::UnknownHandle as usize, 0);
-        assert_eq!(ContentWriteErrorKind::ForeignSession as usize, 1);
     }
 
     #[test]

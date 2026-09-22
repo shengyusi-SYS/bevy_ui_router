@@ -89,7 +89,7 @@ use bevy_ui_router_core::{
 use bevy_ui_router_view::{RouteViewRegistry, ViewBuildEffect, integration as view_integration};
 
 use crate::{
-    app_ext::{RouterHandle, RouterHostRegistration, ViewDriverStore, ViewDriverStoreProjection},
+    app_ext::{RouterHandle, RouterHostRegistration, ViewDriverStore},
     branch_transaction::{
         FailedPreparedBranch, PendingCommit, PreparedBranch, PreparedPermanentIsolationClaimRebind,
         RealizedBranch, ReconciliationAuthorityIdentity, ReconciliationProjectionFacts,
@@ -170,10 +170,9 @@ use crate::{
     },
     registry::{
         ComponentManifest, EntityLifecycle, EntityOwner, ExactRegistryClaim,
-        PreparedLifecycleMutation, ProtectedRegistryProjection, ProvisionalOwner,
-        QuarantineLeaseTable, RegistryOwner, RouteEntityRegistry,
+        PreparedLifecycleMutation, ProvisionalOwner, RegistryOwner, RouteEntityRegistry,
     },
-    snapshots::{RouterSnapshots, RouterSnapshotsProjection},
+    snapshots::RouterSnapshots,
 };
 
 fn allocate_navigation_domain(counter: &AtomicU64) -> Option<u64> {
@@ -627,11 +626,9 @@ struct PendingFrameDrive {
     pending: PendingCommit,
 }
 
-#[derive(Clone)]
 struct AppliedDriverReportArtifact {
     identity: bevy_ui_router_core::integration::ViewReportIdentity,
     kind: ViewBuildReportKind,
-    message: Option<String>,
     plan: ContentPlan,
 }
 
@@ -640,275 +637,9 @@ impl AppliedDriverReportArtifact {
         Self {
             identity: report.identity().clone(),
             kind: report.kind(),
-            message: report.message().map(str::to_owned),
             plan,
         }
     }
-}
-
-#[derive(Clone, Eq, PartialEq)]
-struct OldOutputSourceIdentity {
-    router: RouterHandle,
-    host_version: bevy_ui_router_core::HostVersion,
-    host: Entity,
-    top_slot: Entity,
-    top_slot_claim: ExactRegistryClaim,
-    frame: RouteFrameVersion,
-    request: NavigationRequestId,
-    sequence: u64,
-    mount: FrameMountTarget,
-    report: ViewReportIdentity,
-}
-
-impl OldOutputSourceIdentity {
-    fn freeze(
-        router: RouterHandle,
-        host: &HostBinding,
-        task: &RootFrameTask,
-        artifact: &AppliedDriverReportArtifact,
-    ) -> Option<Self> {
-        if artifact.identity != task.report_identity()
-            || !r3_core::host_version_matches_frame(&host.version, task.frame())
-        {
-            return None;
-        }
-        Some(Self {
-            router,
-            host_version: host.version.clone(),
-            host: host.host,
-            top_slot: host.top_slot,
-            top_slot_claim: host.top_slot_claim.clone(),
-            frame: task.frame().clone(),
-            request: task.request(),
-            sequence: task.view_request_sequence(),
-            mount: task.mount_target(),
-            report: task.report_identity(),
-        })
-    }
-
-    fn matches(
-        &self,
-        router: RouterHandle,
-        task: &RootFrameTask,
-        artifact: &AppliedDriverReportArtifact,
-    ) -> bool {
-        self.router == router
-            && self.frame == *task.frame()
-            && self.request == task.request()
-            && self.sequence == task.view_request_sequence()
-            && self.mount == task.mount_target()
-            && self.report == task.report_identity()
-            && artifact.identity == self.report
-    }
-}
-
-struct SealedOldOutputSourceOwner {
-    source: OldOutputSourceIdentity,
-    pending: PendingCommit,
-    task: RootFrameTask,
-}
-
-struct SealedOldOutputOwner {
-    source: OldOutputSourceIdentity,
-    physical: FailedPreparedBranch,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FrozenStaleOutputOtherHolders {
-    pending_host_confirmation: bool,
-    deferred_host_observation: Option<DeferredHostObservation>,
-    idle_host_loss: bool,
-    idle_host_terminal: bool,
-    host_settlement: bool,
-    pending_host_admission_failure: bool,
-    pending_commit: bool,
-    pending_frame_drive: bool,
-    pending_mount_frame_task: bool,
-    pending_mount_request: bool,
-    pending_mount_mutation_rejection: bool,
-    pending_failed_branch: bool,
-    failure_cleanup_permanent: bool,
-    cleanup_settlement_permanent_inert: bool,
-    projectionless_fail_close: bool,
-    cleanup_ledger: bool,
-    post_commit_compound: bool,
-    settled_retired_host_evidence: bool,
-    failure_cleanup_completion: bool,
-    authority_protocol_residual: bool,
-    back_capacity_enqueue_retire_residual: bool,
-    back_capacity_reservation_count: usize,
-    pending_back_resolution_action: bool,
-    pending_bound_back_resolution: bool,
-    pending_back_target_execution: bool,
-    pending_back_no_target_completion: bool,
-    pending_back_no_target_preparation: bool,
-    pending_back_no_target_authority_cleanup: bool,
-    pending_back_target_permanent_cleanup: bool,
-    history_admission_stamp: bool,
-    back_capacity_issuer: bool,
-}
-
-impl FrozenStaleOutputOtherHolders {
-    fn observe(entry: &RouterEntry) -> Self {
-        Self {
-            pending_host_confirmation: entry.pending_host_confirmation.is_some(),
-            deferred_host_observation: entry.deferred_host_observation.clone(),
-            idle_host_loss: entry.idle_host_loss.is_some(),
-            idle_host_terminal: entry.idle_host_terminal.is_some(),
-            host_settlement: entry.host_settlement.is_some(),
-            pending_host_admission_failure: entry.pending_host_admission_failure.is_some(),
-            pending_commit: entry.pending_commit.is_some(),
-            pending_frame_drive: entry.pending_frame_drive.is_some(),
-            pending_mount_frame_task: entry.pending_mount_frame_task.is_some(),
-            pending_mount_request: entry.pending_mount_request.is_some(),
-            pending_mount_mutation_rejection: entry.pending_mount_mutation_rejection.is_some(),
-            pending_failed_branch: entry.pending_failed_branch.is_some(),
-            failure_cleanup_permanent: entry.failure_cleanup_permanent.is_some(),
-            cleanup_settlement_permanent_inert: entry.cleanup_settlement_permanent_inert.is_some(),
-            projectionless_fail_close: entry.projectionless_fail_close.is_some(),
-            cleanup_ledger: entry.cleanup_ledger.is_some(),
-            post_commit_compound: entry.post_commit_compound.is_some(),
-            settled_retired_host_evidence: entry.settled_retired_host_evidence.is_some(),
-            failure_cleanup_completion: entry.failure_cleanup_completion.is_some(),
-            authority_protocol_residual: entry.authority_protocol_residual.is_some(),
-            back_capacity_enqueue_retire_residual: entry
-                .back_capacity_enqueue_retire_residual
-                .is_some(),
-            back_capacity_reservation_count: entry.back_capacity_reservations.len(),
-            pending_back_resolution_action: entry.pending_back_resolution_action.is_some(),
-            pending_bound_back_resolution: entry.pending_bound_back_resolution.is_some(),
-            pending_back_target_execution: entry.pending_back_target_execution.is_some(),
-            pending_back_no_target_completion: entry.pending_back_no_target_completion.is_some(),
-            pending_back_no_target_preparation: entry.pending_back_no_target_preparation.is_some(),
-            pending_back_no_target_authority_cleanup: entry
-                .pending_back_no_target_authority_cleanup
-                .is_some(),
-            pending_back_target_permanent_cleanup: entry
-                .pending_back_target_permanent_cleanup
-                .is_some(),
-            history_admission_stamp: entry.history_admission_stamp.is_some(),
-            back_capacity_issuer: entry.back_capacity_issuer.is_some(),
-        }
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Eq, PartialEq)]
-enum FrozenDelayedDriverReportReplayProjection {
-    Armed {
-        control: u64,
-    },
-    Captured {
-        control: u64,
-        identity: ViewReportIdentity,
-        released: bool,
-    },
-}
-
-#[derive(Clone, Eq, PartialEq)]
-struct FrozenStaleOutputCurrentEpoch {
-    router: RouterHandle,
-    targets: Vec<Entity>,
-    engine: r3_core::RouterSnapshotProjection,
-    requests: Vec<NavigationRequestId>,
-    physical: FailureCleanupSourceProjection,
-    holders: FrozenStaleOutputOtherHolders,
-    snapshots: Option<RouterSnapshotsProjection>,
-    drivers: Option<ViewDriverStoreProjection>,
-    registry: Option<ProtectedRegistryProjection>,
-    quarantine: Option<QuarantineLeaseTable>,
-    #[cfg(test)]
-    delayed_report: Option<FrozenDelayedDriverReportReplayProjection>,
-}
-
-impl FrozenStaleOutputCurrentEpoch {
-    fn observe(world: &World, entry: &RouterEntry, targets: &[Entity]) -> Self {
-        Self {
-            router: entry.handle,
-            targets: targets.to_vec(),
-            engine: entry.engine.snapshot(),
-            requests: entry.requests.clone(),
-            physical: FailureCleanupSourceProjection::observe(
-                entry.host.as_ref(),
-                entry.active.as_ref(),
-            ),
-            holders: FrozenStaleOutputOtherHolders::observe(entry),
-            snapshots: world
-                .get_resource::<RouterSnapshots>()
-                .map(RouterSnapshots::exact_projection),
-            drivers: world
-                .get_resource::<ViewDriverStore>()
-                .map(ViewDriverStore::exact_projection),
-            registry: world
-                .get_resource::<RouteEntityRegistry>()
-                .map(|registry| registry.protected_projection_excluding(targets)),
-            quarantine: world.get_resource::<QuarantineLeaseTable>().cloned(),
-            #[cfg(test)]
-            delayed_report: entry
-                .delayed_driver_report_replay
-                .as_ref()
-                .map(|state| match state {
-                    TestingDelayedDriverReportReplayState::Armed { control } => {
-                        FrozenDelayedDriverReportReplayProjection::Armed { control: *control }
-                    }
-                    TestingDelayedDriverReportReplayState::Captured {
-                        control,
-                        artifact,
-                        released,
-                    } => FrozenDelayedDriverReportReplayProjection::Captured {
-                        control: *control,
-                        identity: artifact.identity.clone(),
-                        released: *released,
-                    },
-                }),
-        }
-    }
-
-    fn matches(&self, world: &World, entry: &RouterEntry) -> bool {
-        entry.handle == self.router && Self::observe(world, entry, &self.targets) == *self
-    }
-}
-
-enum PendingStaleOutputCleanup {
-    Sealed(SealedOldOutputSourceOwner),
-    Released {
-        owner: SealedOldOutputSourceOwner,
-        artifact: AppliedDriverReportArtifact,
-        stable_inert: bool,
-    },
-    Physical {
-        owner: SealedOldOutputOwner,
-        artifact: AppliedDriverReportArtifact,
-        stable_inert: bool,
-    },
-    Active {
-        source: OldOutputSourceIdentity,
-        current_epoch: FrozenStaleOutputCurrentEpoch,
-        cleanup_source: FailureCleanupSourceProjection,
-        ledger: CleanupLedger,
-        stable_inert: bool,
-    },
-}
-
-#[cfg(test)]
-enum TestingDelayedDriverReportReplayState {
-    Armed {
-        control: u64,
-    },
-    Captured {
-        control: u64,
-        artifact: AppliedDriverReportArtifact,
-        released: bool,
-    },
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TestingDelayedDriverReportReplayControlError {
-    UnknownRouter,
-    AlreadyArmed,
-    NothingCaptured,
-    ForeignControl,
 }
 
 enum PendingMountMutationPayload {
@@ -2466,9 +2197,6 @@ pub(crate) struct RouterEntry {
     pending_frame_drive: Option<PendingFrameDrive>,
     #[cfg(feature = "bsn")]
     native_residuals: Vec<crate::presentation::native_failure::NativeTerminalResidual>,
-    pending_stale_output_cleanup: Option<PendingStaleOutputCleanup>,
-    #[cfg(test)]
-    delayed_driver_report_replay: Option<TestingDelayedDriverReportReplayState>,
     pending_mount_frame_task: Option<RootFrameTask>,
     pending_mount_request: Option<MountRequest>,
     pending_mount_mutation_rejection: Option<PendingMountMutationRejection>,
@@ -5766,130 +5494,6 @@ impl RouterEntry {
             .iter()
             .flat_map(|residual| residual.shell_claims())
     }
-    fn captured_delayed_driver_report(
-        &self,
-        task: &RootFrameTask,
-    ) -> Option<&AppliedDriverReportArtifact> {
-        #[cfg(test)]
-        {
-            return match self.delayed_driver_report_replay.as_ref() {
-                Some(TestingDelayedDriverReportReplayState::Captured { artifact, .. })
-                    if artifact.identity == task.report_identity() =>
-                {
-                    Some(artifact)
-                }
-                _ => None,
-            };
-        }
-        #[cfg(not(test))]
-        {
-            let _ = task;
-            None
-        }
-    }
-
-    fn delayed_driver_report_replay_blocks_drive(&self, task: &RootFrameTask) -> bool {
-        #[cfg(test)]
-        {
-            return matches!(
-                self.delayed_driver_report_replay.as_ref(),
-                Some(TestingDelayedDriverReportReplayState::Captured {
-                    artifact,
-                    released: false,
-                    ..
-                }) if artifact.identity == task.report_identity()
-            );
-        }
-        #[cfg(not(test))]
-        {
-            let _ = task;
-            false
-        }
-    }
-
-    fn capture_delayed_driver_report_replay(
-        &mut self,
-        artifact: &AppliedDriverReportArtifact,
-    ) -> bool {
-        #[cfg(test)]
-        {
-            let Some(state) = self.delayed_driver_report_replay.take() else {
-                return false;
-            };
-            match state {
-                TestingDelayedDriverReportReplayState::Armed { control } => {
-                    self.delayed_driver_report_replay =
-                        Some(TestingDelayedDriverReportReplayState::Captured {
-                            control,
-                            artifact: artifact.clone(),
-                            released: false,
-                        });
-                    true
-                }
-                state => {
-                    self.delayed_driver_report_replay = Some(state);
-                    false
-                }
-            }
-        }
-        #[cfg(not(test))]
-        {
-            let _ = artifact;
-            false
-        }
-    }
-
-    fn take_released_driver_report_replay(
-        &mut self,
-        task: &RootFrameTask,
-    ) -> Option<AppliedDriverReportArtifact> {
-        #[cfg(test)]
-        {
-            let state = self.delayed_driver_report_replay.take()?;
-            match state {
-                TestingDelayedDriverReportReplayState::Captured {
-                    artifact,
-                    released: true,
-                    ..
-                } if artifact.identity == task.report_identity() => Some(artifact),
-                state => {
-                    self.delayed_driver_report_replay = Some(state);
-                    None
-                }
-            }
-        }
-        #[cfg(not(test))]
-        {
-            let _ = task;
-            None
-        }
-    }
-
-    fn take_released_sealed_driver_report_replay(
-        &mut self,
-        source: &OldOutputSourceIdentity,
-    ) -> Option<AppliedDriverReportArtifact> {
-        #[cfg(test)]
-        {
-            let state = self.delayed_driver_report_replay.take()?;
-            match state {
-                TestingDelayedDriverReportReplayState::Captured {
-                    artifact,
-                    released: true,
-                    ..
-                } if artifact.identity == source.report => Some(artifact),
-                state => {
-                    self.delayed_driver_report_replay = Some(state);
-                    None
-                }
-            }
-        }
-        #[cfg(not(test))]
-        {
-            let _ = source;
-            None
-        }
-    }
 
     pub(crate) fn install_back_capacity_issuer(
         &mut self,
@@ -6112,8 +5716,6 @@ impl RouterEntry {
 pub struct RouterNavigation {
     domain: u64,
     next_router: u64,
-    #[cfg(test)]
-    next_delayed_driver_report_replay_control: u64,
     back_capacity_domain_issuer: BackCapacityDomainIssuer,
     pub(crate) entries: Vec<RouterEntry>,
 }
@@ -6127,62 +5729,8 @@ impl RouterNavigation {
         Self {
             domain,
             next_router: 1,
-            #[cfg(test)]
-            next_delayed_driver_report_replay_control: 1,
             back_capacity_domain_issuer: BackCapacityDomainIssuer::new(),
             entries: Vec::new(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn testing_arm_next_applied_driver_report_replay(
-        &mut self,
-        router: RouterHandle,
-    ) -> Result<u64, TestingDelayedDriverReportReplayControlError> {
-        let Some(entry) = self.entries.iter_mut().find(|entry| entry.handle == router) else {
-            return Err(TestingDelayedDriverReportReplayControlError::UnknownRouter);
-        };
-        if entry.delayed_driver_report_replay.is_some() {
-            return Err(TestingDelayedDriverReportReplayControlError::AlreadyArmed);
-        }
-        let control = self.next_delayed_driver_report_replay_control;
-        self.next_delayed_driver_report_replay_control = self
-            .next_delayed_driver_report_replay_control
-            .checked_add(1)
-            .ok_or(TestingDelayedDriverReportReplayControlError::AlreadyArmed)?;
-        entry.delayed_driver_report_replay =
-            Some(TestingDelayedDriverReportReplayState::Armed { control });
-        Ok(control)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn testing_release_applied_driver_report_replay(
-        &mut self,
-        router: RouterHandle,
-        control: u64,
-    ) -> Result<(), TestingDelayedDriverReportReplayControlError> {
-        let Some(entry) = self.entries.iter_mut().find(|entry| entry.handle == router) else {
-            return Err(TestingDelayedDriverReportReplayControlError::UnknownRouter);
-        };
-        match entry.delayed_driver_report_replay.as_mut() {
-            Some(TestingDelayedDriverReportReplayState::Armed { control: armed }) => {
-                if *armed == control {
-                    Err(TestingDelayedDriverReportReplayControlError::NothingCaptured)
-                } else {
-                    Err(TestingDelayedDriverReportReplayControlError::ForeignControl)
-                }
-            }
-            Some(TestingDelayedDriverReportReplayState::Captured {
-                control: captured,
-                released,
-                ..
-            }) if *captured == control && !*released => {
-                *released = true;
-                Ok(())
-            }
-            Some(TestingDelayedDriverReportReplayState::Captured { .. }) | None => {
-                Err(TestingDelayedDriverReportReplayControlError::ForeignControl)
-            }
         }
     }
 
@@ -6239,9 +5787,6 @@ impl RouterNavigation {
             pending_frame_drive: None,
             #[cfg(feature = "bsn")]
             native_residuals: Vec::new(),
-            pending_stale_output_cleanup: None,
-            #[cfg(test)]
-            delayed_driver_report_replay: None,
             pending_mount_frame_task: None,
             pending_mount_request: None,
             pending_mount_mutation_rejection: None,
@@ -8209,28 +7754,6 @@ fn realize_native_task(
     }
 }
 
-fn apply_applied_driver_report(
-    world: &mut World,
-    engine: &mut RouterEngine,
-    host_candidate: ValidatedHostCandidate,
-    top_slot: bevy_ecs::entity::Entity,
-    top_slot_claim: crate::registry::ExactRegistryClaim,
-    task: &RootFrameTask,
-    artifact: AppliedDriverReportArtifact,
-) -> Result<RealizedFrame, DriverReportApplicationError> {
-    apply_applied_driver_report_to_branch(
-        world,
-        engine,
-        host_candidate,
-        top_slot,
-        top_slot_claim,
-        None,
-        None,
-        task,
-        artifact,
-    )
-}
-
 fn apply_applied_driver_report_to_branch(
     world: &mut World,
     engine: &mut RouterEngine,
@@ -9351,335 +8874,6 @@ fn retain_frame_task_after_authority_retry(
     });
 }
 
-fn begin_sealed_old_output_host_loss(
-    world: &mut World,
-    entry: &mut RouterEntry,
-    had_active: bool,
-    active: RealizedBranch,
-    pending: PendingCommit,
-    task: RootFrameTask,
-    retry_effect: Option<ViewBuildEffect>,
-) {
-    let source = entry.host.as_ref().and_then(|host| {
-        entry
-            .captured_delayed_driver_report(&task)
-            .and_then(|artifact| {
-                OldOutputSourceIdentity::freeze(entry.handle, host, &task, artifact)
-            })
-    });
-    let Some(source) = source else {
-        retain_frame_task_after_authority_retry(
-            entry,
-            had_active,
-            active,
-            pending,
-            task,
-            retry_effect,
-        );
-        return;
-    };
-    if entry.pending_stale_output_cleanup.is_some() {
-        retain_frame_task_after_authority_retry(
-            entry,
-            had_active,
-            active,
-            pending,
-            task,
-            retry_effect,
-        );
-        return;
-    }
-    let logical_roots = entry.engine.authority_settlement_logical_roots();
-    match begin_authority_settlement(
-        world,
-        entry,
-        active,
-        PendingCommit::new(),
-        Some(logical_roots),
-    ) {
-        AuthoritySettlementBeginOutcome::Begun => {
-            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Sealed(
-                SealedOldOutputSourceOwner {
-                    source,
-                    pending,
-                    task,
-                },
-            ));
-        }
-        #[cfg(feature = "bsn")]
-        AuthoritySettlementBeginOutcome::NativeCleanupContradiction { active, error, .. } => {
-            if let Err((active, pending)) = fail_closed_normal_owner_protocol(
-                world,
-                entry,
-                active,
-                pending,
-                AuthorityProtocolResidualKind::NativeCleanup(error),
-            ) {
-                retain_frame_task_after_authority_retry(
-                    entry,
-                    had_active,
-                    active,
-                    pending,
-                    task,
-                    retry_effect,
-                );
-            }
-        }
-        AuthoritySettlementBeginOutcome::RetryablePreparation { active, .. }
-        | AuthoritySettlementBeginOutcome::ProtocolContradiction { active, .. }
-        | AuthoritySettlementBeginOutcome::TriggerContradiction { active, .. }
-        | AuthoritySettlementBeginOutcome::IsolationContradiction { active, .. }
-        | AuthoritySettlementBeginOutcome::LedgerContradiction { active, .. } => {
-            retain_frame_task_after_authority_retry(
-                entry,
-                had_active,
-                active,
-                pending,
-                task,
-                retry_effect,
-            );
-        }
-    }
-}
-
-fn activate_stale_output_cleanup(
-    world: &mut World,
-    entry: &mut RouterEntry,
-    owner: SealedOldOutputOwner,
-    artifact: AppliedDriverReportArtifact,
-    stable_inert: bool,
-) {
-    if stable_inert {
-        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
-            owner,
-            artifact,
-            stable_inert,
-        });
-        return;
-    }
-    let manifest = {
-        let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
-            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
-                owner,
-                artifact,
-                stable_inert: true,
-            });
-            return;
-        };
-        FrozenCleanupManifest::from_failed_prepared_branch(world, registry, &owner.physical)
-    };
-    let manifest = match manifest {
-        Ok(manifest) => manifest,
-        Err(FailedManifestBuildError::RetryableCapacity) => {
-            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
-                owner,
-                artifact,
-                stable_inert: false,
-            });
-            return;
-        }
-        Err(_) => {
-            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
-                owner,
-                artifact,
-                stable_inert: true,
-            });
-            return;
-        }
-    };
-    let bindings = manifest
-        .boundary_drifts()
-        .iter()
-        .map(|drift| {
-            (drift.expected.exact_claim() == &owner.source.top_slot_claim
-                && failed_boundary_source_accepts_owner(drift))
-            .then(|| {
-                exact_failed_source_obligation(drift, &owner.physical).map(|obligation| {
-                    PendingBoundaryBinding {
-                        source: drift.source.clone(),
-                        obligation: obligation.clone(),
-                    }
-                })
-            })
-            .flatten()
-        })
-        .collect::<Option<Vec<_>>>();
-    let Some(bindings) = bindings else {
-        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
-            owner,
-            artifact,
-            stable_inert: true,
-        });
-        return;
-    };
-    let manifest = match manifest.finalize_sealed_stale_boundaries(bindings) {
-        Ok(manifest) => manifest,
-        Err((_, _manifest)) => {
-            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
-                owner,
-                artifact,
-                stable_inert: true,
-            });
-            return;
-        }
-    };
-    if manifest.len() == 0 {
-        return;
-    }
-    if !manifest.preflight(world) || !manifest.failure_cleanup_targets_are_isolated(world) {
-        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
-            owner,
-            artifact,
-            stable_inert: true,
-        });
-        return;
-    }
-    let targets = manifest.obligation_entities();
-    let partition = {
-        let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
-            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
-                owner,
-                artifact,
-                stable_inert: true,
-            });
-            return;
-        };
-        let Some(host) = entry.host.as_ref() else {
-            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
-                owner,
-                artifact,
-                stable_inert: false,
-            });
-            return;
-        };
-        manifest.freeze_stale_output_cleanup_partition(world, registry, entry.active.as_ref(), host)
-    };
-    let Some(partition) = partition else {
-        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
-            owner,
-            artifact,
-            stable_inert: true,
-        });
-        return;
-    };
-    let current_epoch = FrozenStaleOutputCurrentEpoch::observe(world, entry, &targets);
-    let cleanup_source = current_epoch.physical.clone();
-    let prepared = match CleanupLedger::reserve(manifest) {
-        Ok(prepared) => prepared.bind_failure_cleanup_partition(partition),
-        Err(error) => {
-            let stable_inert = error.kind() != CleanupLedgerReserveErrorKind::RetryableCapacity;
-            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
-                owner,
-                artifact,
-                stable_inert,
-            });
-            return;
-        }
-    };
-    let SealedOldOutputOwner { source, physical } = owner;
-    entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Active {
-        source,
-        current_epoch,
-        cleanup_source,
-        ledger: CleanupLedger::activate_failed(prepared, physical),
-        stable_inert: false,
-    });
-}
-
-fn drive_released_stale_output_report(world: &mut World, entry: &mut RouterEntry) {
-    let Some(state) = entry.pending_stale_output_cleanup.take() else {
-        return;
-    };
-    let (owner, artifact, stable_inert) = match state {
-        PendingStaleOutputCleanup::Sealed(owner) => {
-            let source = owner.source.clone();
-            let Some(artifact) = entry.take_released_sealed_driver_report_replay(&source) else {
-                entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Sealed(owner));
-                return;
-            };
-            (owner, artifact, false)
-        }
-        PendingStaleOutputCleanup::Released {
-            owner,
-            artifact,
-            stable_inert,
-        } => (owner, artifact, stable_inert),
-        PendingStaleOutputCleanup::Physical {
-            owner,
-            artifact,
-            stable_inert,
-        } => {
-            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
-                owner,
-                artifact,
-                stable_inert,
-            });
-            return;
-        }
-        active @ PendingStaleOutputCleanup::Active { .. } => {
-            entry.pending_stale_output_cleanup = Some(active);
-            return;
-        }
-    };
-    let host_is_available = entry.host.is_some();
-    if stable_inert
-        || !owner.source.matches(entry.handle, &owner.task, &artifact)
-        || !host_is_available
-        || entry.engine.inspect_report_identity(&owner.task).is_ok()
-    {
-        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Released {
-            owner,
-            artifact,
-            stable_inert: stable_inert || host_is_available,
-        });
-        return;
-    }
-    let host = entry
-        .host
-        .as_ref()
-        .expect("the stale receiver prevalidates the current host");
-    if !current_host_binding_is_exact(world, host) {
-        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Released {
-            owner,
-            artifact,
-            stable_inert: false,
-        });
-        return;
-    }
-    let application = apply_applied_driver_report_to_branch(
-        world,
-        &mut entry.engine,
-        host.candidate.clone(),
-        host.top_slot,
-        host.top_slot_claim.clone(),
-        None,
-        entry.active.as_ref(),
-        &owner.task,
-        artifact.clone(),
-    );
-    if !matches!(application, Err(DriverReportApplicationError::Stale)) {
-        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Released {
-            owner,
-            artifact,
-            stable_inert: true,
-        });
-        return;
-    }
-    let SealedOldOutputSourceOwner {
-        source,
-        pending,
-        task: _,
-    } = owner;
-    entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Physical {
-        owner: SealedOldOutputOwner {
-            source,
-            physical: FailedPreparedBranch::new(pending.branch),
-        },
-        artifact,
-        stable_inert: false,
-    });
-}
-
 fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> Vec<usize> {
     let mut newly_bound_entries = Vec::new();
     world.resource_scope(
@@ -9690,7 +8884,6 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                         if only_entries.is_some_and(|entries| !entries.contains(&entry_index)) {
                             continue;
                         }
-                        drive_released_stale_output_report(world, entry);
                         if let Some(pending_rejection) =
                             entry.pending_mount_mutation_rejection.take()
                         {
@@ -10050,18 +9243,6 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                         .take()
                                         .unwrap_or_else(RealizedBranch::empty);
                                     let reconciled = entry.engine.reconciliation_projection_for_task(&task).is_ok();
-                                    if reconciled && entry.captured_delayed_driver_report(&task).is_some() {
-                                        begin_sealed_old_output_host_loss(
-                                            world,
-                                            entry,
-                                            had_active,
-                                            active,
-                                            pending,
-                                            task,
-                                            retry_effect,
-                                        );
-                                        continue;
-                                    }
                                     let outcome = if reconciled {
                                         let logical_roots = entry.engine.authority_settlement_logical_roots();
                                         begin_authority_settlement(
@@ -10228,22 +9409,6 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                 let host_candidate = host.candidate.clone();
                                 let top_slot = host.top_slot;
                                 let top_slot_claim = host.top_slot_claim.clone();
-                                if entry.delayed_driver_report_replay_blocks_drive(&task) {
-                                    let Some(effect) = retry_effect else {
-                                        unreachable!(
-                                            "a captured report retains its exact pending frame-drive owner"
-                                        )
-                                    };
-                                    entry.pending_frame_drive = Some(PendingFrameDrive {
-                                        task,
-                                        effect,
-                                        pending,
-                                    });
-                                    continue;
-                                }
-                                let replay_artifact = retry_effect
-                                    .as_ref()
-                                    .and_then(|_| entry.take_released_driver_report_replay(&task));
                                 let Some(driver_key) =
                                     view_integration::driver_key(&entry.views, task.view())
                                         .cloned()
@@ -10380,9 +9545,7 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                         task.view_request_sequence(),
                                     )
                                 });
-                                let artifact = if let Some(artifact) = replay_artifact {
-                                    artifact
-                                } else {
+                                let artifact = {
                                     let mut plan = ContentPlan::new();
                                     let mut writer = FrameContentWriter::new(&mut plan);
                                     let mut seal = ReportSeal::new();
@@ -10498,14 +9661,6 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                     }
                                     AppliedDriverReportArtifact::from_report(report, plan)
                                 };
-                                if entry.capture_delayed_driver_report_replay(&artifact) {
-                                    entry.pending_frame_drive = Some(PendingFrameDrive {
-                                        task,
-                                        effect,
-                                        pending,
-                                    });
-                                    continue;
-                                }
                                 apply_applied_driver_report_to_branch(
                                     world,
                                     &mut entry.engine,
@@ -22671,91 +21826,10 @@ fn drive_post_commit_compound(world: &mut World, entry: &mut RouterEntry) -> boo
     true
 }
 
-fn drive_stale_output_cleanup_settlement(world: &mut World, entry: &mut RouterEntry) -> bool {
-    let Some(state) = entry.pending_stale_output_cleanup.take() else {
-        return false;
-    };
-    let state = match state {
-        PendingStaleOutputCleanup::Physical {
-            owner,
-            artifact,
-            stable_inert,
-        } => {
-            activate_stale_output_cleanup(world, entry, owner, artifact, stable_inert);
-            if matches!(
-                entry.pending_stale_output_cleanup,
-                Some(PendingStaleOutputCleanup::Active { .. })
-            ) {
-                return drive_stale_output_cleanup_settlement(world, entry);
-            }
-            return true;
-        }
-        state => state,
-    };
-    let PendingStaleOutputCleanup::Active {
-        source,
-        current_epoch,
-        cleanup_source,
-        mut ledger,
-        stable_inert,
-    } = state
-    else {
-        entry.pending_stale_output_cleanup = Some(state);
-        return false;
-    };
-    if stable_inert || !current_epoch.matches(world, entry) {
-        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Active {
-            source,
-            current_epoch,
-            cleanup_source,
-            ledger,
-            stable_inert: true,
-        });
-        return true;
-    }
-    let Some(attempt) = ledger.attempt(world) else {
-        if !ledger.is_settled() {
-            entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Active {
-                source,
-                current_epoch,
-                cleanup_source,
-                ledger,
-                stable_inert: true,
-            });
-        }
-        return true;
-    };
-    let _ = ledger.settle_failure_cleanup_guarded(world, attempt, &cleanup_source, &|world| {
-        current_epoch.matches(world, entry)
-    });
-    let failure_cleanup_is_inert = ledger.failure_cleanup_is_inert();
-    if !current_epoch.matches(world, entry) {
-        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Active {
-            source,
-            current_epoch,
-            cleanup_source,
-            ledger,
-            stable_inert: true,
-        });
-    } else if !ledger.is_settled() {
-        entry.pending_stale_output_cleanup = Some(PendingStaleOutputCleanup::Active {
-            source,
-            current_epoch,
-            cleanup_source,
-            ledger,
-            stable_inert: failure_cleanup_is_inert,
-        });
-    }
-    true
-}
-
 pub(crate) fn settle_cleanup_system(world: &mut World) {
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             for entry in &mut navigation.entries {
-                if drive_stale_output_cleanup_settlement(world, entry) {
-                    continue;
-                }
                 if drive_post_commit_compound(world, entry) {
                     continue;
                 }

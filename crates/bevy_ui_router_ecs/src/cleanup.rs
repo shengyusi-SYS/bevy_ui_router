@@ -3330,38 +3330,6 @@ impl FrozenCleanupManifest {
         Ok(self)
     }
 
-    pub(crate) fn finalize_sealed_stale_boundaries(
-        mut self,
-        bindings: Vec<PendingBoundaryBinding>,
-    ) -> Result<Self, (FailedPreparedTopologyError, Self)> {
-        if bindings.len() != self.boundary_drifts.len()
-            || bindings.iter().enumerate().any(|(index, binding)| {
-                let drift = &self.boundary_drifts[index];
-                binding.source != drift.source
-                    || binding.source.removed_child() != binding.obligation.entity()
-                    || !self.contains_exact_obligation(&binding.obligation)
-                    || bindings[index + 1..]
-                        .iter()
-                        .any(|other| other.source == binding.source)
-            })
-        {
-            return Err((
-                FailedPreparedTopologyError::AmbiguousBoundaryOwnership,
-                self,
-            ));
-        }
-        for (drift, binding) in self.boundary_drifts.iter().zip(&bindings) {
-            let boundary = drift.expected.exact_claim();
-            let removed_child = binding.source.removed_child();
-            self.mount_parents.retain(|parent| {
-                !(parent.claim == *boundary && parent.removed_child == removed_child)
-            });
-        }
-        self.boundary_drifts.clear();
-        self.digest = frozen_manifest_digest(&self.obligations, &self.mount_parents);
-        Ok(self)
-    }
-
     pub(crate) fn preflight(&self, world: &World) -> bool {
         let receipts = (0..self.obligations.len())
             .map(|_| None)
@@ -3378,12 +3346,6 @@ impl FrozenCleanupManifest {
                             && mount_parent_physical_matches(world, registry, parent)
                     })
                 })
-    }
-
-    pub(crate) fn failure_cleanup_targets_are_isolated(&self, world: &World) -> bool {
-        self.obligations
-            .iter()
-            .all(|obligation| unresolved_obligation_is_isolated(world, obligation))
     }
 
     pub(crate) fn freeze_failure_cleanup_partition(
@@ -3403,46 +3365,6 @@ impl FrozenCleanupManifest {
         active: Option<&RealizedBranch>,
         prepared: Option<&RealizedBranch>,
         host: &HostBinding,
-    ) -> Option<FrozenFailureCleanupPartition> {
-        self.freeze_failure_cleanup_partition_retaining_with_protected(
-            world,
-            registry,
-            active,
-            prepared,
-            host,
-            &[],
-        )
-    }
-
-    pub(crate) fn freeze_stale_output_cleanup_partition(
-        &self,
-        world: &World,
-        registry: &RouteEntityRegistry,
-        active: Option<&RealizedBranch>,
-        host: &HostBinding,
-    ) -> Option<FrozenFailureCleanupPartition> {
-        let additional_protected = world
-            .iter_entities()
-            .map(|entity| entity.id())
-            .collect::<Vec<_>>();
-        self.freeze_failure_cleanup_partition_retaining_with_protected(
-            world,
-            registry,
-            active,
-            None,
-            host,
-            &additional_protected,
-        )
-    }
-
-    fn freeze_failure_cleanup_partition_retaining_with_protected(
-        &self,
-        world: &World,
-        registry: &RouteEntityRegistry,
-        active: Option<&RealizedBranch>,
-        prepared: Option<&RealizedBranch>,
-        host: &HostBinding,
-        additional_protected: &[Entity],
     ) -> Option<FrozenFailureCleanupPartition> {
         let targets = self
             .obligations
@@ -3500,7 +3422,6 @@ impl FrozenCleanupManifest {
                 .flat_map(|obligation| [obligation.expected_parent, obligation.authorized_parent]),
         );
         roots.extend(self.mount_parents.iter().map(|parent| parent.physical));
-        roots.extend(additional_protected.iter().copied());
         roots.sort_by_key(|entity| entity.to_bits());
         roots.dedup();
         let target_observed = allowed_writes
@@ -10076,10 +9997,6 @@ impl CleanupLedger {
         self.completion_digest.is_some()
     }
 
-    pub(crate) const fn failure_cleanup_is_inert(&self) -> bool {
-        self.failure_cleanup_inert.is_some()
-    }
-
     fn target_preparation_permanent_boundary(
         stage: TargetPreparationPermanentSettlementFailureStage,
         expected: TargetPreparationPermanentSettlementExpectation,
@@ -10639,7 +10556,7 @@ impl CleanupLedger {
     }
 
     pub(crate) fn settle(&mut self, world: &mut World, attempt: CleanupAttempt) -> bool {
-        self.settle_with_failure_source(world, attempt, None, &|_| true, None)
+        self.settle_with_failure_source(world, attempt, None, None)
     }
 
     pub(crate) fn settle_failure_cleanup(
@@ -10648,20 +10565,7 @@ impl CleanupLedger {
         attempt: CleanupAttempt,
         source: &FailureCleanupSourceProjection,
     ) -> bool {
-        self.settle_with_failure_source(world, attempt, Some(source), &|_| true, None)
-    }
-
-    pub(crate) fn settle_failure_cleanup_guarded<F>(
-        &mut self,
-        world: &mut World,
-        attempt: CleanupAttempt,
-        source: &FailureCleanupSourceProjection,
-        current_epoch: &F,
-    ) -> bool
-    where
-        F: Fn(&World) -> bool,
-    {
-        self.settle_with_failure_source(world, attempt, Some(source), current_epoch, None)
+        self.settle_with_failure_source(world, attempt, Some(source), None)
     }
 
     fn retain_cleanup_settlement_permanent_evidence(&mut self, world: &World) {
@@ -10747,17 +10651,13 @@ impl CleanupLedger {
         }
     }
 
-    fn settle_with_failure_source<F>(
+    fn settle_with_failure_source(
         &mut self,
         world: &mut World,
         attempt: CleanupAttempt,
         failure_source: Option<&FailureCleanupSourceProjection>,
-        current_epoch: &F,
         inherited_quarantine: Option<CleanupDisposition>,
-    ) -> bool
-    where
-        F: Fn(&World) -> bool,
-    {
+    ) -> bool {
         if self.issued_attempt.as_ref() != Some(&attempt)
             || attempt.ledger_domain != self.ledger_domain
             || attempt.manifest_digest != self.manifest_digest
@@ -10804,7 +10704,6 @@ impl CleanupLedger {
                 &current_evidence,
                 &focus_closure,
                 failure_source,
-                current_epoch,
             )
         {
             return settled;
@@ -10961,18 +10860,14 @@ impl CleanupLedger {
         false
     }
 
-    fn settle_failed_prepared_exact<F>(
+    fn settle_failed_prepared_exact(
         &mut self,
         world: &mut World,
         attempt: &CleanupAttempt,
         current_evidence: &[(usize, CleanupEvidence)],
         focus_closure: &[Entity],
         current_source: Option<&FailureCleanupSourceProjection>,
-        current_epoch: &F,
-    ) -> Option<bool>
-    where
-        F: Fn(&World) -> bool,
-    {
+    ) -> Option<bool> {
         if quarantine_disposition(current_evidence, &self.obligations).is_some() {
             return None;
         }
@@ -11002,17 +10897,7 @@ impl CleanupLedger {
         ) {
             return Some(self.retain_failure_cleanup_refreeze_stop(partition, evidence));
         }
-        if !current_epoch(world) {
-            self.issued_attempt = None;
-            self.failure_cleanup_partition = Some(partition);
-            return Some(false);
-        }
         release_cleanup_focus(world, focus_closure);
-        if !current_epoch(world) {
-            self.issued_attempt = None;
-            self.failure_cleanup_partition = Some(partition);
-            return Some(false);
-        }
         let Some(mount_parent_exchanges) =
             self.prepare_failure_cleanup_mount_parent_exchanges(world)
         else {
@@ -11154,22 +11039,12 @@ impl CleanupLedger {
                 ) {
                     return Some(self.retain_failure_cleanup_refreeze_stop(partition, evidence));
                 }
-                if !current_epoch(world) {
-                    self.issued_attempt = None;
-                    self.failure_cleanup_partition = Some(partition);
-                    return Some(false);
-                }
             }
             if let Some(retirement) = removal.retirement {
                 apply_prepared_exact_registry_retirement(
                     &mut world.resource_mut::<RouteEntityRegistry>(),
                     retirement,
                 );
-            }
-            if !current_epoch(world) {
-                self.issued_attempt = None;
-                self.failure_cleanup_partition = Some(partition);
-                return Some(false);
             }
             self.commit_receipt_batch(removal.receipt);
             if let Err(evidence) = partition.refreeze(
@@ -11187,11 +11062,6 @@ impl CleanupLedger {
         }
         let mount_parent_next =
             Self::apply_failure_cleanup_mount_parent_exchanges(world, mount_parent_exchanges);
-        if !current_epoch(world) {
-            self.issued_attempt = None;
-            self.failure_cleanup_partition = Some(partition);
-            return Some(false);
-        }
         if let Err(evidence) = partition.refreeze(
             world,
             current_source,
@@ -13733,13 +13603,7 @@ impl CleanupLedger {
                 self.issued_attempt = None;
                 return Err(PostCommitAuthoritySettlementFailure::PrewriteDrift);
             }
-            if !self.settle_with_failure_source(
-                world,
-                attempt,
-                None,
-                &|_| true,
-                Some(observed_quarantine),
-            ) {
+            if !self.settle_with_failure_source(world, attempt, None, Some(observed_quarantine)) {
                 return Err(PostCommitAuthoritySettlementFailure::PhysicalWriteRejected);
             }
             let original_is_current = original_freeze.terminals_are_current(world, original);

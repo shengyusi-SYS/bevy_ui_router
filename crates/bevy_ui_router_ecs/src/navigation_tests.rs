@@ -8157,11 +8157,8 @@ fn vacant_back_capacity_entry(handle: RouterHandle) -> RouterEntry {
         pending_host_confirmation: None,
         pending_commit: None,
         pending_frame_drive: None,
-        pending_stale_output_cleanup: None,
         #[cfg(feature = "bsn")]
         native_residuals: Vec::new(),
-        #[cfg(test)]
-        delayed_driver_report_replay: None,
         pending_mount_frame_task: None,
         pending_mount_request: None,
         pending_mount_mutation_rejection: None,
@@ -21272,7 +21269,7 @@ fn back_target_physical_permanent_current_isolation_is_exact_and_nonsettling() {
                 splice,
                 &installed.retired_host.top_slot_claim,
             ),
-            splice.current_interactive_entities(),
+            splice.current_live_interactive_entities(world),
             installed.cleanup.physical.target_observed.clone(),
             installed.cleanup.physical.protected.observed.clone(),
             installed
@@ -37227,12 +37224,14 @@ pub(crate) fn production_report_application_rejects_opaque_or_foreign_identity_b
                 .find(|entry| entry.handle == second)
                 .unwrap();
             let host = entry.host.as_ref().unwrap();
-            apply_applied_driver_report(
+            apply_applied_driver_report_to_branch(
                 world,
                 &mut entry.engine,
                 host.candidate.clone(),
                 host.top_slot,
                 host.top_slot_claim.clone(),
+                None,
+                None,
                 &current_task,
                 artifact,
             )
@@ -37264,12 +37263,14 @@ pub(crate) fn production_report_application_rejects_opaque_or_foreign_identity_b
                 .find(|entry| entry.handle == second)
                 .unwrap();
             let host = entry.host.as_ref().unwrap();
-            apply_applied_driver_report(
+            apply_applied_driver_report_to_branch(
                 world,
                 &mut entry.engine,
                 host.candidate.clone(),
                 host.top_slot,
                 host.top_slot_claim.clone(),
+                None,
+                None,
                 &foreign_task,
                 artifact,
             )
@@ -48831,108 +48832,6 @@ fn invalid_host_topology_publishes_unavailable_without_staging() {
     assert!(app.world().get::<Children>(host).is_none());
 }
 
-fn capture_real_applied_report(
-    app: &mut App,
-    router: RouterHandle,
-    after_first_realization: bool,
-) -> (u64, Vec<Entity>) {
-    app.world_mut()
-        .resource_mut::<RouterNavigation>()
-        .push(router, RouteLocation::new("/items/1"))
-        .unwrap();
-    collect_navigation_system(app.world_mut());
-    if after_first_realization {
-        drive_navigation_system(app.world_mut());
-    }
-    let control = app
-        .world_mut()
-        .resource_mut::<RouterNavigation>()
-        .testing_arm_next_applied_driver_report_replay(router)
-        .unwrap();
-    for _ in 0..8 {
-        drive_navigation_system(app.world_mut());
-        if matches!(
-            app.world().resource::<RouterNavigation>().entries[0].delayed_driver_report_replay,
-            Some(TestingDelayedDriverReportReplayState::Captured { .. })
-        ) {
-            break;
-        }
-    }
-    let entry = &app.world().resource::<RouterNavigation>().entries[0];
-    assert!(matches!(
-        entry.delayed_driver_report_replay,
-        Some(TestingDelayedDriverReportReplayState::Captured {
-            released: false,
-            ..
-        })
-    ));
-    let physical = entry
-        .pending_frame_drive
-        .as_ref()
-        .unwrap()
-        .pending
-        .branch
-        .as_realized()
-        .claims()
-        .map(|claim| claim.entity())
-        .collect::<Vec<_>>();
-    if after_first_realization {
-        assert!(!physical.is_empty());
-    } else {
-        assert!(physical.is_empty());
-    }
-    (control, physical)
-}
-
-fn settle_captured_report_host_loss_and_readmit(app: &mut App, router: RouterHandle) {
-    let (host, old_top_slot) = {
-        let entry = &app.world().resource::<RouterNavigation>().entries[0];
-        let binding = entry.host.as_ref().unwrap();
-        (binding.host, binding.top_slot)
-    };
-    assert!(
-        app.world_mut()
-            .entity_mut(host)
-            .take::<RouterHostRegistration>()
-            .is_some()
-    );
-    drive_navigation_system(app.world_mut());
-    for _ in 0..32 {
-        settle_cleanup_system(app.world_mut());
-        let entry = &app.world().resource::<RouterNavigation>().entries[0];
-        if entry.host.is_none() && entry.cleanup_ledger.is_none() {
-            break;
-        }
-    }
-    assert_eq!(
-        app.world().resource::<RouterNavigation>().entries[0]
-            .engine
-            .snapshot()
-            .availability(),
-        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
-    );
-    app.world_mut()
-        .entity_mut(host)
-        .insert(RouterHostRegistration::new(router));
-    for _ in 0..8 {
-        observe_authority_system(app.world_mut());
-        if app.world().resource::<RouterNavigation>().entries[0]
-            .host
-            .is_some()
-        {
-            break;
-        }
-    }
-    let entry = &app.world().resource::<RouterNavigation>().entries[0];
-    let fresh = entry
-        .host
-        .as_ref()
-        .expect("fresh exact registration must reopen admission after retired-edge terminal");
-    assert_eq!(fresh.host, host);
-    assert_ne!(fresh.top_slot, old_top_slot);
-    assert!(entry.active.is_none());
-}
-
 #[test]
 pub(crate) fn same_host_readmission_waits_for_retired_edge_and_old_slot_disposition() {
     let (mut app, router, _request, host, _history) =
@@ -49012,45 +48911,6 @@ fn commit_fresh_nested_epoch(app: &mut App, router: RouterHandle, fragment: &str
         app.world().resource::<RouterNavigation>().entries[0]
             .active
             .is_some()
-    );
-}
-
-#[test]
-fn sealed_stale_output_cleanup_is_disjoint_from_new_epoch() {
-    let mut app = App::new();
-    app.add_plugins(BevyUiRouterPlugin::default());
-    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let router = install_nested_router(&mut app, observed, true);
-    observe_authority_system(app.world_mut());
-    let (control, old_physical) = capture_real_applied_report(&mut app, router, true);
-    settle_captured_report_host_loss_and_readmit(&mut app, router);
-    commit_fresh_nested_epoch(&mut app, router, "fresh-sealed-epoch");
-    let history_before = app.world().resource::<RouterNavigation>().entries[0]
-        .engine
-        .history()
-        .clone();
-    let active_before = app.world().resource::<RouterNavigation>().entries[0]
-        .engine
-        .active()
-        .clone();
-
-    app.world_mut()
-        .resource_mut::<RouterNavigation>()
-        .testing_release_applied_driver_report_replay(router, control)
-        .unwrap();
-    for _ in 0..16 {
-        drive_navigation_system(app.world_mut());
-        settle_cleanup_system(app.world_mut());
-    }
-
-    let entry = &app.world().resource::<RouterNavigation>().entries[0];
-    assert!(entry.delayed_driver_report_replay.is_none());
-    assert_eq!(entry.engine.history(), &history_before);
-    assert_eq!(entry.engine.active(), &active_before);
-    assert!(
-        old_physical
-            .iter()
-            .all(|entity| app.world().get_entity(*entity).is_err())
     );
 }
 
@@ -49338,78 +49198,4 @@ pub(crate) fn old_quarantine_lease_cannot_mutate_new_epoch_fixture() {
             assert!(!gate.allows_gamepad(entity));
         }
     }
-}
-
-#[test]
-fn ownerless_old_report_after_readmission_is_zero_write() {
-    let mut app = App::new();
-    app.add_plugins(BevyUiRouterPlugin::default());
-    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let router = install_nested_router(&mut app, observed, true);
-    observe_authority_system(app.world_mut());
-    let (control, old_physical) = capture_real_applied_report(&mut app, router, false);
-    assert!(old_physical.is_empty());
-    settle_captured_report_host_loss_and_readmit(&mut app, router);
-    commit_fresh_nested_epoch(&mut app, router, "fresh-ownerless-epoch");
-    let before = authority_world_fingerprint(app.world());
-    let snapshot_before = app.world().resource::<RouterNavigation>().entries[0]
-        .engine
-        .snapshot();
-
-    app.world_mut()
-        .resource_mut::<RouterNavigation>()
-        .testing_release_applied_driver_report_replay(router, control)
-        .unwrap();
-    drive_navigation_system(app.world_mut());
-    settle_cleanup_system(app.world_mut());
-
-    let entry = &app.world().resource::<RouterNavigation>().entries[0];
-    assert!(entry.delayed_driver_report_replay.is_none());
-    assert_eq!(entry.engine.snapshot(), snapshot_before);
-    assert_eq!(authority_world_fingerprint(app.world()), before);
-}
-
-#[test]
-fn stale_output_despawn_hook_protected_drift_stops_before_receipt() {
-    let mut app = App::new();
-    install_cleanup_despawn_drift_hook(&mut app);
-    app.add_plugins(BevyUiRouterPlugin::default());
-    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let router = install_nested_router(&mut app, observed, true);
-    observe_authority_system(app.world_mut());
-    let (control, old_physical) = capture_real_applied_report(&mut app, router, true);
-    assert!(old_physical.len() >= 2);
-    let first = *old_physical
-        .last()
-        .expect("the cleanup target order starts at the leaf obligation");
-    let later = old_physical[old_physical.len() - 2];
-    let protected = app.world_mut().spawn_empty().id();
-    settle_captured_report_host_loss_and_readmit(&mut app, router);
-    commit_fresh_nested_epoch(&mut app, router, "fresh-protected-epoch");
-    app.world_mut().insert_resource(CleanupDespawnDrift {
-        target: first,
-        action: CleanupDespawnDriftAction::ProtectedMarker(protected),
-    });
-
-    app.world_mut()
-        .resource_mut::<RouterNavigation>()
-        .testing_release_applied_driver_report_replay(router, control)
-        .unwrap();
-    drive_navigation_system(app.world_mut());
-    settle_cleanup_system(app.world_mut());
-
-    assert!(app.world().get_entity(first).is_err());
-    assert!(app.world().get::<CleanupDriftMarker>(protected).is_some());
-    assert!(app.world().get_entity(later).is_ok());
-    let entry = &app.world().resource::<RouterNavigation>().entries[0];
-    assert!(entry.delayed_driver_report_replay.is_none());
-    let Some(PendingStaleOutputCleanup::Active {
-        ledger,
-        stable_inert: true,
-        ..
-    }) = entry.pending_stale_output_cleanup.as_ref()
-    else {
-        panic!("protected drift must retain the unique stale cleanup owner inert");
-    };
-    assert_eq!(ledger.receipt_count(), 0);
 }

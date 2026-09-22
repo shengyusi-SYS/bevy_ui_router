@@ -10,7 +10,7 @@
 
 **Spec:** [统一 MVP design spec](../specs/2026-09-07-router-mvp-design.md)。实现者同时读取 spec 和本计划；产品合同归 spec，本文件只拥有迁移顺序与证据。
 
-**状态**：Active implementation plan。阶段 A/B 已完成；idle host-loss 基线为 `8ce2b41`，Core native failure/HostLost 来源检查点为 `e7445a2`。官方 BSN 联动切片 `c203446` 已通过独立/交叉审查、反例修正与最终冻结验证：公开注册经真实 FrameTask 接入 adoption、current containment、mount、cleanup、失败/Back/terminal owner 和输入/focus。共享资格、动态隐藏、当前 cleanup 错误证据、官方 clipping 缓存及 pending focus 原 frame 归属问题均已闭合；`a153520` 补齐公开 snapshot 的同更新观察，`31f84c6` 完成 native public journey 迁移及两处失败接收修正。本次撤下旧公开 writer/report 注册与导出，保留私有真实 no-BSN 测试管线。统一验收归集、示例、内部回放机制退出与替身收窄、最终集成仍开放。成功 focus 合同保持 spec §7.1，不重写产品范围或将 MVP 标为 PASS。
+**状态**：Active implementation plan。阶段 A/B 已完成；idle host-loss 基线为 `8ce2b41`，Core native failure/HostLost 来源检查点为 `e7445a2`。官方 BSN 联动切片 `c203446` 已通过独立/交叉审查、反例修正与最终冻结验证：公开注册经真实 FrameTask 接入 adoption、current containment、mount、cleanup、失败/Back/terminal owner 和输入/focus。共享资格、动态隐藏、当前 cleanup 错误证据、官方 clipping 缓存及 pending focus 原 frame 归属问题均已闭合；`a153520` 补齐公开 snapshot 的同更新观察，`31f84c6` 完成 native public journey 迁移及两处失败接收修正。`0d8cb48` 撤下旧公开 writer/report 注册与导出；本次成组退出专属延迟回放机制，保留私有真实 no-BSN 测试管线。统一验收归集、示例、私有替身最终边界核查、最终集成仍开放。成功 focus 合同保持 spec §7.1，不重写产品范围或将 MVP 标为 PASS。
 
 ## 全局约束
 
@@ -46,10 +46,10 @@
 当前按以下三个主要交付单元组织，第一项已闭合；剩余两项仍为中等偏大的工作量，并非只剩文档收尾。独立验收盘点与旧机制调用者盘点经交叉复核，按以下顺序收口：
 
 1. **native 公共验收（本轮交付已闭合）**：公开 snapshot 同更新观察由 `a153520` 闭合；原 public journey fixture 已整体迁到官方 BSN，补齐 factory input/等价与 search/fragment、排队及失败 Back、boundary/build/resolve 恢复和两处真实 host/outlet 缺口。旧 writer 专属测试责任由现有私测保留，不另建永久平行 suite。剩余工作是全 MVP 验收归集，不重新执行这轮迁移。
-2. **示例与旧机制退出**：旧公开 writer/report 注册与导出已撤下，外部迁移 consumer 已改为明确的 ECS-only 安装验证，Data 注册及变体仅在私有单元测试中编译；真实 no-BSN 管线保持。继续完成推荐 quick start/普通内部 outlet 示例，按实际依赖收窄私有替身，成组退出仅服务旧回放的状态、投影和静态 helper。公开入口退出不等于私有执行器已瘦身；不以删除所有 ContentPlan 代码为先决条件，也不以“私有 fixture”名义无限保留旧回放协议。
+2. **示例与旧机制退出**：旧公开 writer/report 注册与导出已撤下，外部迁移 consumer 已改为明确的 ECS-only 安装验证，Data 注册及变体仅在私有单元测试中编译；仅服务旧延迟回放的状态、投影、cleanup 包装和无用静态 helper 已成组退出。继续完成推荐 quick start/普通内部 outlet 示例，并按真实调用者完成私有替身最终边界核查。保留真实 no-BSN 管线，不以删除所有 ContentPlan 代码为先决条件，不重复开发已退出的机制。
 3. **最终集成**：完成 spec 验收证据、Core/ECS/public 独立与交叉审查、全量验证和 main 集成。已闭合路径不重新开发；新增生产问题须有真实可达证据，才安排局部修正。
 
-这些单元不等于固定提交次数或工时承诺。复杂度的主要待减部分是双内容模型和测试回放协议，不是 Core/View 分层或实际 native ownership；创建/cleanup 的真实 FrameOutput role、执行依赖保活、原 failure owner 与残留责任按调用者保留。阶段 checklist 仍按完整验收勾选，不因局部通过整阶段打勾，也不将尚未勾选误报为功能从未实现。
+这些单元不等于固定提交次数或工时承诺。已识别的多余复杂度是旧公开内容模型与专属测试回放协议，二者已退出；不据剩余符号数启动新一轮整体重构。Core/View 分层、创建/cleanup 的真实 FrameOutput role、执行依赖保活、原 failure owner 与残留责任按调用者保留。阶段 checklist 仍按完整验收勾选，不因局部通过整阶段打勾，也不将尚未勾选误报为功能从未实现。
 
 ### 1.1 候选行为 retention map
 
@@ -172,7 +172,7 @@
 
 - [ ] 删除不再被必要内部 fixture 使用的旧 writer/report/ContentPlan/outlet executor 及其 public 导出、兼容 consumer 和 golden。保留最小 fake renderer；删的是旧 API 形状，不是独立验证能力。
 
-  公开面退出已通过独立审查和验证：移除两层 exports 与公开 Data 注册，将剩余单测注册收为私有 test-only 扩展；迁移 ECS-only consumer，移除旧 session 专属拒绝行、旧类型导出断言和未注册的 root 测试源。完整 no-BSN ECS 行为与 native public/独立 consumer 保留。内部 replay、静态 helper 和必要 fixture 收窄仍待完成，因此本整项不提前勾选。
+  公开面退出已通过独立审查和验证：移除两层 exports 与公开 Data 注册，将剩余单测注册收为私有 test-only 扩展；迁移 ECS-only consumer，移除旧 session 专属拒绝行、旧类型导出断言和未注册的 root 测试源。专属延迟回放 owner/投影/调度/cleanup 包装、无用静态 helper 及对应旧形状断言也已成组退出。完整 no-BSN ECS 行为与 native public/独立 consumer 保留；剩余 fixture 按真实调用者完成最终核查，不要求全删 ContentPlan，本整项随最终核查闭合。
 - [ ] 合并重复测试，移除固定 catalogue、Markdown 循环解析、全量 hostile-source 扫描的维护前置。保留能防止 authority 暴露的少量 compile-fail 和实际 consumer 验证，不把迁移承诺变成未经证明的删除。
 - [ ] 对照 spec 第 10 节逐行附上实际 gate/结果；当前架构只记实现事实，roadmap 只留 Now/Next/Post-MVP，旧文档不再同时称自己 canonical。
 - [ ] 执行下列最终验证；独立 consumer 的 target/workspace 与产品测试隔离，同一共享 target 不并行 Cargo。
@@ -275,6 +275,10 @@ native 公共旅程检查点（2026-09-22，本记录所在提交）：原 fixtu
 阶段 E 公开入口退出（本记录所在提交）：两位独立评估及双向交叉复核支持按现有范围做减法，无需整体重写 Core/View 或增加安全需求。已撤旧公开 writer/report 与 Data 注册，保留 test-only 私有注册和同一真实执行管线；ECS-only 外部 consumer 只验证安装/资源/更新，不冒称渲染。删除未注册的旧 root 测试源、session 专属拒绝行和旧类型导出断言；原 native journeys、输入/focus、身份/authority 拒绝保留。该冻结改动经独立 spec/quality 审查无阻断项，主代理核对实际调用者、日志和哈希。
 
 本检查点验证均 exit 0：完整 ECS all-features（668 + 1）和 no-default（624 + 1）、完整 facade（85，含 native journeys/focus/input、独立 LF/CRLF consumer）、workspace all-target/all-feature check、四 facade feature checks、格式与 diff。主代理另行重跑完整 workspace all-feature tests（含 Core 424、ECS 668、public journeys 36、Core doctests 28）与 workspace/consumer 格式检查。现有及公开面撤销后显现的 unused 私有协议 warnings 如实保留，Windows 原生仍 NOT_RUN。下一步是成组退出 replay/static helper 并收窄必要替身、完成示例，随后最终验收与 main 集成；不是本检查点即完成全部旧机制或 MVP。
+
+阶段 E 专属回放退出（本记录所在提交）：在 `0d8cb48` 基线上，成组删除只由测试捕获入口驱动的旧输出 owner、延迟释放状态、全 store/snapshot 投影、调度和 cleanup 专属包装，并删除无消费者的静态 helper、四项形状断言和三项旧协议专属测试。共享 cleanup 中移除的回调在所有剩余调用者均为常真；真实 partition/refreeze、失败来源和原 owner 保留。stale 零写入、原 task 重试、同 host 重新接纳、旧残留隔离与 hook 后停止写入仍由生产路径回归覆盖。两位独立审查者完成双向交叉复核，无可行动 finding；主代理核实调用者、测试责任与最后 import-only 变更。
+
+本检查点完整 ECS all-features（661 + 1）、no-default（617 + 1）、完整 facade（85，含 36 native journeys、19 focus、13 input 和独立 LF/CRLF consumer）、workspace all-target/all-feature check 均 exit 0。主代理另行重跑 `cargo test --workspace --all-features --locked --offline`，含 Core 424、ECS 661 与 Core doctests 28，exit 0；workspace/独立 consumer 格式检查及 diff 检查通过，产品冻结哈希一致。既有 warnings 与 Windows 原生 NOT_RUN 不变。下一交付是推荐 quick start/普通内部 outlet 示例及最后 fixture 边界核查，随后归集完整验收、最终审查验证和 main 集成；本次不新增产品需求或通用事务框架。
 
 每个阶段结束只补充：交付 commit、实际命令与结果、审查结论/未决项、下一依赖；临时构建路径、完整日志和细碎排查过程不固化成长期经验。阶段内私有文件布局和检查点可调整，影响公共语义、范围或信任边界才需要重新确认。
 

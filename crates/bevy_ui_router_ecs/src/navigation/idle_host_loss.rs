@@ -87,7 +87,6 @@ fn physically_idle(entry: &RouterEntry) -> bool {
         && entry.pending_host_confirmation.is_none()
         && entry.pending_commit.is_none()
         && entry.pending_frame_drive.is_none()
-        && entry.pending_stale_output_cleanup.is_none()
         && entry.pending_mount_frame_task.is_none()
         && entry.pending_mount_request.is_none()
         && entry.pending_mount_mutation_rejection.is_none()

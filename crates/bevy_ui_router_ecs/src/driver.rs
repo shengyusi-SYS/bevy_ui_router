@@ -204,12 +204,6 @@ mod tests {
     }
 
     #[test]
-    fn driver_trait_has_the_final_immediate_shape() {
-        fn assert_driver<D: EcsViewDriver>() {}
-        let _ = assert_driver::<ShapeDriver>;
-    }
-
-    #[test]
     fn report_session_is_not_clone_copy_or_default() {
         trait AmbiguousIfClone<A> {
             fn check() {}
@@ -255,22 +249,5 @@ mod tests {
         assert_eq!(report.message(), None);
         assert_eq!(world_snapshot(&world, sentinel), world_before);
         assert_eq!(registry, registry_before);
-    }
-
-    struct ShapeDriver;
-
-    impl EcsViewDriver for ShapeDriver {
-        fn key(&self) -> bevy_ui_router_view::ViewDriverKey {
-            bevy_ui_router_view::ViewDriverKey::new("shape").unwrap()
-        }
-
-        fn apply(
-            &mut self,
-            _effect: &bevy_ui_router_view::ViewBuildEffect,
-            _content: &mut crate::content::FrameContentWriter<'_>,
-            report: EcsViewReportSession<'_>,
-        ) -> ViewBuildReport {
-            execute_data_only(_content, report)
-        }
     }
 }

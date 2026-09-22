@@ -217,11 +217,6 @@ pub(crate) enum ViewExecutor {
     Native(bevy_ui_router_bsn::BsnSceneFactory),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ViewDriverStoreProjection {
-    keys: Vec<ViewDriverKey>,
-}
-
 impl ViewDriverStore {
     pub(crate) const fn new() -> Self {
         Self {
@@ -293,12 +288,6 @@ impl ViewDriverStore {
 
     pub(crate) fn contains(&self, key: &ViewDriverKey) -> bool {
         self.drivers.iter().any(|(stored, _)| stored == key)
-    }
-
-    pub(crate) fn exact_projection(&self) -> ViewDriverStoreProjection {
-        ViewDriverStoreProjection {
-            keys: self.drivers.iter().map(|(key, _)| key.clone()).collect(),
-        }
     }
 
     #[cfg(test)]
